@@ -16,7 +16,7 @@ extra **categorical** bookkeeping column the formula never references —
 — filled ``group`` with the ``"0"`` placeholder and re-validated it against the
 saved levels, aborting with
 
-    GamError: ... unseen level '0' in categorical column 'group' ...
+    GamfitError: ... unseen level '0' in categorical column 'group' ...
 
 even though ``group`` never enters the mean design. That is exactly the #840
 "leave-one-group-out" foot-gun ``predict`` avoids by projecting the frame to

@@ -102,6 +102,18 @@ impl ExpectedInformationRow {
         self.gradient.len()
     }
 
+    /// `κ·v` for one log-likelihood derivative `v`.
+    ///
+    /// On the well-classified tail `κ ≈ 1/Φ(−m)` approaches the largest double
+    /// while every derivative of `ℓ = ln Φ(m)` carries a factor `φ(m)`, so each
+    /// term of the formulas below is `κ` times derivative factors and is small.
+    /// `κ` therefore multiplies exactly one derivative factor before anything
+    /// else: `κ·v` is `O(poly(m))`, where `2κ`, `κ·(sᵀx)` or `κ·(h x)(h y)ᵀ`
+    /// overflow or underflow first and turn the row into `∞·0` (#3164).
+    fn lift<D: ndarray::Dimension>(&self, derivative: &ndarray::Array<f64, D>) -> ndarray::Array<f64, D> {
+        derivative.mapv(|value| self.odds * value)
+    }
+
     /// A third-derivative matrix of the weighted row NLL, per unit weight.
     fn per_unit_weight(&self, mut weighted_nll_matrix: Array2<f64>) -> Array2<f64> {
         let weight = self.weight;
@@ -200,7 +212,7 @@ impl ExpectedInformationRow {
             &self.scaled,
         );
         add_symmetric_outer(&mut out, 2.0, third_moved, &self.scaled);
-        add_symmetric_outer(&mut out, 2.0 * self.odds, second_moved, first_moved);
+        add_symmetric_outer(&mut out, 2.0, &self.lift(second_moved), first_moved);
         out.mapv_inplace(|value| value * self.weight);
         out
     }
@@ -235,8 +247,11 @@ impl ExpectedInformationRow {
         add_symmetric_outer(&mut out, 4.0, &moved, &self.scaled);
         add_symmetric_outer(&mut out, 4.0, &scaled_moved, &self.scaled);
         out.scaled_add(2.0, third_along_scaled_weight);
-        let curvature_product = self.hessian.dot(weight_in_primary).dot(&self.hessian);
-        out.scaled_add(2.0 * self.odds, &curvature_product);
+        let curvature_product = self
+            .lift(&self.hessian)
+            .dot(weight_in_primary)
+            .dot(&self.hessian);
+        out.scaled_add(2.0, &curvature_product);
         out.mapv_inplace(|value| value * self.weight);
         out
     }
@@ -335,7 +350,7 @@ impl ExpectedInformationRow {
         add_symmetric_outer(&mut out, l_xyz, s, g);
         add_symmetric_outer(&mut out, l_xyz, s, s);
         for (l_pq, g_r) in [(l_xy, &g_z), (l_xz, g_y), (l_yz, g_x)] {
-            add_symmetric_outer(&mut out, 2.0 * (1.0 + odds) * l_pq, g_r, s);
+            add_symmetric_outer(&mut out, 2.0 * (l_pq + odds * l_pq), g_r, s);
         }
         for (a_p, b_p, g_qr, g_q, g_r) in [
             (a_x, b_x, &g_yz, g_y, &g_z),
@@ -343,12 +358,13 @@ impl ExpectedInformationRow {
             (a_z, b_z, g_xy, g_x, g_y),
         ] {
             add_symmetric_outer(&mut out, 2.0 * (a_p + b_p), g_qr, s);
-            add_symmetric_outer(&mut out, 2.0 * (b_p + odds * b_p), g_q, g_r);
+            let lifted_q = g_q + &self.lift(g_q);
+            add_symmetric_outer(&mut out, 2.0 * b_p, &lifted_q, g_r);
         }
         add_symmetric_outer(&mut out, 2.0, &g_xyz, s);
-        add_symmetric_outer(&mut out, 2.0 * odds, g_xy, &g_z);
-        add_symmetric_outer(&mut out, 2.0 * odds, &g_xz, g_y);
-        add_symmetric_outer(&mut out, 2.0 * odds, &g_yz, g_x);
+        add_symmetric_outer(&mut out, 2.0, &self.lift(g_xy), &g_z);
+        add_symmetric_outer(&mut out, 2.0, &self.lift(&g_xz), g_y);
+        add_symmetric_outer(&mut out, 2.0, &self.lift(&g_yz), g_x);
         out.mapv_inplace(|value| value * self.weight);
         out
     }
@@ -2912,8 +2928,8 @@ mod expected_information_2922_tests {
         );
     }
 
-    /// The direction formulas before the derivative-parts refactor, verbatim, for its no-change
-    /// control (i979 pin 2).
+    /// The direction formulas before the derivative-parts refactor, for its no-change control
+    /// (i979 pin 2), in the tail-safe association of #3164 (`κ` lifts one derivative factor).
     fn previous_first_directional(state: &ExpectedInformationRow, direction: &Array1<f64>) -> Array2<f64> {
         let dimension = state.gradient.len();
         let along = state.gradient.dot(direction);
@@ -2967,7 +2983,7 @@ mod expected_information_2922_tests {
             &state.scaled,
         );
         add_symmetric_outer(&mut out, 2.0, &third_moved, &state.scaled);
-        add_symmetric_outer(&mut out, 2.0 * state.odds, &second_moved, &first_moved);
+        add_symmetric_outer(&mut out, 2.0, &state.lift(&second_moved), &first_moved);
         out.mapv_inplace(|value| value * state.weight);
         out
     }
@@ -3028,7 +3044,7 @@ mod expected_information_2922_tests {
         add_symmetric_outer(&mut out, l_xyz, s, g);
         add_symmetric_outer(&mut out, l_xyz, s, s);
         for (l_pq, g_r) in [(l_xy, &g_z), (l_xz, &g_y), (l_yz, &g_x)] {
-            add_symmetric_outer(&mut out, 2.0 * (1.0 + odds) * l_pq, g_r, s);
+            add_symmetric_outer(&mut out, 2.0 * (l_pq + odds * l_pq), g_r, s);
         }
         for (a_p, b_p, g_qr, g_q, g_r) in [
             (a_x, b_x, &g_yz, &g_y, &g_z),
@@ -3036,12 +3052,12 @@ mod expected_information_2922_tests {
             (a_z, b_z, &g_xy, &g_x, &g_y),
         ] {
             add_symmetric_outer(&mut out, 2.0 * (a_p + b_p), g_qr, s);
-            add_symmetric_outer(&mut out, 2.0 * (b_p + odds * b_p), g_q, g_r);
+            add_symmetric_outer(&mut out, 2.0 * b_p, &(g_q + &state.lift(g_q)), g_r);
         }
         add_symmetric_outer(&mut out, 2.0, &g_xyz, s);
-        add_symmetric_outer(&mut out, 2.0 * odds, &g_xy, &g_z);
-        add_symmetric_outer(&mut out, 2.0 * odds, &g_xz, &g_y);
-        add_symmetric_outer(&mut out, 2.0 * odds, &g_yz, &g_x);
+        add_symmetric_outer(&mut out, 2.0, &state.lift(&g_xy), &g_z);
+        add_symmetric_outer(&mut out, 2.0, &state.lift(&g_xz), &g_y);
+        add_symmetric_outer(&mut out, 2.0, &state.lift(&g_yz), &g_x);
         out.mapv_inplace(|value| value * state.weight);
         out
     }
@@ -3216,6 +3232,80 @@ mod expected_information_2922_tests {
                 "the unresolved row contributes to {label}: {matrix:?}"
             );
         }
+    }
+
+    /// #3164: every coefficient derivative of the expected information stays finite across the
+    /// band of the well-classified tail where `κ ≈ 1/Φ(−m)` is within a factor of two of the
+    /// largest double and every derivative of `ℓ` is below `1e-300`. There `2κ` overflows, and a
+    /// formula that scales `κ` by a constant, by `sᵀx`, or by a product of two derivative factors
+    /// returned `∞·0 = NaN` for the whole row; the Jeffreys completion of a separated fit read it
+    /// and refused the inner solve. The sweep steps the slope finely enough that the band is hit,
+    /// and asserts so.
+    #[test]
+    fn expected_information_coefficient_derivatives_stay_finite_where_kappa_nears_overflow_3164() {
+        let first = Array1::from_vec(vec![0.6, -0.8]);
+        let second = Array1::from_vec(vec![-0.3, 0.9]);
+        let weight = Array2::from_shape_vec((2, 2), vec![2.0e-3, 0.54, 0.54, 318.6]).expect("weight");
+        let mut band_hits = 0usize;
+        for step in 0..2500 {
+            let slope = 36.0 + 0.002 * step as f64;
+            for y in [1.0_f64, 0.0] {
+                let (family, states) = one_row_rigid_family(0.0, slope, 1.0, y);
+                let cache = family.build_exact_eval_cache_with_order(&states).expect("exact eval cache");
+                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(cache.primary.total);
+                let Some(state) = family
+                    .expected_information_row_state(0, &states, &cache, false, &mut scratch)
+                    .expect("row state")
+                else {
+                    continue;
+                };
+                if state.odds > 0.5 * f64::MAX {
+                    band_hits += 1;
+                }
+                let mut produced = vec![
+                    ("I", family.expected_jeffreys_information(&states).expect("I")),
+                    (
+                        "D I",
+                        family.expected_jeffreys_information_directional(&states, &first).expect("D I"),
+                    ),
+                    (
+                        "D2 I",
+                        family
+                            .expected_jeffreys_information_second_directional(&states, &first, &second)
+                            .expect("D2 I"),
+                    ),
+                    (
+                        "grad2 tr(W I)",
+                        family
+                            .expected_jeffreys_information_contracted_trace_hessian(&states, &weight)
+                            .expect("contracted trace Hessian"),
+                    ),
+                ];
+                for matrix in family.expected_jeffreys_information_all_axes(&states, None).expect("D I[e_a]") {
+                    produced.push(("D I[e_a]", matrix));
+                }
+                for matrix in family
+                    .expected_jeffreys_information_all_axes(&states, Some(&first))
+                    .expect("D2 I[x, e_a]")
+                {
+                    produced.push(("D2 I[x, e_a]", matrix));
+                }
+                for matrix in family
+                    .expected_jeffreys_information_third_all_axes(&states, &first, &second)
+                    .expect("D3 I[x, y, e_a]")
+                {
+                    produced.push(("D3 I[x, y, e_a]", matrix));
+                }
+                for (label, matrix) in produced {
+                    assert!(
+                        matrix.iter().all(|value| value.is_finite()),
+                        "slope {slope} y {y} odds {:e}: {label} is not finite: {matrix:?}",
+                        state.odds
+                    );
+                }
+            }
+        }
+        assert!(band_hits > 0, "the sweep never reached the band where 2κ overflows");
     }
 
     /// A design hyperparameter derivative that moves only the design (no penalty motion).

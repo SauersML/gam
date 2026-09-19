@@ -59,6 +59,7 @@ fn spherical_spec(method: SphereMethod, radians: bool) -> SphericalSplineBasisSp
         max_degree: Some(3),
         wahba_kernel: SphereWahbaKernel::Sobolev,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     }
 }
 

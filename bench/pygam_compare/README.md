@@ -67,8 +67,12 @@ These are the plans (see `plans.py`):
 | `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
 | `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
 | `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
+| `fuzz_families` | gamfit only: n ∈ {50, 500, 5000}, every family/link label × every support-edge regime (convergence fuzz, below) | 3 |
+| `fuzz_families_quick` | gamfit only: n ∈ {50, 500}, every family/link label × {base, edge, zeros, lowdisp} (the 0-failure regression test) | 1 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
 | `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
+| `fuzz_terms` | gamfit only: 120 seeded term-structure cases × n ∈ {50, 500, 5000} × all families (1080 fits) | 1 |
+| `fuzz_terms_quick` | gamfit only: the fixed cases in `FUZZ_QUICK_CASES`, which cover every term kind, × n ∈ {50, 500} × all families (a 0-failure regression test) | 1 |
 
 The positive-response families are Gamma on the log link (`gamma_log`, shape 3),
 heavy right skew with responses near zero (`gamma_skew`, shape 0.5), Gamma on the
@@ -79,6 +83,35 @@ Gamma on y (`lognormal_gamma`), and scaled-t noise with 3 degrees of freedom
 It has no scaled-t family, and its inverse Gaussian stores sqrt(phi) as its
 scale, so `inverse_gaussian` and `student_t` run gamfit alone and report
 absolute numbers.
+
+The `fuzz_families` plans are a convergence fuzz, not a comparison
+(`fuzz_families.py`). A cell is one family/link label, n and an `ff-<regime>`
+design. The labels cover every response family in gamfit's family registry
+with every link its legality table admits: Gamma (log, inverse), the inverse
+Gaussian (canonical `1/μ²`, log), the negative binomial, Tweedie at p = 1.2, 1.5 and
+1.8, beta, scaled t, Poisson, binomial with trials (every binomial link) and the
+Gaussian on its inverse link. gamfit has no quasi families. The regime places
+the data at an edge of the family's support: responses at the boundary, a mean
+spanning orders of magnitude, a region with no events, near-degenerate or
+extreme dispersion, no signal, or extreme units (the module docstring lists
+them). Every fit is `y ~ s(x0) + s(x1)`.
+
+`failure_cause` classifies each rep. A rep fails when it hung (hit the safety
+net), crashed, raised, did not certify its optimum, predicted a non-finite point
+or interval, or reported a scale more than `SCALE_Z_MAX` = 10 standard errors
+from the truth. The standard error is that of the oracle Pearson estimate at the
+true mean, recomputed from the rep's seeded draw. The scale is not judged at
+`lowdisp`, where the basis's approximation error is as large as the noise, so a
+correct fit's scale carries it. A binomial draw with no events at all has a
+constant response, and a typed refusal of it is correct, not a failure. The
+triage table (causes by count, with an example rep for each) prints with:
+
+```bash
+python -m pygam_compare.fuzz_families RUN_DIR [RUN_DIR ...]
+```
+
+`test_fuzz_families_quick.py` runs the quick plan and requires zero failures;
+`test_fuzz_families_fixtures.py` pins the cells whose root causes were fixed.
 
 The `threads` and `oversubscribe` plans measure parallelism rather than compare
 libraries. A cell's `threads` sets every pool variable listed under **Threads**
@@ -91,7 +124,31 @@ thread-scaling table (speedup over one thread) and a process fan-out table
 The workflow `.github/workflows/pygam-compare.yml` runs `quick` weekly and
 `gaussian_small` nightly; any plan can be dispatched by name.
 
-Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.
+Overrides: `--reps`, `--timeout`, `--memcap-mb`, `--only-libs gamfit,pygam_gs`,
+`--designs d1,d2` (every n and family of just those designs, e.g. to re-run
+the designs a generator change touched) and `--shard I/K`, which runs every
+K-th design starting at design I, so K shards started side by side cover the
+plan between them. `--lib-path DIR` puts a pinned library build first on every
+worker's `PYTHONPATH` (workers never inherit the caller's), so a before/after
+comparison measures the build it names; every gamfit record carries `lib_file`.
+
+### Convergence fuzz over term structure
+
+The `fuzz_terms*` plans draw their formulas from `fuzz_terms.py`. A case number
+fixes the term structure: tensor products with two or three margins, `ti`,
+factor and numeric `by=` smooths (including empty and singleton levels), fixed
+factors with rare levels, random intercepts with 5 to 2000 levels, cyclic,
+2-D isotropic, shape-constrained and concurvity terms. The seed draws the data.
+To triage one or more run directories by failure cause, term kind, family and n:
+
+```bash
+python -m pygam_compare.fuzz_terms RUN_DIR [RUN_DIR ...]
+```
+
+A rep counts as a failure if it raised, hung, did not certify its optimum or
+predicted a non-finite value. For each cause the table names one example rep as
+`FAMILY N DESIGN SEED`, so `python bench/pygam_compare/worker.py gamfit FAMILY N
+DESIGN SEED` reruns it in isolation.
 
 To regenerate the docs page from committed baselines:
 
@@ -174,6 +231,9 @@ tail and the traceback of the failed phase.
 
 - `bench/pygam_compare/test_pygam_compare_smoke.py` runs the `smoke` plan end to
   end and pins the verdict rules. It runs in `python-contracts.yml` (bench step).
+- `bench/pygam_compare/test_fuzz_terms_quick.py` runs the `fuzz_terms_quick`
+  plan and requires every fit to be clean. It also checks that the quick cases
+  cover every term kind.
 - `.github/workflows/pygam-compare.yml` is optional. It runs on manual dispatch
   (with a `plan` input, default `quick`) and weekly, never per PR. It uploads
   `records.jsonl`, `meta.json` and `report.md` as an artifact and writes the

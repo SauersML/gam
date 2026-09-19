@@ -94,7 +94,7 @@ def test_matern_half_1d_forward_and_jacobian_on_data_drawn_centers_2469() -> Non
 
 def test_matern_half_1d_hessian_refuses_on_a_data_drawn_center_2469() -> None:
     spec, coords = _data_drawn_1d()
-    with pytest.raises(gamfit.errors.GamError, match="cusp"):
+    with pytest.raises(gamfit.errors.GamfitError, match="cusp"):
         spec.hessian(*coords)
 
 
@@ -110,7 +110,7 @@ def test_matern_half_1d_hessian_is_finite_off_the_data_drawn_centers_2469() -> N
 
 def test_matern_half_2d_forward_refuses_collocation_on_its_own_centers_2469() -> None:
     spec, coords = _data_drawn_2d(0.5, offset=0.05)
-    with pytest.raises(gamfit.errors.GamError, match="singular Laplacian at center collisions"):
+    with pytest.raises(gamfit.errors.GamfitError, match="singular Laplacian at center collisions"):
         spec.evaluate(*coords)
 
 

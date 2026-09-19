@@ -902,6 +902,7 @@ pub fn survival_fit_from_parts(
             // seam, so it never withholds a covariance it could have published.
             covariance_declined: None,
             jeffreys_arming_evidence: None,
+            improper_penalty_null_posterior: None,
             // Assembled outside the custom-family outer search, so it records no
             // point `warm_start_from` could resume.
             outer_warm_start: None,

@@ -421,6 +421,64 @@ fn radial_enrichment(covariates: ArrayView2<'_, f64>, centers: usize) -> Option<
     (dense.ncols() > 0 && dense.iter().all(|value| value.is_finite())).then_some(dense)
 }
 
+/// The continuous covariates a term's alternative is drawn over, and the
+/// grouping column that gates it.
+///
+/// A factor smooth fits one curve per level of its grouping factor, so the
+/// alternative that asks "can any group's curve carry structure this basis
+/// cannot represent" is the radial enrichment in the continuous covariates,
+/// gated by each level's indicator. A pooled enrichment would only test the
+/// groups' shared curve and miss group curves that cancel on average.
+fn enrichment_frame(basis: &gam_terms::smooth::SmoothBasisSpec) -> (Vec<usize>, Option<usize>) {
+    match basis {
+        gam_terms::smooth::SmoothBasisSpec::FactorSmooth { spec } => {
+            (spec.continuous_cols.clone(), Some(spec.group_col))
+        }
+        other => (other.structural_feature_cols(), None),
+    }
+}
+
+/// The distinct levels of `group_col` on the selected rows, and each row's
+/// level index.
+fn group_levels(
+    data: ArrayView2<'_, f64>,
+    group_col: usize,
+    rows: &[usize],
+) -> Option<(usize, Vec<usize>)> {
+    if group_col >= data.ncols() {
+        return None;
+    }
+    let codes: Vec<u64> = rows
+        .iter()
+        .map(|&row| data[[row, group_col]].to_bits())
+        .collect();
+    let mut levels = codes.clone();
+    levels.sort_unstable();
+    levels.dedup();
+    let index = codes
+        .iter()
+        .map(|code| levels.binary_search(code).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some((levels.len(), index))
+}
+
+/// `enrichment` gated by each row's group: level `j`'s rows carry the shared
+/// radial columns in block `j` and zeros elsewhere.
+fn group_gated_enrichment(
+    enrichment: &Array2<f64>,
+    level_count: usize,
+    level_of_row: &[usize],
+) -> Array2<f64> {
+    let width = enrichment.ncols();
+    let mut out = Array2::<f64>::zeros((enrichment.nrows(), width * level_count));
+    for (row, &level) in level_of_row.iter().enumerate() {
+        out.row_mut(row)
+            .slice_mut(s![level * width..(level + 1) * width])
+            .assign(&enrichment.row(row));
+    }
+    out
+}
+
 /// The IRLS row state the score test needs, read off the fit's retained P-IRLS
 /// result.
 struct ScoreRowState {
@@ -676,7 +734,7 @@ pub fn basis_adequacy_report(
         .map(|idx| {
             let realized = &design.smooth.terms[idx];
             let realized_width = realized.coeff_range.len();
-            let feature_cols = spec.smooth_terms[idx].basis.structural_feature_cols();
+            let (feature_cols, group_col) = enrichment_frame(&spec.smooth_terms[idx].basis);
             if feature_cols.is_empty() {
                 return undetermined(idx, BasisAdequacyProvenance::NoContinuousCovariates);
             }
@@ -684,14 +742,30 @@ pub fn basis_adequacy_report(
             else {
                 return undetermined(idx, BasisAdequacyProvenance::DegenerateCovariates);
             };
-            let Some(centers) = enrichment_width(realized_width, report_rows.len()) else {
+            let groups = match group_col {
+                Some(col) => match group_levels(data, col, &report_rows) {
+                    Some(groups) => Some(groups),
+                    None => return undetermined(idx, BasisAdequacyProvenance::DegenerateCovariates),
+                },
+                None => None,
+            };
+            let level_count = groups.as_ref().map_or(1, |(count, _)| *count);
+            // The budget bounds the whole alternative, so a gated enrichment
+            // shares it between the groups.
+            let Some(centers) = enrichment_width(realized_width, report_rows.len())
+                .map(|width| width / level_count)
+            else {
                 return undetermined(
                     idx,
                     BasisAdequacyProvenance::EnrichmentBudgetBelowRealizedWidth,
                 );
             };
-            let Some(enrichment) = radial_enrichment(covariates.view(), centers) else {
+            let Some(radial) = radial_enrichment(covariates.view(), centers) else {
                 return undetermined(idx, BasisAdequacyProvenance::EnrichmentBuildFailed);
+            };
+            let enrichment = match &groups {
+                Some((count, level_of_row)) => group_gated_enrichment(&radial, *count, level_of_row),
+                None => radial,
             };
             let outcome = match &reference {
                 ScoreReference::Conditional(null_fit) => {
@@ -785,9 +859,9 @@ pub const BASIS_ADEQUACY_NOTE_LEVEL: f64 = 1.0e-3;
 /// The rows whose lack-of-fit test rejects basis adequacy at the family-wise
 /// [`BASIS_ADEQUACY_NOTE_LEVEL`], Bonferroni-corrected over the tested terms.
 ///
-/// Both consumers of the verdict read it here: the fit-time note, and the
-/// adaptive spatial-resolution loop that grows the basis the note tells a user
-/// to grow. One reading keeps the advisory and the action from disagreeing.
+/// This is the advisory reading only. The adaptive resolution loop does not
+/// act on a significance level: it screens with the statistic's own
+/// deviance-per-parameter reading and lets the refit's REML evidence decide.
 pub(crate) fn basis_adequacy_rows_lacking_fit(
     rows: &[BasisAdequacyRow],
 ) -> impl Iterator<Item = &BasisAdequacyRow> {
@@ -837,4 +911,37 @@ pub(crate) fn basis_adequacy_notes(rows: &[BasisAdequacyRow]) -> Vec<String> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod group_gated_enrichment_tests {
+    use super::{group_gated_enrichment, group_levels};
+    use ndarray::array;
+
+    #[test]
+    fn each_level_carries_the_shared_columns_in_its_own_block() {
+        // Column 1 is the grouping factor; rows 0 and 2 share a level.
+        let data = array![[0.1, 7.0], [0.2, 3.0], [0.3, 7.0], [0.4, 5.0]];
+        let (level_count, level_of_row) = group_levels(data.view(), 1, &[0, 1, 2, 3]).unwrap();
+        assert_eq!(level_count, 3);
+        assert_eq!(level_of_row, vec![2, 0, 2, 1]);
+
+        let radial = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        let gated = group_gated_enrichment(&radial, level_count, &level_of_row);
+        assert_eq!(
+            gated,
+            array![
+                [0.0, 0.0, 0.0, 0.0, 1.0, 2.0],
+                [3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 5.0, 6.0],
+                [0.0, 0.0, 7.0, 8.0, 0.0, 0.0],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_grouping_column_outside_the_data_has_no_levels() {
+        let data = array![[0.1], [0.2]];
+        assert!(group_levels(data.view(), 1, &[0, 1]).is_none());
+    }
 }

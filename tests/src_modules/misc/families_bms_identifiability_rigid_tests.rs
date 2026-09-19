@@ -121,6 +121,7 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
         cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
@@ -1068,7 +1069,7 @@ fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
         .build_exact_eval_cache(&block_states)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact eval cache", e));
     let row_ctx = family
-        .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
+        .build_row_exact_context(0, &block_states, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "row context", e));
     let bad_dir = array![1.0];
     let good_dir = array![0.0, 1.0];
@@ -1115,24 +1116,25 @@ fn base_spec(
     }
 }
 
+/// gam#2978: the probit marginal link map is never clamped. Its index is the
+/// marginal η itself with unit slope, and the probability derivative is the
+/// exact density — nonzero at the tail indices the refusing seeds stalled at
+/// (η = −7.66, −12.31, 32.84), where the retired clamp zeroed every channel and
+/// left the outer search on a false stationary point.
 #[test]
-fn bernoulli_marginal_link_map_zeroes_derivatives_on_clamped_tails() {
+fn bernoulli_marginal_link_map_is_exact_on_every_tail_2978() {
     let link = bernoulli_marginal_slope_probit_link();
-    let lower = bernoulli_marginal_link_map(&link, -8.0)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "lower tail map", e));
-    let upper = bernoulli_marginal_link_map(&link, 8.0)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "upper tail map", e));
-    let lower_q = standard_normal_quantile(BERNOULLI_LINK_PROBABILITY_EPS).unwrap();
-    let upper_q = standard_normal_quantile(1.0 - BERNOULLI_LINK_PROBABILITY_EPS).unwrap();
-
-    assert_eq!(lower.mu, BERNOULLI_LINK_PROBABILITY_EPS);
-    assert_eq!(upper.mu, 1.0 - BERNOULLI_LINK_PROBABILITY_EPS);
-    assert!((lower.q - lower_q).abs() < 1e-12);
-    assert!((upper.q - upper_q).abs() < 1e-12);
-    assert_eq!([lower.mu1, lower.mu2, lower.mu3, lower.mu4], [0.0; 4]);
-    assert_eq!([upper.mu1, upper.mu2, upper.mu3, upper.mu4], [0.0; 4]);
-    assert_eq!([lower.q1, lower.q2, lower.q3, lower.q4], [0.0; 4]);
-    assert_eq!([upper.q1, upper.q2, upper.q3, upper.q4], [0.0; 4]);
+    for &eta in &[-32.84, -12.31, -8.0, -7.66, 0.0, 7.66, 8.0, 12.31, 32.84] {
+        let map = bernoulli_marginal_link_map(&link, eta)
+            .unwrap_or_else(|e| panic!("link map at eta={eta}: {e}"));
+        assert_eq!(map.q, eta, "q = η exactly at eta={eta}");
+        assert_eq!([map.q1, map.q2, map.q3, map.q4], [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(map.mu, normal_cdf(eta), "μ = Φ(η) at eta={eta}");
+        assert_eq!(map.mu1, normal_pdf(eta), "μ′ = φ(η) at eta={eta}");
+        assert!(map.mu1 > 0.0, "the marginal density is positive at eta={eta}");
+    }
+    assert!(bernoulli_marginal_link_map(&link, f64::INFINITY).is_err());
+    assert!(bernoulli_marginal_link_map(&link, f64::NAN).is_err());
 }
 
 #[test]
@@ -2381,12 +2383,8 @@ fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
     let err = validate_spec(design.to_dense().view(), &spec)
         .expect_err("non-probit marginal-slope link should be rejected");
     assert!(err.contains("requires link(type=probit)"));
-    let err = bernoulli_marginal_slope_eta_from_probability(
-        &InverseLink::Standard(StandardLink::Logit),
-        0.5,
-        "test logit inverse",
-    )
-    .expect_err("non-probit marginal-slope inverse should be rejected");
+    let err = bernoulli_marginal_link_map(&InverseLink::Standard(StandardLink::Logit), 0.5)
+        .expect_err("non-probit marginal-slope link map should be rejected");
     assert!(err.contains("requires link(type=probit)"));
 }
 
@@ -2477,7 +2475,7 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         .build_exact_eval_cache(&block_states)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "eval cache", e));
     let row_ctx = family
-        .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
+        .build_row_exact_context(0, &block_states, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "row context", e));
     let (nll, grad, hess) = family
         .compute_row_primary_gradient_hessian(0, &block_states, &primary, &row_ctx)
@@ -3768,7 +3766,7 @@ fn rigid_fast_path_matches_loglik_finite_differences() {
         .build_exact_eval_cache(&block_states)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "rigid exact eval cache", e));
     let row_ctx = family
-        .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
+        .build_row_exact_context(0, &block_states, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "rigid row context", e));
     let (_, primary_grad, primary_hess) = family
         .compute_row_primary_gradient_hessian(0, &block_states, &cache.primary, &row_ctx)
@@ -3864,7 +3862,7 @@ fn w_only_gradient_hessian_finite_and_symmetric() {
     // regimes (negative tail, near zero, positive tail).
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
         let (_, grad, hess) = family
@@ -3957,7 +3955,7 @@ fn h_only_gradient_hessian_finite_and_symmetric() {
 
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
         let (_, grad, hess) = family
@@ -4330,7 +4328,7 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut max_abs_fourth = 0.0_f64;
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4437,7 +4435,7 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut max_abs_fourth = 0.0_f64;
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4510,7 +4508,7 @@ fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut max_abs_fourth = 0.0_f64;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4561,7 +4559,7 @@ fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
     let zero = Array1::<f64>::zeros(cache.primary.total);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
@@ -4590,7 +4588,7 @@ fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
     let zero = Array1::<f64>::zeros(cache.primary.total);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
@@ -4619,7 +4617,7 @@ fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
     let zero = Array1::<f64>::zeros(cache.primary.total);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
@@ -4761,7 +4759,7 @@ fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
             .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
@@ -4814,7 +4812,7 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
     let neg_dir_u = dir_u.mapv(|value| -value);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4870,7 +4868,7 @@ fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
             .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
@@ -4916,7 +4914,7 @@ fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
             .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
@@ -4955,7 +4953,7 @@ fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir)
@@ -5004,7 +5002,7 @@ fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir)
@@ -5276,7 +5274,7 @@ fn dual_flex_row_primary_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -5327,7 +5325,7 @@ fn h_only_row_primary_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -5378,7 +5376,7 @@ fn w_only_row_primary_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -6656,10 +6654,8 @@ fn empirical_intercept_calibrates_marginal_probability() {
     let target_mu = normal_cdf(target_q);
     let slope = 0.8;
     let scale = 0.9;
-    let intercept = empirical_intercept_from_marginal(
-        target_mu, target_q, slope, scale, &nodes, &weights, None,
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept", e));
+    let intercept = empirical_intercept(target_q, slope, scale, &nodes, &weights)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept", e));
     let calibrated = nodes
         .iter()
         .zip(weights.iter())
@@ -6680,16 +6676,8 @@ fn skewed_rigid_empirical_grid_calibrates_marginal_probability() {
     let slope = 1.35;
     let scale = 0.82;
 
-    let intercept = empirical_intercept_from_marginal(
-        target_mu,
-        target_q,
-        slope,
-        scale,
-        &grid.nodes,
-        &grid.weights,
-        None,
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept", e));
+    let intercept = empirical_intercept(target_q, slope, scale, &grid.nodes, &grid.weights)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept", e));
     let calibrated = grid
         .nodes
         .iter()
@@ -6903,10 +6891,8 @@ fn gaussian_rigid_intercept_miscalibrates_skewed_empirical_law() {
         "skewed empirical law should not be calibrated by Gaussian identity"
     );
 
-    let empirical_intercept = empirical_intercept_from_marginal(
-        target_mu, target_q, slope, scale, &nodes, &weights, None,
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept", e));
+    let empirical_intercept = empirical_intercept(target_q, slope, scale, &nodes, &weights)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept", e));
     let empirical_mu = nodes
         .iter()
         .zip(weights.iter())
@@ -6934,14 +6920,12 @@ fn empirical_intercept_recovers_from_deep_tail_warm_start() {
     let scale = 0.9;
     // Warm start at a = -100: every η = -100 + 0.72·z lies in the deep
     // left tail, where linear-space φ and Φ both round to 0.0 in IEEE-754.
-    let stale_warm_start = Some(-100.0_f64);
-    let intercept = empirical_intercept_from_marginal(
-        target_mu,
+    let stale_warm_start = -100.0_f64;
+    let grid = crate::latent_anchor::AnchorGridOwned::new(nodes.clone(), weights.clone());
+    let intercept = crate::latent_anchor::solve_anchor_from(
         target_q,
-        slope,
-        scale,
-        &nodes,
-        &weights,
+        scale * slope,
+        grid.view(),
         stale_warm_start,
     )
     .unwrap_or_else(|e| {
@@ -6974,14 +6958,12 @@ fn empirical_intercept_recovers_from_far_right_warm_start() {
     let target_mu = normal_cdf(target_q);
     let slope = 0.8;
     let scale = 0.9;
-    let stale_warm_start = Some(50.0_f64);
-    let intercept = empirical_intercept_from_marginal(
-        target_mu,
+    let stale_warm_start = 50.0_f64;
+    let grid = crate::latent_anchor::AnchorGridOwned::new(nodes.clone(), weights.clone());
+    let intercept = crate::latent_anchor::solve_anchor_from(
         target_q,
-        slope,
-        scale,
-        &nodes,
-        &weights,
+        scale * slope,
+        grid.view(),
         stale_warm_start,
     )
     .unwrap_or_else(|e| {
