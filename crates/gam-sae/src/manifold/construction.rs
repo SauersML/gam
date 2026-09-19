@@ -703,7 +703,7 @@ pub(crate) fn realised_rank_charge_dof(
     //     earn), and the fit minted for the user carries its honest weak
     //     evidence instead of no model at all.
     if stratum.mp_reconstruction_rank() == 0 && rank == 1 {
-        log::debug!(
+        log::trace!(
             "realised_rank_charge_dof: below-reconstruction-rank-edge atom promoted to rank 1 — \
              top sv²/n_eff={:.6e} vs MP edge={:.6e} \
              (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})",
@@ -711,7 +711,7 @@ pub(crate) fn realised_rank_charge_dof(
             stratum.mp_reconstruction_rank_edge()
         );
     } else if rank == 0 && !stratum.reconstruction_energies().is_empty() {
-        log::debug!(
+        log::trace!(
             "realised_rank_charge_dof: exactly zero reconstruction spectrum \
              (categorical vanished-atom certificate belongs upstream) — \
              top sv²/n_eff={:.6e} (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})",

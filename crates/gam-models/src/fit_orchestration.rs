@@ -130,6 +130,7 @@ use gam_terms::inference::formula_dsl::{
     validate_marginal_slope_z_column_exclusion,
 };
 
+pub use gam_terms::{FitNoteSink, FitNotes};
 use gam_terms::term_builder::{
     SECONDARY_CENTER_CAP_OPTION, build_termspec, column_map_with_alias, enable_scale_dimensions,
     has_explicit_countwith_basis_alias, resolve_role_col, resolve_smooth_type_name,
@@ -164,9 +165,13 @@ mod binomial_separation_convergence_1762_tests;
 mod perfect_binomial_separation_2273_tests;
 
 #[cfg(test)]
+mod binomial_separation_jeffreys_tests;
 
 #[cfg(test)]
 mod smooth_significance_ref_df_floor_1766_tests;
+
+#[cfg(test)]
+mod smooth_lr_nested_null_tests;
 
 #[cfg(test)]
 mod gaussian_reml_stall_edf_collapse_1788_tests;

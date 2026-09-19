@@ -603,7 +603,7 @@ pub enum EstimationError {
         "Pre-fit linear separation detected in the realized binomial inverse-link design: \
         {num_unpenalized_columns} directions no roughness penalty bounds (parametric columns, and a smooth's penalty null space, \
         unpenalized or penalized only by a ridge) admit a separating direction \
-        with minimum signed margin {min_signed_margin:.6e} (columns {column_indices:?}). \
+        with minimum signed margin {min_signed_margin:.6e}, zero for quasi-complete separation (columns {column_indices:?}). \
         The likelihood has no finite maximizer along that direction; enable Firth/Jeffreys bias reduction or \
         remove/reparameterize the separating columns."
     )]
@@ -611,6 +611,21 @@ pub enum EstimationError {
         min_signed_margin: f64,
         num_unpenalized_columns: usize,
         column_indices: Vec<usize>,
+    },
+
+    #[error(
+        "Not enough observations to identify the model: {n_observations} positive-weight rows but \
+        {unpenalized_dim} unpenalized coefficient directions (intercept, parametric terms and the \
+        penalty null spaces, out of {total_columns} columns). REML/LAML estimate the smoothing \
+        parameters from the n − {unpenalized_dim} residual contrasts the unpenalized directions \
+        cannot absorb, so n must exceed {unpenalized_dim}; the total column count need not be below n. \
+        Add observations, drop parametric terms, or penalize the unpenalized directions \
+        (double-penalty smooths contribute none)."
+    )]
+    PrefitUnpenalizedSpaceExceedsObservations {
+        n_observations: usize,
+        unpenalized_dim: usize,
+        total_columns: usize,
     },
 
     #[error(
@@ -1179,6 +1194,7 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
@@ -1368,6 +1384,7 @@ impl EstimationError {
             | Self::PerfectSeparationDetected { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
@@ -1432,6 +1449,9 @@ impl EstimationError {
             }
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
+            }
+            Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
+                "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
             }
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"

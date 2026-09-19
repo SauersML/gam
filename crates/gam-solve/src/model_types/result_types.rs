@@ -80,7 +80,7 @@ pub fn dispersion_from_likelihood(
                 known(phi.value())
             }
         }
-        Scale::Tweedie { phi, estimated } => {
+        Scale::Tweedie { phi, estimated } | Scale::Dispersion { phi, estimated } => {
             if estimated {
                 estimated_dispersion(phi.value())
             } else {
@@ -2641,6 +2641,16 @@ pub struct FitArtifacts {
     /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
     #[serde(default)]
     pub coefficient_mode_selection: CoefficientModeSelection,
+    /// The variance-component score test of every random-effect term, computed
+    /// once on the training fit's own IRLS row state
+    /// (`gam_terms::inference::random_effect_test`). The summary's random-effect
+    /// rows read their p-value (or its typed absence) from here, so the CLI,
+    /// Rust and persisted-model surfaces report the same number. Empty on a
+    /// model with no random-effect term and on a payload written before the
+    /// test existed; a summary treats a term missing from it as not recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub random_effect_tests:
+        Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
 }
 
 /// A certified outer point (gam#3002): `theta`, the outer coordinates in the order
@@ -2794,6 +2804,7 @@ impl std::fmt::Debug for FitArtifacts {
                     .as_ref()
                     .map(|seed| (seed.theta.len(), seed.beta.len())),
             )
+            .field("random_effect_tests", &self.random_effect_tests)
             .finish()
     }
 }
@@ -3411,6 +3422,13 @@ pub struct FitGeometry {
     /// statement that the terminal solver geometry has no single diagonal
     /// row representation; it is never represented by empty or zero-filled
     /// placeholder vectors.
+    ///
+    /// It is in-memory fit evidence only and is never serialized: both vectors
+    /// have one entry per training row, and a saved model carries no per-row
+    /// training data (speed F6). A loaded fit therefore reads `None`, and a
+    /// payload written at payload version 28 or earlier, which serialized it, has its
+    /// `working` key read past.
+    #[serde(skip)]
     pub working: Option<WorkingGeometry>,
 }
 
@@ -4504,7 +4522,9 @@ pub struct UnifiedFitResult {
     /// Solver artifacts (e.g. cached PIRLS result for ALO).
     #[serde(default)]
     pub artifacts: FitArtifacts,
-    /// Inner cycle count (blockwise path).
+    /// Inner iterations of the final certified inner solve at the reported
+    /// smoothing parameters: P-IRLS iterations on the standard path, blockwise
+    /// cycles on the custom-family path.
     #[serde(default)]
     pub inner_cycles: usize,
     /// Number of outer REML cost-only evaluations the fit executed (each
@@ -4535,7 +4555,8 @@ fn validate_likelihood_scale_estimation(
         LikelihoodScaleMetadata::FixedDispersion { phi }
         | LikelihoodScaleMetadata::EstimatedBetaPhi { phi }
         | LikelihoodScaleMetadata::FixedBetaPhi { phi }
-        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi } => {
+        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi }
+        | LikelihoodScaleMetadata::EstimatedDispersion { phi } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
             if phi > 0.0 {
                 Ok(())
@@ -6158,7 +6179,8 @@ impl UnifiedFitResult {
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => Ok(FittedLinkState::Standard(None)),
+            | (ResponseFamily::Gamma, _)
+            | (ResponseFamily::InverseGaussian, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::Beta { .. }, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::RoystonParmar, _) => Ok(FittedLinkState::Standard(None)),
         }

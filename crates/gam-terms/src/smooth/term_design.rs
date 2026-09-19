@@ -1639,8 +1639,14 @@ fn apply_global_smooth_identifiability(
         // block. So it bypasses both the owner analysis and the frozen-skip
         // gate below.
         let replay_z = frozen_global_orthogonality(termspec);
+        // A shape cone (coordinate bounds or exact inequality rows) is written
+        // in the term's own coefficient chart; residualizing that chart against
+        // other blocks would move the constant and linear directions the cone
+        // is anchored on, so shaped terms keep their local chart.
         let skip_global_transform = replay_z.is_none()
-            && (smooth_has_frozen_identifiability(termspec) || term.lower_bounds_local.is_some());
+            && (smooth_has_frozen_identifiability(termspec)
+                || term.lower_bounds_local.is_some()
+                || term.linear_constraints_local.is_some());
         // A marginally-centered tensor interaction (`ti(...)`, MarginalSumToZero)
         // has ALREADY removed each axis's main effect analytically, in
         // coefficient space, via its per-margin sum-to-zero reparameterization
@@ -2046,7 +2052,7 @@ fn apply_global_smooth_identifiability(
         terms_out.push(SmoothTerm {
             name: smooth.terms[idx].name.clone(),
             coeff_range: col_start..col_end,
-            shape: smooth.terms[idx].shape,
+            shape: smooth.terms[idx].shape.clone(),
             active_penalties: local_active_penalties[idx].clone(),
             dropped_penalties: local_dropped_penalties[idx].clone(),
             metadata: local_metadata[idx]
@@ -2643,7 +2649,7 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                 frozen_parametric_residualization: None,
                 name: termspec.name.clone(),
                 basis: (**inner).clone(),
-                shape: termspec.shape,
+                shape: termspec.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -2652,7 +2658,7 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                 frozen_parametric_residualization: None,
                 name: termspec.name.clone(),
                 basis: (**smooth).clone(),
-                shape: termspec.shape,
+                shape: termspec.shape.clone(),
                 joint_null_rotation: None,
             })
         }

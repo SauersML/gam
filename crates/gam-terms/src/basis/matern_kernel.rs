@@ -161,7 +161,7 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
             boundary: OneDimensionalBoundary::Open,
             radial_reparam: None,
         };
-        log::info!(
+        log::debug!(
             "thin-plate basis auto-promoted to hybrid Duchon ({:?}, s={}) in d={}: \
              canonical TPS would need {} centers but got {} — using Duchon's \
              Riesz-fractional generalization with finite kernel at r=0 \
@@ -200,8 +200,8 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols, workspace.policy());
     if use_lazy {
-        // log::info! — deliberate memory-saving choice, not an anomaly.
-        log::info!(
+        // log::debug! — deliberate memory-saving choice, not an anomaly.
+        log::debug!(
             "thin-plate basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             base_cols,
@@ -3538,7 +3538,7 @@ pub(crate) fn matern_rank_reduce_centers(
     }
     let mut keep = rrqr.column_permutation[..rrqr.rank].to_vec();
     keep.sort_unstable();
-    log::info!(
+    log::debug!(
         "Matérn centers reduced from {k} to {} (data-supported numerical rank): \
          requested centers exceed the kernel's rank at length_scale={length_scale}, so \
          {} collinear basis column(s) were dropped to keep the basis full-rank (#755).",

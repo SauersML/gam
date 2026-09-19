@@ -1,10 +1,15 @@
 # Diagnostics, summaries, plots, reports
 
-A fitted `Model` exposes five inspection methods:
+A fitted `Model` exposes six inspection methods:
 
 | Method | Returns | Contents |
 | --- | --- | --- |
 | `summary()` | `Summary` | Formula, family/link name, model class, deviance, REML/LAML score (in the `reml_score` field), per-coefficient table, smoothing parameters (`lambdas`), group metadata, and deployment extensions. |
+| `basis_check(data)` | `list[dict]` | Per-smooth basis-adequacy report: is each smooth's basis rich enough for the function it was asked to represent? |
+| `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics for point-payload models (the point column is the one the model's class publishes: `posterior_mean`, or `mean` for the transformation-normal and Bernoulli marginal-slope classes). |
+| `check(data)` | `SchemaCheck` | Schema validation result with structured issues. |
+| `plot(data, x=, kind=)` | `matplotlib.axes.Axes` | Prediction / residual / observed-vs-predicted plot. |
+| `report(path=None)` | `str` | Self-contained HTML report (string, or written path). |
 
 `reml_score` and `raw_reml_score` are `None` when the fit has **no**
 criterion, which is a different statement from "not recorded". A Gaussian
@@ -16,11 +21,6 @@ large. `Summary.reml_score_unavailable` then carries the explanation, and
 those ranking surfaces raise it instead of ranking a stand-in value. Compare
 such a model on predictive accuracy, or refit on data whose response is not
 an exact function of the design.
-| `basis_check(data)` | `list[dict]` | Per-smooth basis-adequacy report: is each smooth's basis rich enough for the function it was asked to represent? |
-| `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics for point-payload models (the point column is the one the model's class publishes: `posterior_mean`, or `mean` for the transformation-normal and Bernoulli marginal-slope classes). |
-| `check(data)` | `SchemaCheck` | Schema validation result with structured issues. |
-| `plot(data, x=, kind=)` | `matplotlib.axes.Axes` | Prediction / residual / observed-vs-predicted plot. |
-| `report(path=None)` | `str` | Self-contained HTML report (string, or written path). |
 
 `gamfit.validate_formula(...)` validates a formula and data against the
 parser and schema without fitting.
@@ -45,7 +45,8 @@ s["family_name"]
 s["model_class"]
 s["deviance"]
 s["reml_score"]
-s["iterations"]
+s["scale"]                     # dispersion phi-hat (Gaussian sigma^2)
+s["convergence"]               # certificate incl. outer/inner iteration counts
 s["coefficients"]              # list of dicts (per-term records)
 s.coefficients                 # same list via property
 s.to_dict()                    # full payload as a dict
@@ -57,6 +58,30 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 `model.smoothing_parameters()` returns a `{penalty_index: lambda}` dict of
 the fitted smoothing/precision parameters by penalty index (via a dedicated
 FFI call), the same values surfaced under `summary()["lambdas"]`.
+
+### Fit notes, warnings, and solver logs
+
+A fit records two kinds of notes, both listed in `model.notes` and
+`summary().notes` (and printed under `Notes:` in the text summary):
+
+- **advisories** — the fitted model differs from the literal request (a `k`
+  capped to the covariate's distinct values, a basis too small for the
+  residuals). These are also raised as `gamfit.errors.GamInferenceWarning`, attributed
+  to your calling line; the CLI prints them to stderr.
+- **informational notes** — a default the engine chose for you, such as the
+  internal-knot count of a default `s(x)`. These are never warned.
+
+A default fit writes nothing to stdout or stderr. The engine's solver trace
+(`[OUTER …]`, `[PIRLS …]`, …) goes to the `gamfit` Python logger at `DEBUG`
+(finer records below that), which is silent unless you opt in:
+
+```python
+import logging
+logging.basicConfig()
+logging.getLogger("gamfit").setLevel(logging.DEBUG)
+```
+
+The CLI equivalent is `gam -v …` (`-vv` for the finer records).
 
 ### Shape-constrained smooths have no significance p-value
 
@@ -315,8 +340,8 @@ These are read-only properties.
 
 | Symptom | Try this |
 | --- | --- |
-| `diag.metrics["r_squared"]` low on training | The model is under-flexed. Raise `k` on smooths or add interactions via `te(...)` / multi-d smooths. |
-| `rmse` low on training, high on test | Over-flexed. Reduce `k` or rely on the default complexity. |
+| `diag.metrics["r_squared"]` low on training | The basis may be too small for the function. `k` is an upper bound on each smooth's flexibility, and REML chooses how much of it to use. Run `basis_check(data)` and raise `k` where it reports the basis is inadequate, or add interactions via `te(...)` / multi-d smooths. See [Choosing k](formulas.md#choosing-k). |
+| `rmse` low on training, high on test | Lowering `k` is not the fix: REML already penalizes wiggliness the data do not support. Check for leakage between training and test rows, for a shift between them, and for terms that should not be in the model. |
 | `diagnose()` raises about the response column | Pass `y="column_name"` explicitly. |
 | `check()` reports `missing_column` | The prediction data is missing a required feature. |
 | `predict` raises `SchemaMismatchError` | Run `check()` first to identify the offending column. |

@@ -233,6 +233,15 @@ pub enum BSplineKnotSpec {
     Automatic {
         num_internal_knots: Option<usize>,
         placement: BSplineKnotPlacement,
+        /// `true` when nobody chose `num_internal_knots`: it is the formula
+        /// default's starting resolution, which the standard formula workflow
+        /// refines from the converged fit's own adequacy evidence (the same
+        /// loop that resolves `CenterStrategy::Auto` spatial smooths). An
+        /// explicit `k=`/`knots=` count is `false` and is honoured verbatim.
+        /// Freezing replaces the whole variant with `Provided`, so a fitted
+        /// model never re-reads it.
+        #[serde(default)]
+        adaptive: bool,
     },
     Provided(Array1<f64>),
     /// Natural cubic regression spline (`bs="cr"`/`"cs"`) knot set (#1074).

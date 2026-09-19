@@ -8,4 +8,5 @@ mod issue_1017_resident_frame;
 mod penalty_logdet_fixed_geometry_2612;
 mod penalty_pseudoinverse_range_classification_2730;
 mod probe_2714_log_survival_accuracy;
+mod random_effect_sparse_matches_dense;
 mod shared_dispersion_deviance_roundoff_2730_tests;

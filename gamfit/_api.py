@@ -183,7 +183,7 @@ def cross_fit_shared_precision_groups(
     model_payloads: list[dict[str, Any]] = []
     for key, model in model_items:
         try:
-            state_json = rust.coefficient_state_json(model._model_bytes)
+            state_json = rust.coefficient_state_json(model._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
         model_payloads.append({"key": key, "state_json": state_json})
@@ -812,7 +812,7 @@ def fit(
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
-        ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
+        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
         ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
         ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
         estimated by LAML jointly with the smoothing parameters; the fitted
@@ -839,6 +839,7 @@ def fit(
     expectile_tau:
         Optional expectile level in the open interval ``(0, 1)`` for
         ``family="expectile"``, or a strictly increasing sequence of levels.
+        Passing it with any other family raises.
         A sequence is fitted jointly as one location-scale model whose level
         curves ``mu(x) + c_tau * E[sigma(x)]`` never cross; ``predict`` then
         returns an ``(n, K)`` array with one column per level. This is the
@@ -993,15 +994,20 @@ def fit(
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
         ``"s(x)"`` or ``"s(x, k=12)"``; whitespace differences are ignored).
-        Values are one of ``"monotone_increasing"``,
-        ``"monotone_decreasing"``, ``"convex"``, ``"concave"``, or
-        ``"none"`` / ``None`` for the default unconstrained fit. The mapping
-        is rewritten into the formula option ``s(x, shape=...)``. The
-        constraint is exact on the B-spline control polygon (``β = C·δ``
-        with ``δ ≥ 0``), so it holds everywhere on the knot range, and the
-        term stays centred like an unconstrained smooth. Only open 1-D
-        B-spline ``s(x)`` smooths accept it; see ``docs/formulas.md``
-        (Shape-constrained smooths).
+        Values take the same forms as ``shape=`` in the formula: one of
+        ``"monotone_increasing"``, ``"monotone_decreasing"``, ``"convex"``,
+        ``"concave"``, or ``"none"`` / ``None`` for the default
+        unconstrained fit; a list of atoms that must all hold
+        (``["monotone_increasing", "concave"]``); or, for a ``te()`` term,
+        one entry per margin (``["monotone_increasing", None]``). The
+        mapping is rewritten into the formula option ``shape=...``. The
+        constraint is exact on the B-spline control polygon (``β = C·γ``
+        with ``γ ≥ 0`` for one shape, inequality rows ``A·β ≥ 0`` for a list
+        or a tensor margin), so it holds everywhere on the knot range, and
+        the term stays centred like an unconstrained smooth. Supported on
+        open 1-D B-spline ``s(x)`` smooths, ``te()`` tensor products of
+        them, and either of those with ``by=``; see ``docs/formulas.md``
+        (Shape-constrained smooths) and ``Smooth.shape_constraint``.
 
         Example::
 
@@ -1009,7 +1015,7 @@ def fit(
                        constraints={"s(x)": "monotone_increasing"})
     config:
         Request fields that have no dedicated keyword, such as
-        ``group_metadata`` or ``precompute_conformal``. A key that
+        ``group_metadata``. A key that
         duplicates a dedicated keyword is refused.
     latents:
         Mapping from formula symbol to :class:`gamfit.smooth.LatentCoord`. This is
@@ -1081,9 +1087,12 @@ def fit(
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
         # Python only marshals the mapping across the FFI.
+        from .smooth import shape_constraint_text
+
         try:
             formula = rust_module().apply_shape_constraints_to_formula(
-                formula, [(str(k), str(v)) for k, v in constraints.items()]
+                formula,
+                [(str(k), shape_constraint_text(v)) for k, v in constraints.items()],
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -1208,7 +1217,7 @@ def fit(
     # Surface any materialization advisories (e.g. an mgcv-style "k reduced to
     # the data support" note when a cr/cs/sz basis is capped) as warnings, so a
     # basis the fit silently adjusted is never silent to the caller (#1543).
-    emit_inference_warnings(model.notes)
+    emit_inference_warnings(model._fit_notes()[0])
     return model
 
 
@@ -1325,7 +1334,7 @@ def fit_array(
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
-    emit_inference_warnings(model.notes)  # see fit(): never silently adjust a basis (#1543)
+    emit_inference_warnings(model._fit_notes()[0])  # see fit(): never silently adjust a basis (#1543)
     return model
 
 
@@ -1430,13 +1439,7 @@ def loads(model_bytes: bytes) -> LoadedModel:
             _model_bytes=model_bytes,
             _training_table_kind=str(metadata["training_table_kind"]),
         )
-    try:
-        training_table_kind = rust_module().required_saved_model_payload_string(
-            model_bytes, "training_table_kind"
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes, _training_table_kind=training_table_kind)
+    return Model(_model_bytes=model_bytes)
 
 
 def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeometryModel:

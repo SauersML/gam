@@ -277,7 +277,7 @@ pub fn build_bspline_basis_1d(
         let auto_chunk = auto_streaming_chunk_size_for_dense(data.len(), num_basis);
         let (design, transformed_candidates, identifiability_transform) =
             if let Some(chunk) = auto_chunk {
-                log::info!(
+                log::debug!(
                     "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
                     data.len(),
                     num_basis,
@@ -360,6 +360,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -400,7 +401,7 @@ pub fn build_bspline_basis_1d(
             "streaming B-spline roughness",
         )?;
         let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
-        log::info!(
+        log::debug!(
             "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.len(),
             p_raw,
@@ -498,6 +499,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -561,6 +563,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -1867,6 +1870,21 @@ pub(crate) fn spectral_summary(
     penalty: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), BasisError> {
     let sym = symmetrize_penalty(penalty);
+    if crate::construction::is_diagonal(sym.view()) {
+        // A diagonal matrix is its own eigendecomposition: the spectrum is the
+        // diagonal and the eigenvectors are the coordinate axes, returned in the
+        // ascending order `eigh` uses. A random-effect block is `levels × levels`
+        // and diagonal, so this keeps its analysis out of the O(levels³) solver.
+        let n = sym.nrows();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| sym[[a, a]].total_cmp(&sym[[b, b]]));
+        let evals = order.iter().map(|&j| sym[[j, j]]).collect::<Array1<f64>>();
+        let mut evecs = Array2::<f64>::zeros((n, n));
+        for (col, &j) in order.iter().enumerate() {
+            evecs[[j, col]] = 1.0;
+        }
+        return Ok((sym, evals, evecs));
+    }
     let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
     Ok((sym, evals, evecs))
 }
@@ -2100,7 +2118,7 @@ pub fn filter_penalty_candidates(
         let kronecker_factors =
             validated_kronecker_factors(kronecker_factors, &analysis.sym_penalty);
         if let Some(reason) = dropped_reason {
-            log::debug!(
+            log::trace!(
                 "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
                 source,
                 original_index,
@@ -2114,7 +2132,7 @@ pub fn filter_penalty_candidates(
             });
         } else {
             let null_basis = nullspace_basis_from_block(&analysis);
-            log::debug!(
+            log::trace!(
                 "Retained penalty block source={:?} original_index={} rank={} nullity={} has_op={} has_null_basis={}",
                 source,
                 original_index,
@@ -2168,6 +2186,37 @@ mod atomic_penalty_record_tests {
             max_error <= tolerance,
             "canonical PSD reconstruction changed a penalty beyond roundoff: max error {max_error:e}, tolerance {tolerance:e}"
         );
+    }
+
+    #[test]
+    fn diagonal_spectral_summary_matches_dense_eigh() {
+        // Unsorted, with a repeated eigenvalue and a two-dimensional null space.
+        let diag = array![3.0, 0.0, 1.5, 3.0, 0.0, 0.25];
+        let penalty = Array2::from_diag(&diag);
+        let (sym, evals, evecs) = spectral_summary(&penalty).expect("diagonal spectrum");
+        let (dense_evals, dense_evecs) =
+            FaerEigh::eigh(&sym, Side::Lower).expect("dense eigendecomposition");
+        for (closed, dense) in evals.iter().zip(dense_evals.iter()) {
+            assert!((closed - dense).abs() <= 32.0 * f64::EPSILON * 3.0, "{evals} vs {dense_evals}");
+        }
+        assert_matrix_roundoff_equal(&evecs.t().dot(&evecs), &Array2::eye(diag.len()));
+        // Eigenvectors inside a repeated eigenvalue are only defined up to a
+        // rotation, so compare the spectral projector of each distinct value.
+        for value in [0.0, 0.25, 1.5, 3.0] {
+            let projector = |values: &Array1<f64>, vectors: &Array2<f64>| {
+                let cols: Vec<usize> = (0..values.len())
+                    .filter(|&j| (values[j] - value).abs() <= 1e-12)
+                    .collect();
+                let basis = vectors.select(Axis(1), &cols);
+                basis.dot(&basis.t())
+            };
+            assert_matrix_roundoff_equal(
+                &projector(&evals, &evecs),
+                &projector(&dense_evals, &dense_evecs),
+            );
+        }
+        let block = analyze_penalty_block(&penalty).expect("diagonal block");
+        assert_eq!((block.rank, block.nullity, block.negative_dim), (4, 2, 0));
     }
 
     #[test]
@@ -2679,6 +2728,20 @@ pub(crate) fn cubic_regression_function_gram(
     piecewise_polynomial_function_gram(&knots.to_vec(), 4, &mut |pts| Ok(cr.design(pts)))
 }
 
+/// Exact slope energy `D₁ = ∫ b'(x) b'(x)ᵀ dx` of the natural cubic regression
+/// basis over its knot range, the same range [`cubic_regression_function_gram`]
+/// integrates over.
+pub(crate) fn cubic_regression_slope_energy(
+    knots: &Array1<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let cr = CubicRegressionBasis::new(knots.clone())?;
+    // The derivative of a cubic is quadratic, so the integrand has degree four on
+    // each span, exactly integrated by three Gauss–Legendre points.
+    piecewise_polynomial_function_gram(&knots.to_vec(), 3, &mut |pts| {
+        cr.interior_derivative_design(pts)
+    })
+}
+
 /// Exact L² Gram of a periodic cardinal B-spline basis over one full period.
 pub(crate) fn periodic_bspline_function_gram(
     start: f64,
@@ -2807,6 +2870,77 @@ pub(crate) fn generalized_spectral_tolerance(evals: &Array1<f64>, operator: &Arr
     let operator_scale = max_abs_row_sum(operator);
     let scale = spectral_scale.max(operator_scale);
     default_rrqr_rank_alpha() * f64::EPSILON * operator.nrows().max(1) as f64 * scale
+}
+
+/// Function-mass components of a penalty's null space, one energy factor per
+/// component, for giving each null component its own smoothing parameter.
+///
+/// The null space `N` of `penalty` is a space of functions, so splitting it into
+/// separately penalized components has to use the function metrics, never the
+/// coefficient axes. With `G = ∫ b bᵀ` the function Gram and `D₁ = ∫ b' b'ᵀ` the
+/// slope energy of the same basis, take a `G`-orthonormal frame `Q` of `N` and
+/// the eigenvectors `U` of `QᵀD₁Q`: the columns of `Φ = QU` are `L²`-orthonormal
+/// null functions ordered by `∫φ'²`. For a polynomial null space on `[a, b]` the
+/// first is the constant (`∫φ'² = 0`) and, for `m = 2`, the second is the linear
+/// function centred at the interval's midpoint. Eigenvectors sharing an
+/// eigenvalue are one component (their split is an eigensolver gauge, not a
+/// property of the functions), so each component `g` is the span `Φ_g` of one
+/// eigenspace.
+///
+/// Component `g` charges `Σ_{φ∈Φ_g} ⟨f, φ⟩²`, the `L²` mass of `f` along it: its
+/// energy factor is `(GΦ_g)ᵀ` and its penalty `GΦ_gΦ_gᵀG`. On the null space the
+/// components are mutually orthogonal and sum to the `L²` norm, so equal
+/// smoothing parameters reproduce the single null-function ridge. Under a
+/// change of coefficient chart `β = Tβ'` every input transforms by congruence
+/// with `T`, and so does every returned penalty (`R' = TᵀRT`): the penalized fit
+/// is the same function in every chart.
+///
+/// `slope_energy` is evaluated only when the null space has more than one
+/// dimension. The penalties are not spectrally complementary to `penalty` (a
+/// curved function with non-zero mass along a null component is charged), but
+/// each has rank `|g|` on the `N` directions, so
+/// `log|λ_S S + Σ λ_g R_g| = (p − dim N)ρ_S + Σ |g|ρ_g + const` still separates.
+pub(crate) fn null_function_mass_components(
+    penalty: &Array2<f64>,
+    gram: &Array2<f64>,
+    slope_energy: impl FnOnce() -> Result<Array2<f64>, BasisError>,
+    context: &str,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    let Some(frame) = generalized_nullspace_basis(penalty, gram, context)? else {
+        return Ok(Vec::new());
+    };
+    let gram_sym = symmetrize_penalty(gram);
+    if frame.ncols() == 1 {
+        return Ok(vec![gram_sym.dot(&frame).reversed_axes()]);
+    }
+    let slope = slope_energy()?;
+    if slope.dim() != gram.dim() {
+        crate::bail_dim_basis!(
+            "{context}: slope energy is {}x{} but the function Gram is {}x{}",
+            slope.nrows(),
+            slope.ncols(),
+            gram.nrows(),
+            gram.ncols()
+        );
+    }
+    let restricted = symmetrize_penalty(&frame.t().dot(&symmetrize_penalty(&slope).dot(&frame)));
+    let (evals, evecs) =
+        FaerEigh::eigh(&restricted, Side::Lower).map_err(BasisError::LinalgError)?;
+    let tol = generalized_spectral_tolerance(&evals, &restricted);
+    let mut order: Vec<usize> = (0..evals.len()).collect();
+    order.sort_by(|&left, &right| evals[left].total_cmp(&evals[right]));
+    let mut components = Vec::new();
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && evals[order[end]] - evals[order[start]] <= tol {
+            end += 1;
+        }
+        let functions = frame.dot(&evecs.select(Axis(1), &order[start..end]));
+        components.push(gram_sym.dot(&functions).reversed_axes());
+        start = end;
+    }
+    Ok(components)
 }
 
 fn max_abs_row_sum(matrix: &Array2<f64>) -> f64 {
@@ -3407,7 +3541,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
                 eff_deg = eff_degree,
                 eff_ki = eff_interior,
             );
-            log::info!("B-spline {note} on Generate knotspec");
+            log::debug!("B-spline {note} on Generate knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Generate {
@@ -3419,6 +3553,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
         BSplineKnotSpec::Automatic {
             num_internal_knots,
             placement,
+            adaptive,
         } => {
             let requested_interior = num_internal_knots
                 .unwrap_or_else(|| default_internal_knot_count_for_data(n, spec.degree));
@@ -3439,12 +3574,13 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
                 eff_deg = eff_degree,
                 eff_ki = eff_interior,
             );
-            log::info!("B-spline {note} on Automatic knotspec");
+            log::debug!("B-spline {note} on Automatic knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(eff_interior),
                 placement: *placement,
+                adaptive: *adaptive,
             };
             (shrunk_spec, Some(note))
         }

@@ -833,7 +833,7 @@ mod tests {
         match gam_gpu::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto) {
             Ok(Some(_)) => true,
             Ok(None) => {
-                log::warn!("[{label}] no CUDA device; device parity not exercised here");
+                log::debug!("[{label}] no CUDA device; device parity not exercised here");
                 false
             }
             Err(err) => panic!("[{label}] CUDA availability probe failed: {err}"),

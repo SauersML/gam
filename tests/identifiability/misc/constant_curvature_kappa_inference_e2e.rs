@@ -266,7 +266,7 @@ const KAPPA_STAR: f64 = 0.75;
 fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
     let (feats, y) = dataset_on_m_kappa(n_obs(), KAPPA_STAR, 0.68, 0.02, 0x5151_0001);
     let inf = fit_and_infer(&feats, &y);
-    log::debug!(
+    log::trace!(
         "[spherical] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
         inf.kappa_hat,
         inf.ci.ci_lo,
@@ -296,7 +296,7 @@ fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
 fn flat_truth_does_not_reject_flatness() {
     let (feats, y) = dataset_on_m_kappa(n_obs(), 0.0, 0.68, 0.02, 0x5151_0002);
     let inf = fit_and_infer(&feats, &y);
-    log::debug!(
+    log::trace!(
         "[flat] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
         inf.kappa_hat,
         inf.ci.ci_lo,
@@ -324,7 +324,7 @@ fn flat_truth_does_not_reject_flatness() {
 fn hyperbolic_truth_recovers_negative_kappa_and_rejects_flat() {
     let (feats, y) = dataset_on_m_kappa(n_obs(), -KAPPA_STAR, 0.68, 0.02, 0x5151_0003);
     let inf = fit_and_infer(&feats, &y);
-    log::debug!(
+    log::trace!(
         "[hyperbolic] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
         inf.kappa_hat,
         inf.ci.ci_lo,

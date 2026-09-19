@@ -264,7 +264,7 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
 }
 
 #[test]
-fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
+fn terminal_certification_does_not_change_outer_solution() {
     let center = array![0.25];
     let seed_config = gam_problem::SeedConfig {
         max_seeds: 1,
@@ -279,7 +279,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         .with_problem_size(8, 3);
     let config = problem.config();
 
-    let mut without_diagnostic = problem.build_objective(
+    let mut uncertified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -303,7 +303,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let mut with_diagnostic = problem.build_objective(
+    let mut certified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -328,11 +328,10 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline =
-        run_outer_uncertified(&mut without_diagnostic, &config, "rho-diagnostic-baseline")
-            .expect("baseline outer run");
-    let diagnosed = run_outer(&mut with_diagnostic, &config, "rho-diagnostic-run")
-        .expect("diagnostic outer run");
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "terminal-baseline")
+        .expect("baseline outer run");
+    let diagnosed =
+        run_outer(&mut certified, &config, "terminal-certified").expect("certified outer run");
 
     assert_eq!(baseline.rho, diagnosed.rho);
     assert_eq!(
@@ -341,7 +340,6 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
     );
     assert_eq!(baseline.iterations, diagnosed.iterations);
     assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
-    assert!(diagnosed.rho_uncertainty_diagnostic.is_some());
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
@@ -2806,6 +2804,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let grad_sample = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
     assert_eq!(grad_sample.value, 1.0);
@@ -2869,6 +2868,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a candidate whose row geometry refuses must not produce a cost");
@@ -2941,6 +2941,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a structural refusal must not produce a cost");
@@ -2997,6 +2998,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
         .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
@@ -3098,6 +3100,82 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
     );
 }
 
+/// F4 (pyGAM audit, SAS link): ARC rejecting trials from a strict-saddle
+/// incumbent is not a replay while the trials move.
+///
+/// Each rejection leaves the incumbent bit-identical and raises ARC's
+/// regularization weight, so the next trial is a shorter step to a new point.
+/// The SAS-link probe (seed 1) did exactly this from `V = 935.29` with
+/// `λ_min(H) = −1.5e-3`: six rejected trials whose steps shrank from 3.77 to
+/// 0.58. The replay cut keyed on the incumbent alone and stopped the run after
+/// the second window, so the certificate judged a saddle at `|g| = 0.297` and
+/// the fit failed with `RemlDidNotConverge`. A window proves a replay only when
+/// it revisits the previous window's trials from the same incumbent.
+#[test]
+fn rejected_trials_that_move_do_not_prove_a_replay_at_a_strict_saddle() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let incumbent = array![-2.6, 4.8];
+    guard.observe_second_order_seed(&incumbent, 935.29, 0.297, Some(false));
+
+    // Shrinking trials toward the incumbent, each one above it (rejected).
+    let mut step = 3.77;
+    let mut shrinking_window = |guard: &mut CostStallGuard| {
+        let mut verdicts = Vec::new();
+        for _ in 0..3 {
+            let trial = array![-2.6 - step, 4.8];
+            verdicts.push(guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)));
+            step *= 0.7;
+        }
+        verdicts
+    };
+    for window in 0..4 {
+        let verdicts = shrinking_window(&mut guard);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, CostStallVerdict::Continue)),
+            "window {window}: rejected trials that move are not a replay, so the strict-saddle \
+             escape must be granted again"
+        );
+        assert!(
+            guard.license_continuation(),
+            "window {window}: an unreplayed window at a strict saddle is licensed"
+        );
+    }
+    assert_eq!(guard.stuck_escapes, 4, "each moving window earns its escape");
+
+    // A window that revisits the previous window's trials from the same
+    // incumbent is a proven replay and is cut.
+    let revisited = [0.3, 0.2, 0.1];
+    for trial_step in revisited {
+        let trial = array![-2.6 - trial_step, 4.8];
+        assert!(
+            matches!(
+                guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)),
+                CostStallVerdict::Continue
+            ),
+            "the first pass over a fresh window is not yet a replay"
+        );
+    }
+    let mut last = CostStallVerdict::Continue;
+    for trial_step in revisited {
+        let trial = array![-2.6 - trial_step, 4.8];
+        last = guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false));
+    }
+    assert!(
+        matches!(last, CostStallVerdict::FlatValleyStall { .. }),
+        "a window that revisits the same trials from the same incumbent replays it and must halt"
+    );
+    assert!(
+        !guard.license_continuation(),
+        "no licence reopens a proven replay"
+    );
+    let published = exit.lock().unwrap().take().expect("halt publishes the incumbent");
+    assert!(!published.converged, "a strict saddle is never converged");
+    assert_eq!(published.rho, incumbent);
+}
+
 /// #1237 — On a near-separable multinomial fit the outer REML criterion
 /// decreases monotonically as λ→0, so several log-λ directions slam to the
 /// lower box bound and the ARC outer loop cycles to `max_iter` without ever
@@ -3171,6 +3249,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
     // Every finite sample, including the one that fills the stall window, must
@@ -3237,6 +3316,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
 
     for _ in 0..5 {
@@ -3314,6 +3394,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     for _ in 0..(COST_STALL_WINDOW + 2) {
         let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
@@ -3394,6 +3475,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
     // evals fill the infeasible-streak window and trip the sentinel.
@@ -3496,6 +3578,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     SecondOrderObjective::eval_hessian(&mut bridge, &feasible_rho)
         .expect("feasible iterate must evaluate cleanly");
