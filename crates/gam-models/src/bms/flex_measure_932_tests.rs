@@ -874,20 +874,30 @@ fn flex_jet_scratch_is_charged_and_ends_with_the_family_2989() {
     )
     .expect("dynamic fourth contraction");
     assert_eq!(pool.idle_len(), 1, "the workspace returns to the pool");
-    let retained = pool.retained_bytes();
-    assert!(retained > 0, "the idle workspace is charged to the governor");
+    assert!(
+        pool.retained_bytes() > 0,
+        "the idle workspace is charged to the governor"
+    );
 
-    // A warm contraction reuses the same workspace without growing it.
-    let second = BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
-        &plan,
-        &point,
-        &pairs,
-        &fx.primary,
-        1,
-        &pool,
-    )
-    .expect("warm dynamic fourth contraction");
+    // The first warm reset folds the cold arena's chunks into one chunk of the
+    // high-water size, and the pool re-charges it; from then on a warm
+    // contraction reuses the workspace without growing it.
+    let contract = || {
+        BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
+            &plan,
+            &point,
+            &pairs,
+            &fx.primary,
+            1,
+            &pool,
+        )
+        .expect("warm dynamic fourth contraction")
+    };
+    let second = contract();
+    let retained = pool.retained_bytes();
+    let third = contract();
     assert_eq!(first, second, "a reused workspace gives the same contraction");
+    assert_eq!(second, third);
     assert_eq!(pool.idle_len(), 1);
     assert_eq!(pool.retained_bytes(), retained);
 
