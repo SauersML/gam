@@ -50,7 +50,8 @@ use gam_terms::inference::smooth_test::{
     SmoothTestInput, SmoothTestScale, wood_smooth_test,
 };
 use gam_terms::smooth::{ShapeConstraint, TermCollectionDesign, TermCollectionSpec};
-use ndarray::Array2;
+use ndarray::{Array1, Array2, s};
+use std::ops::Range;
 
 /// What a fit block carries AHEAD of the mean-predictor design it holds, when
 /// the design is not the whole block.
@@ -280,16 +281,32 @@ pub fn smooth_term_summary_rows_after(
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
+                let inputs = term_test_inputs(
+                    design,
+                    fit,
+                    cov,
+                    whitening_gram,
+                    TermLayout {
+                        coefficients: global_range.clone(),
+                        design_columns: (smooth_start - primary.coefficient_offset
+                            + term.coeff_range.start)
+                            ..(smooth_start - primary.coefficient_offset + term.coeff_range.end),
+                        lambdas: term_penalty_start..term_penalty_start + k,
+                        design_penalties: (term_penalty_start - primary.penalty_offset)
+                            ..(term_penalty_start - primary.penalty_offset + k),
+                    },
+                    edf,
+                )?;
                 wood_smooth_test(SmoothTestInput {
-                    beta: fit.beta.view(),
-                    covariance: cov,
-                    influence_matrix: fit.coefficient_influence(),
+                    beta: inputs.beta.view(),
+                    covariance: &inputs.covariance,
+                    influence_matrix: inputs.influence.as_ref(),
                     // Wood (2013) design-whitening Gram in the original
                     // coefficient basis (#2142). Without it the rank-r
                     // truncation keeps the wrong eigen-subspace and a dominant
                     // wiggly smooth reads as non-significant.
-                    whitening_gram,
-                    coeff_range: global_range.clone(),
+                    whitening_gram: inputs.whitening_gram.as_ref(),
+                    coeff_range: 0..inputs.beta.len(),
                     edf,
                     nullspace_dim: term.wald_unpenalized_dim(),
                     residual_df,
@@ -344,6 +361,228 @@ fn edf_rank_bound_label(fit: &UnifiedFitResult, start: usize, count: usize) -> O
     } else {
         None
     }
+}
+
+/// Where one smooth term sits in the four layouts the Wood test reads: its
+/// coefficients `J` in the fit's flat vector, its columns in the mean-predictor
+/// design, its smoothing parameters in the fit's flat λ vector, and its
+/// penalties in the design's own penalty list.
+struct TermLayout {
+    coefficients: Range<usize>,
+    design_columns: Range<usize>,
+    lambdas: Range<usize>,
+    design_penalties: Range<usize>,
+}
+
+/// The Wood-test inputs of one term, restricted to its coefficient block `J`.
+struct TermTestInputs {
+    beta: Array1<f64>,
+    covariance: Array2<f64>,
+    influence: Option<Array2<f64>>,
+    whitening_gram: Option<Array2<f64>>,
+}
+
+/// The term's `β_J`, `V_JJ`, influence block `F_JJ` and whitening Gram `G_JJ`.
+///
+/// A fit that publishes its influence matrix `F = H⁻¹X'WX` and weighted Gram
+/// `X'WX` (the standard single-predictor lane) is read as published. A fit that
+/// publishes neither — every custom-family and survival lane: Gaussian and
+/// survival location-scale, Royston-Parmar survival — still has everything the
+/// term's two blocks are made of. The term's own penalty is
+/// `S_JJ = Σ_k λ_k S_k`, and because no other term's penalty touches `J`,
+/// `(H⁻¹S)_JJ = H⁻¹_JJ·S_JJ`, so
+///
+/// * `F_JJ = I − (V_JJ/c)·S_JJ`, with `V = c·H⁻¹` the conditional covariance
+///   and `c` its scale, and
+/// * `G_JJ = H_JJ − S_JJ`, the likelihood curvature of the term's columns.
+///
+/// Without them the reference df was the truncation rank alone, never Wood's
+/// `tr(F_JJ)²/tr(F_JJ²)`, and the whitening fell back to the caller's
+/// unweighted `X'X`. For a location-scale fit that metric ignores the
+/// observation weights `1/σᵢ²` the scale predictor puts on the mean, so the
+/// rank-truncated subspace and its reference df were the wrong ones; the test
+/// of a mean smooth whose covariate moves only the scale then rejected above
+/// its level.
+///
+/// The design states `S_k` in the design's coefficient units, and a fit may
+/// report `β` in others: a Gaussian location-scale fit solves on a
+/// standardized response and reports the mean block as `d·β` (`d` its
+/// response scale), so its `V` and `H` carry `d²` and `d⁻²` and its penalty is
+/// `S/d²`. Within one block that is one factor, and the fit's own per-penalty
+/// traces `τ_k = tr(H⁻¹ λ_k S_k)` — unit-free, and what the reported EDF is
+/// made of — identify it: `tr(V_JJ λ_k S_k)/c = d²·τ_k` for every `k`. The
+/// penalty is used only when every penalty gives the same `d²`, and when the
+/// resulting `tr(F_JJ)` is the reported EDF; that is the check that the
+/// design's penalties and the fit's λ are the ones the fit solved with. `G_JJ`
+/// additionally needs the penalized Hessian in the saved coefficient frame (an
+/// identity gauge). Whatever is not established falls back to the caller's
+/// `whitening_gram` and the rank-only reference df.
+fn term_test_inputs(
+    design: &TermCollectionDesign,
+    fit: &UnifiedFitResult,
+    cov: &Array2<f64>,
+    whitening_gram: Option<&Array2<f64>>,
+    layout: TermLayout,
+    edf: f64,
+) -> Option<TermTestInputs> {
+    let j = layout.coefficients.clone();
+    if j.is_empty() || j.end > fit.beta.len() || j.end > cov.nrows() || j.end > cov.ncols() {
+        return None;
+    }
+    let term_block = |matrix: &Array2<f64>| {
+        (j.end <= matrix.nrows() && j.end <= matrix.ncols())
+            .then(|| matrix.slice(s![j.clone(), j.clone()]).to_owned())
+    };
+    let covariance = cov.slice(s![j.clone(), j.clone()]).to_owned();
+    let derived = if fit.coefficient_influence().is_none() || fit.weighted_gram().is_none() {
+        fitted_term_penalty(design, fit, &layout, &covariance, edf)
+    } else {
+        None
+    };
+    let influence = match fit.coefficient_influence() {
+        Some(published) => term_block(published),
+        None => derived.as_ref().map(|(_, influence)| influence.clone()),
+    };
+    let whitening_gram = match fit.weighted_gram() {
+        Some(_) => whitening_gram.and_then(term_block),
+        None => derived
+            .as_ref()
+            .and_then(|(penalty, _)| curvature_gram(fit, &j, cov, penalty))
+            .or_else(|| whitening_gram.and_then(term_block)),
+    };
+    Some(TermTestInputs {
+        beta: fit.beta.slice(s![j.clone()]).to_owned(),
+        covariance,
+        influence,
+        whitening_gram,
+    })
+}
+
+/// The term's penalty `S_JJ` in the fit's coefficient units and its influence
+/// block `F_JJ = I − (V_JJ/c)·S_JJ`, or `None` unless both are established as
+/// [`term_test_inputs`] describes.
+fn fitted_term_penalty(
+    design: &TermCollectionDesign,
+    fit: &UnifiedFitResult,
+    layout: &TermLayout,
+    covariance: &Array2<f64>,
+    edf: f64,
+) -> Option<(Array2<f64>, Array2<f64>)> {
+    let m = layout.coefficients.len();
+    let scale = fit
+        .coefficient_covariance_scale()
+        .ok()
+        .filter(|scale| scale.is_finite() && *scale > 0.0)?;
+    let penalties = design_term_penalties(design, fit, layout)?;
+    let traces = fit.penalty_block_trace().get(layout.lambdas.clone())?;
+    // `d²` from every penalty the fit gave a trace worth resolving; a penalty
+    // whose trace is below that resolution must be as negligible in `V`.
+    let resolution = 1e-10 * (m as f64).max(1.0);
+    let mut units: Option<(f64, f64)> = None;
+    let mut negligible = Vec::new();
+    for (penalty, &trace) in penalties.iter().zip(traces) {
+        let reported = (covariance * &penalty.t()).sum() / scale;
+        if !(reported.is_finite() && trace.is_finite()) {
+            return None;
+        }
+        if trace.abs() <= resolution {
+            negligible.push(reported);
+            continue;
+        }
+        let ratio = reported / trace;
+        units = Some(match units {
+            None => (ratio, ratio),
+            Some((low, high)) => (low.min(ratio), high.max(ratio)),
+        });
+    }
+    let units = match units {
+        Some((low, high)) if low > 0.0 && high - low <= 1e-6 * high => 0.5 * (low + high),
+        Some(_) => return None,
+        None => 1.0,
+    };
+    if negligible.iter().any(|reported| reported.abs() > resolution * units) {
+        return None;
+    }
+    let mut penalty = Array2::<f64>::zeros((m, m));
+    for component in &penalties {
+        penalty.scaled_add(units.recip(), component);
+    }
+    let influence = Array2::<f64>::eye(m) - covariance.dot(&penalty) / scale;
+    let trace = influence.diag().sum();
+    (trace.is_finite() && (trace - edf).abs() <= 1e-6 * (m as f64).max(1.0))
+        .then_some((penalty, influence))
+}
+
+/// Each of the term's penalties `λ_k S_k`, embedded over the term's own
+/// columns in the design's coefficient units, or `None` when a penalty is not
+/// the term's (a column range outside it, a local matrix of the wrong size) or
+/// a smoothing parameter is not a finite non-negative number.
+fn design_term_penalties(
+    design: &TermCollectionDesign,
+    fit: &UnifiedFitResult,
+    layout: &TermLayout,
+) -> Option<Vec<Array2<f64>>> {
+    let columns = &layout.design_columns;
+    let m = layout.coefficients.len();
+    if columns.len() != m || layout.lambdas.len() != layout.design_penalties.len() {
+        return None;
+    }
+    let penalties = design.penalties.get(layout.design_penalties.clone())?;
+    penalties
+        .iter()
+        .zip(layout.lambdas.clone())
+        .map(|(penalty, lambda_idx)| {
+            let lambda = fit.lambdas.get(lambda_idx).copied()?;
+            let range = &penalty.col_range;
+            if !(lambda.is_finite() && lambda >= 0.0)
+                || range.start < columns.start
+                || range.end > columns.end
+                || penalty.local.dim() != (range.len(), range.len())
+            {
+                return None;
+            }
+            let at = (range.start - columns.start)..(range.end - columns.start);
+            let mut embedded = Array2::<f64>::zeros((m, m));
+            embedded
+                .slice_mut(s![at.clone(), at])
+                .scaled_add(lambda, &penalty.local);
+            Some(embedded)
+        })
+        .collect()
+}
+
+/// The likelihood curvature of the term's columns, `G_JJ = H_JJ − S_JJ`, when
+/// the fit's penalized Hessian is in the saved coefficient frame and is the
+/// precision of the covariance the test reads, `H·V = c·I`.
+fn curvature_gram(
+    fit: &UnifiedFitResult,
+    j: &Range<usize>,
+    covariance: &Array2<f64>,
+    penalty: &Array2<f64>,
+) -> Option<Array2<f64>> {
+    let hessian = fit.penalized_hessian()?;
+    let p = fit.beta.len();
+    let saved_frame = fit
+        .geometry
+        .as_ref()
+        .is_none_or(|geometry| geometry.coefficient_gauge.is_identity());
+    if !saved_frame
+        || hessian.dim() != (p, p)
+        || covariance.dim() != (p, p)
+    {
+        return None;
+    }
+    let scale = fit
+        .coefficient_covariance_scale()
+        .ok()
+        .filter(|scale| scale.is_finite() && *scale > 0.0)?;
+    let precision_trace = (hessian * &covariance.t()).sum() / scale;
+    if !((precision_trace - p as f64).abs() <= 1e-6 * p as f64) {
+        return None;
+    }
+    let block = hessian.slice(s![j.clone(), j.clone()]);
+    let gram = (&block + &block.t()) * 0.5 - penalty;
+    gram.iter().all(|value| value.is_finite()).then_some(gram)
 }
 
 /// Invert the three-λ Matérn identity for a continuous-order smooth, in
