@@ -1731,6 +1731,7 @@ fn test_build_bspline_basis_1d_automatic_uniform_uses_data_range() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Uniform,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::default(),
@@ -1757,6 +1758,7 @@ fn test_build_bspline_basis_1d_automatic_quantile_is_not_uniform_for_skewed_data
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::default(),
@@ -1856,6 +1858,7 @@ fn test_build_bspline_basis_1d_quantile_uses_exact_derivative_gram() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -1906,6 +1909,7 @@ fn test_build_bspline_basis_1d_none_identifiability_prefers_sparse_design() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(6),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -1935,6 +1939,7 @@ fn test_build_bspline_basis_1d_default_identifiability_densifies_via_orthonormal
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(6),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::default(),
@@ -1956,6 +1961,7 @@ fn test_build_bspline_basis_1d_quantile_rejects_missing_interior_support() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,

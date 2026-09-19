@@ -1,5 +1,19 @@
 ## Unreleased
 
+- **The default `s(x)` sizes its basis from the data** (slop.md G1). The formula-default
+  open B-spline was capped at `clamp(unique/4, 4..8)` internal knots (12 cubic
+  coefficients), so `y ~ s(x)` stopped improving with `n`: on `sin(8πx) + N(0, 0.3²)`
+  its truth RMSE stayed at ~0.134 from `n = 1e3` to `n = 1e5` while `basis_check`
+  rejected it at `p = 0`. The default now starts from that pilot resolution and grows
+  through the adaptive resolution loop the spatial smooths already use, one doubling at
+  a time, until the basis is neither saturated nor rejected by the #2774 lack-of-fit
+  test. The growth is bounded only by the covariate's distinct values (the
+  interpolating limit) and by the design rank (the model keeps a residual degree of
+  freedom). Null and linear truths still shrink to ~0 and ~1 EDF. An explicit `k=`,
+  `knots=`, a Python smooth override, or a cyclic, factor, tensor or radial basis keeps
+  its fixed size. Knot placement stays uniform by default (`knot_placement=quantile`
+  opts in). The per-fit "Automatically set N internal knots" note is gone. **Behavior change:** default
+  `s(x)` fits on signal-rich data have more coefficients and different EDF.
 - **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
   accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
   `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`
