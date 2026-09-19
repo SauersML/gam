@@ -11,9 +11,10 @@ it internally), there were no residuals, and no inner-iteration count.
 
 Every accessor is checked here against a closed form evaluated in the test:
 
-* Gaussian identity with a fixed (empty) smoothing vector is ordinary least
-  squares, so ``coefficients`` solve the normal equations, ``edf_total = p``,
-  every residual type is ``y - X beta``, and ``scale = RSS / (n - p)``.
+* Gaussian identity with a fixed (empty) smoothing vector -- a linear term with
+  its default shrinkage ridge switched off -- is ordinary least squares, so
+  ``coefficients`` solve the normal equations, ``edf_total = p``, every
+  residual type is ``y - X beta``, and ``scale = RSS / (n - p)``.
 * A penalized, prior-weighted Gaussian smooth at its reported ``lambda`` is a
   linear smoother ``mu = F y`` with ``edf = tr F``. Then
   ``E||y - mu||_w^2 = sigma^2 (n - 2 tr F + tr F'F) ~ sigma^2 (n - tr F)``,
@@ -45,6 +46,11 @@ GAM_BIN = Path(os.environ.get("GAM_BIN", REPO / "target" / "release" / "gam"))
 
 RTOL = 1e-8
 
+# A formula linear term carries a REML-selected shrinkage ridge by default (the
+# null is recoverable); opting out leaves no smoothing coordinate, so the fit
+# is the unpenalized GLM and its closed forms are exact.
+UNPENALIZED_LINEAR = "y ~ linear(x, double_penalty=false)"
+
 
 def _linear_predictor(model: Any, data: dict[str, Any]) -> np.ndarray:
     design = model.design_matrix(data)
@@ -62,7 +68,7 @@ def test_gaussian_ols_accessors_match_normal_equations() -> None:
     data = _gaussian_linear_data()
     y = np.asarray(data["y"])
     n = y.size
-    model = gamfit.fit(data, "y ~ x", family="gaussian")
+    model = gamfit.fit(data, UNPENALIZED_LINEAR, family="gaussian")
 
     x_design = np.asarray(model.design_matrix(data).matrix)
     p = x_design.shape[1]
@@ -139,7 +145,7 @@ def test_poisson_residuals_and_loglik_closed_forms() -> None:
     x = rng.uniform(-1.0, 1.0, n)
     y = rng.poisson(np.exp(0.4 + 0.9 * x)).astype(float)
     data = {"x": x.tolist(), "y": y.tolist()}
-    model = gamfit.fit(data, "y ~ x", family="poisson")
+    model = gamfit.fit(data, UNPENALIZED_LINEAR, family="poisson")
 
     x_design = np.asarray(model.design_matrix(data).matrix)
     mu = np.exp(_linear_predictor(model, data))
@@ -176,7 +182,7 @@ def test_gamma_scale_is_the_dispersion_the_loglik_uses() -> None:
     shape = 4.0
     y = rng.gamma(shape, mean / shape)
     data = {"x": x.tolist(), "y": y.tolist()}
-    model = gamfit.fit(data, "y ~ x", family="gamma")
+    model = gamfit.fit(data, UNPENALIZED_LINEAR, family="gamma")
 
     mu = np.exp(_linear_predictor(model, data))
     np.testing.assert_allclose(model.residuals(data, type="response"), y - mu, atol=1e-9)
