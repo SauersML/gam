@@ -1,5 +1,19 @@
 ## Unreleased
 
+- **Several expectile levels fit jointly and never cross** (pyGAM audit F5b). A list of
+  levels (`expectile_tau=[0.1, 0.5, 0.9]` in Python, `--expectile-tau 0.1,0.5,0.9` on the
+  CLI, a list `expectile_tau` in a fit request document) could not be requested, and
+  levels fitted one at a time can cross, most visibly where the spread is small or past
+  the data. A multi-level request now fits ONE Gaussian location-scale GAM `(μ, σ)`, with
+  REML/LAML smoothing on both surfaces, and reports the level-`τ` curve as
+  `μ(x) + c_τ·E[σ(x)]`, where `c_τ` is the closed-form weighted `τ`-expectile of the
+  standardized residuals. `c_τ` increases strictly with `τ` and `σ > 0`, so the curves are
+  ordered at every `x`, including under extrapolation; nothing is sorted afterwards.
+  Python `predict` returns an `(n, K)` array (one column per level), and the CLI and the
+  prediction table add one `expectile_{τ}` column per level. A single level, as a scalar
+  or a one-element list, is still the single-level LAWS fit. Saved joint models refuse
+  estimator metadata whose levels or standardized expectiles are not strictly increasing.
+  They do not sample (no observation law is claimed) and do not take conformal intervals.
 - **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
   accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
   `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`

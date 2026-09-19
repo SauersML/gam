@@ -463,7 +463,7 @@ fn expectile_kkt_residual(
 
 #[cfg(test)]
 mod expectile_convergence_tests {
-    use super::{ExpectileSignCycle, expectile_kkt_residual};
+    use super::{ExpectileSignCycle, expectile_kkt_residual, weighted_empirical_expectile};
     use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::array;
 
@@ -526,6 +526,70 @@ mod expectile_convergence_tests {
         )
         .expect("scaled KKT audit");
         assert!((base_kkt - scaled_kkt).abs() <= f64::EPSILON.sqrt());
+    }
+
+    /// `g(c)` from the doc comment of `weighted_empirical_expectile`.
+    fn expectile_estimating_function(z: &[f64], p: &[f64], tau: f64, c: f64) -> f64 {
+        z.iter()
+            .zip(p)
+            .map(|(&v, &w)| {
+                if v > c {
+                    tau * w * (v - c)
+                } else {
+                    -(1.0 - tau) * w * (c - v)
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn weighted_expectile_is_the_exact_root_of_the_estimating_function() {
+        let z = [0.3, -1.7, 2.4, 0.3, -0.2, 5.1, -3.3];
+        let p = [1.0, 0.5, 2.0, 0.0, 1.5, 0.25, 1.0];
+        for tau in [0.02, 0.1, 0.3, 0.5, 0.7, 0.9, 0.98] {
+            let c = weighted_empirical_expectile(&z, &p, tau).expect("expectile");
+            let scale: f64 = z.iter().zip(&p).map(|(v, w)| w * v.abs()).sum();
+            let g = expectile_estimating_function(&z, &p, tau, c);
+            assert!(g.abs() <= 1.0e-13 * scale, "tau={tau}: g(c)={g:e}");
+        }
+    }
+
+    #[test]
+    fn weighted_expectile_at_one_half_is_the_weighted_mean() {
+        let z = [4.0, -2.0, 1.0, 7.5];
+        let p = [1.0, 3.0, 0.5, 2.0];
+        let mean = z.iter().zip(&p).map(|(v, w)| v * w).sum::<f64>() / p.iter().sum::<f64>();
+        let c = weighted_empirical_expectile(&z, &p, 0.5).expect("expectile");
+        assert!((c - mean).abs() <= 1.0e-14 * mean.abs().max(1.0));
+    }
+
+    #[test]
+    fn weighted_expectile_is_strictly_increasing_in_the_level() {
+        let z = [0.9, -0.4, 1.3, -2.2, 0.1, 3.0];
+        let p = [1.0; 6];
+        let levels = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
+        let values: Vec<f64> = levels
+            .iter()
+            .map(|&tau| weighted_empirical_expectile(&z, &p, tau).expect("expectile"))
+            .collect();
+        assert!(
+            values.windows(2).all(|pair| pair[0] < pair[1]),
+            "expectiles not strictly increasing: {values:?}"
+        );
+        assert!(values[0] > -2.2 && values[values.len() - 1] < 3.0);
+    }
+
+    #[test]
+    fn weighted_expectile_ignores_zero_weight_rows_and_rejects_bad_input() {
+        let with_dead = weighted_empirical_expectile(&[1.0, 100.0, 3.0], &[1.0, 0.0, 1.0], 0.8)
+            .expect("expectile");
+        let without = weighted_empirical_expectile(&[1.0, 3.0], &[1.0, 1.0], 0.8).expect("expectile");
+        assert!((with_dead - without).abs() <= 1.0e-15);
+        assert!(weighted_empirical_expectile(&[], &[], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[0.0, 0.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, f64::NAN], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[1.0, -1.0], 0.5).is_err());
     }
 }
 
