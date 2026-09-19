@@ -494,6 +494,7 @@ impl<'a> RemlState<'a> {
             weights_obs_log_abs,
             y: self.y.to_owned(),
             prior_weights: self.weights.to_owned(),
+            row_measures: crate::pirls::DevianceRowMeasure::rows(self.weights.view(), -phi.ln()),
             likelihood: likelihood.clone(),
             inverse_link,
             phi,

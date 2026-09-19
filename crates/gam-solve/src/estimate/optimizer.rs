@@ -1730,7 +1730,13 @@ where
                 Some(|state: &mut &mut crate::estimate::reml::RemlState<'_>| {
                     state.reset_outer_seed_state()
                 }),
-                Some(
+                // The EFS map is the fixed point of the Laplace trace identity
+                // alone. Once the #784 block correction is latched the criterion
+                // also carries Delta_b(rho), whose rho-gradient that map never
+                // sees, so its fixed point is not a stationary point of the
+                // corrected criterion: the corrected continuation has no
+                // fixed-point map and walks on the criterion's own derivatives.
+                (!corrected_continuation).then_some(
                     |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                         state.compute_efs_steps(rho)
                     },
