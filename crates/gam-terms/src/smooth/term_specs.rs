@@ -1011,10 +1011,21 @@ pub(crate) struct RawSmoothDesign {
     pub linear_constraints: Option<LinearInequalityConstraints>,
 }
 
+/// Penalty-source tag of the latent-scale ridge a `bounded()` coefficient
+/// carries under [`BoundedCoefficientPriorSpec::Shrinkage`].
+pub const BOUNDED_SHRINKAGE_PENALTY_SOURCE: &str = "BoundedShrinkage";
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
+    /// Constrained MLE: no prior term on the bounded coefficient (`prior=none`).
     #[default]
     None,
+    /// The formula default: a Gaussian prior on the latent logit coordinate,
+    /// centred at the null, whose precision REML estimates like any other
+    /// smoothing parameter. The null is `beta = 0` when zero lies strictly
+    /// inside `(min, max)`; otherwise zero is not an admissible value and the
+    /// prior centres at the box midpoint, the latent origin.
+    Shrinkage,
     Uniform,
     Beta {
         a: f64,
@@ -1478,7 +1489,9 @@ impl TermCollectionSpec {
                     .into());
                 }
                 match prior {
-                    BoundedCoefficientPriorSpec::None | BoundedCoefficientPriorSpec::Uniform => {}
+                    BoundedCoefficientPriorSpec::None
+                    | BoundedCoefficientPriorSpec::Shrinkage
+                    | BoundedCoefficientPriorSpec::Uniform => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
                             return Err(SmoothError::invalid_config(format!(
@@ -2380,6 +2393,7 @@ impl TermCollectionDesign {
                     &info.penalty.source,
                     crate::basis::PenaltySource::Other(source)
                         if source == "LinearTermRidge"
+                            || source == BOUNDED_SHRINKAGE_PENALTY_SOURCE
                             || source.starts_with("RandomEffectRidge(")
                 )
             })

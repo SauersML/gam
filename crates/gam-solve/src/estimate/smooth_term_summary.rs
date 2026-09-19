@@ -52,7 +52,9 @@ use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
 use gam_terms::inference::smooth_test::{
     SmoothTestInput, SmoothTestScale, wood_smooth_test,
 };
-use gam_terms::smooth::{ShapeSpec, TermCollectionDesign, TermCollectionSpec};
+use gam_terms::smooth::{
+    BOUNDED_SHRINKAGE_PENALTY_SOURCE, ShapeSpec, TermCollectionDesign, TermCollectionSpec,
+};
 use ndarray::Array2;
 
 /// Build the smooth/random-effect rows of a model summary.
@@ -112,6 +114,7 @@ pub fn smooth_term_summary_rows(
 
     // The fit's GLOBAL penalty layout (and thus `penalty_block_trace`) opens with
     // ONE `LinearTermRidge` block PER linear term carrying `double_penalty=true`
+    // (or a `BoundedShrinkage` block per shrinkage-prior `bounded()` term)
     // — not one shared block (`smooth/term_design.rs:289-311`; every non-intercept
     // effect owns its own REML coordinate so an unsupported slope can be shrunk
     // independently). Random-effect and smooth penalty blocks follow them.
@@ -126,7 +129,11 @@ pub fn smooth_term_summary_rows(
         .penaltyinfo
         .iter()
         .filter(|info| {
-            matches!(&info.penalty.source, PenaltySource::Other(s) if s == "LinearTermRidge")
+            matches!(
+                &info.penalty.source,
+                PenaltySource::Other(s)
+                    if s == "LinearTermRidge" || s == BOUNDED_SHRINKAGE_PENALTY_SOURCE
+            )
         })
         .count();
 
