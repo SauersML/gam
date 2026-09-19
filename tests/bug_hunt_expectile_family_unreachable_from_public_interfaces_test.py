@@ -107,5 +107,10 @@ def test_expectile_family_is_fittable_from_python_and_monotone_in_tau(
         "tau": 0.9,
     }
     restored = gamfit.load(model_path)
+    # The family name reports the fitted estimator from the saved tag, not the
+    # Gaussian working likelihood of the inner solves.
+    for model in (hi_model, restored):
+        assert model.family_name == "Expectile(tau=0.9)"
+        assert model.summary().family_name == "Expectile(tau=0.9)"
     with pytest.raises(Exception, match="expectile.*no observation-replicate sampler"):
         restored.sample_replicates(pd.DataFrame({"x": [0.25, 0.75]}), 3, seed=4)

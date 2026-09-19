@@ -4477,6 +4477,18 @@
     "evidence": "git grep -w at d10950d360: every caller is in gam-solve's rho_optimizer (run.rs, bridges.rs, run_plan_tests.rs, rail_projection_tests.rs, arc_curvature_stationary_2817_tests.rs) and resolves through the re-export; gam-pyffi names none of them."
   },
   {
+    "base": "ae20ed3b52b554c6379b92ae588611a08d2376a3",
+    "removed": {
+      "crates/gam-inference/src/model_comparison.rs::corrected_edf": 1,
+      "crates/gam-inference/src/model_comparison.rs::rho_uncertainty_df": 1,
+      "crates/gam-solve/src/evidence.rs::compare_reml_fits": 1,
+      "crates/gam-solve/src/evidence.rs::criterion_gap": 1,
+      "crates/gam-solve/src/evidence.rs::ranking_score": 1
+    },
+    "reason": "slop.md G2 / pyGAM audit d11: model comparison ranks on the smoothing-corrected AIC through one Rust function. corrected_edf and CorrectedEdf::rho_uncertainty_df move from gam-inference::model_comparison to gam_solve::inference::information_criteria under the same names, so the fitted summary can form aic_corrected. compare_reml_fits (which ranked on ranking_score, the uncorrected -2*loglik + 2*edf) is replaced by evidence::compare_models ranking on aic_corrected, and criterion_gap by log_evidence_ratio, half the corrected-AIC gap.",
+    "evidence": "At the base, git grep -w finds compare_reml_fits, ranking_score and criterion_gap only in crates/gam-solve/src/evidence.rs and the gam-pyffi FFI (ffi_prelude.rs imports, model_ffi.rs), and corrected_edf / rho_uncertainty_df only in gam-inference; every caller is rewritten in this change. See the matching docs/source-removal-changes.json entry."
+  },
+  {
     "base": "da5b1ad4bd7ecf8081e094aaf5e8573a7d9792af",
     "removed": {
       "crates/gam-models/src/fit_orchestration/materialize/marginal_slope.rs::resolve_marginal_slope_base_link": 1
@@ -4496,7 +4508,15 @@
     "evidence": "At the landing tree git grep finds no call of OuterWarmStart::from_model, .session(), .required() or .consumed() on a warm start; gam-pyffi's geometry_ffi.rs, the only production caller of from_model, calls resolve_warm_start. public_api_census.py at 5bd6913b9b on 55212405d7 refused exactly these four identities without this entry, and verified 13342 -> 13345 public function declarations with it."
   },
   {
-    "base": "2e5bfa7a077b61cce266d0c60036b0bf81ed3bcd",
+    "base": "a5a71e516b0a0f1afd3b29b7e1e080926e4bb206",
+    "removed": {
+      "crates/gam-terms/src/basis/bspline_eval.rs::create_difference_penalty_matrix": 1
+    },
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix was a coefficient-difference penalty DᵀD. SPEC puts penalties on the function; production B-spline penalties are bspline_derivative_penalty_matrix, and the function's one production caller discarded its result. Deleted together with the dead penalty output of compute_geometric_constraint_transform (see docs/source-removal-changes.json).",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call, in duchon_thinplate.rs compute_geometric_constraint_transform, whose output both bspline_build.rs callers bind to `_`; all other uses are tests, now served by the test-only gam_linalg_test_support::coefficient_difference_penalty. cargo check --workspace --all-targets RC 0."
+  },
+  {
+    "base": "e110c67a94b801ddc9cc3756a3d0c61dada87550",
     "removed": {
       "crates/gam-math/src/probability.rs::signed_weighted_chi_square_sf_to_tolerance": 1
     },

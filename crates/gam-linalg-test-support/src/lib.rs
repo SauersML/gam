@@ -593,9 +593,44 @@ pub fn dense_to_upper_csc(matrix: &Array2<f64>) -> SparseColMat<usize, f64> {
     SparseColMat::<usize, f64>::new(symbolic, values)
 }
 
+/// Integer-grid coefficient-difference Gram `DᵀD`, with `D` the `order`-th
+/// forward difference of a length-`num_coefficients` sequence.
+///
+/// A synthetic positive-semidefinite fixture with a known `order`-dimensional
+/// null space (the polynomials of degree `< order` in the index). It penalizes
+/// the coefficient sequence, not a represented function, so production builds
+/// no penalty this way (SPEC: penalties go on the function); tests use it as a
+/// stand-in penalty block or as the discriminator a function-space Gram must
+/// differ from.
+pub fn coefficient_difference_penalty(num_coefficients: usize, order: usize) -> Array2<f64> {
+    assert!(
+        0 < order && order < num_coefficients,
+        "difference order {order} must lie in 1..{num_coefficients}"
+    );
+    let mut d = Array2::<f64>::eye(num_coefficients);
+    for _ in 0..order {
+        d = &d.slice(s![1.., ..]) - &d.slice(s![..-1, ..]);
+    }
+    d.t().dot(&d)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PairedFoldComparison, RESOLUTION_TAIL, assert_paired_match_or_beat, paired_holdout_partition, student_t_cdf, student_t_upper_quantile};
+    use super::{PairedFoldComparison, RESOLUTION_TAIL, assert_paired_match_or_beat, coefficient_difference_penalty, paired_holdout_partition, student_t_cdf, student_t_upper_quantile};
+    use ndarray::array;
+
+    #[test]
+    fn coefficient_difference_penalty_matches_closed_form_second_difference_gram() {
+        // D₂ for n = 5 is the 3×5 band [1, -2, 1]; DᵀD is the pentadiagonal below.
+        let expected = array![
+            [1., -2., 1., 0., 0.],
+            [-2., 5., -4., 1., 0.],
+            [1., -4., 6., -4., 1.],
+            [0., 1., -4., 5., -2.],
+            [0., 0., 1., -2., 1.]
+        ];
+        assert_eq!(coefficient_difference_penalty(5, 2), expected);
+    }
 
     #[test]
     fn paired_holdout_is_exact_reproducible_and_partitioned() {
