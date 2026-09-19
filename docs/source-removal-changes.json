@@ -1578,5 +1578,30 @@
     ],
     "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
     "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
+  },
+  {
+    "base": "431fd845bc0566b25f57f8890da5512b7115dc04",
+    "items": [
+      "crates/gam-solve/src/inference/residual_factor.rs:const:ALTERNATION_MAX_SWEEPS",
+      "crates/gam-solve/src/inference/residual_factor.rs:const:DIAGONAL_REL_FLOOR",
+      "crates/gam-solve/src/inference/residual_factor.rs:const:SCALE_REL_FLOOR",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:bic_penalized_log_likelihood",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:column_variances",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:evidence_ladder_prefers_planted_rank_one",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:factor_coordinates",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:fit_fixed_rank",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:gaussian_bic_log_likelihood",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:gaussian_bic_log_likelihood_with_band",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:hoisted_gram_matches_naive_per_row_rebuild",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:is_finite",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:moving_average_3",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:naive_factor_coordinates",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:naive_gaussian_bic_log_likelihood",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:occupancy_scale_improves_second_moment_reconstruction",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:scaled_second_moment",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:scaled_second_moment_chunk"
+    ],
+    "reason": "#2901/#2902 (lane bic-removal, SPEC R11/R18/R23): the structured residual model's BIC rank ladder is replaced by the Laplace marginal likelihood of every identifiable rank (residual_factor/evidence.rs). The ladder's alternating fixed-rank fit (fit_fixed_rank with its ALTERNATION_MAX_SWEEPS cap and the DIAGONAL_REL_FLOOR / SCALE_REL_FLOOR clamps), its BIC scorer (gaussian_bic_log_likelihood[_with_band], bic_penalized_log_likelihood) and its moment helpers (column_variances, scaled_second_moment[_chunk], factor_coordinates, moving_average_3, is_finite) have no remaining caller. The tests of the removed internals (hoisted_gram_matches_naive_per_row_rebuild with its naive_* oracles, occupancy_scale_improves_second_moment_reconstruction) go with them; evidence_ladder_prefers_planted_rank_one is superseded by evidence_prefers_planted_rank_one on the same planted DGP.",
+    "evidence": "Replacement: evidence::fit_rank and StructuredResidualModel::log_evidence in crates/gam-solve/src/inference/residual_factor*. The only external reader of bic_penalized_log_likelihood (gam-sae fit_entry.rs StructuredResidualPassDiagnostic and its pyffi dict key) now reads log_evidence. cargo test -p gam-solve --lib residual_factor: 9/9 pass, including the null (rank 0 on three seeds, p = 6) and the planted rank-1 and rank-2 recoveries."
   }
 ]
