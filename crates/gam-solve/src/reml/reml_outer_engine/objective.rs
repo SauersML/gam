@@ -992,6 +992,43 @@ pub(crate) fn reml_laml_evaluate(
             None
         };
 
+    // Exact trace batching for operator-backed ρ corrections.  The hot large-scale
+    // GAMLSS path has many Duchon smoothing coordinates whose correction
+    // operators share the same design and spectral factor.  Evaluating them one
+    // by one repeats the same `X·F` projection and row-kernel setup for every
+    // coordinate.  The trace is linear, so split `tr(K·(A_i + C_i))` into the
+    // cheap penalty part plus a batched exact vector of `tr(K·C_i)` values.
+    // This preserves the full first-order gradient (no iteration caps or
+    // stochastic approximation) while collapsing the per-coordinate trace pass.
+    let rho_operator_correction_traces: Option<Vec<Option<f64>>> = if incl_logdet_h
+        && solution.penalty_subspace_trace.is_none()
+    {
+        let pairs: Vec<(usize, Arc<dyn HyperOperator>)> = rho_corrections
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, correction)| match correction {
+                Some(DriftDerivResult::Operator(op)) => Some((idx, Arc::clone(op))),
+                _ => None,
+            })
+            .collect();
+        if pairs.len() >= 2 {
+            hop.as_exact_dense_spectral().map(|ds| {
+                let ops: Vec<Arc<dyn HyperOperator>> =
+                    pairs.iter().map(|(_, op)| Arc::clone(op)).collect();
+                let values = dense_spectral_trace_logdet_operators_batched(ds, &ops);
+                let mut traces = vec![None; k];
+                for ((idx, _), value) in pairs.into_iter().zip(values) {
+                    traces[idx] = Some(value);
+                }
+                traces
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Cancellation-free fused logdet gradient for singleton penalty blocks (a2).
     //
     // On the exact-dense-spectral path the ρ_k-gradient of `½·log|H|` subtracts
@@ -1079,9 +1116,12 @@ pub(crate) fn reml_laml_evaluate(
                         // The family curvature correction C[v_k] has no paired det
                         // term; add its logdet trace back so the fused value equals
                         // `tr(G_ε·(λ_k S_k + C)) − det1[k]`.
-                        let correction_trace = rho_corrections[idx]
+                        // Reuses the batched `tr(G_ε·C_k)` when it was formed
+                        // above rather than tracing each correction a second time.
+                        let correction_trace = rho_operator_correction_traces
                             .as_ref()
-                            .map(|c| c.trace_logdet(hop))
+                            .and_then(|traces| traces[idx])
+                            .or_else(|| rho_corrections[idx].as_ref().map(|c| c.trace_logdet(hop)))
                             .unwrap_or(0.0);
                         // Integer det derivative ⇒ PROPORTIONAL SINGLETON block
                         // (`log|λ_k S_k|₊ = rank·ρ_k + const`), det term is exactly
@@ -1161,43 +1201,6 @@ pub(crate) fn reml_laml_evaluate(
     //
     // Both ρ and ext coordinates are processed through outer_gradient_entry()
     // so that the three-term formula (penalty + trace − det) is written once.
-
-    // Exact trace batching for operator-backed ρ corrections.  The hot large-scale
-    // GAMLSS path has many Duchon smoothing coordinates whose correction
-    // operators share the same design and spectral factor.  Evaluating them one
-    // by one repeats the same `X·F` projection and row-kernel setup for every
-    // coordinate.  The trace is linear, so split `tr(K·(A_i + C_i))` into the
-    // cheap penalty part plus a batched exact vector of `tr(K·C_i)` values.
-    // This preserves the full first-order gradient (no iteration caps or
-    // stochastic approximation) while collapsing the per-coordinate trace pass.
-    let rho_operator_correction_traces: Option<Vec<Option<f64>>> = if incl_logdet_h
-        && solution.penalty_subspace_trace.is_none()
-    {
-        let pairs: Vec<(usize, Arc<dyn HyperOperator>)> = rho_corrections
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, correction)| match correction {
-                Some(DriftDerivResult::Operator(op)) => Some((idx, Arc::clone(op))),
-                _ => None,
-            })
-            .collect();
-        if pairs.len() >= 2 {
-            hop.as_exact_dense_spectral().map(|ds| {
-                let ops: Vec<Arc<dyn HyperOperator>> =
-                    pairs.iter().map(|(_, op)| Arc::clone(op)).collect();
-                let values = dense_spectral_trace_logdet_operators_batched(ds, &ops);
-                let mut traces = vec![None; k];
-                for ((idx, _), value) in pairs.into_iter().zip(values) {
-                    traces[idx] = Some(value);
-                }
-                traces
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
 
     // #2454: the ρ-block audit needs each entry split into the SAME additive
     // parts the criterion value carries, not just their sum. Computed inside

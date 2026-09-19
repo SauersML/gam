@@ -53,10 +53,21 @@ On main, the rank-zero model runs end to end.
   it, including each channel's support (`joint/emission.rs`). The fit builds
   only the rank-zero specification of its marks, which has no signatures,
   channels or genetic scores, and a reload refuses any other.
-- A follow-up record holds a subject's entry, exit and dated events of
-  recurrent, once-only and terminal marks, and takes no covariates. Its nodes
-  are entry, the distinct event times and exit, and events at one time form
-  one node. A once-only mark fired at or before entry starts outside its risk
+- Every surface hands the model long tables (`joint/data.rs`): subjects
+  `(id, entry, exit)`, events `(id, time, mark)`, and covariate, measurement,
+  visit and genetics tables, with rows in any order. A fit freezes one
+  `FrozenJointSchema`: the mark vocabulary, covariate columns and levels,
+  channels and their families, genetic score names, the visit process, the
+  frozen bases with their penalties and the node resolution. The model saves
+  it, so conditioning and a reloaded model encode a new history exactly as the
+  fit encoded its cohort. Records pass the event-history cohort's own rules.
+  Latent nodes sit at entry, exit and every dated time, and between them where
+  a latent state needs resolving. Each node has a zero-weight anchor and
+  Gauss-Legendre points on its cell; the entry node has only its anchor.
+- The rank-zero model reads subjects and events only, and refuses a
+  covariate, measurement, visit or genetics table by name. Its nodes are
+  entry, the distinct event times and exit, and events at one time form one
+  node. A once-only mark fired at or before entry starts outside its risk
   set, and exposure starts at entry. The fit reads each mark's event count
   `y_d` and at-risk exposure `E_d`, the sufficient statistics of the rank-zero
   complete-path density `sum_d y_d log r_d - E_d r_d`.
@@ -84,7 +95,7 @@ conditioning beyond prevalent once-only marks; the structured state-space
 posterior; reference evolution, `M_d`, its sensitivities and resolution;
 function, decoder and structural priors and the structure models;
 complete-path scores, cohort integrals, coefficient integration and strengths
-beyond the rank-zero `c`; forecasts with signatures; and the table encoder.
+beyond the rank-zero `c`; and forecasts with signatures.
 
 ## State, events, and a positive decoder
 

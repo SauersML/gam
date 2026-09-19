@@ -4885,6 +4885,17 @@ impl DesignMatrix {
         <Self as LinearOperator>::ncols(self)
     }
 
+    /// Cache token naming this design's contents: the shared-`Arc` identity
+    /// ([`DenseDesignMatrix::cache_identity`]) for a dense design, which every
+    /// clone shares, and the value fingerprint for a sparse one, whose address
+    /// is an allocation rather than a matrix (gam#2515).
+    pub fn cache_token(&self) -> usize {
+        match self {
+            Self::Dense(dense) => dense.cache_identity(),
+            Self::Sparse(sparse) => sparse.value_fingerprint() as usize,
+        }
+    }
+
     /// Extract a dense row chunk without materializing the full matrix.
     ///
     /// Returns a `(rows.len(), ncols())` dense `Array2` for the requested row

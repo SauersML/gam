@@ -1510,7 +1510,28 @@ pub fn apply_request_metadata(
 /// dispatch on the request variant, fit, and assemble the persistence payload.
 /// Both front ends (CLI, Python FFI) must route through this function so a fit
 /// requested through any surface produces an identical saved model. (#2470)
+///
+/// An automatic `.` term is expanded against `dataset` first, so the payload
+/// stores (and `model.formula` shows) the formula that was actually fitted, and
+/// the expansion's notes lead the payload's inference notes.
 pub fn fit_formula_to_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+) -> Result<FittedModelPayload, WorkflowError> {
+    let automatic = crate::fit_orchestration::expand_automatic_fit_formula(
+        &formula, dataset, fit_config,
+    )?;
+    let mut payload = fit_expanded_formula_to_payload(automatic.formula, dataset, fit_config)?;
+    if !automatic.notes.is_empty() {
+        let mut notes = automatic.notes;
+        notes.append(&mut payload.inference_notes);
+        payload.inference_notes = notes;
+    }
+    Ok(payload)
+}
+
+fn fit_expanded_formula_to_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,

@@ -578,22 +578,11 @@ impl gam_problem::HyperOperator for DesignTwoBlockRowCoeffOperator {
 }
 
 impl DesignTwoBlockRowCoeffOperator {
-    pub(crate) fn design_cache_token(design: &DesignMatrix) -> usize {
-        match design {
-            // `cache_identity` is the canonical shared-Arc identity for both
-            // materialized and lazy dense designs.
-            DesignMatrix::Dense(dense) => dense.cache_identity(),
-            // A sparse design has no shared-Arc identity; its address is an
-            // allocation, not a matrix (gam#2515), so the token is the values.
-            DesignMatrix::Sparse(sparse) => sparse.value_fingerprint() as usize,
-        }
-    }
-
     pub(crate) fn projected_row_gram_cache_id(&self) -> usize {
         let mut hasher = DefaultHasher::new();
         "DesignTwoBlockRowCoeffOperator::projected_row_gram_triples".hash(&mut hasher);
-        Self::design_cache_token(&self.x_a).hash(&mut hasher);
-        Self::design_cache_token(&self.x_b).hash(&mut hasher);
+        self.x_a.cache_token().hash(&mut hasher);
+        self.x_b.cache_token().hash(&mut hasher);
         self.nrows.hash(&mut hasher);
         self.pa.hash(&mut hasher);
         self.dim.hash(&mut hasher);
