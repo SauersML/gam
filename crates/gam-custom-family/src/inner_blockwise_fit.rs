@@ -2490,8 +2490,8 @@ fn linearized_residual_contraction(
 /// accepted step changes β before several later exits can fire. This fresh
 /// certificate uses the same structural dense materialization required by the
 /// Laplace log-determinant, assembles the complete coefficient-objective
-/// Hessian `H + S + H_Φ + completion`, and tests its inertia in the scale-aware
-/// trust metric. Solver stabilization, reflected curvature, trace-only ridge,
+/// Hessian `H + S + H_Φ + completion`, and tests its inertia in the penalized
+/// joint-diagonal trust metric. Solver stabilization, reflected curvature, trace-only ridge,
 /// and component-wise PSD projections are deliberately excluded.
 pub(crate) fn exact_joint_mode_curvature_certificate<
     F: CustomFamily + Clone + Send + Sync + 'static,
@@ -2534,22 +2534,13 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
             "fresh exact joint-mode curvature certificate requires a joint Hessian".to_string()
         })?,
     };
-    let mut metric = joint_penalty_preconditioner_diag(
+    let metric = joint_penalty_preconditioner_diag(
         &likelihood_hessian.diag().to_owned(),
         ranges,
         s_lambdas,
         0.0,
         joint_bundle,
     );
-    if let Some(floor) = family.joint_trust_metric_block_floor(states, specs)?
-        && floor.len() == metric.len()
-    {
-        for (value, floor_value) in metric.iter_mut().zip(floor.iter()) {
-            if floor_value.is_finite() && *floor_value > *value {
-                *value = *floor_value;
-            }
-        }
-    }
     let mut jeffreys_score: Option<Array1<f64>> = None;
     let jeffreys_curvature = if family.joint_jeffreys_term_required() {
         let z_joint = build_joint_jeffreys_subspace(family, specs, ranges)?.ok_or_else(|| {
