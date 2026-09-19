@@ -48,6 +48,10 @@ def jax_value_grad_from_rust(
     from ._frame_jax import from_numpy_like
 
     jax, jnp = import_jax()
+    # ``import_jax`` hands back the module untyped (it guards the optional
+    # import); bind ``custom_vjp`` from the now-importable package so the
+    # decorator keeps jax's own annotations.
+    from jax import custom_vjp
 
     out_dtype = jnp.float64
     value_spec = jax.ShapeDtypeStruct((), out_dtype)
@@ -68,7 +72,7 @@ def jax_value_grad_from_rust(
             )
         )
 
-    @jax.custom_vjp
+    @custom_vjp
     def _value(x: Any) -> Any:
         return jax.pure_callback(_host_value, value_spec, x)
 
@@ -79,7 +83,9 @@ def jax_value_grad_from_rust(
         return (jax.pure_callback(_host_grad, grad_spec, (res, g)),)
 
     _value.defvjp(_value_fwd, _value_bwd)
-    _value.__name__ = f"jax_penalty_value[{name}]"
+    # ``custom_vjp.__init__`` copies ``__name__`` onto the instance via
+    # ``functools.update_wrapper``, but jax's class annotations do not declare it.
+    _value.__name__ = f"jax_penalty_value[{name}]"  # type: ignore[attr-defined]
 
     value_j = _value(ref)
     # Analytic gradient (no autograd needed) for the second return slot.

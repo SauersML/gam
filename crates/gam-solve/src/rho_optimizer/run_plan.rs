@@ -3638,8 +3638,9 @@ mod run_trial_inner_nonconvergence_retreat_2943_tests;
 /// Is `seed` a prior fit's terminal certificate that is STILL stationary here?
 ///
 /// `Some(cost)` only when all of: the seed is the resumed rho itself; a first
-/// order evaluation succeeds and is finite; and the rail-projected gradient sits
-/// inside the band the outer certificate demands. Anything else is `None` and
+/// order evaluation succeeds and is finite; on a resume attempt
+/// (`OuterConfig::resume_value`) its value agrees with the recorded one; and the
+/// rail-projected gradient sits inside the band the outer certificate demands. Anything else is `None` and
 /// the ordinary seed cascade runs. This refuses by default and never turns an
 /// evaluation failure into an acceptance.
 fn certified_resume_is_already_stationary(
@@ -3666,6 +3667,22 @@ fn certified_resume_is_already_stationary(
     if !eval.cost.is_finite() || eval.gradient.iter().any(|value| !value.is_finite()) {
         return None;
     }
+    // A certificate belongs to a point AND a criterion (gam#3002). A resume
+    // records the value its criterion took at the point; another criterion (a
+    // pilot's, an unarmed evidence fit's, an earlier alternation round's) takes
+    // another value there, and a small projected gradient under it, which a
+    // point railed on its box faces has for many criteria, certifies nothing.
+    if let Some(recorded) = config.resume_value
+        && (eval.cost - recorded).abs()
+            > crate::rho_optimizer::outer_value_agreement_bound(recorded, eval.cost)
+    {
+        log::debug!(
+            "[OUTER] {context}: resumed certificate seed {seed_idx} was certified at \
+             value {recorded:.12e}, this search's criterion is {:.12e} there; declining",
+            eval.cost
+        );
+        return None;
+    }
     let projected = rail_projected_gradient_norm(seed, &eval.gradient, Some(bounds_template));
     let band = outer_gradient_tolerance(config).threshold(eval.cost, projected);
     if projected > band {
@@ -3680,4 +3697,59 @@ fn certified_resume_is_already_stationary(
          stationary (|Pg|={projected:.6e} <= band {band:.6e}); accepting with zero outer iterations"
     );
     Some(eval.cost)
+}
+
+/// A resume attempt (gam#3002, `OuterConfig::resume_value`): accept the prior
+/// fit's certified point `initial_rho` where it stands, or decline.
+///
+/// The point is accepted exactly as the seed loop accepts a still-stationary
+/// terminal certificate, with no outer iteration: certified for this search's
+/// criterion (`certified_resume_is_already_stationary`), then screened by the
+/// analytic certificate and installed as the terminal state, and `run_outer`
+/// mints it as it mints every plan's winner. Anything else declines with an
+/// error. No plan runs, so no reseed, fallback or retry can search from the
+/// point: a declined attempt costs one evaluation, and the caller runs the cold
+/// search from a reset objective.
+pub(crate) fn resume_prior_certificate(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    cap: &OuterCapability,
+    context: &str,
+) -> Result<OuterResult, EstimationError> {
+    let declined = |reason: String| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "{context}: the prior certificate is declined: {reason}"
+        ))
+    };
+    let seed = config
+        .initial_rho
+        .clone()
+        .ok_or_else(|| declined("the resume attempt carries no point".to_string()))?;
+    let the_plan = plan(cap);
+    let bounds_template = outer_search_bounds_template(config, cap.n_params);
+    obj.reset();
+    install_matching_initial_inner_seed(obj, config, &seed, context)?;
+    let cost =
+        certified_resume_is_already_stationary(obj, config, &seed, &bounds_template, 0, context)
+            .ok_or_else(|| {
+                declined("the point is not certified for this search's criterion".to_string())
+            })?;
+    let mut candidate = OuterResult::new(seed, cost, 0, true, the_plan);
+    candidate.origin = OuterResultOrigin::SeedAcceptedWithoutIteration;
+    let result = CertifiedOuterCandidate::from_solver_claim(obj, config, context, candidate)
+        .map_err(|(_, error)| declined(format!("the analytic certificate refused it: {error}")))?
+        .into_result();
+    // Install the accepted point at full inner fidelity, as the seed loop's
+    // winner is installed.
+    let finalize_cap_guard = config
+        .outer_inner_cap
+        .as_ref()
+        .map(FullFidelityInnerCapGuard::lift);
+    if finalize_cap_guard.is_some() {
+        obj.reset();
+    }
+    let finalize_outcome = obj.finalize_outer_result(&result.rho, &the_plan);
+    drop(finalize_cap_guard);
+    finalize_outcome?;
+    Ok(result)
 }
