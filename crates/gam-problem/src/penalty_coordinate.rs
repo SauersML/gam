@@ -58,6 +58,44 @@ pub fn project_block_root_out_of_null_directions(
     (projected, stays_block_local)
 }
 
+/// The diagonal of `RᵀR` when that Gram is diagonal by structure: every row
+/// of the penalty root `R` (rank × width) carries at most one nonzero.
+///
+/// Rows with disjoint supports make every off-diagonal product `R_rj R_rk`
+/// (j ≠ k) exactly zero, so the Gram is `diag(Σ_r R_rj²)`. A random-effect
+/// factor's ridge root has this form, and at thousands of levels the dense
+/// product is an `O(width³)` step whose result is zero off its diagonal. The
+/// structural test reads each entry once, the same scan the diagonal sum
+/// needs; `None` means some row couples two columns.
+pub fn penalty_root_gram_diagonal(root: ArrayView2<'_, f64>) -> Option<Array1<f64>> {
+    let mut diagonal = Array1::<f64>::zeros(root.ncols());
+    for row in root.outer_iter() {
+        let mut support = None;
+        for (col, &value) in row.iter().enumerate() {
+            if value == 0.0 {
+                continue;
+            }
+            if support.is_some() {
+                return None;
+            }
+            support = Some((col, value));
+        }
+        if let Some((col, value)) = support {
+            diagonal[col] += value * value;
+        }
+    }
+    Some(diagonal)
+}
+
+/// `RᵀR` for a penalty root `R`, formed in `O(rank · width)` when
+/// [`penalty_root_gram_diagonal`] finds it diagonal and densely otherwise.
+pub fn penalty_root_gram(root: ArrayView2<'_, f64>) -> Array2<f64> {
+    match penalty_root_gram_diagonal(root) {
+        Some(diagonal) => Array2::from_diag(&diagonal),
+        None => root.t().dot(&root),
+    }
+}
+
 /// A rho-coordinate always contributes
 ///
 ///   A_k = λ_k S_k,
@@ -504,7 +542,7 @@ impl PenaltyCoordinate {
     pub fn scaled_dense_matrix(&self, scale: f64) -> Array2<f64> {
         match self {
             Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
-                let mut out = root.t().dot(root);
+                let mut out = penalty_root_gram(root.view());
                 out *= scale;
                 out
             }
@@ -522,7 +560,7 @@ impl PenaltyCoordinate {
                 ..
             } => {
                 let mut out = Array2::<f64>::zeros((*total_dim, *total_dim));
-                let mut block = root.t().dot(root);
+                let mut block = penalty_root_gram(root.view());
                 block *= scale;
                 out.slice_mut(ndarray::s![*start..*end, *start..*end])
                     .assign(&block);
@@ -537,7 +575,7 @@ impl PenaltyCoordinate {
     pub fn scaled_block_local(&self, scale: f64) -> (Array2<f64>, usize, usize) {
         match self {
             Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
-                let mut out = root.t().dot(root);
+                let mut out = penalty_root_gram(root.view());
                 out *= scale;
                 let p = out.nrows();
                 (out, 0, p)
@@ -548,7 +586,7 @@ impl PenaltyCoordinate {
             | Self::BlockRootCentered {
                 root, start, end, ..
             } => {
-                let mut block = root.t().dot(root);
+                let mut block = penalty_root_gram(root.view());
                 block *= scale;
                 (block, *start, *end)
             }
@@ -671,7 +709,6 @@ impl PenaltyCoordinate {
                 0u8.hash(&mut hasher);
                 root.nrows().hash(&mut hasher); // rank
                 root.ncols().hash(&mut hasher); // block width
-                let sk = root.t().dot(root);
                 // Orthogonal-invariants of the symmetric Sₖ = RₖᵀRₖ: the power
                 // sums Σλ (trace), Σλ² (= ‖Sₖ‖²_F), Σλ³ (tr(Sₖ³)). Each is a
                 // symmetric function of Sₖ's eigenvalues, so they are unchanged
@@ -680,13 +717,22 @@ impl PenaltyCoordinate {
                 // order of the terms. Together with rank and width they form a
                 // strong placement-independent fingerprint without an
                 // eigendecomposition.
-                let n = sk.nrows().min(sk.ncols());
-                let trace1 = (0..n).map(|i| sk[[i, i]]).sum::<f64>();
-                let frob_sq = sk.iter().map(|&x| x * x).sum::<f64>(); // = Σλ²
-                let sk2 = sk.dot(&sk);
-                let trace3 = {
-                    let sk3diag = sk2.dot(&sk);
-                    (0..n).map(|i| sk3diag[[i, i]]).sum::<f64>()
+                // A structurally diagonal Sₖ has its diagonal as spectrum.
+                let (trace1, frob_sq, trace3) = match penalty_root_gram_diagonal(root.view()) {
+                    Some(d) => (
+                        d.sum(),
+                        d.iter().map(|&x| x * x).sum::<f64>(),
+                        d.iter().map(|&x| x * x * x).sum::<f64>(),
+                    ),
+                    None => {
+                        let sk = root.t().dot(root);
+                        let n = sk.nrows().min(sk.ncols());
+                        let trace1 = (0..n).map(|i| sk[[i, i]]).sum::<f64>();
+                        let frob_sq = sk.iter().map(|&x| x * x).sum::<f64>(); // = Σλ²
+                        let sk3diag = sk.dot(&sk).dot(&sk);
+                        let trace3 = (0..n).map(|i| sk3diag[[i, i]]).sum::<f64>();
+                        (trace1, frob_sq, trace3)
+                    }
                 };
                 let mut invariants = [quant(trace1), quant(frob_sq), quant(trace3)];
                 // Power sums are already order-agnostic; sorting is a harmless

@@ -466,6 +466,63 @@ impl HessianFactorization for SparseCholeskyOperator {
         self.trace_hinv_operator(op)
     }
 
+    fn trace_logdet_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        assert_eq!(block.nrows(), end - start);
+        match self.takahashi {
+            // `A_block` shares `H`'s pattern on its block, so every entry of
+            // `H⁻¹` it meets is a selected-inverse lookup.
+            Some(ref taka) => scale * Self::takahashi_block_trace(taka, block, start),
+            None => {
+                let mut full = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+                full.slice_mut(ndarray::s![start..end, start..end])
+                    .scaled_add(scale, block);
+                self.trace_hinv_product(&full)
+            }
+        }
+    }
+
+    fn trace_logdet_block_root(
+        &self,
+        root: ndarray::ArrayView2<'_, f64>,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        assert_eq!(root.ncols(), end - start);
+        let Some(ref taka) = self.takahashi else {
+            let block = root.t().dot(&root);
+            return self.trace_logdet_block_local(&block, 1.0, start, end);
+        };
+        // tr(H⁻¹ RᵀR) = Σ_r r H⁻¹ rᵀ over the rows r of the root, each row
+        // contracted on its own support. A pair (j, k) inside one row's support
+        // is a nonzero of `RᵀR`, hence of `H`, so its `H⁻¹` entry is on the
+        // selected-inverse pattern. A random-effect ridge root (one nonzero
+        // per row) costs one lookup per level instead of forming `RᵀR`.
+        let mut support: Vec<(usize, f64)> = Vec::new();
+        let mut trace = 0.0;
+        for row in root.outer_iter() {
+            support.clear();
+            support.extend(
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &value)| value != 0.0)
+                    .map(|(col, &value)| (start + col, value)),
+            );
+            for (a, &(j, r_j)) in support.iter().enumerate() {
+                trace += r_j * r_j * taka.get(j, j);
+                for &(k, r_k) in &support[a + 1..] {
+                    trace += 2.0 * r_j * r_k * taka.get(j, k);
+                }
+            }
+        }
+        trace
+    }
+
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
         // SAFETY: `self.factor` is the validated SPD Cholesky factor stored
         // at construction time; a triangular solve against an already-built

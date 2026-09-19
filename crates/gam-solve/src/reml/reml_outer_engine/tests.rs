@@ -5543,6 +5543,77 @@ pub(crate) fn sparse_takahashi_trace_hinv_product_pairs_symmetric_lookups() {
     );
 }
 
+/// A random-effect-shaped Hessian: a structurally diagonal level block
+/// `[0, 4)` coupled to two dense fixed-effect columns `[4, 6)`.
+fn random_effect_shaped_hessian() -> Array2<f64> {
+    array![
+        [3.0, 0.0, 0.0, 0.0, 1.0, 0.4],
+        [0.0, 2.5, 0.0, 0.0, 1.0, -0.3],
+        [0.0, 0.0, 4.0, 0.0, 1.0, 0.7],
+        [0.0, 0.0, 0.0, 1.5, 1.0, 0.1],
+        [1.0, 1.0, 1.0, 1.0, 6.0, 0.9],
+        [0.4, -0.3, 0.7, 0.1, 0.9, 3.0],
+    ]
+}
+
+#[test]
+pub(crate) fn sparse_takahashi_block_root_traces_match_dense_reference() {
+    let h = random_effect_shaped_hessian();
+    let h_sparse = gam_linalg_test_support::dense_to_upper_csc(&h);
+    let factor =
+        std::sync::Arc::new(gam_linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap());
+    let sfactor = gam_linalg::sparse_exact::factorize_simplicial(&h_sparse).unwrap();
+    let taka =
+        std::sync::Arc::new(gam_linalg::sparse_exact::TakahashiInverse::compute(&sfactor).unwrap());
+    let sparse = SparseCholeskyOperator::new(factor, 0.0, h.nrows()).with_takahashi(taka);
+    let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+    let embedded = |block: &Array2<f64>, start: usize| {
+        let mut full = Array2::<f64>::zeros(h.raw_dim());
+        let end = start + block.nrows();
+        full.slice_mut(ndarray::s![start..end, start..end])
+            .assign(block);
+        full
+    };
+
+    // A random-effect ridge root (one nonzero per row) on the level block,
+    // whose Gram is diagonal, and a coupling root on the fixed block.
+    let ridge_root = array![
+        [0.0, 1.3, 0.0, 0.0],
+        [0.7, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 2.0],
+        [0.0, 0.0, 0.9, 0.0],
+    ];
+    let ridge_gram = gam_problem::penalty_coordinate::penalty_root_gram(ridge_root.view());
+    assert_eq!(ridge_gram, ridge_root.t().dot(&ridge_root));
+    assert!(
+        gam_problem::penalty_coordinate::penalty_root_gram_diagonal(ridge_root.view()).is_some()
+    );
+    let coupling_root = array![[0.6, -0.4], [0.2, 0.9], [1.1, 0.3]];
+    assert!(
+        gam_problem::penalty_coordinate::penalty_root_gram_diagonal(coupling_root.view())
+            .is_none()
+    );
+
+    for (root, start) in [(&ridge_root, 0usize), (&coupling_root, 4usize)] {
+        let end = start + root.ncols();
+        let block = root.t().dot(root);
+        let reference = dense.trace_hinv_product(&embedded(&block, start));
+        assert_relative_eq!(
+            sparse.trace_logdet_block_root(root.view(), start, end),
+            reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(
+            sparse.trace_logdet_block_local(&block, 1.7, start, end),
+            1.7 * reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+    }
+}
+
 #[test]
 pub(crate) fn hyper_operator_bilinear_view_matches_owned_bilinear() {
     let dense = DenseMatrixHyperOperator {
