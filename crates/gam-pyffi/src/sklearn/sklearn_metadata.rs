@@ -7,7 +7,10 @@
 //! estimator wrapper. The response column comes from the formula DSL's own
 //! `formula_response_column`, the same authority the CLI fit uses.
 
-use gam::terms::inference::formula_dsl::{AUTOMATIC_REST_TERM, formula_response_column};
+use gam::solver::fit_orchestration::formula_columns;
+use gam::terms::inference::formula_dsl::{
+    AUTOMATIC_REST_TERM, formula_response_column, parse_formula,
+};
 use pyo3::prelude::*;
 
 use crate::py_value_error;
@@ -19,13 +22,35 @@ pub(crate) fn sklearn_resolved_formula(formula: &str, target_name: &str) -> Stri
     }
 }
 
-#[pyfunction(signature = (columns, formula, target_column = None, has_external_target = false))]
+/// First name of the form `sample_weight`, `sample_weight_1`, ... that is
+/// neither a table column nor the response, so sklearn `sample_weight`
+/// can be attached to the training table as the prior-weight column.
+fn sklearn_weight_column(columns: &[String], target_name: &str) -> String {
+    let taken = |name: &str| name == target_name || columns.iter().any(|column| column == name);
+    let base = "sample_weight";
+    if !taken(base) {
+        return base.to_string();
+    }
+    (1usize..)
+        .map(|suffix| format!("{base}_{suffix}"))
+        .find(|name| !taken(name))
+        .expect("an unbounded suffix sequence always yields a free name")
+}
+
+#[pyfunction(signature = (
+    columns,
+    formula,
+    target_column = None,
+    has_external_target = false,
+    has_sample_weight = false,
+))]
 pub(crate) fn sklearn_fit_metadata(
     columns: Vec<String>,
     formula: Option<&str>,
     target_column: Option<String>,
     has_external_target: bool,
-) -> PyResult<(String, Vec<String>, String)> {
+    has_sample_weight: bool,
+) -> PyResult<(String, Vec<String>, String, Option<String>)> {
     // No formula is the automatic formula `target ~ .`: the fit expands `.`
     // against the training table's schema in Rust
     // (`gam_terms::inference::automatic_formula`), the same expansion the CLI
@@ -74,10 +99,29 @@ pub(crate) fn sklearn_fit_metadata(
     } else {
         formula.to_string()
     };
-    let feature_names = columns
-        .into_iter()
-        .filter(|column| column != &target_name)
+    let feature_names: Vec<String> = columns
+        .iter()
+        .filter(|column| *column != &target_name)
+        .cloned()
         .collect();
-
-    Ok((fit_formula, feature_names, target_name))
+    // A formula that parses reads a known set of columns; one of them absent
+    // from X is a width/schema mismatch between the formula and the input,
+    // reported against X's feature count. A formula that does not parse is
+    // left to the fit, which reports it with its typed formula error; so is
+    // an automatic `.` formula, which reads whatever columns X has.
+    if let Ok(parsed) = parse_formula(&fit_formula) {
+        let read = formula_columns(&parsed).map_err(|err| py_value_error(err.to_string()))?;
+        if let Some(absent) = read
+            .iter()
+            .find(|name| *name != &target_name && !columns.iter().any(|column| column == *name))
+        {
+            return Err(py_value_error(format!(
+                "formula '{fit_formula}' reads column '{absent}', but X has {} feature(s): {:?}",
+                feature_names.len(),
+                feature_names
+            )));
+        }
+    }
+    let weight_column = has_sample_weight.then(|| sklearn_weight_column(&columns, &target_name));
+    Ok((fit_formula, feature_names, target_name, weight_column))
 }

@@ -109,8 +109,25 @@ fn drive_arc_oracle_at_points_2817(
     hessian: Array2<f64>,
     bounds: (Array1<f64>, Array1<f64>),
     floor: Option<f64>,
-    mut value: impl FnMut(&Array1<f64>) -> f64,
+    value: impl FnMut(&Array1<f64>) -> f64,
 ) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
+    drive_arc_oracle_publishing_2817(points, samples, hessian, bounds, floor, value, None)
+}
+
+/// [`drive_arc_oracle_at_points_2817`] on a route that takes the certificate's
+/// Newton-decrement verdict (#2954): when `verdict` is given, the bridge judges
+/// under its configuration and every evaluation publishes its evidence to the
+/// armed capture, exactly as a REML evaluator publishes its own.
+fn drive_arc_oracle_publishing_2817(
+    points: Vec<Array1<f64>>,
+    samples: Vec<(f64, Array1<f64>)>,
+    hessian: Array2<f64>,
+    bounds: (Array1<f64>, Array1<f64>),
+    floor: Option<f64>,
+    mut value: impl FnMut(&Array1<f64>) -> f64,
+    verdict: Option<(&OuterConfig, crate::estimate::outer_eval_capture::CertificateEvidence)>,
+) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
+    let (verdict_config, published_evidence) = verdict.unzip();
     assert_eq!(points.len(), samples.len(), "one point per scripted sample");
     let point = points[0].clone();
     let table = Arc::new(samples.clone());
@@ -130,6 +147,19 @@ fn drive_arc_oracle_at_points_2817(
         move |_: &mut (), _: &Array1<f64>, order: OuterEvalOrder| {
             let idx = calls.fetch_add(1, Ordering::Relaxed);
             let (cost, gradient) = table[idx.min(table.len() - 1)].clone();
+            if let Some(evidence) = published_evidence.as_ref() {
+                use crate::estimate::outer_eval_capture as capture;
+                capture::record_certificate_parts(&evidence.parts);
+                if let Some(criterion) = evidence.criterion {
+                    capture::record_certificate_criterion(criterion);
+                }
+                if let Some(factor) = evidence.inner_factor {
+                    capture::record_certificate_inner_factor(factor);
+                }
+                if let Some(charge) = evidence.inner_residual {
+                    capture::record_certificate_inner_residual(charge);
+                }
+            }
             Ok(OuterEval {
                 cost,
                 gradient,
@@ -164,6 +194,7 @@ fn drive_arc_oracle_at_points_2817(
         cost_stall: Some(guard),
         cost_stall_bounds: Some(bounds),
         curvature_stationary_floor: floor,
+        decrement_verdict_config: verdict_config,
     };
     let mut outcomes = Vec::new();
     for trial in &points {
@@ -591,6 +622,218 @@ fn a_route_that_declares_no_resolution_is_unchanged_2817() {
         "with no declared resolution every sample reaches the solver: {outcomes:?}"
     );
     assert!(published.is_none_or(|exit| !exit.converged));
+}
+
+// ─── the stop decides on the certificate's verdict (#2954) ──────────────────
+
+/// The size the verdict fixtures declare, as every REML route does.
+const VERDICT_ROWS_2954: usize = 1_000;
+const VERDICT_COEFFICIENTS_2954: usize = 10;
+
+/// [`claim_band_config_2817`] on a route that declares its size, so the
+/// certificate decides stationarity on the Newton-decrement verdict (#2954).
+fn sized_claim_band_config_2954() -> OuterConfig {
+    OuterConfig {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
+            n_obs: Some(VERDICT_ROWS_2954),
+            p_coefficients: Some(VERDICT_COEFFICIENTS_2954),
+        },
+        ..claim_band_config_2817(CLAIM_BAND_2817)
+    }
+}
+
+/// What a one-coordinate REML evaluation at residual `gradient` publishes: the
+/// whole entry in the penalty channel, an exact inner mode, and, when given, the
+/// criterion's channels with the inner factor `log|H_β|` was read from.
+fn published_evidence_2954(
+    gradient: f64,
+    criterion: Option<(
+        crate::estimate::outer_eval_capture::CertificateCriterion,
+        crate::estimate::outer_eval_capture::InnerFactorCondition,
+    )>,
+) -> crate::estimate::outer_eval_capture::CertificateEvidence {
+    use crate::estimate::outer_eval_capture as capture;
+    capture::CertificateEvidence {
+        parts: vec![capture::RhoGradientParts {
+            index: 0,
+            lambda: 0.5f64.exp(),
+            block_quadratic: 0.0,
+            rank: 1,
+            dim: 1,
+            fixed_beta: gradient,
+            logdet_h: 0.0,
+            frozen_logdet_h: 0.0,
+            mode_response_logdet_h: 0.0,
+            logdet_s: 0.0,
+            total: gradient,
+        }],
+        criterion: criterion.map(|(criterion, _)| criterion),
+        inner_factor: criterion.map(|(_, factor)| factor),
+        inner_residual: Some(capture::InnerResidualCharge {
+            energy: 0.0,
+            source: capture::InnerResidualSource::InnerGradient,
+        }),
+    }
+}
+
+/// The flatlined unit-curvature stall of
+/// [`a_flatlined_arc_stall_is_adjudicated_by_the_certificates_own_test_2817`],
+/// on a route that takes the certificate's verdict under `config`.
+fn drive_flat_stall_with_verdict_2954(
+    gradient: f64,
+    config: &OuterConfig,
+    evidence: crate::estimate::outer_eval_capture::CertificateEvidence,
+) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
+    let samples = flatlined_2817(array![gradient], 2 * ARC_COST_STALL_WINDOW + 3);
+    drive_arc_oracle_publishing_2817(
+        vec![array![0.5]; samples.len()],
+        samples,
+        array![[1.0]],
+        wide_box_2817(1),
+        Some(FLOOR_2817),
+        |_| COST_2817,
+        Some((config, evidence)),
+    )
+}
+
+/// The loop does not stop where its certificate refuses (#2954).
+///
+/// [`STOP_GRAD_2817`] against unit curvature is a Newton decrement of `8.45e-5`,
+/// inside `floor·(1 + |V|) = 1.001e-4`, so the curvature-resolvability rung
+/// halts ARC there (the control half, on a route that takes no verdict). A route
+/// that declares its size is certified on the verdict instead, and a criterion
+/// of `V = 1e3` channelled through the penalty alone rounds at `γ₁·|V| ≈ 1e-13`:
+/// the decrement is nine orders outside that band and the certificate refuses
+/// the point by name. The abalone Poisson fit (UCI, 5-fold CV fold 0) was this
+/// split at scale: `|V| = 4.4e4` carries a λ-independent `Σ log y!`, so the old
+/// rung's tolerance was `4.4e-3` against a `band_f` of `5e-8`. Every seed
+/// stopped at `|Pg| ≈ 1e-4`, the screening certificate refused each on
+/// `DecrementAboveTolerance`, and the fit was minted only by the polish after
+/// all three seeds had run.
+#[test]
+fn the_online_stop_declines_a_point_the_certificates_verdict_refuses_2954() {
+    let (control, _) = drive_arc_oracle_2817(
+        array![0.5],
+        flatlined_2817(array![STOP_GRAD_2817], 2 * ARC_COST_STALL_WINDOW + 3),
+        array![[1.0]],
+        wide_box_2817(1),
+        Some(FLOOR_2817),
+    );
+    assert_eq!(
+        control.last().expect("ran").clone().err().as_deref(),
+        Some(ARC_CURVATURE_STATIONARY_SENTINEL),
+        "control: without the verdict the curvature-resolvability rung halts this stall"
+    );
+
+    let config = sized_claim_band_config_2954();
+    let evidence = published_evidence_2954(STOP_GRAD_2817, None);
+    let decision = crate::rho_optimizer::decrement_bands::outer_decrement_verdict(
+        &config,
+        &array![[1.0]],
+        &array![STOP_GRAD_2817],
+        &[],
+        COST_2817,
+        &evidence,
+    )
+    .expect("the fixture publishes everything the verdict needs");
+    assert!(
+        matches!(decision.verdict, opt::DecrementVerdict::DecrementAboveTolerance(_)),
+        "fixture precondition: the certificate refuses this point on its verdict: {:?}",
+        decision.verdict
+    );
+
+    let (outcomes, published) = drive_flat_stall_with_verdict_2954(STOP_GRAD_2817, &config, evidence);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.as_ref().err().map(String::as_str)
+                != Some(ARC_CURVATURE_STATIONARY_SENTINEL)),
+        "a point the certificate's verdict refuses must never be the loop's stationary stop: \
+         {outcomes:?}"
+    );
+    assert!(
+        published.is_none_or(|exit| !exit.converged),
+        "such a point must never be published as converged"
+    );
+}
+
+/// POSITIVE CONTROL: the verdict stops the loop where it certifies.
+///
+/// The criterion's `½·log|H_β|` channel comes from a factor whose forward error
+/// is `1e-4`, which charges `5e-5` to the objective band, inside the resolution
+/// `1.001e-4`. `|g| = 5e-3` is a decrement of `1.25e-5`, inside that band, so the
+/// certificate accepts the point and the loop halts there, above the claim band
+/// the guard reads as KKT-stationary.
+#[test]
+fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
+    const GRADIENT: f64 = 5.0e-3;
+    let config = sized_claim_band_config_2954();
+    let criterion = crate::estimate::outer_eval_capture::CertificateCriterion {
+        cost: COST_2817,
+        fixed_beta: COST_2817 - 1.0,
+        logdet_h: 1.0,
+        logdet_s: 0.0,
+        kkt: 0.0,
+        inner_residual_energy: Some(0.0),
+    };
+    let factor = crate::estimate::outer_eval_capture::InnerFactorCondition {
+        logdet_forward_error: 1.0e-4,
+    };
+    let evidence = published_evidence_2954(GRADIENT, Some((criterion, factor)));
+    let decision = crate::rho_optimizer::decrement_bands::outer_decrement_verdict(
+        &config,
+        &array![[1.0]],
+        &array![GRADIENT],
+        &[],
+        COST_2817,
+        &evidence,
+    )
+    .expect("the fixture publishes everything the verdict needs");
+    assert!(
+        decision.verdict.is_certified(),
+        "fixture precondition: the certificate accepts this point on its verdict: {:?}",
+        decision.verdict
+    );
+    assert!(GRADIENT > CLAIM_BAND_2817, "the stop must not come from the claim band");
+
+    let (outcomes, published) = drive_flat_stall_with_verdict_2954(GRADIENT, &config, evidence);
+    assert_eq!(
+        outcomes.last().expect("ran").clone().err().as_deref(),
+        Some(ARC_CURVATURE_STATIONARY_SENTINEL),
+        "a flatlined stall the certificate's verdict certifies must halt ARC: {outcomes:?}"
+    );
+    let published = published.expect("the halt publishes its point");
+    assert!(published.converged);
+    assert_eq!(published.value, COST_2817);
+}
+
+/// Where no verdict is taken the certificate's `else` branch, the
+/// curvature-resolvability rung, decides, and so does the loop: the same
+/// evidence on a route that declares no size halts where it always did.
+#[test]
+fn where_no_verdict_is_taken_the_curvature_rung_still_decides_2954() {
+    let config = claim_band_config_2817(CLAIM_BAND_2817);
+    let evidence = published_evidence_2954(STOP_GRAD_2817, None);
+    assert_eq!(
+        crate::rho_optimizer::decrement_bands::outer_decrement_verdict(
+            &config,
+            &array![[1.0]],
+            &array![STOP_GRAD_2817],
+            &[],
+            COST_2817,
+            &evidence,
+        )
+        .err(),
+        Some(crate::rho_optimizer::decrement_bands::DecrementVerdictNotTaken::NoProblemSize),
+        "fixture precondition: a route with no declared size takes no verdict"
+    );
+    let (outcomes, published) = drive_flat_stall_with_verdict_2954(STOP_GRAD_2817, &config, evidence);
+    assert_eq!(
+        outcomes.last().expect("ran").clone().err().as_deref(),
+        Some(ARC_CURVATURE_STATIONARY_SENTINEL),
+        "with no verdict taken the curvature-resolvability rung halts this stall: {outcomes:?}"
+    );
+    assert!(published.is_some_and(|exit| exit.converged));
 }
 
 /// The decrement is taken at the resolution its definiteness verdict was taken at.

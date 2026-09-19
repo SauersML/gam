@@ -1,0 +1,18 @@
+import numpy as np, gamfit, time, pandas as pd
+rng=np.random.default_rng(0)
+n=300
+x=rng.uniform(0,1,n); z=rng.uniform(0,1,n)
+f=np.sin(2*np.pi*x)
+y=f+rng.normal(0,0.5,n)
+df=dict(x=x,z=z,y=y)
+t=time.time()
+m=gamfit.fit(df,"y ~ s(x) + s(z)")
+print("fit time",time.time()-t)
+p=m.predict(dict(x=x[:5],z=z[:5]),interval=0.95,observation_interval=True)
+print(type(p)); print(p)
+s=m.summary()
+print(s)
+print([a for a in dir(s) if not a.startswith('_')])
+pd_=m.partial_dependence("s(x)",n_points=5)
+print(pd_)
+print(m.term_blocks)

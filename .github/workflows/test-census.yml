@@ -88,6 +88,19 @@ jobs:
           python scripts/test_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output test-census.json
           python scripts/source_removal_guard.py --base "$BASE_SHA" --head "$HEAD_SHA"
           python scripts/public_api_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output public-api-census.json
+      - name: SPEC ban ratchet
+        # scripts/spec_ban_ledger.tsv lists every known shape-level SPEC
+        # violation (grid, box, jitter, unconverged, magic, fd, gcv,
+        # python-math), each linked to its issue. The positive control plants
+        # one violation per rule; the check demands tree == ledger and that the
+        # ledger only lost lines relative to the base.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python scripts/spec_ban_ratchet.py --positive-control
+          python scripts/spec_ban_ratchet.py --base "$BASE_SHA"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

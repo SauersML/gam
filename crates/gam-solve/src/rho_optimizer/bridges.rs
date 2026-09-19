@@ -2566,6 +2566,14 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// (which is every route with no synchronized analytic Hessian at the
     /// evaluated point). See [`ARC_CURVATURE_STATIONARY_SENTINEL`].
     pub(crate) curvature_stationary_floor: Option<f64>,
+    /// The outer configuration the terminal certificate takes its
+    /// Newton-decrement verdict under (#2954), or `None` on a route that
+    /// takes none. When set, every Hessian evaluation publishes its
+    /// certificate evidence and the online decrement stop decides on that
+    /// verdict exactly as the certificate does, falling back to the
+    /// `floor·(1 + |V|)` rung only where the verdict is not taken. See
+    /// [`Self::curvature_stationary_exit`].
+    pub(crate) decrement_verdict_config: Option<&'a OuterConfig>,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -2689,6 +2697,7 @@ impl OuterSecondOrderBridge<'_> {
         gradient: &Array1<f64>,
         hessian: Option<&Array2<f64>>,
         hessian_psd: Option<bool>,
+        evidence: Option<&crate::estimate::outer_eval_capture::CertificateEvidence>,
     ) -> Option<ObjectiveEvalError> {
         let bounds = self.cost_stall_bounds.clone();
         let separation_bound_stationary = {
@@ -2825,7 +2834,8 @@ impl OuterSecondOrderBridge<'_> {
         // deferral above is unchanged; what follows is the adjudication it was
         // always waiting for and never had.
         if adjudicate_second_order {
-            let verdict = self.curvature_stationary_exit(x, cost, gradient, hessian, hessian_psd);
+            let verdict =
+                self.curvature_stationary_exit(x, cost, gradient, hessian, hessian_psd, evidence);
             if verdict.is_some() {
                 return verdict;
             }
@@ -2857,8 +2867,28 @@ impl OuterSecondOrderBridge<'_> {
     /// has just evaluated (#2817).
     ///
     /// Returns the halt sentinel exactly when this point is one the terminal
-    /// certificate would accept on its curvature-resolvability rung. Every
-    /// input is the certificate's:
+    /// certificate would accept on the rung it decides stationarity on. Where
+    /// the evaluation published its certificate evidence and the route declares
+    /// its size, that rung is the Newton-decrement verdict on rounding bands
+    /// (#2954): `run::outer_decrement_verdict` with the certificate's own face
+    /// (`certificate_railed_coordinates`), read through the same
+    /// `decrement_stationarity_bound`. It stops the run iff the verdict
+    /// certifies (`½λ̂² + band_λ² ≤ band_f`) and refuses every other decided
+    /// verdict, because the certificate refuses them too. Only where that
+    /// verdict is not taken, or is a genuine saddle the certificate leaves to
+    /// its first-order ladder, does the curvature-resolvability rung below
+    /// decide, exactly as the certificate's `else` branch does.
+    ///
+    /// Before this, the loop stopped on the curvature-resolvability rung alone
+    /// while the certificate had moved to the verdict, so the two disagreed by
+    /// the gap between `floor·(1 + |V|)` and `band_f`. On a Poisson REML fit
+    /// whose `V` carries a λ-independent `Σ log y!` of `4.4e4` that gap is five
+    /// orders of magnitude (`4.4e-3` against `5e-8`): every seed of the
+    /// UCI abalone fit stopped at `½gᵀH⁻¹g ≈ 1e-4`, the screening certificate
+    /// refused each one on the verdict, and the fit was minted only by the
+    /// polish after all three seeds had run.
+    ///
+    /// On the curvature-resolvability rung every input is the certificate's:
     ///
     /// * the reduced Hessian on the rail-relaxed free set must be PSD. That is
     ///   the certificate's own `certificate_hessian_is_psd_at_resolution` gate, reached here
@@ -2889,6 +2919,7 @@ impl OuterSecondOrderBridge<'_> {
         gradient: &Array1<f64>,
         hessian: Option<&Array2<f64>>,
         hessian_psd: Option<bool>,
+        evidence: Option<&crate::estimate::outer_eval_capture::CertificateEvidence>,
     ) -> Option<ObjectiveEvalError> {
         let floor = self.curvature_stationary_floor?;
         if hessian_psd != Some(true) || !cost.is_finite() || !floor.is_finite() || floor <= 0.0 {
@@ -2897,20 +2928,71 @@ impl OuterSecondOrderBridge<'_> {
         let hessian = hessian?;
         let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
         let projected = project_gradient_vector(x, gradient, rail_bounds.as_ref());
-        // The decrement travels with the verdict (#2817, #1082). `hessian_psd` was
-        // judged at the criterion's curvature resolution, so a negative eigenvalue
-        // below that resolution is PSD by this point's own standard; taking the
-        // decrement at the arithmetic shift alone would find no factor, and this
-        // exit could never fire at a point its verdict already accepts.
-        let decrement = super::run::newton_predicted_decrease_at_resolution(
-            hessian,
-            &projected,
-            super::run::criterion_curvature_resolution(floor, cost),
-        )?;
-        let tolerance = floor * (1.0 + cost.abs());
-        if !decrement.is_finite() || decrement > tolerance {
-            return None;
-        }
+        let projected_norm = projected.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // #2954: the certificate's verdict, where it is taken, is the rung.
+        let verdict_decided = self
+            .decrement_verdict_config
+            .zip(evidence)
+            .and_then(|(config, evidence)| {
+                match super::decrement_bands::outer_decrement_verdict(
+                    config,
+                    hessian,
+                    &projected,
+                    &certificate_railed_coordinates(x, config),
+                    cost,
+                    evidence,
+                ) {
+                    Ok(decision) => Some(decision),
+                    Err(reason) => {
+                        log::debug!(
+                            "[OUTER] ARC online stop: Newton-decrement verdict not taken: \
+                             {reason}; the curvature-resolvability rung decides (#2954)"
+                        );
+                        None
+                    }
+                }
+            })
+            .and_then(|decision| {
+                super::decrement_bands::decrement_stationarity_bound(
+                    projected_norm,
+                    &decision.verdict,
+                )
+                .map(|(bound, _)| (decision.verdict, bound))
+            });
+        let rung = match verdict_decided {
+            Some((verdict, bound)) => {
+                if !(projected_norm <= bound) {
+                    log::debug!(
+                        "[OUTER] ARC online stop declined: Newton-decrement verdict {verdict:?} \
+                         refuses |Pg|={projected_norm:.3e} against bound {bound:.3e}, as the \
+                         certificate would (#2954)"
+                    );
+                    return None;
+                }
+                format!("Newton-decrement verdict {verdict:?} (bound {bound:.3e})")
+            }
+            None => {
+                // The decrement travels with the verdict (#2817, #1082).
+                // `hessian_psd` was judged at the criterion's curvature
+                // resolution, so a negative eigenvalue below that resolution is
+                // PSD by this point's own standard; taking the decrement at the
+                // arithmetic shift alone would find no factor, and this exit
+                // could never fire at a point its verdict already accepts.
+                let decrement = super::run::newton_predicted_decrease_at_resolution(
+                    hessian,
+                    &projected,
+                    super::run::criterion_curvature_resolution(floor, cost),
+                )?;
+                let tolerance = floor * (1.0 + cost.abs());
+                if !decrement.is_finite() || decrement > tolerance {
+                    return None;
+                }
+                format!(
+                    "Newton ½gᵀH⁻¹g={decrement:.3e} ≤ criterion resolution {tolerance:.3e} \
+                     (= {floor:.3e}·(1+|V|) at |V|={cost:.6e})"
+                )
+            }
+        };
         let guard = self.cost_stall.as_mut()?;
         // The incumbent test. `observe_cost_stall` has already folded this point
         // in, so the guard's best is the minimum over the trajectory INCLUDING
@@ -2921,12 +3003,9 @@ impl OuterSecondOrderBridge<'_> {
         if !(cost <= guard.best_value) {
             return None;
         }
-        let projected_norm = projected.iter().map(|v| v * v).sum::<f64>().sqrt();
         log::debug!(
-            "[OUTER] ARC stopping at the point its own certificate accepts: \
-             Newton ½gᵀH⁻¹g={decrement:.3e} ≤ criterion resolution \
-             {tolerance:.3e} (= {floor:.3e}·(1+|V|) at |V|={cost:.6e}); reduced Hessian \
-             PSD; |Pg|={projected_norm:.3e} after {iters} accepted outer iteration(s). The \
+            "[OUTER] ARC stopping at the point its own certificate accepts: {rung}; reduced \
+             Hessian PSD; |Pg|={projected_norm:.3e} after {iters} accepted outer iteration(s). The \
              absolute gradient band the solver was driven to is a different and unrelated \
              standard (#2817).",
             iters = guard.accepted_iters,
@@ -3146,10 +3225,20 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // of grinding to `max_iter` (#1082/#1237). A typed refusal is an
         // infeasible trial exactly like a non-finite cost, so it feeds the same
         // streak (#2735).
-        let eval = match self
+        //
+        // #2954: the online decrement stop decides on the certificate's verdict,
+        // which reads this evaluation's own parts. The capture is taken before
+        // the error is surfaced, so a failed evaluation leaves it disarmed.
+        let capture_evidence = self.decrement_verdict_config.is_some();
+        if capture_evidence {
+            crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
+        }
+        let evaluated = self
             .obj
-            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
-        {
+            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian);
+        let evidence = capture_evidence
+            .then(crate::estimate::outer_eval_capture::take_certificate_evidence);
+        let eval = match evaluated {
             Ok(eval) => eval,
             Err(err) => {
                 let err = into_line_search_value_probe_error("outer eval failed", err);
@@ -3253,6 +3342,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             &eval.gradient,
             hessian.as_ref(),
             hessian_psd,
+            evidence.as_ref(),
         ) {
             return Err(stop);
         }

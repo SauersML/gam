@@ -68,7 +68,7 @@ use crate::py_value_error;
 /// that `alternative_prefit_loglik` is the (K+1)-atom dictionary fit on shards
 /// **before** this one, evaluated on this shard, and `null_sup_loglik` is the
 /// honest K-atom null refit on this shard.
-#[pyclass(name = "AtomBirthGate", module = "gam_pyffi._rust")]
+#[pyclass(name = "AtomBirthGate", module = "gamfit._rust")]
 pub(crate) struct PyAtomBirthGate {
     gate: AtomBirthGate,
 }

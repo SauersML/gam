@@ -1,0 +1,20 @@
+[run] head_circumference n=7040 gaussian :: y ~ s(age)
+   pygam_default  ok=5/5 dev=2.8282
+   pygam_grid     ok=5/5 dev=2.7707
+   gamfit         ok=5/5 dev=2.8339
+[run] nottem n=240 gaussian :: y ~ s(t) + s(month)
+   pygam_default  ok=5/5 dev=5.5468
+   pygam_grid     ok=5/5 dev=5.57
+   gamfit         ok=5/5 dev=5.4479
+[run] city_temp n=100 gaussian :: y ~ s(lat) + s(lon)
+   pygam_default  ok=5/5 dev=11.702
+   pygam_grid     ok=5/5 dev=10.52
+   gamfit         ok=5/5 dev=11.009
+[run] bike n=1752 gaussian :: y ~ te(season, hour)
+   pygam_default  ok=5/5 dev=0.15215
+   pygam_grid     ok=5/5 dev=0.067336
+   gamfit         ok=5/5 dev=0.16701
+[run] sleepstudy n=180 gaussian :: y ~ s(days) + factor(subj)
+   pygam_default  ok=5/5 dev=2027.9
+   pygam_grid     ok=5/5 dev=2105.9
+   gamfit         ok=5/5 dev=1079.1
