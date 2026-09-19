@@ -235,6 +235,7 @@ __all__ = [
     "interpolate_rows",
     "intervention_calibration_plan",
     "is_multinomial_family_name",
+    "kl_measurement_floor",
     "label_shuffle_permutation",
     "latent_conditional_residual_table",
     "lawley_bartlett_factor",
@@ -1860,6 +1861,8 @@ def interpolate_rows(grid: NDArray[np.float64], surface: NDArray[np.float64], qu
 def intervention_calibration_plan(row_id: NDArray[np.int64], atom: NDArray[np.int64], dose: NDArray[np.float64], nu_hat_1: NDArray[np.float64], nu_hat_2: NDArray[np.float64] | None, nu_measured: NDArray[np.float64], logit_max_abs: NDArray[np.float64], logit_max_abs_change: NDArray[np.float64], group: NDArray[np.int64], is_control: NDArray[np.bool_], layer: int, seed: int, logit_format: str, vocab_size: int, prediction: str, split_seed: int, floor_quantile: float) -> _InterventionCalibrationPlan: ...
 
 def is_multinomial_family_name(family: str) -> bool: ...
+
+def kl_measurement_floor(logit_format: str, vocab_size: int, logit_max_abs: float, logit_max_abs_change: float, control_nats: float) -> dict[Any, Any]: ...
 
 def label_shuffle_permutation(n_rows: int, seed: int, draw: int) -> NDArray[np.uint64]: ...
 

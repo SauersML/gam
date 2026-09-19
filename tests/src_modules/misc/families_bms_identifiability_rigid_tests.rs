@@ -7203,8 +7203,10 @@ fn conditional_latent_gate_silent_without_conditional_structure() {
 
 /// #905/gam#2926: a conditional shift on the span makes the default a moving law —
 /// refused by name when no context covariates are supplied — fitted first on the
-/// location-scale Gaussian arm and certified against the Gaussian, location-scale
-/// empirical and local arms, whose local law tracks the shift by context; and the
+/// simplest admissible location-scale arm and certified against the Gaussian,
+/// location-scale Gaussian and local arms. The residual `ζ = ±0.35/σ` is two-point, so
+/// it fails the adequacy screen and the location-scale Gaussian arm is not a
+/// candidate: the fit starts on the location-scale empirical arm, whose local law tracks the shift by context; and the
 /// declared conditional location-scale law routes the same score to the
 /// conditional correction with an empirical residual law.
 #[test]
@@ -7229,9 +7231,9 @@ fn a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declarat
         ),
     }
 
-    // With the covariate as context the default fits the location-scale Gaussian
-    // arm first, carrying the certificate's candidates, and its local arm tracks
-    // the conditional mean `0.8·c` across the span.
+    // With the covariate as context the default fits the simplest admissible
+    // location-scale arm first, carrying the certificate's candidates, and its local
+    // arm tracks the conditional mean `0.8·c` across the span.
     let policy = LatentZPolicy {
         check_mode: LatentZCheckMode::Off,
         normalization: LatentZNormalizationMode::None,
@@ -7252,18 +7254,18 @@ fn a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declarat
         "rigid latent-law test",
     )
     .unwrap_or_else(|e| panic!("moving latent law failed: {e}"));
-    assert!(matches!(provisional.kind, LatentMeasureKind::StandardNormal));
+    assert!(matches!(provisional.kind, LatentMeasureKind::GlobalEmpirical { .. }));
     assert!(
         matches!(
             provisional.calibration,
             LatentMeasureCalibration::ConditionalLocationScale(_)
         ),
-        "a moving conditional mean must be fitted first on the location-scale Gaussian arm"
+        "a moving conditional mean must be fitted first on a location-scale arm"
     );
     assert!(matches!(
         provisional.consumed,
         LatentLawConsumed::EstimatedMovingLaw {
-            arm: MovingLawArm::LocationScaleGaussian,
+            arm: MovingLawArm::LocationScaleEmpirical,
             certificate: None,
             ..
         }
@@ -7272,6 +7274,15 @@ fn a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declarat
         .moving_law
         .as_ref()
         .unwrap_or_else(|| panic!("a provisional moving law must carry its certificate's candidates"));
+    let location_scale_screen = candidates
+        .screen_of(MovingLawArm::LocationScaleGaussian)
+        .expect("the location-scale Gaussian arm is screened on ζ");
+    assert!(
+        !location_scale_screen.passes(),
+        "a two-point residual must fail the adequacy screen: {}",
+        location_scale_screen.ledger()
+    );
+    assert_eq!(candidates.fitted_arm(), MovingLawArm::LocationScaleEmpirical);
     assert_eq!(
         candidates.arms(),
         &[

@@ -15,6 +15,9 @@ replay = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(replay)
 
 EPS = 2.0**-52
+# Every fixture dose clears a measurement floor this small; the floor pins set their own.
+EVALUATION_BAND = 1e-12
+FLOOR = 1e-9
 FRACTIONS = (0.01, 0.02, 0.05, 0.1, 0.2)
 # (atom, base prompt, split, reference dose, gamma, chord-level scatter eta). The
 # held-out scatter is symmetric about 0, so the mean r0 is exactly 1 in exact
@@ -58,7 +61,6 @@ def _protocol(row_count: int) -> dict[str, object]:
         "harvest_cache_sha256": "cache-hash",
         "seed": 0,
         "fractions": list(FRACTIONS),
-        "floor_multiplier": 30,
         "floor_repetitions": 5,
         "max_templates": 6,
         "bases": 10,
@@ -91,6 +93,8 @@ def _row(
         "resident_metric_nats": predicted * 0.4,
         "resident_metric_nats_kind": "uncertified_approximation",
         "router_topk_changes": 0,
+        "measurement_evaluation_nats": EVALUATION_BAND,
+        "measurement_floor_nats": FLOOR,
     }
 
 
@@ -295,3 +299,66 @@ def test_acceptance_rejects_non_public_or_unstable_rows() -> None:
         ledger["rows"][0]["router_topk_changes"] = value
         with pytest.raises(ValueError, match="router_topk_changes"):
             _report(ledger)
+
+    ledger = _ledger()
+    ledger["rows"][0]["measurement_floor_nats"] = 0.0
+    with pytest.raises(ValueError, match="measurement_floor_nats"):
+        _report(ledger)
+
+
+def _find(ledger: dict[str, object], intervention_id: str) -> dict[str, object]:
+    return next(row for row in ledger["rows"] if row["intervention_id"] == intervention_id)
+
+
+def test_a_negative_kl_within_its_evaluation_band_is_kept_flagged_and_never_clamped() -> None:
+    # A deterministic forward can return a KL negative by roundoff. Chord (1, h3)'s
+    # smallest dose measures -E64/2: it is kept as measured, not clamped to 0, set
+    # aside as not resolving its dose, and the chord's next two doses give its r0.
+    ledger = _ledger()
+    _find(ledger, "1-h3-f0")["measured_nats"] = -0.5 * EVALUATION_BAND
+    validated = {row["intervention_id"]: row for row in replay._validate_ledger(ledger)}
+    assert validated["1-h3-f0"]["measured_nats"] == -0.5 * EVALUATION_BAND
+    report = _report(ledger)
+    assert report["heldout_at_or_under_measurement_floor"] == ["1-h3-f0"]
+    remaining = [validated[f"1-h3-f{k}"] for k in range(1, len(FRACTIONS))]
+    assert report["heldout_chords"]["1:h3"] == replay._chord_extrapolation(remaining)
+
+
+def test_a_kl_below_minus_its_evaluation_band_is_refused() -> None:
+    # A true KL is non-negative and only roundoff within the evaluation band makes a
+    # computed one negative; below it the sign is wrong.
+    ledger = _ledger()
+    _find(ledger, "1-h3-f0")["measured_nats"] = -2.0 * EVALUATION_BAND
+    with pytest.raises(ValueError, match="evaluation band"):
+        _report(ledger)
+
+
+def test_a_dose_resolves_only_strictly_above_its_own_floor() -> None:
+    clean = _report(_ledger())
+    ledger = _ledger()
+    row = _find(ledger, "0-h2-f0")
+    row["measurement_floor_nats"] = row["measured_nats"]
+    at_floor = _report(ledger)
+    assert at_floor["heldout_at_or_under_measurement_floor"] == ["0-h2-f0"]
+    assert at_floor["heldout_chords"]["0:h2"] != clean["heldout_chords"]["0:h2"]
+    row["measurement_floor_nats"] = math.nextafter(float(row["measured_nats"]), 0.0)
+    above = _report(ledger)
+    assert above["heldout_at_or_under_measurement_floor"] == []
+    assert above["heldout_chords"]["0:h2"] == clean["heldout_chords"]["0:h2"]
+
+
+def test_an_unresolved_calibration_dose_does_not_extend_the_calibrated_region() -> None:
+    # Atom 1's lowest calibration dose (c-a at 0.5 x 0.01) does not clear its floor,
+    # so the region starts at the lowest calibration dose that does.
+    ledger = _ledger()
+    row = _find(ledger, "1-c-a-f0")
+    row["measurement_floor_nats"] = 2.0 * float(row["measured_nats"])
+    report = _report(ledger)
+    lowest_resolved = min(
+        reference * fraction
+        for atom, prompt, split, reference, _gamma, _eta in CHORDS
+        if atom == 1 and split == "calibration"
+        for k, fraction in enumerate(FRACTIONS)
+        if (prompt, k) != ("c-a", 0)
+    )
+    assert report["by_atom"]["atom_1"]["calibrated_region_nats"] == [lowest_resolved, 2.0 * 0.2]

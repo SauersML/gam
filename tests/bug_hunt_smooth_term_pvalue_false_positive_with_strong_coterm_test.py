@@ -26,7 +26,7 @@ This is internally contradictory two ways:
   freedom cannot also be "overwhelmingly different from zero";
 * against the model's own exposed covariance — reconstructing the Wald
   quadratic from ``summary().coefficients_frame()`` and
-  ``summary().covariance_flat`` (which is the *corrected* covariance, with
+  ``summary().covariance`` (which is the *corrected* covariance, with
   ``std_error == sqrt(diag(cov))`` exactly) gives a statistic of ~15 spread
   over ~2 reference d.f., with every coefficient z-score ``|beta/se| < 0.6``
   — clearly non-significant.  The engine instead reports ``chi_sq ~ 84``,

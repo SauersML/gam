@@ -1821,7 +1821,7 @@ fn sae_fit_report_into_dict<'py>(
         .collect::<Vec<_>>();
     let geometry_value = serde_json::to_value(geometry_plans)
         .map_err(|error| py_value_error(format!("failed to serialize geometry plans: {error}")))?;
-    out.set_item("geometry_plans", json_value_to_py(py, geometry_value)?)?;
+    out.set_item("geometry_plans", json_value_to_py(py, &geometry_value)?)?;
 
     // Contract keys the python `ManifoldSAE.from_payload` boundary reads
     // unconditionally (tightened in 23db2c80a, which rejected stale payload
@@ -1844,10 +1844,10 @@ fn sae_fit_report_into_dict<'py>(
     let collapse_events = serde_json::to_value(term.collapse_events()).map_err(|error| {
         py_value_error(format!("failed to serialize collapse events: {error}"))
     })?;
-    out.set_item("collapse_events", json_value_to_py(py, collapse_events)?)?;
+    out.set_item("collapse_events", json_value_to_py(py, &collapse_events)?)?;
     // #2023 criterion 3: the fit's migration account on every fit, the nursery's
     // promotions and the structure search's moves, with its `pc_reseed_events`.
-    out.set_item("migration", json_value_to_py(py, migration.to_json())?)?;
+    out.set_item("migration", json_value_to_py(py, &migration.to_json())?)?;
     match structure_search_json {
         Some(json) => out.set_item("structure_search", json)?,
         None => out.set_item("structure_search", py.None())?,
@@ -3161,4 +3161,66 @@ fn intervention_calibration_plan<'py>(
     let inner = prepare_intervention_calibration(&shard, spec)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok(PyInterventionCalibrationPlan { inner })
+}
+
+/// What one KL measurement resolves, in nats, from the one Rust owner
+/// (`kl_measurement_floor`, gh#2263): the float64 evaluation band `E₆₄`, the
+/// measurement band `B`, and the floor `max(B, control_nats)` a measured KL must
+/// exceed to resolve a dose. The logits are of `logit_format` over `vocab_size`
+/// entries, with largest `|logit|` `logit_max_abs` over the clean and patched vectors
+/// and largest `|patched − clean|` `logit_max_abs_change`.
+#[pyfunction]
+fn kl_measurement_floor(
+    py: Python<'_>,
+    logit_format: &str,
+    vocab_size: usize,
+    logit_max_abs: f64,
+    logit_max_abs_change: f64,
+    control_nats: f64,
+) -> PyResult<Py<PyDict>> {
+    use gam::terms::sae::inference::intervention_shard::{
+        LogitFormat, kl_measurement_floor as measurement_floor,
+    };
+
+    let format = logit_format
+        .parse::<LogitFormat>()
+        .map_err(|message: String| py_value_error(message))?;
+    if vocab_size == 0 {
+        return Err(py_value_error(
+            "kl_measurement_floor: vocab_size must be positive".to_string(),
+        ));
+    }
+    for (name, value) in [
+        ("logit_max_abs", logit_max_abs),
+        ("logit_max_abs_change", logit_max_abs_change),
+    ] {
+        if !(value.is_finite() && value >= 0.0) {
+            return Err(py_value_error(format!(
+                "kl_measurement_floor: {name} must be finite and non-negative; got {value}"
+            )));
+        }
+    }
+    if logit_max_abs_change > 2.0 * logit_max_abs {
+        return Err(py_value_error(format!(
+            "kl_measurement_floor: a logit change of {logit_max_abs_change} exceeds twice the \
+             largest |logit| {logit_max_abs}"
+        )));
+    }
+    if !control_nats.is_finite() {
+        return Err(py_value_error(format!(
+            "kl_measurement_floor: control_nats must be finite; got {control_nats}"
+        )));
+    }
+    let floor = measurement_floor(
+        format,
+        vocab_size,
+        logit_max_abs,
+        logit_max_abs_change,
+        control_nats,
+    );
+    let out = PyDict::new(py);
+    out.set_item("evaluation_band_nats", floor.evaluation_band_nats)?;
+    out.set_item("measurement_band_nats", floor.measurement_band_nats)?;
+    out.set_item("floor_nats", floor.floor_nats)?;
+    Ok(out.unbind())
 }

@@ -1488,12 +1488,12 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
         "implicit {label} centers must retain Auto provenance"
     );
     assert!(
-        raw_centers > starting_num_centers(data.values.nrows(), 1),
+        raw_centers >= starting_num_centers(data.values.nrows(), 1, 2),
         "{label} formula default must retain its derived univariate resolution floor"
     );
 
     let initial_config = FitConfig {
-        spatial_center_counts: Some(Vec::new()),
+        adaptive_resolution: Some(Vec::new()),
         ..FitConfig::default()
     };
     let initial = materialize(formula, &data, &initial_config)
@@ -1518,7 +1518,9 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
         "test data must leave room for a genuine {label} growth proposal"
     );
     let growth_config = FitConfig {
-        spatial_center_counts: Some(vec![Some(proposed_centers)]),
+        adaptive_resolution: Some(vec![Some(
+            gam_terms::smooth::AdaptiveResolution::Centers(proposed_centers),
+        )]),
         ..FitConfig::default()
     };
     let grown = materialize(formula, &data, &growth_config)
@@ -1556,7 +1558,9 @@ fn matern_is_excluded_from_generic_adaptive_center_growth() {
         formula,
         &data,
         &FitConfig {
-            spatial_center_counts: Some(vec![Some(raw_centers.saturating_mul(2))]),
+            adaptive_resolution: Some(vec![Some(
+                gam_terms::smooth::AdaptiveResolution::Centers(raw_centers.saturating_mul(2)),
+            )]),
             ..FitConfig::default()
         },
     )
@@ -1594,7 +1598,7 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     let raw_centers = raw_spec.center_strategy.planned_num_centers(2);
 
     let adaptive_config = FitConfig {
-        spatial_center_counts: Some(Vec::new()),
+        adaptive_resolution: Some(Vec::new()),
         ..FitConfig::default()
     };
     let adaptive = materialize("y ~ duchon(ct, st)", &data, &adaptive_config)
@@ -1612,16 +1616,13 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     let adaptive_centers = adaptive_spec.center_strategy.planned_num_centers(2);
     assert_eq!(
         adaptive_centers,
-        starting_num_centers(data.values.nrows(), 2)
+        starting_num_centers(data.values.nrows(), 2, 3)
     );
-    // #1757 made the IMPLICIT 2-D Duchon default the low-rank thin-plate
-    // representer rank `10 * 3^(d - 1)`, which is where `starting_num_centers`
-    // starts the adaptive pilot while the sample holds at most eight rows per
-    // pilot center (240 rows in 2-D; above that the pilot grows at the
-    // production budget's `n^0.4` rate, #1561). At this 72-row fixture the raw
-    // default and the pilot start therefore COINCIDE — so the
-    // `raw_centers > adaptive_centers` this replaces was unsatisfiable rather
-    // than merely unmet, and could not have distinguished the two paths.
+    // #1757 made the IMPLICIT 2-D Duchon default low-rank; that rank is the
+    // rate-derived pilot `starting_num_centers(n, d, nullspace)` — the affine
+    // null space plus the penalized resolution rank at `n` rows — which is
+    // also where the adaptive pilot starts. The raw default and the pilot
+    // start therefore COINCIDE at every n.
     // What separates them is the grow CEILING, not the start: only the
     // orchestrated request has an owner that may escalate toward
     // `default_num_centers`, and the raw request stays pinned at the low-rank
@@ -1653,15 +1654,12 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     assert!(!center_strategy_is_auto(&explicit_spec.center_strategy));
 
     // Second arm, at an n where the `n / COND_N_DIVISOR` conditioning cap in
-    // `default_num_centers` no longer binds: the low-rank rule `10 * 3^(d - 1)`
-    // is then STRICTLY below the production ceiling, so the orchestrator's grow
-    // loop has something to escalate. At the 72-row fixture above both numbers
-    // collapse onto the conditioning cap and the headroom is legitimately zero,
-    // which is why the strict statement needs its own, larger, fixture rather
-    // than a wider bar on the small one.
+    // `default_num_centers` no longer binds: the rate pilot is then STRICTLY
+    // below the production ceiling, so the orchestrator's grow loop has
+    // something to escalate.
     let wide = duchon_workflow_dataset_with_rows(200);
     let wide_rows = wide.values.nrows();
-    let low_rank_representer_rank = 10usize * 3usize.pow(1);
+    let low_rank_representer_rank = starting_num_centers(wide_rows, 2, 3);
     let wide_raw = materialize("y ~ duchon(ct, st)", &wide, &FitConfig::default())
         .expect("raw Duchon materialization at 200 rows");
     let FitRequest::Standard(wide_raw_request) = wide_raw.request else {
@@ -1677,12 +1675,7 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     assert_eq!(
         wide_raw_spec.center_strategy.planned_num_centers(2),
         low_rank_representer_rank,
-        "the implicit 2-D Duchon default is the low-rank representer rank (#1757)"
-    );
-    assert_eq!(
-        starting_num_centers(wide_rows, 2),
-        low_rank_representer_rank,
-        "the adaptive pilot start uses the same low-rank rule"
+        "the implicit 2-D Duchon default is the rate-derived low-rank pilot (#1757)"
     );
     assert!(
         default_num_centers(wide_rows, 2) > low_rank_representer_rank,
