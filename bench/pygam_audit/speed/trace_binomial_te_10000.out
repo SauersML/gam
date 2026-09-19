@@ -1,0 +1,11 @@
+fit wall=132.267 cpu=29.988
+GAM fitted model
+  Formula: y ~ te(x0, x1)
+  Family:  Binomial Logit
+  Class:   standard
+  Training rows: 10000
+  Deviance: 12627.8
+  REML score: 6382.35
+  Effective dof: 34.3415
+  Outer iterations: 11
+  Coefficients: 49

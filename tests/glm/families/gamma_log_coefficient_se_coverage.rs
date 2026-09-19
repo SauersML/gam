@@ -112,7 +112,6 @@ fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Option<Vec<(
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )

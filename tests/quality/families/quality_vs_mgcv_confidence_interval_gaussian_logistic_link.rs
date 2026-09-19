@@ -136,7 +136,6 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
                 edgeworth_one_sided: false,
                 boundary_correction: false,
                 ood_inflation: false,
-                multi_point_joint: false,
                 ..PredictUncertaintyOptions::default()
             };
             let offset = Array1::zeros(N);
