@@ -44,6 +44,7 @@ import psutil
 
 from . import report
 from .plans import PLANS, Cell, Plan, threads_label
+from .worker import supports
 
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "worker.py"
@@ -198,32 +199,12 @@ def run_isolated(
     ``memcap`` when the safety net killed the process tree, or ``crash`` when
     it exited without a RESULT line), ``returncode``, ``proc_wall_s``,
     ``peak_tree_rss_mb``, ``peak_threads``, ``load_start``/``load_end`` and,
-    for any status but ``ok``, ``stderr_tail``.
+    for any status but ``ok``, ``stderr_tail``. Shared with
+    ``bench/convergence_fuzz`` and ``bench/real_data``.
     """
     load_start = os.getloadavg()
     run = police(cmd, cwd, timeout_s, memcap_mb, threads, env_extra)
     status = run.status
-    rec: dict[str, Any] = {}
-    if status == "ok":
-        for line in run.stdout.splitlines():
-            if line.startswith("RESULT "):
-                rec = json.loads(line[len("RESULT ") :])
-        if not rec:
-            status = "crash"
-        else:
-            status = str(rec.get("status", "error"))
-    rec.update(
-        status=status,
-        returncode=run.returncode,
-        proc_wall_s=run.wall_s,
-        peak_tree_rss_mb=run.peak_tree_rss_mb,
-        peak_threads=run.peak_threads,
-        load_start=list(load_start),
-        load_end=list(os.getloadavg()),
-    )
-    if status != "ok":
-        rec["stderr_tail"] = run.stderr[-2000:]
-    return rec
     rec: dict[str, Any] = {}
     if status == "ok":
         for line in run.stdout.splitlines():
@@ -341,8 +322,9 @@ def run_plan(
         records_path.open("w") as fh,
     ):
         for cell in plan.cells:
+            libs = [lib for lib in plan.libs if supports(lib, cell.family)]
             for rep in range(plan.reps):
-                for lib in plan.libs:
+                for lib in libs:
                     key = (
                         lib,
                         cell.family,
