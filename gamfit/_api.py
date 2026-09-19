@@ -183,7 +183,7 @@ def cross_fit_shared_precision_groups(
     model_payloads: list[dict[str, Any]] = []
     for key, model in model_items:
         try:
-            state_json = rust.coefficient_state_json(model._model_bytes)
+            state_json = rust.coefficient_state_json(model._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
         model_payloads.append({"key": key, "state_json": state_json})
@@ -273,10 +273,9 @@ def _build_fit_payload(
     *,
     family: str,
     negative_binomial_theta: float | None,
-    expectile_tau: float | None,
+    expectile_tau: float | Sequence[float] | None,
     offset: str | None,
     weights: str | None,
-    persistent_warm_start_root: str | Path | None,
     transformation_normal: bool | None,
     transformation_normal_stage1: Any | None = None,
     survival_likelihood: str | None,
@@ -318,7 +317,13 @@ def _build_fit_payload(
             payload["ctn_stage1"] = recipe.native_document()
     kwarg_items: dict[str, Any] = {
         "negative_binomial_theta": negative_binomial_theta,
-        "expectile_tau": expectile_tau,
+        # One level, or a strictly increasing sequence fitted jointly; a
+        # sequence rides the JSON document as a list.
+        "expectile_tau": (
+            expectile_tau
+            if expectile_tau is None or isinstance(expectile_tau, (int, float))
+            else [float(tau) for tau in expectile_tau]
+        ),
         "transformation_normal": transformation_normal,
         "survival_likelihood": survival_likelihood,
         "survival_time_anchor": survival_time_anchor,
@@ -336,11 +341,6 @@ def _build_fit_payload(
         "frailty_kind": frailty_kind,
         "frailty_sd": frailty_sd,
         "hazard_loading": hazard_loading,
-        "persistent_warm_start_root": (
-            None
-            if persistent_warm_start_root is None
-            else str(persistent_warm_start_root)
-        ),
         "scale_dimensions": scale_dimensions,
         "firth": firth,
         "noise_formula": noise_formula,
@@ -487,7 +487,7 @@ def _normalize_smooths(
             # On the formula `smooths={}` descriptor path the gating variable
             # is named by data-frame column (resolved to a `by_col` in the Rust
             # merge, identical to `s(x, by=g)`). A raw per-row `by` *array* is
-            # the contract of the primitive numpy API (`gamfit.duchon_basis`,
+            # the contract of the primitive numpy API (`gamfit.basis.duchon_basis`,
             # ... — `crates/gam-pyffi/src/model_ffi.rs`), which has no data
             # frame to name. Reject it loudly here rather than mis-serialize.
             raise ValueError(
@@ -602,16 +602,15 @@ def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
         raise map_exception(exc) from exc
 
 
-MULTINOMIAL_FAMILY_NAMES = frozenset(
-    {"multinomial", "multinomial-logit", "categorical", "categorical-logit", "softmax"}
-)
-
-
 def is_multinomial_family(family: str | None) -> bool:
-    """Whether ``family`` names the softmax (multinomial-logit) likelihood."""
+    """Whether ``family`` names the softmax (multinomial-logit) likelihood.
+
+    The spelling list lives in the engine (the predicate ``fit`` and the CLI
+    route on); this only forwards to it.
+    """
     if family is None:
         return False
-    return str(family).lower().replace("_", "-") in MULTINOMIAL_FAMILY_NAMES
+    return bool(rust_module().is_multinomial_family_name(str(family)))
 
 
 @overload
@@ -624,7 +623,6 @@ def fit(
     expectile_tau: float | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
-    persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
@@ -668,10 +666,9 @@ def fit(
     *,
     family: str = ...,
     negative_binomial_theta: float | None = ...,
-    expectile_tau: float | None = ...,
+    expectile_tau: float | Sequence[float] | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
-    persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
@@ -715,10 +712,9 @@ def fit(
     *,
     family: str = ...,
     negative_binomial_theta: float | None = ...,
-    expectile_tau: float | None = ...,
+    expectile_tau: float | Sequence[float] | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
-    persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
@@ -761,10 +757,9 @@ def fit(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
-    persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
@@ -802,7 +797,7 @@ def fit(
     """Fit a GAM model from a formula and tabular data.
 
     Manifold sparse autoencoders have their own explicit
-    :func:`gamfit.sae_manifold_fit` front door.  Keeping the two fit contracts
+    :func:`gamfit.sae.sae_manifold_fit` front door.  Keeping the two fit contracts
     separate prevents a missing formula from silently selecting an unrelated
     model family.
 
@@ -817,8 +812,12 @@ def fit(
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
-        ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
-        ``"negbin"`` / ``"nb"``. Binomial/Bernoulli link spellings accept
+        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
+        ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
+        ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
+        estimated by LAML jointly with the smoothing parameters; the fitted
+        values are reported as ``student_t_sigma`` / ``student_t_nu``).
+        Binomial/Bernoulli link spellings accept
         ``"-logit"``, ``"-probit"``, ``"-cloglog"``, or mgcv-style
         parentheses such as ``"bernoulli(probit)"``. Specialized values include
         ``"gaussian-location-scale"`` when ``noise_formula`` is supplied,
@@ -838,17 +837,18 @@ def fit(
         This is the Python spelling of CLI ``--negative-binomial-theta`` and
         the shared request field ``negative_binomial_theta``.
     expectile_tau:
-        Optional target in the open interval ``(0, 1)`` for
-        ``family="expectile"``. This is the Python spelling of CLI
-        ``--expectile-tau`` and the shared request field ``expectile_tau``.
+        Optional expectile level in the open interval ``(0, 1)`` for
+        ``family="expectile"``, or a strictly increasing sequence of levels.
+        Passing it with any other family raises.
+        A sequence is fitted jointly as one location-scale model whose level
+        curves ``mu(x) + c_tau * E[sigma(x)]`` never cross; ``predict`` then
+        returns an ``(n, K)`` array with one column per level. This is the
+        Python spelling of CLI ``--expectile-tau`` (comma-separated) and the
+        shared request field ``expectile_tau``.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:
         Name of the observation-weight column. Corresponds to ``--weights-column``.
-    persistent_warm_start_root:
-        Explicit directory for cross-process solver warm starts. Persistence is
-        disabled when omitted. The directory is used exactly as supplied; no
-        environment or platform cache directory is consulted.
     transformation_normal:
         Fit a conditional transformation-normal model (``h(Y|x) ~ N(0,1))``).
         Corresponds to ``--transformation-normal``.
@@ -993,16 +993,21 @@ def fit(
     constraints:
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
-        ``"s(x)"`` or ``"s(x, type=duchon, centers=8)"``; whitespace
-        differences are ignored). Values are one of ``"monotone_increasing"``,
-        ``"monotone_decreasing"``, ``"convex"``, ``"concave"``, or
-        ``"none"`` / ``None`` for the default unconstrained fit. Shape
-        constraints are enforced by the inner solver as joint linear
-        inequalities ``A·β ≥ b`` on the coefficient vector; when active at
-        convergence the outer REML score uses the tangent-projected LAML
-        formulation. This is the same functionality exposed by mgcv's
-        ``scop=...`` argument and the ``scam`` R library. Currently restricted
-        to univariate 1D B-spline / thin-plate / Duchon smooths.
+        ``"s(x)"`` or ``"s(x, k=12)"``; whitespace differences are ignored).
+        Values take the same forms as ``shape=`` in the formula: one of
+        ``"monotone_increasing"``, ``"monotone_decreasing"``, ``"convex"``,
+        ``"concave"``, or ``"none"`` / ``None`` for the default
+        unconstrained fit; a list of atoms that must all hold
+        (``["monotone_increasing", "concave"]``); or, for a ``te()`` term,
+        one entry per margin (``["monotone_increasing", None]``). The
+        mapping is rewritten into the formula option ``shape=...``. The
+        constraint is exact on the B-spline control polygon (``β = C·γ``
+        with ``γ ≥ 0`` for one shape, inequality rows ``A·β ≥ 0`` for a list
+        or a tensor margin), so it holds everywhere on the knot range, and
+        the term stays centred like an unconstrained smooth. Supported on
+        open 1-D B-spline ``s(x)`` smooths, ``te()`` tensor products of
+        them, and either of those with ``by=``; see ``docs/formulas.md``
+        (Shape-constrained smooths) and ``Smooth.shape_constraint``.
 
         Example::
 
@@ -1010,24 +1015,24 @@ def fit(
                        constraints={"s(x)": "monotone_increasing"})
     config:
         Request fields that have no dedicated keyword, such as
-        ``group_metadata`` or ``precompute_conformal``. A key that
+        ``group_metadata``. A key that
         duplicates a dedicated keyword is refused.
     latents:
-        Mapping from formula symbol to :class:`gamfit.LatentCoord`. This is
+        Mapping from formula symbol to :class:`gamfit.smooth.LatentCoord`. This is
         the standard fit API surface for per-row latent coordinates. The Rust
         standard workflow maps the named formula smooth onto the latent
         coordinate matrix and optimizes it jointly with the REML parameters.
     penalties:
-        Analytic penalty wrappers such as :class:`gamfit.OrthogonalityPenalty`
-        or :class:`gamfit.ARDPenalty`, targeted at latent block names declared
+        Analytic penalty wrappers such as :class:`gamfit.penalties.OrthogonalityPenalty`
+        or :class:`gamfit.penalties.ARDPenalty`, targeted at latent block names declared
         in ``latents``. The Rust-backed public wrappers also
         include the SAE/assignment family
-        (:class:`gamfit.SoftmaxAssignmentSparsityPenalty`,
-        :class:`gamfit.OrderedBetaBernoulliPenalty`,
-        :class:`gamfit.TopKActivationPenalty`,
-        :class:`gamfit.SmoothThresholdPenalty`) and newer structured penalties such
-        as :class:`gamfit.ScadMcpPenalty` and
-        :class:`gamfit.NuclearNormPenalty`. ``penalties=`` is not for smooth
+        (:class:`gamfit.penalties.SoftmaxAssignmentSparsityPenalty`,
+        :class:`gamfit.penalties.OrderedBetaBernoulliPenalty`,
+        :class:`gamfit.penalties.TopKActivationPenalty`,
+        :class:`gamfit.penalties.SmoothThresholdPenalty`) and newer structured penalties such
+        as :class:`gamfit.penalties.ScadMcpPenalty` and
+        :class:`gamfit.penalties.NuclearNormPenalty`. ``penalties=`` is not for smooth
         basis descriptors; pass those through ``smooths=``.
     smooths:
         Optional mapping from formula symbol to :class:`gamfit.smooth.Smooth`
@@ -1082,9 +1087,12 @@ def fit(
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
         # Python only marshals the mapping across the FFI.
+        from .smooth import shape_constraint_text
+
         try:
             formula = rust_module().apply_shape_constraints_to_formula(
-                formula, [(str(k), str(v)) for k, v in constraints.items()]
+                formula,
+                [(str(k), shape_constraint_text(v)) for k, v in constraints.items()],
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -1130,7 +1138,6 @@ def fit(
             coordinates=response_coordinates,
             reference=-1 if response_reference is None else int(response_reference),
             weights=weights,
-            persistent_warm_start_root=persistent_warm_start_root,
             fisher_rao_w=fisher_rao_w,
             scale_dimensions=scale_dimensions,
             firth=firth,
@@ -1150,7 +1157,6 @@ def fit(
         expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
-        persistent_warm_start_root=persistent_warm_start_root,
         transformation_normal=transformation_normal,
         transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
@@ -1189,38 +1195,6 @@ def fit(
     headers, rows, table_kind = normalize_table(data, required_columns=required_columns)
     payload["training_table_kind"] = table_kind
 
-    # ── Vector-response (multinomial-logit) dispatch (#328). ──────────────
-    # The scalar `fit_table` payload pipeline is parameterised by a single
-    # `ResponseFamily × InverseLink` likelihood spec; multinomial-logit
-    # carries K-1 active linear predictors and a per-row dense Fisher block,
-    # which the scalar pipeline cannot represent. Routing here keeps the
-    # high-level Python API uniform — `gamfit.fit(data, formula,
-    # family='multinomial')` returns a `MultinomialModel` — while the
-    # underlying Rust entry is a dedicated formula→design→REML path that
-    # bypasses the workflow.rs `FitRequest::Standard` materialiser. The Rust
-    # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
-    # to select an independent smoothing parameter per (class, term), from the
-    # same `MultinomialFitRequest::new` defaults the CLI uses.
-    if is_multinomial_family(family):
-        if warm_start_bytes is not None:
-            raise ValueError("warm_start_from is not supported for multinomial fits")
-        try:
-            model_bytes = bytes(
-                rust_module().fit_multinomial_formula_pyfunc(
-                    headers,
-                    rows,
-                    formula,
-                    json.dumps(payload),
-                )
-            )
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        from ._model import MultinomialModel
-        return MultinomialModel(
-            _model_bytes=model_bytes,
-            _training_table_kind=table_kind,
-        )
-
     fisher_w = None
     if fisher_rao_w is not None:
         fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
@@ -1232,11 +1206,18 @@ def fit(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
+    # `fit_table` routes the multinomial-logit family (every spelling the
+    # engine accepts) to its vector-response driver; the payload header names
+    # which model it built.
+    if rust_module().saved_model_kind(model_bytes) == "multinomial":
+        from ._model import MultinomialModel
+
+        return MultinomialModel(_model_bytes=model_bytes, _training_table_kind=table_kind)
     model = Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
     # Surface any materialization advisories (e.g. an mgcv-style "k reduced to
     # the data support" note when a cr/cs/sz basis is capped) as warnings, so a
     # basis the fit silently adjusted is never silent to the caller (#1543).
-    emit_inference_warnings(model.notes)
+    emit_inference_warnings(model._fit_notes()[0])
     return model
 
 
@@ -1247,10 +1228,9 @@ def fit_array(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
-    persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
@@ -1317,7 +1297,6 @@ def fit_array(
         expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
-        persistent_warm_start_root=persistent_warm_start_root,
         transformation_normal=transformation_normal,
         transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
@@ -1355,7 +1334,7 @@ def fit_array(
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
-    emit_inference_warnings(model.notes)  # see fit(): never silently adjust a basis (#1543)
+    emit_inference_warnings(model._fit_notes()[0])  # see fit(): never silently adjust a basis (#1543)
     return model
 
 
@@ -1394,7 +1373,7 @@ def model_from_dict(payload: Any) -> ManifoldSAE | ManifoldSAESupport:
 
 
 def load(path: str | Path) -> LoadedModel:
-    """Load a fitted model previously written with :func:`gamfit.save`.
+    """Load a fitted model previously written with its ``save(path)`` method.
 
     Reads the file and dispatches through :func:`loads`.
 
@@ -1414,21 +1393,6 @@ def load(path: str | Path) -> LoadedModel:
     >>> model.predict(test_df)
     """
     return loads(Path(path).read_bytes())
-
-
-def save(model: Any, path: str | Path) -> None:
-    """Write a fitted model to ``path``. Symmetric with :func:`gamfit.load`.
-
-    Dispatches to ``model.save(path)`` for any object that exposes the method
-    (covers :class:`Model` binary archives and :class:`ManifoldSAE` JSON
-    payloads alike).
-    """
-    saver = getattr(model, "save", None)
-    if not callable(saver):
-        raise TypeError(
-            f"gamfit.save: {type(model).__name__} has no .save(path) method"
-        )
-    saver(path)
 
 
 def loads(model_bytes: bytes) -> LoadedModel:
@@ -1475,13 +1439,7 @@ def loads(model_bytes: bytes) -> LoadedModel:
             _model_bytes=model_bytes,
             _training_table_kind=str(metadata["training_table_kind"]),
         )
-    try:
-        training_table_kind = rust_module().required_saved_model_payload_string(
-            model_bytes, "training_table_kind"
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes, _training_table_kind=training_table_kind)
+    return Model(_model_bytes=model_bytes)
 
 
 def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeometryModel:
@@ -1547,10 +1505,9 @@ def validate_formula(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
-    persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
@@ -1594,7 +1551,6 @@ def validate_formula(
         expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
-        persistent_warm_start_root=persistent_warm_start_root,
         transformation_normal=transformation_normal,
         transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
@@ -1661,7 +1617,7 @@ def explain_error(exc: BaseException) -> str:
     --------
     >>> try:
     ...     gamfit.fit(df, "y ~ s(nope)")
-    ... except gamfit.GamError as exc:
+    ... except gamfit.errors.GamError as exc:
     ...     print(gamfit.explain_error(exc))
     Check the formula syntax and confirm every referenced column exists.
     """
@@ -1726,7 +1682,8 @@ def bspline_basis(
     ``knots`` may be:
 
     * ``None`` — auto-derive a clamped knot vector with quantile-spaced
-      interior knots inferred from ``t`` (10 interior knots).
+      interior knots, sized by the formula default, so the basis has the
+      columns ``s(x)`` builds on the same ``t``.
     * an ``int`` ``K`` — auto-derive with ``K`` interior knots.
     * an array-like — used verbatim (must be a valid clamped knot vector).
 
@@ -1819,8 +1776,9 @@ def duchon_basis(
     ----------
     points : array-like of shape (N, d) — N evaluation points in d-dim.
         For 1D, pass shape (N, 1) or a 1D array (auto-promoted).
-    centers : array-like of shape (K, d), or ``None`` (auto: K=10 quantile
-        centers for d=1), or an ``int`` K (auto-quantile centers, d=1 only).
+    centers : array-like of shape (K, d), or ``None`` (auto: the formula
+        ``duchon(x)`` default center count for d=1), or an ``int`` K
+        (auto-quantile centers, d=1 only).
     m : int, default 2 — spline order.
     periodic_per_axis : sequence of bool of length d, optional. For ``d=1``
         the Bernoulli-Green builder is used (true Green's function on the
@@ -2762,7 +2720,7 @@ def gaussian_reml_fit_latent(
     :func:`gaussian_reml_optimize_latent`, which wraps this solve in a
     spectral-seeded outer optimization over ``t``.
 
-    This is the low-level array API behind :class:`gamfit.LatentCoord`: each
+    This is the low-level array API behind :class:`gamfit.smooth.LatentCoord`: each
     row has a latent coordinate ``t_n ∈ R^d`` and the fitted mean is
 
     .. math::
@@ -3019,7 +2977,7 @@ def gaussian_reml_optimize_latent(
 
     A fit is only ever returned from a *converged* optimization (SPEC rule 20).
     If the relative stationarity measure does not reach ``grad_tol`` within the
-    iteration budget, this raises :class:`gamfit.RemlConvergenceError` instead
+    iteration budget, this raises :class:`gamfit.errors.RemlConvergenceError` instead
     of returning a degraded payload. The exception carries the evidence as
     attributes (``grad_t_norm``, ``grad_t_norm_init``, ``grad_t_norm_scaled``,
     ``grad_tol``, ``latent_t_std``, ``objective_value``, ``max_iter``,
@@ -3759,48 +3717,31 @@ def _numeric_array(values: Any, label: str) -> Any:
     return arr
 
 
-# Default number of basis functions when the caller does not pin centers /
-# knots themselves. Matches mgcv's ``k = 10`` convention. The actual
-# placement (quantile knots, equal-mass centers, boundary clamping, ...)
-# is performed by the Rust engine; Python only forwards the request.
-_DEFAULT_BASIS_K = 10
-
-
 def _resolve_centers(centers: Any, t_arr: Any, *, label: str = "centers") -> Any:
-    """Coerce ``centers`` (None / int / array) into a 1D float64 array.
+    """Resolve ``centers`` (None / int / array) into a 1D float64 center vector.
 
-    Auto-derivation delegates to the Rust ``auto_centers_1d`` FFI export so
-    Python never reimplements basis-placement logic.
+    ``None`` takes the formula front door's 1-D Duchon default on ``t``; the
+    Rust ``resolve_basis_locations_1d`` export owns the placement.
     """
-    if centers is None:
-        return _numpy_module().asarray(
-            rust_module().auto_centers_1d(t_arr, int(_DEFAULT_BASIS_K)),
-            dtype=float,
+    try:
+        locations, _order, _shrunk = rust_module().resolve_basis_locations_1d(
+            t_arr, "duchon", centers
         )
-    if isinstance(centers, int) and not isinstance(centers, bool):
-        if centers < 2:
-            raise ValueError(f"{label}: integer count must be >= 2, got {centers}")
-        return _numpy_module().asarray(
-            rust_module().auto_centers_1d(t_arr, int(centers)),
-            dtype=float,
-        )
-    return _numeric_vector(centers, label)
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _numpy_module().asarray(locations, dtype=float)
 
 
 class _ResolvedBasisLocations(NamedTuple):
     """Outcome of resolving a basis-location argument (knots or centers).
 
-    ``order`` is the spline *degree* (B-spline) or *m*-order (Duchon) that the
-    ``locations`` vector was actually built for. For auto-derived B-spline
-    knots it can differ from the requested degree: the Rust engine auto-shrinks
-    cubic → quadratic → linear when ``n`` is too small (issue #340), and the
-    clamped knot vector then carries boundary multiplicity ``order + 1``.
-    Evaluating it with any other degree fails ("insufficient knots") or breaks
-    the partition-of-unity, so callers MUST use this effective ``order`` for
-    every downstream basis/penalty build rather than the requested one.
+    ``order`` is the spline *degree* the ``locations`` vector was actually
+    built for. For auto-derived open knots it can be lower than the requested
+    degree: the Rust engine auto-shrinks cubic → quadratic → linear when ``n``
+    is too small (issue #340), and callers MUST use this effective ``order``
+    for every downstream basis/penalty build rather than the requested one.
 
-    ``shrunk`` is ``True`` iff the auto-shrink reduced the requested
-    ``(degree, num_internal_knots)``.
+    ``shrunk`` is ``True`` iff the auto-shrink reduced the request.
     """
 
     locations: Any
@@ -3816,74 +3757,24 @@ def _resolve_knots(
     degree: int = 3,
     periodic: bool = False,
 ) -> _ResolvedBasisLocations:
-    """Coerce ``knots`` (None / int / array) into a resolved knot vector.
+    """Resolve ``knots`` (None / int / array) into a knot vector or cyclic grid.
 
-    Open (``periodic=False``) auto-derivation delegates to the Rust
-    ``auto_knots_1d`` FFI export, which returns ``(knots, effective_degree,
-    num_internal_knots, shrunk)`` (issue #340). We surface the knot vector
-    together with the **effective** degree so the auto-shrink decision stays
-    consistent with downstream evaluation; the explicit-array path passes the
-    requested degree straight through unshrunk.
-
-    Periodic auto-derivation builds the uniform cyclic grid the Rust periodic
-    evaluator consumes — ``num_basis + 1`` equally spaced points over
-    ``[min(t), max(t)]``, one cyclic control per interval — with ``num_basis =
-    K + degree + 1`` for an integer ``K`` (the ``cyclic(x, knots=K)`` formula
-    convention, so ``K`` names the same dimension it does for an open basis).
-    It used to hand the periodic evaluator the CLAMPED OPEN vector, whose
-    ``2 * (degree + 1)`` repeated endpoints were then counted as ``2 * degree
-    + 1`` extra cyclic controls: ``knots=8, degree=3`` silently became a
-    15-function basis.
+    The Rust ``resolve_basis_locations_1d`` export owns the placement: ``None``
+    takes the formula front door's default for ``s(x)`` / ``cyclic(x)`` on
+    ``t``, an integer ``K`` names the interior-knot count (``K + degree + 1``
+    functions, open or cyclic), and an explicit array is used as given.
     """
-    degree_i = int(degree)
-    if degree_i < 0:
+    if int(degree) < 0:
         raise ValueError(f"{label}: degree must be non-negative, got {degree}")
-    if knots is None or (isinstance(knots, int) and not isinstance(knots, bool)):
-        if knots is None:
-            requested_internal = int(_DEFAULT_BASIS_K)
-        else:
-            if knots < 0:
-                raise ValueError(
-                    f"{label}: integer interior-knot count must be >= 0, got {knots}"
-                )
-            requested_internal = int(knots)
-        if periodic:
-            grid = _periodic_uniform_grid(
-                t_arr, requested_internal + degree_i + 1, label=label
-            )
-            return _ResolvedBasisLocations(grid, degree_i, False)
-        knot_vec, eff_degree, _eff_internal, shrunk = rust_module().auto_knots_1d(
-            t_arr, requested_internal, degree_i
+    try:
+        locations, order, shrunk = rust_module().resolve_basis_locations_1d(
+            t_arr, "bspline", knots, int(degree), bool(periodic)
         )
-        return _ResolvedBasisLocations(
-            _numpy_module().asarray(knot_vec, dtype=float),
-            int(eff_degree),
-            bool(shrunk),
-        )
-    return _ResolvedBasisLocations(_numeric_vector(knots, label), degree_i, False)
-
-
-def _periodic_uniform_grid(t_arr: Any, num_basis: int, *, label: str) -> Any:
-    """``num_basis + 1`` equally spaced grid points spanning ``[min(t), max(t)]``.
-
-    The Rust periodic B-spline evaluator (``bspline_basis(..., periodic=True)``)
-    reads a knot vector as a cyclic lattice: ``len(knots) - 1`` uniform
-    intervals of the closed domain, one cyclic control per interval. The domain
-    is the evaluated range, as it always was for the auto-derived periodic
-    path; pass an explicit grid to fix a different period.
-    """
-    np = _numpy_module()
-    t_np = np.asarray(t_arr, dtype=float).reshape(-1)
-    if t_np.size == 0:
-        raise ValueError(f"{label}: cannot derive a periodic domain from empty t")
-    lo = float(np.min(t_np))
-    hi = float(np.max(t_np))
-    if not (np.isfinite(lo) and np.isfinite(hi)) or not hi > lo:
-        raise ValueError(
-            f"{label}: periodic auto-knots need a positive finite range of t, "
-            f"got [{lo}, {hi}]"
-        )
-    return np.linspace(lo, hi, int(num_basis) + 1, dtype=float)
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _ResolvedBasisLocations(
+        _numpy_module().asarray(locations, dtype=float), int(order), bool(shrunk)
+    )
 
 
 def _numpy_module() -> Any:

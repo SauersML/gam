@@ -5,7 +5,7 @@
 //! reports the first engagement and the first decline it sees, once per
 //! process per route — the routes are per-minibatch or per-iterate, so an
 //! unconditional line would flood the fit log with thousands of identical
-//! entries. Routed through `log::warn!`, the repo's sanctioned diagnostics
+//! entries. Routed through `log::debug!`, the repo's sanctioned diagnostics
 //! path, so an initialised `log` backend lands it in the job logs.
 
 use std::sync::Mutex;
@@ -40,8 +40,8 @@ pub fn note_route_engagement(
         return;
     }
     if engaged {
-        log::warn!("[{route}] device ENGAGED: {detail}");
+        log::debug!("[{route}] device ENGAGED: {detail}");
     } else {
-        log::warn!("[{route}] device DECLINED - {fallback}: {detail}");
+        log::debug!("[{route}] device DECLINED - {fallback}: {detail}");
     }
 }

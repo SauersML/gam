@@ -75,7 +75,7 @@ def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
 def test_single_atom_recovers_each_supported_topology(basis: str):
     z = _data_for_basis(basis)
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis=basis,

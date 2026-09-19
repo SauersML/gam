@@ -84,9 +84,10 @@ fn matern_2d_spec(num_centers: usize) -> TermCollectionSpec {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

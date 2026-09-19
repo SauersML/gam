@@ -19,7 +19,7 @@ basis reduction is a statistical-software footgun.
 
 Expected (mgcv parity):
   * a fit that caps/degrades a cr/cs/sz basis emits a Python ``warnings.warn``
-    (category ``gamfit.GamInferenceWarning``) carrying the note text; and
+    (category ``gamfit.errors.GamInferenceWarning``) carrying the note text; and
   * the note is retrievable after the fact via ``model.notes``.
   * a clean fit (no reduction) emits no inference warning and has empty notes.
 """
@@ -56,7 +56,7 @@ def _binary_data(seed: int = 99) -> dict:
 def test_gamfit_exposes_inference_warning_category() -> None:
     # The public warning category must exist and be a UserWarning subclass so it
     # is visible by default (mgcv warnings are not silenced by default either).
-    assert issubclass(gamfit.GamInferenceWarning, UserWarning)
+    assert issubclass(gamfit.errors.GamInferenceWarning, UserWarning)
 
 
 def test_cr_cap_emits_warning_and_exposes_note_on_model() -> None:
@@ -64,7 +64,7 @@ def test_cr_cap_emits_warning_and_exposes_note_on_model() -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         model = gamfit.fit(d, "y ~ s(x, bs='cr', k=10)")
-    notes = [str(w.message) for w in caught if issubclass(w.category, gamfit.GamInferenceWarning)]
+    notes = [str(w.message) for w in caught if issubclass(w.category, gamfit.errors.GamInferenceWarning)]
     assert notes, "no GamInferenceWarning emitted for a capped cr basis"
     joined = " ".join(notes).lower()
     assert "reduced" in joined or "cap" in joined, f"warning lacks cap wording: {notes}"
@@ -82,7 +82,7 @@ def test_binary_degradation_warns() -> None:
         warnings.simplefilter("always")
         model = gamfit.fit(d, "y ~ s(x, bs='cr', k=10)")
     notes = " ".join(
-        str(w.message) for w in caught if issubclass(w.category, gamfit.GamInferenceWarning)
+        str(w.message) for w in caught if issubclass(w.category, gamfit.errors.GamInferenceWarning)
     ).lower()
     assert "degrad" in notes or "linear" in notes, (
         f"binary degradation not surfaced as a warning: {notes!r}"
@@ -103,7 +103,7 @@ def test_clean_fit_has_no_inference_notes() -> None:
         warnings.simplefilter("always")
         model = gamfit.fit(d, "y ~ s(x, bs='cr', k=10)")
     inference_warnings = [
-        w for w in caught if issubclass(w.category, gamfit.GamInferenceWarning)
+        w for w in caught if issubclass(w.category, gamfit.errors.GamInferenceWarning)
     ]
     assert not inference_warnings, f"spurious inference warning on clean fit: {inference_warnings}"
     assert list(model.notes) == [], f"clean fit should have no notes, got {model.notes}"

@@ -719,11 +719,8 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     if options.includeobservation_interval && override_band.is_none() && observation.is_none() {
         let z = validated_central_z(options.confidence_level)?;
         let z_row = Array1::from_elem(state.mean.len(), z);
-        let eta_variance = eta_se.mapv(|standard_error| standard_error * standard_error);
         let (lower, upper) = family_observation_band(
             &response_family,
-            &state.eta,
-            &eta_variance,
             &state.mean,
             &mean_se,
             &z_row,
@@ -926,11 +923,8 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
             // and `family_observation_band` additionally applies the skew-aware
             // Gamma predictive arm for the right-skewed positive families.
             (None, None) => {
-                let etavar = result.eta_standard_error.mapv(|s| s * s);
                 let (obs_lower, obs_upper) = family_observation_band(
                     &transform.response_family(),
-                    &result.eta,
-                    &etavar,
                     &result.mean,
                     &mean_se,
                     &z_row,

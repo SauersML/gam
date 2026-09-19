@@ -142,7 +142,7 @@ def test_tensor_period_wraps_only_the_margin_it_names() -> None:
 def test_one_dimensional_unconsumable_declarations_are_refused(
     formula: str, expected: str
 ) -> None:
-    with pytest.raises(gamfit.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.GamError) as excinfo:
         gamfit.fit(_hourly(), formula, family="gaussian")
     assert expected in str(excinfo.value), f"got: {excinfo.value}"
 
@@ -158,6 +158,6 @@ def test_one_dimensional_unconsumable_declarations_are_refused(
 def test_tensor_unconsumable_declarations_are_refused(
     formula: str, expected: str
 ) -> None:
-    with pytest.raises(gamfit.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.GamError) as excinfo:
         gamfit.fit(_cylinder(), formula, family="gaussian")
     assert expected in str(excinfo.value), f"got: {excinfo.value}"

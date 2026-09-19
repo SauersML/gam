@@ -49,9 +49,10 @@ fn eager_pca_spec() -> TermCollectionSpec {
                 pca_basis_path: None,
                 chunk_size: 32,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

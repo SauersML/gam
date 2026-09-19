@@ -165,7 +165,7 @@ def main() -> int:
         f"pca_ev={explained:.4f}, layer L{args.layer}"
     )
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis="periodic",
@@ -188,7 +188,7 @@ def main() -> int:
     # classes, their certified fits, matched nulls, and cross-fit stacking.
     assignments = np.asarray(fit.assignments, dtype=float)
     mean_l0 = float(np.count_nonzero(assignments, axis=1).mean())
-    v = gamfit.adjudicate_atom_shape(
+    v = gamfit.sae.adjudicate_atom_shape(
         np.ascontiguousarray(coords),
         folds=5,
         seed=args.seed + 11,
@@ -201,7 +201,7 @@ def main() -> int:
     circle_wins = bool(v["circle_wins"])
     table = dict(zip(v["candidate_names"], v["stacking_weights"]))
     print(
-        "shape race via RUST FFI (gamfit.adjudicate_atom_shape), "
+        "shape race via RUST FFI (gamfit.sae.adjudicate_atom_shape), "
         f"headline={v['headline']}, held-out stacking weights:"
     )
     for name, val in sorted(table.items(), key=lambda kv: -kv[1]):

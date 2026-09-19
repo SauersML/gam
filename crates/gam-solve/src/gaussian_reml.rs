@@ -11,7 +11,6 @@ use gam_terms::smooth::BlockwisePenalty;
 use ndarray::{
     Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s,
 };
-use opt::{RidgeSchedule, escalate_ridge};
 use rayon::prelude::*;
 
 const EIGEN_REL_TOL: f64 = 1.0e-10;
@@ -701,8 +700,8 @@ pub fn gaussian_reml_fit_blocks_exact(
 
     if f_blocks == 1 {
         // The scalar solver whitens by X'WX.  Certify that exact matrix before
-        // delegating so this block entry point never reaches the scalar
-        // compatibility jitter path.
+        // delegating so this block entry point rejects a singular Gram with
+        // the certified factorization's diagnosis.
         let xtwx = fast_xt_diag_x(&design.view(), &weight.view());
         gam_linalg::utils::certified_spd_factorize(
             &xtwx,
@@ -4275,60 +4274,18 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
 }
 
 fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-    // Attempt Cholesky directly; on failure, retry with a tiny diagonal jitter
-    // proportional to the matrix trace. X'WX is symmetric positive semidefinite
-    // by construction, but FP noise (e.g. in a basis whose kernel block is only
-    // FP-orthogonal to its explicit polynomial nullspace columns, as the
-    // periodic Duchon basis is) can push the smallest eigenvalue slightly
-    // negative on adversarial inputs, intermittently failing Cholesky. A
-    // jitter of 1e-12 * trace/p shifts every eigenvalue up by an amount well
-    // below the natural scale of the well-conditioned eigenvalues but well
-    // above f64 FP noise, eliminating the spurious-failure regime.
+    // The cache whitens by X'WX, so X'WX itself must factor. A failed Cholesky
+    // means the unpenalized Gram is numerically singular, which is the same
+    // verdict `weighted_design_qr` reaches from the design. Adding a diagonal
+    // ridge here would build the cache of `X'WX + δI`, a different model whose
+    // `logdet_xtwx` is the log of δ (#3090), so the failure is reported.
     let mut gpu_candidate = xtwx.clone();
     if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
         return Ok(gpu_candidate);
     }
-    if let Ok(chol) = xtwx.cholesky(Side::Lower) {
-        return Ok(chol.lower_triangular());
-    }
-    let p = xtwx.nrows();
-    let trace: f64 = (0..p).map(|i| xtwx[[i, i]]).sum();
-    if !trace.is_finite() || trace <= 0.0 {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-    let schedule = RidgeSchedule::geometric(1e-12 * trace / (p as f64), 6);
-    escalate_ridge(schedule, |jitter| {
-        let mut jittered = xtwx.clone();
-        for i in 0..p {
-            jittered[[i, i]] += jitter;
-        }
-        let mut gpu_candidate = jittered.clone();
-        if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
-            return Some(gpu_candidate);
-        }
-        jittered
-            .cholesky(Side::Lower)
-            .ok()
-            .map(|chol| chol.lower_triangular())
-    })
-    .map(|success| success.value)
-    .map_err(|exhausted| {
-        // Cholesky failed at every escalation. The largest shift actually tried
-        // is one growth factor below the one the schedule would try next, and
-        // X'WX is still not numerically PSD there, so `trace / last_attempted`
-        // is a measured lower bound on the conditioning rather than a blanket
-        // `INFINITY`.
-        let last_attempted = exhausted.next_ridge / schedule.growth;
-        EstimationError::ModelIsIllConditioned {
-            condition_number: if last_attempted > 0.0 && last_attempted.is_finite() {
-                trace / last_attempted
-            } else {
-                f64::INFINITY
-            },
-        }
-    })
+    xtwx.cholesky(Side::Lower)
+        .map(|chol| chol.lower_triangular())
+        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })
 }
 
 fn validate_gaussian_reml_eigen_cache(
@@ -5553,7 +5510,7 @@ fn enumerate_and_select_rho_with_controls(
         stack[top] = (a, ea, pa, mid, emid, pmid, depth + 1);
         top += 1;
     }
-    log::info!(
+    log::debug!(
         "[REML-BNB] certified 1-D rho search over [{}, {}]: {cells_visited} cells, \
          {evaluations} objective evaluations, deepest bisection {deepest}/{}, \
          {unbounded_enclosures} unbounded enclosures",
@@ -7773,6 +7730,47 @@ mod tests {
                 assert!((a - b).abs() <= 1.0e-12);
             }
         }
+    }
+
+    #[test]
+    fn batched_eigen_cache_rejects_singular_gram_instead_of_ridging_it() {
+        // #3090: a Gram whose Cholesky fails used to be retried at
+        // `X'WX + δI` for a geometric δ schedule, and the cache of that
+        // different model came back as `Ok`. Its `logdet_xtwx` is then the log
+        // of the invented ridge, not of the data. The design-based builder
+        // reports the same design as ill-conditioned, so the batched path
+        // must too, and its well-posed siblings must be unaffected.
+        let singular = array![[1.0, 1.0], [1.0, 1.0]];
+        let regular = array![[4.0, 1.0], [1.0, 3.0]];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+        let design = array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
+        assert!(matches!(
+            build_gaussian_reml_eigen_cache_with_nullspace_dim(
+                design.view(), penalty.view(), None, None,
+            ),
+            Err(EstimationError::ModelIsIllConditioned { .. })
+        ));
+
+        let batched = build_gaussian_reml_eigen_cache_batched(
+            vec![singular.clone(), regular.clone()],
+            penalty.view(),
+            None,
+        );
+        assert_eq!(batched.len(), 2);
+        match &batched[0] {
+            Err(EstimationError::ModelIsIllConditioned { .. }) => {}
+            Err(other) => panic!("singular Gram gave the wrong error: {other}"),
+            Ok(cache) => panic!(
+                "singular Gram produced a cache with logdet_xtwx={:.6e}",
+                cache.logdet_xtwx
+            ),
+        }
+        let regular_cache = batched[1].as_ref().expect("regular Gram factors");
+        assert!((regular_cache.logdet_xtwx - 11.0_f64.ln()).abs() <= 1.0e-12);
+        assert!(matches!(
+            gaussian_reml_eigen_cache_from_xtwx(singular, penalty.view(), None),
+            Err(EstimationError::ModelIsIllConditioned { .. })
+        ));
     }
 
     /// Deterministic linear-congruential generator (Knuth/MMIX constants) so the

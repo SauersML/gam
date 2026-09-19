@@ -718,7 +718,7 @@ pub(crate) fn build_joint_latent_law(
         log_weights,
         ..runtime_shell
     };
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope latent-z] the row index is anchored on the joint law of K={k} \
          scores: {} nodes, {} transport (gam#2929)",
         runtime.node_count,

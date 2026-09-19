@@ -21,6 +21,7 @@ mod n_block_realization_refusal_2953_tests {
         // The two-block cache fixture's anisotropic ν = 5/2 Matérn: each block
         // carries per-axis log-κ coordinates the cache realizes.
         let spec = |name: &str| TermCollectionSpec {
+            level: Default::default(),
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
@@ -40,7 +41,7 @@ mod n_block_realization_refusal_2953_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };

@@ -65,7 +65,7 @@ fn a_trial_dropping_odd_order_blocks_keeps_the_builders_numbering_2953() {
                 },
                 input_scale: Some(input_scale),
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
         let mut workspace = BasisWorkspace::default();

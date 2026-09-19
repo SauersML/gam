@@ -11,15 +11,19 @@ timed out, blew the memory cap, errored or were not run), ``DIR/meta.json``
 
 Every rep is its own subprocess (``worker.py``) so import cost, cold-fit cost
 and peak RSS are per-rep, and one library's allocator state or thread pool
-never leaks into the next measurement. Within a cell the libraries are
-interleaved rep by rep, so slow drift in host load hits all of them alike.
+never leaks into the next measurement. A cell with ``concurrency`` K launches
+K identical reps at once (one process each, like a ``joblib`` fan-out) and
+records each process plus the wall time of the whole batch; a cell's
+``threads`` sets every thread-pool variable, or unsets them all for ``auto``.
+Within a cell the libraries are interleaved rep by rep, so slow drift in host
+load hits all of them alike.
 
 The per-rep timeout and memory cap are a HARNESS SAFETY NET, not a solver
 budget: they only stop a runaway rep from stalling the whole plan. A rep that
 trips either is recorded with that status, the remaining reps of the cell and
-every larger ``n`` of the same (lib, family, design) are recorded as
-``not_run_after_<status>``, and the report counts all of it against the
-library.
+every larger ``n`` of the same (lib, family, design, threads, concurrency)
+are recorded as ``not_run_after_<status>``, and the report counts all of it
+against the library.
 """
 
 from __future__ import annotations
@@ -33,13 +37,14 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import psutil
 
 from . import report
-from .plans import PLANS, Cell, Plan
+from .plans import PLANS, Cell, Plan, threads_label
 
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "worker.py"
@@ -50,9 +55,14 @@ POLL_S = 0.05
 # Every BLAS / OpenMP / Rayon pool gets one thread, so the comparison is
 # single-core CPU against single-core CPU. pyGAM's scipy/numpy BLAS and
 # gamfit's Rayon + faer pools are otherwise sized to the host and a many-core
-# runner would measure parallelism, not the algorithms.
+# runner would measure parallelism, not the algorithms. gamfit's ndarray
+# products also run on matrixmultiply's own pool (its threading is enabled by
+# the MCMC sampler's ``burn`` dependency), which reads ``MATMUL_NUM_THREADS``
+# and not ``RAYON_NUM_THREADS``. A cell's ``threads`` replaces the "1" (see
+# ``thread_env``).
 THREAD_ENV: dict[str, str] = {
     "RAYON_NUM_THREADS": "1",
+    "MATMUL_NUM_THREADS": "1",
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
     "MKL_NUM_THREADS": "1",
@@ -80,12 +90,20 @@ def _sample(procs: list[psutil.Process]) -> tuple[float, int]:
     return rss, threads
 
 
+def thread_env(threads: int | None) -> dict[str, str]:
+    """The pinned pool sizes for a cell; empty for ``auto``, where every
+    variable is removed so each pool takes its own host default."""
+    if threads is None:
+        return {}
+    return {k: str(threads) for k in THREAD_ENV}
+
+
 def run_rep(
     lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
 ) -> dict[str, Any]:
     """Run one worker subprocess, policing the safety net; return its record."""
-    env = dict(os.environ)
-    env.update(THREAD_ENV)
+    env = {k: v for k, v in os.environ.items() if k not in THREAD_ENV}
+    env.update(thread_env(cell.threads))
     env.pop("PYTHONPATH", None)
     cmd = [
         sys.executable,
@@ -138,6 +156,8 @@ def run_rep(
         family=cell.family,
         n=cell.n,
         design=cell.design,
+        threads=cell.threads,
+        concurrency=cell.concurrency,
         seed=seed,
         status=status,
         returncode=proc.returncode,
@@ -150,6 +170,31 @@ def run_rep(
     if status != "ok":
         rec["stderr_tail"] = stderr[-2000:]
     return rec
+
+
+def run_batch(
+    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+) -> list[dict[str, Any]]:
+    """Run ``cell.concurrency`` identical reps at once; one record per process,
+    each carrying its ``slot`` and the wall time of the whole batch."""
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=cell.concurrency) as pool:
+        futures = [
+            pool.submit(run_rep, lib, cell, seed, timeout_s, memcap_mb, cwd)
+            for _ in range(cell.concurrency)
+        ]
+        recs = [f.result() for f in futures]
+    batch_wall = time.perf_counter() - t0
+    for slot, rec in enumerate(recs):
+        rec.update(slot=slot, batch_wall_s=batch_wall)
+    return recs
+
+
+def _worst_status(recs: list[dict[str, Any]]) -> str:
+    for status in ("timeout", "memcap"):
+        if any(r["status"] == status for r in recs):
+            return status
+    return "ok"
 
 
 def git_sha() -> str | None:
@@ -173,6 +218,12 @@ def run_plan(
         "memcap_mb": memcap_mb,
         "safety_net": "timeout_s and memcap_mb are a harness safety net, not a solver budget",
         "thread_env": THREAD_ENV,
+        "cell_thread_settings": [
+            threads_label(t)
+            for t in sorted(
+                {c.threads for c in plan.cells}, key=lambda t: (t is None, t or 0)
+            )
+        ],
         "host": platform.node(),
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -182,8 +233,8 @@ def run_plan(
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     records: list[dict[str, Any]] = []
-    # (lib, family, design) -> status that stopped it at some n
-    stopped: dict[tuple[str, str, str], str] = {}
+    # (lib, family, design, threads, concurrency) -> status that stopped it at some n
+    stopped: dict[tuple[str, str, str, int | None, int], str] = {}
     with (
         tempfile.TemporaryDirectory(prefix="pygam_compare_") as cwd,
         records_path.open("w") as fh,
@@ -191,30 +242,50 @@ def run_plan(
         for cell in plan.cells:
             for rep in range(plan.reps):
                 for lib in plan.libs:
-                    key = (lib, cell.family, cell.design)
+                    key = (
+                        lib,
+                        cell.family,
+                        cell.design,
+                        cell.threads,
+                        cell.concurrency,
+                    )
                     if key in stopped:
-                        rec: dict[str, Any] = dict(
-                            lib=lib,
-                            family=cell.family,
-                            n=cell.n,
-                            design=cell.design,
-                            seed=rep,
-                            status=f"not_run_after_{stopped[key]}",
-                        )
+                        batch: list[dict[str, Any]] = [
+                            dict(
+                                lib=lib,
+                                family=cell.family,
+                                n=cell.n,
+                                design=cell.design,
+                                threads=cell.threads,
+                                concurrency=cell.concurrency,
+                                seed=rep,
+                                slot=slot,
+                                status=f"not_run_after_{stopped[key]}",
+                            )
+                            for slot in range(cell.concurrency)
+                        ]
+                    elif cell.concurrency == 1:
+                        batch = [
+                            run_rep(lib, cell, rep, plan.timeout_s, memcap_mb, cwd)
+                        ]
                     else:
-                        rec = run_rep(lib, cell, rep, plan.timeout_s, memcap_mb, cwd)
-                        if rec["status"] in ("timeout", "memcap"):
-                            stopped[key] = rec["status"]
-                    records.append(rec)
-                    fh.write(json.dumps(rec) + "\n")
-                    fh.flush()
-                    if progress:
-                        print(
-                            f"[{cell.key} seed={rep}] {lib:9s} {rec['status']:>8s} "
-                            f"fit_cpu={rec.get('fit_cpu_s', float('nan')):.3f}s",
-                            file=sys.stderr,
-                            flush=True,
+                        batch = run_batch(
+                            lib, cell, rep, plan.timeout_s, memcap_mb, cwd
                         )
+                    if key not in stopped and _worst_status(batch) != "ok":
+                        stopped[key] = _worst_status(batch)
+                    for rec in batch:
+                        records.append(rec)
+                        fh.write(json.dumps(rec) + "\n")
+                        fh.flush()
+                        if progress:
+                            print(
+                                f"[{cell.key} seed={rep}] {lib:9s} {rec['status']:>8s} "
+                                f"fit_s={rec.get('fit_s', float('nan')):.3f}s "
+                                f"fit_cpu={rec.get('fit_cpu_s', float('nan')):.3f}s",
+                                file=sys.stderr,
+                                flush=True,
+                            )
     meta["finished"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     meta["lib_versions"] = sorted(
         {f"{r['lib']}={r['lib_version']}" for r in records if r.get("lib_version")}

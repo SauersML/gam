@@ -745,38 +745,6 @@ fn test_knot_generation_uniform() {
 }
 
 #[test]
-fn test_penalty_matrix_creation() {
-    let s = create_difference_penalty_matrix(5, 2, None).unwrap();
-    assert_eq!(s.shape(), &[5, 5]);
-    // D_2 for n=5 is [[1, -2, 1, 0, 0], [0, 1, -2, 1, 0], [0, 0, 1, -2, 1]]
-    // s = d_2' * d_2
-    let expected_s = array![
-        [1., -2., 1., 0., 0.],
-        [-2., 5., -4., 1., 0.],
-        [1., -4., 6., -4., 1.],
-        [0., 1., -4., 5., -2.],
-        [0., 0., 1., -2., 1.]
-    ];
-    assert_eq!(s.shape(), expected_s.shape());
-    assert_abs_diff_eq!(
-        s.as_slice().unwrap(),
-        expected_s.as_slice().unwrap(),
-        epsilon = 1e-9
-    );
-}
-
-#[test]
-fn test_penalty_matrix_rejects_singular_greville_span() {
-    let g = array![0.0, 0.0, 0.5, 1.0];
-    match create_difference_penalty_matrix(4, 1, Some(g.view())).unwrap_err() {
-        BasisError::InvalidKnotVector(msg) => {
-            assert!(msg.contains("singular"));
-        }
-        other => panic!("expected InvalidKnotVector, got {other:?}"),
-    }
-}
-
-#[test]
 fn test_thin_plate_kernel_matches_dimensionspecific_forms() {
     let dist2 = 4.0;
     assert_abs_diff_eq!(thin_plate_kernel_from_dist2(dist2, 1).unwrap(), 8.0);
@@ -1731,6 +1699,7 @@ fn test_build_bspline_basis_1d_automatic_uniform_uses_data_range() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Uniform,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::default(),
@@ -1757,6 +1726,7 @@ fn test_build_bspline_basis_1d_automatic_quantile_is_not_uniform_for_skewed_data
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::default(),
@@ -1856,6 +1826,7 @@ fn test_build_bspline_basis_1d_quantile_uses_exact_derivative_gram() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -1906,6 +1877,7 @@ fn test_build_bspline_basis_1d_none_identifiability_prefers_sparse_design() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(6),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -1935,6 +1907,7 @@ fn test_build_bspline_basis_1d_default_identifiability_densifies_via_orthonormal
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(6),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::default(),
@@ -1956,6 +1929,7 @@ fn test_build_bspline_basis_1d_quantile_rejects_missing_interior_support() {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(3),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -3280,14 +3254,6 @@ fn test_error_conditions() {
         expected_knots.as_slice().unwrap(),
         epsilon = 1e-9
     );
-
-    match create_difference_penalty_matrix(5, 5, None).unwrap_err() {
-        BasisError::InvalidPenaltyOrder { order, num_basis } => {
-            assert_eq!(order, 5);
-            assert_eq!(num_basis, 5);
-        }
-        _ => panic!("Expected InvalidPenaltyOrder error"),
-    }
 }
 
 #[test]
@@ -3381,13 +3347,8 @@ fn test_geometric_constraint_transform_orthogonality() {
     let knots = array![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0];
     let degree = 3;
 
-    let (z, s_constrained) = compute_geometric_constraint_transform(&knots, degree, 2)
+    let z = compute_geometric_constraint_transform(&knots, degree)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "should compute transform", e));
-    // Verify s_constrained has expected dimensions
-    assert!(
-        s_constrained.nrows() > 0,
-        "s_constrained should not be empty"
-    );
 
     let g = compute_greville_abscissae(&knots, degree)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "should compute Greville", e));
@@ -3475,7 +3436,7 @@ fn test_geometric_constraint_transform_dimensions() {
             knots[degree + 1 + i] = (i + 1) as f64 / (n_internal + 1) as f64;
         }
 
-        let (z, s_c) = compute_geometric_constraint_transform(&knots, degree, 2)
+        let z = compute_geometric_constraint_transform(&knots, degree)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "should compute transform", e));
 
         let n_basis = n_knots - degree - 1;
@@ -3483,12 +3444,6 @@ fn test_geometric_constraint_transform_dimensions() {
 
         assert_eq!(z.nrows(), n_basis, "Z rows should equal n_basis");
         assert_eq!(z.ncols(), n_constrained, "Z cols should equal n_basis - 2");
-        assert_eq!(
-            s_c.nrows(),
-            n_constrained,
-            "S_c should be n_constrained x n_constrained"
-        );
-        assert_eq!(s_c.ncols(), n_constrained);
     }
 }
 

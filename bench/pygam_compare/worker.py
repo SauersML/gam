@@ -4,7 +4,7 @@ Usage: worker.py LIB FAMILY N DESIGN SEED
 
   LIB     gamfit | pygam | pygam_gs
   FAMILY  gaussian | binomial | poisson
-  DESIGN  p1 | p5 | p20 | te | fz<case>
+  DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | fz<case>
 
 A ``fz<case>`` design is a convergence-fuzz case (``fuzz_terms.py``): a seeded
 term structure — tensor, ``ti``, ``by=``, factor, random-effect, cyclic, 2-D
@@ -22,6 +22,8 @@ shared host wall time measures the neighbours as much as the library.
 
   import    import of the library (numpy/scipy already imported)
   fit       one cold fit (the first fit in the process)
+  fit_warm  a second fit of the same data in the same process: the per-fit cost
+            once imports, lazy initialisation and caches are paid
   pred      point prediction on ``n`` fresh rows
   interval  95% interval prediction on the same rows
 
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import resource
 import sys
 import time
@@ -63,6 +66,12 @@ FUZZ_INTERVAL_ROWS = 200
 FloatArray = NDArray[np.float64]
 
 
+def design_width(design: str) -> int | None:
+    """Covariate count of an additive design ``p<k>``; ``None`` otherwise."""
+    match = re.fullmatch(r"p([1-9][0-9]*)", design)
+    return None if match is None else int(match.group(1))
+
+
 def make_data(
     n: int, design: str, family: str, seed: int
 ) -> tuple[FloatArray, FloatArray, FloatArray]:
@@ -75,14 +84,14 @@ def make_data(
     if design == "te":
         X = rng.uniform(0.0, 1.0, (n, 2))
         eta = np.sin(2 * np.pi * X[:, 0]) * np.cos(2 * np.pi * X[:, 1])
-    elif design in DESIGNS:
-        p = int(design[1:])
+    elif design_width(design) is not None:
+        p = design_width(design)
         X = rng.uniform(0.0, 1.0, (n, p))
         eta = np.zeros(n)
         for j in range(p):
             eta += np.sin(2 * np.pi * X[:, j] + j) / np.sqrt(p)
     else:
-        raise ValueError(f"unknown design {design!r}; expected one of {DESIGNS}")
+        raise ValueError(f"unknown design {design!r}; expected p<k> or te")
     if family == "gaussian":
         mu = eta
         y = eta + rng.normal(0.0, 0.5, n)
@@ -387,6 +396,8 @@ def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]
         out["after_import_rss_mb"] = rss_peak_mb()
         phase("fit", lambda: adapter.fit(X, y))
     if adapter is not None and "fit" not in errors:
+        phase("fit_warm", lambda: adapter.fit(X, y))
+    if adapter is not None and not {"fit", "fit_warm"} & errors.keys():
         out["rss_after_fit_mb"] = rss_peak_mb()
         pred: FloatArray | None = phase("pred", lambda: adapter.predict(Xt))
         iv = phase("interval", lambda: adapter.interval(Xt))

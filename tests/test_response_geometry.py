@@ -181,12 +181,12 @@ def _simplex_frame(n: int) -> dict[str, list[float]]:
 
 _DROPPED_BY_THE_JOINT_TANGENT_FIT = {
     "latents": lambda n: {
-        "t": gamfit.LatentCoord(n=n, d=1, init=np.zeros((n, 1)), aux_prior={"u": np.zeros((n, 1))})
+        "t": gamfit.smooth.LatentCoord(n=n, d=1, init=np.zeros((n, 1)), aux_prior={"u": np.zeros((n, 1))})
     },
-    "smooths": lambda n: {"x": gamfit.BSpline()},
+    "smooths": lambda n: {"x": gamfit.smooth.BSpline()},
     "constraints": lambda n: {"s(x)": "monotone_increasing"},
     "penalties": lambda n: [
-        gamfit.AuxConditionalPriorPenalty(
+        gamfit.penalties.AuxConditionalPriorPenalty(
             lambda_per_row=np.ones((n, 1, 1)), weight=1.0, n_eff=n, target="t"
         )
     ],

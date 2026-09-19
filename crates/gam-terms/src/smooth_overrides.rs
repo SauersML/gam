@@ -36,9 +36,10 @@ use crate::basis::{
     MaternBasisSpec, MaternLengthScale, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
     SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
+use crate::fit_notes::FitNoteSink;
 use crate::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
-    TermCollectionSpec, parse_shape_constraint,
+    TermCollectionSpec,
 };
 use gam_data::{ColumnKindTag, EncodedDataset as Dataset};
 
@@ -51,7 +52,7 @@ pub fn apply_smooth_overrides(
     spec: &mut TermCollectionSpec,
     overrides: &JsonValue,
     data: &Dataset,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut impl FitNoteSink,
 ) -> Result<(), String> {
     let registry = overrides
         .as_object()
@@ -83,6 +84,7 @@ pub fn apply_smooth_overrides(
             .ok_or_else(|| {
                 format!("smooths[{symbol:?}] descriptor missing required \"kind\" field")
             })?;
+        pin_adaptive_bspline_default(&mut term.basis, data)?;
         apply_one_override(term, kind, descriptor_obj, symbol, inference_notes)?;
         apply_by_variable(
             term,
@@ -94,6 +96,55 @@ pub fn apply_smooth_overrides(
         )?;
     }
     Ok(())
+}
+
+/// A `smooths={...}` descriptor is an explicit specification of the smooth, so
+/// the formula default's adaptive resolution
+/// ([`BSplineKnotSpec::Automatic`]`{ adaptive: true, .. }`) is replaced by the
+/// fixed spec the formula DSL builds for the same count and placement: the
+/// descriptor's own tunables (knot count, knot vector, periodicity, degree) then
+/// act on exactly the basis they always did, and the formula workflow never
+/// grows a smooth the caller described by hand. Uniform placement becomes the
+/// `Generate` vector over the covariate's range, which is the knot vector the
+/// adaptive spec builds.
+fn pin_adaptive_bspline_default(
+    basis: &mut SmoothBasisSpec,
+    data: &Dataset,
+) -> Result<(), String> {
+    use crate::basis::BSplineKnotPlacement;
+    match basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            pin_adaptive_bspline_default(inner, data)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => pin_adaptive_bspline_default(smooth, data),
+        SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+            let BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(num_internal_knots),
+                placement,
+                adaptive: true,
+            } = spec.knotspec
+            else {
+                return Ok(());
+            };
+            spec.knotspec = match placement {
+                BSplineKnotPlacement::Uniform => {
+                    let column = data.values.column(*feature_col);
+                    BSplineKnotSpec::Generate {
+                        data_range: crate::term_builder::col_minmax(column)?,
+                        num_internal_knots,
+                    }
+                }
+                BSplineKnotPlacement::Quantile => BSplineKnotSpec::Automatic {
+                    num_internal_knots: Some(num_internal_knots),
+                    placement,
+                    adaptive: false,
+                },
+            };
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Wrap the term's basis in the `ByVariable` row-gating envelope when the
@@ -111,7 +162,7 @@ fn apply_by_variable(
     symbol: &str,
     data: &Dataset,
     column_index: &HashMap<&str, usize>,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     let by_name = match descriptor.get("by") {
         None => return Ok(()),
@@ -160,7 +211,7 @@ fn apply_by_variable(
                 kind: BySmoothKind::Numeric,
                 by: ByVariableSpec::Numeric,
             };
-            inference_notes.push(format!(
+            inference_notes.inform(format!(
                 "smooths[{symbol:?}] gated by numeric column {by_name:?} (by·s(x))",
             ));
             Ok(())
@@ -265,7 +316,7 @@ fn apply_one_override(
     kind: &str,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     // Push the descriptor's optional `name` into the term name for downstream
     // diagnostics (purely cosmetic — the term identity is its feature_cols).
@@ -278,17 +329,28 @@ fn apply_one_override(
     // Universal shape constraint (`Smooth.shape_constraint`). Stamped onto the
     // term, not the basis: the constraint solver (box-reparam / tangent-LAML)
     // keys off `SmoothTermSpec.shape`. A basis-incompatible request fails
-    // loudly downstream via `shape_supports_basis`.
-    if let Some(shape_val) = descriptor.get("shape_constraint") {
-        let raw = shape_val
-            .as_str()
-            .ok_or_else(|| format!("smooths[{symbol:?}].shape_constraint must be a string"))?;
-        term.shape = parse_shape_constraint(raw).map_err(|e| format!("smooths[{symbol:?}].{e}"))?;
-    }
+    // loudly downstream via `validate_shape_request`. The value is a DSL
+    // string or a (nested) JSON list, resolved against the final basis so a
+    // `te()` list addresses the tensor's margins.
+    let shape_expr = descriptor
+        .get("shape_constraint")
+        .map(|value| {
+            crate::smooth::shape_expr_from_json(value)
+                .map_err(|e| format!("smooths[{symbol:?}].shape_constraint: {e}"))
+        })
+        .transpose()?;
 
     apply_kind_specific(&mut term.basis, kind, descriptor, symbol)?;
 
-    inference_notes.push(format!(
+    if let Some(expr) = shape_expr {
+        term.shape = crate::smooth::resolve_shape_spec(
+            &expr,
+            crate::smooth::shape_tensor_margin_count(&term.basis),
+        )
+        .map_err(|e| format!("smooths[{symbol:?}].shape_constraint: {e}"))?;
+    }
+
+    inference_notes.inform(format!(
         "smooths[{symbol:?}] descriptor (kind={kind}) merged onto formula-built term",
     ));
     Ok(())
@@ -696,7 +758,7 @@ fn apply_bspline_1d(
     } else if let Some(n) = descriptor.get("n_knots").and_then(JsonValue::as_u64) {
         // `BSpline(knots=K)` means K INTERIOR knots — the one meaning the
         // integer has everywhere else it is read: the public evaluator
-        // (`gamfit.bspline_basis`, `BSpline.evaluate`) and the formula DSL's
+        // (`gamfit.basis.bspline_basis`, `BSpline.evaluate`) and the formula DSL's
         // `knots=K`. An open basis therefore spans `K + degree + 1` functions
         // and a cyclic one, by the `cyclic(x, knots=K)` convention, has
         // `K + degree + 1` cyclic controls. This bridge used to read the same
@@ -712,6 +774,7 @@ fn apply_bspline_1d(
             BSplineKnotSpec::Automatic { placement, .. } => BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(n_internal),
                 placement: *placement,
+                adaptive: false,
             },
             BSplineKnotSpec::PeriodicUniform { data_range, .. } => {
                 BSplineKnotSpec::PeriodicUniform {
@@ -1175,7 +1238,7 @@ mod tests {
                 feature_col: 0,
                 spec: open_bspline_spec(),
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }
@@ -1246,6 +1309,7 @@ mod tests {
             linear_terms: Vec::new(),
             random_effect_terms: Vec::new(),
             smooth_terms: vec![term],
+            level: Default::default(),
         }
     }
 
@@ -1453,6 +1517,7 @@ mod tests {
         automatic.knotspec = BSplineKnotSpec::Automatic {
             num_internal_knots: Some(5),
             placement: crate::basis::BSplineKnotPlacement::Quantile,
+            adaptive: false,
         };
         let err2 = apply_bspline_1d(&mut automatic, &obj(json!({"periodic": true})), "x")
             .expect_err("periodic against automatic knots must error");

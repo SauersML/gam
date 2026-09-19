@@ -3396,7 +3396,7 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
         }
-        log::info!(
+        log::debug!(
             "[bernoulli intercept warm-start] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
             preseeded,
             kept_warm,
@@ -3508,7 +3508,7 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
         }
-        log::info!(
+        log::debug!(
             "[bernoulli intercept warm-start rows={}] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
             rows.len(),
             preseeded,

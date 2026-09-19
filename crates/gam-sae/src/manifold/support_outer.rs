@@ -653,7 +653,7 @@ impl SaeSupportOuterObjective {
         // before #2576 it emitted nothing at all — six minutes of fourteen busy
         // cores between two log lines is what kept the cost invisible.
         if dense_reduced_schur_admitted {
-            log::info!(
+            log::debug!(
                 "support LAML evidence: border {}, row log|H_tt| = {:.6e}, dense exact log|S| = \
                  {:.6e} from one eigendecomposition, {:.1}s",
                 system.k,
@@ -663,7 +663,7 @@ impl SaeSupportOuterObjective {
             );
         } else {
             let metrics = bundle.evaluation_metrics();
-            log::info!(
+            log::debug!(
                 "support LAML evidence: border {}, row log|H_tt| = {:.6e}, surrogate log|S| = \
                  {:.6e}; {} total shifted-CG iterations, {} rational nodes, deflation rank {}, \
                  {:.1}s",
@@ -1318,7 +1318,7 @@ fn run_support_outer_search(
         let std_err_norm = unseen_std_err.dot(&unseen_std_err).sqrt();
         let seen_std_err_norm = seen_std_err.dot(&seen_std_err).sqrt();
         let band = certificate.stationarity.bound();
-        log::info!(
+        log::debug!(
             "support LAML certified point re-scored on {seen} unseen probes: |Pg| = \
              {gradient_norm:.6e}, standard error {std_err_norm:.6e}; certificate band \
              {band:.6e}, search-probe resolution {seen_std_err_norm:.6e} (plan {plans})"
@@ -1613,7 +1613,7 @@ pub fn fit_sae_support_sparse(
             outer.criterion.value(),
         );
     }
-    log::info!(
+    log::debug!(
         "support-sparse migration ledger: {} births, {} deaths, {} refusals, {} \
          principal-component reseeds",
         migration.n_births,
@@ -1671,7 +1671,7 @@ pub fn fit_sae_support_sparse_with_census(
         .unwrap_or(1);
     let linear_bulk_census = crate::tiered::linear_bulk_census(target, d_max, support_k);
     match &linear_bulk_census {
-        Ok(report) => log::info!(
+        Ok(report) => log::debug!(
             "support-sparse linear-bulk census: {} blocks of size {}, EV {:.6}, {} of {} \
              communities curve ({:.1} bits saved)",
             report.tier1.block_utilization.len(),
@@ -1681,7 +1681,7 @@ pub fn fit_sae_support_sparse_with_census(
             report.code_space.n_communities,
             report.code_space.dl_saved_bits,
         ),
-        Err(reason) => log::warn!("support-sparse linear-bulk census refused: {reason}"),
+        Err(reason) => log::debug!("support-sparse linear-bulk census refused: {reason}"),
     }
     Ok(SaeSupportSparseCensusedFit {
         fit,

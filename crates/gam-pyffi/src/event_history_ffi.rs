@@ -19,7 +19,7 @@ use pyo3::types::{PyDict, PyList, PyModule};
 use std::sync::Arc;
 
 /// A fitted event-history model held in memory.
-#[pyclass(name = "_EventHistoryModel", frozen)]
+#[pyclass(module = "gamfit._rust", name = "_EventHistoryModel", frozen)]
 pub(crate) struct PyEventHistoryModel {
     fit: Arc<EventHistoryFit>,
     cohort: Arc<EventHistoryCohort>,
