@@ -456,6 +456,10 @@ pub fn fit_shared_tangent_reml(
     } else {
         let (rho_lower, rho_upper) = prepared.resolvability_domain();
         let mut problem = OuterProblem::new(n_outer)
+            .with_problem_size(
+                prepared.effective_observations * prepared.n_outputs,
+                prepared.n_coefficients * prepared.n_outputs,
+            )
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Dense)
             .with_bounds(rho_lower, rho_upper)
