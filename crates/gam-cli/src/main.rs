@@ -3,7 +3,7 @@
 // Crate-root shared imports, re-exported so each `src/main/` submodule
 // inherits them via `use super::*;`. Real submodules below replace the
 // former textually-pasted source fragments.
-pub(crate) use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+pub(crate) use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 
@@ -169,6 +169,8 @@ mod run_parameter_decomposition;
 mod run_compare;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
+#[path = "main/run_summary.rs"]
+mod run_summary;
 #[path = "main/run_fit.rs"]
 mod run_fit;
 #[path = "main/run_joint_events.rs"]
@@ -194,6 +196,7 @@ pub(crate) use run_crosscoder::*;
 pub(crate) use run_parameter_decomposition::*;
 pub(crate) use run_compare::*;
 pub(crate) use run_diagnose::*;
+pub(crate) use run_summary::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_joint_events::*;
 pub(crate) use run_predict::*;
@@ -303,6 +306,7 @@ fn run() -> CliResult<()> {
             run_transformation_score(args).map_err(CliError::from)
         }
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
+        Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),
         Command::Generate(args) => run_generate(args).map_err(CliError::from),

@@ -48,7 +48,18 @@ pub fn render_summary_text(summary: &SummaryPayload) -> String {
     if let Some(edf) = summary.edf_total {
         line("Effective dof", &format_significant(edf));
     }
-    line("Outer iterations", &summary.iterations.to_string());
+    if let Some(scale) = summary.scale {
+        line("Scale", &format_significant(scale));
+    }
+    if let Some(convergence) = &summary.convergence {
+        line(
+            "Iterations",
+            &format!(
+                "{} outer, {} inner",
+                convergence.outer_iterations, convergence.inner_iterations
+            ),
+        );
+    }
     if !summary.coefficients.is_empty() {
         line("Coefficients", &summary.coefficients.len().to_string());
     }

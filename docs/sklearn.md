@@ -4,7 +4,8 @@
 `gamfit.fit`:
 
 - `GAMRegressor` (inherits `RegressorMixin`) — continuous responses.
-- `GAMClassifier` (inherits `ClassifierMixin`) — binary classification.
+- `GAMClassifier` (inherits `ClassifierMixin`) — binary and multiclass
+  classification.
 
 Install with `pip install gamfit[sklearn]`.
 
@@ -29,7 +30,7 @@ r2    = est.score(X, y)       # r2_score
 
 ```text
 GAMRegressor(
-    formula: str,
+    formula: str | None = None,
     family: str = "auto",
     offset: str | None = None,
     weights: str | None = None,
@@ -37,8 +38,8 @@ GAMRegressor(
 )
 ```
 
-All five arguments are surfaced as `get_params()` keys, so they work with
-`GridSearchCV` and related utilities.
+All five arguments are surfaced as `get_params()` keys, so the estimator
+works with `sklearn.base.clone`, `cross_val_score` and pipelines.
 
 ### Binding the response
 
@@ -58,6 +59,20 @@ GAMRegressor(formula="y ~ s(x)").fit(df, y="y")   # name a column
 
 If the formula has no `~`, `y` must be supplied as an array-like target or
 response-column name, and gamfit prepends `<target> ~`.
+
+With no formula (`GAMRegressor().fit(X, y)`), the estimator fits the
+automatic formula `y ~ .`: one term per column of `X`, chosen from the
+column's type (see
+[Every remaining column](formulas.md#every-remaining-column)). Every such
+term is penalized and can shrink to zero. `formula_` holds the formula actually
+fitted.
+
+```python
+from gamfit.sklearn import GAMRegressor
+
+est = GAMRegressor().fit(X, y)
+print(est.formula_)            # y ~ s(x)
+```
 
 ### Methods
 
@@ -100,10 +115,60 @@ the positive-class probability to `[0, 1]` and stacks
 `[P(classes_[0]), P(classes_[1])]`. `predict()` returns
 `classes_[argmax(predict_proba(X), axis=1)]`.
 
-`score(X, y, sample_weight=None)` returns AUC, not accuracy. If
-`sample_weight` is supplied, rows with weight `<= 0` are dropped before
+The modelled event is therefore the label that sorts last: with labels
+`"no"` and `"yes"`, `classes_` is `["no", "yes"]` and the second column of
+`predict_proba` is `P(y == "yes")`. `gamfit.fit` follows the same rule for
+a string response, which needs an explicit `family="binomial"` there:
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+from gamfit.sklearn import GAMClassifier
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": np.linspace(0, 10, 200)})
+labels = np.where(X["x"] + rng.normal(0, 2, len(X)) > 5, "yes", "no")
+
+est = GAMClassifier(formula="y ~ s(x)", family="binomial").fit(X, labels)
+model = gamfit.fit(X.assign(y=labels), "y ~ s(x)", family="binomial")
+
+print(est.classes_)                                   # ['no' 'yes']
+print(np.allclose(est.predict_proba(X)[:, 1], model.predict(X), atol=1e-6))
+```
+
+If the event you care about sorts first (for example `"case"` against
+`"control"`), recode the labels to `1`/`0` before fitting.
+
+`score(X, y, sample_weight=None)` returns AUC, not accuracy, for a binary
+model. A model with more than two classes has no single ROC curve, so its
+score is accuracy. If `sample_weight` is supplied, rows with weight `<= 0` are dropped before
 computing AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
 `brier`, `logloss`, `nagelkerke_r2`, and `ece`.
+
+With three or more classes (or `family="multinomial"` at any class count),
+`GAMClassifier` fits one joint multinomial-logit GAM: `K − 1` linear
+predictors, each with its own smooths and REML-selected smoothing
+parameters, estimated together. It is a single model, not `K` one-vs-rest
+fits, so the class probabilities sum to 1 by construction.
+`predict_proba(X)` has shape `(n, K)`, with column `j` for `classes_[j]`. A
+binary family such as `family="binomial"` with more than two classes is an
+error.
+
+```python
+import numpy as np
+import pandas as pd
+from gamfit.sklearn import GAMClassifier
+
+rng = np.random.default_rng(1)
+X = pd.DataFrame({"x": rng.uniform(0, 3, 300)})
+species = np.array(["a", "b", "c"])[np.clip((X["x"] + rng.normal(0, 0.5, 300)).astype(int), 0, 2)]
+
+clf = GAMClassifier(formula="y ~ s(x)").fit(X, species)
+probs = clf.predict_proba(X)
+print(clf.classes_, probs.shape)                      # ['a' 'b' 'c'] (300, 3)
+print(np.allclose(probs.sum(axis=1), 1.0))            # True
+```
 
 Like `GAMRegressor`, `GAMClassifier` also inherits the pass-through helpers
 `summary()`, `check(X)`, and `report(path)` from the shared base estimator,
@@ -144,21 +209,32 @@ scores = cross_val_score(
 `n_jobs=-1` runs the folds in parallel processes, each with its own full-width
 thread pool; see [Threads](threads.md) for how that shares the CPUs.
 
-## Grid search
+## Choosing between formulas
+
+The estimator has no hyperparameters to tune: REML chooses every
+smoothing parameter inside `fit`, and `k` is only an upper bound on each
+smooth's flexibility. To choose between structurally different formulas,
+fit each one and rank the underlying models with `gamfit.compare_models`,
+which scores them by AIC corrected for smoothing-parameter selection:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
 from gamfit.sklearn import GAMRegressor
-from sklearn.model_selection import GridSearchCV
 
-grid = GridSearchCV(
-    GAMRegressor(formula="y ~ s(x)"),
-    param_grid={
-        "formula": ["y ~ s(x)", "y ~ s(x, k=10)", "y ~ s(x, k=20)"],
-    },
-    cv=5,
-)
-grid.fit(X, y)
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 1, 300), "z": rng.uniform(0, 1, 300)})
+y = np.sin(2 * np.pi * X["x"]) + 4 * (X["z"] - 0.5) ** 2 + rng.normal(0, 0.3, len(X))
+
+formulas = ["y ~ s(x)", "y ~ s(x) + z", "y ~ s(x) + s(z)"]
+estimators = [GAMRegressor(formula=formula).fit(X, y) for formula in formulas]
+comparison = gamfit.compare_models([est.model_ for est in estimators], names=formulas)
+print("winner:", comparison["winner"])
 ```
+
+`cross_val_score` (above) still works when you want an out-of-sample
+check of the winner.
 
 ## No survival wrapper
 

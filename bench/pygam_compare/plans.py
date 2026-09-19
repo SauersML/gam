@@ -22,6 +22,7 @@ from .worker import DESIGNS as ALL_DESIGNS
 from .worker import FAMILIES, LIBS
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
+SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,16 @@ PLANS: dict[str, Plan] = {
             timeout_s=600.0,
         ),
         Plan(
+            name="small_n",
+            description=(
+                "n in {50, 200, 500}, every family x {p1, p3, p5}, 3 reps:"
+                " fixed per-fit overhead, cold and warm"
+            ),
+            cells=_grid((50, 200, 500), SMALL_N_DESIGNS),
+            reps=3,
+            timeout_s=600.0,
+        ),
+        Plan(
             name="n1e4_core",
             description="n=1e4, every family x {p1, p5, te}, 3 reps",
             cells=_grid((10_000,), CORE_DESIGNS),
@@ -132,6 +143,18 @@ PLANS: dict[str, Plan] = {
             description="n=1e5, every family x {p1, p5, te}, 2 reps",
             cells=_grid((100_000,), CORE_DESIGNS),
             reps=2,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="n1e6_memory",
+            description=(
+                "n=1e6, {gaussian, poisson} x {p1, p5}, 1 rep: peak RSS and"
+                " user/sys CPU against the dense design (pyGAM audit F11)"
+            ),
+            cells=tuple(
+                Cell(f, 1_000_000, d) for f in ("gaussian", "poisson") for d in ("p1", "p5")
+            ),
+            reps=1,
             timeout_s=3_600.0,
         ),
         Plan(

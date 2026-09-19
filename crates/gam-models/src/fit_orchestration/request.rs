@@ -705,27 +705,6 @@ pub struct FitConfig {
     /// resolution for that smooth only. This is in-process orchestration state,
     /// never a user knob or environment setting.
     pub spatial_center_counts: Option<Vec<Option<usize>>>,
-    /// Whether to precompute the distribution-free conformal substrates (#942
-    /// jackknife+, #1098 exact full-conformal) at fit time and persist them on
-    /// the saved model. `None` keeps the historical behaviour of precomputing
-    /// whenever the fit is eligible; `Some(false)` skips both.
-    ///
-    /// The trade-off, measured on `y ~ s(x1,k=6) + s(x2,k=6)` (#2633): the two
-    /// substrates are **94% of a saved Gaussian model at n=20,000** (10.2 MB of
-    /// 10.85 MB) and grow linearly with the training rows, because they are
-    /// per-row. Rebuilding both costs **~5.6 ms**, 0.3% of the fit that produced
-    /// them. So keeping them buys single-digit milliseconds at roughly half a
-    /// kilobyte per training row, forever — turning the flag off yields a **~16x
-    /// smaller** model (10.85 MB -> ~0.65 MB at n=20,000).
-    ///
-    /// It is opt-OUT rather than opt-in for one reason: rebuilding a substrate
-    /// needs the training design AND response back, and a saved model
-    /// deliberately does not carry the training rows. So a model that will be
-    /// shipped to a host that never sees the training data must keep them, or it
-    /// cannot produce a conformal interval at all. Turn this off when the caller
-    /// retains its training data, fits in batch, or never asks for conformal
-    /// intervals; leave it alone when the model has to stand on its own.
-    pub precompute_conformal: Option<bool>,
     /// Whether the fit computes and publishes a coefficient covariance (and the
     /// standard errors derived from it). `None` keeps each family's own
     /// default, which for every path that reaches this field today is "yes";
@@ -757,7 +736,6 @@ pub struct FitConfig {
 impl Default for FitConfig {
     fn default() -> Self {
         Self {
-            precompute_conformal: None,
             compute_covariance: None,
             warm_start: None,
             family: None,

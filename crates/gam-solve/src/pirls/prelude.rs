@@ -57,8 +57,8 @@ pub(crate) use faer::{Accum, Par, Side};
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip};
 
 pub(crate) use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
+    ParallelIterator,
 };
 
 pub(crate) use statrs::function::gamma::{digamma, ln_gamma};

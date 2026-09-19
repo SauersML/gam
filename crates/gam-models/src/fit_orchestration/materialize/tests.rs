@@ -396,67 +396,129 @@ fn materialized_standard_fit_carries_no_survival_time_basis_2470() {
     );
 }
 
-/// #2633: `FitConfig::precompute_conformal = Some(false)` must drop the exact
-/// full-conformal substrate from the saved payload, and nothing else about the
-/// fit.
-///
-/// The substrate grows with the training rows. The knob lets a caller that
-/// keeps its training data decline it. Both arms are asserted so the test
-/// proves the FLAG is what removed it, rather than the fit having been
-/// ineligible for a substrate all along — an assertion on the off-arm alone
-/// would pass just as well against a model that never qualified.
+/// Speed F6: a saved standard GAM carries only O(p²) state and term metadata,
+/// never per-row training data, so its size does not grow with the training
+/// rows. The same formula is fit at two training sizes; the longest array
+/// anywhere in the serialized payload must be the same length at both, and the
+/// exact full-conformal field must hold only the p × p frozen penalty. Before
+/// the fix the payload persisted the training design and response for the
+/// conformal set and the final PIRLS working weights and response (twice, once
+/// under `unified` and once under `fit_result`), each of length n.
 #[test]
-fn precompute_conformal_false_drops_the_full_conformal_substrate_2633() {
+fn saved_standard_payload_carries_no_per_row_training_data() {
     use crate::inference::model_payload_builders::fit_formula_to_payload;
 
-    let td = tempdir().expect("tempdir");
-    let data_path = td.path().join("conformal_optout.csv");
-    let mut csv = String::from("y,x1,x2\n");
-    for i in 0..80u32 {
-        let t = f64::from(i) / 80.0;
-        let x1 = t * 10.0;
-        let x2 = f64::from((i * 7) % 40) / 4.0;
-        let y = (x1 * 0.7).sin() * 2.0 + (x2 * 0.4).cos();
-        csv.push_str(&format!("{y:.6},{x1:.6},{x2:.6}\n"));
+    fn longest_array(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(longest_array)
+                .max()
+                .unwrap_or(0)
+                .max(items.len()),
+            serde_json::Value::Object(fields) => {
+                fields.values().map(longest_array).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
     }
-    fs::write(&data_path, csv).expect("write conformal opt-out csv");
-    let data = load_dataset_projected(
-        &data_path,
-        &["y".to_string(), "x1".to_string(), "x2".to_string()],
-    )
-    .expect("load conformal opt-out dataset");
-    // Two smooths, so the single-smooth spline-scan fast path (which produces a
-    // payload with no fit_result and therefore no substrates for an unrelated
-    // reason) is not taken.
+
+    let td = tempdir().expect("tempdir");
     let formula = "y ~ s(x1, k=6) + s(x2, k=6)".to_string();
-
-    let on = fit_formula_to_payload(formula.clone(), &data, &FitConfig::default())
-        .expect("eligible gaussian fit should materialize and fit");
-    assert!(
-        on.full_conformal.is_some(),
-        "precondition: this fit must be substrate-eligible by default, otherwise the \
-         opt-out arm below proves nothing"
-    );
-
-    let config = FitConfig {
-        precompute_conformal: Some(false),
-        ..FitConfig::default()
+    let fit_at = |n: u32| {
+        let data_path = td.path().join(format!("rows_{n}.csv"));
+        let mut csv = String::from("y,x1,x2\n");
+        for i in 0..n {
+            let t = f64::from(i) / f64::from(n);
+            let x1 = t * 10.0;
+            let x2 = f64::from((i * 7) % 40) / 4.0;
+            let y = (x1 * 0.7).sin() * 2.0 + (x2 * 0.4).cos() + 0.3 * (f64::from(i) * 1.7).sin();
+            csv.push_str(&format!("{y:.6},{x1:.6},{x2:.6}\n"));
+        }
+        fs::write(&data_path, csv).expect("write training csv");
+        let data = load_dataset_projected(
+            &data_path,
+            &["y".to_string(), "x1".to_string(), "x2".to_string()],
+        )
+        .expect("load training dataset");
+        let payload = fit_formula_to_payload(formula.clone(), &data, &FitConfig::default())
+            .expect("gaussian fit should materialize and fit");
+        serde_json::to_value(&payload).expect("payload serializes")
     };
-    let off = fit_formula_to_payload(formula, &data, &config)
-        .expect("opting out of the substrate must not affect fittability");
-    assert!(
-        off.full_conformal.is_none(),
-        "precompute_conformal=false must drop the exact full-conformal substrate"
+    let small_rows = 400u32;
+    let large_rows = 4 * small_rows;
+    let small = fit_at(small_rows);
+    let large = fit_at(large_rows);
+
+    // Two smooths, so the single-smooth spline-scan path is not taken and the
+    // payload is the standard one that carries the conformal penalty.
+    let conformal = large
+        .get("full_conformal")
+        .and_then(serde_json::Value::as_object)
+        .expect("an eligible gaussian fit persists its exact full-conformal penalty");
+    assert_eq!(
+        conformal.keys().collect::<Vec<_>>(),
+        vec!["s_lambda"],
+        "the exact full-conformal field must persist only the frozen penalty"
     );
-    // The knob is about what is PERSISTED, not about how the model was fitted.
     assert!(
-        off.unified.is_some() && off.fit_result.is_some(),
-        "opting out of the substrates must leave the fit itself on the payload"
+        longest_array(&large) < small_rows as usize,
+        "a saved standard payload must hold no array as long as the training rows \
+         (longest array {} at n={large_rows})",
+        longest_array(&large)
     );
     assert_eq!(
-        on.formula, off.formula,
-        "the knob must not disturb anything else on the payload"
+        longest_array(&small),
+        longest_array(&large),
+        "the longest array in the saved payload must not depend on the training rows"
     );
+
+    // A v28 payload of the same fit carried the per-row data this version no
+    // longer writes: the conformal training `x` and `y`, and the working PIRLS
+    // geometry under every fit geometry. It must still load.
+    fn insert_working_geometry(value: &mut serde_json::Value, rows: usize) -> usize {
+        match value {
+            serde_json::Value::Object(fields) => {
+                let mut inserted = 0;
+                if fields.contains_key("coefficient_gauge") && fields.contains_key("penalized_hessian")
+                {
+                    fields.insert(
+                        "working".to_string(),
+                        serde_json::json!({
+                            "weights": vec![1.0; rows],
+                            "working_response": vec![0.5; rows],
+                        }),
+                    );
+                    inserted += 1;
+                }
+                inserted + fields.values_mut().map(|v| insert_working_geometry(v, rows)).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().map(|v| insert_working_geometry(v, rows)).sum()
+            }
+            _ => 0,
+        }
+    }
+    let rows = large_rows as usize;
+    let mut legacy = large.clone();
+    legacy["version"] = serde_json::json!(28);
+    let p = conformal["s_lambda"]["dim"][0].as_u64().expect("s_lambda dim") as usize;
+    legacy["full_conformal"]["x"] = serde_json::to_value(Array2::<f64>::zeros((rows, p))).expect("x");
+    legacy["full_conformal"]["y"] = serde_json::to_value(ndarray::Array1::<f64>::zeros(rows)).expect("y");
+    assert!(
+        insert_working_geometry(&mut legacy, rows) > 0,
+        "the fit payload must carry a fit geometry to plant the v28 working rows in"
+    );
+    let loaded: crate::inference::model::FittedModelPayload =
+        serde_json::from_value(legacy).expect("a v28 standard payload with training rows must load");
+    let penalty = loaded
+        .full_conformal
+        .as_ref()
+        .expect("the v28 conformal field loads as the frozen penalty");
+    assert_eq!(penalty.p(), p);
+    crate::inference::model::FittedModel::from_payload(loaded)
+        .validate_for_persistence()
+        .expect("a loaded v28 standard payload passes the saved-model gate");
 }
 
 #[test]

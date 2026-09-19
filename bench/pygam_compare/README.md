@@ -47,8 +47,10 @@ These are the plans (see `plans.py`):
 |-------------|-------|------|
 | `smoke`     | n=300, all families × `p1` (the CI smoke test) | 1 |
 | `quick`     | n=1e3, all families × all designs (the committed baseline) | 3 |
+| `small_n`   | n ∈ {50, 200, 500}, all families × {`p1`, `p3`, `p5`} (fixed per-fit overhead) | 3 |
 | `n1e4_core` | n=1e4, all families × {`p1`, `p5`, `te`} | 3 |
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
+| `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
 | `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
@@ -82,10 +84,12 @@ host load hits all of them alike.
 `threads` and `oversubscribe` cells change this.
 
 **Time.** Each phase is timed as both wall time (`perf_counter`) and process
-CPU time (`process_time`). The phases are import, one cold fit, point predict
-on n fresh rows, and a 95% interval predict. CPU time is the primary metric,
-because wall time on a shared box also measures the neighbours. The 1-minute
-load average is recorded at the start and end of each rep.
+CPU time (`process_time`). The phases are import, one cold fit, a warm refit
+of the same data in the same process (the per-fit cost once imports and lazy
+initialisation are paid), point predict on n fresh rows, and a 95% interval
+predict. CPU time is the primary metric, because wall time on a shared box also
+measures the neighbours. The 1-minute load average is recorded at the start and
+end of each rep.
 
 **Memory.** The worker's own peak RSS comes from `ru_maxrss`. The driver also
 polls the process-tree RSS and thread count with psutil every 50 ms.

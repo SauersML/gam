@@ -198,6 +198,8 @@ def paired_verdict(g: list[Record], c: list[Record], metric: str) -> Verdict:
 SPEED_METRICS: tuple[tuple[str, str], ...] = (
     ("fit_cpu_s", "fit CPU"),
     ("fit_s", "fit wall"),
+    ("fit_warm_cpu_s", "warm fit CPU"),
+    ("import_cpu_s", "import CPU"),
     ("pred_cpu_s", "predict CPU"),
     ("interval_cpu_s", "interval CPU"),
     ("proc_wall_s", "process wall (import+fit+predict)"),
