@@ -58,6 +58,7 @@ test = [
   "numpy>=1.26",
   "pandas>=2.0",
   "pyarrow>=14",
+  "polars>=1",
   "matplotlib>=3.8",
   "scikit-learn>=1.4",
 ]
