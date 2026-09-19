@@ -2361,11 +2361,10 @@ pub(crate) fn certificate_meets_curvature_requirement(
         // descent along it exists. Refusing here instead would refuse for the
         // ABSENCE of a measurement the route has just shown it cannot make,
         // which is the failure mode this flag's own doc block at
-        // `with_require_measured_psd` warns about one case earlier.
-        || matches!(
-            certificate.curvature,
-            CurvatureEvidence::CriterionContradicted
-        )
+        // `with_require_measured_psd` warns about one case earlier. A claim the
+        // criterion cannot resolve at any allowed step (#3036) supports the
+        // same statement: no descent along it is representable.
+        || certificate.curvature.withdrawn_by_criterion()
 }
 
 pub(crate) fn certificate_hessian_is_psd_off_railed_above_gradient_floor(
@@ -2518,6 +2517,53 @@ pub(crate) fn interior_curvature_floor_clearance(
     })
 }
 
+/// Whether a negative-curvature claim is falsifiable by any step the
+/// adjudication may take (#3036).
+///
+/// At a stationary point the claim `vᵀHv = λ_min < 0` predicts
+/// `V(ρ ± αv) − V(ρ) ≈ ½λ_min α²` for every step `α ≤ α_max`. It is falsifiable
+/// iff the largest step predicts a decrease the criterion can represent,
+/// `½|λ_min|·α_max² > objective_resolution`; its falsifiable range is then
+/// `[α_min, α_max]` with `α_min = sqrt(2·objective_resolution/|λ_min|)`.
+/// Otherwise no allowed step can produce a decrease the criterion resolves, and
+/// no probe outcome — a decrease under the resolution, a rise, or a failed
+/// evaluation — can confirm or falsify the claim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum NegativeCurvatureClaim {
+    /// The claim can be falsified by steps from `α_max` down to `alpha_min`.
+    Resolvable { alpha_min: f64 },
+    /// Even the largest step predicts only `predicted_at_largest`, which the
+    /// criterion's resolution does not exceed.
+    Unresolvable { predicted_at_largest: f64 },
+}
+
+/// Classify a negative-curvature claim against the criterion's resolution
+/// ([`NegativeCurvatureClaim`]). `None` when the inputs carry no claim to judge:
+/// `λ_min` not a finite negative number, `α_max` not a finite positive step, or
+/// no finite positive resolution.
+pub(crate) fn negative_curvature_claim(
+    lambda_min: f64,
+    alpha_max: f64,
+    objective_resolution: f64,
+) -> Option<NegativeCurvatureClaim> {
+    if !(lambda_min.is_finite() && lambda_min < 0.0)
+        || !(alpha_max.is_finite() && alpha_max > 0.0)
+        || !(objective_resolution.is_finite() && objective_resolution > 0.0)
+    {
+        return None;
+    }
+    let predicted_at_largest = 0.5 * lambda_min.abs() * alpha_max * alpha_max;
+    Some(if predicted_at_largest > objective_resolution {
+        NegativeCurvatureClaim::Resolvable {
+            alpha_min: (2.0 * objective_resolution / lambda_min.abs()).sqrt(),
+        }
+    } else {
+        NegativeCurvatureClaim::Unresolvable {
+            predicted_at_largest,
+        }
+    })
+}
+
 /// What the CRITERION said about a Hessian's reported negative direction
 /// (#2357/#2155/#2612).
 ///
@@ -2552,6 +2598,18 @@ pub(crate) enum SaddleAdjudication {
         objective_resolution: f64,
         /// Best objective seen, against the baseline it had to beat.
         best_seen_cost: f64,
+    },
+    /// The claim's falsifiable range is empty (#3036): even the largest step
+    /// predicts a decrease `½|λ_min|·α_max²` the criterion cannot resolve, so no
+    /// trial could confirm or falsify it and none was evaluated. A curvature the
+    /// criterion cannot resolve cannot refuse the point.
+    Unresolvable {
+        /// The eigenvalue in dispute on the judged sub-block.
+        lambda_min: f64,
+        /// `½|λ_min|·α_max²`, the claim's prediction at its largest step.
+        predicted_at_largest: f64,
+        /// The resolution that prediction does not exceed.
+        objective_resolution: f64,
     },
     /// The adjudication could not be run: no eigen-resolvable negative
     /// direction, nothing left to search after rails and invariance, an
@@ -2767,15 +2825,39 @@ pub(crate) fn adjudicate_negative_curvature(
     // in either sign is a measurement of the criterion that contradicts the
     // matrix; stopping earlier would only have been a statement about the
     // ladder.
+    //
+    // When `α_min ≥ α_max` that range is EMPTY (#3036): the largest step's
+    // predicted decrease `½|λ_min|·α_max²` is already under the resolution, so
+    // no trial can confirm or falsify the claim. The adjudication decides that
+    // before any trial. Probing `α_max` anyway made the verdict a function of
+    // whether two noise-level evaluations happened to succeed: they "contradict"
+    // when they evaluate and "decline" when they fail, and the declined exit
+    // refused the point on a curvature its criterion cannot resolve.
     let lambda_min = eigenvalues[min_idx];
-    let alpha_min = if objective_resolution.is_finite() && objective_resolution > 0.0 {
-        (2.0 * objective_resolution / lambda_min.abs()).sqrt().min(1.0)
-    } else {
+    let alpha_max = 1.0_f64;
+    let alpha_min = match negative_curvature_claim(lambda_min, alpha_max, objective_resolution) {
+        Some(NegativeCurvatureClaim::Resolvable { alpha_min }) => alpha_min,
+        Some(NegativeCurvatureClaim::Unresolvable {
+            predicted_at_largest,
+        }) => {
+            log::debug!(
+                "[CERTIFICATE] {context}: the reported negative curvature is UNRESOLVABLE by the \
+                 criterion: lambda_min={lambda_min:.6e} on the judged sub-block predicts at most \
+                 ½|λ_min|α_max² = {predicted_at_largest:.3e} at the largest step \
+                 α_max={alpha_max}, which does not exceed the criterion's resolution \
+                 {objective_resolution:.3e}. No trial was evaluated (#3036)."
+            );
+            return SaddleAdjudication::Unresolvable {
+                lambda_min,
+                predicted_at_largest,
+                objective_resolution,
+            };
+        }
         // No usable resolution: keep the historical five-rung ladder's reach.
-        0.0625
+        None => 0.0625,
     };
     let mut escape_step_scales: Vec<f64> = Vec::new();
-    let mut alpha = 1.0_f64;
+    let mut alpha = alpha_max;
     loop {
         escape_step_scales.push(alpha);
         // `f64::EPSILON` is where halving stops changing `ρ + αv` at all — a
@@ -5354,6 +5436,30 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 // them beside a withdrawn verdict is exactly the #2550
                 // misdirection.
                 certificate.curvature = CurvatureEvidence::CriterionContradicted;
+                certificate.curvature_floor = None;
+                result.criterion_certificate = Some(certificate.clone());
+                curvature_requirement_met = certificate_meets_curvature_requirement(
+                    &certificate,
+                    config.require_measured_psd,
+                    fidelity,
+                );
+            }
+            SaddleAdjudication::Unresolvable {
+                lambda_min,
+                predicted_at_largest,
+                objective_resolution,
+            } => {
+                log::debug!(
+                    "[CERTIFICATE] {context}: WITHDRAWING the curvature verdict — \
+                     lambda_min={lambda_min:.6e} predicts at most {predicted_at_largest:.3e} at \
+                     the adjudication's largest step, which the criterion's resolution \
+                     {objective_resolution:.3e} does not resolve. The certificate records \
+                     `criterion-unresolvable`, NOT a PSD claim (#3036)."
+                );
+                // Withdrawn exactly as a contradicted verdict is, and for the
+                // same reason: the floor's fields describe a negative direction
+                // the criterion cannot represent at any step it may take.
+                certificate.curvature = CurvatureEvidence::CriterionUnresolvable;
                 certificate.curvature_floor = None;
                 result.criterion_certificate = Some(certificate.clone());
                 curvature_requirement_met = certificate_meets_curvature_requirement(
@@ -9430,6 +9536,10 @@ mod criterion_curvature_ladder_2748_tests;
 #[cfg(test)]
 #[path = "saddle_adjudication_evaluable_trials_2665_tests.rs"]
 mod saddle_adjudication_evaluable_trials_2665_tests;
+
+#[cfg(test)]
+#[path = "saddle_adjudication_unresolvable_3036_tests.rs"]
+mod saddle_adjudication_unresolvable_3036_tests;
 
 #[cfg(test)]
 #[path = "canonical_checkpoint_order_tests.rs"]

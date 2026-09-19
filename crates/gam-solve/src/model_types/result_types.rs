@@ -1142,6 +1142,19 @@ pub enum CurvatureEvidence {
     /// reason: the four are acceptance-identical, and the adjudication is a
     /// statement about a run, not a property of a stored model.
     CriterionContradicted,
+    /// A Hessian was measured and reported a negative direction whose claim
+    /// the criterion **cannot resolve at any step the adjudication may take**
+    /// (#3036): even the largest step predicts a decrease `½|λ_min|·α_max²`
+    /// under the criterion's resolution, so no trial could confirm or falsify
+    /// it and none was evaluated.
+    ///
+    /// Like [`Self::CriterionContradicted`] this withdraws the matrix's verdict
+    /// without inverting it, and it is admissible: a negative direction below
+    /// the instrument's own resolution is exactly what
+    /// [`CurvatureAdmissibility::Admissible`] already admits through the
+    /// gradient-residue floor. Serializes as `null` and reloads as
+    /// [`Self::NotAvailable`], for the reason recorded on that variant.
+    CriterionUnresolvable,
 }
 
 impl CurvatureEvidence {
@@ -1153,7 +1166,20 @@ impl CurvatureEvidence {
             Self::NotSpent
             | Self::NotAvailable
             | Self::NoEstimand
-            | Self::CriterionContradicted => None,
+            | Self::CriterionContradicted
+            | Self::CriterionUnresolvable => None,
+        }
+    }
+
+    /// Whether the criterion's adjudication withdrew a measured negative
+    /// direction: it contradicted the claim over its falsifiable range
+    /// (#2612), or that range is empty (#3036). Either way the matrix is wrong
+    /// along that direction by at least `|λ_min|` at the criterion's
+    /// resolution.
+    pub fn withdrawn_by_criterion(self) -> bool {
+        match self {
+            Self::CriterionContradicted | Self::CriterionUnresolvable => true,
+            Self::Measured { .. } | Self::NotSpent | Self::NotAvailable | Self::NoEstimand => false,
         }
     }
 
@@ -1192,6 +1218,7 @@ impl std::fmt::Display for CurvatureEvidence {
             Self::NotAvailable => "n/a",
             Self::NoEstimand => "no-estimand",
             Self::CriterionContradicted => "criterion-contradicted",
+            Self::CriterionUnresolvable => "criterion-unresolvable",
         })
     }
 }
@@ -1379,6 +1406,7 @@ impl OuterCriterionCertificate {
             CurvatureEvidence::CriterionContradicted => {
                 CurvatureAdmissibility::CriterionContradicted
             }
+            CurvatureEvidence::CriterionUnresolvable => CurvatureAdmissibility::Admissible,
             evidence @ (CurvatureEvidence::NotSpent
             | CurvatureEvidence::NotAvailable
             | CurvatureEvidence::NoEstimand) => CurvatureAdmissibility::Unevaluated { evidence },
@@ -1586,6 +1614,7 @@ impl OuterCriterionCertificate {
             // keeps the source honest while `hessian_psd=criterion-contradicted`
             // beside it carries what happened to it.
             CurvatureEvidence::CriterionContradicted => "terminal-analytic-contradicted",
+            CurvatureEvidence::CriterionUnresolvable => "terminal-analytic-unresolvable",
         };
         let verdict = match self.refusal() {
             None => "stationary".to_string(),
@@ -6241,6 +6270,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
             (CurvatureEvidence::NotSpent, "null"),
             (CurvatureEvidence::NoEstimand, "null"),
             (CurvatureEvidence::CriterionContradicted, "null"),
+            (CurvatureEvidence::CriterionUnresolvable, "null"),
         ] {
             let wire = serde_json::to_string(&evidence).expect("evidence serializes");
             assert_eq!(
@@ -6277,6 +6307,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
             CurvatureEvidence::NotSpent,
             CurvatureEvidence::NoEstimand,
             CurvatureEvidence::CriterionContradicted,
+            CurvatureEvidence::CriterionUnresolvable,
         ] {
             let wire = serde_json::to_string(&lossy).expect("serializes");
             let back: CurvatureEvidence = serde_json::from_str(&wire).expect("reloads");
