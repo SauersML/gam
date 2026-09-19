@@ -15,10 +15,11 @@ ordinary additive model certifies, not whether a tuned one does.
 
 Each true function is evaluated on the covariate's own robust unit scale
 ``u = (x - q01) / (q99 - q01)`` and then scaled so its sample sd is at most the
-case's per-term amplitude and its largest centred value is at most three
-times that amplitude. A heavy-tailed or outlying covariate therefore keeps a
+case's per-term amplitude and its largest centred value over the training
+hull is at most three times that amplitude. A heavy-tailed or outlying covariate therefore keeps a
 bounded linear predictor (no ``exp`` overflow in the truth), while its
-function is still exactly the declared shape on the data.
+function is still exactly the declared shape on the data. Held-out rows
+outside the training range see the truth held at its boundary value.
 """
 
 from __future__ import annotations
@@ -46,6 +47,8 @@ DISTRIBUTIONS: tuple[str, ...] = (
 SHAPES: tuple[str, ...] = ("linear", "sinusoid", "step", "spiky", "flat")
 # Held-out rows are drawn from the same DGP with this seed offset.
 TEST_SEED_OFFSET = 1_000
+# Grid over each covariate's training hull on which a truth's reach is taken.
+HULL_GRID = 2_001
 
 
 @dataclass(frozen=True)
@@ -215,11 +218,20 @@ def draw(case: int, family: str, n: int) -> Draw:
     eta = np.full(n, spec.intercept[family])
     eta_t = np.full(n, spec.intercept[family])
     for cov, x, x_t in zip(spec.covariates, xs, xt):
-        f = _shape(cov, _unit(x, x))
-        f_t = _shape(cov, _unit(x_t, x))
+        u = _unit(x, x)
+        f = _shape(cov, u)
+        # The truth is the shape on the training hull, held at its boundary
+        # value beyond it: a held-out heavy-tailed draw far outside the
+        # training range would otherwise extrapolate a linear truth without
+        # bound and overflow the Poisson mean.
+        f_t = _shape(cov, np.clip(_unit(x_t, x), u.min(), u.max()))
         centre = float(np.mean(f))
         sd = float(np.std(f))
-        reach = float(np.max(np.abs(f - centre))) if f.size else 0.0
+        # The reach is taken over the whole hull, not just the sample: a
+        # narrow spike that no training row hits must not blow up the scale
+        # for the held-out rows that do.
+        hull = _shape(cov, np.linspace(u.min(), u.max(), HULL_GRID))
+        reach = float(np.max(np.abs(np.concatenate([f, hull]) - centre)))
         denom = max(sd, reach / 3.0)
         if denom > 0.0:
             eta += amp * (f - centre) / denom
