@@ -33,6 +33,12 @@
 //! verdict exists, so neither `agrees` nor `refutes` can be read without the check
 //! (mpd-verify and mpd-spec on #2951). The native side is Rust `f64`, binary64 by type.
 //!
+//! A module can round at a coarser precision than its rows' dtype says. transformers'
+//! `Qwen3RMSNorm` and `LlamaRMSNorm` cast binary64 rows to binary32, normalize there, and
+//! cast back before the gain, so their stage output is binary64 while the norm ran in
+//! binary32. The dtype record cannot see that; the caller declares the module's program
+//! ([`ExternalRmsNormProgram`]), and [`rms_norm_stage`] takes the band of that program.
+//!
 //! Two implementations of a special function (torch's `erf` against gam-math's
 //! `erfc`) share no derivation here. A receipt evaluates the native activation at
 //! the external executor's exported pre-activation, which isolates that difference
@@ -40,10 +46,11 @@
 //! band and never folded into it (#2951 correction C2).
 
 use super::apply::{ApplyError, FactorView, apply_anchored_linear, native_linear};
-use super::gated_rewrite::{GatedRewriteError, swiglu_hidden};
+use super::block::rms_norm_band;
+use super::gated_rewrite::{GatedRewriteError, MaskedNorm, swiglu_hidden};
 use super::occurrence::{OccurrenceError, PositionScope};
 use super::rewrite::{NativeMlp, ShapeMismatch};
-use gam_linalg::roundoff::accumulation_growth;
+use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_math::gaussian_activation::{GaussianActivation, GaussianActivationError};
 use gam_math::gaussian_gated::silu_derivatives;
 use ndarray::{Array2, ArrayView1, ArrayView2, Zip};
@@ -98,6 +105,15 @@ pub enum ReceiptRefusal {
     GatedRewrite(GatedRewriteError),
     /// An edit's declared rows do not fit the receipt's rows.
     Occurrence(OccurrenceError),
+    /// A binary32-internal norm's band rests on torch's CPU kernels (a correctly rounded
+    /// square root and division in `rsqrt`), and the stage ran elsewhere.
+    ExternalDevice { program: ExternalRmsNormProgram },
+    /// A row that the binary32 program cannot evaluate in range: its sum of squares reaches
+    /// binary32's largest finite value, so torch's norm would overflow or read zero.
+    Binary32Range { row: usize },
+    /// A norm epsilon the binary32 program's band does not cover: not a positive binary32
+    /// normal number, so `fl32(ε)` and `mean + ε` are not relative roundings.
+    Binary32Epsilon { epsilon: f64 },
 }
 
 impl From<ShapeMismatch> for ReceiptRefusal {
@@ -156,6 +172,18 @@ impl fmt::Display for ReceiptRefusal {
             Self::Occurrence(error) => {
                 write!(formatter, "an edit's declared rows do not fit the receipt: {error}")
             }
+            Self::ExternalDevice { program } => write!(
+                formatter,
+                "the {program:?} RMSNorm band covers torch's CPU kernels only, and the stage ran elsewhere"
+            ),
+            Self::Binary32Range { row } => write!(
+                formatter,
+                "row {row}'s sum of squares reaches binary32's largest finite value, outside the binary32 norm band"
+            ),
+            Self::Binary32Epsilon { epsilon } => write!(
+                formatter,
+                "the norm epsilon {epsilon:e} is not a positive binary32 normal number, outside the binary32 norm band"
+            ),
         }
     }
 }
@@ -600,6 +628,167 @@ fn product_stage_band(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> 
         .map_collect(|&a, &u| evaluation_band(1, up((a * u).abs())))
 }
 
+/// The program an external executor's RMSNorm module runs on binary64 rows, as its source
+/// declares it: `w ⊙ x (mean(x²) + ε)^{-1/2}` computed in one of two precisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalRmsNormProgram {
+    /// Every operation in binary64, [`MaskedNorm::Rms`]'s program, with its band
+    /// [`rms_norm_band`].
+    Binary64,
+    /// transformers' `Qwen3RMSNorm` and `LlamaRMSNorm` on torch's CPU kernels:
+    /// `h = x.to(float32)`, `v = h.pow(2).mean(-1)`, `h * torch.rsqrt(v + ε)` in binary32, cast
+    /// back to binary64, then `w *` that in binary64 ([`binary32_internal_rms_norm_band`]).
+    Binary32Internal,
+}
+
+/// The binary32 unit roundoff `2^-24`.
+const BINARY32_UNIT_ROUNDOFF: f64 = f32::EPSILON as f64 / 2.0;
+
+/// The largest rounding error of a binary32 operation whose result is subnormal:
+/// half the subnormal spacing, `2^-150`.
+const BINARY32_UNDERFLOW: f64 = f32::MIN_POSITIVE as f64 * BINARY32_UNIT_ROUNDOFF;
+
+/// The same for binary64, `2^-1075`.
+const BINARY64_UNDERFLOW: f64 = f64::MIN_POSITIVE * UNIT_ROUNDOFF;
+
+/// `γ_k` at the binary32 unit roundoff, rounded up; infinite when `k u ≥ 1`.
+fn binary32_growth(operations: usize) -> f64 {
+    let scaled = up(operations as f64 * BINARY32_UNIT_ROUNDOFF);
+    if scaled < 1.0 { up(scaled / down(1.0 - scaled)) } else { f64::INFINITY }
+}
+
+/// Per-entry band of the external rows `external` of the [`ExternalRmsNormProgram::Binary32Internal`]
+/// program at `inputs` (binary64 rows, `d` wide), against the exact binary64 RMSNorm
+/// `y = w x (mean(x²) + ε)^{-1/2}` of the same rows.
+///
+/// # The program's roundings
+/// With `u = 2^-24` and `U = 2^-53`, for an entry whose binary32 operands stay normal:
+/// - `h = fl32(x)`: one rounding. `h²`: one more (ATen's `pow(2)` is `x * x`);
+/// - the sum over the row in any order and any association: at most `d − 1` roundings,
+///   plus one for a final conversion when the accumulator is wider than binary32;
+/// - the mean's scaling, a division or a reciprocal and a product: two;
+/// - `+ ε`: one, and `fl32(ε)` rounds once on its own branch;
+/// so the argument `W` of the square root is `X (1 + θ)`, `|θ| ≤ γ_(d+6)(u)`, with
+/// `X = mean(x²) + ε`, all terms being nonnegative.
+/// - `torch.rsqrt` on the CPU is `1 / sqrt` (`Vectorized<float>::rsqrt` and the scalar kernel in
+///   ATen's `UnaryOpsKernel.cpp`): a correctly rounded square root and a division, two roundings.
+///   CUDA's `rsqrtf` is not correctly rounded, so any other device is refused.
+/// So `R = r (1 + ρ')` with `r = X^{-1/2}` and `|ρ'| ≤ ρ = (1 + u)/((1 − u) √(1 − ω)) − 1`, where
+/// `ω = γ_(d+6)(u) + A/ε` bounds `|W − X|/X` (below).
+/// - `z = fl32(h R)`: one rounding; the cast back is exact; `ŷ = fl64(w z)`: `U`.
+///
+/// Then `|ŷ − y| ≤ λ |y| + a`, `λ = (1 + u)² (1 + ρ)(1 + U) − 1`, and `|y| ≤ (|ŷ| + a)/(1 − λ)`,
+/// so the band is `λ (|ŷ| + a)/(1 − λ) + a`.
+///
+/// # Underflow
+/// A binary32 result in the subnormal range rounds by an absolute `μ = 2^-150`, not relatively.
+/// - An entry with `x² < 2^-126` enters the sum with `|fl32(h²) − x²| ≤ 2^-126`, so `n` such
+///   entries move `W` by at most `A = (1 + γ_(d+6)) n 2^-126 / d + μ` (the last `μ` for a subnormal
+///   mean), and `A/X ≤ A/ε`.
+/// - The cast of an entry below `2^-126` and the product `z` in the subnormal range add
+///   `a = |w| μ (1 + (1 + ρ)(1 + u)/√ε)(1 + U) + 2^-1075` to each entry.
+///
+/// Every operation here rounds to nearest and then steps one float up (or down where the value
+/// is subtracted), so the band is an upper bound computed in binary64.
+///
+/// It refuses a row whose sum of squares, grown by `γ_(d+6)`, reaches binary32's largest finite
+/// value (the program would overflow, or read `rsqrt(inf) = 0` into a finite row), and an `ε`
+/// that is not a positive binary32 normal number.
+pub fn binary32_internal_rms_norm_band(
+    epsilon: f64,
+    gain: ArrayView1<'_, f64>,
+    inputs: ArrayView2<'_, f64>,
+    external: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, ReceiptRefusal> {
+    let (rows, width) = inputs.dim();
+    check("binary32 norm gain", width, gain.len())?;
+    check("binary32 norm external rows", rows, external.nrows())?;
+    check("binary32 norm external width", width, external.ncols())?;
+    require_finite("binary32 norm inputs", inputs)?;
+    require_finite("external output", external)?;
+    if !(epsilon >= f32::MIN_POSITIVE as f64 && epsilon <= f32::MAX as f64) {
+        return Err(ReceiptRefusal::Binary32Epsilon { epsilon });
+    }
+    let u = BINARY32_UNIT_ROUNDOFF;
+    let growth = binary32_growth(width + 6);
+    let square_floor = f32::MIN_POSITIVE as f64;
+    let root_epsilon = down(epsilon.sqrt());
+    let mut band = Array2::<f64>::zeros((rows, width));
+    for (row, (input, (executed, mut band_row))) in inputs
+        .rows()
+        .into_iter()
+        .zip(external.rows().into_iter().zip(band.rows_mut()))
+        .enumerate()
+    {
+        let (mut sum_of_squares, mut tiny) = (0.0_f64, 0_usize);
+        for &value in input {
+            let square = up(value * value);
+            sum_of_squares = up(sum_of_squares + square);
+            if value * value < square_floor {
+                tiny += 1;
+            }
+        }
+        if !(up(sum_of_squares * up(1.0 + growth)) < f32::MAX as f64) {
+            return Err(ReceiptRefusal::Binary32Range { row });
+        }
+        let absolute_sum = up(up(up(up(1.0 + growth) * up(tiny as f64 * square_floor)) / width as f64)
+            + BINARY32_UNDERFLOW);
+        let relative = up(growth + up(absolute_sum / epsilon));
+        if !(relative < 1.0) {
+            return Err(ReceiptRefusal::Binary32Range { row });
+        }
+        let root_relative = up(up(up(1.0 + u) / down(1.0 - u)) / down(down(1.0 - relative).sqrt())) - 1.0;
+        let root_relative = up(root_relative);
+        let lambda = up(up(up(up(up(1.0 + u) * up(1.0 + u)) * up(1.0 + root_relative)) * up(1.0 + UNIT_ROUNDOFF)) - 1.0);
+        let dominance = down(1.0 - lambda);
+        let cast_reach = up(up(up(1.0 + root_relative) * up(1.0 + u)) / root_epsilon);
+        for ((slot, &weight), &value) in band_row.iter_mut().zip(gain.iter()).zip(executed.iter()) {
+            let absolute = up(up(up(up(weight.abs() * BINARY32_UNDERFLOW) * up(1.0 + cast_reach))
+                * up(1.0 + UNIT_ROUNDOFF))
+                + BINARY64_UNDERFLOW);
+            *slot = up(up(up(lambda * up(value.abs() + absolute)) / dominance) + absolute);
+        }
+    }
+    Ok(band)
+}
+
+/// One RMSNorm stage: the native [`MaskedNorm::Rms`] at `inputs` with its band
+/// [`rms_norm_band`], against the external module's rows with the band of its declared
+/// `program`. A `Binary32Internal` stage must have run on the CPU.
+pub fn rms_norm_stage(
+    external_execution: ExternalExecution<'_>,
+    program: ExternalRmsNormProgram,
+    epsilon: f64,
+    gain: ArrayView1<'_, f64>,
+    inputs: ArrayView2<'_, f64>,
+    external: ArrayView2<'_, f64>,
+) -> Result<StageAgreement, ReceiptRefusal> {
+    external_execution.require_binary64_bands()?;
+    let native = MaskedNorm::Rms { epsilon, gain }.apply(inputs)?;
+    let native_band = rms_norm_band(native.view());
+    let external_band = match program {
+        ExternalRmsNormProgram::Binary64 => {
+            check("external norm rows", native.nrows(), external.nrows())?;
+            check("external norm width", native.ncols(), external.ncols())?;
+            require_finite("external output", external)?;
+            rms_norm_band(external)
+        }
+        ExternalRmsNormProgram::Binary32Internal => {
+            if external_execution.device != "cpu" {
+                return Err(ReceiptRefusal::ExternalDevice { program });
+            }
+            binary32_internal_rms_norm_band(epsilon, gain, inputs, external)?
+        }
+    };
+    compare_stage(
+        external_execution,
+        external,
+        native.view(),
+        external_band.view(),
+        native_band.view(),
+    )
+}
+
 /// One SwiGLU MLP block's tensors and the stages an external executor ran.
 ///
 /// The block writes `g W_dᵀ` with `g = SiLU(x W_gᵀ) ⊙ x W_uᵀ`, without the residual and without
@@ -958,6 +1147,103 @@ mod tests {
                 tf32_matmul: true,
             })
         );
+    }
+
+    /// transformers' `Qwen3RMSNorm` on binary64 rows, emulated in binary32 as its source runs it:
+    /// `h = x as f32`, the squares summed over the row in `order`, the mean, `+ ε as f32`,
+    /// `1 / sqrt`, `h * r`, cast back, and the binary64 gain.
+    fn binary32_rms_norm(inputs: &Array2<f64>, epsilon: f64, gain: &Array1<f64>, order: &[usize]) -> Array2<f64> {
+        let width = inputs.ncols();
+        let mut output = Array2::<f64>::zeros(inputs.raw_dim());
+        for (input, mut output_row) in inputs.rows().into_iter().zip(output.rows_mut()) {
+            let h: Vec<f32> = input.iter().map(|&value| value as f32).collect();
+            let sum = order.iter().fold(0.0_f32, |sum, &column| sum + h[column] * h[column]);
+            let inverse_root = 1.0_f32 / (sum / width as f32 + epsilon as f32).sqrt();
+            for ((slot, &value), &weight) in output_row.iter_mut().zip(h.iter()).zip(gain.iter()) {
+                *slot = weight * f64::from(value * inverse_root);
+            }
+        }
+        output
+    }
+
+    /// The binary32 program's band covers its evaluation in every summation order: left to right,
+    /// right to left and interleaved halves, on rows spanning 2^-30 to 2^20 with a zero and an entry
+    /// whose binary32 square is subnormal, all with the native binary64 norm on the other side.
+    ///
+    /// Positive controls:
+    /// - the same rows declared `Binary64` are refuted: binary64 bands cannot hold a binary32
+    ///   evaluation, so the declared program is load-bearing;
+    /// - an external entry displaced by twice its band sum is refuted there;
+    /// - a CUDA record, a row whose squares overflow binary32 and a subnormal binary32 epsilon are
+    ///   refused, typed;
+    /// - rows the binary64 owner itself computed agree under `Binary64`.
+    #[test]
+    fn a_binary32_internal_norm_band_holds_every_summation_order_and_the_binary64_band_does_not() {
+        let (rows, width) = (5, 64);
+        let mut rng = StdRng::seed_from_u64(2951);
+        let mut inputs = Array2::from_shape_simple_fn((rows, width), || {
+            rng.random_range(-8.0..8.0) * 2.0_f64.powi(rng.random_range(-30..=20))
+        });
+        inputs[[1, 3]] = 0.0;
+        inputs[[2, 7]] = 1.0e-25;
+        let gain: Array1<f64> = Array1::from_shape_simple_fn(width, || rng.random_range(-2.0..2.0));
+        // Qwen3's rms_norm_eps.
+        let epsilon = 1.0e-6;
+        let forward: Vec<usize> = (0..width).collect();
+        let reverse: Vec<usize> = (0..width).rev().collect();
+        let interleaved: Vec<usize> = (0..width / 2).flat_map(|c| [c, c + width / 2]).collect();
+        let stage = |program, execution: ExternalExecution<'static>, external: &Array2<f64>| {
+            rms_norm_stage(execution, program, epsilon, gain.view(), inputs.view(), external.view())
+        };
+        for order in [&forward, &reverse, &interleaved] {
+            let external = binary32_rms_norm(&inputs, epsilon, &gain, order);
+            let agreement = stage(ExternalRmsNormProgram::Binary32Internal, BINARY64_CPU, &external)
+                .expect("a binary32 CPU stage compares");
+            assert!(agreement.agrees && !agreement.refutes, "{agreement:?}");
+            let refuted = stage(ExternalRmsNormProgram::Binary64, BINARY64_CPU, &external)
+                .expect("a declared binary64 stage compares");
+            assert!(
+                !refuted.agrees && refuted.refutes,
+                "a binary64 band must not hold a binary32 evaluation: {refuted:?}"
+            );
+        }
+
+        let external = binary32_rms_norm(&inputs, epsilon, &gain, &forward);
+        let band = binary32_internal_rms_norm_band(epsilon, gain.view(), inputs.view(), external.view())
+            .expect("rows in binary32 range");
+        let native = MaskedNorm::Rms { epsilon, gain: gain.view() }.apply(inputs.view()).expect("finite rows");
+        let native_band = rms_norm_band(native.view());
+        let mut displaced = external.clone();
+        displaced[[3, 5]] += 2.0 * (band[[3, 5]] + native_band[[3, 5]]);
+        let refuted = stage(ExternalRmsNormProgram::Binary32Internal, BINARY64_CPU, &displaced)
+            .expect("a binary32 CPU stage compares");
+        assert!(refuted.refutes && refuted.witness == (3, 5), "{refuted:?}");
+
+        let cuda = ExternalExecution {
+            dtype: "float64",
+            device: "cuda",
+            tf32_matmul: false,
+        };
+        assert_eq!(
+            stage(ExternalRmsNormProgram::Binary32Internal, cuda, &external),
+            Err(ReceiptRefusal::ExternalDevice {
+                program: ExternalRmsNormProgram::Binary32Internal
+            })
+        );
+        let mut overflowing = inputs.clone();
+        overflowing[[4, 0]] = 2.0_f64.powi(70);
+        assert_eq!(
+            binary32_internal_rms_norm_band(epsilon, gain.view(), overflowing.view(), external.view()),
+            Err(ReceiptRefusal::Binary32Range { row: 4 })
+        );
+        let subnormal = f64::from(f32::MIN_POSITIVE) / 4.0;
+        assert_eq!(
+            binary32_internal_rms_norm_band(subnormal, gain.view(), inputs.view(), external.view()),
+            Err(ReceiptRefusal::Binary32Epsilon { epsilon: subnormal })
+        );
+        let binary64 = stage(ExternalRmsNormProgram::Binary64, BINARY64_CPU, &native)
+            .expect("a binary64 stage compares");
+        assert!(binary64.agrees && !binary64.refutes, "{binary64:?}");
     }
 
     /// A dense float64 program stands in for the external executor. It forms
