@@ -415,10 +415,6 @@ pub struct BlockwiseFitOptions {
     pub outer_max_iter: usize,
     /// Absolute outer stationarity tolerance; must be finite and positive.
     pub outer_tol: f64,
-    /// `outer_tol` is the caller's own request (a fit request's `outer_tol`),
-    /// not the default. A family that floors the default outer tolerance for its
-    /// own route keeps its hands off a requested one.
-    pub outer_tol_is_caller_set: bool,
     /// Optional override for the OUTER smoothing optimizer's
     /// *relative-cost-decrease* convergence stop, decoupled from `outer_tol`.
     ///
@@ -604,7 +600,6 @@ impl Default for BlockwiseFitOptions {
             inner_tol: 1e-6,
             outer_max_iter: 60,
             outer_tol: 1e-5,
-            outer_tol_is_caller_set: false,
             outer_rel_cost_tol: None,
             rho_lower_bound: None,
             // Conditioning is solver state, not a coefficient prior. Start at

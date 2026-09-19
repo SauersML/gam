@@ -155,7 +155,7 @@ pub(crate) mod result_types;
 
 pub(crate) use result_types::CERTIFICATE_RAIL_MARGIN;
 pub use result_types::{
-    BlockRole, CertifiedRung, CoefficientCovarianceDefinition,
+    BlockRole, CertifiedRung, CoefficientCovarianceDefinition, CoefficientModeSelection,
     CovarianceDeclined, CurvatureAdmissibility, CurvatureEvidence, CurvatureFloorClearance,
     DisplayCoefficientUncertainty,
     ExecutionPath, FitArtifacts, FitGeometry, FitInference, FitOptions, FittedBlock,
