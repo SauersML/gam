@@ -24,6 +24,13 @@ Use it when:
 The scale formula is the `noise_formula=` keyword:
 
 ```python
+import gamfit
+import numpy as np
+
+rng = np.random.default_rng(0)
+x1, x2 = rng.uniform(0, 1, 400), rng.uniform(0, 1, 400)
+df = {"x1": x1, "x2": x2, "y": np.sin(2 * np.pi * x1) + x2 ** 2 + rng.normal(0, 0.1 + 0.4 * x1)}
+
 gamfit.fit(
     df,
     "y ~ s(x1) + s(x2)",
@@ -51,6 +58,17 @@ This is supported for:
 - Survival location-scale: pair with `survival_likelihood="location-scale"`:
 
 ```python
+import gamfit
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 80, n), rng.normal(27, 4, n)
+t = 20 * rng.weibull(1.0 + (age - 40) / 40, n) * np.exp(-0.03 * (age - 60) - 0.05 * (bmi - 27))
+c = rng.uniform(5, 40, n)
+df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, c), "event": (t <= c).astype(float), "age": age, "bmi": bmi})
+
 gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(age) + bmi",
@@ -83,6 +101,15 @@ A Gaussian location-scale fit returns the same Python prediction columns
 as a standard Gaussian fit:
 
 ```python
+import gamfit
+import numpy as np
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+train_df = {"x": x, "y": np.sin(2 * np.pi * x) + rng.normal(0, 0.1 + 0.4 * x)}
+test_df = {"x": [0.1, 0.5, 0.9]}
+model = gamfit.fit(train_df, "y ~ s(x)", noise_formula="s(x)")
+
 preds = model.predict(test_df, interval=0.95)
 # Columns: linear_predictor_plugin, mean_plugin, posterior_mean, noise_scale,
 #          posterior_mean_standard_error, posterior_mean_lower, posterior_mean_upper
@@ -104,6 +131,18 @@ For survival location-scale, predictions return a
 surface and linear predictor:
 
 ```python
+import gamfit
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 80, n), rng.normal(27, 4, n)
+t = 20 * rng.weibull(1.0 + (age - 40) / 40, n) * np.exp(-0.03 * (age - 60) - 0.05 * (bmi - 27))
+c = rng.uniform(5, 40, n)
+train_df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, c), "event": (t <= c).astype(float), "age": age, "bmi": bmi})
+test_df = train_df.head(5)
+
 model = gamfit.fit(
     train_df,
     "Surv(entry, exit, event) ~ s(age) + bmi",

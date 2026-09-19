@@ -166,7 +166,7 @@ pub fn exact_a_band_edge(curvature: f64, resolution: f64, substituted_stiffness:
 /// direction of a repeated eigenspace carries the same `μ`, but the positive edge also
 /// reads its substituted stiffness, so without this step an arbitrary rotation of the
 /// eigenspace could change which directions the band retains. A cluster is replaced by
-/// its mean within the arithmetic envelope `4γ‖μ‖`, `γ = nε/(1 − nε)`, which accounts for
+/// its mean within the arithmetic envelope `4γ_n‖μ‖`, `γ_n = nu/(1 − nu)` from `gam_linalg::roundoff`, which accounts for
 /// projection, its transpose product, eigendecomposition and lifting, so replacing it
 /// changes the pencil only within that envelope and distinct resolved eigenvalues keep
 /// their eigenvectors. The cluster is rotated to diagonalize the substitution restricted
@@ -181,7 +181,7 @@ where
     B: Fn(&Array1<f64>) -> Result<Array1<f64>, String>,
 {
     let n = vectors.nrows();
-    let gamma = n as f64 * f64::EPSILON / (1.0 - n as f64 * f64::EPSILON);
+    let gamma = gam_linalg::roundoff::accumulation_growth(n);
     let envelope = 4.0 * gamma * spectral_norm;
     let mut start = 0;
     while start < values.len() {
