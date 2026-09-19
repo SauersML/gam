@@ -80,7 +80,7 @@ fn refused_value_gradient_evaluation_names_its_reason_2982() {
         cost_stall: None,
         cost_stall_bounds: None,
         consecutive_probe_refusals: 0,
-        accepted_steps: None,
+        accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: None,
         stratum_rank: None,

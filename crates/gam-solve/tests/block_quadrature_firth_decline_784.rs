@@ -71,8 +71,8 @@ impl LaplaceMarginalCorrector for DiagnosticCounter {
         panic!("a zero-skewness diagnostic never runs the order search: {step}")
     }
 
-    fn max_representable_order(&self) -> usize {
-        gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+    fn is_representable_order(&self, order: usize) -> bool {
+        gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
     }
 }
 
