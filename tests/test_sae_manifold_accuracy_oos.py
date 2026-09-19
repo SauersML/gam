@@ -74,7 +74,7 @@ def test_curved_circle_atom_in_sample_r2_per_seed(seed: int):
     on every seed. If any seed drops below this it usually means the
     optimization got stuck in a bad local minimum (initialisation bug)."""
     z, _ = _circle_data(n=400, p=64, noise=0.04, seed=seed)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis="periodic",
@@ -97,7 +97,7 @@ def test_curved_circle_atom_mean_r2_across_seeds():
     scores = []
     for seed in range(5):
         z, _ = _circle_data(n=400, p=64, noise=0.04, seed=seed)
-        fit = gamfit.sae_manifold_fit(
+        fit = gamfit.sae.sae_manifold_fit(
             X=z,
             K=1,
             atom_basis="periodic",
@@ -125,7 +125,7 @@ def test_curved_circle_atom_oos_r2():
     z_train = z_full[:200]
     z_test = z_full[200:]
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z_train,
         K=1,
         atom_basis="periodic",
@@ -181,7 +181,7 @@ def test_oos_uses_fit_time_hyperparameters():
     z_train = z_full[:200]
     z_test = z_full[200:]
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z_train,
         K=1,
         atom_basis="periodic",
@@ -217,7 +217,7 @@ def test_oos_uses_fit_time_hyperparameters():
     # the same hyperparameters and therefore reproduce OOS predictions
     # bit-exactly. If any knob were dropped on the way through, the OOS
     # solve would diverge here.
-    restored = gamfit.ManifoldSAE.from_dict(fit.to_dict())
+    restored = gamfit.sae.ManifoldSAE.from_dict(fit.to_dict())
     assert restored.tau == pytest.approx(0.3)
     assert restored.sparsity_strength == pytest.approx(0.5)
     assert restored.smoothness == pytest.approx(2.0)
@@ -235,7 +235,7 @@ def test_curved_sphere_atom_on_sphere_data():
     lat/lon ranges, this test fails while the periodic test passes.
     """
     z, _ = _sphere_data(n=500, p=48, noise=0.03, seed=0)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis="sphere",
@@ -270,7 +270,7 @@ def test_sae_manifold_oos_reconstruction_idempotence():
     z_train = z_full[:200]
     z_test = z_full[200:]
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z_train,
         K=1,
         atom_basis="periodic",
@@ -316,7 +316,7 @@ def test_near_duplicate_training_input_takes_oos_path_not_cache():
     within tolerance).
     """
     z_train, _ = _circle_data(n=200, p=48, noise=0.04, seed=11)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z_train,
         K=1,
         atom_basis="periodic",

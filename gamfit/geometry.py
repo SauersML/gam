@@ -10,6 +10,8 @@ behavior is unchanged.
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 from ._binding import rust_module
 
 __all__ = [
@@ -119,13 +121,15 @@ class ProductManifold:
 # Runtime rebind: replace each stub with the matching `gamfit._rust` pyclass.
 # Static analysis sees the class definitions above; runtime sees the Rust
 # implementation, so existing callers and `isinstance` checks against the
-# top-level `gamfit.X` re-export resolve to the live Rust type.
+# `gamfit.geometry.X` export resolve to the live Rust type.
 # ---------------------------------------------------------------------------
 _rust = rust_module()
 for _name in __all__:
     _cls = getattr(_rust, _name, None)
     if _cls is None:
-        def _missing(*args, _missing_name: str = _name, **kwargs):
+        def _missing(
+            *args: object, _missing_name: str = _name, **kwargs: object
+        ) -> NoReturn:
             del args, kwargs
             raise AttributeError(
                 f"gamfit._rust does not expose {_missing_name}; rebuild the local Rust extension"

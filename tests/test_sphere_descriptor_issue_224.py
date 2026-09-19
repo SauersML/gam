@@ -26,7 +26,7 @@ def test_sphere_evaluate_more_centers_than_rows_numpy():
     lat = rng.uniform(-60.0, 60.0, size=6)
     lon = rng.uniform(-180.0, 180.0, size=6)
 
-    spec = gamfit.Sphere(n_centers=12)
+    spec = gamfit.smooth.Sphere(n_centers=12)
     design = spec.evaluate(lat, lon, backend="numpy")
     arr = np.asarray(design)
     assert arr.shape[0] == 6
@@ -40,7 +40,7 @@ def test_sphere_evaluate_more_centers_than_rows_torch():
     lat = rng.uniform(-60.0, 60.0, size=6)
     lon = rng.uniform(-180.0, 180.0, size=6)
 
-    spec = gamfit.Sphere(n_centers=12)
+    spec = gamfit.smooth.Sphere(n_centers=12)
     design = spec.evaluate(lat, lon, backend="torch")
     if hasattr(design, "detach"):
         arr = design.detach().cpu().numpy()
@@ -57,7 +57,7 @@ def test_sphere_basis_size_default_no_eval():
 
     The Wahba design has one column per center, so basis_size is
     n_centers = 50 for the default."""
-    spec = gamfit.Sphere()  # default n_centers=50
+    spec = gamfit.smooth.Sphere()  # default n_centers=50
     size = spec.basis_size
     assert isinstance(size, int)
     assert size == 50
@@ -66,7 +66,7 @@ def test_sphere_basis_size_default_no_eval():
 def test_sphere_basis_size_custom_centers_before_evaluate():
     """basis_size accessed BEFORE any evaluate call must work and reflect
     the configured n_centers."""
-    spec = gamfit.Sphere(n_centers=37)
+    spec = gamfit.smooth.Sphere(n_centers=37)
     size = spec.basis_size
     assert isinstance(size, int)
     assert size == 37
@@ -79,7 +79,7 @@ def test_sphere_basis_size_then_evaluate_consistent():
     The evaluate() design exposes one column per center, and basis_size is
     that column count: a property of the spec's centers, NOT of the eval row
     count (issue #224)."""
-    spec = gamfit.Sphere(n_centers=20)
+    spec = gamfit.smooth.Sphere(n_centers=20)
     size = spec.basis_size
 
     rng = np.random.default_rng(2)
@@ -98,7 +98,7 @@ def test_sphere_explicit_centers_round_trip_if_supported():
     centers = np.column_stack(
         [rng.uniform(-60.0, 60.0, size=10), rng.uniform(-180.0, 180.0, size=10)]
     )
-    spec = gamfit.Sphere(centers=centers)
+    spec = gamfit.smooth.Sphere(centers=centers)
     np.testing.assert_array_equal(np.asarray(spec.centers, dtype=np.float64), centers)
     assert spec.basis_size == 10
 

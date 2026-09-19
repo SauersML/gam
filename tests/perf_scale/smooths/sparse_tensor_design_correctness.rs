@@ -196,6 +196,7 @@ fn build_non_periodic_design(n: usize) -> (DesignMatrix, Array2<f64>) {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let design =
         build_term_collection_design(data.view(), &spec).expect("non-periodic te(x, h) build");
@@ -301,6 +302,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let design =
         build_term_collection_design(data.view(), &spec).expect("cylinder te(theta, h) build");

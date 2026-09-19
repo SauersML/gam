@@ -127,7 +127,7 @@ def test_one_dimensional_period_declaration_is_not_a_silent_no_op(formula: str) 
     plain_dev, _ = _plain()
     try:
         model = gamfit.fit(_hourly(), formula, family="gaussian")
-    except gamfit.GamError:
+    except gamfit.errors.GamError:
         return  # rejected rather than silently dropped: acceptable resolution
 
     deviance = float(model.summary().deviance)
@@ -178,7 +178,7 @@ def test_tensor_period_declaration_is_not_a_silent_no_op(formula: str) -> None:
 
     try:
         model = gamfit.fit(data, formula, family="gaussian")
-    except gamfit.GamError:
+    except gamfit.errors.GamError:
         return  # rejected rather than silently dropped: acceptable resolution
 
     deviance = float(model.summary().deviance)

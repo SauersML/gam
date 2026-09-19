@@ -16,10 +16,10 @@ def main() -> None:
         {"y": y},
         "y ~ s(t, type='duchon', centers=24)",
         family="gaussian",
-        latents={"t": gamfit.LatentCoord(n=n, d=4, init=t)},
+        latents={"t": gamfit.smooth.LatentCoord(n=n, d=4, init=t)},
         penalties=[
-            gamfit.NuclearNormPenalty(weight=1.0, n_eff=n, target="t"),
-            gamfit.ARDPenalty(target="t"),
+            gamfit.penalties.NuclearNormPenalty(weight=1.0, n_eff=n, target="t"),
+            gamfit.penalties.ARDPenalty(target="t"),
         ],
     )
 

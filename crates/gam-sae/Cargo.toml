@@ -33,6 +33,7 @@ cudarc.workspace = true
 
 [dev-dependencies]
 approx = "0.5.1"
+gam-linalg-test-support = { path = "../gam-linalg-test-support" }
 qd = "0.8.0"
 env_logger = "0.11"
 

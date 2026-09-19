@@ -11,7 +11,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Sequence, cast
+from typing import Any, Iterator, Literal, Sequence, cast, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -140,7 +140,7 @@ class Model:
         self,
         data: Any,
         *,
-        interval: float | str | None = None,
+        interval: float | Literal["conformal"] | None = None,
         conformal_level: float = 0.9,
         calibration: Any | None = None,
         covariance_mode: str | None = None,
@@ -321,8 +321,6 @@ class Model:
                 raise map_exception(exc) from exc
             return shape_predict_response(
                 raw,
-                headers=headers,
-                rows=rows,
                 table_kind=table_kind,
                 training_table_kind=self._training_table_kind,
                 interval=conformal_level,
@@ -346,8 +344,6 @@ class Model:
             raise map_exception(exc) from exc
         return shape_predict_response(
             raw,
-            headers=headers,
-            rows=rows,
             table_kind=table_kind,
             training_table_kind=self._training_table_kind,
             interval=interval,
@@ -379,7 +375,7 @@ class Model:
         named ``score`` (plus the requested identifier).
         """
         required = rust_module().required_model_columns(self._model_bytes, True)
-        if id_column is not None:
+        if required is not None and id_column is not None:
             required = sorted(set(required) | {id_column})
         headers, rows, table_kind = normalize_table(data, required_columns=required)
         row_ids = extract_row_ids(headers, rows, id_column)
@@ -444,10 +440,12 @@ class Model:
             # the 1-D response-scale prediction vector, not the engine's
             # full estimand-explicit column matrix. The FFI returns the lone
             # response-scale `posterior_mean` column as `(n, 1)`; drop the
-            # trailing axis.
+            # trailing axis. A joint expectile fit's point is its `(n, K)`
+            # level curves, returned as is.
             import numpy as np
 
-            return np.asarray(result).reshape(-1)
+            result = np.asarray(result)
+            return result.reshape(-1) if result.shape[1] == 1 else result
         return result
 
     def summary(self) -> Summary:
@@ -587,9 +585,17 @@ class Model:
         null refit converged, else ``"none"`` (the uncorrected reference stands,
         never weakened).
 
+        A shape-constrained smooth (``shape=...``) gets no LR p-value. Its null
+        :math:`f = 0` is the apex of the constraint cone and the fitted
+        coefficients are a truncated posterior mean, so no :math:`\\chi^2`,
+        spectral or chi-bar-square reference is calibrated. Such a term appears
+        as a row with only ``name``, ``term_idx``, ``p_value_unavailable``
+        (``"shape_constrained"``) and ``explanation``; every tested row carries
+        no ``p_value_unavailable`` key.
+
         Needs the training ``data`` for the per-term null refits, exactly as
-        :meth:`curvature` does. Returns an empty list when the model has no
-        penalized smooth term.
+        :meth:`curvature` does. Rows are in term order. Returns an empty list
+        when the model has no penalized smooth term.
         """
         headers, rows, _ = normalize_table(data)
         try:
@@ -599,7 +605,8 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         payload = json.loads(raw)
-        return list(payload.get("smooth_terms", []))
+        terms = list(payload["smooth_terms"]) + list(payload["unavailable"])
+        return sorted(terms, key=lambda row: row["term_idx"])
 
     def basis_check(self, data: Any) -> list[dict[str, Any]]:
         r"""Per-smooth basis-adequacy report: is each smooth's basis big enough (#2774)?
@@ -1090,6 +1097,18 @@ class Model:
         return self.summary().family_name
 
     @property
+    def student_t_sigma(self) -> float | None:
+        """LAML-estimated scale σ of a ``family="student-t"`` fit; ``None`` otherwise."""
+        params = rust_module().student_t_parameters_from_model(self._model_bytes)
+        return None if params is None else params[0]
+
+    @property
+    def student_t_nu(self) -> float | None:
+        """LAML-estimated degrees of freedom ν of a ``family="student-t"`` fit; ``None`` otherwise."""
+        params = rust_module().student_t_parameters_from_model(self._model_bytes)
+        return None if params is None else params[1]
+
+    @property
     def notes(self) -> list[str]:
         """Inference advisories recorded while this model was fit.
 
@@ -1099,7 +1118,7 @@ class Model:
         regression marginal is capped to the data support, or a basis-
         degradation note when a low-cardinality covariate cannot support the
         requested smooth. :func:`gamfit.fit` also emits these as
-        :class:`gamfit.GamInferenceWarning` at fit time; this property lets a
+        :class:`gamfit.errors.GamInferenceWarning` at fit time; this property lets a
         caller inspect them after the fact (or after loading a saved model).
         Empty when the fit used exactly the requested configuration.
         """
@@ -1140,7 +1159,8 @@ class Model:
 
     @property
     def group_metadata(self) -> dict[str, Any] | None:
-        return rust_module().model_group_metadata(self._model_bytes)
+        metadata: dict[str, Any] | None = rust_module().model_group_metadata(self._model_bytes)
+        return metadata
 
     @property
     def deployment_extensions(self) -> tuple[dict[str, Any], ...]:
@@ -1157,9 +1177,12 @@ class Model:
     def _coefficient_state(self) -> dict[str, Any]:
         """Decode the Rust coefficient-state JSON payload."""
         try:
-            return json.loads(rust_module().coefficient_state_json(self._model_bytes))
+            state: dict[str, Any] = json.loads(
+                rust_module().coefficient_state_json(self._model_bytes)
+            )
         except Exception as exc:
             raise map_exception(exc) from exc
+        return state
 
     def partial_dependence(
         self,
@@ -1263,39 +1286,18 @@ class Model:
             return shares[term]
         return shares
 
-    @property
-    def conditional_aic(self) -> float:
-        """Model-selection cost for this fit, on the same rank scale used by
-        ``gamfit.compare_models`` to pick its winner: the Occam-penalised
-        conditional AIC (``-2*loglik + 2*edf``). Both the ordinary
-        log-likelihood and effective degrees of freedom are required; raw REML /
-        LAML is a different estimand and is never used as a fallback (#2079).
-        It is a *cost*, so **lower is better** -- the model with the smaller
-        ``conditional_aic`` is the better-supported one, agreeing with the
-        winner reported by ``gamfit.compare_models``. It is not a marginal
-        likelihood or evidence (#2946). Use :meth:`evidence_ratio_vs` or
-        ``gamfit.compare_models`` for a direct comparison. (The raw REML/LAML
-        criterion remains available as ``Summary.reml_score`` and the
-        ``score_table`` column of ``gamfit.compare_models``.)
-        """
-        return float(rust_module().model_conditional_aic(self._model_bytes))
-
     def evidence_ratio_vs(self, other: "Model") -> float:
         """Akaike evidence ratio of this fit over ``other``.
 
-        ``exp(-(self.conditional_aic - other.conditional_aic) / 2)``: the
-        relative likelihood of the two fits under the conditional-AIC criterion that
-        ``gamfit.compare_models`` ranks on (Burnham & Anderson). Returns ``> 1``
-        when this fit is better supported than ``other`` (i.e. has the lower
-        :attr:`conditional_aic` cost) and ``< 1`` otherwise, agreeing with the winner
-        reported by ``gamfit.compare_models``.
+        ``exp((other_aic - self_aic) / 2)`` on the smoothing-corrected AIC
+        (``Summary.aic_corrected``) that ``gamfit.compare_models`` ranks on
+        (Burnham & Anderson's relative likelihood). Returns ``> 1`` when this
+        fit is better supported than ``other`` and ``< 1`` otherwise, agreeing
+        with the winner ``gamfit.compare_models`` reports. Both fits must share
+        the response family and the number of observations.
 
-        This is **not** a Bayes factor. A Bayes factor is a ratio of
-        prior-integrated marginal likelihoods; this quantity integrates over no
-        prior and must not be read against Jeffreys / Kass-Raftery thresholds.
-        (The raw REML/LAML headline in the ``score_table`` of
-        ``gamfit.compare_models`` is the Laplace-approximate marginal-likelihood
-        diagnostic, kept on its own labelled scale.)
+        This is **not** a Bayes factor: it integrates over no prior and must
+        not be read against Jeffreys / Kass-Raftery thresholds.
         """
         # allow-list (a): FFI input validation.
         if not isinstance(other, Model):
@@ -1343,11 +1345,16 @@ class Model:
         return _plot(self, data, x=x, y=y, interval=interval, kind=kind, ax=ax)
 
     def __repr__(self) -> str:
+        summary = self.summary()
         parts = [
             f"formula={self.formula!r}",
-            f"family_name={self.family_name!r}",
+            f"family_name={summary.family_name!r}",
             f"training_table_kind={self._training_table_kind!r}",
         ]
+        # The objective's name is rendered in Rust (`SummaryEstimator`), so the
+        # repr, `print(model)` and `gam summary` print the same words.
+        if summary.convergence is not None:
+            parts.append(f"estimator={summary.convergence['estimator']['text']!r}")
         return f"Model({', '.join(parts)})"
 
     def __str__(self) -> str:
@@ -1377,7 +1384,16 @@ class MultinomialPrediction:
 
     __slots__ = ("classes", "mean", "std_error", "mean_lower", "mean_upper", "level")
 
-    def __init__(self, *, classes, mean, std_error, mean_lower, mean_upper, level):
+    def __init__(
+        self,
+        *,
+        classes: Sequence[Any],
+        mean: NDArray[np.float64],
+        std_error: NDArray[np.float64],
+        mean_lower: NDArray[np.float64],
+        mean_upper: NDArray[np.float64],
+        level: float,
+    ) -> None:
         self.classes = list(classes)
         self.mean = mean
         self.std_error = std_error
@@ -1399,17 +1415,15 @@ class MultinomialModel:
     Returned by ``gamfit.fit(data, formula, family='multinomial')``. The
     underlying solver is the canonical
     ``gam::families::multinomial::fit_penalized_multinomial`` Newton solve
-    against a reference-coded softmax likelihood; the reference class is the
-    last level recorded in the dataset schema (i.e. order of first appearance
-    in the training table, which is stable across runs).
+    against a reference-coded softmax likelihood with ``K − 1`` linear
+    predictors; every (class, term) penalty carries its own smoothing
+    parameter, selected jointly by REML/LAML. Class levels are the sorted label
+    set of the categorical response column and the reference class is the last
+    of them.
 
     Class names are preserved verbatim from the categorical response column,
     so :attr:`classes_` matches what ``predict`` columns line up with — no
     silent permutation.
-
-    Slice A of issue #328: a single uniform smoothing parameter is shared
-    across every penalty block and every active class. REML / LAML λ
-    selection lands in the follow-up slice.
     """
 
     __slots__ = ("_model_bytes", "_training_table_kind", "_metadata")
@@ -1478,7 +1492,19 @@ class MultinomialModel:
         return self._model_bytes
 
     # ------------------------------------------------------------------ predict
-    def predict(self, data: Any, *, interval: str | None = None, level: float = 0.95) -> Any:
+    @overload
+    def predict(
+        self, data: Any, *, interval: None = None, level: float = 0.95
+    ) -> NDArray[np.float64]: ...
+
+    @overload
+    def predict(
+        self, data: Any, *, interval: Literal["confidence"], level: float = 0.95
+    ) -> MultinomialPrediction: ...
+
+    def predict(
+        self, data: Any, *, interval: Literal["confidence"] | None = None, level: float = 0.95
+    ) -> NDArray[np.float64] | MultinomialPrediction:
         """Predict class probabilities for new rows.
 
         With ``interval=None`` (default) returns an ``(N, K)`` numpy array whose
@@ -1588,7 +1614,7 @@ class MultinomialModel:
             labels[idx == c] = name
         return labels
 
-    def smooth_significance(self) -> list[dict]:
+    def smooth_significance(self) -> list[dict[str, Any]]:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 
         One row per ``(active class, smooth term)`` with keys ``class``,

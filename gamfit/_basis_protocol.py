@@ -1,8 +1,8 @@
 """Uniform callable-basis protocol for gamfit descriptors.
 
-Every basis descriptor in the public surface — :class:`gamfit.Duchon`,
-:class:`gamfit.BSpline`, :class:`gamfit.Matern`, :class:`gamfit.Pca`,
-:class:`gamfit.TensorBSpline`, :class:`gamfit.PeriodicSplineCurve` — gains
+Every basis descriptor in the public surface — :class:`gamfit.smooth.Duchon`,
+:class:`gamfit.smooth.BSpline`, :class:`gamfit.smooth.Matern`, :class:`gamfit.smooth.Pca`,
+:class:`gamfit.smooth.TensorBSpline`, :class:`gamfit.smooth.PeriodicSplineCurve` — gains
 three methods with a single uniform contract:
 
 * ``evaluate(*coords) -> Tensor`` of shape ``(B, M)``.
@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch as _torch_t
+    from numpy.typing import NDArray
 
     TensorLike = _torch_t.Tensor
 
@@ -148,14 +149,14 @@ def _normalize_backend(backend: str | None, coords: Sequence[Any]) -> str:
 # already-normalized backend to the matching adapter.
 
 
-def _stack_coords_torch(coords: Sequence[Any]) -> Any:
+def _stack_coords_torch(coords: tuple[Any, ...]) -> Any:
     """Stack 1D torch coordinates into a (B, d) float64 tensor."""
     from ._frame_torch import stack_coords
 
     return stack_coords(coords)
 
 
-def _stack_coords_for(backend: str, coords: Sequence[Any]) -> Any:
+def _stack_coords_for(backend: str, coords: tuple[Any, ...]) -> Any:
     """Stack ``coords`` via the frame adapter for ``backend``.
 
     ``backend`` is already normalized to one of ``"torch"``/``"numpy"``/
@@ -244,24 +245,31 @@ class BasisDescriptor:
         ``coords`` is a ``(B, d)`` jax.numpy array.
         """
         jax, jnp = _jax()
-        B = int(coords.shape[0])
+        # ``_jax`` hands back the modules untyped (it guards the optional
+        # import); bind ``custom_jvp`` from the now-importable package so the
+        # decorator keeps jax's own annotations.
+        from jax import custom_jvp
+
+        B =int(coords.shape[0])
         M = int(self.basis_size)
         d = int(self.intrinsic_dim)
         out_shape = jax.ShapeDtypeStruct((B, M), coords.dtype)
 
-        def _host(x):
+        def _host(x: NDArray[Any]) -> NDArray[Any]:
             import numpy as np
 
             arr = np.asarray(x, dtype=np.float64)
             res = self._evaluate_numpy(arr)
             return np.asarray(res, dtype=np.asarray(x).dtype)
 
-        @jax.custom_jvp
-        def _fwd(x):
+        @custom_jvp
+        def _fwd(x: Any) -> Any:
             return jax.pure_callback(_host, out_shape, x)
 
         @_fwd.defjvp
-        def _fwd_jvp(primals, tangents):
+        def _fwd_jvp(
+            primals: tuple[Any, ...], tangents: tuple[Any, ...]
+        ) -> tuple[Any, Any]:
             (x,) = primals
             (xdot,) = tangents
             primal_out = _fwd(x)
@@ -274,7 +282,7 @@ class BasisDescriptor:
                 # (unreachable below by design; raised above)
             jac_shape = jax.ShapeDtypeStruct((B, M, d), coords.dtype)
 
-            def _host_jac(z):
+            def _host_jac(z: NDArray[Any]) -> NDArray[Any]:
                 import numpy as np
 
                 arr = np.asarray(z, dtype=np.float64)
