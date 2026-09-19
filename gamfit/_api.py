@@ -1211,6 +1211,7 @@ def fit_array(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
