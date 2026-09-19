@@ -27,7 +27,7 @@ The model's own evidence numbers show the failure directly: ``small`` and
 gets the *better* (lower) score every time, by a near-constant margin of ~3
 nats — so it is the evidence/REML score itself that fails to penalise the extra
 term, not a ranking-direction or normalisation disagreement between entry
-points (``Model.evidence``, now ``Model.conditional_aic``, and ``Model.bayes_factor_vs`` agree with
+points (``Model.evidence``, now ``Summary.aic_corrected``, and ``Model.bayes_factor_vs`` agree with
 ``compare_models`` here, all preferring ``big``).
 
 The direction is confirmed by a relevant-``z`` control: when ``z`` genuinely

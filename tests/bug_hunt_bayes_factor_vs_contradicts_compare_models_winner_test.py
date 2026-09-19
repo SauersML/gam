@@ -1,6 +1,6 @@
 """Regression test for issue #2079.
 
-``Model.evidence`` (now ``Model.conditional_aic``, #2946) and ``Model.bayes_factor_vs``
+``Model.evidence`` (now ``Summary.aic_corrected``) and ``Model.bayes_factor_vs``
 (now ``Model.evidence_ratio_vs``) document AGREEMENT with
 ``gamfit.compare_models``, but historically they contradicted it. ``compare_models``
 ranks on an Occam-penalised conditional AIC (``-2*loglik + 2*edf``), while
@@ -10,8 +10,9 @@ winners: ``compare_models`` correctly prefers the smaller model (the noise
 smooth spends effective degrees of freedom fitting nothing), yet the raw-REML
 Bayes factor claimed the augmented model was better supported.
 
-The fix routes ``evidence`` and ``bayes_factor_vs`` through the SAME conditional
-AIC ranking score that ``compare_models`` uses, so they can no longer disagree
+The fix routes ``evidence`` and ``bayes_factor_vs`` through the SAME ranking
+score that ``compare_models`` uses (since the pyGAM audit, the smoothing-corrected
+AIC), so they can no longer disagree
 about which model wins.
 
 This test builds the issue's DGP (a genuine ``s(x)`` signal plus a pure-noise
@@ -40,6 +41,6 @@ def test_bayes_factor_vs_and_evidence_agree_with_compare_models_winner():
 
     # If compare_models picks `small`, then the augmented model must NOT be
     # better supported than `small`, and `small` must have the lower (better)
-    # conditional-AIC cost. Before the fix these contradicted the declared winner.
+    # corrected-AIC cost. Before the fix these contradicted the declared winner.
     assert big.evidence_ratio_vs(small) <= 1.0
-    assert small.conditional_aic <= big.conditional_aic
+    assert small.summary().aic_corrected <= big.summary().aic_corrected
