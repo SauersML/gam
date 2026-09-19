@@ -42,6 +42,17 @@ pub(crate) const KKT_TOL_COMP: f64 = 1e-7;
 
 pub(crate) const KKT_TOL_STAT: f64 = 5e-6;
 
+/// Roundings a row oracle ([`crate::pirls::deviance_eta_row_on_measure`])
+/// commits forming one half-deviance row on its direct route, counted per
+/// branch: binomial logit at `y ∈ {0, 1}` through the `bd0` series is the
+/// deepest (the logistic pair 4–5, the series about 12, the two-term sum, the
+/// prior weight). A rounding in the logistic pair moves the row through
+/// `∂bd0/∂μ = (μ − y)/μ`, so it lands within the count times
+/// `|row| + |ψ'_i|` (the η-score `w(μ − y)`), not `|row|` alone, which the
+/// interior-`y` rows need. Gaussian (3), cauchit (about 10) and Student-t
+/// (about 11) are shallower.
+pub(crate) const ROW_ORACLE_FORMATION_ROUNDINGS: usize = 23;
+
 pub(crate) fn transformed_penalty_matvec(
     penalty: &gam_terms::construction::CanonicalPenalty,
     beta: &Array1<f64>,
@@ -1375,7 +1386,35 @@ impl Gam784BlockTarget<'_> {
     ) -> Result<f64, EstimationError> {
         let curv = self.observed_quadratic(s)?;
         let value_diff = displaced_scaled_half_deviance - self.base_scaled_half_deviance;
-        Ok(value_diff - self.base_neg_score_at_mode.dot(&s) - 0.5 * curv)
+        Ok(value_diff - self.linear_taylor_term(s) - 0.5 * curv)
+    }
+
+    /// `ψ'(η̂)·s`, one deterministic Neumaier pass.
+    ///
+    /// Near the mode the products are `O(1)` per row while the excess they cancel
+    /// against is small, so a plain inner product's `γ_n·Σ|ψ'_i s_i|` rounding
+    /// grows with the row count and, at tens of thousands of rows, sits above the
+    /// resolution the #784 correction is asked for. The compensated pass rounds
+    /// within `compensated_band(1, Σ|ψ'_i s_i|)` at any `n`.
+    fn linear_taylor_term(&self, s: ndarray::ArrayView1<'_, f64>) -> f64 {
+        assert_eq!(
+            s.len(),
+            self.base_neg_score_at_mode.len(),
+            "#784 displacement score length must match the mode score"
+        );
+        let mut sum = 0.0_f64;
+        let mut compensation = 0.0_f64;
+        for (&score, &value) in self.base_neg_score_at_mode.iter().zip(s.iter()) {
+            let term = score * value;
+            let next = sum + term;
+            compensation += if sum.abs() >= term.abs() {
+                (sum - next) + term
+            } else {
+                (term - next) + sum
+            };
+            sum = next;
+        }
+        sum + compensation
     }
 
     /// `sum_i W_i s_i^2`, one deterministic Neumaier pass that preserves signed
@@ -1506,15 +1545,31 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     /// The rounding band of [`Self::excess`] at `t`, from what its sums accumulate:
-    /// - the displaced and base scaled half-deviances, compensated sums over `n`
-    ///   rows. Each row oracle rounds in fewer than `n` operations, so each sum
-    ///   carries at most `accumulation_band(n, Σ|row|)`.
-    /// - the linear Taylor term `ψ'(η̂)·s`, an inner product over `n` terms.
-    /// - the observed quadratic `Σ_i W_i s_i²`, a compensated sum over `n` terms.
-    /// - the design product `s = X_t V_b t`, whose entries round within
-    ///   `γ_{p(m+1)}·Σ_j |x_ij|·‖δ‖∞`. That moves the displaced surface by at most
-    ///   `|ψ'(η̂_i + s_i)|` times it, the linear term by `|ψ'(η̂_i)|` times it and
-    ///   the quadratic by `|W_i|·|s_i|` times it.
+    /// - the displaced and base scaled half-deviances. Each is a compensated
+    ///   sum ([`crate::pirls::stable_finite_signed_sum`]: one division per
+    ///   term, a Neumaier pass, one rescaling product), within
+    ///   `compensated_band(2, Σ|row|)` at any row count, plus the rounding each
+    ///   row oracle commits forming its row: within
+    ///   `γ_{ROW_ORACLE_FORMATION_ROUNDINGS}·(|row| + |ψ'_i|)` (see that count).
+    /// - the displaced rows' argument `η̂_i + s_i`, one rounding, which moves
+    ///   row `i` by at most `u·|η_i|·|ψ'(η_i)|`.
+    /// - the linear Taylor term `ψ'(η̂)·s` and the observed quadratic
+    ///   `Σ_i W_i s_i²`, compensated sums of terms formed in one and two
+    ///   roundings.
+    /// - the three subtractions that combine those four sums.
+    /// - the design product `s = X_t (V_b t)`, whose entries round within
+    ///   `γ_{p+m}·(|X_t|·|V_b|·|t|)_i` (Higham, *ASNA* 2nd ed., §3.5, for the two
+    ///   products in turn). The same computed `s` enters the displaced surface,
+    ///   the linear term and the quadratic, so a move `ε_i` in `s_i` moves the
+    ///   excess by `∂ΔF/∂s_i = ψ'(η̂_i + s_i) − ψ'(η̂_i) − W_i s_i` times it, to
+    ///   first order in `ε_i`. The three pieces cancel to `O(s_i²)` near the mode;
+    ///   the computed sensitivity carries the row oracle's rounding of
+    ///   `ψ'(η̂_i + s_i)` and the three operations that combine the pieces.
+    ///   Bounding the three moves apart, at `|ψ'(η̂_i + s_i)| + |ψ'(η̂_i)| +
+    ///   |W_i s_i|` against `γ_{p(m+1)}·Σ_j |x_ij|·‖δ‖∞`, made this term 99.7% of
+    ///   the composite rule's rounding floor on the log-capital-gain axis of the
+    ///   adult census fit (p = 96): a floor of 2.5e-7 against a paired error of
+    ///   5.4e-9 and a target of 1.5e-9, so the rule refused.
     ///
     /// A row surface that does not evaluate returns `+∞`, which no bar passes.
     fn excess_rounding_band(&self, t: &Array1<f64>) -> f64 {
@@ -1530,10 +1585,22 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         ) else {
             return f64::INFINITY;
         };
-        let n = rows.len();
         let displaced_absolute: f64 = rows.iter().map(|row| row.half_deviance.abs()).sum();
-        let deviance_band = gam_linalg::roundoff::accumulation_band(n, displaced_absolute)
-            + gam_linalg::roundoff::accumulation_band(n, self.base_absolute_half_deviance);
+        let absolute_half_deviance = displaced_absolute + self.base_absolute_half_deviance;
+        let absolute_row_score: f64 = rows
+            .iter()
+            .map(|row| row.eta_score.abs())
+            .chain(self.base_neg_score_at_mode.iter().map(|score| score.abs()))
+            .sum();
+        let deviance_band = gam_linalg::roundoff::compensated_band(2, absolute_half_deviance)
+            + gam_linalg::roundoff::accumulation_growth(ROW_ORACLE_FORMATION_ROUNDINGS)
+                * (absolute_half_deviance + absolute_row_score);
+        let argument_band: f64 = rows
+            .iter()
+            .zip(eta_disp.iter())
+            .map(|(row, eta)| row.eta_score.abs() * eta.abs())
+            .sum::<f64>()
+            * gam_linalg::roundoff::UNIT_ROUNDOFF;
         let p = delta.len();
         let linear_absolute: f64 = self
             .base_neg_score_at_mode
@@ -1541,17 +1608,20 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             .zip(s.iter())
             .map(|(score, value)| (score * value).abs())
             .sum();
-        let linear_band = gam_linalg::roundoff::accumulation_band(n, linear_absolute);
+        let linear_band = gam_linalg::roundoff::compensated_band(1, linear_absolute);
         let curvature_absolute: f64 = self
             .weights_obs
             .iter()
             .zip(s.iter())
             .map(|(weight, value)| weight.abs() * value * value)
             .sum();
-        let curvature_band = gam_linalg::roundoff::accumulation_band(n, curvature_absolute);
-        let delta_max = delta.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        let design_growth =
-            gam_linalg::roundoff::accumulation_growth(p * (self.block_lambdas.len() + 1));
+        let curvature_band = gam_linalg::roundoff::compensated_band(2, curvature_absolute);
+        let combination_band = gam_linalg::roundoff::accumulation_growth(3)
+            * (absolute_half_deviance + linear_absolute + 0.5 * curvature_absolute);
+        let absolute_delta = self.block_vecs.mapv(f64::abs).dot(&t.mapv(f64::abs));
+        let design_growth = gam_linalg::roundoff::accumulation_growth(p + t.len());
+        let sensitivity_growth =
+            gam_linalg::roundoff::accumulation_growth(ROW_ORACLE_FORMATION_ROUNDINGS + 3);
         let mut design_band = 0.0_f64;
         for ((((design_row, row), base_score), weight), value) in self
             .x_transformed
@@ -1562,12 +1632,20 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             .zip(self.weights_obs.iter())
             .zip(s.iter())
         {
-            let row_absolute: f64 = design_row.iter().map(|entry| entry.abs()).sum();
-            let entry_band = design_growth * row_absolute * delta_max;
-            design_band += (row.eta_score.abs() + base_score.abs() + weight.abs() * value.abs())
-                * entry_band;
+            let entry_band = design_growth
+                * design_row
+                    .iter()
+                    .zip(absolute_delta.iter())
+                    .map(|(entry, delta)| entry.abs() * delta)
+                    .sum::<f64>();
+            let curvature_move = weight * value;
+            let sensitivity = (row.eta_score - base_score - curvature_move).abs()
+                + sensitivity_growth
+                    * (row.eta_score.abs() + base_score.abs() + curvature_move.abs());
+            design_band += sensitivity * entry_band;
         }
-        deviance_band + linear_band + 0.5 * curvature_band + design_band
+        deviance_band + argument_band + linear_band + 0.5 * curvature_band + combination_band
+            + design_band
     }
 
     /// Zero: with `δ` held fixed in coefficient space, ρ reaches `ΔF` only
@@ -1812,6 +1890,122 @@ mod exact_deviance_state_cache_tests {
         }
         // At the mode the excess is exactly the base's cancellation.
         approx::assert_abs_diff_eq!(batch[0].0, 0.0, epsilon = 1.0e-12);
+    }
+
+    /// Binomial-logit rows about a fixed `η̂`, each row repeated `copies` times.
+    fn replicated_logit_rows(copies: usize) -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+        let rows = 64;
+        let n = rows * copies;
+        let x = Array2::from_shape_fn((n, 3), |(i, j)| {
+            let u = ((i % rows) as f64 + 0.5) / rows as f64;
+            match j {
+                0 => 1.0,
+                1 => 2.0 * u - 1.0,
+                _ => (3.0 * u).sin(),
+            }
+        });
+        let eta_hat = x.dot(&array![-0.3, 1.2, 0.7]);
+        let y = Array1::from_iter((0..n).map(|i| f64::from(u8::from(((i % rows) * 7) % 5 < 2))));
+        let weights_obs = eta_hat.mapv(|eta: f64| {
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            mu * (1.0 - mu)
+        });
+        (x, eta_hat, weights_obs, y)
+    }
+
+    /// Repeating every row `r` times multiplies each sum `ΔF` accumulates by
+    /// `r`, so the exact excess is `r` times the single copy's, and a band
+    /// derived from those sums grows by `r`. The half-deviance, linear and
+    /// quadratic sums are compensated, whose rounding carries no factor of the
+    /// row count; banding them with `γ_n` made the band grow by `r²`, and on
+    /// the adult fit (`n ≈ 39 000`) put a 2.99e-7 floor under a composite axis
+    /// that had to resolve to 1.47e-9, refusing it as `CompositeRoundingFloor`.
+    #[test]
+    fn excess_rounding_band_does_not_scale_with_the_row_count_784() {
+        let copies = 512;
+        let (x_one, eta_one, weights_one, y_one) = replicated_logit_rows(1);
+        let (x_many, eta_many, weights_many, y_many) = replicated_logit_rows(copies);
+        let logit = || {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ))
+        };
+        let block_vecs = array![[0.6, 0.0], [0.8, 0.0], [0.0, 1.0]];
+        let one = target(&x_one, block_vecs.clone(), eta_one, weights_one, y_one, logit());
+        let many = target(&x_many, block_vecs, eta_many, weights_many, y_many, logit());
+        let n_many = x_many.nrows();
+        let r = copies as f64;
+        for t in [array![0.4, -0.7], array![-1.1, 0.3], array![2.0, 1.5]] {
+            let band_one = one.excess_rounding_band(&t);
+            let band_many = many.excess_rounding_band(&t);
+            assert!(band_one.is_finite() && band_one > 0.0, "band {band_one:e} at t = {t}");
+            assert!(
+                band_many
+                    <= r * band_one * (1.0 + gam_linalg::roundoff::accumulation_growth(n_many)),
+                "{copies} copies of the rows moved the band from {band_one:.3e} to \
+                 {band_many:.3e}, {:.1} times the {copies}-fold its sums grew by (t = {t})",
+                band_many / band_one / r
+            );
+            let excess_one = one.excess(&t);
+            let excess_many = many.excess(&t);
+            assert!(
+                (excess_many - r * excess_one).abs() <= band_many + r * band_one,
+                "ΔF {excess_many:.17e} of the repeated rows against {copies} × {excess_one:.17e} \
+                 lies outside the two bands {band_many:.3e} + {copies} × {band_one:.3e}"
+            );
+        }
+    }
+
+    /// Design columns the block direction leaves at zero add exact zeros to
+    /// `s = X_t (V_b t)`, so they move neither `ΔF` nor its rounding beyond the
+    /// longer products' growth `γ_{p+m}`. Banding the product by
+    /// `Σ_j |x_ij|·‖δ‖∞` charged every column at the largest coefficient move; on
+    /// the adult fit (p = 96, one axis) that design term was 99.7% of a 2.5e-7
+    /// floor under an axis that had to resolve to 1.5e-9.
+    #[test]
+    fn excess_rounding_band_ignores_design_columns_the_block_does_not_move_784() {
+        let (x_narrow, eta_hat, weights_obs, y) = replicated_logit_rows(1);
+        let extra = 5;
+        let (n, p_narrow) = x_narrow.dim();
+        let x_wide = Array2::from_shape_fn((n, p_narrow + extra), |(i, j)| {
+            if j < p_narrow {
+                x_narrow[(i, j)]
+            } else {
+                1.0e4 * ((i * (j + 1)) as f64).sin()
+            }
+        });
+        let narrow_vecs = array![[0.6, 0.0], [0.8, 0.0], [0.0, 1.0]];
+        let wide_vecs = Array2::from_shape_fn((p_narrow + extra, 2), |(j, r)| {
+            if j < p_narrow { narrow_vecs[(j, r)] } else { 0.0 }
+        });
+        let logit = || {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ))
+        };
+        let narrow = target(
+            &x_narrow,
+            narrow_vecs,
+            eta_hat.clone(),
+            weights_obs.clone(),
+            y.clone(),
+            logit(),
+        );
+        let wide = target(&x_wide, wide_vecs, eta_hat, weights_obs, y, logit());
+        let growth = (p_narrow + extra + 2) as f64 / (p_narrow + 2) as f64;
+        for t in [array![0.4, -0.7], array![-1.1, 0.3], array![2.0, 1.5]] {
+            let band_narrow = narrow.excess_rounding_band(&t);
+            let band_wide = wide.excess_rounding_band(&t);
+            assert!(band_narrow.is_finite() && band_narrow > 0.0, "band {band_narrow:e} at t = {t}");
+            assert!(
+                band_wide <= growth * band_narrow,
+                "{extra} unmoved columns of magnitude 1e4 moved the band from {band_narrow:.3e} to \
+                 {band_wide:.3e}, {:.1} times the {growth:.2} of the longer products (t = {t})",
+                band_wide / band_narrow
+            );
+        }
     }
 
     /// `ΔF` is the definition `F(β̂+δ) − F(β̂) − ½ δᵀ H δ` at an exact mode, and

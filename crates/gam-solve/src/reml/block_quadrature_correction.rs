@@ -685,6 +685,7 @@ impl<'a> RemlState<'a> {
         let piece_count = if axis_split { m } else { 1 };
         let mut pieces: Vec<BlockPieceQuadrature> = Vec::with_capacity(piece_count);
         let mut axis_orders: Vec<usize> = Vec::with_capacity(m);
+        let mut axis_partitions = Vec::with_capacity(piece_count);
         for k in 0..piece_count {
             let (first_axis, width) = if axis_split { (k, 1) } else { (0, m) };
             let axis_target;
@@ -694,31 +695,60 @@ impl<'a> RemlState<'a> {
             } else {
                 &target
             };
-            let mut quadrature = match &latched_quadrature {
-                Some(latch) => corrector
-                    .block_quadrature_marginal_correction_at_certified_orders(
-                        piece_target,
-                        &latch.axis_orders[first_axis..first_axis + width],
-                        &latch.axis_quadrature_errors[first_axis..first_axis + width],
-                    )
-                    .map_err(|refusal| EstimationError::InvalidInput(refusal.to_string()))?,
-                None => match gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
-                    corrector,
-                    piece_target,
-                    next_order_remainder,
-                ) {
-                    Ok(quadrature) => quadrature,
-                    Err(mut refusal) => {
-                        // Name the axis and the orders in the block's frame.
-                        refusal.axis += first_axis;
-                        let mut block_orders = axis_orders.clone();
-                        block_orders.extend_from_slice(&refusal.axis_orders);
-                        refusal.axis_orders = block_orders;
-                        return Err(EstimationError::BlockQuadratureCorrectionRefused {
-                            stage: BlockQuadratureCorrectionStage::OrderSearchRefused(refusal),
-                        });
+            // Name a refused search's axis and orders in the block's frame.
+            let order_search_refused =
+                |mut refusal: gam_problem::laplace_sampler_contract::BlockQuadratureOrderRefusal| {
+                    refusal.axis += first_axis;
+                    let mut block_orders = axis_orders.clone();
+                    block_orders.extend_from_slice(&refusal.axis_orders);
+                    refusal.axis_orders = block_orders;
+                    EstimationError::BlockQuadratureCorrectionRefused {
+                        stage: BlockQuadratureCorrectionStage::OrderSearchRefused(refusal),
                     }
-                },
+                };
+            let mut quadrature = if width == 1 {
+                // One axis: the composite Gauss–Kronrod rule, whose bisection resolves a
+                // wall no representable Gauss–Hermite order reaches.
+                let partition = match &latched_quadrature {
+                    Some(latch) => {
+                        let Some(breakpoints) = latch.axis_partitions.get(k) else {
+                            return Err(EstimationError::InvalidInput(format!(
+                                "the #784 latch holds {} axis partitions for piece {k}",
+                                latch.axis_partitions.len()
+                            )));
+                        };
+                        gam_problem::laplace_sampler_contract::CompositeAxisPartition::Latched(
+                            breakpoints,
+                        )
+                    }
+                    None => gam_problem::laplace_sampler_contract::CompositeAxisPartition::Adapt {
+                        next_order_remainder,
+                    },
+                };
+                let composite = corrector
+                    .composite_axis_marginal_correction(piece_target, partition)
+                    .map_err(|refusal| match &latched_quadrature {
+                        Some(_) => EstimationError::InvalidInput(refusal.to_string()),
+                        None => order_search_refused(refusal),
+                    })?;
+                axis_partitions.push(composite.breakpoints);
+                composite.marginal
+            } else {
+                match &latched_quadrature {
+                    Some(latch) => corrector
+                        .block_quadrature_marginal_correction_at_certified_orders(
+                            piece_target,
+                            &latch.axis_orders[first_axis..first_axis + width],
+                            &latch.axis_quadrature_errors[first_axis..first_axis + width],
+                        )
+                        .map_err(|refusal| EstimationError::InvalidInput(refusal.to_string()))?,
+                    None => gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
+                        corrector,
+                        piece_target,
+                        next_order_remainder,
+                    )
+                    .map_err(order_search_refused)?,
+                }
             };
             axis_orders.extend_from_slice(&quadrature.axis_orders);
             let Some(moments) = quadrature.moments.take() else {
@@ -834,6 +864,7 @@ impl<'a> RemlState<'a> {
                 axis_orders: axis_orders.clone(),
                 axis_quadrature_errors: axis_quadrature_errors.clone(),
                 axis_split,
+                axis_partitions,
             });
             let mut decision = self.block_correction_decision_guard();
             if *decision == BlockCorrectionDecision::DecidingAtOptimum {
