@@ -1470,5 +1470,30 @@
     ],
     "reason": "gam#3002: warm_start_from carried a saved model's point to one route through the outer cache seam. OuterWarmStart staged the point as a one-entry cache session in a scratch directory (from_model, session, required, consumed, and its Debug fmt), and RequiredWarmStart was the flag the consuming route set. That made the point the sole seed of every search that read the options, including searches whose criterion the point is not certified for (an unarmed evidence fit, a pilot). One mechanism replaces them. gam_model_api::WarmStart carries the point, its certified value and whether the inputs are the parent's; resolve_warm_start builds it; OuterProblem::with_warm_start offers it to every search, which accepts it only where it is certified for its own criterion (resume_prior_certificate), or joins it to an independent multistart on other inputs. The suite test and its certified_point helper are replaced by four tests of the new contract (resume with no outer iteration and the parent's bits, join on other data with V at most cold, another dimension bit-cold, the three refusals).",
     "evidence": "git grep -w OuterWarmStart and RequiredWarmStart at the landing tree find nothing under crates, src, tests or gamfit, and none of .consumed(), warm_start.required() or OuterWarmStart:: remains; gam-pyffi's geometry_ffi.rs, the only caller of from_model, calls resolve_warm_start. The fmt removed is OuterWarmStart's own Debug impl (the 1269 production occurrences are other fmt fns). Gate on acn112 (strike-wall lane, 6 cores) at 5bd6913b9b on 55212405d7: without this entry source_removal_guard.py refused exactly these 9 items, and with it verified 1714 -> 1738 Rust items with 9 guarded removals; test_census 12085 -> 12093 tests; cargo check --workspace --all-targets and cargo build --workspace --lib RC 0; gam-solve rho_optimizer:: 440 of 440 with the four gam#3002 multistart pins; gam-models suite warm_start_from 4 of 4; gam-custom-family lib 347 of 347; the gam-models materialize and payload tests 106 of 108, whose two failures are the Gaussian location-scale tests that fail identically on unpatched main (gam#2959 comment)."
+  },
+  {
+    "base": "2e5bfa7a077b61cce266d0c60036b0bf81ed3bcd",
+    "items": [
+      "crates/gam-math/src/probability.rs:const:GAUSS_LEGENDRE_16",
+      "crates/gam-math/src/probability.rs:const:IMHOF_MAX_PANELS",
+      "crates/gam-math/src/probability.rs:fn:imhof_amplitude_bound",
+      "crates/gam-math/src/probability.rs:fn:imhof_amplitude_panel",
+      "crates/gam-math/src/probability.rs:fn:imhof_integrand",
+      "crates/gam-math/src/probability.rs:fn:imhof_log_rho",
+      "crates/gam-math/src/probability.rs:fn:imhof_phase_slack",
+      "crates/gam-math/src/probability.rs:fn:imhof_survival",
+      "crates/gam-math/src/probability.rs:fn:regularized_beta_lower_from_log_x",
+      "crates/gam-math/src/probability.rs:fn:signed_weighted_chi_square_sf_to_tolerance",
+      "crates/gam-math/src/probability.rs:fn:term",
+      "crates/gam-math/src/probability.rs:fn:the_amplitude_bound_certifies_the_zero_statistic_answer",
+      "crates/gam-math/src/probability.rs:fn:the_f_tail_is_the_two_term_signed_combination_at_zero",
+      "crates/gam-math/src/probability.rs:fn:the_quadrature_resolves_the_amplitude_not_only_the_phase",
+      "crates/gam-math/src/probability.rs:struct:WeightedChiSquareTerm",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_TAIL_COARSEST",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_TAIL_ROUNDOFF_FLOOR",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:fn:selection_standard_error"
+    ],
+    "reason": "pyGAM audit pv-tails-numerics (inference L4). The Imhof evaluator in probability.rs computed P(Q > q) = 1/2 + I/pi. That form cancels once the tail falls below about 1e-16, which is the floor under small smooth-term LR p-values. The evaluator is deleted along with its Gauss-Legendre panel rule, its integrand, log-rho, phase-slack and amplitude-bound helpers, its panel cap and its caller-tolerance entry point. Its in-file tests pinned that method's panel and amplitude behaviour and are deleted too. It is replaced by crates/gam-math/src/probability/weighted_chi_square.rs, which inverts the moment generating function along a saddle-point contour and returns a TailProbability with a derived relative bound. WeightedChiSquareTerm moves there unchanged and is re-exported from gam_math::probability. The two-term F test and its term() helper move there as well. regularized_beta_lower_from_log_x becomes regularized_beta_lower_from_logs, which also takes ln(1 - x), so F and t tails whose x rounds to one are no longer returned as 1. In smooth_term_lr.rs, the tolerance floor (SMOOTH_LR_TAIL_ROUNDOFF_FLOOR), the ceiling (SMOOTH_LR_TAIL_COARSEST) and selection_standard_error existed only to budget the Imhof tolerance, and the replacement takes no tolerance.",
+    "evidence": "git grep -w finds none of imhof_integrand, imhof_log_rho, imhof_phase_slack, imhof_amplitude_panel, imhof_amplitude_bound, imhof_survival, IMHOF_MAX_PANELS, GAUSS_LEGENDRE_16, signed_weighted_chi_square_sf_to_tolerance, regularized_beta_lower_from_log_x, SMOOTH_LR_TAIL_ROUNDOFF_FLOOR, SMOOTH_LR_TAIL_COARSEST or selection_standard_error under crates, src or tests at the landing tree. WeightedChiSquareTerm, term and the_f_tail_is_the_two_term_signed_combination_at_zero are declared in crates/gam-math/src/probability/weighted_chi_square.rs. crates/gam-math/tests/tail_references.rs passes all five tests against stored 25-digit mpmath references: worst relative error 5.0e-12 (chi-square), 7.9e-12 (F), 1.85e-11 (t) and 1.1e-13 (weighted, within its returned bound, which is at most 1e-10), plus the monotonicity property. The gam-math lib tests pass, 364 of 364. Without this entry, source_removal_guard.py at base 2e5bfa7a07 refused exactly these items."
   }
 ]
