@@ -4598,7 +4598,7 @@
     "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
   },
   {
-    "base": "9580f2c1bfa0efa51d16e67a181ec09476782d7f",
+    "base": "c8f927327ae4b3fa476d8ceb9242798c2d3d7578",
     "removed": {
       "crates/gam-models/src/fit_orchestration/materialize/terms.rs::gate_duchon_operator_penalties_for_family": 1
     },
