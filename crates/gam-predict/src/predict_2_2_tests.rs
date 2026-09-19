@@ -58,6 +58,7 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
         0.95,
         like(ResponseFamily::Beta { phi: 20.0 }, StandardLink::Logit),
         None,
+        array![0.1, 0.1],
     )
     .expect("beta-family bounds should be enrichable");
     for i in 0..2 {
@@ -86,6 +87,7 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
         0.95,
         like(ResponseFamily::Poisson, StandardLink::Log),
         None,
+        array![1.0, 1.0],
     )
     .expect("poisson-family bounds should be enrichable");
     assert!(

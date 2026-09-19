@@ -595,6 +595,25 @@ pub trait PredictionTransform {
         assert_eq!(mean.len(), z_upper.len());
         Ok(None)
     }
+
+    /// Optional response-scale posterior SD `√Var[T(η)]`, `η ~ N(eta, eta_se²)`
+    /// per row, from the same Gaussian η integral as the posterior-mean point.
+    ///
+    /// The posterior-mean driver's smoothing-corrected arm reports this, built
+    /// on the corrected η SE, as the response-scale SE whenever it is `Some`,
+    /// instead of the full-uncertainty pass's delta-method `|dT/dη̂|·SE(η)` —
+    /// which collapses to zero wherever the inverse link saturates although the
+    /// posterior of μ stays wide. The default `None` keeps the full-uncertainty
+    /// pass's `mean_se`.
+    fn posterior_response_sd(
+        &self,
+        eta: &Array1<f64>,
+        eta_se: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        // One SE per row, as every overriding impl consumes them.
+        assert_eq!(eta.len(), eta_se.len());
+        Ok(None)
+    }
 }
 
 /// Build the `MeanBoundMethod` selected by a transform's [`ResponseInterval`]
@@ -797,7 +816,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
     // dimensionally wrong (a logistic fit at η = 10 with SE(η) = 1 has response
     // SE ≈ 4.5e-5, not 1). Only the identity link may reuse SE(η) — there the
     // response IS the linear predictor. Every other transform must supply a
-    // genuine delta-method `mean_se`; a missing one is a producer bug, not a
+    // genuine response-scale `mean_se`; a missing one is a producer bug, not a
     // fallback opportunity. The no-covariance degrade (η SE also absent) keeps
     // its zero-SE point-only behaviour.
     let cond_mean_se = match (state.mean_se.clone(), &policy) {
@@ -856,11 +875,19 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                     "smoothing-corrected posterior-mean uncertainty requires eta SE".to_string(),
                 )
             })?;
-            let mean_se = unc.mean_se.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "smoothing-corrected posterior-mean uncertainty requires mean SE".to_string(),
-                )
-            })?;
+            // The full-uncertainty pass supplies the corrected η SE; the
+            // response-scale SE is the posterior SD over that same η posterior
+            // when the transform can integrate it, as the conditional
+            // posterior-mean pass already reports.
+            let mean_se = match transform.posterior_response_sd(&result.eta, &eta_se)? {
+                Some(sd) => sd,
+                None => unc.mean_se.ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "smoothing-corrected posterior-mean uncertainty requires mean SE"
+                            .to_string(),
+                    )
+                })?,
+            };
             if unc.covariance_source != InferenceCovarianceMode::SmoothingCorrected {
                 return Err(EstimationError::InvalidInput(
                     "smoothing-corrected posterior-mean uncertainty resolved a conditional covariance"
@@ -1014,6 +1041,10 @@ pub struct PredictionColumns {
     pub linear_predictor_plugin: Array1<f64>,
     pub mean_plugin: Array1<f64>,
     pub posterior_mean: Option<Array1<f64>>,
+    /// Link-scale posterior SD `SE(η) = √diag(X V Xᵀ)` under the covariance
+    /// the band was built from; the response-scale credible bounds are the
+    /// inverse link applied to the η quantiles this SD defines.
+    pub linear_predictor_standard_error: Option<Array1<f64>>,
     /// Response-scale SE — the SE the response-scale band is built from, never
     /// the link-scale `σ_η` (#1536).
     pub posterior_mean_standard_error: Option<Array1<f64>>,
@@ -1090,6 +1121,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: plugin.eta,
                 mean_plugin: plugin.mean,
                 posterior_mean: Some(prediction.mean),
+                linear_predictor_standard_error: Some(prediction.eta_standard_error),
                 posterior_mean_standard_error: Some(mean_standard_error),
                 posterior_mean_lower: Some(mean_lower),
                 posterior_mean_upper: Some(mean_upper),
@@ -1120,6 +1152,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: prediction.eta,
                 mean_plugin: mean_plugin.clone(),
                 posterior_mean: Some(mean_plugin),
+                linear_predictor_standard_error: Some(prediction.eta_standard_error),
                 posterior_mean_standard_error: Some(prediction.mean_standard_error),
                 posterior_mean_lower: Some(prediction.mean_lower),
                 posterior_mean_upper: Some(prediction.mean_upper),
@@ -1149,6 +1182,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: plugin.eta,
                 mean_plugin: plugin.mean,
                 posterior_mean: Some(prediction.mean),
+                linear_predictor_standard_error: None,
                 posterior_mean_standard_error: None,
                 posterior_mean_lower: None,
                 posterior_mean_upper: None,
@@ -1168,6 +1202,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: prediction.eta,
                 mean_plugin: mean_plugin.clone(),
                 posterior_mean: Some(mean_plugin),
+                linear_predictor_standard_error: None,
                 posterior_mean_standard_error: None,
                 posterior_mean_lower: None,
                 posterior_mean_upper: None,

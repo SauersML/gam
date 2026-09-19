@@ -151,7 +151,9 @@ class Model:
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``posterior_mean_standard_error``,
+            gains ``linear_predictor_standard_error`` (the posterior SD of η),
+            ``posterior_mean_standard_error`` (the posterior SD of the
+            response, from the same η integral as ``posterior_mean``),
             ``posterior_mean_lower``, and ``posterior_mean_upper`` columns
             alongside ``linear_predictor_plugin`` / ``mean_plugin`` /
             ``posterior_mean``. On survival models it
@@ -239,8 +241,10 @@ class Model:
               ``linear_predictor_plugin`` (``X·beta_hat``), ``mean_plugin``
               (its inverse-link image), and ``posterior_mean`` (the default
               response-scale point prediction). When ``interval`` is set it
-              adds ``posterior_mean_standard_error`` plus
-              ``posterior_mean_lower`` / ``posterior_mean_upper``.
+              adds ``linear_predictor_standard_error`` (``SE(η)``),
+              ``posterior_mean_standard_error`` (``√Var[link^{-1}(η)]``) plus
+              ``posterior_mean_lower`` / ``posterior_mean_upper`` (the
+              inverse link of the η credible quantiles).
               When the requested table container is ``"dict"``, the return is
               a ``PredictionResult``: it supports normal mapping access
               (``pred["posterior_mean"]``) and column attributes

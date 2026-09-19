@@ -200,7 +200,8 @@ def _point_payload_spec(
     * **standard GAM / GLM, including the location-scale classes** —
       ``posterior_mean`` as emitted; table form is the *full* Rust
       estimand-explicit payload (``linear_predictor_plugin``, ``mean_plugin``,
-      and ``posterior_mean`` always, plus ``posterior_mean_standard_error`` /
+      and ``posterior_mean`` always, plus ``linear_predictor_standard_error``
+      / ``posterior_mean_standard_error`` /
       ``posterior_mean_lower`` / ``posterior_mean_upper`` when an interval was
       set, and ``noise_scale`` when the family fits a response-side scale).
       The Rust ``PredictModelClass::point_shape`` / ``point_column`` decide

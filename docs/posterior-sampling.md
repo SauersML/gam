@@ -5,10 +5,14 @@ and then draws from the posterior of the coefficients. The sampler
 dispatches among NUTS, Polya-Gamma Gibbs, and a Gaussian Laplace
 approximation based on model class; see
 [Sampler dispatch](#sampler-dispatch) below. The MCMC routes sample the
-exact likelihood conditional on the fitted smoothing parameters; the
-Laplace route draws from the covariance the fit *publishes* — the
-smoothing-corrected `Vp` whenever the fit carries one — so its draw spread
-agrees with `summary().std_error` and with the default
+exact likelihood at the fitted smoothing parameters; on a standard GLM
+(NUTS and Pólya-Gamma) each draw then receives an independent
+smoothing-parameter displacement `N(0, J V_ρ Jᵀ)`, where `J = ∂β̂/∂ρ` and
+`V_ρ` is the REML/LAML smoothing-parameter covariance, so the draws integrate
+the smoothing uncertainty for every family (their covariance is the
+first-order `Vb + J V_ρ Jᵀ`). The Laplace route draws from the covariance the
+fit *publishes* — the smoothing-corrected `Vp` whenever the fit carries one —
+so its draw spread agrees with `summary().std_error` and with the default
 `predict(interval=...)` band on the same object. Every draw set reports
 which covariance it describes in `covariance_source`.
 
@@ -180,7 +184,7 @@ Frozen dataclass holding the draws and convergence diagnostics.
 | `converged` | `bool` | Sampler convergence flag. Laplace draws set this to `True`; NUTS and Gibbs paths require `rhat < 1.1` and `ess > 100`. |
 | `method` | `str` | `"nuts"`, `"polya-gamma"`, `"laplace"`, or `"truncated-laplace"` — the sampler that ran (table above). |
 | `exact` | `bool` | Whether `method` targets the exact posterior; the value behind `is_exact`. |
-| `covariance_source` | `str` | `"conditional"` (MCMC routes, and Laplace draws on a fit without a smoothing correction) or `"smoothing-corrected"` (Laplace draws from the published `Vp`). Same vocabulary as `predict()`. |
+| `covariance_source` | `str` | `"smoothing-corrected"` (standard-GLM NUTS / Pólya-Gamma draws with the smoothing-parameter displacement, and Laplace draws from the published `Vp`) or `"conditional"` (the other MCMC routes, and any fit without a smoothing correction). Same vocabulary as `predict()`. |
 | `model_class` | `str` | Saved-model predictive class. |
 | `family_kind` | `str` | Inverse-link tag (`"identity"`, `"logit"`, `"probit"`, `"cloglog"`, `"log"`, ...). |
 | `config` | `SamplingConfig` | Echo of the sampler configuration. |

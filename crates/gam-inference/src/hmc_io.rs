@@ -4361,8 +4361,10 @@ pub struct NutsResult {
     pub sampler: PosteriorSampler,
     /// Which coefficient covariance the draws describe. MCMC on the exact
     /// likelihood is conditional on the fitted smoothing parameters; the
-    /// Laplace path draws from the fit's PUBLISHED covariance, which is the
-    /// smoothing-corrected `Vp` whenever the fit carries one (gam#2777).
+    /// standard-GAM sampler then adds the first-order smoothing-parameter
+    /// displacement so its draws describe the smoothing-corrected `V_c`, and
+    /// the Laplace path draws from the fit's PUBLISHED covariance, which is
+    /// the smoothing-corrected `Vp` whenever the fit carries one (gam#2777).
     pub covariance: InferenceCovarianceMode,
 }
 

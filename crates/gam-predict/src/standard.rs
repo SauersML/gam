@@ -163,11 +163,20 @@ impl StandardPredictor {
                 strategy.posterior_mean(&quadctx, e, se)
             })
             .collect::<Result<Array1<f64>, _>>()?;
-        // Response-scale delta-method SE at the plug-in η: SE(μ) = |dμ/dη|·SE(η).
-        // The η-scale SE alone is on the link scale and must not stand in for a
-        // response-scale SE across the nonlinear inverse link.
-        let (_, dmu_deta) = inverse_link_mean_and_d1(&strategy, plugin.eta.view())?;
-        let mean_se = delta_method_mean_se_from_d1(&dmu_deta, &eta_se);
+        // Response-scale SE: the posterior SD `√Var[g⁻¹(η)]` over the same η
+        // posterior the mean integrates. The η-scale SE alone is on the link
+        // scale, and the delta-method `|dμ/dη̂|·SE(η)` collapses to zero where
+        // the inverse link saturates although the posterior of μ stays wide.
+        let mean_se = plugin
+            .eta
+            .iter()
+            .zip(eta_se.iter())
+            .map(|(&e, &se)| {
+                strategy
+                    .posterior_meanvariance(&quadctx, e, se)
+                    .map(|(_, var)| var.max(0.0).sqrt())
+            })
+            .collect::<Result<Array1<f64>, _>>()?;
         Ok(LinearState {
             eta: plugin.eta,
             mean,
@@ -264,6 +273,24 @@ impl PredictionTransform for StandardPredictor {
 
     fn response_family(&self) -> ResponseFamily {
         self.family.response.clone()
+    }
+
+    fn posterior_response_sd(
+        &self,
+        eta: &Array1<f64>,
+        eta_se: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
+        let quadctx = gam_solve::quadrature::QuadratureContext::new();
+        eta.iter()
+            .zip(eta_se.iter())
+            .map(|(&e, &se)| {
+                strategy
+                    .posterior_meanvariance(&quadctx, e, se)
+                    .map(|(_, var)| var.max(0.0).sqrt())
+            })
+            .collect::<Result<Array1<f64>, _>>()
+            .map(Some)
     }
 }
 
@@ -460,11 +487,16 @@ impl PredictableModel for StandardPredictor {
                 // serialize as `covariance_source`. Leaving this unset made
                 // curved-link interval payloads omit the key entirely.
                 result.uncertainty_covariance_source = Some(unc.covariance_source);
+                // The response-scale SE is the posterior SD `√Var[g⁻¹(η)]` the
+                // full-uncertainty engine integrated over the same η posterior
+                // (including any fitted link-parameter variance), not a
+                // delta-method slope at η̂.
                 enrich_posterior_mean_bounds(
                     &mut result,
                     level,
                     self.family.clone(),
                     self.link_kind.as_ref(),
+                    unc.mean_standard_error.clone(),
                 )?;
                 if options.include_observation_interval {
                     let z = standard_normal_quantile(0.5 + 0.5 * level)
