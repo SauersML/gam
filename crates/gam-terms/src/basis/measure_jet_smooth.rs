@@ -134,11 +134,6 @@ use super::{
 /// functional self-consistent, but it is not a relative tail-error bound.
 pub(crate) const MEASURE_JET_PROFILE_CUTOFF: f64 = 3.0;
 
-/// Relative eigenvalue threshold for rank-revealing pseudo-inverses of local
-/// Gram matrices. Directions at the roundoff floor are treated as unresolved
-/// and excluded from the affine fit.
-pub(crate) const MEASURE_JET_PSEUDOINVERSE_RTOL: f64 = 64.0 * f64::EPSILON;
-
 /// Default continuous smoothness order `s` realized by the `0.0` auto
 /// sentinel. Sits mid-band in the admissible `(0, 2)` for the affine-jet
 /// (r = 2) energy: rough enough to stay pointwise-defined on filaments and
@@ -408,8 +403,15 @@ pub(crate) fn householder_sum_to_zero_z(u: &Array1<f64>) -> Array2<f64> {
     z
 }
 
+/// Rank-revealing pseudo-inverse of a symmetric Gram.
+///
+/// `assembly_band` bounds, in spectral norm, the rounding the Gram's formation
+/// left in `a`. An eigenvalue at or below that plus the eigensolver's own band
+/// ([`gam_linalg::roundoff::resolved_eigenvalue_band`]) is not resolved from
+/// zero, so its direction is excluded from the affine fit.
 pub(crate) fn symmetric_pseudoinverse(
     a: &Array2<f64>,
+    assembly_band: f64,
     label: &str,
 ) -> Result<Array2<f64>, BasisError> {
     let n = a.nrows();
@@ -424,8 +426,7 @@ pub(crate) fn symmetric_pseudoinverse(
             "measure-jet pseudo-inverse `{label}` eigendecomposition failed: {e}"
         ))
     })?;
-    let lam_max = evals.iter().fold(0.0_f64, |acc, v| acc.max((*v).max(0.0)));
-    let rank_tol = MEASURE_JET_PSEUDOINVERSE_RTOL * (n.max(1) as f64) * lam_max;
+    let rank_tol = gam_linalg::roundoff::resolved_eigenvalue_band(&evals.to_vec(), assembly_band);
     let mut scaled = evecs.clone();
     for (k, mut col) in scaled.axis_iter_mut(Axis(1)).enumerate() {
         let lam = evals[k].max(0.0);
@@ -433,6 +434,30 @@ pub(crate) fn symmetric_pseudoinverse(
         col.mapv_inplace(|v| v * inv);
     }
     Ok(scaled.dot(&evecs.t()))
+}
+
+/// Spectral-norm bound on the rounding in the local affine Gram
+/// `G = (ΦᵀWΦ)/q − a·aᵀ`, `a = Φᵀw/q`, `q = Σw`, as the measure-jet energy
+/// forms it from `ml` weighted neighbors (`w ≥ 0`).
+///
+/// Per entry, with `P = |Φ|ᵀW|Φ|/q` and `ã = |Φ|ᵀw/q`: the second-moment sum
+/// rounds `ml + 1` deep (the weight product, the feature product, `ml − 1`
+/// additions), `q` `ml − 1` deep and the quotient once, so `(ΦᵀWΦ)/q` errs by
+/// `γ_{2ml+1}·P`. The mean's sum rounds `ml` deep and its quotient `ml`, so
+/// `a·aᵀ` errs by `γ_{4ml+1}·ããᵀ`, and the subtraction adds one. Hence
+/// `|E| ≤ γ_{4ml+2}·(P + ããᵀ)` entrywise. That majorant is PSD, so
+/// `‖E‖₂ ≤ γ_{4ml+2}·(tr P + ‖ã‖²)`, and `ã_r² ≤ P_rr` (Jensen) gives
+/// `‖E‖₂ ≤ 2·γ_{4ml+2}·tr P` with `tr P = Σ_a w_a‖φ_a‖²/q`. The uncentered
+/// formula cancels, so this band scales with the second moment, not with `G`.
+fn local_affine_gram_assembly_band(phi: &Array2<f64>, w: &Array1<f64>, q: f64) -> f64 {
+    let ml = phi.nrows();
+    let second_moment_trace: f64 = phi
+        .outer_iter()
+        .zip(w.iter())
+        .map(|(row, wa)| wa * row.dot(&row))
+        .sum::<f64>()
+        / q;
+    2.0 * gam_linalg::roundoff::accumulation_growth(4 * ml + 2) * second_moment_trace
 }
 
 /// Rank-adapted center values of the measure-jet energy's affine null space.
@@ -478,7 +503,18 @@ pub fn affine_function_nullspace_form(
         row.mapv_inplace(|v| v * masses[i]);
     }
     let affine_gram = affine.t().dot(&weighted_affine);
-    let affine_gram_pinv = symmetric_pseudoinverse(&affine_gram, "affine function-space Gram")?;
+    // `AᵀWA` over the m centers, each summand rounding twice (the mass scaling
+    // and the product) before the additions.
+    let weighted_row_norm_sum: f64 = affine
+        .outer_iter()
+        .zip(masses.iter())
+        .map(|(row, w)| w.abs() * row.dot(&row))
+        .sum();
+    let affine_gram_pinv = symmetric_pseudoinverse(
+        &affine_gram,
+        gam_linalg::roundoff::weighted_gram_assembly_band(m, 2, weighted_row_norm_sum),
+        "affine function-space Gram",
+    )?;
     let form = weighted_affine
         .dot(&affine_gram_pinv)
         .dot(&weighted_affine.t());
@@ -1548,7 +1584,11 @@ where
                     g[(r, c)] -= a_mean[r] * a_mean[c];
                 }
             }
-            let g_pinv = symmetric_pseudoinverse(&g, "local affine Gram")?;
+            let g_pinv = symmetric_pseudoinverse(
+                &g,
+                local_affine_gram_assembly_band(&phi, &w, q),
+                "local affine Gram",
+            )?;
             let bm = b.dot(&g_pinv);
             let base = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
             weights(scale_idx, eps, q, base, &mut wbuf);
@@ -1897,9 +1937,9 @@ fn measure_jet_design_log_length_jets(
 /// numerically-degenerate directions dropped. Working in the mean-CENTERED
 /// coordinate columns (the mass-weighted mean is the intercept's, not the
 /// head's) makes the rank test measure the genuine spread of the centers along
-/// each direction rather than its offset; the relative floor
-/// `MEASURE_JET_PSEUDOINVERSE_RTOL` is the module's own numerical rank
-/// tolerance (the same one the local Gram pseudo-inverses use). The returned
+/// each direction rather than its offset; a residual is dropped when it lies
+/// inside the rounding band of the centering and projection arithmetic that
+/// produced it (derived in the body). The returned
 /// `T` satisfies `linear_head(points) = points · T` (the mean-centering only
 /// informs the keep/drop decision). `T` is a deterministic function of the
 /// frozen centers + masses, so the frozen replay path reconstructs the
@@ -1931,29 +1971,39 @@ pub(crate) fn measure_jet_affine_head_transform(
     // Mean-centered coordinate columns: the mass-weighted mean is removed so the
     // residual mass-norm is the genuine spread of the centers along a direction,
     // not dominated by the coordinate's offset (which the intercept owns).
-    let cols: Vec<Array1<f64>> = (0..d)
+    let ones = Array1::ones(m);
+    let (cols, raw_norms): (Vec<Array1<f64>>, Vec<f64>) = (0..d)
         .map(|k| {
             let col = centers.column(k).to_owned();
             let mean = if total_mass > 0.0 {
-                mdot(&col, &Array1::ones(m)) / total_mass
+                mdot(&col, &ones) / total_mass
             } else {
                 0.0
             };
-            col.mapv(|x| x - mean)
+            let raw_norm = mdot(&col, &col).sqrt();
+            (col.mapv(|x| x - mean), raw_norm)
         })
-        .collect();
-    // Relative numerical rank floor from the centered coordinate-column scale.
-    let max_norm = cols
-        .iter()
-        .fold(0.0_f64, |acc, c| acc.max(mdot(c, c).sqrt()));
-    let drop_below =
-        (MEASURE_JET_PSEUDOINVERSE_RTOL * (d.max(1) as f64) * max_norm).max(f64::MIN_POSITIVE);
+        .unzip();
     // Mass-weighted modified Gram–Schmidt on the centered columns; `t`
     // accumulates the lift in the ORIGINAL coordinate basis, so every kept head
     // column is `points · t_r` (up to the intercept-owned constant).
     let mut q_cols: Vec<Array1<f64>> = Vec::new();
     let mut t_cols: Vec<Array1<f64>> = Vec::new();
     for k in 0..d {
+        // A residual is kept only when it clears the rounding that produced it.
+        // Centering: the mean's mass sum rounds `m + 1` deep, the total mass
+        // `m − 1` and the quotient once, so `|δmean| ≤ γ_{2m+1}·Σw|x|/W`, and in
+        // the mass norm `|δmean|·√W ≤ γ_{2m+1}·‖x‖_W` (Cauchy–Schwarz) — the
+        // UNcentered norm, which is what makes a far-offset stratum's spurious
+        // spread visible as rounding; each subtraction adds `u·‖c‖_W`. The mass
+        // inner products of the single projection pass are `m + 1` deep. The
+        // mass-metric projector is a contraction, so the centering error reaches
+        // the residual undiminished and the two bands add.
+        let centered_norm = mdot(&cols[k], &cols[k]).sqrt();
+        let drop_below =
+            gam_math::roundoff::gram_schmidt_residual_band(1, q_cols.len(), m + 1, centered_norm)
+                + gam_math::roundoff::UNIT_ROUNDOFF * centered_norm
+                + gam_math::roundoff::accumulation_growth(2 * m + 1) * raw_norms[k];
         let mut v = cols[k].clone();
         let mut t = Array1::<f64>::zeros(d);
         t[k] = 1.0;
@@ -3896,5 +3946,119 @@ mod tests {
                 assert!((a - b).abs() <= 1e-12, "penalty replay drift: {a} vs {b}");
             }
         }
+    }
+
+    /// #2469: centers on a tilted line far from the origin. Storing
+    /// `y = 0.3·x + 10⁶` rounds each `y` by up to `u·10⁶`, so the centered `y`
+    /// column keeps a residual of about `2.4e-9` after projecting out `x`. That
+    /// is rounding, not spread: the replaced floor `64·ε·d·max‖c‖` (≈ 4e-14
+    /// here) read it as a second linear direction and normalized it into a head
+    /// column of size ~4e8. The derived band, which carries the centering's
+    /// rounding at the uncentered scale, drops it.
+    #[test]
+    fn affine_head_drops_the_rounding_residual_of_a_far_offset_line_2469() {
+        let m = 24usize;
+        let mut centers = Array2::<f64>::zeros((m, 2));
+        for i in 0..m {
+            let x = i as f64 / (m - 1) as f64;
+            centers[(i, 0)] = x;
+            centers[(i, 1)] = 0.3 * x + 1.0e6;
+        }
+        let masses = Array1::<f64>::ones(m);
+        let lift = measure_jet_affine_head_transform(centers.view(), masses.view());
+        assert_eq!(
+            lift.ncols(),
+            1,
+            "a line carries one linear direction, got {}",
+            lift.ncols()
+        );
+
+        // Negative control: the same offset with a perpendicular spread of
+        // 1e-4 — far above the `γ_{2m+1}·‖y‖_W` centering band (~3e-8) — is a
+        // genuine plane and keeps both directions.
+        let mut plane = centers.clone();
+        for i in 0..m {
+            plane[(i, 1)] += if i % 2 == 0 { 1.0e-4 } else { -1.0e-4 };
+        }
+        let plane_lift = measure_jet_affine_head_transform(plane.view(), masses.view());
+        assert_eq!(
+            plane_lift.ncols(),
+            2,
+            "a resolved plane keeps both linear directions"
+        );
+    }
+
+    /// #2469: the local affine Gram is formed by the uncentered formula
+    /// `(ΦᵀWΦ)/q − a·aᵀ`, which cancels when the neighbors sit far from the
+    /// base point relative to their spread. On a cluster at `φ ≈ 2.9` spread
+    /// along a line, the computed normal eigenvalue is cancellation noise
+    /// (~1e-15) while the exact one is zero. The derived band covers the
+    /// formation error (checked against the centered two-pass Gram) and drops
+    /// the noise; the replaced floor `64·ε·d·λ_max` sat ~9 decades below that
+    /// error and inverted the noise whenever it rounded positive.
+    #[test]
+    fn local_affine_gram_band_covers_uncentered_cancellation_2469() {
+        let ml = 40usize;
+        let mut phi = Array2::<f64>::zeros((ml, 2));
+        let mut w = Array1::<f64>::zeros(ml);
+        for a in 0..ml {
+            let t = (1.7 * a as f64 + 0.3).sin();
+            phi[(a, 0)] = 2.9 + 1.0e-5 * t;
+            phi[(a, 1)] = 2.9 + 0.3e-5 * t;
+            w[a] = (-0.5 * (1.0 + 0.01 * (a as f64).cos())).exp();
+        }
+        let q = w.sum();
+        // The production formation, operation for operation.
+        let a_mean = phi.t().dot(&w) / q;
+        let mut wphi = phi.clone();
+        for (a, mut row) in wphi.outer_iter_mut().enumerate() {
+            row.mapv_inplace(|v| v * w[a]);
+        }
+        let mut g = phi.t().dot(&wphi);
+        g.mapv_inplace(|v| v / q);
+        for r in 0..2 {
+            for c in 0..2 {
+                g[(r, c)] -= a_mean[r] * a_mean[c];
+            }
+        }
+        // Centered two-pass reference: no cancellation, error at the scale of
+        // G itself.
+        let mut centered = phi.clone();
+        for mut row in centered.outer_iter_mut() {
+            row -= &a_mean;
+        }
+        let mut wc = centered.clone();
+        for (a, mut row) in wc.outer_iter_mut().enumerate() {
+            row.mapv_inplace(|v| v * w[a]);
+        }
+        let g_ref = centered.t().dot(&wc) / q;
+        let band = local_affine_gram_assembly_band(&phi, &w, q);
+        let formation_error = (&g - &g_ref).iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            formation_error <= band,
+            "formation error {formation_error:e} escapes the assembly band {band:e}"
+        );
+
+        let pinv = symmetric_pseudoinverse(&g, band, "test local Gram").expect("pinv");
+        let rank = pinv.dot(&g).diag().sum();
+        assert!(
+            (rank - 1.0).abs() < 0.5,
+            "the cluster is 1-D: the pseudo-inverse must resolve one direction, got trace {rank}"
+        );
+
+        // Negative control: the replaced floor sits below the formation error,
+        // so which side of it the noise eigenvalue lands on is the sign of a
+        // rounding error (a positive one was inverted).
+        let (evals, _) = g.eigh(Side::Lower).expect("eigh");
+        let lam_max = evals.iter().fold(0.0_f64, |acc, v| acc.max(*v));
+        let replaced_floor = 64.0 * f64::EPSILON * 2.0 * lam_max;
+        assert!(
+            formation_error > replaced_floor,
+            "fixture must carry formation error {formation_error:e} above the replaced floor {replaced_floor:e}"
+        );
+        assert!(
+            evals.iter().filter(|&&v| v > band).count() == 1,
+            "the tangent eigenvalue must clear the derived band {band:e}: {evals:?}"
+        );
     }
 }
