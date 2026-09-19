@@ -53,6 +53,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "group_metadata",
     "deployment_extensions",
     "convergence",
+    "text",
 )
 
 
@@ -359,7 +360,15 @@ class Summary:
     #: ``None`` when no smoothing coordinate was optimized, else a mapping with
     #: ``kind``, ``gradient_norm``, ``projected_gradient_norm``,
     #: ``stationarity_bound``, ``hessian_psd`` and ``lambdas_railed``.
+    #: ``estimator`` names the objective the coefficients are the mode of:
+    #: ``name`` (``"penalized likelihood"`` or ``"penalized likelihood with
+    #: Jeffreys prior"``), ``reason`` (why the Jeffreys prior is in it, else
+    #: ``None``) and ``text`` (the line every surface prints).
     convergence: dict[str, Any] | None = None
+    #: The rendered report ``print(summary)`` shows: the same string
+    #: ``gam summary MODEL`` prints, rendered in Rust from these fields.
+    #: ``None`` for summaries that are not of a fitted model.
+    text: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -460,40 +469,14 @@ class Summary:
     # -- presentation -----------------------------------------------------------
 
     def __str__(self) -> str:
-        """Multi-line human-readable summary (the ``print(summary)`` form).
+        """The rendered report (the ``print(summary)`` form); see :attr:`text`.
 
-        ``Model.__str__`` delegates here so the rendering lives in one place.
+        ``Model.__str__`` delegates here. A summary without rendered text
+        prints its compact form.
         """
-        lines = ["GAM fitted model"]
-        if self.formula:
-            lines.append(f"  Formula: {self.formula}")
-        if self.family_name:
-            lines.append(f"  Family:  {self.family_name}")
-        if self.model_class:
-            lines.append(f"  Class:   {self.model_class}")
-        if self.n_obs is not None:
-            lines.append(f"  Training rows: {self.n_obs}")
-        if self.deviance is not None:
-            lines.append(f"  Deviance: {self.deviance:g}")
-        if (
-            self.reml_score is not None
-            or self.raw_reml_score is not None
-            or self.reml_score_unavailable is not None
-        ):
-            # gam-report owns the words for an absent criterion, so this line
-            # names a fit without null-space metadata apart from an exact fit
-            # the same way `gam fit` and the HTML report do (#2627).
-            lines.append(
-                f"  REML score: {rust_module().summary_criterion_row(self.to_dict())}"
-            )
-        if self.edf_total is not None:
-            lines.append(f"  Effective dof: {self.edf_total:g}")
-        if self.iterations is not None:
-            lines.append(f"  Outer iterations: {self.iterations}")
-        n_coef = len(self.coefficients)
-        if n_coef:
-            lines.append(f"  Coefficients: {n_coef}")
-        return "\n".join(lines)
+        if self.text is None:
+            return repr(self)
+        return self.text
 
     def __repr__(self) -> str:
         """Compact developer one-liner. Stable across engine versions."""

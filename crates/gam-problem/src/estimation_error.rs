@@ -601,7 +601,8 @@ pub enum EstimationError {
 
     #[error(
         "Pre-fit linear separation detected in the realized binomial inverse-link design: \
-        {num_unpenalized_columns} parametric columns (unpenalized, or penalized only by a one-column ridge) admit a separating direction \
+        {num_unpenalized_columns} directions no roughness penalty bounds (parametric columns, and a smooth's penalty null space, \
+        unpenalized or penalized only by a ridge) admit a separating direction \
         with minimum signed margin {min_signed_margin:.6e} (columns {column_indices:?}). \
         The likelihood has no finite maximizer along that direction; enable Firth/Jeffreys bias reduction or \
         remove/reparameterize the separating columns."

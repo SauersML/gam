@@ -26,6 +26,7 @@ def _draws() -> PosteriorSamples:
         ess=240.0,
         converged=True,
         method="nuts",
+        acceptance_rate=None,
         exact=True,
         covariance_source="conditional",
         model_class="standard",
