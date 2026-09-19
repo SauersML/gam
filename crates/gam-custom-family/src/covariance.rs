@@ -2189,9 +2189,18 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
         }
         h_proj_inverse[[out_col, out_col]] = 1.0 / m_evals[src_col];
     }
-    let u_m = match face_tangent {
-        Some(z) => z.dot(&kept_basis),
-        None => kept_basis,
+    // The eigenpairs the kernel drops, from the same decomposition: its derivative couples them to
+    // the kept ones (`PenaltySubspaceTrace::pseudo_inverse_rotation`).
+    let dropped: Vec<usize> = (0..m_evals.len()).filter(|index| !kept.contains(index)).collect();
+    let mut dropped_basis = Array2::<f64>::zeros((precision_dim, dropped.len()));
+    let mut dropped_eigenvalues = Array1::<f64>::zeros(dropped.len());
+    for (out_col, &src_col) in dropped.iter().enumerate() {
+        dropped_basis.column_mut(out_col).assign(&m_evecs.column(src_col));
+        dropped_eigenvalues[out_col] = m_evals[src_col];
+    }
+    let (u_m, dropped_basis) = match face_tangent {
+        Some(z) => (z.dot(&kept_basis), z.dot(&dropped_basis)),
+        None => (kept_basis, dropped_basis),
     };
 
     Ok((
@@ -2199,6 +2208,8 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
         Some(PenaltySubspaceTrace {
             u_s: u_m,
             h_proj_inverse,
+            dropped_basis,
+            dropped_eigenvalues,
             // Filled by the caller, which is the only place that holds the
             // operator's own `logdet()` this pseudo-determinant replaces.
             logdet_correction: 0.0,
