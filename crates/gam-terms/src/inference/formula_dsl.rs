@@ -1408,8 +1408,8 @@ mod tests {
 
     #[test]
     fn factor_wrapper_is_strict_on_unseen_levels_while_group_re_are_lenient() {
-        // Regression for #2137 (sibling of #2102): `factor(g)` is a FIXED
-        // categorical factor (R `factor()` / patsy `C()`), so an out-of-vocabulary
+        // Regression for #2137 (sibling of #2102): `factor(g)` names the
+        // categorical level effect of a column seen in training, so an out-of-vocabulary
         // level at predict is a schema mismatch that must raise — NOT be shrunk to
         // the centering point. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine
         // random effects that tolerate a held-out group (→ population mean). The
@@ -1418,12 +1418,33 @@ mod tests {
         // policy at the parse layer, where the whole distinction now lives.
         assert!(
             !random_effect_lenient_unseen("y ~ factor(g)"),
-            "factor(g) is a fixed categorical factor: strict (lenient_unseen=false) on unseen levels"
+            "factor(g) is strict (lenient_unseen=false) on unseen levels"
         );
         for lenient in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=re)"] {
             assert!(
                 random_effect_lenient_unseen(lenient),
                 "{lenient} is a genuine random effect: lenient (lenient_unseen=true) on unseen levels"
+            );
+        }
+    }
+
+    #[test]
+    fn categorical_wrappers_reject_unknown_options() {
+        // pyGAM audit F3: `factor()`/`group()`/`re()` accept no options, so a
+        // stray keyword must be a typed parse error instead of being dropped.
+        for formula in [
+            "y ~ factor(g, foo=1)",
+            "y ~ factor(g, double_penalty=false)",
+            "y ~ group(g, bogus=3)",
+            "y ~ re(g, k=4)",
+        ] {
+            let err = match parse_formula(formula) {
+                Ok(_) => panic!("{formula} must reject its unknown option"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains("does not accept option"),
+                "{formula}: unexpected error {err}"
             );
         }
     }
@@ -1723,9 +1744,9 @@ pub enum ParsedTerm {
         /// Unseen-level policy, fixed at parse time by the wrapper the user
         /// wrote. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine **random
         /// effects**: a held-out group is shrunk to the population mean, so an
-        /// unseen level at predict is tolerated (`true`). `factor(g)` is a
-        /// **fixed** categorical factor (R `factor()` / patsy `C()`
-        /// convention): like a bare `+ g` categorical main effect, an unseen
+        /// unseen level at predict is tolerated (`true`). `factor(g)` (and
+        /// patsy's `C(g)` spelling) names a categorical level effect: like a
+        /// bare `+ g` categorical main effect, an unseen
         /// level is a schema mismatch that must raise rather than collapse onto
         /// the factor's centering point (`false`, #2137/#2102). Both wrappers
         /// share the penalized-categorical materialization; only this policy
@@ -3366,13 +3387,17 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                // `factor(g)` is a FIXED categorical factor (R `factor()` /
-                // patsy `C()`): it forces categorical encoding of the column
-                // but, like a bare `+ g` main effect, is strict on unseen
-                // levels. `group(g)`/`re(g)` are genuine random effects that
-                // shrink a held-out group to the population mean, so they
-                // tolerate unseen levels. Both share the penalized-categorical
-                // block; only the unseen policy differs (#2137/#2102).
+                // None of the categorical wrappers take options: every one
+                // lowers to a level block whose ridge strength is
+                // REML-estimated, so `factor(g, foo=1)` or
+                // `group(g, double_penalty=false)` is a typo, not a request.
+                validate_known_term_options(&name, &options, &[], raw)?;
+                // `factor(g)` forces categorical encoding of the column and,
+                // like a bare `+ g` main effect, is strict on unseen levels.
+                // `group(g)`/`re(g)` are genuine random effects that shrink a
+                // held-out group to the population mean, so they tolerate
+                // unseen levels. Both share the penalized-categorical block;
+                // only the unseen policy differs (#2137/#2102).
                 let lenient_unseen = name != "factor";
                 return Ok(ParsedTerm::RandomEffect {
                     name: vars[0].clone(),
@@ -3876,25 +3901,17 @@ pub fn parse_link_choice(
     }))
 }
 
+/// Parse a link name through the canonical vocabulary in
+/// [`LinkFunction::from_name`]; the error lists [`LinkFunction::ALL`].
 pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
-    match v.trim() {
-        "identity" => Ok(LinkFunction::Identity),
-        "log" => Ok(LinkFunction::Log),
-        "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
-        "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
-        "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
-        "loglog" => Ok(LinkFunction::LogLog),
-        "cauchit" => Ok(LinkFunction::Cauchit),
-        "sas" => Ok(LinkFunction::Sas),
-        "beta-logistic" => Ok(LinkFunction::BetaLogistic),
-        other => Err(FormulaDslError::UnknownIdentifier {
-            reason: format!(
-                "unsupported link type '{other}'; \
-                 use one of identity|log|logit|probit|cloglog|loglog|cauchit|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
-                 Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
-            ),
-        }),
-    }
+    LinkFunction::from_name(v).ok_or_else(|| FormulaDslError::UnknownIdentifier {
+        reason: format!(
+            "{}, blended(...)/mixture(...) or flexible(...). \
+             The formula term `link(type=<type>)`, the mgcv-style `family(<type>)` and \
+             Python's `link=` accept the same set.",
+            gam_problem::types::UnknownLinkName(v.trim().to_string())
+        ),
+    })
 }
 
 pub(crate) fn parse_link_component(v: &str) -> Result<LinkComponent, String> {

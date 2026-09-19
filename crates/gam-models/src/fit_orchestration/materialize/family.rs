@@ -4,15 +4,19 @@ const SCALAR_FAMILY_NAMES_HELP: &str = "auto, gaussian, gaussian-identity, \
 binomial/bernoulli, binomial-logit/bernoulli-logit/logistic, \
 binomial-probit/bernoulli-probit/probit, \
 binomial-cloglog/bernoulli-cloglog/cloglog, latent-cloglog-binomial, \
-poisson, poisson-log, gamma, gamma-log, beta/beta-regression, \
+poisson, poisson-log, gamma, gamma-log, \
+inverse-gaussian/inverse.gaussian/inv-gauss/invgauss, beta/beta-regression, \
 beta-logit/beta-regression-logit, tweedie/tw, tweedie-log, \
 negative-binomial/negbin/nb, negative-binomial-log/negbin-log, \
-student-t/t, royston-parmar, transformation-normal";
+student-t/t, royston-parmar, transformation-normal; any family also accepts \
+an mgcv-style link argument, e.g. gamma(inverse)";
 
 /// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
 /// onto the [`ResponseColumnKind`] consumed by the family layer.
 ///
-/// `Categorical` carries the source-string levels through so the
+/// `Categorical` carries the source-string levels through so a two-level
+/// column can be coded as a binary outcome
+/// ([`code_two_level_label_response`]) and any other level count's
 /// auto-inference refusal can echo them; `Binary` short-circuits the
 /// numeric scan inside [`ResponseFamily::infer_from_response`]; `Continuous`
 /// maps to `Numeric` and the family layer scans `y` itself to decide
@@ -32,49 +36,73 @@ pub fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind 
     }
 }
 
-/// Legality of a `(response family, link)` pairing.
+/// Code a two-level label response to the `0`/`1` outcome a Binomial family
+/// models, in canonical sorted level order.
 ///
-/// This is the single source of truth for which links a given response family
-/// accepts. It is consulted only when the caller supplied an *explicit* family
-/// together with a link (`family=..., link(type=...)`): the link must be
-/// validated against that family rather than the family re-inferred from the
-/// link. The legal pairings are:
+/// A string or categorical response arrives as level indices whose order is
+/// the ingestion path's (encounter order for an Arrow string column, the
+/// declared categories for a pandas categorical, sorted for a CSV). The event
+/// must not depend on which of those carried the data, so the two levels are
+/// ranked by [`gam_data::natural_level_cmp`]: the first is coded `0`, the
+/// second `1`, and the fit models `P(y = second level)`. `{"no", "yes"}` models
+/// `P(yes)`; `{"0", "1"}` models `P(1)`. The coding is recorded as an
+/// informational fit note so the summary states which level is the event.
 ///
-/// * `Gaussian` + `Identity`
-/// * `{Poisson, Gamma, Tweedie, NegativeBinomial}` + `Log`
-/// * `Beta` + `Logit`
-/// * `Binomial` + `{Logit, Probit, CLogLog, LogLog, Cauchit, Sas,
-///   BetaLogistic}` (and the Logit-shaped `Mixture`, handled by the caller via
-///   `mixture_components`). `LogLog` (`μ = exp(−exp(−η))`, the reflected
-///   extreme-value link) and `Cauchit` (`μ = ½ + atan(η)/π`) are fully wired
-///   binomial inverse links — closed-form μ in the kernel plus a full IRLS
-///   d1..d5 / Fisher-weight jet in the solver — so they are legal here (#2104).
-///
-/// `RoystonParmar` is a flexible-parametric survival family whose link is fixed
-/// at construction and is never reached through the scalar link-choice path, so
-/// it accepts no link override here.
-fn link_legal_for_family(response: &ResponseFamily, link: LinkFunction) -> bool {
-    match response {
-        ResponseFamily::Gaussian | ResponseFamily::StudentT { .. } => {
-            matches!(link, LinkFunction::Identity)
-        }
-        ResponseFamily::Poisson
-        | ResponseFamily::Gamma
-        | ResponseFamily::Tweedie { .. }
-        | ResponseFamily::NegativeBinomial { .. } => matches!(link, LinkFunction::Log),
-        ResponseFamily::Beta { .. } => matches!(link, LinkFunction::Logit),
-        ResponseFamily::Binomial => matches!(
-            link,
-            LinkFunction::Logit
-                | LinkFunction::Probit
-                | LinkFunction::CLogLog
-                | LinkFunction::LogLog
-                | LinkFunction::Cauchit
-                | LinkFunction::Sas
-                | LinkFunction::BetaLogistic
-        ),
-        ResponseFamily::RoystonParmar => false,
+/// A no-op unless `family` is Binomial and `y_kind` is a two-level categorical
+/// column; every other response is already on its family's scale.
+pub(crate) fn code_two_level_label_response(
+    family: &LikelihoodSpec,
+    y_kind: &ResponseColumnKind,
+    y: &mut Array1<f64>,
+    response_name: &str,
+    notes: &mut FitNotes,
+) {
+    let ResponseColumnKind::Categorical { levels } = y_kind else {
+        return;
+    };
+    if !matches!(family.response, ResponseFamily::Binomial) || levels.len() != 2 {
+        return;
     }
+    let event_code = match gam_data::natural_level_cmp(&levels[0], &levels[1]) {
+        std::cmp::Ordering::Greater => 0.0,
+        _ => 1.0,
+    };
+    let (reference, event) = if event_code == 1.0 {
+        (&levels[0], &levels[1])
+    } else {
+        (&levels[1], &levels[0])
+    };
+    y.mapv_inplace(|code| if code == event_code { 1.0 } else { 0.0 });
+    notes.inform(format!(
+        "response '{response_name}' has two levels, coded in sorted order as \
+         '{reference}' = 0 and '{event}' = 1; the binomial fit models \
+         P({response_name} = '{event}')"
+    ));
+}
+
+/// Reject a `(response family, link)` pairing the likelihood legality table
+/// ([`LikelihoodSpec::is_legal_cell`]) does not admit.
+///
+/// Consulted only when the caller supplied an *explicit* family together with
+/// a link (`family=..., link(type=...)` or `family(link)`): the link is
+/// validated against that family rather than the family re-inferred from the
+/// link. The message lists the family's legal links, generated from the same
+/// table by [`LikelihoodSpec::legal_links_for`], so it cannot drift from what
+/// the solver accepts.
+fn require_legal_link(response: &ResponseFamily, link: LinkFunction) -> Result<(), String> {
+    let legal = LikelihoodSpec::legal_links_for(response);
+    if legal.contains(&link) {
+        return Ok(());
+    }
+    Err(WorkflowError::InvalidConfig {
+        reason: format!(
+            "link `{}` is not supported for family `{}`; {}",
+            link.name(),
+            response.name(),
+            LikelihoodSpec::legal_links_clause(response)
+        ),
+    }
+    .into())
 }
 
 /// Apply an explicit mgcv-style `family(link)` link argument to an
@@ -86,7 +114,7 @@ fn link_legal_for_family(response: &ResponseFamily, link: LinkFunction) -> bool 
 /// user-supplied family string, used only for error messages.
 ///
 /// The link is parsed with the shared [`parse_linkname`] vocabulary, validated
-/// against the family with [`link_legal_for_family`], and applied to the
+/// against the family with [`require_legal_link`], and applied to the
 /// family's response variant (preserving e.g. NB θ, Tweedie p, Beta φ). The
 /// result is pinned (`link_pinned = true`): an explicit link spelled into the
 /// family name pins it exactly as the hyphen spelling `binomial-probit` does,
@@ -103,26 +131,17 @@ fn apply_paren_link(
     name: &str,
 ) -> Result<(LikelihoodSpec, bool), String> {
     let (base_spec, base_pinned) = base;
-    let link = gam_terms::inference::formula_dsl::parse_linkname(link_str).map_err(|_| {
+    let link = LinkFunction::from_name(link_str).ok_or_else(|| {
         let reason: String = WorkflowError::InvalidConfig {
             reason: format!(
-                "family '{name}' names an unknown link '{link_str}'; \
-                 use one of identity|log|logit|probit|cloglog|sas|beta-logistic"
+                "family '{name}' names an unknown link: {}",
+                gam_problem::UnknownLinkName(link_str.trim().to_string())
             ),
         }
         .into();
         reason
     })?;
-    if !link_legal_for_family(&base_spec.response, link) {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "link '{}' is not supported for family '{}'",
-                link.name(),
-                base_spec.response.name()
-            ),
-        }
-        .into());
-    }
+    require_legal_link(&base_spec.response, link)?;
     // A head that already pinned its own link (only reachable via the malformed
     // double-spec `binomial-logit(probit)`) may not be re-pointed at a different
     // link — mirror the `link(type=...)` pin-conflict guard.
@@ -139,7 +158,7 @@ fn apply_paren_link(
     }
     // Build the inverse link. State-less links narrow into `StandardLink`; the
     // state-bearing `Sas` / `BetaLogistic` links (legal only for Binomial, which
-    // `link_legal_for_family` already enforced) carry the canonical zero seed,
+    // `require_legal_link` already enforced) carry the canonical zero seed,
     // exactly as the `link(type=...)` path constructs them — their effective
     // state is rebuilt later from `FitOptions`.
     let inverse_link = match link {
@@ -492,6 +511,17 @@ pub fn scalar_family_from_name(
             ),
             true,
         ),
+        // Inverse-Gaussian with its canonical `1/μ²` link; mgcv spells it
+        // `inverse.gaussian`, pyGAM `inv_gauss`. The log link is reached
+        // through `inverse-gaussian(log)`.
+        "inverse-gaussian" | "inverse.gaussian" | "inversegaussian" | "inv-gauss"
+        | "invgauss" | "inv-gaussian" => (
+            LikelihoodSpec::new(
+                ResponseFamily::InverseGaussian,
+                InverseLink::Standard(StandardLink::InverseSquared),
+            ),
+            false,
+        ),
         // Royston-Parmar flexible-parametric survival and the
         // transformation-normal response model are CLI/formula families
         // whose materialization is dispatched before the scalar GLM
@@ -589,10 +619,11 @@ pub fn scalar_family_from_name(
 /// `Numeric`). It is consulted only on the auto-detect path — explicit
 /// `family=...` always wins — but is required there because the same numeric
 /// `y = [0.0, 1.0, ...]` payload may come from a real binary outcome or from
-/// a categorical column whose two levels happened to encode to those indices.
-/// Routing the kind through [`ResponseFamily::infer_from_response`] is what
-/// stops the auto-detector from silently inferring Binomial off encoded
-/// strings (see `tests/issues/issue_304`).
+/// a categorical column whose levels happened to encode to those indices.
+/// Routing the kind through [`ResponseFamily::infer_from_response`] keeps the
+/// auto-detector from reading level indices as values: a two-level label
+/// column is a binary outcome (Binomial, coded by
+/// [`code_two_level_label_response`]), and any other label column is refused.
 pub fn resolve_family(
     family: Option<&str>,
     negative_binomial_theta: Option<f64>,
@@ -646,21 +677,38 @@ pub fn resolve_family(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(StandardLink::Identity),
                 ),
-                LinkFunction::Log => {
-                    if y.iter()
-                        .all(|&yi| yi.is_finite() && yi >= 0.0 && yi == yi.round())
-                    {
-                        LikelihoodSpec::new(
-                            ResponseFamily::Poisson,
-                            InverseLink::Standard(StandardLink::Log),
-                        )
-                    } else {
-                        LikelihoodSpec::new(
-                            ResponseFamily::Gamma,
-                            InverseLink::Standard(StandardLink::Log),
-                        )
+                // `log` (Poisson, Gamma, Tweedie, NB, Inverse-Gaussian) and
+                // `1/μ` (Gaussian, Gamma) are each legal for several families,
+                // and nothing in the link distinguishes them: a variance
+                // function is a modelling choice, not something to read off
+                // whether `y` happens to be integer-valued. The caller names
+                // the family. With an explicit family only `from_link.link`
+                // is carried below, so the response here is immaterial.
+                LinkFunction::Log if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::Log),
+                ),
+                LinkFunction::Inverse if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::Inverse),
+                ),
+                link @ (LinkFunction::Log | LinkFunction::Inverse) => {
+                    return Err(WorkflowError::InvalidConfig {
+                        reason: format!(
+                            "link '{}' does not determine a response family; name one \
+                             with family=: {}",
+                            link.name(),
+                            LikelihoodSpec::families_admitting(link).join("|")
+                        ),
                     }
+                    .into());
                 }
+                // `1/μ²` is the canonical Inverse-Gaussian link and legal for
+                // no other family.
+                LinkFunction::InverseSquared => LikelihoodSpec::new(
+                    ResponseFamily::InverseGaussian,
+                    InverseLink::Standard(StandardLink::InverseSquared),
+                ),
                 LinkFunction::Logit => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(StandardLink::Logit),
@@ -730,22 +778,21 @@ pub fn resolve_family(
                 .into());
             }
             let mixture_requested = choice.mixture_components.is_some();
-            let legal = if mixture_requested {
+            if mixture_requested {
                 // The mixture link is a Binomial latent construct; it has no
                 // legal pairing with any other response family.
-                matches!(explicit_spec.response, ResponseFamily::Binomial)
-            } else {
-                link_legal_for_family(&explicit_spec.response, choice.link)
-            };
-            if !legal {
-                return Err(WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "link '{}' is not supported for family '{}'",
-                        choice.link.name(),
-                        explicit_spec.response.name()
-                    ),
+                if !LikelihoodSpec::is_legal_cell(&explicit_spec.response, &from_link.link) {
+                    return Err(WorkflowError::InvalidConfig {
+                        reason: format!(
+                            "a mixture link is not supported for family `{}`; {}",
+                            explicit_spec.response.name(),
+                            LikelihoodSpec::legal_links_clause(&explicit_spec.response)
+                        ),
+                    }
+                    .into());
                 }
-                .into());
+            } else {
+                require_legal_link(&explicit_spec.response, choice.link)?;
             }
             // A family name that pinned its own link (e.g. "binomial-probit")
             // may not be re-pointed at a different link by `link(type=...)`.
@@ -858,28 +905,17 @@ mod tweedie_power_tests {
         // "not supported for family 'binomial'". Exercise the real legality
         // predicate directly (it is private to this module) and the end-to-end
         // resolver seam through which the user reaches it.
-        assert!(
-            link_legal_for_family(&ResponseFamily::Binomial, LinkFunction::LogLog),
+        assert!(require_legal_link(&ResponseFamily::Binomial, LinkFunction::LogLog).is_ok(),
             "binomial + loglog must be a legal pairing"
         );
-        assert!(
-            link_legal_for_family(&ResponseFamily::Binomial, LinkFunction::Cauchit),
+        assert!(require_legal_link(&ResponseFamily::Binomial, LinkFunction::Cauchit).is_ok(),
             "binomial + cauchit must be a legal pairing"
         );
         // The other three canonical binomial links stay legal (no regression),
         // and a non-binomial family still rejects these two links.
-        assert!(link_legal_for_family(
-            &ResponseFamily::Binomial,
-            LinkFunction::CLogLog
-        ));
-        assert!(!link_legal_for_family(
-            &ResponseFamily::Gaussian,
-            LinkFunction::LogLog
-        ));
-        assert!(!link_legal_for_family(
-            &ResponseFamily::Gaussian,
-            LinkFunction::Cauchit
-        ));
+        assert!(require_legal_link(&ResponseFamily::Binomial, LinkFunction::CLogLog).is_ok());
+        assert!(require_legal_link(&ResponseFamily::Gaussian, LinkFunction::LogLog).is_err());
+        assert!(require_legal_link(&ResponseFamily::Gaussian, LinkFunction::Cauchit).is_err());
 
         // End-to-end resolver path (mgcv-style `family(link)`) must now accept
         // both links and carry the requested inverse link into the spec.
@@ -908,6 +944,64 @@ mod tweedie_power_tests {
                 want,
                 "{raw}: expected {want:?} link"
             );
+        }
+    }
+
+    /// pyGAM audit families.md F11: `link="log"` with no family once picked
+    /// Poisson when every `y` was a non-negative integer and Gamma otherwise, so
+    /// a positive cost column rounded to whole dollars got a Poisson variance
+    /// function from a data coincidence. A link several families admit does not
+    /// determine the family; the caller names one, and the error lists the
+    /// families the legality table admits for that link.
+    #[test]
+    fn a_link_several_families_admit_requires_the_family() {
+        use gam_terms::inference::formula_dsl::{LinkChoice, LinkMode};
+        let integer_valued = array![1.0, 3.0, 7.0, 2.0, 12.0];
+        for (link, admitting) in [
+            (
+                LinkFunction::Log,
+                "poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
+            ),
+            (LinkFunction::Inverse, "gaussian|gamma"),
+        ] {
+            let choice = LinkChoice {
+                mode: LinkMode::Strict,
+                link,
+                mixture_components: None,
+            };
+            let error = resolve_family(
+                None,
+                None,
+                Some(&choice),
+                integer_valued.view(),
+                ResponseColumnKind::Numeric,
+                "y",
+            )
+            .expect_err("a link alone must not choose between variance functions");
+            assert!(
+                error.contains(&format!("name one with family=: {admitting}")),
+                "{} error must list the admitting families: {error}",
+                link.name()
+            );
+            for family in admitting.split('|') {
+                // A Tweedie family is named with its variance power.
+                let requested = if family == "tweedie" {
+                    "tweedie(1.5)"
+                } else {
+                    family
+                };
+                let spec = resolve_family(
+                    Some(requested),
+                    None,
+                    Some(&choice),
+                    integer_valued.view(),
+                    ResponseColumnKind::Numeric,
+                    "y",
+                )
+                .unwrap_or_else(|err| panic!("{requested} + {link:?}: {err}"));
+                assert_eq!(spec.response.name(), family);
+                assert_eq!(spec.link.link_function(), link);
+            }
         }
     }
 

@@ -175,7 +175,7 @@ fn stopped_run_checkpoint(
                 && (!last_solution.final_value.is_finite()
                     || best.value < last_solution.final_value) =>
         {
-            log::warn!(
+            log::debug!(
                 "[OUTER] {context}: {stop} last iterate (value={:.6e}) is worse than the best \
                  feasible iterate seen (value={:.6e}); substituting the best iterate so a \
                  degenerate box-corner does not over-shrink a supported penalty direction \
@@ -313,7 +313,7 @@ fn eval_seed_restoring_rays(
             return Err(err);
         };
         if restorations >= rho_dim {
-            log::warn!(
+            log::debug!(
                 "[OUTER] {context}: seed {seed_idx} still descends a ray after {restorations} \
                  restorations (one per rho coordinate); refusing it as evaluated: {ray}"
             );
@@ -353,7 +353,7 @@ fn eval_seed_restoring_rays(
             // EVERY coordinate of the block is at its ceiling: no admissible
             // strength closes this ray, and the refusal is the model's answer
             // rather than a missed opportunity.
-            log::warn!(
+            log::debug!(
                 "[OUTER] {context}: seed {seed_idx} descends a ray whose every coordinate is \
                  already at its domain ceiling ({}); no admissible penalty strength closes it, \
                  so refusing it as evaluated: {ray}",
@@ -369,7 +369,7 @@ fn eval_seed_restoring_rays(
             return Err(err);
         }
         if !capped.is_empty() {
-            log::warn!(
+            log::debug!(
                 "[OUTER] {context}: seed {seed_idx} raises the {} coordinate(s) of this block \
                  that still have room and leaves {} at the ceiling ({}); the block gains less \
                  than the ray's full {:.4}, which is a step along it, not past it",
@@ -386,7 +386,7 @@ fn eval_seed_restoring_rays(
                 ray.log_strength_ratio,
             );
         }
-        log::warn!(
+        log::debug!(
             "[OUTER] {context}: seed {seed_idx} is under-penalized, not failed — {ray}; \
              restoring rho{:?} from {:?} to {:?} and re-evaluating",
             native_coordinates(
@@ -470,6 +470,21 @@ pub(crate) fn eligible_transferred_outer_hessian<'a>(
     hessian.filter(|h| {
         h.nrows() == n_params && h.ncols() == n_params && h.iter().all(|v| v.is_finite())
     })
+}
+
+/// The continuation's exact start curvature, only at the start it was measured
+/// at and only in this layout's dimension; see [`OuterConfig::initial_curvature`].
+pub(crate) fn bound_initial_curvature<'a>(
+    bound: Option<&'a BoundOuterCurvature>,
+    start: &Array1<f64>,
+    n_params: usize,
+) -> Option<&'a Array2<f64>> {
+    bound
+        .filter(|bound| outer_theta_bitwise_eq(&bound.theta, start))
+        .map(|bound| &bound.hessian)
+        .filter(|h| {
+            h.nrows() == n_params && h.ncols() == n_params && h.iter().all(|v| v.is_finite())
+        })
 }
 
 /// A multistart candidate that has cleared the analytic outer certificate.
@@ -701,7 +716,7 @@ pub(crate) fn run_outer_with_plan(
         seeds_without_recorded_refusals(seeds, &config.previously_refused_seed_points);
     seeds = kept_seeds;
     if replayed_seeds > 0 {
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: replaying {replayed_seeds} recorded seed refusal(s) instead of \
              re-running them ({}/{generated_seed_count} seeds kept); a resume re-enters a \
              non-initial seed from the state that already refused it (#2569/#2080)",
@@ -756,7 +771,7 @@ pub(crate) fn run_outer_with_plan(
         seeds = match screened {
             Ok(ranked) => ranked,
             Err(error) if error.is_trial_point_infeasible() => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: seed screening could not rank the seeds \
                      ({error}); continuing with the generated order",
                 );
@@ -778,13 +793,13 @@ pub(crate) fn run_outer_with_plan(
             seed_budget,
         );
     }
-    log::debug!(
+    log::trace!(
         "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",
         seeds.len(),
         seed_budget,
     );
     if seed_budget < config.seed_config.seed_budget.max(1) {
-        log::debug!(
+        log::trace!(
             "[OUTER] {context}: capped requested seed budget {} -> {} for {:?} ({:?})",
             config.seed_config.seed_budget.max(1),
             seed_budget,
@@ -793,7 +808,7 @@ pub(crate) fn run_outer_with_plan(
         );
     }
     if seeds.len() > seed_budget {
-        log::debug!(
+        log::trace!(
             "[OUTER] {context}: trying up to {seed_budget}/{} generated seeds in heuristic order",
             seeds.len(),
         );
@@ -932,7 +947,7 @@ pub(crate) fn run_outer_with_plan(
         // therefore consistent both with one seed and with several. One line
         // here makes "how many seeds ran, and which one produced this outcome"
         // a reading rather than an inference.
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: entering seed {seed_idx} of {} (started {started_seeds},              budget {seed_budget}) on {the_plan}",
             seeds.len(),
         );
@@ -966,7 +981,7 @@ pub(crate) fn run_outer_with_plan(
             let starts_below_winner = start_value.is_finite()
                 && winner_value - start_value
                     > crate::rho_optimizer::outer_value_agreement_bound(winner_value, start_value);
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: certified winner (value={winner_value:.6e}) is railed on the \
                  domain face; seed {seed_idx} starts at {start_value:.6e}, {}",
                 if starts_below_winner { "running it" } else { "skipping it" }
@@ -984,7 +999,7 @@ pub(crate) fn run_outer_with_plan(
             if let Some(key) =
                 uniform_structural_key(&seed_rejections, STRUCTURAL_EARLY_EXIT_MIN_COUNT)
             {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: structural early-exit after {} uniform structural \
                      rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
                     seed_rejections.len(),
@@ -1007,7 +1022,7 @@ pub(crate) fn run_outer_with_plan(
                 let first_seed = seed_rejections[seed_rejections.len() - run_len].seed_idx;
                 let last_seed = seed_rejections[seed_rejections.len() - 1].seed_idx;
                 let label = crate::startup_stats::generic_signature_label(&sig);
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: generic structural bail after {run_len} consecutive \
                      identical failure signatures ({label}) on seeds {first_seed}..{last_seed}; \
                      skipping remaining {} seed(s)",
@@ -1053,7 +1068,7 @@ pub(crate) fn run_outer_with_plan(
             let probe: &mut dyn crate::estimate::outer_eval_capture::OuterSeedProbe =
                 &mut runner_probe;
             if let Err(err) = observer(probe) {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: outer-seed observer refused at seed {seed_idx} \
                      ({err}); the seed cascade proceeds unchanged"
                 );
@@ -1076,7 +1091,7 @@ pub(crate) fn run_outer_with_plan(
         // baseline before each walk.
         let curvature_entry_refused = match obj.curvature_homotopy_entry(seed) {
             Some(Ok(arrived)) => {
-                log::info!(
+                log::debug!(
                     "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} arrived={arrived}"
                 );
                 !arrived
@@ -1084,7 +1099,7 @@ pub(crate) fn run_outer_with_plan(
             Some(Err(err)) => {
                 // A hard anchor-construction failure is not a feasibility gate:
                 // fall through to the ordinary seed cascade.
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} errored ({err}); \
                      deferring to seed cascade"
                 );
@@ -1107,7 +1122,7 @@ pub(crate) fn run_outer_with_plan(
             // before any solver started). Reset to the baseline so the cascade
             // opens each seed from its own cold default, exactly as a hard
             // anchor-construction error already does above.
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: curvature-homotopy entry refused seed {seed_idx}; deferring \
                  to the seed cascade from the pristine baseline"
             );
@@ -1162,7 +1177,7 @@ pub(crate) fn run_outer_with_plan(
                     break;
                 }
                 Err((checkpoint, error)) => {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: zero-iteration seed {seed_idx} claimed acceptance but \
                          failed analytic certification: {error}"
                     );
@@ -1194,7 +1209,7 @@ pub(crate) fn run_outer_with_plan(
         if reactive_domain_entry_available {
             match obj.eval_cost(seed) {
                 Ok(cost) if cost.is_finite() => {
-                    log::debug!(
+                    log::trace!(
                         "[OUTER] {context}: exact seed {seed_idx} is inside the objective domain; \
                          reactive continuation entry not needed"
                     );
@@ -1208,7 +1223,7 @@ pub(crate) fn run_outer_with_plan(
                         // walk cannot reach a later, seed-dependent leg without
                         // clearing this one, so re-running it would reproduce the
                         // recorded verdict digit for digit.
-                        log::info!(
+                        log::debug!(
                             "[OUTER] {context}: exact seed {seed_idx} has undefined criterion, but \
                              the seed-independent cold entry leg has already refused; replaying \
                              that verdict instead of re-walking it"
@@ -1219,7 +1234,7 @@ pub(crate) fn run_outer_with_plan(
                              empty warm start, none of which depend on the seed)"
                         ));
                     } else {
-                        log::info!(
+                        log::debug!(
                             "[OUTER] {context}: exact seed {seed_idx} has undefined criterion; \
                              entering through certified heavy-smoothing continuation"
                         );
@@ -1240,7 +1255,7 @@ pub(crate) fn run_outer_with_plan(
                     }
                 }
                 Err(err) => {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: rejecting seed {seed_idx}: reactive domain-entry \
                          seed probe failed before continuation: {err}"
                     );
@@ -1360,7 +1375,7 @@ pub(crate) fn run_outer_with_plan(
                             // next attempted distance is refined. Consume the
                             // reason for diagnostics, then continue.
                             let RefinementReason::WaypointStruggled(failure) = reason;
-                            log::info!(
+                            log::debug!(
                                 "[OUTER] {context}: continuation seed {seed_idx} coupled \
                                  waypoint struggled below accepted s={s:.4} ({}); refining the \
                                  next attempted distance",
@@ -1369,7 +1384,7 @@ pub(crate) fn run_outer_with_plan(
                         }
                     }
                 }
-                log::info!(
+                log::debug!(
                     "[OUTER] {context}: continuation-path walk seed {seed_idx} legs={legs_descended} \
                      arrived={continuation_arrived} accepted_s={:.4} elapsed={:.3}s",
                     path.s(),
@@ -1383,7 +1398,7 @@ pub(crate) fn run_outer_with_plan(
                     "reactive domain entry refused before a solved exact-target waypoint"
                         .to_string()
                 });
-                log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
+                log::debug!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
                 seed_rejections.push(SeedRejection::from_message_with_producer_verdict(
                     seed_idx,
                     "domain-entry",
@@ -1396,7 +1411,7 @@ pub(crate) fn run_outer_with_plan(
             // exact criterion before any optimizer can start.
             match obj.eval_cost(seed) {
                 Ok(cost) if cost.is_finite() => {
-                    log::info!(
+                    log::debug!(
                         "[OUTER] {context}: reactive continuation seed {seed_idx} arrived with \
                          finite exact criterion {cost:.6e}"
                     );
@@ -1405,7 +1420,7 @@ pub(crate) fn run_outer_with_plan(
                     let msg = "reactive domain entry refused: exact seed criterion remained \
                                non-finite after certified continuation arrival"
                         .to_string();
-                    log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
+                    log::debug!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
                     seed_rejections.push(SeedRejection::from_message_with_producer_verdict(
                         seed_idx,
                         "domain-entry",
@@ -1439,7 +1454,7 @@ pub(crate) fn run_outer_with_plan(
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
                     Err(err) if err.is_recoverable() => {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         seed_rejections.push(SeedRejection::from_objective_error(
@@ -1460,7 +1475,7 @@ pub(crate) fn run_outer_with_plan(
                 let mut seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
                     Err(err) if err.is_recoverable() => {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         seed_rejections.push(SeedRejection::from_objective_error(
@@ -1479,7 +1494,7 @@ pub(crate) fn run_outer_with_plan(
                 };
                 if let Err(err) = validate_second_order_seed_hessian(context, layout, &seed_eval) {
                     if err.is_recoverable() {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         seed_rejections.push(SeedRejection::from_objective_error(
@@ -1514,7 +1529,7 @@ pub(crate) fn run_outer_with_plan(
                                 let err = EstimationError::RemlOptimizationFailed(format!(
                                     "outer Hessian operator materialization failed: {message}"
                                 ));
-                                log::warn!(
+                                log::debug!(
                                     "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                                 );
                                 // No producer verdict: a Hessian operator that
@@ -1531,7 +1546,7 @@ pub(crate) fn run_outer_with_plan(
                     }
                 }
                 if matches!(seed_eval.hessian, HessianValue::Operator(_)) {
-                    log::debug!(
+                    log::trace!(
                         "[OUTER] {context}: analytic Hessian provided as Hv operator; \
                         routing to opt::MatrixFreeTrustRegion (Steihaug-Toint CG)"
                     );
@@ -1583,6 +1598,9 @@ pub(crate) fn run_outer_with_plan(
                     );
                     let unprogressing_stop: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
+                    // The observer reports each ratio-test decision here, and the
+                    // bridge folds only the accepted trials into the guard (#3017).
+                    let accepted_steps: Arc<AcceptedStepLedger> = Arc::default();
                     let bridge_obj = OuterOperatorBridge {
                         obj,
                         layout,
@@ -1594,6 +1612,7 @@ pub(crate) fn run_outer_with_plan(
                         cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
                         unprogressing_stop: Arc::clone(&unprogressing_stop),
+                        accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
                     };
 
                     let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
@@ -1638,7 +1657,7 @@ pub(crate) fn run_outer_with_plan(
                     let census = Arc::new(OuterStepCensus::default());
                     solver = solver.with_observer(OuterAcceptObserver {
                         feedback: config.outer_inner_cap.clone(),
-                        accepted_steps: None,
+                        accepted_steps: Arc::clone(&accepted_steps),
                         census: Some(Arc::clone(&census)),
                     });
                     if let Some(r) = sanitized_operator_trust_restart_radius(
@@ -1651,7 +1670,7 @@ pub(crate) fn run_outer_with_plan(
                     let report = solver.run_report();
                     let mf_elapsed = mf_start.elapsed().as_secs_f64();
                     let final_radius = report.diagnostics.final_trust_radius;
-                    log::info!(
+                    log::debug!(
                         "[OUTER summary] matrix-free TR finished status={:?} in {} iters \
                          elapsed={:.3}s final_value={:.6e} final_trust_radius={} | {}",
                         report.status,
@@ -1685,7 +1704,7 @@ pub(crate) fn run_outer_with_plan(
                             Ok(result)
                         }
                         OptimizationStatus::MaxIterations => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER warning] {context}: matrix-free TR hit max_iter={} at final_value={:.6e} |g|={:.3e} final_trust_radius={}",
                                 config.max_iter,
                                 report.solution.final_value,
@@ -1701,7 +1720,7 @@ pub(crate) fn run_outer_with_plan(
                             Ok(result)
                         }
                         OptimizationStatus::TrustRegionRejectFloor => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER warning] {context}: matrix-free TR reached trust-radius reject floor at final_value={:.6e} |g|={:.3e} final_trust_radius={}",
                                 report.solution.final_value,
                                 report.solution.final_gradient_norm.unwrap_or(f64::NAN),
@@ -1740,7 +1759,7 @@ pub(crate) fn run_outer_with_plan(
                             Ok(result)
                         }
                         OptimizationStatus::CostStallFloor => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER warning] {context}: matrix-free TR stopped on a cost stall \
                                  with non-stationary projected gradient at final_value={:.6e} |g|={:.3e}",
                                 report.solution.final_value,
@@ -1868,6 +1887,9 @@ pub(crate) fn run_outer_with_plan(
 
                     let last_objective_error: Arc<Mutex<Option<ObjectiveEvalError>>> =
                         Arc::new(Mutex::new(None));
+                    // See the matrix-free route: only accepted trials reach the
+                    // guard (#3017).
+                    let accepted_steps: Arc<AcceptedStepLedger> = Arc::default();
                     let objective = RetainingObjective::new(
                         OuterSecondOrderBridge {
                         obj,
@@ -1895,6 +1917,14 @@ pub(crate) fn run_outer_with_plan(
                         // (`with_model_decrement_tolerance` above); this is the
                         // dense route's half of the same repair.
                         curvature_stationary_floor: Some(outer_rel_cost_floor(config)),
+                        accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
+                        // #2954 — and on the rung it judges on. Where the route
+                        // declares its size the certificate decides on the
+                        // Newton-decrement verdict on rounding bands, not on
+                        // `floor·(1 + |V|)`; without the config the loop kept
+                        // stopping on the older rung at points the certificate
+                        // then refused.
+                        decrement_verdict_config: Some(config),
                         },
                         Arc::clone(&last_objective_error),
                     );
@@ -1919,7 +1949,7 @@ pub(crate) fn run_outer_with_plan(
                     let arc_census = Arc::new(OuterStepCensus::default());
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
                         feedback: config.outer_inner_cap.clone(),
-                        accepted_steps: None,
+                        accepted_steps: Arc::clone(&accepted_steps),
                         census: Some(Arc::clone(&arc_census)),
                     });
                     // On the exact-Hessian ARC route, forbid `opt`'s
@@ -1934,7 +1964,7 @@ pub(crate) fn run_outer_with_plan(
                     match optimizer.run() {
                         Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e} | {}",
                                 config.max_iter,
                                 last_solution.final_value,
@@ -1995,7 +2025,7 @@ pub(crate) fn run_outer_with_plan(
                         // (#2953). `opt` hands back the iterate the run stopped at, so it is a
                         // checkpoint like a budget exit, not a failure that loses it.
                         Err(ArcError::TrustRegionRejectFloor { last_solution }) => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER warning] {context}: ARC regularization reached its ceiling \
                                  with no accepted step at final_value={:.6e} |g|={:.3e} | {}; the \
                                  iterate is kept as a checkpoint for the terminal certificate \
@@ -2193,7 +2223,7 @@ pub(crate) fn run_outer_with_plan(
                     {
                         Ok(e) => e,
                         Err(err) if err.is_recoverable() => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before device-BFGS start: {err}"
                             );
                             seed_rejections.push(SeedRejection::from_objective_error(
@@ -2261,13 +2291,13 @@ pub(crate) fn run_outer_with_plan(
                     // the device-resident branch replaces with its own
                     // device-BFGS summary log below.
                     if seed_slot == 0 {
-                        log::debug!(
+                        log::trace!(
                             "[OUTER] {context}: device-BFGS seed_slot underflow at seed {seed_idx}"
                         );
                     }
                     match device_outcome {
                         Ok(outcome) => {
-                            log::info!(
+                            log::debug!(
                                 "[OUTER summary] device-BFGS finished in {} iters \
                                  final_value={:.6e} |g|∞={:.3e} converged={}",
                                 outcome.iterations,
@@ -2290,7 +2320,7 @@ pub(crate) fn run_outer_with_plan(
                             if err.is_fatal_outer_evaluation() {
                                 return Err(err);
                             }
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER] {context}: device-BFGS failed at seed {seed_idx}: {err}; falling back to host BFGS"
                             );
                             // Fall through to the host BFGS path below by
@@ -2361,7 +2391,7 @@ pub(crate) fn run_outer_with_plan(
                     let seed_eval = match seed_eval {
                         Ok(seed_eval) => seed_eval,
                         Err(err) if err.is_recoverable() => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                             );
                             seed_rejections.push(SeedRejection::from_objective_error(
@@ -2385,7 +2415,7 @@ pub(crate) fn run_outer_with_plan(
                     ) {
                         Ok(eval) => eval,
                         Err(err) if err.is_recoverable() => {
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                             );
                             seed_rejections.push(SeedRejection::from_objective_error(
@@ -2409,7 +2439,7 @@ pub(crate) fn run_outer_with_plan(
                     // `opt::Bfgs` never re-evaluates here, so a zero gradient
                     // in this sample is a zero-iteration "convergence" at
                     // whatever rho this seed happens to be.
-                    log::info!(
+                    log::debug!(
                         "[OUTER] {context}: BFGS seed {seed_idx} (slot {seed_slot}) cost={:.6e} \
                          |g|={:.6e} rho={:?}",
                         seed_eval.cost,
@@ -2481,7 +2511,7 @@ pub(crate) fn run_outer_with_plan(
                                 cost_stall: Some(cost_stall_guard),
                                 cost_stall_bounds: Some((lo.clone(), hi.clone())),
                                 consecutive_probe_refusals: 0,
-                                accepted_steps: Some(Arc::clone(&accepted_steps)),
+                                accepted_steps: Arc::clone(&accepted_steps),
                                 pending_first_order: Vec::new(),
                                 incumbent: Some((stratum_start.clone(), stratum_eval.cost)),
                                 stratum_rank,
@@ -2578,6 +2608,13 @@ pub(crate) fn run_outer_with_plan(
                                 cap.hessian,
                                 layout.n_params,
                             )
+                                .or_else(|| {
+                                    bound_initial_curvature(
+                                        config.initial_curvature.as_ref(),
+                                        &stratum_start,
+                                        layout.n_params,
+                                    )
+                                })
                                 .and_then(|h| {
                                     match gam_linalg::utils::certified_spd_inverse(
                                         h,
@@ -2585,7 +2622,7 @@ pub(crate) fn run_outer_with_plan(
                                     ) {
                                         Ok(inverse) => Some(inverse.into_inverse()),
                                         Err(error) => {
-                                            log::info!(
+                                            log::debug!(
                                                 "[OUTER] {context}: rejected transferred BFGS metric: {error}"
                                             );
                                             None
@@ -2593,7 +2630,7 @@ pub(crate) fn run_outer_with_plan(
                                     }
                                 });
                             if let Some(h_inv) = dense_metric {
-                                log::info!(
+                                log::debug!(
                                     "[OUTER] {context}: warm-start BFGS metric = transferred \
                                      H(θ̂)⁻¹ (dim={}); quasi-Newton first step",
                                     layout.n_params,
@@ -2623,7 +2660,7 @@ pub(crate) fn run_outer_with_plan(
                         // guard is present on every BFGS seed.
                         optimizer = optimizer.with_observer(OuterAcceptObserver {
                             feedback: config.outer_inner_cap.clone(),
-                            accepted_steps: Some(Arc::clone(&accepted_steps)),
+                            accepted_steps: Arc::clone(&accepted_steps),
                             // BFGS reports no trust radius, so a region census would
                             // be a column of `None`s; its own non-convergence
                             // reporting is the line-search failure path.
@@ -2656,7 +2693,7 @@ pub(crate) fn run_outer_with_plan(
                         });
                         match crossing_eval {
                             Ok(eval) if eval.cost < final_value - resolution => {
-                                log::info!(
+                                log::debug!(
                                     "[OUTER] {context}: seed {seed_idx} crosses from kept rank \
                                      {from_rank} to {} at criterion {:.6e} -> {:.6e} (delta {:.3e}) \
                                      and restarts BFGS there (#2765)",
@@ -2671,7 +2708,7 @@ pub(crate) fn run_outer_with_plan(
                                 stratum_eval = eval;
                             }
                             Ok(eval) => {
-                                log::info!(
+                                log::debug!(
                                     "[OUTER] {context}: seed {seed_idx} stays on kept rank {from_rank}: \
                                      the refused rank-{} trial re-evaluates at {:.6e}, not below the \
                                      run's {:.6e} by more than {:.3e} (#2765)",
@@ -2683,7 +2720,7 @@ pub(crate) fn run_outer_with_plan(
                                 break (outcome, cost_stall_exit, last_objective_error);
                             }
                             Err(err) => {
-                                log::info!(
+                                log::debug!(
                                     "[OUTER] {context}: seed {seed_idx} stays on kept rank {from_rank}: \
                                      the refused rank-{} trial did not re-evaluate: {err} (#2765)",
                                     probe.rank,
@@ -2694,13 +2731,13 @@ pub(crate) fn run_outer_with_plan(
                     };
                     let bfgs_elapsed = bfgs_start.elapsed().as_secs_f64();
                     match &outcome {
-                        Ok(sol) => log::info!(
+                        Ok(sol) => log::debug!(
                             "[OUTER summary] BFGS converged in {} iters elapsed={:.3}s final_value={:.6e}",
                             sol.iterations,
                             bfgs_elapsed,
                             sol.final_value
                         ),
-                        Err(BfgsError::MaxIterationsReached { last_solution }) => log::warn!(
+                        Err(BfgsError::MaxIterationsReached { last_solution }) => log::debug!(
                             // Include `in N iters` for symmetry with the
                             // converged log line — the runner aggregator
                             // (commit afd66d6a) reads the optional iters
@@ -2717,7 +2754,7 @@ pub(crate) fn run_outer_with_plan(
                             last_solution,
                             max_attempts,
                             failure_reason,
-                        }) => log::info!(
+                        }) => log::debug!(
                             // Same rationale as the MaxIterationsReached
                             // arm: surface `in N iters` so the runner can
                             // include line-search-failed runs in the
@@ -2734,7 +2771,7 @@ pub(crate) fn run_outer_with_plan(
                             max_attempts,
                             last_solution.final_gradient_norm.unwrap_or(f64::NAN),
                         ),
-                        Err(e) => log::info!(
+                        Err(e) => log::debug!(
                             "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
                             bfgs_elapsed,
                             e
@@ -2892,7 +2929,7 @@ pub(crate) fn run_outer_with_plan(
                         Ok(result)
                     }
                     Err(FixedPointOuterRunError::SeedRejected(err)) => {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         seed_rejections.push(SeedRejection::from_objective_error(
@@ -2903,7 +2940,7 @@ pub(crate) fn run_outer_with_plan(
                         continue 'seed_attempts;
                     }
                     Err(FixedPointOuterRunError::IterationRejected(mut request)) => {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: EFS trial refused after {} finite iteration(s) \
                              at cost={:.6e}; continuing the exact incumbent with the \
                              analytic-gradient fallback: {}",
@@ -2948,7 +2985,7 @@ pub(crate) fn run_outer_with_plan(
                         Ok(result)
                     }
                     Err(FixedPointOuterRunError::SeedRejected(err)) => {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
                         );
                         seed_rejections.push(SeedRejection::from_objective_error(
@@ -2959,7 +2996,7 @@ pub(crate) fn run_outer_with_plan(
                         continue 'seed_attempts;
                     }
                     Err(FixedPointOuterRunError::IterationRejected(mut request)) => {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: HybridEFS trial refused after {} finite \
                              iteration(s) at cost={:.6e}; continuing the exact incumbent \
                              with the analytic-gradient fallback: {}",
@@ -2991,7 +3028,7 @@ pub(crate) fn run_outer_with_plan(
         let seed_elapsed = t_seed_start.elapsed().as_secs_f64();
         match result {
             Ok(candidate) => {
-                log::debug!(
+                log::trace!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  cost={:.6e}  converged={}",
                     seed_slot,
                     seed_budget,
@@ -3014,7 +3051,7 @@ pub(crate) fn run_outer_with_plan(
                         .and_then(|seed| budget_exhausted_replay_point(the_plan.solver, seed))
                         && !budget_exhausted_seed_points.contains(&point)
                     {
-                        log::info!(
+                        log::debug!(
                             "[OUTER] {context}: seed {seed_idx} exhausted its {:?} budget at                              final_value={:.6e}; recording the point so a later dispatch replays                              the outcome instead of re-deriving it (#2748)",
                             the_plan.solver,
                             candidate.final_value,
@@ -3032,7 +3069,7 @@ pub(crate) fn run_outer_with_plan(
                 ) {
                     Ok(candidate) => candidate,
                     Err((checkpoint, error)) => {
-                        log::warn!(
+                        log::debug!(
                             "[OUTER] {context}: seed {seed_idx} solver convergence claim failed \
                              analytic certification: {error}; retaining only a resume checkpoint"
                         );
@@ -3104,7 +3141,7 @@ pub(crate) fn run_outer_with_plan(
                     best = Some(candidate);
                 }
                 if ladder_reached_a_repeated_attractor {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: seed {seed_idx} exhausted its budget at exactly the                          value a previous seed already reached (bit-identical); the remaining                          seeds descend to the same attractor, so stopping the ladder here                          instead of re-deriving it up to {} more time(s)",
                         seed_budget.saturating_sub(started_seeds)
                     );
@@ -3163,7 +3200,7 @@ pub(crate) fn run_outer_with_plan(
                 if e.is_fatal_outer_evaluation() {
                     return Err(e);
                 }
-                log::debug!(
+                log::trace!(
                     "[outer-timing] seed {}/{} ({:?}): {:.3}s  FAILED: {}",
                     seed_slot,
                     seed_budget,
@@ -3222,7 +3259,7 @@ pub(crate) fn run_outer_with_plan(
                 // value is the criterion's evaluation there and beats the winner beyond
                 // the envelope, so the winner is declined on it (#2953).
                 Err(error) if error.is_trial_point_infeasible() => {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: certified winner rho={:?} cost={:.6e} sits above a stored \
                          checkpoint rho={:?} cost={:.6e} by more than the criterion's rounding envelope \
                          {:.3e}, and re-evaluating that checkpoint was refused ({error}); the winner is \
@@ -3263,7 +3300,7 @@ pub(crate) fn run_outer_with_plan(
                 ),
             },
             None => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: certified winner rho={:?} cost={:.6e} is dominated by an \
                      evaluated state rho={:?} cost={:.6e} (gap {:.3e} > the criterion's rounding \
                      envelope {:.3e}); it is not published, and the search continues from that \
@@ -3289,7 +3326,7 @@ pub(crate) fn run_outer_with_plan(
             retry_config.seed_config.seed_budget = 1;
             match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
                 Ok(PlanRunOutcome::Exhausted(retry_checkpoint)) => {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: the retry from the dominating incumbent exhausted \
                          at cost {:.6e} without certifying (#2627)",
                         retry_checkpoint.final_value,
@@ -3306,7 +3343,7 @@ pub(crate) fn run_outer_with_plan(
                     }
                 }
                 Ok(PlanRunOutcome::DominatedPlateau(retry)) => {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: the retry from the dominating incumbent ended on \
                          another dominated plateau at cost {:.6e} (#2627)",
                         retry.plateau.final_value,
@@ -3343,7 +3380,7 @@ pub(crate) fn run_outer_with_plan(
                     return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
                 }
                 Err(retry_error) => {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: the retry from the dominating incumbent failed \
                          ({retry_error}); returning the dominated plateau with the incumbent as \
                          the resume checkpoint (#2627)"
@@ -3445,7 +3482,7 @@ pub(crate) fn run_outer_with_plan(
     // this can never recurse; a failed retry falls back to the original
     // exhaustion accounting.
     if allow_tail_snap_reseed && let Some(reseed) = tail_snap_reseed_point {
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: retrying once from the confirmed-tail snapped \
              reseed {reseed} (#2348 Inc 2b)"
         );
@@ -3460,7 +3497,7 @@ pub(crate) fn run_outer_with_plan(
                 return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
             }
             Err(retry_error) => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: confirmed-tail reseed retry failed ({retry_error}); \
                      falling through to the original exhaustion accounting"
                 );
@@ -3478,7 +3515,7 @@ pub(crate) fn run_outer_with_plan(
     // so it can never recurse; a failed retry falls back to the original
     // exhaustion accounting.
     if allow_tail_snap_reseed && let Some(reseed) = saddle_escape_reseed_point {
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: retrying once from the negative-curvature saddle-escape \
              reseed {reseed} (#2357)"
         );
@@ -3493,7 +3530,7 @@ pub(crate) fn run_outer_with_plan(
                 return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
             }
             Err(retry_error) => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: saddle-escape reseed retry failed ({retry_error}); \
                      falling through to the original exhaustion accounting"
                 );
@@ -3686,13 +3723,13 @@ fn certified_resume_is_already_stationary(
     let projected = rail_projected_gradient_norm(seed, &eval.gradient, Some(bounds_template));
     let band = outer_gradient_tolerance(config).threshold(eval.cost, projected);
     if projected > band {
-        log::debug!(
+        log::trace!(
             "[OUTER] {context}: resumed terminal certificate seed {seed_idx} is not stationary \
              here (|Pg|={projected:.6e} > band {band:.6e}); running the ordinary cascade"
         );
         return None;
     }
-    log::info!(
+    log::debug!(
         "[OUTER] {context}: seed {seed_idx} is a prior fit's terminal certificate and is still \
          stationary (|Pg|={projected:.6e} <= band {band:.6e}); accepting with zero outer iterations"
     );

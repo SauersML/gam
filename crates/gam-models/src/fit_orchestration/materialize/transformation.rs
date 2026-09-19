@@ -34,7 +34,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
     }
 
     let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     let covariate_spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
@@ -46,7 +46,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
         None,
     )?;
 
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
 
     Ok(MaterializedModel {

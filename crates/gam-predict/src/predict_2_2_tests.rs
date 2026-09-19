@@ -1,7 +1,8 @@
 #![cfg(test)]
 use gam_spec::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use crate::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult, PredictUncertaintyOptions,
+    InferenceCovarianceMode, IntervalReference, MeanIntervalMethod, PredictPosteriorMeanResult,
+    PredictUncertaintyOptions,
     enrich_posterior_mean_bounds, predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, array};
@@ -56,6 +57,7 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
     enrich_posterior_mean_bounds(
         &mut beta_result,
         0.95,
+        IntervalReference::Normal,
         like(ResponseFamily::Beta { phi: 20.0 }, StandardLink::Logit),
         None,
         array![0.1, 0.1],
@@ -85,6 +87,7 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
     enrich_posterior_mean_bounds(
         &mut pois_result,
         0.95,
+        IntervalReference::Normal,
         like(ResponseFamily::Poisson, StandardLink::Log),
         None,
         array![1.0, 1.0],

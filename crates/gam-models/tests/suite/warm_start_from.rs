@@ -139,11 +139,11 @@ fn a_warm_refit_on_the_parents_inputs_resumes_its_point_with_no_outer_iteration(
         "the resume publishes the parent's certified point"
     );
     assert!(
-        warm.inference_notes
+        warm.informational_notes
             .iter()
             .any(|note| note.starts_with("warm_start_from: resumed")),
         "the model says it resumed: {:?}",
-        warm.inference_notes
+        warm.informational_notes
     );
 }
 

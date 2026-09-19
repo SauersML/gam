@@ -71,7 +71,7 @@ pub(crate) fn outer_decrement_bands(
     cost: f64,
     evidence: &CertificateEvidence,
 ) -> Result<(opt::DecrementBands, ObjectiveBand), DecrementVerdictNotTaken> {
-    let size = &config.rho_uncertainty_problem_size;
+    let size = &config.problem_size;
     let (Some(n_obs), Some(p_coefficients)) = (size.n_obs, size.p_coefficients) else {
         return Err(DecrementVerdictNotTaken::NoProblemSize);
     };
@@ -145,14 +145,14 @@ pub(crate) fn outer_decrement_bands(
 
 /// The Newton-decrement stationarity verdict at a point whose curvature is in
 /// hand, decided against the bands [`outer_decrement_bands`] forms (#2954):
-/// [`opt::newton_decrement_verdict`] certifies iff `½λ̂² + band_λ² ≤ band_f`.
+/// [`opt::newton_decrement_verdict`] certifies iff `λ̂² + band_λ² ≤ band_f`.
 ///
 /// Every gradient standard the certificate used to apply grew with `n`: the
 /// arithmetic floor `n·√ε`, the declared-scale rung `τ·(1 + n)`, the
 /// point-anchored widening `τ·(1 + |V|)`, and the curvature rung's decrement
 /// tolerance `rel_cost_floor·(1 + |V|)`. At `n = 300,000` the declared band was
-/// `6.0` and a seed certified in zero iterations. The decrement is the decrease a
-/// Newton step would still buy, in the criterion's own units, so it needs no
+/// `6.0` and a seed certified in zero iterations. The decrement bounds the decrease
+/// left to the minimum, in the criterion's own units, so it needs no
 /// scale anchor; judged at the arithmetic's resolution it is independent of
 /// `outer_tol` too.
 ///
@@ -278,7 +278,7 @@ pub(crate) struct OuterDecrementDecision {
 /// A certificate records a gradient bound beside `|Pg|`, so the verdict is
 /// rendered as the gradient norm along the measured direction at which the
 /// decrement reaches the objective band with the measured rounding held fixed:
-/// `|Pg|·√((band_f − band_λ²)/(½λ̂²))`. It clears `|Pg|` exactly when the verdict
+/// `|Pg|·√((band_f − band_λ²)/λ̂²)`. It clears `|Pg|` exactly when the verdict
 /// certifies and falls strictly below it on `DecrementAboveTolerance`. A verdict
 /// that cannot decide publishes `0`, so the point refuses unless large-step
 /// flatness removes its flat coordinates and a second verdict certifies.
@@ -291,11 +291,10 @@ pub(crate) fn decrement_stationarity_bound(
 ) -> Option<(f64, StationarityBoundSource)> {
     let along_direction = |evidence: &opt::DecrementEvidence| {
         let headroom = evidence.band_f - evidence.band_lambda_sq;
-        let half_decrement = 0.5 * evidence.lambda_sq;
         if !(headroom > 0.0) {
             0.0
-        } else if half_decrement > 0.0 {
-            projected_grad_norm * (headroom / half_decrement).sqrt()
+        } else if evidence.lambda_sq > 0.0 {
+            projected_grad_norm * (headroom / evidence.lambda_sq).sqrt()
         } else {
             projected_grad_norm
         }

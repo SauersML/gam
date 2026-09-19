@@ -36,6 +36,7 @@ fn ps_spec() -> BSplineBasisSpec {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(20),
             placement: BSplineKnotPlacement::Uniform,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },

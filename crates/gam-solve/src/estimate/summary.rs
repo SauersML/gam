@@ -56,6 +56,13 @@ pub enum SmoothPValueUnavailable {
     ///   REML-selected λ shrink every face together, and the mixture weights
     ///   move with them.
     ShapeConstrained,
+    /// A random-effect term whose variance-component score test
+    /// (`gam_terms::inference::random_effect_test`) could not be computed, with
+    /// the test's own reason.
+    RandomEffect(gam_terms::inference::random_effect_test::RandomEffectTestUnavailable),
+    /// A random-effect term the fit carries no test record for: a model saved
+    /// before the test existed, or a fit route that does not compute it.
+    RandomEffectTestNotRecorded,
 }
 
 impl SmoothPValueUnavailable {
@@ -63,6 +70,8 @@ impl SmoothPValueUnavailable {
     pub fn label(self) -> &'static str {
         match self {
             Self::ShapeConstrained => "shape_constrained",
+            Self::RandomEffect(reason) => reason.label(),
+            Self::RandomEffectTestNotRecorded => "random_effect_test_not_recorded",
         }
     }
 
@@ -73,6 +82,10 @@ impl SmoothPValueUnavailable {
                 "shape-constrained: the null f = 0 is the apex of the constraint cone, so no \
                  chi-square, spectral or chi-bar-square reference is valid for the truncated \
                  posterior mean; no p-value is reported"
+            }
+            Self::RandomEffect(reason) => reason.explanation(),
+            Self::RandomEffectTestNotRecorded => {
+                "the fit carries no variance-component test for this random effect"
             }
         }
     }
@@ -654,21 +667,32 @@ mod edf_rank_bound_label_tests {
 mod pvalue_unavailable_tests {
     use super::*;
     use crate::estimate::smooth_pvalue_unavailable;
-    use gam_terms::smooth::ShapeConstraint;
+    use gam_terms::smooth::{ShapeConstraint, ShapeSet, ShapeSpec};
 
-    /// Every shape constraint withholds the p-value with the typed reason, and
-    /// only the unconstrained smooth is testable.
+    /// Every shape request (atom, conjunction, per-margin tensor) withholds
+    /// the p-value with the typed reason, and only the unconstrained smooth is
+    /// testable.
     #[test]
     fn every_shape_constraint_withholds_the_smooth_pvalue() {
-        assert_eq!(smooth_pvalue_unavailable(ShapeConstraint::None), None);
+        assert_eq!(smooth_pvalue_unavailable(&ShapeSpec::None), None);
+        let mut conjunction = ShapeSet::single(ShapeConstraint::MonotoneIncreasing);
+        conjunction
+            .insert(ShapeConstraint::Concave)
+            .expect("increasing and concave are compatible");
+        let per_margin = ShapeSpec::PerMargin(vec![
+            ShapeSet::single(ShapeConstraint::MonotoneIncreasing),
+            ShapeSet::default(),
+        ]);
         for shape in [
-            ShapeConstraint::MonotoneIncreasing,
-            ShapeConstraint::MonotoneDecreasing,
-            ShapeConstraint::Convex,
-            ShapeConstraint::Concave,
+            ShapeConstraint::MonotoneIncreasing.into(),
+            ShapeConstraint::MonotoneDecreasing.into(),
+            ShapeConstraint::Convex.into(),
+            ShapeConstraint::Concave.into(),
+            ShapeSpec::Joint(conjunction),
+            per_margin,
         ] {
             assert_eq!(
-                smooth_pvalue_unavailable(shape),
+                smooth_pvalue_unavailable(&shape),
                 Some(SmoothPValueUnavailable::ShapeConstrained),
                 "{shape:?}"
             );

@@ -848,7 +848,7 @@ impl NutsPosterior {
         let (ll, mut grad_ll_beta) = match self.family_logp_and_grad_into(&eta, residual) {
             Ok(value) => value,
             Err(error) => {
-                log::warn!("[NUTS] likelihood target is unrepresentable: {error}");
+                log::debug!("[NUTS] likelihood target is unrepresentable: {error}");
                 grad.fill(0.0);
                 return f64::NEG_INFINITY;
             }
@@ -862,7 +862,7 @@ impl NutsPosterior {
                     grad_ll_beta += &grad_beta_firth;
                 }
                 Err(err) => {
-                    log::warn!(
+                    log::debug!(
                         "[NUTS/Firth] Jeffreys target became invalid at the current state: {}",
                         err
                     );
@@ -3137,11 +3137,21 @@ mod tests {
             lambdas: array![2.0, 0.5],
             a: 0.05,
         };
-        let cases: [(&dyn Fn(usize) -> super::BlockQuadratureMarginal, (f64, Array1<f64>), usize, [usize; 3]); 2] = [
+        let cases: [(
+            &dyn Fn(usize) -> super::BlockQuadratureMarginal,
+            (f64, Array1<f64>),
+            usize,
+            [usize; 3],
+        ); 2] = [
             (
                 &|chunk| {
-                    super::block_quadrature_marginal_correction_in_chunks(&anharmonic, &[4, 5], chunk)
-                        .expect("anharmonic rule")
+                    super::block_quadrature_marginal_correction_in_chunks(
+                        &anharmonic,
+                        &[4, 5],
+                        chunk,
+                        None,
+                    )
+                    .expect("anharmonic rule")
                 },
                 materialized_fine_rule(&anharmonic, &[4, 5]),
                 20,
@@ -3149,8 +3159,13 @@ mod tests {
             ),
             (
                 &|chunk| {
-                    super::block_quadrature_marginal_correction_in_chunks(&matvec, &[3, 4, 2], chunk)
-                        .expect("matvec rule")
+                    super::block_quadrature_marginal_correction_in_chunks(
+                        &matvec,
+                        &[3, 4, 2],
+                        chunk,
+                        None,
+                    )
+                    .expect("matvec rule")
                 },
                 materialized_fine_rule(&matvec, &[3, 4, 2]),
                 24,
@@ -3188,10 +3203,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn certified_orders_integrate_the_fine_rule_the_measured_path_does_784() {
+        // A latched admission evaluates at certified orders: the fine rule alone,
+        // carrying the admission's paired errors. Value, gradient and moments must
+        // be bit for bit the measured path's, since the paired lower rules never
+        // enter them, and the certificate must be the one handed in.
+        use gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector;
+        let target = AnharmonicBlock {
+            lambdas: array![2.0, 1.0, 0.5],
+            a: 0.05,
+        };
+        let orders = [5usize, 4, 6];
+        let corrector = super::HmcIoLaplaceMarginalCorrector;
+        let measured = corrector
+            .block_quadrature_marginal_correction(&target, &orders)
+            .expect("measured rule");
+        let admission_errors = [3.0e-9, 0.0, 7.5e-10];
+        let certified = corrector
+            .block_quadrature_marginal_correction_at_certified_orders(
+                &target,
+                &orders,
+                &admission_errors,
+            )
+            .expect("certified rule");
+        assert_eq!(certified.axis_orders, measured.axis_orders);
+        assert_eq!(certified.node_count, measured.node_count);
+        assert_bitwise_equal("value", &[certified.value], &[measured.value]);
+        assert_bitwise_equal(
+            "rho gradient",
+            certified.rho_gradient.as_slice().expect("contiguous"),
+            measured.rho_gradient.as_slice().expect("contiguous"),
+        );
+        let certified_moments = certified.moments.as_ref().expect("certified moments");
+        let measured_moments = measured.moments.as_ref().expect("measured moments");
+        for ((name, channel), (reference_name, reference)) in moment_channels(certified_moments)
+            .into_iter()
+            .zip(moment_channels(measured_moments))
+        {
+            assert_eq!(name, reference_name);
+            assert_bitwise_equal(&format!("certified {name}"), &channel, &reference);
+        }
+        assert_bitwise_equal(
+            "axis errors",
+            &certified.axis_quadrature_errors,
+            &admission_errors,
+        );
+        assert_bitwise_equal("quadrature error", &[certified.quadrature_error], &[3.0e-9]);
+        assert!(
+            corrector
+                .block_quadrature_marginal_correction_at_certified_orders(&target, &orders, &[1e-9])
+                .is_err(),
+            "a certificate must name one error per axis"
+        );
+    }
+
     /// A corrector that integrates with the standard rule and records every step the
     /// order search publishes.
     struct RecordingCorrector {
-        steps: std::sync::Mutex<Vec<gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep>>,
+        steps:
+            std::sync::Mutex<Vec<gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep>>,
     }
     impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector for RecordingCorrector {
         fn directional_cubic_diagnostic(
@@ -3216,8 +3287,8 @@ mod tests {
         ) {
             self.steps.lock().expect("step record").push(step.clone());
         }
-        fn max_representable_order(&self) -> usize {
-            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+        fn is_representable_order(&self, order: usize) -> bool {
+            gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
         }
     }
 
@@ -3268,12 +3339,14 @@ mod tests {
     struct ScriptedCorrector {
         script: Vec<f64>,
         requests: std::sync::Mutex<Vec<Vec<usize>>>,
+        representability_queries: std::sync::Mutex<Vec<usize>>,
     }
     impl ScriptedCorrector {
         fn new(script: Vec<f64>) -> Self {
             Self {
                 script,
                 requests: std::sync::Mutex::new(Vec::new()),
+                representability_queries: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn requests(self) -> Vec<Vec<usize>> {
@@ -3338,8 +3411,12 @@ mod tests {
         ) {
             assert_eq!(step.axis_orders.len(), 1, "the scripted corrector is one-axis");
         }
-        fn max_representable_order(&self) -> usize {
-            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+        fn is_representable_order(&self, order: usize) -> bool {
+            self.representability_queries
+                .lock()
+                .expect("query record")
+                .push(order);
+            gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
         }
     }
 
@@ -3495,6 +3572,30 @@ mod tests {
             ),
             "typed refusal at order {max_order} expected, got {refusal}"
         );
+    }
+
+    #[test]
+    fn the_order_search_asks_representability_only_of_the_orders_it_raises_to_784() {
+        // A search that resolves at order 6 raises 4 → 5 → 6, so it asks the rule builder
+        // about orders 5 and 6 alone. Taking the ceiling from a scan of every order up to it
+        // built a few hundred rules, most of a second, on the first non-Gaussian fit of
+        // every process.
+        let target = AnharmonicBlock {
+            lambdas: array![2.0],
+            a: 0.05,
+        };
+        let corrector = ScriptedCorrector::new(vec![1e-2, 1e-4, 1e-7]);
+        let marginal = gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
+            &corrector, &target, 1e-6,
+        )
+        .expect("a fast-contracting axis resolves");
+        assert_eq!(marginal.axis_orders, vec![6]);
+        let queries = corrector
+            .representability_queries
+            .lock()
+            .expect("query record")
+            .clone();
+        assert_eq!(queries, vec![5, 6], "representability queries {queries:?}");
     }
 
     #[test]
@@ -5064,7 +5165,7 @@ pub(crate) fn run_nuts_sampling(
         "NUTS sampling failed",
         Array1::zeros(dim),
     )?;
-    log::info!("NUTS sampling complete: {}", run_stats);
+    log::debug!("NUTS sampling complete: {}", run_stats);
 
     Ok(result)
 }
@@ -5336,7 +5437,7 @@ where
         "rho-posterior NUTS sampling failed",
         mode.clone(),
     )?;
-    log::info!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
+    log::debug!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
     Ok(result)
 }
 
@@ -5726,6 +5827,9 @@ pub fn run_nuts_sampling_flattened_family(
         ),        (ResponseFamily::StudentT { .. }, _, FamilyNutsInputs::Glm(_)) => Err(
             "NUTS sampling is not implemented for the Student-t response family".to_string(),
         ),
+        (ResponseFamily::InverseGaussian, _, FamilyNutsInputs::Glm(_)) => {
+            Err("NUTS sampling is not implemented for the inverse-Gaussian family".to_string())
+        }
     }
 }
 
@@ -6259,18 +6363,33 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         block_quadrature_marginal_correction(target, axis_orders)
     }
 
+    /// The fine rule alone: the admission's paired errors are the certificate.
+    fn block_quadrature_marginal_correction_at_certified_orders(
+        &self,
+        target: &dyn BlockExcessTarget,
+        axis_orders: &[usize],
+        certified_axis_errors: &[f64],
+    ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
+        block_quadrature_marginal_correction_in_chunks(
+            target,
+            axis_orders,
+            usize::MAX,
+            Some(certified_axis_errors),
+        )
+    }
+
     fn publish_order_search_step(
         &self,
         step: &gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep,
     ) {
-        log::info!("[#784] block quadrature order search: {step}");
+        log::debug!("[#784] block quadrature order search: {step}");
     }
 
-    /// `block_quadrature_marginal_correction` refuses the order past this one as
+    /// `block_quadrature_marginal_correction` refuses an order this rejects as
     /// [`BlockQuadratureRefusal::UnrepresentableOrder`], or as an integration refusal when the
     /// rule cannot be built, because it integrates with the same rule builder.
-    fn max_representable_order(&self) -> usize {
-        gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+    fn is_representable_order(&self, order: usize) -> bool {
+        gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
     }
 }
 
@@ -6439,17 +6558,22 @@ pub fn block_quadrature_marginal_correction<T: BlockExcessTarget + ?Sized>(
     target: &T,
     axis_orders: &[usize],
 ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
-    block_quadrature_marginal_correction_in_chunks(target, axis_orders, usize::MAX)
+    block_quadrature_marginal_correction_in_chunks(target, axis_orders, usize::MAX, None)
 }
 
 /// [`block_quadrature_marginal_correction`] with at most `chunk_limit` nodes per
 /// target batch. The accumulators run node by node in the rule's order whatever the
 /// chunk, so the limit decides only how much of the rule is live at once. Production
 /// passes `usize::MAX` and lets the memory governor decide.
+///
+/// `certified_axis_errors` is `None` to measure each axis's paired-rule error, or the
+/// errors an admission already certified at these orders: the fine rule is then the
+/// only rule built and integrated, and those errors are returned as its certificate.
 fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
     target: &T,
     axis_orders: &[usize],
     chunk_limit: usize,
+    certified_axis_errors: Option<&[f64]>,
 ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
     use BlockQuadratureRefusal::Integration;
     let m = target.block_dim();
@@ -6472,6 +6596,15 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
             reservation_bytes: 0,
             moments: None,
         });
+    }
+    if let Some(errors) = certified_axis_errors
+        && errors.len() != m
+    {
+        return Err(Integration(format!(
+            "block_quadrature_marginal_correction: {} certified axis errors for a {m}-direction \
+             block",
+            errors.len()
+        )));
     }
     let lambdas = target.block_curvatures();
     if lambdas.len() != m {
@@ -6511,8 +6644,12 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
         log_rules.push(log_weight_gh_rule(rule));
     }
     // Each axis's lower rules for its paired difference: one order lower, then two.
+    // Certified orders need none.
     let mut lower_rules: Vec<Vec<(usize, Vec<(f64, f64)>)>> = Vec::with_capacity(m);
-    for &order in axis_orders {
+    for &order in axis_orders
+        .iter()
+        .filter(|_| certified_axis_errors.is_none())
+    {
         let mut lower = Vec::new();
         for lower_order in (order.saturating_sub(2).max(1)..order).rev() {
             let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(lower_order)
@@ -6711,7 +6848,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     // while the same-parity rule two orders lower tracks each sequence. Each
     // difference is in the same log-marginal units as Δ_b and is deterministic
     // across rho. An axis at order one has no lower rule, so nothing certifies it.
-    let mut axis_quadrature_errors = Vec::with_capacity(m);
+    let mut axis_quadrature_errors =
+        certified_axis_errors.map_or_else(|| Vec::with_capacity(m), <[f64]>::to_vec);
     for (axis, lower) in lower_rules.iter().enumerate() {
         let order = axis_orders[axis];
         if order < 2 {
@@ -6948,7 +7086,7 @@ mod survival_hmc {
             match self.compute_logp_and_grad_into(position, grad) {
                 Ok(logp) => logp,
                 Err(e) => {
-                    log::warn!("Survival posterior evaluation failed: {}", e);
+                    log::debug!("Survival posterior evaluation failed: {}", e);
                     grad.fill(0.0);
                     f64::NEG_INFINITY
                 }
@@ -7022,7 +7160,7 @@ mod survival_hmc {
             Array1::zeros(dim),
         )?;
 
-        log::info!("Survival NUTS sampling complete: {}", run_stats);
+        log::debug!("Survival NUTS sampling complete: {}", run_stats);
 
         Ok(result)
     }

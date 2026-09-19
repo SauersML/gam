@@ -17,7 +17,7 @@ struct OuterLifecycleLogger;
 
 impl log::Log for OuterLifecycleLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -35,7 +35,7 @@ static INIT_OUTER_LIFECYCLE_LOGGER: Once = Once::new();
 fn init_outer_lifecycle_logger() {
     INIT_OUTER_LIFECYCLE_LOGGER.call_once(|| {
         if log::set_logger(&OUTER_LIFECYCLE_LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
 }

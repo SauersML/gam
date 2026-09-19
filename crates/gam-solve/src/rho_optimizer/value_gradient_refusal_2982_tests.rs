@@ -49,7 +49,7 @@ fn refused_value_gradient_evaluation_names_its_reason_2982() {
         log::set_logger(&PLANTED_REASON_LOGGER).is_ok(),
         "another `log` backend owns this process, so the bridge's own record cannot be read here"
     );
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Debug);
 
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
     let mut obj = problem.build_objective_with_eval_order(
@@ -80,7 +80,7 @@ fn refused_value_gradient_evaluation_names_its_reason_2982() {
         cost_stall: None,
         cost_stall_bounds: None,
         consecutive_probe_refusals: 0,
-        accepted_steps: None,
+        accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: None,
         stratum_rank: None,

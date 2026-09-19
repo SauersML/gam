@@ -9,7 +9,6 @@ those FFI payloads.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -616,14 +615,6 @@ class SurvivalPrediction:
         return float("nan") if c_index is None else float(c_index)
 
 
-def ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, list[float]]:
-    columns_json = json.dumps(columns, separators=(",", ":"))
-    ordered: dict[str, list[float]] = json.loads(
-        rust_module().ordered_prediction_columns(columns_json)
-    )
-    return ordered
-
-
 def numeric_matrix(values: Any, label: str) -> Any:
     return rust_module().numeric_matrix_validate(values, label)
 
@@ -637,24 +628,28 @@ def extract_row_ids(
 
 
 def survival_prediction_from_ffi_payload(
-    raw: str,
+    payload: dict[str, Any],
     *,
     id_column: str | None = None,
     row_ids: Sequence[str] | None = None,
 ) -> SurvivalPrediction:
-    payload = rust_module().survival_prediction_payload_from_json(raw)
+    """Build a :class:`SurvivalPrediction` from the decoded Rust FFI payload.
+
+    ``predict_table`` already decoded the payload into arrays; its ``class``
+    discriminator routed it here and is not a prediction field.
+    """
+    fields = {key: value for key, value in payload.items() if key != "class"}
     return SurvivalPrediction(
-        **payload,
+        **fields,
         id_column=id_column,
         row_ids=row_ids,
     )
 
 
 def competing_risks_prediction_from_ffi_payload(
-    raw: str,
+    parsed: dict[str, Any],
 ) -> CompetingRisksPrediction:
-    """Build a :class:`CompetingRisksPrediction` from the Rust FFI payload."""
-    parsed = rust_module().competing_risks_prediction_payload_from_json(raw)
+    """Build a :class:`CompetingRisksPrediction` from the decoded Rust FFI payload."""
     return CompetingRisksPrediction(
         model_class=parsed["model_class"],
         likelihood_mode=parsed["likelihood_mode"],
@@ -690,11 +685,11 @@ def competing_risks_prediction_from_ffi_payload(
     )
 
 
-def term_blocks_for_model(model_bytes: bytes) -> tuple[TermBlock, ...]:
-    """Return per-term coefficient column ranges for a saved model."""
+def term_blocks_for_model(model: Any) -> tuple[TermBlock, ...]:
+    """Return per-term coefficient column ranges for a compiled fitted model."""
     return tuple(
         TermBlock(name=str(name), kind=str(kind), start=int(start), end=int(end))
-        for name, kind, start, end in rust_module().term_blocks_for_model(model_bytes)
+        for name, kind, start, end in rust_module().term_blocks_for_model(model)
     )
 
 
@@ -710,6 +705,5 @@ __all__ = [
     "competing_risks_prediction_from_ffi_payload",
     "extract_row_ids",
     "numeric_matrix",
-    "ordered_prediction_columns",
     "survival_prediction_from_ffi_payload",
 ]

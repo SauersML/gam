@@ -317,7 +317,7 @@ impl SurvivalMarginalSlopeFamily {
             if let Err(reason) =
                 design.try_to_dense_arc("survival marginal-slope row-kernel design memo")
             {
-                log::warn!(
+                log::debug!(
                     "[survival-marginal-slope] {label} design stays streamed ({}x{}), so every \
                      row-kernel pass reads it one row at a time through its operator: {reason}",
                     design.nrows(),

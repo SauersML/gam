@@ -123,8 +123,11 @@ mod tests {
         let flags: BTreeSet<&str> = help
             .split_whitespace()
             .filter(|token| token.starts_with("--"))
+            // clap renders a counted flag (`-v`, `-vv`) as `--verbose...`; the
+            // trailing ellipsis is its multiplicity marker, not part of the name.
+            .map(|token| token.trim_end_matches("..."))
             .collect();
-        let expected: BTreeSet<&str> = ["--request", "--tensor", "--out", "--log-level", "--help"]
+        let expected: BTreeSet<&str> = ["--request", "--tensor", "--out", "--verbose", "--help"]
             .into_iter()
             .collect();
         assert_eq!(

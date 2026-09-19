@@ -151,9 +151,6 @@ pub(crate) fn run_fit_multinomial(
     // honored by the shared driver; offsets and the other config fields the
     // softmax family cannot consume are rejected with a typed error inside
     // `fit_penalized_multinomial_formula`, shared with the Python surface.
-    if fit_config.expectile_tau.is_some() {
-        return Err("--expectile-tau requires --family expectile".to_string());
-    }
     let Some(out) = args.out.as_ref() else {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),
@@ -175,14 +172,14 @@ pub(crate) fn run_fit_multinomial(
     require_dataset_rows("fit", &args.data, ds.values.nrows())?;
 
     let phase_start = std::time::Instant::now();
-    log::info!("[PHASE] multinomial fit start n={}", ds.values.nrows());
+    log::debug!("[PHASE] multinomial fit start n={}", ds.values.nrows());
     let saved = fit_penalized_multinomial_formula(&MultinomialFitRequest::new(
         &ds,
         formula_text,
         fit_config,
     ))
     .map_err(|e| format!("multinomial fit failed: {e}"))?;
-    log::info!(
+    log::debug!(
         "[PHASE] multinomial fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );

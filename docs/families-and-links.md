@@ -1,7 +1,8 @@
 # Families and link functions
 
 `gamfit` supports Gaussian, binomial, Poisson, negative-binomial, beta,
-Gamma, Tweedie, multinomial-logit, and Royston-Parmar likelihoods, plus
+Gamma, inverse Gaussian, Tweedie, multinomial-logit, and Royston-Parmar
+likelihoods, plus
 survival ([survival.md](survival.md)), conditional transformation-normal,
 location-scale / dispersion ([location-scale.md](location-scale.md)) and
 marginal-slope families. The family is inferred from the response unless
@@ -26,13 +27,20 @@ count; the `>= 2` requirement is what separates counts from a binary column.)
 > signature and therefore auto-routes to Poisson/log. If you want it treated as
 > a continuous/Gaussian response, pass `family="gaussian"` explicitly.
 
-When `link="log"` is pinned *without* a `family=`, Poisson vs Gamma is chosen
-automatically by whether the response is integer-valued — `family=` is optional:
+A link that several families admit does not choose the family. `log` is legal for
+Poisson, Tweedie, negative binomial, Gamma and inverse Gaussian, and `inverse` for
+Gaussian and Gamma. Pinning either link without a `family=` is an error that lists
+those families. A variance function is a modelling choice, so gamfit does not read
+it off whether `y` happens to be integer-valued:
 
 ```python
 gamfit.fit(df, "count ~ s(x)")                 # integer counts -> Poisson/log (auto)
-gamfit.fit(df, "count ~ s(x)", link="log")     # log pinned: Poisson (integer) / Gamma (else)
 gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
+gamfit.fit(df, "prop ~ s(x)", family="gamma", link="log")     # explicit
+try:
+    gamfit.fit(df, "prop ~ s(x)", link="log")
+except gamfit.errors.GamError as err:          # name one with family=
+    print(err)
 ```
 
 ## Setting family and link
@@ -40,7 +48,8 @@ gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
 The `family=` kwarg accepts `"gaussian"`, `"binomial"` (aliases
 `"binomial-logit"`, `"binomial-probit"`, `"binomial-cloglog"`),
 `"latent-cloglog-binomial"`, `"poisson"`, `"negative-binomial"`,
-`"beta"`, `"gamma"`, `"tweedie"`, `"royston-parmar"`,
+`"beta"`, `"gamma"`, `"inverse-gaussian"`, `"tweedie"`, `"student-t"` (see
+[Student-t](#student-t)), `"royston-parmar"`,
 `"expectile"` (see [Expectile regression](#expectile-regression)), and
 `"multinomial"` / `"softmax"`. Omitting
 `family=` triggers auto-detection. Survival, transformation-normal,
@@ -67,22 +76,25 @@ Inverse link `eta`. Default for continuous Gaussian responses.
 
 ### `logit`
 
-Inverse link `1 / (1 + exp(-eta))`. Default for binary `{0, 1}` responses.
+Inverse link `1 / (1 + exp(-eta))` (alias `binomial-logit`). Default for
+binary `{0, 1}` responses.
 
 ### `probit`
 
-Inverse link `Phi(eta)`, the standard normal CDF. Required for the
-Bernoulli marginal-slope family (see [marginal-slope.md](marginal-slope.md)).
+Inverse link `Phi(eta)` (alias `binomial-probit`), the standard normal CDF.
+Required for the Bernoulli marginal-slope family (see
+[marginal-slope.md](marginal-slope.md)).
 
 ### `cloglog`
 
-Inverse link `1 - exp(-exp(eta))`. Used for grouped discrete-time hazards
-and rare-event Bernoulli data.
+Inverse link `1 - exp(-exp(eta))` (alias `binomial-cloglog`). Used for
+grouped discrete-time hazards and rare-event Bernoulli data.
 
 ### `log`
 
 Inverse link `exp(eta)`. Pair with `family="poisson"` for counts and
-`family="gamma"` for positive continuous responses.
+`family="gamma"` or `family="inverse-gaussian"` for positive continuous
+responses.
 
 ```python
 gamfit.fit(df, "count ~ s(time)",
@@ -90,6 +102,69 @@ gamfit.fit(df, "count ~ s(time)",
 ```
 
 Pass the offset column via `offset=`; do not include it on the formula RHS.
+
+### `inverse`
+
+Inverse link `1 / eta` (alias `1/mu`), canonical for the Gamma family and
+also legal for the Gaussian family. The mean is only defined on `eta > 0`.
+There is no hand-supplied bound: an inner Newton/PIRLS step or an outer
+trial point that would put any weighted row at `eta <= 0` is reported as an
+inverse-link domain violation, and the step is halved until every row is
+feasible again (the same retriable refusal every bounded link uses). A fit
+therefore only ever certifies at a mean that is positive at every observed
+row. Prediction away from the data can still produce `eta <= 0`; such points
+have no mean under this link and are refused rather than clipped.
+
+```python
+gamfit.fit(df, "y ~ s(x)", family="gamma", link="inverse")
+```
+
+### `inverse-squared`
+
+Inverse link `eta^(-1/2)` (`eta = 1 / mu^2`, aliases `inv-squared` and
+`1/mu^2`), canonical for the inverse Gaussian family and legal only there.
+The `eta > 0` domain is handled exactly as for `inverse`.
+
+### Link legality
+
+Each family admits a fixed set of links. An illegal pairing is refused with
+the family's legal links spelled out, generated from the same table the
+engine checks, e.g.
+
+```
+illegal likelihood cell: response `gamma` does not admit inverse link `identity`;
+legal links for `gamma`: log|inverse
+```
+
+| family | legal links |
+| --- | --- |
+| gaussian | identity, inverse |
+| gamma | log, inverse |
+| inverse-gaussian | log, inverse-squared |
+| poisson, negative-binomial, tweedie | log |
+
+An unknown link name is refused with the whole vocabulary. Link names are
+case-insensitive and `_` is read as `-`, so `inverse_squared` and
+`Inverse-Squared` are the same link.
+
+### Inverse Gaussian
+
+`family="inverse-gaussian"` fits `y > 0` with `Var(y) = phi * mu^3`, using
+its canonical `inverse-squared` link by default or `link="log"`. `phi` is
+the dispersion itself, not its square root. It is estimated exactly like the
+Gaussian non-identity-link dispersion: the maximum-likelihood value
+`sum(w (y - mu)^2 / (y mu^2)) / sum(w)` at the converged mean, refreshed until
+it is stationary and then held while REML/LAML selects the smoothing
+parameters. Responses must be strictly positive; a
+zero or negative weighted response is refused with its row. `predict`
+returns the posterior mean of `mu` (the expectation of the inverse link under the
+Gaussian posterior of `eta`, not the plug-in `mu(eta_hat)`), and prediction intervals use the
+inverse Gaussian law with the estimated `phi`.
+
+```python
+gamfit.fit(df, "y ~ s(x)", family="inverse-gaussian")              # 1/mu^2
+gamfit.fit(df, "y ~ s(x)", family="inverse-gaussian", link="log")
+```
 
 ### Dispersion families
 
@@ -106,6 +181,27 @@ gamfit.fit(df, "claim ~ te(age, year)", family="tweedie(p=1.5)", link="log")
 
 `negative_binomial_theta` / `--negative-binomial-theta` fixes the
 negative-binomial size parameter when a constant-size model is desired.
+
+### Student-t
+
+`family="student-t"` (aliases `"student_t"`, `"t"`) is a heavy-tailed
+alternative to the Gaussian for a continuous response with outliers. The
+link is the identity. The scale `σ` and the degrees of freedom `ν` are
+estimated by LAML jointly with the smoothing parameters. The fitted model
+reports them as `model.student_t_sigma` and `model.student_t_nu`, which are
+`None` for any other family.
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+y = np.sin(2 * np.pi * x) + rng.standard_t(3, x.size) * 0.3
+model = gamfit.fit(pd.DataFrame({"x": x, "y": y}), "y ~ s(x)", family="student-t")
+print(model.student_t_sigma, model.student_t_nu)
+```
 
 ### Multinomial
 
@@ -184,6 +280,21 @@ cross.
 Sinh-arcsinh inverse link with learned skewness (`epsilon`) and
 tail-weight (`delta`) parameters. Cannot be combined with `linkwiggle(...)`
 or with blended/mixture links.
+
+At `epsilon = 0`, `delta = 1` the SAS link is the probit, not the logit.
+`epsilon` and `delta` describe the link's tails, so they are identified only
+when the fitted means reach those tails. When every mean stays near 1/2, as in
+`tests/sas_link_logistic_data_regression_test.py`, where the means lie within
+about [0.27, 0.73], the two shape parameters are weakly identified. The
+REML/LAML path then tends to drift toward small `delta`. On many such draws it
+converges and the fitted mean is as accurate as the `logit` fit's. On others it
+reaches an inner-mode fold, a point where the penalized likelihood's softest
+curvature vanishes and past which there is no inner mode. There the Laplace
+normalizer breaks down, and the fit is refused with "did not certify a
+stationary optimum" or "all 1 seed candidates failed" rather than returned
+uncertified. If the data do not reach the tails, use `logit` or `probit`, or
+`beta-logistic` (whose shape parameters leave logit's location and scale
+fixed).
 
 ### `beta-logistic`
 

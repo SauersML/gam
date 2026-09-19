@@ -92,7 +92,7 @@ pub(crate) use super::*;
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
-    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
+    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, unit_measure_deviance_and_log_kernel_from_eta, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
     use crate::estimate::EstimationError;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use approx::assert_relative_eq;
@@ -148,7 +148,7 @@ mod tests {
         Ok((
             op.pirls_hat_diag(),
             op.jeffreys_logdet(),
-            op.pirls_firth_score_shift(),
+            op.pirls_jeffreys_eta_score(),
         ))
     }
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
@@ -157,15 +157,9 @@ mod tests {
     pub(crate) fn dense_workspace_xtwx_preserves_signed_observed_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [-2.0, 4.0], [0.5, -3.0]];
         let weights = array![2.0, -1.5, 0.25, -3.0];
-        let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols());
         let mut streamed = Array2::<f64>::zeros((x.ncols(), x.ncols()).f());
 
-        PirlsWorkspace::add_dense_xtwx_signed(
-            &weights,
-            &mut workspace.weighted_x_chunk,
-            &x,
-            &mut streamed,
-        );
+        PirlsWorkspace::add_dense_xtwx_signed(&weights, &x, &mut streamed);
 
         let wx = Array2::from_shape_fn(x.raw_dim(), |(i, j)| weights[i] * x[[i, j]]);
         let expected = x.t().dot(&wx);
@@ -226,7 +220,7 @@ mod tests {
         );
 
         for link in [&cloglog, &mixture] {
-            let (hat, logdet, shift) = compute_jeffreys_pirls_diagnostics(
+            let (hat, logdet, score) = compute_jeffreys_pirls_diagnostics(
                 link,
                 x.view(),
                 eta.view(),
@@ -234,7 +228,7 @@ mod tests {
             )
             .expect("supported Firth inverse link");
             assert_eq!(hat.len(), x.nrows());
-            assert_eq!(shift.len(), x.nrows());
+            assert_eq!(score.len(), x.nrows());
             assert!(
                 logdet.is_finite(),
                 "Jeffreys logdet must stay finite for {link:?}"
@@ -244,8 +238,8 @@ mod tests {
                 "hat diagonal must stay finite and non-negative for {link:?}: {hat:?}"
             );
             assert!(
-                shift.iter().all(|value| value.is_finite()),
-                "Firth score shift must stay finite for {link:?}: {shift:?}"
+                score.iter().all(|value| value.is_finite()),
+                "Jeffreys eta-score must stay finite for {link:?}: {score:?}"
             );
         }
     }
@@ -302,16 +296,16 @@ mod tests {
                     .expect("factored weighted operator");
                 let hat_f = op_f.pirls_hat_diag();
                 let logdet_f = op_f.jeffreys_logdet();
-                let shift_f = op_f.pirls_firth_score_shift();
-                let (hat_o, logdet_o, shift_o) =
+                let score_f = op_f.pirls_jeffreys_eta_score();
+                let (hat_o, logdet_o, score_o) =
                     compute_jeffreys_pirls_diagnostics(link, x.view(), eta.view(), weights.view())
                         .expect("oracle weighted diagnostics");
                 assert_relative_eq!(logdet_f, logdet_o, epsilon = 1e-12, max_relative = 1e-12);
                 for i in 0..x.nrows() {
                     assert_relative_eq!(hat_f[i], hat_o[i], epsilon = 1e-12, max_relative = 1e-12);
                     assert_relative_eq!(
-                        shift_f[i],
-                        shift_o[i],
+                        score_f[i],
+                        score_o[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );
@@ -323,7 +317,7 @@ mod tests {
                     .expect("factored unweighted operator");
                 let hat_fu = op_fu.pirls_hat_diag();
                 let logdet_fu = op_fu.jeffreys_logdet();
-                let shift_fu = op_fu.pirls_firth_score_shift();
+                let score_fu = op_fu.pirls_jeffreys_eta_score();
                 let op_u = FirthDenseOperator::build_for_link(link, &x, eta)
                     .expect("full unweighted operator");
                 assert_relative_eq!(
@@ -333,7 +327,7 @@ mod tests {
                     max_relative = 1e-12
                 );
                 let hat_ou = op_u.pirls_hat_diag();
-                let shift_ou = op_u.pirls_firth_score_shift();
+                let score_ou = op_u.pirls_jeffreys_eta_score();
                 for i in 0..x.nrows() {
                     assert_relative_eq!(
                         hat_fu[i],
@@ -342,8 +336,8 @@ mod tests {
                         max_relative = 1e-12
                     );
                     assert_relative_eq!(
-                        shift_fu[i],
-                        shift_ou[i],
+                        score_fu[i],
+                        score_ou[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );
@@ -375,6 +369,9 @@ mod tests {
             | LinkFunction::Sas
             | LinkFunction::BetaLogistic
             | LinkFunction::Log => 1.0,
+            LinkFunction::Inverse | LinkFunction::InverseSquared => {
+                panic!("calculate_scale has no residual scale for the reciprocal links")
+            }
             LinkFunction::Identity => {
                 let mut fitted = x.dot(beta);
                 fitted += &offset;
@@ -1236,8 +1233,8 @@ mod tests {
             .map(|root| {
                 let rank = root.nrows();
                 CanonicalPenalty {
-                    local: root.t().dot(&root),
-                    root,
+                    local: root.t().dot(&root).into_shared(),
+                    root: root.into_shared(),
                     col_range: 0..p,
                     total_dim: p,
                     nullity: p - rank,
@@ -1299,7 +1296,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p,
                 coefficient_lower_bounds: None,
@@ -1320,7 +1316,7 @@ mod tests {
     #[test]
     pub(crate) fn sparse_native_reparam_preserves_declared_penalty() {
         use gam_terms::construction::{
-            CanonicalPenalty, EngineDims, stable_reparameterization_engine_canonical,
+            CanonicalPenalty, EngineDims, stable_reparameterization_original_frame,
         };
         use ndarray::array;
 
@@ -1328,16 +1324,13 @@ mod tests {
         let root = array![[1.0, 0.0]];
         let canonical = vec![CanonicalPenalty::from_dense_root(root, p)];
         let lambdas = [3.0f64];
-        let base = stable_reparameterization_engine_canonical(
+        let result = stable_reparameterization_original_frame(
             &canonical,
             &lambdas,
             EngineDims::new(p, canonical.len()),
             None,
         )
         .expect("declared penalty must reparameterize");
-        let result = super::loop_driver::build_sparse_native_reparam_result(
-            base, &canonical, &lambdas, p,
-        );
 
         let gram = result.e_transformed.t().dot(&result.e_transformed);
         for (actual, expected) in gram.iter().zip(result.s_transformed.iter()) {
@@ -1400,11 +1393,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -1437,7 +1430,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -1538,11 +1530,11 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let r = array![[1.0]];
         let canonical = vec![gam_terms::construction::CanonicalPenalty {
-            root: r.clone(),
+            root: r.clone().into_shared(),
             col_range: 0..r.ncols(),
             total_dim: r.ncols(),
             nullity: 0,
-            local: r.t().dot(&r),
+            local: r.t().dot(&r).into_shared(),
             prior_mean: Array1::zeros(r.ncols()),
             positive_eigenvalues: Vec::new(),
             op: None,
@@ -1577,7 +1569,6 @@ mod tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 1,
                     coefficient_lower_bounds: None,
@@ -2262,6 +2253,74 @@ mod tests {
         assert_eq!(data_kernel, -0.5 * raw_weighted_rss / phi);
     }
 
+    #[test]
+    fn unit_measure_single_pass_objective_is_bit_identical_to_the_two_pass_objective() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(2_026_091_9);
+        let n = 4096usize;
+        let eta = Array1::from_iter((0..n).map(|_| -6.0 + 8.0 * rng.random::<f64>()));
+        let bernoulli_y = eta.mapv(|e| {
+            let p = 1.0 / (1.0 + (-e).exp());
+            if rng.random::<f64>() < p { 1.0 } else { 0.0 }
+        });
+        let bernoulli_w = Array1::from_iter((0..n).map(|i| if i % 97 == 0 { 0.0 } else { 1.0 }));
+        let trials = Array1::from_iter((0..n).map(|i| (1 + i % 9) as f64));
+        let trials_y = Array1::from_iter(
+            (0..n).map(|i| (rng.random::<f64>() * (trials[i] + 1.0)).floor().min(trials[i]) / trials[i]),
+        );
+        let poisson_eta = eta.mapv(|e| 0.25 * e);
+        let poisson_y = poisson_eta.mapv(|e| (rng.random::<f64>() * 2.0 * e.exp()).floor());
+        let poisson_w = Array1::from_iter((0..n).map(|_| 0.5 + rng.random::<f64>()));
+
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        let log = InverseLink::Standard(StandardLink::Log);
+        let binomial = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            logit.clone(),
+        ));
+        let poisson = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            log.clone(),
+        ));
+        let cases = [
+            ("bernoulli", &binomial, &logit, &bernoulli_y, &eta, &bernoulli_w),
+            ("binomial trials", &binomial, &logit, &trials_y, &eta, &trials),
+            ("poisson", &poisson, &log, &poisson_y, &poisson_eta, &poisson_w),
+        ];
+        for (label, likelihood, link, y, eta, w) in cases {
+            let deviance =
+                calculate_deviance_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("two-pass deviance");
+            let log_kernel =
+                pirls_data_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view(), deviance)
+                    .expect("two-pass data log-kernel");
+            let (fused_deviance, fused_log_kernel) =
+                unit_measure_deviance_and_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("single-pass objective")
+                    .expect("unit-measure family takes the single pass");
+            assert_eq!(fused_deviance.to_bits(), deviance.to_bits(), "{label} deviance");
+            assert_eq!(fused_log_kernel.to_bits(), log_kernel.to_bits(), "{label} log-kernel");
+        }
+
+        let profiled_gaussian = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ));
+        assert!(
+            unit_measure_deviance_and_log_kernel_from_eta(
+                poisson_y.view(),
+                &poisson_eta,
+                &profiled_gaussian,
+                &profiled_gaussian.spec.link,
+                poisson_w.view(),
+            )
+            .expect("profiled Gaussian is declined, not rejected")
+            .is_none()
+        );
+    }
+
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must
     /// report the conventional **unscaled** deviance `D = 2·Σ wᵢ·d(yᵢ, μᵢ)` —
     /// exactly like Poisson/Binomial/NB/Beta and R/mgcv/statsmodels — and must
@@ -2593,11 +2652,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2630,7 +2689,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -2671,11 +2729,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2708,7 +2766,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -4193,11 +4250,11 @@ mod root_cause_tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -4231,7 +4288,6 @@ mod root_cause_tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 2,
                     coefficient_lower_bounds: None,
@@ -4296,11 +4352,11 @@ mod root_cause_tests {
                 .map(|r| {
                     let local = r.t().dot(r);
                     gam_terms::construction::CanonicalPenalty {
-                        root: r.clone(),
+                        root: r.clone().into_shared(),
                         col_range: 0..r.ncols(),
                         total_dim: r.ncols(),
                         nullity: 0,
-                        local,
+                        local: local.into_shared(),
                         prior_mean: Array1::zeros(r.ncols()),
                         positive_eigenvalues: Vec::new(),
                         op: None,
@@ -4334,7 +4390,6 @@ mod root_cause_tests {
                     },
                     PenaltyConfig {
                         canonical_penalties: &canonical,
-                        balanced_penalty_root: None,
                         reparam_invariant: None,
                         p: 3,
                         coefficient_lower_bounds: None,
@@ -4598,9 +4653,8 @@ mod root_cause_tests {
     pub(crate) fn dense_xtwx_signed_assembly_preserves_negative_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]];
         let weights = array![2.0, -3.0, 0.25];
-        let mut chunk = Array2::<f64>::zeros((0, 0));
         let mut got = Array2::<f64>::zeros((2, 2));
-        PirlsWorkspace::add_dense_xtwx_signed(&weights, &mut chunk, &x, &mut got);
+        PirlsWorkspace::add_dense_xtwx_signed(&weights, &x, &mut got);
 
         let mut expected = Array2::<f64>::zeros((2, 2));
         for i in 0..x.nrows() {
@@ -4711,6 +4765,43 @@ mod reporting_loglikelihood_tests {
             "omitting − full must equal Σ ln Γ(y+1) = {dropped}; got {}",
             omitting - total
         );
+    }
+
+    // A fractional binomial prior weight (a scikit-learn `sample_weight` on 0/1
+    // labels) is a weighted Bernoulli log-mass, w·[y ln μ + (1−y) ln(1−μ)]:
+    // the continuous `ln C(w, wy)` normalizer vanishes for a 0/1 response, and
+    // for a proportion it is the lnΓ continuation of the integer coefficient.
+    #[test]
+    fn binomial_full_loglik_accepts_fractional_prior_weights() {
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.4];
+        let mu = array![0.3, 0.8, 0.55, 0.1, 0.35];
+        let w = array![0.5, 2.25, 1.0, 3.7, 2.5];
+        let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
+
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Logit);
+        let pw = evaluation.pointwise();
+        for row in 0..y.len() {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let log_coefficient = ln_gamma(wi + 1.0)
+                - ln_gamma(wi * yi + 1.0)
+                - ln_gamma(wi * (1.0 - yi) + 1.0);
+            let expected =
+                log_coefficient + wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - expected).abs() < 1e-10,
+                "row {row} (w={wi}, y={yi}): {} vs {expected}",
+                pw[row]
+            );
+        }
+        let bernoulli_rows = [0, 1, 2, 3];
+        for row in bernoulli_rows {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let weighted_log_mass = wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - weighted_log_mass).abs() < 1e-12,
+                "row {row}: a 0/1 response carries no normalizer at w={wi}"
+            );
+        }
     }
 
     // ---- #1582: Poisson and NB(θ→∞) report the SAME log-likelihood on the same

@@ -487,6 +487,7 @@ impl PredictableModel for StandardPredictor {
                 // serialize as `covariance_source`. Leaving this unset made
                 // curved-link interval payloads omit the key entirely.
                 result.uncertainty_covariance_source = Some(unc.covariance_source);
+                let reference = IntervalReference::of_fit(fit)?;
                 // The response-scale SE is the posterior SD `√Var[g⁻¹(η)]` the
                 // full-uncertainty engine integrated over the same η posterior
                 // (including any fitted link-parameter variance), not a
@@ -494,23 +495,21 @@ impl PredictableModel for StandardPredictor {
                 enrich_posterior_mean_bounds(
                     &mut result,
                     level,
+                    reference,
                     self.family.clone(),
                     self.link_kind.as_ref(),
                     unc.mean_standard_error.clone(),
                 )?;
                 if options.include_observation_interval {
-                    let z = standard_normal_quantile(0.5 + 0.5 * level)
-                        .map_err(EstimationError::InvalidInput)?;
+                    let z = reference.central_multiplier(level)?;
                     let z_row = Array1::from_elem(result.eta.len(), z);
-                    let etavar = result.eta_standard_error.mapv(|s| s * s);
                     let (obs_lower, obs_upper) = family_observation_band(
                         &self.family.response,
-                        &result.eta,
-                        &etavar,
                         &result.mean,
                         &unc.mean_standard_error,
                         &z_row,
                         &z_row,
+                        reference,
                         fit,
                         // Posterior-mean band: the analytic prior-weights path
                         // (#2077) is threaded through `predict_gamwith_uncertainty`

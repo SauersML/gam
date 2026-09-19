@@ -1,0 +1,11 @@
+mcycle                 dev       | default: 544.92 (edf 9.8) | dp0: 554.88 (edf 13.3) | pygam_default: 556.34 | pygam_grid: 548.05 | dp0-default d=+9.97+-14
+coal                   dev       | default: 1.1754 (edf 4.9) | dp0: 1.1733 (edf 4.9) | pygam_default: 1.159 | pygam_grid: 1.1309 | dp0-default d=-0.00204+-0.0029
+hepatitis              dev       | default: 0.013108 (edf 4.9) | dp0: 0.013012 (edf 5.1) | pygam_default: 0.012402 | pygam_grid: 0.013206 | dp0-default d=-9.56e-05+-3.4e-05
+lidar                  dev       | default: 0.006779 (edf 8.5) | dp0: 0.0067787 (edf 9.6) | pygam_default: 0.0068316 | pygam_grid: 0.0068149 | dp0-default d=-3.35e-07+-1.5e-05
+gagurine               dev       | default: 0.097923 (edf 6.9) | dp0: 0.097831 (edf 7.3) | pygam_default: 0.1026 | pygam_grid: 0.10298 | dp0-default d=-9.21e-05+-9e-05
+null3_n200             truth_mse | default: 0.044947 (edf 3.7) | dp0: 0.062119 (edf 6.2) | pygam_default: 0.28757 | pygam_grid: 0.054715 | dp0-default d=+0.0172+-0.0022
+null3_n2000            truth_mse | default: 0.00064514 (edf 1.5) | dp0: 0.0018635 (edf 4.0) | pygam_default: 0.022846 | pygam_grid: 0.0033163 | dp0-default d=+0.00122+-0.00025
+add4_n1000             truth_mse | default: 0.10495 (edf 16.5) | dp0: 0.10892 (edf 18.1) | pygam_default: 0.20257 | pygam_grid: 0.20558 | dp0-default d=+0.00397+-0.0017
+binom_sin2_n500        truth_mse | default: 0.0039722 (edf 8.6) | dp0: 0.0040949 (edf 8.7) | pygam_default: 0.004176 | pygam_grid: 0.0042539 | dp0-default d=+0.000123+-6e-05
+pois_lowcount_n500     truth_mse | default: 0.0068971 (edf 8.2) | dp0: 0.0055271 (edf 8.6) | pygam_default: 0.0051932 | pygam_grid: 0.0056836 | dp0-default d=-0.00137+-0.00024
+gamma_add2_n300        truth_mse | default: 0.2611 (edf 9.3) | dp0: 0.28832 (edf 9.3) | pygam_default: 0.63708 | pygam_grid: 0.42244 | dp0-default d=+0.0272+-0.0098

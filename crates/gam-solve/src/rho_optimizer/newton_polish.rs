@@ -1,7 +1,7 @@
-//! The mint's Newton polish (#2954): which verdicts it polishes, the step budget
-//! quadratic convergence allows, the damped step on the free coordinates and
-//! when it continues past that budget (#3012), and the coordinate a stopped
-//! polish rails at a limit-model bound.
+//! The mint's Newton polish (#2954): which verdicts it polishes, the damped step
+//! on the free coordinates, the settling step where the decrease left is
+//! resolvable but a step's is not, when it tries a limit face first (#3012), and
+//! the coordinate a stopped polish rails at a limit-model bound.
 
 use super::capability::OuterThetaLayout;
 use super::decrement_bands::OuterDecrementDecision;
@@ -41,11 +41,12 @@ pub(super) struct MintPolish<'a> {
 /// mint takes that Newton step on the free coordinates, clamped to the model
 /// box, and re-certifies the point it reaches by the same verdict: the
 /// recursion re-owns it with a value, gradient and Hessian evaluation. A step
-/// is kept only when it lowers the criterion by more than `band_f`, a full step
-/// that does not is damped (`damped_newton_step`), and the steps on one face
-/// are bounded by `newton_polish_step_budget` until no limit face lowers the
-/// criterion: past it the polish continues only while the decrement contracts
-/// (#3012).
+/// is kept only when it lowers the criterion by more than `band_f`, and a full
+/// step that does not is damped (`damped_newton_step`). Where the decrease left,
+/// `λ̂²`, is resolvable but the full step's own `½λ̂²` is not, the full step is a
+/// settling step whose point must certify. The polish moves a point only while
+/// its decrement contracts, and where it contracts slower than Newton's
+/// quadratic rate it tries the limit faces its step heads to first (#3012).
 ///
 /// When polishing stops with the decrement still above its band, the optimum
 /// may lie on the box instead: along an exponential tail `V ≈ V∞ + a·e^(−ρ)`
@@ -89,26 +90,32 @@ pub(super) fn polish_the_mint(
             lambda_sq_before: evidence.lambda_sq,
             lambda_sq_after: evidence.lambda_sq,
             decreases: Vec::new(),
-            step_budget: newton_polish_step_budget(evidence.lambda_sq, evidence.band_f),
+            settled: false,
             rails: Vec::new(),
             entry: result.rho.to_vec(),
         },
     };
-    // A rail changes the face, so the first verdict on the new face sets the
-    // budget its own decrement allows.
+    // A rail changes the face, so the rate is measured from the first verdict on
+    // the new face.
     let face_start = record.rails.last().map_or(0, |rail| rail.steps_before);
-    if !record.rails.is_empty() && record.decreases.len() == face_start {
-        record.step_budget = newton_polish_step_budget(evidence.lambda_sq, evidence.band_f);
-    }
     // The decrement where the last Newton step on this face began, when one did:
     // the polish moves a point along Newton only while that decrement contracts,
     // the evidence that Newton is converging there (#3012).
     let previous_lambda_sq =
         (record.decreases.len() > face_start).then_some(record.lambda_sq_after);
     let contracted = previous_lambda_sq.is_none_or(|previous| evidence.lambda_sq < previous);
+    // Newton's quadratic rate, `λ₊ ≤ 2λ²`: the rate of a criterion
+    // self-concordant with constant 2 (`|V'''| ≤ 2·V''^(3/2)`) once `λ ≤ 1/4`
+    // (Boyd & Vandenberghe, *Convex Optimization*, §9.6.3), measured on the step
+    // just taken rather than predicted from the first decrement. An exponential
+    // tail `V∞ + a·e^(−ρ)` has `|V'''|/V''^(3/2) = V''^(−1/2)`, large exactly
+    // where the tail is flat, and there Newton contracts `λ̂²` by `e^(−1)` per
+    // step, a linear rate, with the infimum at the bound.
+    let quadratic = previous_lambda_sq
+        .is_none_or(|previous| evidence.lambda_sq.sqrt() <= 2.0 * previous);
+    let settled = record.settled;
     record.lambda_sq_after = evidence.lambda_sq;
-    let steps_on_face = record.decreases.len() - face_start;
-    let budget_spent = steps_on_face >= record.step_budget;
+    record.settled = false;
     let newton_step = analytic_hessian
         .as_ref()
         .and_then(|hessian| free_newton_step(hessian, &projected_gradient, &decision.face));
@@ -125,8 +132,19 @@ pub(super) fn polish_the_mint(
             evidence.lambda_sq,
             previous_lambda_sq.unwrap_or(f64::NAN),
         )
-    } else if budget_spent {
-        "the step budget quadratic convergence allows is spent".to_string()
+    } else if settled {
+        format!(
+            "the settling step's point does not certify (λ̂² {:.3e} there, {:.3e} before it)",
+            evidence.lambda_sq,
+            previous_lambda_sq.unwrap_or(f64::NAN),
+        )
+    } else if !quadratic {
+        format!(
+            "the Newton decrement contracted slower than Newton's quadratic rate λ₊ ≤ 2λ² \
+             (λ̂² {:.3e} after the last step, {:.3e} before it)",
+            evidence.lambda_sq,
+            previous_lambda_sq.unwrap_or(f64::NAN),
+        )
     } else if let Some(step) = newton_step.as_ref() {
         trial_ran = true;
         match damped_newton_step(obj, config, &result.rho, step, bounds, cost, evidence) {
@@ -181,7 +199,7 @@ pub(super) fn polish_the_mint(
                     Ok((rail_cost, judged))
                         if rail_cost.is_finite() && cost - rail_cost > evidence.band_f =>
                     {
-                        log::info!(
+                        log::debug!(
                             "[CERTIFICATE] {context}: Newton-decrement polish rails coordinate(s) \
                              {natives:?} at their limit-model bounds ({stopped}); the criterion \
                              there is {rail_cost:.9e} against {cost:.9e}, and the railed point is \
@@ -239,33 +257,28 @@ pub(super) fn polish_the_mint(
         }
         RailPlan::None => {}
     }
-    // A spent budget ends the quadratic phase, not the polish (#3012). The budget
-    // is `λ₊ ≤ 2λ²`, the rate of a criterion self-concordant with constant 2
-    // (`|V'''| ≤ 2·V''^(3/2)`). An exponential tail `V∞ + a·e^(−ρ)` has
-    // `|V'''|/V''^(3/2) = V''^(−1/2)`, which is large exactly where the tail is
-    // flat, and there Newton contracts `λ̂²` by `e^(−1)` per step, a linear rate: on
-    // an exact-fit `y ~ s(x)` the one step the budget allowed stopped a sequence
-    // that one more step certified. So once no limit face lowers the criterion, a
-    // polish that has stepped on this face and whose decrement contracted keeps
-    // taking Newton steps, each of which must again lower the criterion by more
-    // than `band_f`. That bounds the walk, since the criterion is bounded below.
-    // Along a tail `λ̂²` is the whole decrease left, so the walk certifies once
-    // that decrease is below the band. The walk is never moved onto a
-    // representability face (`damped_newton_step`), so box-KKT is never taken at
-    // one.
-    if budget_spent
+    // A linear rate ends the quadratic phase, not the polish (#3012): on an
+    // exact-fit `y ~ s(x)` a polish that stopped there refused a sequence that one
+    // more step certified. So once no limit face lowers the criterion, a polish
+    // whose decrement contracted keeps taking Newton steps, each of which must
+    // again lower the criterion by more than `band_f`, or settle where only the
+    // decrease left is resolvable. That bounds the walk, since the criterion is
+    // bounded below and a settling step's point must certify. Along a tail `λ̂²`
+    // is the whole decrease left, so the walk certifies once that decrease is
+    // below the band. The walk is never moved onto a representability face
+    // (`damped_newton_step`), so box-KKT is never taken at one.
+    if !quadratic
         && contracted
-        && steps_on_face > 0
+        && !settled
         && let Some(step) = newton_step.as_ref()
     {
         trial_ran = true;
         match damped_newton_step(obj, config, &result.rho, step, bounds, cost, evidence) {
             Ok(taken) => {
-                log::info!(
-                    "[CERTIFICATE] {context}: Newton-decrement polish continues past its \
-                     {}-step budget ({stopped}): λ̂² contracted from {:.3e} to {:.3e} on this \
-                     face (#3012)",
-                    record.step_budget,
+                log::debug!(
+                    "[CERTIFICATE] {context}: Newton-decrement polish continues at a linear \
+                     rate ({stopped}): λ̂² contracted from {:.3e} to {:.3e} on this face \
+                     (#3012)",
                     previous_lambda_sq.unwrap_or(f64::NAN),
                     evidence.lambda_sq,
                 );
@@ -311,13 +324,12 @@ pub(super) fn polish_the_mint(
     Err(outer_nonconvergence_error(
         context,
         &format!(
-            "Newton-decrement above tolerance after polish: ½λ̂²={:.3e} > band_f={:.3e} \
-             after {} of {} Newton step(s) on the current face (ΔV per step {:?}; {} \
+            "Newton-decrement above tolerance after polish: λ̂²={:.3e} > band_f={:.3e} \
+             after {} Newton step(s) on the current face (ΔV per step {:?}; {} \
              rail(s) {:?}; λ̂² {:.3e} before, {:.3e} now): {stopped}",
-            0.5 * evidence.lambda_sq,
+            evidence.lambda_sq,
             evidence.band_f,
             record.decreases.len() - face_start,
-            record.step_budget,
             record.decreases,
             record.rails.len(),
             record
@@ -336,9 +348,9 @@ pub(super) fn polish_the_mint(
 
 /// The evidence of a verdict whose Newton decrement the arithmetic resolves as
 /// a decrease still to buy (#2954): `DecrementAboveTolerance`, and a
-/// `DecrementUnresolved` whose `½λ̂²` exceeds its own rounding `band_λ²` by more
+/// `DecrementUnresolved` whose `λ̂²` exceeds its own rounding `band_λ²` by more
 /// than `band_f`. The latter's certificate is undecidable, but its decrease is
-/// not: a Newton step buys more than either band. So both are polished, or
+/// not: the decrease left to the minimum is more than either band. So both are polished, or
 /// refused by name, and neither certifies.
 pub(super) fn resolvable_decrease_evidence(
     verdict: &opt::DecrementVerdict,
@@ -346,7 +358,7 @@ pub(super) fn resolvable_decrease_evidence(
     match verdict {
         opt::DecrementVerdict::DecrementAboveTolerance(evidence) => Some(evidence),
         opt::DecrementVerdict::DecrementUnresolved(evidence)
-            if 0.5 * evidence.lambda_sq - evidence.band_lambda_sq > evidence.band_f =>
+            if evidence.lambda_sq - evidence.band_lambda_sq > evidence.band_f =>
         {
             Some(evidence)
         }
@@ -354,42 +366,27 @@ pub(super) fn resolvable_decrease_evidence(
     }
 }
 
-/// The Newton-step budget a mint's polish may spend, from quadratic convergence
-/// (#2954).
-///
-/// For a self-concordant criterion the Newton decrement satisfies `λ₊ ≤ 2λ²`
-/// once `λ ≤ 1/4` (Boyd & Vandenberghe, *Convex Optimization*, §9.6.3). So
-/// `2λ_t ≤ (2λ_0)^(2^t)`, and `½λ_t² ≤ band_f` as soon as
-/// `2^(t+1) ≥ ln(8·band_f)/ln(2λ_0)`. The budget is the smallest such `t`, at
-/// least one step. Outside `λ_0 ≤ 1/4` the bound gives no step count and the
-/// budget is zero. A criterion that needs more steps than this converges slower
-/// than Newton's quadratic rate: the polish then tries the limit faces its step
-/// heads to, and continues past the budget only on the evidence that Newton
-/// converges there, a decrement that contracted (#3012).
-pub(super) fn newton_polish_step_budget(lambda_sq: f64, band_f: f64) -> usize {
-    let lambda = lambda_sq.sqrt();
-    if !(lambda.is_finite() && lambda > 0.0 && lambda <= 0.25 && band_f.is_finite() && band_f > 0.0)
-    {
-        return 0;
-    }
-    let ratio = (8.0 * band_f).ln() / (2.0 * lambda).ln();
-    if !(ratio.is_finite() && ratio > 1.0) {
-        return 1;
-    }
-    (ratio.log2() - 1.0).ceil().max(1.0) as usize
-}
-
 /// A polish step the criterion accepted: the point `t·p` along the Newton step
-/// `p` reached, the criterion there, and that evaluation's certificate evidence.
+/// `p` reached, the criterion there, that evaluation's certificate evidence, and
+/// whether it was a settling step.
 struct DampedNewtonStep {
     point: Array1<f64>,
     cost: f64,
     judged: JudgedEvidence,
     t: f64,
+    settling: bool,
 }
 
 /// The first step along the Newton step `p`, halving `t` from one, that lowers
 /// the criterion by more than `band_f` (#3012).
+///
+/// A verdict refuses on the decrease left to the minimum, `λ̂²`, while the full
+/// step's quadratic model promises `½λ̂²`. Where `band_f < λ̂² ≤ 2·band_f` the
+/// decrease left is resolvable but no step's decrease is, so no step can show
+/// the decrease `band_f` a kept step must. There the full step is a settling
+/// step: it is taken where it does not raise the criterion by more than
+/// `band_f`, and the point it reaches must certify (`polish_the_mint` refuses a
+/// settled point that does not).
 ///
 /// A full step outside the quadratic region can raise the criterion while the
 /// decrement still promises a resolvable decrease; it is damped rather than
@@ -412,6 +409,7 @@ fn damped_newton_step(
     evidence: &opt::DecrementEvidence,
 ) -> Result<DampedNewtonStep, String> {
     let (lower, upper) = bounds;
+    let settling = !(0.5 * evidence.lambda_sq > evidence.band_f);
     let mut t = 1.0_f64;
     let mut full_step = None;
     loop {
@@ -439,13 +437,19 @@ fn damped_newton_step(
         } else {
             match judged_cost(obj, &point) {
                 Ok((trial_cost, judged))
-                    if trial_cost.is_finite() && cost - trial_cost > evidence.band_f =>
+                    if trial_cost.is_finite()
+                        && if settling {
+                            trial_cost - cost <= evidence.band_f
+                        } else {
+                            cost - trial_cost > evidence.band_f
+                        } =>
                 {
                     return Ok(DampedNewtonStep {
                         point,
                         cost: trial_cost,
                         judged,
                         t,
+                        settling,
                     });
                 }
                 Ok((trial_cost, _)) => {
@@ -454,6 +458,13 @@ fn damped_newton_step(
                 Err(error) => format!("fails to evaluate ({error})"),
             }
         };
+        if settling {
+            return Err(format!(
+                "the settling step, where λ̂²={:.3e} is resolvable against band_f={:.3e} but \
+                 the full step's own ½λ̂² is not, {outcome}",
+                evidence.lambda_sq, evidence.band_f,
+            ));
+        }
         let full = full_step.get_or_insert(outcome);
         let next = 0.5 * t;
         if !(next * (1.0 - 0.5 * next) * evidence.lambda_sq > evidence.band_f) {
@@ -486,17 +497,20 @@ fn take_polish_step(
         cost: trial_cost,
         judged,
         t,
+        settling,
     } = taken;
-    log::info!(
-        "[CERTIFICATE] {context}: Newton-decrement polish step {}: ½λ̂²={:.3e} is \
-         resolvable against band_f={:.3e}; the Newton step at t={t:.3e} lowers the \
+    log::debug!(
+        "[CERTIFICATE] {context}: Newton-decrement polish {} {}: λ̂²={:.3e} is \
+         resolvable against band_f={:.3e}; the Newton step at t={t:.3e} moves the \
          criterion from {cost:.9e} to {trial_cost:.9e}, and the point it reaches is judged \
          instead (#2954)",
+        if settling { "settling step" } else { "step" },
         record.decreases.len() + 1,
-        0.5 * evidence.lambda_sq,
+        evidence.lambda_sq,
         evidence.band_f,
     );
     record.decreases.push(cost - trial_cost);
+    record.settled = settling;
     result.rho = point;
     result.final_value = trial_cost;
     certify_outer_optimality_at_terminal_fidelity(

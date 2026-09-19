@@ -478,7 +478,7 @@ fn assemble_bundle(
         && collapsed_to_penalty_null_space(edf_total, coefficient_count, joint_penalty_nullity)
     {
         let mp = joint_penalty_nullity.clamp(0.0, p);
-        log::warn!(
+        log::debug!(
             "fit collapsed to its penalty null space: effective df {edf_total:.3} of {p} \
              coefficients, against a joint penalty nullity of {mp}. The {} penalized \
              directions this design offered were smoothed away entirely -- the model \

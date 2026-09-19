@@ -280,8 +280,34 @@ pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool>
 
     spec.smooth_terms
         .iter()
-        .map(|term| auto_spatial(&term.basis))
+        .map(|term| auto_spatial(&term.basis) || adaptive_bspline_knots(&term.basis).is_some())
         .collect()
+}
+
+/// Internal-knot count of an ungated formula-default `s(x)` B-spline whose
+/// resolution the standard workflow owns
+/// ([`gam_terms::basis::BSplineKnotSpec::Automatic`]`{ adaptive: true, .. }`).
+/// A row-gated smooth (`by=`, factor sum-to-zero) is supported by only its
+/// gate's rows, so the covariate's distinct values do not bound its basis; it
+/// keeps its starting resolution.
+pub(crate) fn adaptive_bspline_knots(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
+    match basis {
+        gam_terms::smooth::SmoothBasisSpec::BSpline1D {
+            spec:
+                gam_terms::basis::BSplineBasisSpec {
+                    knotspec:
+                        gam_terms::basis::BSplineKnotSpec::Automatic {
+                            num_internal_knots: Some(num_internal_knots),
+                            adaptive: true,
+                            ..
+                        },
+                    boundary: gam_terms::basis::OneDimensionalBoundary::Open,
+                    ..
+                },
+            ..
+        } => Some(*num_internal_knots),
+        _ => None,
+    }
 }
 
 pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<Option<usize>> {
@@ -315,7 +341,7 @@ pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<O
 
     spec.smooth_terms
         .iter()
-        .map(|term| center_count(&term.basis))
+        .map(|term| center_count(&term.basis).or_else(|| adaptive_bspline_knots(&term.basis)))
         .collect()
 }
 
@@ -612,7 +638,8 @@ pub struct FitConfig {
     /// cross anywhere (see `fit_expectile_location_scale`). `None` defaults to
     /// the single median level `[0.5]`. The levels may also be written inline
     /// as `family = "expectile(0.9)"` or `family = "expectile(0.1, 0.9)"`;
-    /// both spellings together must agree.
+    /// both spellings together must agree. Setting it with any other family is
+    /// rejected by [`FitConfig::resolve`].
     pub expectile_tau: Option<Vec<f64>>,
     /// Cross-fitted predictive CTN, saved with an ordinary marginal-slope outcome.
     pub ctn_stage1: Option<CtnStage1Recipe>,
@@ -705,27 +732,6 @@ pub struct FitConfig {
     /// resolution for that smooth only. This is in-process orchestration state,
     /// never a user knob or environment setting.
     pub spatial_center_counts: Option<Vec<Option<usize>>>,
-    /// Whether to precompute the distribution-free conformal substrates (#942
-    /// jackknife+, #1098 exact full-conformal) at fit time and persist them on
-    /// the saved model. `None` keeps the historical behaviour of precomputing
-    /// whenever the fit is eligible; `Some(false)` skips both.
-    ///
-    /// The trade-off, measured on `y ~ s(x1,k=6) + s(x2,k=6)` (#2633): the two
-    /// substrates are **94% of a saved Gaussian model at n=20,000** (10.2 MB of
-    /// 10.85 MB) and grow linearly with the training rows, because they are
-    /// per-row. Rebuilding both costs **~5.6 ms**, 0.3% of the fit that produced
-    /// them. So keeping them buys single-digit milliseconds at roughly half a
-    /// kilobyte per training row, forever — turning the flag off yields a **~16x
-    /// smaller** model (10.85 MB -> ~0.65 MB at n=20,000).
-    ///
-    /// It is opt-OUT rather than opt-in for one reason: rebuilding a substrate
-    /// needs the training design AND response back, and a saved model
-    /// deliberately does not carry the training rows. So a model that will be
-    /// shipped to a host that never sees the training data must keep them, or it
-    /// cannot produce a conformal interval at all. Turn this off when the caller
-    /// retains its training data, fits in batch, or never asks for conformal
-    /// intervals; leave it alone when the model has to stand on its own.
-    pub precompute_conformal: Option<bool>,
     /// Whether the fit computes and publishes a coefficient covariance (and the
     /// standard errors derived from it). `None` keeps each family's own
     /// default, which for every path that reaches this field today is "yes";
@@ -757,7 +763,6 @@ pub struct FitConfig {
 impl Default for FitConfig {
     fn default() -> Self {
         Self {
-            precompute_conformal: None,
             compute_covariance: None,
             warm_start: None,
             family: None,
@@ -834,7 +839,7 @@ pub struct UnidentifiedScalarTerm {
 /// The result of materializing a formula + config against a dataset.
 pub struct MaterializedModel<'a> {
     pub request: FitRequest<'a>,
-    pub inference_notes: Vec<String>,
+    pub inference_notes: FitNotes,
     /// Scalar terms materialization removed as unidentified. Empty for every
     /// request that does not prune scalar terms.
     pub unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,

@@ -1,0 +1,100 @@
+[run] g1d_sin1_n100 n=100 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.012451
+   pygam_grid     ok=5/5 truth_mse=0.0062474
+   gamfit         ok=5/5 truth_mse=0.0086747
+[run] g1d_sin1_n500 n=500 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.0025334
+   pygam_grid     ok=5/5 truth_mse=0.001952
+   gamfit         ok=5/5 truth_mse=0.0020808
+[run] g1d_sin1_n2000 n=2000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.00072379
+   pygam_grid     ok=5/5 truth_mse=0.00064012
+   gamfit         ok=5/5 truth_mse=0.00054567
+[run] g1d_sin3_n100 n=100 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.04328
+   pygam_grid     ok=5/5 truth_mse=0.025219
+   gamfit         ok=5/5 truth_mse=0.022058
+[run] g1d_sin3_n500 n=500 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.0035121
+   pygam_grid     ok=5/5 truth_mse=0.0031117
+   gamfit         ok=5/5 truth_mse=0.0041218
+[run] g1d_sin3_n2000 n=2000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.00060126
+   pygam_grid     ok=5/5 truth_mse=0.00070158
+   gamfit         ok=5/5 truth_mse=0.0020021
+[run] g1d_sin3_n10000 n=10000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.00014137
+   pygam_grid     ok=5/5 truth_mse=0.00014359
+   gamfit         ok=5/5 truth_mse=0.0016948
+[run] g1d_sin6_n100 n=100 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.45464
+   pygam_grid     ok=5/5 truth_mse=0.04173
+   gamfit         ok=5/5 truth_mse=0.50948
+[run] g1d_sin6_n500 n=500 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.17664
+   pygam_grid     ok=5/5 truth_mse=0.0079739
+   gamfit         ok=5/5 truth_mse=0.45366
+[run] g1d_sin6_n2000 n=2000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.039176
+   pygam_grid     ok=5/5 truth_mse=0.0043517
+   gamfit         ok=5/5 truth_mse=0.40613
+[run] g1d_sin6_n10000 n=10000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.0057884
+   pygam_grid     ok=5/5 truth_mse=0.0037578
+   gamfit         ok=5/5 truth_mse=0.4067
+[run] g1d_doppler_n100 n=100 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.39686
+   pygam_grid     ok=5/5 truth_mse=0.28771
+   gamfit         ok=5/5 truth_mse=0.40246
+[run] g1d_doppler_n500 n=500 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.25274
+   pygam_grid     ok=5/5 truth_mse=0.18973
+   gamfit         ok=5/5 truth_mse=0.28256
+[run] g1d_doppler_n2000 n=2000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.17137
+   pygam_grid     ok=5/5 truth_mse=0.15229
+   gamfit         ok=5/5 truth_mse=0.24927
+[run] null3_n200 n=200 gaussian :: y ~ s(a) + s(b) + s(c)
+   pygam_default  ok=5/5 truth_mse=0.28757
+   pygam_grid     ok=5/5 truth_mse=0.054715
+   gamfit         ok=5/5 truth_mse=0.044947
+[run] null3_n2000 n=2000 gaussian :: y ~ s(a) + s(b) + s(c)
+   pygam_default  ok=5/5 truth_mse=0.022846
+   pygam_grid     ok=5/5 truth_mse=0.0033163
+   gamfit         ok=5/5 truth_mse=0.00064514
+[run] add4_n200 n=200 gaussian :: y ~ s(x0) + s(x1) + s(x2) + s(x3)
+   pygam_default  ok=5/5 truth_mse=1.0084
+   pygam_grid     ok=5/5 truth_mse=0.72009
+   gamfit         ok=5/5 truth_mse=0.49004
+[run] add4_n1000 n=1000 gaussian :: y ~ s(x0) + s(x1) + s(x2) + s(x3)
+   pygam_default  ok=5/5 truth_mse=0.20257
+   pygam_grid     ok=5/5 truth_mse=0.20558
+   gamfit         ok=5/5 truth_mse=0.10495
+[run] add4_n5000 n=5000 gaussian :: y ~ s(x0) + s(x1) + s(x2) + s(x3)
+   pygam_default  ok=5/5 truth_mse=0.052009
+   pygam_grid     ok=5/5 truth_mse=0.040041
+   gamfit         ok=5/5 truth_mse=0.014412
+[run] bump2d_n1000 n=1000 gaussian :: y ~ te(x0, x1)
+   pygam_default  ok=5/5 truth_mse=0.018686
+   pygam_grid     ok=5/5 truth_mse=0.0062263
+   gamfit         ok=5/5 truth_mse=0.01046
+[run] bump2d_n4000 n=4000 gaussian :: y ~ te(x0, x1)
+   pygam_default  ok=5/5 truth_mse=0.0063915
+   pygam_grid     ok=5/5 truth_mse=0.0022949
+   gamfit         ok=5/5 truth_mse=0.0079425
+[run] hetero_n500 n=500 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.012943
+   pygam_grid     ok=5/5 truth_mse=0.013964
+   gamfit         ok=5/5 truth_mse=0.0116
+[run] hetero_n3000 n=3000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.0022927
+   pygam_grid     ok=5/5 truth_mse=0.0019638
+   gamfit         ok=5/5 truth_mse=0.0012979
+[run] outlier_n300 n=300 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.21397
+   pygam_grid     ok=5/5 truth_mse=0.26111
+   gamfit         ok=5/5 truth_mse=0.32349
+[run] outlier_n2000 n=2000 gaussian :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.16599
+   pygam_grid     ok=5/5 truth_mse=0.067722
+   gamfit         ok=5/5 truth_mse=0.060047

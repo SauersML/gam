@@ -167,7 +167,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     assert model.training_table_kind == "records"
     assert not model.is_survival
     assert not model.is_transformation_normal
-    assert summary["iterations"] >= 0
+    assert summary["convergence"]["outer_iterations"] >= 0
     assert not summary.coefficients_frame().empty
 
     predicted = model.predict(prediction_rows())
@@ -373,40 +373,42 @@ def test_numpy_inputs_and_outputs() -> None:
         "y ~ x0",
         family="gaussian",
     )
-    raw = np.asarray(model.predict(x_test, return_type="numpy"), dtype=float)
+    raw = model.predict(x_test, return_type="numpy")
     table = model.predict(x_test, return_type="pandas")
     # A plain Gaussian fit publishes the estimand-explicit schema (#2785). Under
     # the identity link its plug-in linear predictor and its posterior mean
     # agree, and the posterior mean must match the analytic predictions.
-    assert raw.shape == (2, len(table.columns))
+    assert raw.shape == (2,)
+    assert raw.dtype.names == tuple(table.columns)
     posterior_mean = table["posterior_mean"].to_numpy(dtype=float)
     np.testing.assert_allclose(
         table["linear_predictor_plugin"].to_numpy(dtype=float), posterior_mean, atol=1e-9
     )
     np.testing.assert_allclose(posterior_mean, [2.5, 3.5], atol=1e-3)
 
-    # The numpy-return contract is the prediction table's columns stacked in the
-    # table's fixed order (docs/data-input.md). The identity link makes every
-    # point column coincide, so the order is checked on a log-link fit, whose
-    # plug-in linear predictor, plug-in mean and posterior mean differ. The
-    # pandas table is the reference: it keeps covariance provenance in `attrs`,
-    # where a dict result carries it as extra scalar keys.
+    # The numpy-return contract is a structured array with one named field per
+    # prediction-table column (docs/data-input.md). The identity link makes
+    # every point column coincide, so the field-to-column binding is checked on
+    # a log-link fit, whose plug-in linear predictor, plug-in mean and
+    # posterior mean differ. The pandas table is the reference: it keeps
+    # covariance provenance in `attrs`, where a dict result carries it as extra
+    # scalar keys.
     counts = gamfit.fit(
         {"x0": x_train[:, 0].tolist(), "y": [1.0, 2.0, 4.0, 7.0]},
         "y ~ x0",
         family="poisson",
     )
-    raw_counts = np.asarray(counts.predict(x_test, return_type="numpy"), dtype=float)
+    raw_counts = counts.predict(x_test, return_type="numpy")
     frame = counts.predict(x_test, return_type="pandas")
     columns = [frame[name].to_numpy(dtype=float) for name in frame.columns]
-    assert raw_counts.shape == (2, len(columns))
+    assert raw_counts.dtype.names == tuple(frame.columns)
     assert not any(
         np.allclose(columns[i], columns[j])
         for i in range(len(columns))
         for j in range(i + 1, len(columns))
-    ), "the log-link table's columns must differ pairwise for the order check to have power"
-    for index, values in enumerate(columns):
-        np.testing.assert_array_equal(raw_counts[:, index], values)
+    ), "the log-link table's columns must differ pairwise for the binding check to have power"
+    for name, values in zip(frame.columns, columns):
+        np.testing.assert_array_equal(raw_counts[name], values)
 
 
 def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target() -> None:
@@ -2681,9 +2683,9 @@ def test_diagnose_keeps_regression_metrics_for_gaussian_family() -> None:
     assert "auc" not in diag.metrics
 
 
-def test_gamclassifier_score_is_auc_and_metrics_panel_is_sane() -> None:
-    """`GAMClassifier.score` returns AUC over `classification_metrics`, and
-    `.metrics` surfaces the full panel on a separable case."""
+def test_gamclassifier_score_is_accuracy_and_metrics_panel_is_sane() -> None:
+    """`GAMClassifier.score` is ClassifierMixin accuracy (the sklearn classifier
+    contract), and `.metrics` surfaces the full AUC/Brier/... panel."""
     _require_extension()
     rng = np.random.default_rng(20260602)
     n = 200
@@ -2694,25 +2696,28 @@ def test_gamclassifier_score_is_auc_and_metrics_panel_is_sane() -> None:
 
     clf = GAMClassifier(formula="y ~ s(x)", family="binomial").fit(X, y)
 
-    auc = clf.score(X, y)
-    assert 0.0 <= auc <= 1.0
-    assert auc > 0.85, f"GAMClassifier.score (AUC) unexpectedly low: {auc:.3f}"
+    accuracy = clf.score(X, y)
+    np.testing.assert_allclose(accuracy, float(np.mean(clf.predict(X) == y)), atol=0.0)
+    assert accuracy > 0.8, f"GAMClassifier.score (accuracy) unexpectedly low: {accuracy:.3f}"
 
     panel = clf.metrics(X, y)
     for key in ("auc", "pr_auc", "brier", "logloss", "nagelkerke_r2", "ece"):
         assert key in panel, f"missing classification metric {key!r}"
-    # .score must agree with the AUC entry of the full panel.
-    np.testing.assert_allclose(auc, float(panel["auc"]), atol=1e-9)
+    assert float(panel["auc"]) > 0.85
 
-    # A perfectly-separable, perfectly-ranked subset scores AUC == 1.0, and
-    # sample_weight==0 rows are dropped before scoring (sklearn scorer
-    # contract compatibility).
+    # Accuracy and AUC must be distinguishable here: relabelling y as the
+    # sign of x keeps the ranking perfect (AUC 1) but is not what score
+    # reports unless every hard label is right.
     y_ranked = (x > 0.0).astype(int)
-    perfect = clf.score(X, y_ranked)
-    assert perfect == 1.0, f"separable ranking must give AUC 1.0; got {perfect}"
-    weights = np.ones(n, dtype=float)
-    weights[0] = 0.0
-    assert clf.score(X, y_ranked, sample_weight=weights) == 1.0
+    assert float(clf.metrics(X, y_ranked)["auc"]) == 1.0
+    np.testing.assert_allclose(
+        clf.score(X, y_ranked), float(np.mean(clf.predict(X) == y_ranked)), atol=0.0
+    )
+    weights = np.zeros(n, dtype=float)
+    weights[0] = 1.0
+    assert clf.score(X, y_ranked, sample_weight=weights) == float(
+        clf.predict(X.iloc[:1])[0] == y_ranked[0]
+    )
 
 
 def test_survival_prediction_concordance_recovers_known_ordering() -> None:
