@@ -66,15 +66,17 @@ fn design_and_penalties(x1: &[f64], x2: &[f64]) -> (Array2<f64>, Vec<Array2<f64>
     (x, penalties)
 }
 
-fn simulate(family: &ResponseFamily, link: StandardLink) -> (Array1<f64>, Array2<f64>, Vec<Array2<f64>>) {
+fn simulate(
+    family: &ResponseFamily,
+    link: StandardLink,
+) -> (Array1<f64>, Array2<f64>, Vec<Array2<f64>>) {
     let mut rng = Lcg(0x5eed_0f_9a11);
     let x1: Vec<f64> = (0..N).map(|_| rng.uniform()).collect();
     let x2: Vec<f64> = (0..N).map(|_| rng.uniform()).collect();
     let (x, penalties) = design_and_penalties(&x1, &x2);
     let y = (0..N)
         .map(|i| {
-            let signal =
-                (2.0 * std::f64::consts::PI * x1[i]).sin() * 0.9 + (x2[i] - 0.5) * 1.2;
+            let signal = (2.0 * std::f64::consts::PI * x1[i]).sin() * 0.9 + (x2[i] - 0.5) * 1.2;
             match family {
                 ResponseFamily::Binomial => {
                     let mu = match link {
@@ -121,7 +123,8 @@ fn libm_erf(z: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.327_591_1 * z.abs());
     let poly = t
         * (0.254_829_592
-            + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
     let r = 1.0 - poly * (-z * z).exp();
     if z >= 0.0 { r } else { -r }
 }
@@ -138,9 +141,10 @@ fn state<'a>(
     let p = x.ncols();
     let specs: Vec<PenaltySpec> = penalties.iter().cloned().map(PenaltySpec::Dense).collect();
     let nullspace = vec![2; specs.len()];
-    let canonical = gam_terms::construction::canonicalize_penalty_specs(&specs, &nullspace, p, "test")
-        .map(|(canonical, _)| canonical)
-        .expect("canonicalize");
+    let canonical =
+        gam_terms::construction::canonicalize_penalty_specs(&specs, &nullspace, p, "test")
+            .map(|(canonical, _)| canonical)
+            .expect("canonicalize");
     RemlState::newwith_offset(
         y.view(),
         x.clone(),
@@ -254,5 +258,59 @@ fn gamma_log_outer_hessian_matches_gradient_fd() {
     assert_hessian_matches_fd(
         "gamma-log",
         spec(ResponseFamily::Gamma, StandardLink::Log).with_gamma_shape_frozen_for_search(2.0),
+    );
+}
+
+/// A latched #784 block correction splices `Δ_b` with its exact gradient but no
+/// ρ-Hessian. The criterion it defines therefore declares no outer Hessian: the
+/// search runs on BFGS curvature, the unified VGH evaluation reports none, and
+/// the smoothing correction's Hessian refuses with the typed not-analytic text.
+/// Before, the Laplace Hessian without `∂²Δ_b` was declared exact, ARC stepped
+/// on it, and its inversion at the fit's end read the missing curvature as the
+/// criterion contradicting itself (DOC-17: "criterion-contradicted negative
+/// curvature" on ISLR `Default`).
+#[test]
+fn a_latched_block_correction_declares_no_outer_hessian_784() {
+    let (y, x, penalties) = simulate(&ResponseFamily::Binomial, StandardLink::Logit);
+    let w = Array1::<f64>::ones(N);
+    let offset = Array1::<f64>::zeros(N);
+    let cfg = RemlConfig::external(
+        spec(ResponseFamily::Binomial, StandardLink::Logit),
+        1e-10,
+        false,
+    )
+    .with_max_iterations(500);
+    let reml = state(&y, &w, &offset, &x, &penalties, &cfg);
+    let rho = Array1::from(vec![0.5, -0.5]);
+    assert!(reml.analytic_outer_hessian_enabled());
+    assert!(reml.compute_lamlhessian_consistent(&rho).is_ok());
+
+    // Latch a one-direction block, as an admission does.
+    reml.block_correction_admission
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    reml.reset_outer_seed_state();
+
+    assert!(
+        !reml.analytic_outer_hessian_enabled(),
+        "a latched block correction has no analytic outer Hessian"
+    );
+    let eval = reml
+        .compute_outer_eval_with_order(&rho, OuterEvalOrder::ValueGradientHessian)
+        .expect("value and gradient stay exact");
+    assert!(matches!(eval.hessian, HessianValue::Unavailable));
+    let bundle = reml.obtain_eval_bundle(&rho).expect("bundle");
+    assert!(
+        reml.compute_lamlhessian_exact_from_bundle(&rho, &bundle)
+            .is_err(),
+        "the unified VGH evaluation must not declare the Laplace Hessian without ∂²Δ_b"
+    );
+    let refusal = reml
+        .compute_lamlhessian_consistent(&rho)
+        .expect_err("the smoothing correction's Hessian is typed-unavailable");
+    assert!(
+        refusal.to_string().contains(
+            crate::estimate::smoothing_correction::BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC
+        ),
+        "{refusal}"
     );
 }

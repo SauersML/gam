@@ -156,6 +156,17 @@ impl<'a> RemlState<'a> {
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DeferredToOptimum;
     }
 
+    /// Whether the #784 correction is latched into this fit's criterion. Its
+    /// value and exact ρ-gradient are spliced, but `Δ_b` has no analytic
+    /// ρ-Hessian, so a latched criterion declares none: the search continues on
+    /// BFGS curvature and the smoothing correction is typed-unavailable, as for
+    /// a non-canonical Firth link.
+    pub(crate) fn block_correction_latched(&self) -> bool {
+        self.block_correction_admission
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
     pub(crate) fn block_correction_admission_deferred(&self) -> bool {
         *self.block_correction_decision_guard() == BlockCorrectionDecision::DeferredToOptimum
     }
@@ -501,7 +512,10 @@ impl<'a> RemlState<'a> {
         // lower rule resolves min(|Δ_b|, 1/n_eff²), and latched beside the block
         // dimension. Under a latched admission the orders are the model's, so
         // every ρ integrates against the same nodes and the value, gradient and
-        // moments share one measure.
+        // moments share one measure. The paired lower rules then switch nothing
+        // (#2748), so a latched evaluation integrates the fine rule alone and
+        // carries the admission's paired errors as its certificate: on a
+        // three-axis block the lower rules are five times the fine rule's nodes.
         let laplace_floor = if n_eff > 0.0 {
             1.0 / n_eff
         } else {
@@ -513,10 +527,14 @@ impl<'a> RemlState<'a> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .filter(|orders| orders.len() == m);
+            .filter(|(orders, _)| orders.len() == m);
         let quadrature = match latched_axis_orders {
-            Some(axis_orders) => corrector
-                .block_quadrature_marginal_correction(&target, &axis_orders)
+            Some((axis_orders, certified_axis_errors)) => corrector
+                .block_quadrature_marginal_correction_at_certified_orders(
+                    &target,
+                    &axis_orders,
+                    &certified_axis_errors,
+                )
                 .map_err(|refusal| EstimationError::InvalidInput(refusal.to_string()))?,
             None => match gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
                 corrector,
@@ -547,8 +565,8 @@ impl<'a> RemlState<'a> {
         // it.
         //
         // It decides ADMISSION and nothing else (#2748). Once the fit has
-        // latched an admission, this test is reported and no longer switches:
-        // a rule that drops the whole `Δ_b` whenever the paired rules disagree
+        // latched an admission, the latched evaluations carry the admission's
+        // errors, which this test resolved, and it no longer switches: a rule that drops the whole `Δ_b` whenever the paired rules disagree
         // is a second predicate on ρ, and it re-introduces exactly the jump the
         // latch exists to remove — measured toggling 143 times against 235
         // admissions inside ONE `haberman_5yr` fit. A quadrature error that
@@ -560,29 +578,15 @@ impl<'a> RemlState<'a> {
             .axis_quadrature_errors
             .iter()
             .all(|&error| error == 0.0 || error < resolution_target);
-        if !resolved {
-            if latched_block_dim.is_none() {
-                return Err(EstimationError::BlockQuadratureCorrectionRefused {
-                    stage: BlockQuadratureCorrectionStage::UnresolvedAtAdmission {
-                        quadrature_error: quadrature.quadrature_error,
-                        resolution_target,
-                        axis_orders: quadrature.axis_orders.clone(),
-                        node_count: quadrature.node_count,
-                    },
-                });
-            }
-            log::info!(
-                "[#784] block-local correction spliced UNRESOLVED (admission already latched, \
-                 #2748): paired Gauss-Hermite error {:.4e} does not resolve \
-                 min(|Δ_b|, 1/n_eff²)={resolution_target:.4e} (|Δ_b|={abs_value:.4e}, m={m}, \
-                 max|γ|={:.3}, τ={:.3}, axis orders={:?}, nodes={}, 1/n_eff={:.3e})",
-                quadrature.quadrature_error,
-                verdict.max_abs_skewness,
-                verdict.threshold,
-                quadrature.axis_orders,
-                quadrature.node_count,
-                laplace_floor,
-            );
+        if !resolved && latched_block_dim.is_none() {
+            return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                stage: BlockQuadratureCorrectionStage::UnresolvedAtAdmission {
+                    quadrature_error: quadrature.quadrature_error,
+                    resolution_target,
+                    axis_orders: quadrature.axis_orders.clone(),
+                    node_count: quadrature.node_count,
+                },
+            });
         }
 
         // Latch the admission on the first evaluation that reaches here with
@@ -594,8 +598,10 @@ impl<'a> RemlState<'a> {
             *self
                 .block_correction_axis_orders
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(quadrature.axis_orders.clone());
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+                quadrature.axis_orders.clone(),
+                quadrature.axis_quadrature_errors.clone(),
+            ));
             let mut decision = self.block_correction_decision_guard();
             if *decision == BlockCorrectionDecision::DecidingAtOptimum {
                 *decision = BlockCorrectionDecision::AdmittedAtOptimum;

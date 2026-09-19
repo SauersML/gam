@@ -588,22 +588,6 @@ pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedCon
     }
 }
 
-pub(crate) fn standard_reml_search_prefers_gradient_only(link: LinkFunction) -> bool {
-    // The optimize-3 / certify-4 split exists to keep the generic
-    // non-Gaussian family derivative tower through order four out of the
-    // smoothing-parameter search (#2359).  A profiled Gaussian identity
-    // likelihood is quadratic in eta: its family derivatives above order two
-    // vanish, so reserving the already-available exact outer Hessian for mint
-    // buys nothing.  Worse, it routes a small exact-curvature problem through
-    // first-order BFGS: the saturated wine_gamair fold took 86 accepted
-    // iterations, then failed the first analytic stationarity audit.
-    //
-    // Let the capability planner choose analytic-Hessian ARC for that exact
-    // quadratic objective.  Every non-identity family retains the order-three
-    // search ceiling and pays order four only at mint.
-    !matches!(link, LinkFunction::Identity)
-}
-
 /// The resolution the outer certificate's curvature verdict was decided at,
 /// when that verdict admitted the point (#2748, #1561).
 ///
@@ -1360,12 +1344,13 @@ where
                 .and_then(|rho| rho.as_slice())
                 .or(heuristic_log_lambdas);
             let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
-            // #2359: non-Gaussian search consumes the analytic outer gradient
-            // (the family derivative ladder through order three), reserving
-            // exact curvature for the terminal mint audit.  Profiled Gaussian
-            // identity is quadratic in eta and has no expensive order-four
-            // family tower, so it uses the declared exact outer Hessian during
-            // search instead of approximating it with first-order BFGS.
+            // Every family's search consumes the declared exact outer Hessian
+            // (ARC), as profiled Gaussian identity always has. The #2359 split
+            // that held non-Gaussian links to gradient-only BFGS, paying the
+            // order-four family tower only at the mint audit, made binomial and
+            // Poisson fits 6-10x slower than the Gaussian path: BFGS rebuilds
+            // from secant pairs the curvature the evaluator already has exactly
+            // (48-61 outer iterations on a one-smooth n=1000 logistic fit).
             let n_obs = y_o.len();
             let problem = OuterProblem::new(k)
                 .with_gradient(Derivative::Analytic)
@@ -1374,9 +1359,6 @@ where
                 } else {
                     DeclaredHessianForm::Unavailable
                 })
-                .with_prefer_gradient_only(standard_reml_search_prefers_gradient_only(
-                    cfg.link_function(),
-                ))
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                         fit_linear_constraints.as_ref(),

@@ -2245,7 +2245,12 @@ impl<'a> RemlState<'a> {
             "sampled_block_marginal",
             block_terms,
         );
-        let result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
+        let mut result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
+        // A latched correction's `Δ_b` has no ρ-Hessian: the spliced criterion
+        // declares none rather than the Laplace Hessian without `∂²Δ_b`.
+        if self.block_correction_latched() {
+            result.hessian = HessianValue::Unavailable;
+        }
         let components = [
             result.criterion_components.fixed_beta,
             result.criterion_components.logdet_h,
@@ -2366,7 +2371,11 @@ impl<'a> RemlState<'a> {
             "sampled_block_marginal",
             block_terms,
         );
-        let cost_result = self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
+        let mut cost_result =
+            self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
+        if self.block_correction_latched() {
+            cost_result.hessian = HessianValue::Unavailable;
+        }
         crate::estimate::outer_eval_capture::record_outer_criterion_components(
             cost_result.cost,
             [

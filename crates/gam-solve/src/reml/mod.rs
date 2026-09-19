@@ -5612,8 +5612,11 @@ pub(crate) struct RemlState<'a> {
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve
     /// `min(|Δ_b|, 1/n_eff²)`, and held for the fit, so the nodes, and with them
-    /// the value, gradient and moments, are one measure at every ρ.
-    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<Vec<usize>>>,
+    /// the value, gradient and moments, are one measure at every ρ. Beside them
+    /// sit the paired-rule errors measured at that admission: the certificate
+    /// every later evaluation at those orders carries, since the paired error
+    /// no longer switches anything once the orders are latched (#2748).
+    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<(Vec<usize>, Vec<f64>)>>,
     /// Adaptive IFT step-cap controller, the hypergradient budget controller,
     /// and the two mode-response caches.
     ///

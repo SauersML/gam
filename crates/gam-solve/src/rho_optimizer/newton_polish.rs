@@ -79,22 +79,52 @@ pub(super) fn polish_the_mint(
         stationarity_bound,
         bound_source,
     } = inputs;
-    let mut record = match polish {
-        Some(walk) => walk.record,
-        None => crate::model_types::NewtonPolishRecord {
-            lambda_sq_before: evidence.lambda_sq,
-            lambda_sq_after: evidence.lambda_sq,
-            decreases: Vec::new(),
-            step_budget: newton_polish_step_budget(evidence.lambda_sq, evidence.band_f),
-            rails: Vec::new(),
-            entry: result.rho.to_vec(),
-        },
+    let (mut record, walk_face_entry_lambda_sq) = match polish {
+        Some(walk) => (walk.record, Some(walk.face_entry_lambda_sq)),
+        None => (
+            crate::model_types::NewtonPolishRecord {
+                lambda_sq_before: evidence.lambda_sq,
+                lambda_sq_after: evidence.lambda_sq,
+                decreases: Vec::new(),
+                step_budget: newton_polish_step_budget(
+                    evidence.lambda_sq,
+                    evidence.band_f,
+                    SELF_CONCORDANT_RATE,
+                ),
+                rails: Vec::new(),
+                entry: result.rho.to_vec(),
+            },
+            None,
+        ),
     };
     // A rail changes the face, so the first verdict on the new face sets the
     // budget its own decrement allows.
     let face_start = record.rails.last().map_or(0, |rail| rail.steps_before);
-    if !record.rails.is_empty() && record.decreases.len() == face_start {
-        record.step_budget = newton_polish_step_budget(evidence.lambda_sq, evidence.band_f);
+    let steps_on_face = record.decreases.len() - face_start;
+    if !record.rails.is_empty() && steps_on_face == 0 {
+        record.step_budget =
+            newton_polish_step_budget(evidence.lambda_sq, evidence.band_f, SELF_CONCORDANT_RATE);
+    }
+    let face_entry_lambda_sq = match walk_face_entry_lambda_sq {
+        Some(lambda_sq) if steps_on_face > 0 => lambda_sq,
+        _ => evidence.lambda_sq,
+    };
+    // The first Newton step on a face measures the criterion's own quadratic
+    // rate `κ̂ = λ̂₁/λ̂₀²`. A REML/LAML criterion is not self-concordant at
+    // unit scale in ρ: along a smooth whose penalty barely binds, `V‴ ≈ V″`
+    // while `V″` is small, so `κ = ½|V‴|/V″^(3/2)` is far above one and the
+    // unit-rate budget spends its step while Newton is still converging
+    // quadratically (#2954). The budget is extended to what quadratic
+    // convergence at the measured rate allows, never shortened, and the rate is
+    // measured once per face, so a linear-rate walk (an exponential tail, whose
+    // `λ̂²` contracts by `e^(−1)` per step, `κ̂λ̂₁ = e^(−1) > ¼`) gains no step
+    // from it and is railed or refused as before.
+    if steps_on_face == 1 {
+        let measured_rate =
+            (evidence.lambda_sq.sqrt() / face_entry_lambda_sq).max(SELF_CONCORDANT_RATE);
+        record.step_budget = record
+            .step_budget
+            .max(1 + newton_polish_step_budget(evidence.lambda_sq, evidence.band_f, measured_rate));
     }
     record.lambda_sq_after = evidence.lambda_sq;
     let newton_step = analytic_hessian
@@ -133,7 +163,11 @@ pub(super) fn polish_the_mint(
                     result,
                     allow_tail_snap,
                     fidelity,
-                    Some(PolishWalk { record, judged }),
+                    Some(PolishWalk {
+                        record,
+                        judged,
+                        face_entry_lambda_sq,
+                    }),
                 );
             }
             Ok((trial_cost, _)) => format!(
@@ -200,7 +234,13 @@ pub(super) fn polish_the_mint(
                             result,
                             allow_tail_snap,
                             fidelity,
-                            Some(PolishWalk { record, judged }),
+                            // The rail starts a new face; its first verdict
+                            // takes that face's entry decrement.
+                            Some(PolishWalk {
+                                record,
+                                judged,
+                                face_entry_lambda_sq,
+                            }),
                         );
                     }
                     Ok((rail_cost, _)) => {
@@ -291,23 +331,29 @@ pub(super) fn resolvable_decrease_evidence(
     }
 }
 
+/// The quadratic rate `κ` of a standard self-concordant criterion (#2954).
+const SELF_CONCORDANT_RATE: f64 = 1.0;
+
 /// The Newton-step budget a mint's polish may spend, from quadratic convergence
-/// (#2954).
+/// at rate `κ` (#2954).
 ///
 /// For a self-concordant criterion the Newton decrement satisfies `λ₊ ≤ 2λ²`
-/// once `λ ≤ 1/4` (Boyd & Vandenberghe, *Convex Optimization*, §9.6.3). So
-/// `2λ_t ≤ (2λ_0)^(2^t)`, and `½λ_t² ≤ band_f` as soon as
-/// `2^(t+1) ≥ ln(8·band_f)/ln(2λ_0)`. The budget is the smallest such `t`, at
-/// least one step. Outside `λ_0 ≤ 1/4` the bound gives no step count and the
-/// budget is zero. A criterion that needs more steps than this converges slower
-/// than Newton's quadratic rate, and its mint is refused by name.
-pub(super) fn newton_polish_step_budget(lambda_sq: f64, band_f: f64) -> usize {
-    let lambda = lambda_sq.sqrt();
-    if !(lambda.is_finite() && lambda > 0.0 && lambda <= 0.25 && band_f.is_finite() && band_f > 0.0)
+/// once `λ ≤ 1/4` (Boyd & Vandenberghe, *Convex Optimization*, §9.6.3). A
+/// criterion whose third derivative is `κ` times the standard one,
+/// `|V‴| ≤ 2κ·V″^(3/2)`, is standard self-concordant after scaling by `κ²`,
+/// which scales its decrement by `κ`: so `2κλ_t ≤ (2κλ_0)^(2^t)` once
+/// `κλ_0 ≤ 1/4`, and `½λ_t² ≤ band_f` as soon as
+/// `2^(t+1) ≥ ln(8κ²·band_f)/ln(2κλ_0)`. The budget is the smallest such `t`,
+/// at least one step. Outside `κλ_0 ≤ 1/4` the bound gives no step count and
+/// the budget is zero. A criterion that needs more steps than this converges
+/// slower than Newton's quadratic rate, and its mint is refused by name.
+pub(super) fn newton_polish_step_budget(lambda_sq: f64, band_f: f64, rate: f64) -> usize {
+    let scaled = rate * lambda_sq.sqrt();
+    if !(scaled.is_finite() && scaled > 0.0 && scaled <= 0.25 && band_f.is_finite() && band_f > 0.0)
     {
         return 0;
     }
-    let ratio = (8.0 * band_f).ln() / (2.0 * lambda).ln();
+    let ratio = (8.0 * rate * rate * band_f).ln() / (2.0 * scaled).ln();
     if !(ratio.is_finite() && ratio > 1.0) {
         return 1;
     }
@@ -522,6 +568,9 @@ pub(super) fn polish_rail_plan(
 pub(super) struct PolishWalk {
     pub(super) record: NewtonPolishRecord,
     judged: JudgedEvidence,
+    /// `λ̂²` at the first verdict on the current face, from which the face's
+    /// first Newton step measures the criterion's quadratic rate.
+    face_entry_lambda_sq: f64,
 }
 
 /// The certificate evidence a polish trial's evaluation published, with the

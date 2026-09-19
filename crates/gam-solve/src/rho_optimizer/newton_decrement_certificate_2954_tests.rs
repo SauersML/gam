@@ -462,6 +462,42 @@ fn an_exponential_tail_is_railed_at_its_bound_and_certified_there_2954() {
     );
 }
 
+/// `V = n·(0.6 + s·(e^ρ − 1 − ρ))` with `n·s = 1e-4`: an interior optimum at
+/// `ρ = 0` whose third derivative equals its second, so `½V‴/V″^(3/2) =
+/// 1/(2√(n·s)) = 50` and Newton converges quadratically at fifty times the unit
+/// self-concordant rate, as a LAML criterion does along a smooth whose penalty
+/// barely binds. From `ρ = 0.5` (`λ̂ ≈ 5.0e-3`) the unit-rate bound allows two
+/// steps against the channel band `≈ 2.8e-10`, and they leave `½λ̂² ≈ 1.5e-9`.
+/// The first step measures `κ̂ = λ̂₁/λ̂₀² ≈ 42`, at which quadratic convergence
+/// allows a third, and that one reaches the band: the mint certifies the
+/// optimum instead of refusing a walk that is converging at Newton's rate.
+#[test]
+fn a_criterion_at_a_steep_quadratic_rate_is_polished_to_its_optimum_2954() {
+    const STEEP_2954: fn(f64) -> [f64; 3] = |rho| {
+        let s = 1.0e-4 / 2_000.0;
+        [
+            0.6 + s * (rho.exp() - 1.0 - rho),
+            s * (rho.exp() - 1.0),
+            s * rho.exp(),
+        ]
+    };
+    let (outcome, published) =
+        certify_scripted_2954(2_000, 0.5, (-20.0, 20.0), None, STEEP_2954, None);
+    let certificate = outcome.expect("Newton at the measured rate reaches the optimum");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
+    assert_eq!(polish.decreases.len(), 3, "{polish:?}");
+    assert_eq!(polish.step_budget, 3, "{polish:?}");
+    assert!(polish.rails.is_empty(), "{polish:?}");
+    assert!(
+        published[0].abs() <= 1.0e-4,
+        "published at ρ = {:.3e}",
+        published[0]
+    );
+}
+
 /// A coordinate railed at its upper bound whose gradient points back into the
 /// box, `V = n·(0.6 + ½(ρ − ρ*)²)` handed over at `ρ = 20` with `ρ* = 20 − 1e-3`,
 /// fails its bound's KKT condition: its inward descent `n·1e-3` is far above its
