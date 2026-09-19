@@ -8,7 +8,8 @@ the folds where all three exist, the paired per-fold relative change marginal
 vs conditional, and its paired t-statistic across those folds. A change is
 flagged when |t| exceeds the two-sided 5% Student-t quantile for the fold
 count. CV folds share training data, so the fold t overstates significance;
-the replicate study (full_laplace_replicates.py) is the valid test.
+the replicate studies (rho_marginal_replicates.py, full_laplace_replicates.py)
+are the valid test.
 """
 import json
 from pathlib import Path
@@ -25,7 +26,7 @@ def main():
              "|---|---|---:|---|---:|---:|---:|---:|---:|---:|"]
     better = worse = 0
     for p in sorted((HERE / "results").glob("*.json")):
-        if p.name.startswith("full_laplace"):
+        if p.name.startswith(("full_laplace", "gamfit_replicates")):
             continue
         d = json.loads(p.read_text())
         key = "truth_mse" if d["synth"] else "dev"
