@@ -1119,11 +1119,9 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
         &[Vec::new()],
         &kappa_options,
         &setup,
-        crate::seeding::SeedRiskProfile::Survival,
         true,
         analytic_outer_hessian_available,
         true,
-        None,
         Some(walk_signals),
         outer_policy,
         // The final fit: the solver's error is carried whole (#2937). The family

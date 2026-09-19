@@ -5,6 +5,7 @@ use faer::prelude::ReborrowMut;
 use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::FaerArrayView;
 use gam_linalg::matrix::{DesignMatrix, PsdWeightsView, SignedWeightsView};
+use gam_linalg::roundoff::accumulation_growth;
 use gam_linalg::utils::{
     CertifiedSpdFactor, certified_spd_factorize, symmetric_extremes,
     validate_finite_symmetric_matrix,
@@ -1677,18 +1678,6 @@ fn mat_mul_flat(a: &[f64], b_mat: &[f64], out: &mut [f64], b: usize) {
     }
 }
 
-/// Standard `gamma_n = n*u/(1-n*u)` bound for `n` rounded operations, where
-/// binary64 unit roundoff under round-to-nearest is `u = eps/2`.
-#[inline]
-fn floating_point_gamma(operation_count: usize) -> f64 {
-    let accumulated = operation_count as f64 * (0.5 * f64::EPSILON);
-    if accumulated < 1.0 {
-        accumulated / (1.0 - accumulated)
-    } else {
-        f64::INFINITY
-    }
-}
-
 /// Pivot allowance for a row-major `I - left * right` local system.
 ///
 /// The scale is `max(||I-left*right||_inf,
@@ -1747,7 +1736,7 @@ fn identity_minus_product_lu_tolerance(
     let elimination_operations = b.saturating_mul(3);
     let backward_error_scale = operand_envelope_inf.max(system_norm_inf);
     Ok(
-        (floating_point_gamma(formation_operations) + floating_point_gamma(elimination_operations))
+        (accumulation_growth(formation_operations) + accumulation_growth(elimination_operations))
             * backward_error_scale,
     )
 }
@@ -1869,7 +1858,7 @@ fn solve_identity_minus_product_in_place(
     // residual from `I - product`.
     let certification_operations = b.saturating_mul(10);
     let arithmetic_scale = system_norm * solution_norm + rhs_norm;
-    let allowance = floating_point_gamma(certification_operations) * arithmetic_scale
+    let allowance = accumulation_growth(certification_operations) * arithmetic_scale
         + operator_error_bound * solution_norm;
     if rhs[..b].iter().any(|value| !value.is_finite())
         || !residual_norm.is_finite()
@@ -2006,7 +1995,7 @@ mod tests {
     // --- Multi-block ALO tests ---
 
     use super::{
-        MultiBlockAloInput, compute_multiblock_alo, floating_point_gamma,
+        MultiBlockAloInput, accumulation_growth, compute_multiblock_alo,
         identity_minus_product_lu_tolerance, lu_factor_in_place, mat_mul_flat,
     };
     use gam_linalg::matrix::DesignMatrix;
@@ -2304,7 +2293,7 @@ mod tests {
 
         let result = compute_multiblock_alo(&input)
             .expect("trace-one but invertible deletion system must be solved exactly");
-        let roundoff = floating_point_gamma(16);
+        let roundoff = accumulation_growth(16);
         assert!((result.leverage[0] - 1.0).abs() <= roundoff);
         assert!((result.eta_tilde[0][0] - 1.0).abs() <= roundoff);
         assert!((result.eta_tilde[0][1] + 1.0).abs() <= roundoff);

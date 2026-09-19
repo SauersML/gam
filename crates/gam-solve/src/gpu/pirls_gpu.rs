@@ -2861,8 +2861,11 @@ extern "C" __global__ void status_first_ladder(
                     // (step_lm_lambda was stripped from the export), so
                     // H_pen·β ≈ Xᵀ·grad_eta at a KKT-feasible solution.
                     let grad = penalized_hessian.dot(&beta);
+                    // One product, no cancellation of operands: the
+                    // gradient's natural scale is its own magnitude.
+                    let grad_scale = grad.dot(&grad).sqrt();
                     Some(crate::active_set::compute_constraint_kkt_diagnostics(
-                        &beta, &grad, lin,
+                        &beta, &grad, grad_scale, lin,
                     ))
                 });
 
