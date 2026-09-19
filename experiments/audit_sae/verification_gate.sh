@@ -63,7 +63,7 @@ Date: $run_date
 API shipped in this branch:
 
 \`\`\`python
-gamfit.audit_sae(checkpoint, activations, *, codes=None, decoder_key=None, active=None, ...)
+gamfit.sae.audit_sae(checkpoint, activations, *, codes=None, decoder_key=None, active=None, ...)
 \`\`\`
 
 Supported external checkpoint format for the facade:
@@ -113,7 +113,7 @@ Blocked before producing audit numbers.
 
 What blocked it:
 
-- The available MSI gamfit virtualenvs expose neither `gamfit.audit_sae` nor the Rust `audit_sae` pyfunction.
+- The available MSI gamfit virtualenvs expose neither `gamfit.sae.audit_sae` nor the Rust `audit_sae` pyfunction.
 - No extension-build output is part of this verification artifact. The only certified gate here is the crate-local `gam-sae` check captured above.
 - Because the updated Python extension was not available, I did not run the Gemma Scope 2 audit and did not fabricate dual-certified atom counts, dark-matter fractions, or Betti distributions.
 REPORT

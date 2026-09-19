@@ -24,7 +24,7 @@ maps, and distances — not as drop-in latent smooths.
 
 They live in this submodule (rather than the top-level ``gamfit`` namespace)
 to avoid colliding with the existing basis-spec / topology-factory names
-``gamfit.Circle / Cylinder / Sphere / Torus``, which are basis descriptors
+``gamfit.topology.Circle / Cylinder / Sphere / Torus``, which are basis descriptors
 in the new callable-descriptor world.
 
 >>> from gamfit.manifolds import Circle, Sphere, Poincare, Spd
@@ -51,12 +51,14 @@ from ._manifold import (
     Stiefel,
     Torus,
 )
+from ._protocol import ManifoldDescriptor
 
 __all__ = [
     "Circle",
     "CylinderManifold",
     "Euclidean",
     "Grassmann",
+    "ManifoldDescriptor",
     "Poincare",
     "Spd",
     "Sphere",

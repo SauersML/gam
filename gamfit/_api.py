@@ -487,7 +487,7 @@ def _normalize_smooths(
             # On the formula `smooths={}` descriptor path the gating variable
             # is named by data-frame column (resolved to a `by_col` in the Rust
             # merge, identical to `s(x, by=g)`). A raw per-row `by` *array* is
-            # the contract of the primitive numpy API (`gamfit.duchon_basis`,
+            # the contract of the primitive numpy API (`gamfit.basis.duchon_basis`,
             # ... — `crates/gam-pyffi/src/model_ffi.rs`), which has no data
             # frame to name. Reject it loudly here rather than mis-serialize.
             raise ValueError(
@@ -797,7 +797,7 @@ def fit(
     """Fit a GAM model from a formula and tabular data.
 
     Manifold sparse autoencoders have their own explicit
-    :func:`gamfit.sae_manifold_fit` front door.  Keeping the two fit contracts
+    :func:`gamfit.sae.sae_manifold_fit` front door.  Keeping the two fit contracts
     separate prevents a missing formula from silently selecting an unrelated
     model family.
 
@@ -1012,21 +1012,21 @@ def fit(
         ``group_metadata`` or ``precompute_conformal``. A key that
         duplicates a dedicated keyword is refused.
     latents:
-        Mapping from formula symbol to :class:`gamfit.LatentCoord`. This is
+        Mapping from formula symbol to :class:`gamfit.smooth.LatentCoord`. This is
         the standard fit API surface for per-row latent coordinates. The Rust
         standard workflow maps the named formula smooth onto the latent
         coordinate matrix and optimizes it jointly with the REML parameters.
     penalties:
-        Analytic penalty wrappers such as :class:`gamfit.OrthogonalityPenalty`
-        or :class:`gamfit.ARDPenalty`, targeted at latent block names declared
+        Analytic penalty wrappers such as :class:`gamfit.penalties.OrthogonalityPenalty`
+        or :class:`gamfit.penalties.ARDPenalty`, targeted at latent block names declared
         in ``latents``. The Rust-backed public wrappers also
         include the SAE/assignment family
-        (:class:`gamfit.SoftmaxAssignmentSparsityPenalty`,
-        :class:`gamfit.OrderedBetaBernoulliPenalty`,
-        :class:`gamfit.TopKActivationPenalty`,
-        :class:`gamfit.SmoothThresholdPenalty`) and newer structured penalties such
-        as :class:`gamfit.ScadMcpPenalty` and
-        :class:`gamfit.NuclearNormPenalty`. ``penalties=`` is not for smooth
+        (:class:`gamfit.penalties.SoftmaxAssignmentSparsityPenalty`,
+        :class:`gamfit.penalties.OrderedBetaBernoulliPenalty`,
+        :class:`gamfit.penalties.TopKActivationPenalty`,
+        :class:`gamfit.penalties.SmoothThresholdPenalty`) and newer structured penalties such
+        as :class:`gamfit.penalties.ScadMcpPenalty` and
+        :class:`gamfit.penalties.NuclearNormPenalty`. ``penalties=`` is not for smooth
         basis descriptors; pass those through ``smooths=``.
     smooths:
         Optional mapping from formula symbol to :class:`gamfit.smooth.Smooth`
@@ -1364,7 +1364,7 @@ def model_from_dict(payload: Any) -> ManifoldSAE | ManifoldSAESupport:
 
 
 def load(path: str | Path) -> LoadedModel:
-    """Load a fitted model previously written with :func:`gamfit.save`.
+    """Load a fitted model previously written with its ``save(path)`` method.
 
     Reads the file and dispatches through :func:`loads`.
 
@@ -1384,21 +1384,6 @@ def load(path: str | Path) -> LoadedModel:
     >>> model.predict(test_df)
     """
     return loads(Path(path).read_bytes())
-
-
-def save(model: Any, path: str | Path) -> None:
-    """Write a fitted model to ``path``. Symmetric with :func:`gamfit.load`.
-
-    Dispatches to ``model.save(path)`` for any object that exposes the method
-    (covers :class:`Model` binary archives and :class:`ManifoldSAE` JSON
-    payloads alike).
-    """
-    saver = getattr(model, "save", None)
-    if not callable(saver):
-        raise TypeError(
-            f"gamfit.save: {type(model).__name__} has no .save(path) method"
-        )
-    saver(path)
 
 
 def loads(model_bytes: bytes) -> LoadedModel:
@@ -1629,7 +1614,7 @@ def explain_error(exc: BaseException) -> str:
     --------
     >>> try:
     ...     gamfit.fit(df, "y ~ s(nope)")
-    ... except gamfit.GamError as exc:
+    ... except gamfit.errors.GamError as exc:
     ...     print(gamfit.explain_error(exc))
     Check the formula syntax and confirm every referenced column exists.
     """
@@ -2732,7 +2717,7 @@ def gaussian_reml_fit_latent(
     :func:`gaussian_reml_optimize_latent`, which wraps this solve in a
     spectral-seeded outer optimization over ``t``.
 
-    This is the low-level array API behind :class:`gamfit.LatentCoord`: each
+    This is the low-level array API behind :class:`gamfit.smooth.LatentCoord`: each
     row has a latent coordinate ``t_n ∈ R^d`` and the fitted mean is
 
     .. math::
@@ -2989,7 +2974,7 @@ def gaussian_reml_optimize_latent(
 
     A fit is only ever returned from a *converged* optimization (SPEC rule 20).
     If the relative stationarity measure does not reach ``grad_tol`` within the
-    iteration budget, this raises :class:`gamfit.RemlConvergenceError` instead
+    iteration budget, this raises :class:`gamfit.errors.RemlConvergenceError` instead
     of returning a degraded payload. The exception carries the evidence as
     attributes (``grad_t_norm``, ``grad_t_norm_init``, ``grad_t_norm_scaled``,
     ``grad_tol``, ``latent_t_std``, ``objective_value``, ``max_iter``,

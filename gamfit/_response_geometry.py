@@ -425,7 +425,7 @@ class ResponseGeometryModel:
         serialized as a small JSON container that embeds each constituent
         ``Model`` through its own binary archive (base64-encoded ``Model.dumps``)
         plus the base point, coordinate chart, and geometry metadata. Passed to
-        :func:`gamfit.loads` (or written by :meth:`save` / :func:`gamfit.save`)
+        :func:`gamfit.loads` (or written by :meth:`save`)
         it reconstructs a :class:`ResponseGeometryModel` that reproduces
         :meth:`predict`.
         """

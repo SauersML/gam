@@ -8,6 +8,8 @@ from collections.abc import Mapping
 
 import numpy as np
 
+from ._matplotlib import pyplot
+
 
 def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     """Plot one SAE manifold atom in its leading decoder SVD subspace.
@@ -15,7 +17,7 @@ def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     Parameters
     ----------
     fit
-        A fitted :class:`gamfit.ManifoldSAE`-like object with ``atoms``.
+        A fitted :class:`gamfit.sae.ManifoldSAE`-like object with ``atoms``.
     k
         Atom index.
     ax
@@ -41,7 +43,7 @@ def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     active = _active_weights(fit, atom, k, token_proj.shape[0])
 
     if ax is None:
-        from matplotlib import pyplot as plt
+        plt = pyplot()
 
         fig = plt.figure(figsize=(5.2, 4.2))
         if plot_dim == 3:
@@ -65,7 +67,7 @@ def plot_fit(fit: Any) -> Any:
     if not atoms:
         raise ValueError("plot_fit requires fit.atoms to contain at least one atom")
 
-    from matplotlib import pyplot as plt
+    plt = pyplot()
 
     n_atoms = len(atoms)
     ncols = min(3, max(1, ceil(sqrt(n_atoms))))
@@ -97,7 +99,7 @@ def plot(target: Any, atom: int | None = None, *, ax: Any = None, color_by: str 
 
 
 def _plot_standalone_atom(atom: Any, *, ax: Any = None, color_by: str = "assignment") -> Any:
-    from matplotlib import pyplot as plt
+    plt = pyplot()
 
     coords = _as_2d(_atom_field(atom, "coords"), "coords")
     assignments = np.asarray(_atom_field(atom, "assignments"), dtype=float).reshape(-1)

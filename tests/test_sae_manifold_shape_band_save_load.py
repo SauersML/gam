@@ -32,7 +32,7 @@ def _fit_circle(n: int = 400, noise: float = 0.18, seed: int = 0, n_iter: int = 
     t = rng.uniform(0.0, 1.0, n)
     clean = np.column_stack([np.cos(2 * np.pi * t), np.sin(2 * np.pi * t)])
     x = clean + noise * rng.standard_normal((n, 2))
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
         isometry_weight=0.0, sparsity_weight=0.01,
         smoothness_weight=0.01, n_iter=n_iter, learning_rate=1.0, random_state=seed,
@@ -57,7 +57,7 @@ def test_shape_band_survives_save_load_to_tight_tolerance(tmp_path: Path):
 
     path = tmp_path / "sae_band.json"
     fit.save(path)
-    restored = gamfit.ManifoldSAE.load(path)
+    restored = gamfit.sae.ManifoldSAE.load(path)
     restored_atom = restored.atoms[0]
     after = {
         "coords": np.asarray(restored_atom.shape_band_coords),
@@ -94,7 +94,7 @@ def test_restored_covariance_reproduces_analytic_band(tmp_path: Path):
 
     path = tmp_path / "sae_band.json"
     fit.save(path)
-    restored = gamfit.ManifoldSAE.load(path)
+    restored = gamfit.sae.ManifoldSAE.load(path)
     cov_after = np.asarray(restored.atoms[0].decoder_covariance, dtype=float)
     assert cov_after.shape == (m * p, m * p)
 
@@ -170,7 +170,7 @@ def test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale(
     col_scale = np.array([1.0, 1.0e4])
     clean = np.column_stack([np.cos(2 * np.pi * t), np.sin(2 * np.pi * t)]) * col_scale
     x = clean + 0.02 * col_scale * rng.standard_normal((n, 2))
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
         isometry_weight=0.0, sparsity_weight=0.01,
         smoothness_weight=0.01, n_iter=40, learning_rate=1.0, random_state=11,
@@ -195,7 +195,7 @@ def test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale(
 
     path = tmp_path / "sae_hetero.json"
     fit.save(path)
-    restored = gamfit.ManifoldSAE.load(path)
+    restored = gamfit.sae.ManifoldSAE.load(path)
     np.testing.assert_array_equal(
         np.asarray(restored.atoms[0].decoder_coefficients),
         np.asarray(atom.decoder_coefficients),

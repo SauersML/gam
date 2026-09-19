@@ -3,7 +3,7 @@
 Every gamfit exception is defined in Rust via ``pyo3::create_exception!``
 (see ``crates/gam-pyffi/src/lib.rs``) and re-exported here under its public
 ``gamfit.*`` name. The class identity caught by user code with
-``except gamfit.RemlConvergenceError`` is exactly the same Python type
+``except gamfit.errors.RemlConvergenceError`` is exactly the same Python type
 object that the Rust extension constructs via ``RemlConvergenceError::new_err``;
 there is no parallel Python-defined class shadowing the Rust one.
 
@@ -30,7 +30,7 @@ from __future__ import annotations
 from ._binding import RustExtensionUnavailableError, rust_module
 
 # Pull every gamfit exception class out of the Rust extension. This
-# happens at import time so the public ``gamfit.GamError`` name is the
+# happens at import time so the public ``gamfit.errors.GamError`` name is the
 # same type object as ``gam._rust.GamError``.
 _rust = rust_module()
 
@@ -139,7 +139,7 @@ def map_exception(exc: BaseException) -> BaseException:
     Python-native contract violations rather than gamfit engine errors,
     so they pass through unwrapped. Every other ``ValueError`` is
     promoted to :class:`GamError` to preserve the documented
-    ``except gamfit.GamError`` umbrella from issue #330 — this is a
+    ``except gamfit.errors.GamError`` umbrella from issue #330 — this is a
     type-hierarchy widening, never a narrowing, because ``GamError``
     inherits from ``ValueError``.
     """

@@ -1981,7 +1981,7 @@ fn competing_risks_cif_impl(
     let cumulative_hazard =
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
-    // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
+    // `Result<_, SurvivalError>`, dispatch to `gamfit.errors.SurvivalError`.
     let result =
         gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
             .map_err(survival_error_to_pyerr)?;
@@ -2061,7 +2061,7 @@ fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
 ) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
-    // Typed engine path: `SurvivalError` → `gamfit.SurvivalError` (issue
+    // Typed engine path: `SurvivalError` → `gamfit.errors.SurvivalError` (issue
     // #343), no string flattening.
     let result = gam::families::survival::assemble_competing_risks_cif_from_endpoints(
         times,
@@ -4217,7 +4217,7 @@ fn no_criterion_error(payload: &serde_json::Value, surface: &str) -> pyo3::PyErr
 enum RemlFitView<'py> {
     /// The `SummaryPayload` of a gamfit Model or its saved bytes.
     SavedSummary(serde_json::Value),
-    /// A summary mapping (a dict or `gamfit.Summary`) read through `.get`.
+    /// A summary mapping (a dict or `gamfit.results.Summary`) read through `.get`.
     Mapping(Bound<'py, PyAny>),
 }
 

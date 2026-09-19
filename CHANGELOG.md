@@ -1,5 +1,36 @@
 ## Unreleased
 
+- **The top-level `gamfit` namespace is 19 names** (PKG-06). `import gamfit` exposed about
+  340 names: the core API next to every research helper, basis primitive, result class and
+  error type, several under two names. The top level now holds the fit and load entry
+  points and the fitted-model classes: `fit`, `fit_array`, `load`, `loads`,
+  `validate_formula`, `explain_error`, `build_info`, `compare_models`,
+  `competing_risks_cif`, `fit_event_history`, `fit_joint_event_model`,
+  `load_joint_event_model`, `Model`, `MultinomialModel`, `EventHistoryModel`,
+  `JointEventModel`, `ResponseGeometryModel`, `CtnStage1` and `__version__`. Everything else
+  lives in one public submodule, loaded on first access: `basis`, `cuda`, `diagnostics`,
+  `errors`, `examples`, `geometry`, `identifiability`, `inference`, `kernels`, `manifolds`,
+  `penalties`, `plot`, `reml`, `response_geometry`, `results`, `sae`, `sklearn`, `smooth`,
+  `topology`, `torch` (and `kernels_jax` / `kernels_torch`). Every other module is private.
+  `import gamfit` no longer loads the SAE, topology-selection or plotting code.
+  **Migration:** `gamfit.X` becomes `gamfit.<submodule>.X`, for example
+  `gamfit.GamError` → `gamfit.errors.GamError`, `gamfit.Diagnostics` →
+  `gamfit.results.Diagnostics`, `gamfit.bspline_basis` → `gamfit.basis.bspline_basis`,
+  `gamfit.sae_manifold_fit` → `gamfit.sae.sae_manifold_fit`,
+  `gamfit.select_topology` → `gamfit.topology.select_topology`. Duplicates were removed
+  rather than aliased: `gamfit.save(m, path)` → `m.save(path)`;
+  `gamfit.identifiability_check` → `gamfit.identifiability.check`;
+  `gamfit.TopologySphere` → `gamfit.topology.Sphere`; `gamfit.SmoothSpec` →
+  `gamfit.smooth.Smooth`; `gamfit.plot_atom` / `gamfit.plot_fit` →
+  `gamfit.plot.sae_atom` / `gamfit.plot.sae_fit`; `gamfit.PoincareAtoms` /
+  `gamfit.InterchangeSwapDecoder` → `gamfit.torch.PoincareAtoms` /
+  `gamfit.torch.InterchangeSwapDecoder`. The research modules `structure_discovery`,
+  `layer_transport`, `manifold_crosscoder`, `manifold_behavior`, `checkpoint_dynamics`,
+  `intervention_calibration`, `parameter_decomposition`, `bartlett` and `full_conformal`
+  are now private; their public functions are in `gamfit.sae` and `gamfit.inference`.
+- **`gamfit.plot` is a plotting module.** `gamfit.plot.model`, `trace`, `sae_atom` and
+  `sae_fit` import matplotlib when called. Without it they raise an `ImportError` naming
+  the `gamfit[plot]` extra, as do `Model.plot` and `PosteriorSamples.plot_trace`.
 - **Weighted chi-square, F and t tails are accurate relative to the tail itself** (pyGAM
   audit pv-tails-numerics, inference L4). The signed weighted chi-square survival function
   used Imhof's `½ + (1/π)∫`, which cancels once the tail falls below about `1e-16`. It

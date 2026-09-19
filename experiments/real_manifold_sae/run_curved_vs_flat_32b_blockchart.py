@@ -193,7 +193,7 @@ def main():
         "model": "Qwen3-30B-A3B (MoE, 32B) L17 residual",
         "lane": "BLOCK-CHART compose (block_sparse_dictionary_fit + compose_block_charts) "
                 "-- NOT stagewise-T2 (which hangs)",
-        "engine": "gamfit.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
+        "engine": "gamfit.sae.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
         "gamfit_version": ver,
         "provenance": {
             "t1_transform": "ridge-LS top-active support (active=32), NOT dot-product",

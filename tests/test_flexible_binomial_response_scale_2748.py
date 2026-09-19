@@ -36,7 +36,7 @@ def test_flexible_binomial_response_scale_survives_save_load(link, tmp_path):
     }
     before = model.predict(held_out, return_type="dict")
     path = tmp_path / f"flexible-{link}.gam"
-    gamfit.save(model, path)
+    model.save(path)
     loaded = gamfit.load(path)
     assert loaded.family_name == model.family_name
     after = loaded.predict(held_out, return_type="dict")

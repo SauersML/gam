@@ -4507,7 +4507,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // the classes here makes them addressable as `gam._rust.GamError`,
     // `gam._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
     // re-exports each one under its public `gamfit.*` name so the class
-    // identity caught by `pytest.raises(gamfit.RemlConvergenceError)`
+    // identity caught by `pytest.raises(gamfit.errors.RemlConvergenceError)`
     // and constructed by `RemlConvergenceError::new_err(...)` on the
     // Rust side is exactly the same object.
     module.add("GamError", module.py().get_type::<GamError>())?;

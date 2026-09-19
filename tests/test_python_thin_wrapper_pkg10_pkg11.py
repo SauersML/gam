@@ -41,18 +41,18 @@ def _formula_default_open_dim(t: typing.Any) -> int:
 @pytest.mark.parametrize("n", [20, 40, 400])
 def test_bspline_basis_default_has_the_formula_dimension(n: int) -> None:
     t = np.linspace(0.0, 1.0, n)
-    basis = gamfit.bspline_basis(t)
+    basis = gamfit.basis.bspline_basis(t)
     assert basis.shape == (n, _formula_default_open_dim(t))
-    derivative = gamfit.bspline_basis_derivative(t)
+    derivative = gamfit.basis.bspline_basis_derivative(t)
     assert derivative.shape == basis.shape
 
 
 def test_periodic_bspline_basis_default_has_the_cyclic_formula_dimension() -> None:
     t = np.linspace(0.0, 1.0, 400)
     # cyclic(x) default: min(internal + degree + 1, 12).
-    assert gamfit.bspline_basis(t, periodic=True).shape == (400, 12)
+    assert gamfit.basis.bspline_basis(t, periodic=True).shape == (400, 12)
     # An explicit K still names K + degree + 1 cyclic controls.
-    assert gamfit.bspline_basis(t, 5, periodic=True).shape == (400, 5 + 3 + 1)
+    assert gamfit.basis.bspline_basis(t, 5, periodic=True).shape == (400, 5 + 3 + 1)
 
 
 def test_duchon_default_centers_are_not_coarser_than_the_default_spline() -> None:
@@ -65,7 +65,7 @@ def test_duchon_default_centers_are_not_coarser_than_the_default_spline() -> Non
 
 def test_duchon_basis_size_without_centers_is_data_dependent() -> None:
     with pytest.raises(ValueError, match="depends on the data"):
-        gamfit.Duchon().basis_size()
+        gamfit.smooth.Duchon().basis_size()
 
 
 def test_python_owns_no_basis_defaults_or_multinomial_entry() -> None:
