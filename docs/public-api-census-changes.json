@@ -4475,5 +4475,13 @@
     },
     "reason": "#2900 row 24.2 (SPEC rule 24): the four pub(crate) second-order helpers are opt::second_order at opt 53ce029, re-exported by run.rs under the same names, so no call site changes.",
     "evidence": "git grep -w at d10950d360: every caller is in gam-solve's rho_optimizer (run.rs, bridges.rs, run_plan_tests.rs, rail_projection_tests.rs, arc_curvature_stationary_2817_tests.rs) and resolves through the re-export; gam-pyffi names none of them."
+  },
+  {
+    "base": "0827abd72c6e08487b409c3b26a9a843f6d3a763",
+    "removed": {
+      "crates/gam-terms/src/basis/bspline_eval.rs::create_difference_penalty_matrix": 1
+    },
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix was a coefficient-difference penalty DᵀD. SPEC puts penalties on the function; production B-spline penalties are bspline_derivative_penalty_matrix, and the function's one production caller discarded its result. Deleted together with the dead penalty output of compute_geometric_constraint_transform (see docs/source-removal-changes.json).",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call, in duchon_thinplate.rs compute_geometric_constraint_transform, whose output both bspline_build.rs callers bind to `_`; all other uses are tests, now served by the test-only gam_linalg_test_support::coefficient_difference_penalty. cargo check --workspace --all-targets RC 0."
   }
 ]

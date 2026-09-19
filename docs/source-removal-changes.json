@@ -1428,5 +1428,21 @@
     ],
     "reason": "#2822: the ring-of-clusters generalized EM now takes a squared-extrapolation (SQUAREM S3) update, ring_mixture_squarem_update, in place of the EM-or-Newton choice. At an over-fitted order EM contracts along one fixed direction (successive updates parallel, cosine 1.000000, rate 0.9989-0.9999), and the S3 extrapolation is that direction's limit. The Newton proposal stepped only along resolvably positive curvature and was not an ascent above EM along the split. It is deleted with its analytic gradient and Hessian, ring_mixture_log_likelihood_derivatives, which had no other consumer, and with their central-difference test.",
     "evidence": "At 5cd50a7d95, git grep -n -w finds ring_mixture_log_likelihood_derivatives only in crates/gam-solve/src/evidence.rs (its declaration at 2179, its call in ring_mixture_newton_proposal at 2315 and the test at 4538/4548), ring_mixture_newton_proposal only there (declaration 2308, the fit loop's call at 2498), and ring_mixture_newton_derivatives_match_central_differences_2822 only at its declaration at 4508. All of these are deleted in this commit. The guard of direct gate dy5 run sc-ring-g1 (base 5cd50a7d95, tree 848e475b54) names exactly these three items: two production fns with production_occurrences 4 and 2, and one test-scoped fn. That gate: workspace --all-targets check RC 0, gam-pyffi RC 0, gam-solve evidence:: and topology_selector:: tests RC 0, public API census 0, assertionless 0. Lane-only job 1335942 at eded626399: gam-solve 68/68 and gam-sae atom_shape_race 13/13 pass with the change, and the alpha = -1 mutant fails both ring pins."
+  },
+  {
+    "base": "0827abd72c6e08487b409c3b26a9a843f6d3a763",
+    "items": [
+      "crates/gam-terms/src/basis/bspline_eval.rs:fn:create_difference_penalty_matrix",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:clamped_cubic_knots",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:difference_penalty_annihilates_constant_and_greville_linear",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:difference_penalty_rejects_collapsed_span",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:difference_penalty_value_is_scale_invariant_across_decades",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:penalty_for_width",
+      "crates/gam-terms/src/basis/internal.rs:fn:divided_difference_penalty_is_invariant_on_tiny_coordinate_domains",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:test_penalty_matrix_creation",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:test_penalty_matrix_rejects_singular_greville_span"
+    ],
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix built the knot-scaled coefficient-difference Gram DᵀD, a penalty on the coefficient sequence. SPEC puts penalties on the function: every production B-spline penalty is the exact function-space Gram bspline_derivative_penalty_matrix (∫B^(m)B^(m)ᵀ), and the one production caller, compute_geometric_constraint_transform, formed this penalty only for bspline_build.rs to discard it (`let (z, _)`). The function now returns just the transform Z and the difference penalty is deleted. The removed tests exercised only that deleted function (its null space, span rejection and scale invariance) or the discarded penalty output of owed_bughunt_splines_tests.rs; clamped_cubic_knots and penalty_for_width were that file's private helpers. Tests that used the Gram only as a generic PSD fixture now call the test-only gam_linalg_test_support::coefficient_difference_penalty.",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call (duchon_thinplate.rs compute_geometric_constraint_transform) whose penalty result both bspline_build.rs callers bind to `_`; every other occurrence is a test or a comment. In the landing tree the name has 0 occurrences outside this ledger. cargo check --workspace --all-targets RC 0; gam-terms basis::tests::test_geometric_constraint_transform_{orthogonality,dimensions} and knot_scale_invariance_tests pass; gam-linalg-test-support 13/13 including coefficient_difference_penalty_matches_closed_form_second_difference_gram."
   }
 ]
