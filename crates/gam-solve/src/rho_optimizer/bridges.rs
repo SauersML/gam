@@ -3098,8 +3098,8 @@ impl OuterSecondOrderBridge<'_> {
     /// margin-railed coordinates of the search box, the objective's declared
     /// invariance, and the resolution `floor·(1 + |V|)` that the certificate's
     /// `asymptote_objective_tol` equals. It stops ARC only when the claim is
-    /// contradicted AND `|Pg|` is inside the certificate's first-order band at the
-    /// incumbent's value ([`CostStallGuard::stationarity_band`]); the mandatory final certificate
+    /// contradicted, or unresolvable at every allowed step (#3036), AND `|Pg|`
+    /// is inside the certificate's first-order band at the incumbent's value ([`CostStallGuard::stationarity_band`]); the mandatory final certificate
     /// re-derives its verdict from a fresh evaluation regardless. A descended or
     /// declined adjudication leaves the escape standing, and the objective is
     /// re-evaluated at `x` so ARC's next trial starts from the state it holds.
@@ -3159,23 +3159,23 @@ impl OuterSecondOrderBridge<'_> {
                      |Pg|={grad_norm:.3e} is inside the certificate's band {grad_threshold:.3e} after \
                      {iterations} accepted outer iteration(s) (value={value:.6e}; #1082, #2612).",
                 );
-                let guard = self.cost_stall.as_mut()?;
-                if let Ok(mut slot) = guard.exit.lock() {
-                    *slot = Some(CostStallExit {
-                        rho,
-                        value,
-                        grad_norm,
-                        iterations,
-                        converged: true,
-                        // No stall window's evidence is reported: the rung that
-                        // stopped this run is the certificate's band.
-                        probe_scale: None,
-                        rank_boundary: None,
-                    });
-                }
-                Some(ObjectiveEvalError::fatal(
-                    ARC_CURVATURE_STATIONARY_SENTINEL.to_string(),
-                ))
+                self.stop_at_accepted_strict_saddle(rho, value, grad_norm, iterations)
+            }
+            super::run::SaddleAdjudication::Unresolvable {
+                lambda_min,
+                predicted_at_largest,
+                ..
+            } => {
+                log::debug!(
+                    "[OUTER] ARC stopping at the strict-saddle incumbent its own certificate \
+                     accepts: the reported negative curvature is UNRESOLVABLE by the criterion \
+                     ({curvature_note}; lambda_min={lambda_min:.6e} predicts at most \
+                     {predicted_at_largest:.3e} at the largest step, against resolution \
+                     {objective_resolution:.3e}), and |Pg|={grad_norm:.3e} is inside the \
+                     certificate's band {grad_threshold:.3e} after {iterations} accepted outer \
+                     iteration(s) (value={value:.6e}; #1082, #3036).",
+                );
+                self.stop_at_accepted_strict_saddle(rho, value, grad_norm, iterations)
             }
             other => {
                 if let super::run::SaddleAdjudication::Declined(reason) = &other {
@@ -3192,6 +3192,35 @@ impl OuterSecondOrderBridge<'_> {
                 None
             }
         }
+    }
+
+    /// Stop ARC at a strict-saddle incumbent whose curvature verdict the
+    /// criterion withdrew, contradicted (#2612) or unresolvable (#3036): publish
+    /// the incumbent as a converged cost-stall exit and hand `opt` the sentinel.
+    fn stop_at_accepted_strict_saddle(
+        &mut self,
+        rho: Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        iterations: usize,
+    ) -> Option<ObjectiveEvalError> {
+        let guard = self.cost_stall.as_mut()?;
+        if let Ok(mut slot) = guard.exit.lock() {
+            *slot = Some(CostStallExit {
+                rho,
+                value,
+                grad_norm,
+                iterations,
+                converged: true,
+                // No stall window's evidence is reported: the rung that
+                // stopped this run is the certificate's band.
+                probe_scale: None,
+                rank_boundary: None,
+            });
+        }
+        Some(ObjectiveEvalError::fatal(
+            ARC_CURVATURE_STATIONARY_SENTINEL.to_string(),
+        ))
     }
 
     /// Fold one INFEASIBLE ARC trial (non-finite cost) into the cost-stall
