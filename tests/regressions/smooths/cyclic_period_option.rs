@@ -177,25 +177,6 @@ fn cyclic_declared_period_wraps_at_seam() {
     }
 }
 
-/// The `cc` / `cp` aliases share the dispatch arm and must honour `period=` too.
-#[test]
-fn cc_and_cp_aliases_honour_period_option() {
-    let grid = probe_grid();
-    let reference = fit_predict(
-        "y ~ cyclic(theta, k=10, period_start=0, period_end=2*pi)",
-        &grid,
-    );
-    for alias in ["cc", "cp"] {
-        let form = fit_predict(&format!("y ~ {alias}(theta, k=10, period=2*pi)"), &grid);
-        let diff = max_abs_diff(&form, &reference);
-        assert!(
-            diff < 1e-9,
-            "`{alias}(theta, period=2*pi)` disagrees with the cyclic endpoint reference \
-             (max abs diff {diff:.3e})"
-        );
-    }
-}
-
 /// #815: an unparseable endpoint must be a hard error, never a silent fallback
 /// to the data range.
 #[test]

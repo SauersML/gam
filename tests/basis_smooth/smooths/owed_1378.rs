@@ -361,7 +361,7 @@ fn worst_permutation_drift(bs: &str) -> PermutationReport {
 fn default_thin_plate_fit_is_row_permutation_invariant_1378() {
     init_parallelism();
 
-    let tp = worst_permutation_drift("tp");
+    let tp = worst_permutation_drift("tps");
     eprintln!(
         "#1378 bs=tps row-permutation drift = {:.3e} ({:.4}% of signal range {:.3e})",
         tp.worst_drift,

@@ -84,7 +84,7 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    // Natural cubic regression spline (bs="cr"/"cs", #1074): a dense
+    // Natural cubic regression spline (bs="cr", #1074): a dense
     // value-at-knot basis with its own roughness penalty, not a B-spline
     // derivative penalty. Route to the dedicated builder BEFORE the B-spline-only
     // auto-shrink and periodic logic so neither touches a cr spec.
@@ -753,7 +753,7 @@ pub fn build_bspline_basis_1d(
     })
 }
 
-/// Build a natural cubic regression spline (mgcv `bs="cr"`/`"cs"`, #1074) basis
+/// Build a natural cubic regression spline (`bs="cr"`, #1074) basis
 /// from a fixed Lancaster–Salkauskas knot set.
 ///
 /// Mirrors the dense-penalty tail of the other dense bases (design + penalty

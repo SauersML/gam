@@ -2097,8 +2097,7 @@ fn parse_tensor_identifiability(
 }
 
 /// Parse the `identifiability=` option for every 1-D B-spline family arm —
-/// `s()` / `bs='ps'|'bspline'|'cr'|'cs'` and the cyclic `cc`/`cp`/`periodic`
-/// selector.
+/// `s()` / `bs='ps'|'bspline'|'cr'` and the `cyclic` selector.
 ///
 /// Returns `Ok(None)` when the option is absent so each arm can keep applying
 /// its own *structural* default: an anchored endpoint is already the model's
@@ -2224,7 +2223,7 @@ fn resolve_bspline_identifiability(
         if context.natural_cubic_regression {
             return Err(TermBuilderError::incompatible_config(
                 "identifiability='linear' needs B-spline knot/degree geometry, which the natural \
-                 cubic regression basis (bs='cr'/'cs') does not carry; use 'none' or 'sum_tozero', \
+                 cubic regression basis (bs='cr') does not carry; use 'none' or 'sum_tozero', \
                  or switch to bs='ps'",
             )
             .to_string());
@@ -2684,10 +2683,10 @@ pub(crate) fn build_smooth_basis(
         };
         let (n_knots, _, effective_degree) =
             parse_ps_internal_knots(options, degree, default_internal)?;
-        // `m=` is mgcv's spelling of `penalty_order=` and is resolved as its
-        // alias here (#2791). It used to be read further down as a boolean gate
-        // on the `Fs` null-penalty path instead, which made every value >= 1 the
-        // same model and dropped the key entirely on `sz`.
+        // `penalty_order=` is resolved here (#2791). An earlier `m=` key was read
+        // further down as a boolean gate on the `Fs` null-penalty path instead,
+        // which made every value >= 1 the same model and dropped the key
+        // entirely on `sz`; `m=` is now refused and names `penalty_order=`.
         let penalty_order = resolve_spline_penalty_order(
             parse_penalty_order(options)?,
             effective_degree,
@@ -4040,7 +4039,7 @@ pub(crate) fn build_smooth_basis(
                     log::debug!(
                         "tensor smooth: margin axis {axis} requested k={k_requested}, but the \
                          covariate has only {n_distinct_axis} distinct value(s); reducing this \
-                         margin to k={k_axis} (mgcv-style data-support cap on the per-axis basis)."
+                         margin to k={k_axis} (data-support cap on the per-axis basis)."
                     );
                 }
                 // Per-axis effective spline degree. The B-spline basis with `k`
@@ -4567,7 +4566,7 @@ fn capped_cr_marginal_knotspec(
     let k_cr = k_cr_requested.min(n_distinct);
     if k_cr < CR_MIN_KNOTS {
         inference_notes.advise(format!(
-            "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis requested k={k_cr_requested}, \
+            "Smooth '{label}': cubic-regression ('cr'/'sz') basis requested k={k_cr_requested}, \
              but the covariate has only {n_distinct} distinct value(s) — too few to support a cubic \
              regression spline (needs >= {CR_MIN_KNOTS} distinct values). Degraded to the linear \
              B-spline marginal the default basis builds on the same data."
@@ -4576,9 +4575,9 @@ fn capped_cr_marginal_knotspec(
     }
     if k_cr < k_cr_requested {
         inference_notes.advise(format!(
-            "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis reduced from k={k_cr_requested} \
-             to k={k_cr} to match the covariate's {n_distinct} distinct value(s) (mgcv-style \
-             data-support cap; a cr basis cannot place more value-knots than the data has)."
+            "Smooth '{label}': cubic-regression ('cr'/'sz') basis reduced from k={k_cr_requested} \
+             to k={k_cr} to match the covariate's {n_distinct} distinct value(s) (data-support \
+             cap; a cr basis cannot place more value-knots than the data has)."
         ));
     }
     let cr_knots = crate::basis::select_cr_knots(col, k_cr).map_err(|e| e.to_string())?;

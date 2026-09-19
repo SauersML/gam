@@ -159,7 +159,7 @@ fn assert_by_factor_spatial_freeze_replays(bs: &str) {
 
 #[test]
 fn gam_matern_by_factor_predict_replays_frozen_basis() {
-    assert_by_factor_spatial_freeze_replays("gp");
+    assert_by_factor_spatial_freeze_replays("matern");
 }
 
 #[test]

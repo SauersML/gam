@@ -85,7 +85,7 @@ def _max_drift_under_permutation(bs: str) -> tuple[float, float]:
 
 def test_default_thinplate_fit_is_row_permutation_invariant() -> None:
     """The DEFAULT ``s(x, bs="tps")`` fit must not move under a row permutation."""
-    drift, signal_range = _max_drift_under_permutation("tp")
+    drift, signal_range = _max_drift_under_permutation("tps")
     rel = drift / signal_range
     assert drift < DRIFT_CEILING, (
         f'default s(x, bs="tps") is not row-permutation invariant: '
