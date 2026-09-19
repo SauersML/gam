@@ -105,8 +105,10 @@ pub enum WorkflowError {
     /// last under-resolved fit as if it were complete.
     SpatialUnderresolved {
         term: String,
-        current_centers: usize,
-        attempted_centers: usize,
+        /// The resolution the converged fit realized.
+        current_resolution: String,
+        /// The refinement that could not be certified.
+        attempted_resolution: String,
         reason: String,
         /// The certification refit's own failure, when a refit is what failed.
         /// It decides the failure's category; `reason` renders it (#2937).
@@ -164,15 +166,14 @@ impl std::fmt::Display for WorkflowError {
             }
             WorkflowError::SpatialUnderresolved {
                 term,
-                current_centers,
-                attempted_centers,
+                current_resolution,
+                attempted_resolution,
                 reason,
                 ..
             } => write!(
                 f,
-                "smooth term '{term}' remains under-resolution-uncertain at resolution \
-                 {current_centers} (centers, or internal knots for a B-spline): the \
-                 resolution-{attempted_centers} certification refit failed ({reason})"
+                "smooth term '{term}' remains under-resolved at {current_resolution}; its \
+                 refinement to {attempted_resolution} was not certified ({reason})"
             ),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
             WorkflowError::TermBuilder { source } => std::fmt::Display::fmt(source, f),
@@ -942,8 +943,8 @@ mod fit_failure_tests {
         let refit = WorkflowError::from(FitFailure::from(seeds_refused()));
         let refused = WorkflowError::SpatialUnderresolved {
             term: "s(x)".to_string(),
-            current_centers: 8,
-            attempted_centers: 16,
+            current_resolution: "8 centers".to_string(),
+            attempted_resolution: "16 centers".to_string(),
             reason: refit.to_string(),
             refit_failure: Some(Box::new(refit)),
         };
@@ -951,8 +952,8 @@ mod fit_failure_tests {
         assert_eq!(refused.variant_name(), "EstimationError::StartupSeedsRefused");
         let exhausted = WorkflowError::SpatialUnderresolved {
             term: "s(x)".to_string(),
-            current_centers: 8,
-            attempted_centers: 8,
+            current_resolution: "8 centers".to_string(),
+            attempted_resolution: "8 centers".to_string(),
             reason: "term EDF remains at its realized basis ceiling".to_string(),
             refit_failure: None,
         };

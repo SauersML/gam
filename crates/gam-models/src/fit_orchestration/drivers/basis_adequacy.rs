@@ -598,9 +598,9 @@ pub const BASIS_ADEQUACY_NOTE_LEVEL: f64 = 1.0e-3;
 /// The rows whose lack-of-fit test rejects basis adequacy at the family-wise
 /// [`BASIS_ADEQUACY_NOTE_LEVEL`], Bonferroni-corrected over the tested terms.
 ///
-/// Both consumers of the verdict read it here: the fit-time note, and the
-/// adaptive spatial-resolution loop that grows the basis the note tells a user
-/// to grow. One reading keeps the advisory and the action from disagreeing.
+/// This is the advisory reading only. The adaptive resolution loop does not
+/// act on a significance level: it screens with the statistic's own
+/// deviance-per-parameter reading and lets the refit's REML evidence decide.
 pub(crate) fn basis_adequacy_rows_lacking_fit(
     rows: &[BasisAdequacyRow],
 ) -> impl Iterator<Item = &BasisAdequacyRow> {

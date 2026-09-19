@@ -1493,7 +1493,7 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
     );
 
     let initial_config = FitConfig {
-        spatial_center_counts: Some(Vec::new()),
+        adaptive_resolution: Some(Vec::new()),
         ..FitConfig::default()
     };
     let initial = materialize(formula, &data, &initial_config)
@@ -1518,7 +1518,9 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
         "test data must leave room for a genuine {label} growth proposal"
     );
     let growth_config = FitConfig {
-        spatial_center_counts: Some(vec![Some(proposed_centers)]),
+        adaptive_resolution: Some(vec![Some(
+            gam_terms::smooth::AdaptiveResolution::Centers(proposed_centers),
+        )]),
         ..FitConfig::default()
     };
     let grown = materialize(formula, &data, &growth_config)
@@ -1556,7 +1558,9 @@ fn matern_is_excluded_from_generic_adaptive_center_growth() {
         formula,
         &data,
         &FitConfig {
-            spatial_center_counts: Some(vec![Some(raw_centers.saturating_mul(2))]),
+            adaptive_resolution: Some(vec![Some(
+                gam_terms::smooth::AdaptiveResolution::Centers(raw_centers.saturating_mul(2)),
+            )]),
             ..FitConfig::default()
         },
     )
@@ -1594,7 +1598,7 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     let raw_centers = raw_spec.center_strategy.planned_num_centers(2);
 
     let adaptive_config = FitConfig {
-        spatial_center_counts: Some(Vec::new()),
+        adaptive_resolution: Some(Vec::new()),
         ..FitConfig::default()
     };
     let adaptive = materialize("y ~ duchon(ct, st)", &data, &adaptive_config)
