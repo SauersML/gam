@@ -452,6 +452,106 @@ class Model:
         """Return fitted smoothing/precision parameters by penalty index."""
         return dict(rust_module().smoothing_parameters_from_model(self._model_bytes))
 
+    # -- fitted-result accessors -------------------------------------------------
+    # Each reads one field of the Rust ``SummaryPayload`` (the same document
+    # ``gam summary`` prints); nothing is recomputed here.
+
+    @property
+    def coefficients(self) -> NDArray[np.float64]:
+        """Fitted coefficient vector ``beta_hat`` in design-column order."""
+        return np.asarray(
+            [record["estimate"] for record in self.summary().coefficients], dtype=float
+        )
+
+    @property
+    def edf_total(self) -> float | None:
+        """Total effective degrees of freedom
+        ``tr(H^-1 X'WX) = p - sum_k tr(lambda_k H^-1 S_k)``; ``n - edf_total``
+        is the residual degrees of freedom behind :attr:`scale`."""
+        return self.summary().edf_total
+
+    @property
+    def smooth_edf(self) -> dict[str, float]:
+        """Effective degrees of freedom of each smooth / random-effect term,
+        keyed by term name (the ``edf`` column of
+        :meth:`Summary.smooth_terms_frame`)."""
+        return {
+            str(record["name"]): float(record["edf"])
+            for record in self.summary().smooth_terms
+        }
+
+    @property
+    def scale(self) -> float | None:
+        """Estimated dispersion ``phi_hat`` of the fitted family.
+
+        Gaussian: ``sigma_hat^2 = RSS_w / (n - edf_total)`` (mgcv's
+        ``gam.scale``); Gamma: ``1 / shape``; fixed-scale families (Poisson,
+        binomial): ``1``. ``None`` only for a custom family that declares no
+        dispersion.
+        """
+        return self.summary().scale
+
+    @property
+    def log_likelihood(self) -> float | None:
+        """Ordinary log-likelihood at the fitted coefficients and :attr:`scale`."""
+        return self.summary().log_likelihood
+
+    @property
+    def deviance(self) -> float | None:
+        """Model deviance at the fitted coefficients (prior weights included)."""
+        return self.summary().deviance
+
+    @property
+    def n_obs(self) -> int | None:
+        """Number of training rows the model was fitted on."""
+        return self.summary().n_obs
+
+    @property
+    def convergence(self) -> dict[str, Any] | None:
+        """The optimizer's convergence certificate; see :attr:`Summary.convergence`."""
+        return self.summary().convergence
+
+    @property
+    def outer_iterations(self) -> int | None:
+        """Outer (smoothing-parameter) iterations the convergence proof covers."""
+        convergence = self.convergence
+        return None if convergence is None else convergence["outer_iterations"]
+
+    @property
+    def inner_iterations(self) -> int | None:
+        """Inner P-IRLS iterations of the final coefficient solve."""
+        convergence = self.convergence
+        return None if convergence is None else convergence["inner_iterations"]
+
+    def residuals(
+        self,
+        data: Any,
+        type: Literal["response", "working", "deviance", "pearson"] = "deviance",
+    ) -> NDArray[np.float64]:
+        """Per-row residuals of the fit on the labelled rows ``data``.
+
+        The saved model carries no per-row training data, so the rows are
+        passed back: the training table gives in-sample residuals, any other
+        labelled table gives residuals at the fitted coefficients. The Rust
+        core evaluates ``eta = X beta_hat + offset`` and the family's residual
+        kernel, with prior weights as at fit time:
+
+        - ``"response"``: ``y - mu``
+        - ``"working"``: ``(y - mu) / (dmu/deta)``
+        - ``"deviance"``: ``sign(y - mu) sqrt(d_i)``, so
+          ``sum(r**2) == deviance`` on the training rows
+        - ``"pearson"``: ``(y - mu) sqrt(w / V(mu))``
+
+        ``gam residuals MODEL DATA --type TYPE`` returns the same values.
+        """
+        headers, rows, _ = normalize_table(data)
+        try:
+            return rust_module().residuals_table(
+                self._prediction_model, headers, rows, type
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+
     def check(self, data: Any) -> SchemaCheck:
         """Validate ``data`` against the model's training schema."""
         headers, rows, _ = normalize_table(data)

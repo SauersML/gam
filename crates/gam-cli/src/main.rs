@@ -167,6 +167,8 @@ mod run_crosscoder;
 mod run_parameter_decomposition;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
+#[path = "main/run_summary.rs"]
+mod run_summary;
 #[path = "main/run_fit.rs"]
 mod run_fit;
 #[path = "main/run_joint_events.rs"]
@@ -191,6 +193,7 @@ pub(crate) use prediction_csv::*;
 pub(crate) use run_crosscoder::*;
 pub(crate) use run_parameter_decomposition::*;
 pub(crate) use run_diagnose::*;
+pub(crate) use run_summary::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_joint_events::*;
 pub(crate) use run_predict::*;
@@ -304,6 +307,8 @@ fn run() -> CliResult<()> {
             run_transformation_score(args).map_err(CliError::from)
         }
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
+        Command::Summary(args) => run_summary(args).map_err(CliError::from),
+        Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),
         Command::Generate(args) => run_generate(args).map_err(CliError::from),
         Command::JointEvents(args) => run_joint_events(args).map_err(CliError::from),

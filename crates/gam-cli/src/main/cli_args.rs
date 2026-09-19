@@ -101,6 +101,11 @@ pub(crate) enum Command {
     TransformationScore(TransformationScoreArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Print a fitted model's summary (coefficients, EDF, smoothing
+    /// parameters, scale, log-likelihood, deviance, convergence) as JSON.
+    Summary(SummaryArgs),
+    /// Print a fitted model's per-row residuals on a labeled dataset as JSON.
+    Residuals(ResidualsArgs),
     /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
@@ -522,6 +527,29 @@ pub(crate) struct DiagnoseArgs {
         help = "Dataset to evaluate diagnostics against (CSV or parquet); typically the training data"
     )]
     pub(crate) data: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SummaryArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ResidualsArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Labeled dataset (CSV or parquet) carrying the response; the training data for in-sample residuals"
+    )]
+    pub(crate) data: PathBuf,
+    #[arg(
+        long = "type",
+        value_name = "TYPE",
+        help = "Residual type: response, working, deviance or pearson"
+    )]
+    pub(crate) kind: gam::solver::pirls::ResidualKind,
 }
 
 #[derive(Args, Debug)]

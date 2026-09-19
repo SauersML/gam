@@ -24,6 +24,7 @@ mod low_rank;
 mod newton_solve;
 mod penalty;
 mod pls_solver;
+mod residuals;
 mod reweight;
 mod sparse_system;
 mod state;
@@ -34,6 +35,8 @@ mod workspace;
 mod beta_logistic_saturated_row_2902_tests;
 #[cfg(test)]
 mod firth_noncanonical_curvature_2273_tests;
+#[cfg(test)]
+mod residuals_tests;
 #[cfg(test)]
 mod sas_saturated_row_2733_tests;
 #[cfg(test)]
@@ -59,6 +62,7 @@ pub(crate) use gam_working_model::*;
 pub use glm_update::*;
 pub use low_rank::*;
 pub use newton_solve::*;
+pub use residuals::*;
 pub(crate) use sparse_system::*;
 pub(crate) use working_model_trait::*;
 pub use workspace::*;

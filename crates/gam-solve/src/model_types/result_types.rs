@@ -4364,7 +4364,9 @@ pub struct UnifiedFitResult {
     /// Solver artifacts (e.g. cached PIRLS result for ALO).
     #[serde(default)]
     pub artifacts: FitArtifacts,
-    /// Inner cycle count (blockwise path).
+    /// Inner iterations of the final certified inner solve at the reported
+    /// smoothing parameters: P-IRLS iterations on the standard path, blockwise
+    /// cycles on the custom-family path.
     #[serde(default)]
     pub inner_cycles: usize,
     /// Number of outer REML cost-only evaluations the fit executed (each

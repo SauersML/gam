@@ -37,7 +37,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "reml_score_unavailable",
     "null_space_logdet",
     "null_dim",
-    "iterations",
+    "scale",
     "edf_total",
     "edf_rank_bound",
     "lambdas",
@@ -199,8 +199,12 @@ class Summary:
         evidence calculation.
     null_dim : float or None
         Dimension of the penalty null space.
-    iterations : int or None
-        Outer-loop iteration count.
+    scale : float or None
+        Estimated dispersion :math:`\\hat\\varphi` of the fitted family:
+        Gaussian :math:`\\hat\\sigma^2 = \\mathrm{RSS}_w / (n - \\mathrm{edf})`
+        (mgcv's ``gam.scale``), Gamma ``1 / shape``, ``1`` for fixed-scale
+        families (Poisson, binomial). ``None`` only for a custom family that
+        declares no dispersion.
     edf_total : float or None
         Total effective degrees of freedom across all blocks.
     edf_rank_bound : list of mapping
@@ -278,6 +282,8 @@ class Summary:
         ``certified`` is the
         verdict the mint gate used; ``inner_status`` is the terminal P-IRLS
         status; ``outer_iterations`` is the iteration count the proof covers;
+        ``inner_iterations`` is the P-IRLS iteration count of the final
+        coefficient solve;
         ``outer`` is ``None`` when no smoothing coordinate was optimized (there
         is no outer stationarity equation, which is *not* the same as a zero
         gradient), else a mapping carrying ``kind``, ``gradient_norm``,
@@ -312,7 +318,7 @@ class Summary:
     reml_score_unavailable: str | None = None
     null_space_logdet: float | None = None
     null_dim: float | None = None
-    iterations: int | None = None
+    scale: float | None = None
     edf_total: float | None = None
     #: Per-block rank-bound status beside the EDF fields (#2901).
     edf_rank_bound: list[Any] = field(default_factory=list)
@@ -355,7 +361,7 @@ class Summary:
     deployment_extensions: list[dict[str, Any]] = field(default_factory=list)
     #: How the optimization that produced this fit terminated (#2411), read
     #: from the certificate the fit itself carries. Keys: ``certified``,
-    #: ``inner_status``, ``outer_iterations``, and ``outer`` — the last being
+    #: ``inner_status``, ``outer_iterations``, ``inner_iterations``, and ``outer`` — the last being
     #: ``None`` when no smoothing coordinate was optimized, else a mapping with
     #: ``kind``, ``gradient_norm``, ``projected_gradient_norm``,
     #: ``stationarity_bound``, ``hessian_psd`` and ``lambdas_railed``.
@@ -488,8 +494,13 @@ class Summary:
             )
         if self.edf_total is not None:
             lines.append(f"  Effective dof: {self.edf_total:g}")
-        if self.iterations is not None:
-            lines.append(f"  Outer iterations: {self.iterations}")
+        if self.scale is not None:
+            lines.append(f"  Scale: {self.scale:g}")
+        if self.convergence is not None:
+            lines.append(
+                f"  Iterations: {self.convergence['outer_iterations']} outer, "
+                f"{self.convergence['inner_iterations']} inner"
+            )
         n_coef = len(self.coefficients)
         if n_coef:
             lines.append(f"  Coefficients: {n_coef}")

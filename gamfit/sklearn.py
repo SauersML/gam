@@ -76,6 +76,11 @@ class _BaseGAMEstimator(BaseEstimator):
         self.formula_ = fit_formula
         self.feature_names_in_ = np.asarray(feature_names, dtype=object)
         self.n_features_in_ = len(feature_names)
+        if isinstance(self.model_, Model):
+            # sklearn fitted attributes: the fitted Model's Rust summary fields.
+            self.coef_ = self.model_.coefficients
+            self.edf_ = self.model_.edf_total
+            self.n_iter_ = self.model_.outer_iterations
         return self
 
     def summary(self) -> Any:

@@ -316,6 +316,12 @@ where
     let penalized_objective = result.reml_score;
     let outer_cost_evals = result.outer_cost_evals;
     let inner_pirls_solves = result.inner_pirls_solves;
+    // The final certified P-IRLS solve is the inner iterate the fit reports.
+    let inner_cycles = result
+        .artifacts
+        .pirls
+        .as_ref()
+        .map_or(0, |pirls| pirls.iteration);
     UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: result.beta.clone(),
@@ -349,7 +355,7 @@ where
         max_abs_eta: result.max_abs_eta,
         constraint_kkt: result.constraint_kkt,
         artifacts: result.artifacts,
-        inner_cycles: 0,
+        inner_cycles,
     })
     .map(|mut unified| {
         // Surface the optimizer's outer cost-eval count (not carried by the
