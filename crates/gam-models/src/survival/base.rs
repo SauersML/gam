@@ -2310,6 +2310,11 @@ impl WorkingModelSurvival {
         Ok(())
     }
 
+    /// The number of survival records the likelihood sums over.
+    pub fn n_observations(&self) -> usize {
+        self.age_exit.len()
+    }
+
     /// The λ-selection domain of the active penalty blocks (#2812): per block,
     /// the resolvability interval of the block's penalty against the exit
     /// design's Gram on the block's columns. Below the lower edge the block is

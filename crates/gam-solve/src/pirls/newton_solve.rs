@@ -1592,7 +1592,11 @@ pub(super) fn constrained_stationarity_norm(
     linear_constraints: Option<&LinearInequalityConstraints>,
 ) -> f64 {
     if let Some(constraints) = linear_constraints {
-        let kkt = compute_constraint_kkt_diagnostics(beta, gradient, constraints);
+        // Only the two residual norms are read here, and neither depends on the
+        // gradient scale. No scale is known at this call, so none is claimed:
+        // a NaN scale makes any gradient-unit verdict drawn from these
+        // diagnostics refuse rather than pass.
+        let kkt = compute_constraint_kkt_diagnostics(beta, gradient, f64::NAN, constraints);
         return kkt.dual_feasibility.max(kkt.stationarity);
     }
     projected_gradient_norm(gradient, beta, lower_bounds)
@@ -1610,7 +1614,8 @@ pub(super) fn constrained_stationarity_norm(
 ///   certifying against it can never hand the outer gate something it rejects.
 /// * Complementarity is `|λ_i·s_i|` — a gradient times a distance — and is held
 ///   to `KKT_TOL_COMP`, the OUTER startup gate's own bound, in the gate's own
-///   frame: absolutely AND relative to `max(1, ‖g‖∞)`
+///   frame: relative to `gradient_scale`, the natural scale of the operands
+///   that formed `gradient`
 ///   ([`crate::active_set::exceeds_at_gradient_scale`]). The multipliers carry
 ///   the gradient's scale, so a bare absolute bar made the same fit pass or
 ///   fail under a response rescale `y → c·y`. The requirement here is
@@ -1624,12 +1629,13 @@ pub(super) fn constrained_stationarity_norm(
 pub(super) fn constraint_geometry_is_certified(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
+    gradient_scale: f64,
     linear_constraints: Option<&LinearInequalityConstraints>,
 ) -> bool {
     let Some(constraints) = linear_constraints else {
         return true;
     };
-    let kkt = compute_constraint_kkt_diagnostics(beta, gradient, constraints);
+    let kkt = compute_constraint_kkt_diagnostics(beta, gradient, gradient_scale, constraints);
     kkt.primal_feasibility <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         && !crate::active_set::exceeds_at_gradient_scale(
             kkt.complementarity,
@@ -1861,9 +1867,10 @@ pub(super) fn linear_constraints_from_lower_bounds(
 pub(super) fn compute_constraint_kkt_diagnostics(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
+    gradient_scale: f64,
     constraints: &LinearInequalityConstraints,
 ) -> ConstraintKktDiagnostics {
-    active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
+    active_set::compute_constraint_kkt_diagnostics(beta, gradient, gradient_scale, constraints)
 }
 
 /// Select which active bound-constraint to release in the primal active-set

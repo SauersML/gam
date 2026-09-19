@@ -270,8 +270,8 @@ pub struct WorkingModelPirlsResult {
     /// observed across all iterations whose state was computed during the
     /// inner P-IRLS loop. The penalized objective is monotonically decreasing
     /// along any descent path the inner solver takes, so this minimum is a
-    /// principled seed-screening proxy that remains meaningful even when the
-    /// solver hit its iteration cap before reaching the mode. `f64::INFINITY`
+    /// diagnostic that remains meaningful even when the solver hit its
+    /// iteration cap before reaching the mode. `f64::INFINITY`
     /// when no state was ever computed (paths that synthesize a result
     /// without iterating, e.g. zero-iteration warm-only paths).
     pub min_penalized_deviance: f64,
@@ -458,7 +458,7 @@ pub struct PirlsResult {
     /// Natural scale of the penalized gradient at the accepted PIRLS state,
     /// equal to ‖Xᵀ(weighted residual)‖₂ + ‖Sβ‖₂ (+ ridge·‖β‖₂ when active).
     /// Mirrors `WorkingState::gradient_natural_scale` so that callers reading
-    /// `PirlsResult` directly (e.g. seed-screening cost augmentation) can form
+    /// `PirlsResult` directly (e.g. diagnostics) can form
     /// the scale-invariant residual r_g = ‖g‖ / (1 + this) without rebuilding
     /// the score and penalty norms.
     pub gradient_natural_scale: f64,
@@ -515,11 +515,8 @@ pub struct PirlsResult {
     /// bundle construction.
     pub cache_compacted: bool,
     /// Minimum penalized objective observed across the inner P-IRLS loop.
-    /// Mirrors `WorkingModelPirlsResult::min_penalized_deviance`. Used as the
-    /// seed-screening ranking proxy: the penalized objective descends monotonically
-    /// along any inner descent path, so the per-seed minimum tells the outer
-    /// cascade "how good a fit this rho's neighbourhood can support" even
-    /// when the inner solver was capped before reaching the mode.
+    /// Mirrors `WorkingModelPirlsResult::min_penalized_deviance`; reported in
+    /// inner-solve diagnostics.
     pub min_penalized_deviance: f64,
 }
 
@@ -564,7 +561,7 @@ impl PirlsResult {
     /// Returns ‖g‖ / (‖score‖ + ‖Sβ‖ + ridge·‖β‖), the dimensionless residual
     /// of [`WorkingState::relative_gradient_norm`]. Numerator is
     /// `lastgradient_norm`; denominator is `gradient_natural_scale`.
-    /// This is the "r_g" used by seed-screening cost augmentation.
+    /// This is the scale-invariant inner gradient residual "r_g".
     #[inline]
     pub fn relative_gradient_norm(&self) -> f64 {
         relative_gradient_residual(self.lastgradient_norm, self.gradient_natural_scale)

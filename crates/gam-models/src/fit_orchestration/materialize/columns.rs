@@ -106,14 +106,14 @@ pub fn expand_automatic_fit_formula(
         formula_without_automatic_term,
     };
     let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    if !formula_has_automatic_term(formula).map_err(invalid)? {
+    if !formula_has_automatic_term(formula)? {
         return Ok(AutomaticFormula {
             formula: formula.to_string(),
             notes: Vec::new(),
         });
     }
     let explicit = gam_terms::inference::formula_dsl::parse_formula(
-        &formula_without_automatic_term(formula).map_err(invalid)?,
+        &formula_without_automatic_term(formula)?,
     )?;
     let reserved = fit_required_columns(&explicit, config)?;
     expand_automatic_formula(formula, data, &reserved).map_err(invalid)

@@ -145,9 +145,9 @@ pub(crate) fn update_glmvectors(
         LinkFunction::Log => {
             write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives)
         }
-        // A reciprocal-power link's Fisher weight depends on the variance
-        // function, which only the likelihood knows.
-        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+        // A reciprocal-power or square-root link's Fisher weight depends on
+        // the variance function, which only the likelihood knows.
+        LinkFunction::Inverse | LinkFunction::InverseSquared | LinkFunction::Sqrt => {
             crate::bail_invalid_estim!(
                 "the {link:?} link's working state is family-specific; route it through the likelihood's IRLS update"
             )
@@ -423,6 +423,22 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
     let mut dmu_deta = Array1::<f64>::zeros(n);
     let mut d2mu_deta2 = Array1::<f64>::zeros(n);
     let mut d3mu_deta3 = Array1::<f64>::zeros(n);
+    if let Some(cell) = GenericEdmCell::classify(&likelihood.spec.response, inverse_link) {
+        write_generic_edm_eta_curvature(
+            cell,
+            fixed_glm_dispersion(likelihood)?,
+            eta,
+            priorweights,
+            WorkingDerivativeBuffersMut {
+                c: &mut c,
+                d: &mut d,
+                dmu_deta: &mut dmu_deta,
+                d2mu_deta2: &mut d2mu_deta2,
+                d3mu_deta3: &mut d3mu_deta3,
+            },
+        )?;
+        return Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3));
+    }
     if let Some((standard, exponent)) = reciprocal_power_link(inverse_link) {
         let family = match likelihood.spec.response {
             ResponseFamily::Gaussian => PowerVarianceEdm::Gaussian,

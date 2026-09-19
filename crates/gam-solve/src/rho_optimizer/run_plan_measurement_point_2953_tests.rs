@@ -11,7 +11,7 @@
 use super::*;
 use ndarray::array;
 
-/// Off the integer seed lattice, so no generated seed starts at the centre.
+/// Off every start the fixtures search from.
 const CENTER: f64 = -3.5;
 const WIDTH: f64 = 0.5;
 const DEPTH: f64 = 10.0;
@@ -26,22 +26,16 @@ fn well_derivative(x: f64) -> f64 {
     -well_value(x) * (x - CENTER) / (WIDTH * WIDTH)
 }
 
-/// The well searched from `WELL_START` under a one-iteration budget, the neutral
-/// seed next in the cascade. That seed certifies on the flat top at ρ = 0, the
-/// search inside the well beats it, and the attempt declines it.
+/// The well searched from `WELL_START` under a one-iteration budget. The search
+/// stops inside the well without certifying, and a later search from the flat top
+/// at ρ = 0, which certifies there, carries that stop as its checkpoint, as the
+/// next plan attempt does, and declines the flat top.
 fn well_problem() -> OuterProblem {
     OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_bounds(array![-6.0], array![6.0])
         .with_initial_rho(array![WELL_START])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            risk_profile: gam_problem::SeedRiskProfile::Gaussian,
-            ..Default::default()
-        })
         .with_max_iter(1)
 }
 
@@ -72,7 +66,19 @@ fn dominated_well_incumbent(
 ) -> Result<OuterResult, String> {
     let cap = obj.capability();
     let the_plan = plan(&cap);
-    match run_outer_with_plan(obj, config, context, &cap, &the_plan, continue_from_incumbent) {
+    let stop = match run_outer_with_plan(obj, config, context, &cap, &the_plan, false) {
+        Ok(PlanRunOutcome::Exhausted(stop)) => stop,
+        Ok(_) => {
+            return Err(format!(
+                "{context}: a one-iteration search inside the well must stop without certifying"
+            ));
+        }
+        Err(error) => return Err(format!("{context}: the capped well search failed: {error}")),
+    };
+    let mut flat_top = config.clone();
+    flat_top.initial_rho = Some(array![0.0]);
+    flat_top.carried_checkpoint = Some(carried_checkpoint_of(&stop));
+    match run_outer_with_plan(obj, &flat_top, context, &cap, &the_plan, continue_from_incumbent) {
         Ok(PlanRunOutcome::DominatedPlateau(dominated)) => Ok(dominated.incumbent),
         Ok(_) => Err(format!(
             "{context}: a one-iteration search inside the well cannot certify, so the flat \

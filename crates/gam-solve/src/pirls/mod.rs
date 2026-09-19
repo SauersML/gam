@@ -17,6 +17,7 @@ mod dispersion;
 mod edf;
 mod family_state;
 mod gam_working_model;
+mod generic_edm;
 mod glm_update;
 mod log_link_working_state;
 pub(crate) mod loop_driver;
@@ -37,6 +38,8 @@ mod workspace;
 mod beta_logistic_saturated_row_2902_tests;
 #[cfg(test)]
 mod firth_noncanonical_curvature_2273_tests;
+#[cfg(test)]
+mod gaussian_row_log_free_tests;
 #[cfg(test)]
 mod residuals_tests;
 #[cfg(test)]
@@ -66,6 +69,7 @@ pub use family_state::{
     valid_count_response,
 };
 pub(crate) use gam_working_model::*;
+pub(crate) use generic_edm::*;
 pub(crate) use row_pass::*;
 pub use glm_update::*;
 pub use low_rank::*;

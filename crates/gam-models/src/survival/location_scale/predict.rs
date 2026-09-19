@@ -341,7 +341,10 @@ pub(crate) fn validate_predict_inverse_link(
 ) -> Result<(), SurvivalLocationScaleError> {
     match inverse_link {
         InverseLink::Standard(
-            link @ (StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared),
+            link @ (StandardLink::Log
+                | StandardLink::Sqrt
+                | StandardLink::Inverse
+                | StandardLink::InverseSquared),
         ) => Err(SurvivalLocationScaleError::InvalidConfiguration {
             reason: format!(
                 "prediction does not support the {} link for survival models",
@@ -414,7 +417,10 @@ pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f
         InverseLink::Standard(StandardLink::Cauchit) => 0.5 - eta.atan() / std::f64::consts::PI,
         InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
         InverseLink::Standard(
-            StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared,
+            StandardLink::Log
+                | StandardLink::Sqrt
+                | StandardLink::Inverse
+                | StandardLink::InverseSquared,
         ) => {
             // SAFETY: survival families register only Probit/Logit/CLogLog/
             // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;

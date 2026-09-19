@@ -560,8 +560,7 @@ impl<const K: usize> Tower2<K> {
     /// left a ≤1-ulp asymmetry; mirroring removes it, so the result is exactly
     /// symmetric — strictly closer to the true symmetric Hessian, not merely a
     /// reordering. Dense-`h` consumers are all tolerance-gated (rel-tol ≥ 1e-11 ≫
-    /// 1e-16); the `f64`/`f64x4` lane oracle stays exact because
-    /// [`crate::jet_scalar::Order2Lane::mul`] mirrors term-for-term.
+    /// 1e-16).
     pub fn mul(&self, o: &Self) -> Self {
         let a = self;
         let b = o;
@@ -1098,6 +1097,82 @@ pub(crate) fn polygamma_positive_stack(mut x: f64, orders: usize) -> [f64; POLYG
             let [leading, half_term] = POLYGAMMA_ASYMPTOTIC_LEADING[order];
             power *= inverse;
             power * (leading + half_term * inverse + inverse_squared * tail)
+        };
+        *entry += series;
+    }
+    out
+}
+
+/// `[ψ(x + ½) − ψ(x), ψ₁(x + ½) − ψ₁(x), …]` through the first `orders` entries
+/// (at most five), for `x > 0`; those entries are `NaN` otherwise, and the
+/// entries past `orders` are zero.
+///
+/// The gap is `O(x^{−(k+1)})` while `ψ(x)` is `O(ln x)` and `ψ_k(x)` is
+/// `O(x^{−k})`, so subtracting two [`polygamma_positive_stack`] values loses
+/// about `log₂(2x·ln x)` bits for `ψ` and `log₂(2x)` bits for `ψ_k`: at
+/// `x = 2.5·10⁷` the digamma difference keeps about seven significant digits.
+/// Here every term of the recurrence and of the asymptotic series is
+/// differenced in closed form instead, `c·[(x+½)^{−m} − x^{−m}] = c·x^{−m}·δ_m`
+/// with `δ_m = (1 + 1/(2x))^{−m} − 1`, and the logarithm as `ln(1 + 1/(2x))`.
+/// Every `δ_m` has the sign of `δ₁ = −1/(2x + 1)` and follows from
+/// `δ_m = ρ·δ_{m−1} + δ₁`, `ρ = x/(x + ½)`, a sum of like-signed terms. The
+/// recurrence terms and the two leading asymptotic terms of one order share the
+/// gap's sign, and the alternating Bernoulli tail is below `x⁻² ≤ 1/400` of
+/// them, so the result is correct to a few ulps relative at every `x`.
+pub(crate) fn polygamma_half_shift_gap_stack(
+    mut x: f64,
+    orders: usize,
+) -> [f64; POLYGAMMA_STACK_ORDERS] {
+    const DELTA_ORDERS: usize = POLYGAMMA_STACK_ORDERS + 2 * BERNOULLI_EVEN.len();
+    let orders = orders.min(POLYGAMMA_STACK_ORDERS);
+    let mut out = [0.0; POLYGAMMA_STACK_ORDERS];
+    if !(x.is_finite() && x > 0.0) {
+        out[..orders].fill(f64::NAN);
+        return out;
+    }
+    // `δ[m] = (1 + 1/(2x))^{−m} − 1` for `m = 0, …, DELTA_ORDERS`.
+    let deltas = |x: f64, top: usize| {
+        let mut delta = [0.0; DELTA_ORDERS + 1];
+        let first = -1.0 / (2.0 * x + 1.0);
+        let ratio = x / (x + 0.5);
+        for m in 1..=top {
+            delta[m] = ratio * delta[m - 1] + first;
+        }
+        delta
+    };
+    // gap_k(x) = gap_k(x + 1) + (−1)^{k+1} k! x^{−(k+1)} δ_{k+1}.
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        let delta = deltas(x, orders);
+        let inverse = 1.0 / x;
+        let mut power = inverse;
+        for (order, (entry, coefficient)) in
+            out[..orders].iter_mut().zip(POLYGAMMA_RECURRENCE).enumerate()
+        {
+            *entry += coefficient * power * delta[order + 1];
+            power *= inverse;
+        }
+        x += 1.0;
+    }
+    let delta = deltas(x, orders + 2 * BERNOULLI_EVEN.len());
+    let inverse = 1.0 / x;
+    let inverse_squared = inverse * inverse;
+    let mut power = 1.0;
+    for (order, entry) in out[..orders].iter_mut().enumerate() {
+        // The Bernoulli tail `x^{−k} Σ_j c_j x^{−2j}`, term by term against
+        // `δ_{k+2j}`, summed from the smallest term up.
+        let mut tail = 0.0;
+        for (index, coefficient) in POLYGAMMA_ASYMPTOTIC_TAIL[order].iter().enumerate().rev() {
+            tail = tail * inverse_squared + coefficient * delta[order + 2 * (index + 1)];
+        }
+        let series = if order == 0 {
+            (0.5 * inverse).ln_1p() - 0.5 * inverse * delta[1] + inverse_squared * tail
+        } else {
+            let [leading, half_term] = POLYGAMMA_ASYMPTOTIC_LEADING[order];
+            power *= inverse;
+            power
+                * (leading * delta[order]
+                    + half_term * inverse * delta[order + 1]
+                    + inverse_squared * tail)
         };
         *entry += series;
     }
@@ -2302,6 +2377,61 @@ mod derivative_stack_tests {
                 );
             }
         }
+    }
+
+    /// `ψ_k(x+½) − ψ_k(x)` against 400-digit `mpmath` values at the binary `x`
+    /// on both sides of the recurrence/asymptotic switch and deep in the
+    /// Student-t Gaussian limit (`x = ν/2` with `ln ν = 17.70` is `2.43·10⁷`).
+    /// There the difference of two digammas keeps seven digits; the gap kernel
+    /// must keep all of them.
+    #[test]
+    fn polygamma_half_shift_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, [f64; 5]); 12] = [
+            (0.03, [3.203962927515465354e1, -1.108216193141883652e3, 7.4062072095399956908e4, -7.4073358559239705465e6, 9.8765376546290203606e8]),
+            (0.5, [1.3862943611198906188, -3.2898681336964528729, 1.4424682837915131425e1, -9.0915151631735608087e1, 7.4658798370322634696e2]),
+            (1.0, [6.1370563888010938117e-1, -7.1013186630354712706e-1, 1.5753171620848685752, -5.0848483682643919127, 2.1412016296773653041e1]),
+            (3.7, [1.4418535192508819002e-1, -4.1372916938637520346e-2, 2.3630458175422828735e-2, -2.0153376495578495503e-2, 2.281893286763947146e-2]),
+            (19.75, [2.5636814596444142669e-2, -1.3142768926585609018e-3, 1.347313104225428014e-4, -2.0714308420636192681e-5, 4.245611132991352318e-6]),
+            (20.0, [2.5312402465497531231e-2, -1.2812305052421270327e-3, 1.296826299469204848e-4, -1.9686040254261824038e-5, 3.9838645959225312368e-6]),
+            (20.5, [2.4687597534502468769e-2, -1.2187694947578729673e-3, 1.203173700530795152e-4, -1.7813959745738175962e-5, 3.5161354040774687632e-6]),
+            (137.25, [3.6496228835637444387e-3, -2.6639405679585358511e-5, 3.8889254842790333176e-7, -8.5157817978979074043e-9, 2.4863182550889251633e-10]),
+            (2.5e7, [2.00000002e-8, -8.00000016e-16, 6.400000192e-23, -7.6800003072e-30, 1.22880006144e-36]),
+            (2.4411730862068e7, [2.0481956316231987033e-8, -8.3902106908007068881e-16, 6.8739171541185058233e-23, -8.4474762523231734664e-30, 1.3841667166599221186e-36]),
+            (1.0e12, [5.00000000000125e-13, -5.0000000000025e-25, 1.00000000000075e-36, -3.000000000003e-48, 1.2000000000015e-59]),
+            (1.0e100, [4.9999999999999999205e-101, -4.999999999999999841e-201, 9.9999999999999995229e-301, 0.0, 0.0]),
+        ];
+        let mut worst = 0.0_f64;
+        for (x, reference) in REFERENCES {
+            let gaps = polygamma_half_shift_gap_stack(x, POLYGAMMA_STACK_ORDERS);
+            for order in 0..POLYGAMMA_STACK_ORDERS {
+                if reference[order] == 0.0 {
+                    // Below the f64 range: the gap underflows with its reference.
+                    assert_eq!(gaps[order], 0.0, "x={x:e} order={order}");
+                    continue;
+                }
+                let relative = (gaps[order] - reference[order]).abs() / reference[order].abs();
+                worst = worst.max(relative);
+                assert!(
+                    relative <= 8.0 * f64::EPSILON,
+                    "x={x:e} order={order}: gap={:+.17e} reference={:+.17e} relative error {relative:e}",
+                    gaps[order],
+                    reference[order]
+                );
+            }
+            // Each entry is independent of how many orders are requested.
+            assert_eq!(polygamma_half_shift_gap_stack(x, 1)[0], gaps[0]);
+        }
+        eprintln!("half-shift polygamma gap: worst relative error {worst:e}");
+        // The cancelling difference this kernel replaces, at the Student-t limit.
+        let x = 2.4411730862068e7;
+        let naive = polygamma_positive_stack(x + 0.5, 1)[0] - polygamma_positive_stack(x, 1)[0];
+        let reference = 2.0481956316231987033e-8;
+        assert!(
+            ((naive - reference) / reference).abs() > 1.0e-9,
+            "the direct digamma difference was expected to cancel at x={x:e}: {naive:e}"
+        );
+        assert!(polygamma_half_shift_gap_stack(0.0, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(polygamma_half_shift_gap_stack(f64::INFINITY, 2)[..2].iter().all(|g| g.is_nan()));
     }
 }
 

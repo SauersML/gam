@@ -4530,5 +4530,24 @@
     },
     "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
     "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
+  },
+  {
+    "base": "700c8e6300da9abcd2b722c827792ca81283035a",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/newton_polish.rs::newton_polish_step_budget": 1
+    },
+    "reason": "#3012 (996d0af2c1, acknowledged after it landed, gam#3166): the Newton polish's step budget is deleted. newton_polish_step_budget counted the steps that quadratic convergence (λ₊ ≤ 2λ²) allowed from the first decrement, and it allowed none outside λ ≤ 1/4. On the exponential tail a smoothing parameter takes toward a limit model, Newton converges linearly, so the count stopped walks that were converging. The polish now measures the rate each step achieved, so no caller needs a predicted step count and nothing replaces the function.",
+    "evidence": "public_api_census.py --base 700c8e6300 --head 996d0af2c1 reported exactly this removal (13510 public function declarations before, 13509 after) with no acknowledgement. With this entry, it passes on a probe commit made of 996d0af2c1's tree plus this ledger (gam#3166, run on MSI). git grep -n -w newton_polish_step_budget finds no occurrence under crates, src, tests or docs at 72d1e93bee."
+  },
+  {
+    "base": "26afd99f5fbbbbfca8daf5921bf054b96b0d6cc4",
+    "removed": {
+      "crates/gam-models/src/bms/row_kernel.rs::fourth_full_cache": 1,
+      "crates/gam-models/src/bms/row_kernel.rs::third_full_cache": 1,
+      "crates/gam-models/src/bms/row_primary_hessian.rs::build_row_exact_context_with_stats_and_cell_cache": 1,
+      "crates/gam-models/src/row_kernel.rs::validate_row_kernel_cache_lengths": 1
+    },
+    "reason": "#3022 and #2998: the rigid BMS row kernel builds each row's derivative tensors once and hands the same tensors to every consumer, so the per-row third/fourth full-tensor caches (RigidThirdFull, RigidFourthFull, their get/insert helpers and the third_full_cache/fourth_full_cache accessors) and the cache-length validator that policed them (validate_row_kernel_cache_lengths with its test) have no remaining purpose. The empirical third directional trace is contracted in factored form through gam-math jet_trace, whose cost does not depend on the flex width, so the fixed-width third-trace dispatch (empirical_fixed_third_trace_dispatch, empirical_fixed_third_trace_from_plan) is deleted. The degree-9 cell cache flag is gone, so build_row_exact_context_with_stats_and_cell_cache is renamed build_row_exact_context.",
+    "evidence": "source_removal_guard.py and public_api_census.py run against base 26afd99f5f report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-models third_trace_2998, rigid_row_tensors_3022 (3), multistart_member_2359, flex_measure_932 pass; gam-math jet_trace 2/2; gam-custom-family warm_start 14/14."
   }
 ]
