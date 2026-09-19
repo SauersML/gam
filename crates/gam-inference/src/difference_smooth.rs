@@ -296,25 +296,18 @@ fn random_effect_ranges(
     let mut all = Vec::with_capacity(termspec.random_effect_terms.len());
     let mut selected = Vec::new();
     for term in &termspec.random_effect_terms {
-        let width = term
-            .column_levels()
-            .ok_or_else(|| {
-                format!(
-                    "difference_smooth random effect {:?} has no frozen levels",
-                    term.name
-                )
-            })?
-            .len();
-        let range = (column, column + width);
-        // Only a penalized block is a random effect to marginalise; a fixed
-        // factor (`factor(g)` / bare `+ g`) is a parametric main effect.
-        if term.penalized {
-            all.push(range);
-        }
+        let levels = term.frozen_levels.as_ref().ok_or_else(|| {
+            format!(
+                "difference_smooth random effect {:?} has no frozen levels",
+                term.name
+            )
+        })?;
+        let range = (column, column + levels.len());
+        all.push(range);
         if term.name == group {
             selected.push(range);
         }
-        column += width;
+        column += levels.len();
     }
     Ok((all, selected))
 }

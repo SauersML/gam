@@ -1395,36 +1395,35 @@ mod tests {
         assert!(err.contains("reserves z column 'z3'"));
     }
 
-    /// Classify the single categorical term of a one-term formula: `true` for
-    /// a fixed `Factor`, `false` for a `RandomEffect`, panicking otherwise.
-    fn categorical_term_is_fixed(formula: &str) -> bool {
-        let parsed = parse_formula(formula).expect("parse categorical formula");
-        let kind = parsed.terms.iter().find_map(|t| match t {
-            ParsedTerm::Factor { .. } => Some(true),
-            ParsedTerm::RandomEffect { .. } => Some(false),
+    /// Extract the single `RandomEffect` term's unseen-level policy from a
+    /// one-term formula, panicking if the term is not a random-effect block.
+    fn random_effect_lenient_unseen(formula: &str) -> bool {
+        let parsed = parse_formula(formula).expect("parse random-effect formula");
+        let re = parsed.terms.iter().find_map(|t| match t {
+            ParsedTerm::RandomEffect { lenient_unseen, .. } => Some(*lenient_unseen),
             _ => None,
         });
-        kind.unwrap_or_else(|| panic!("{formula} did not lower to a categorical term"))
+        re.unwrap_or_else(|| panic!("{formula} did not lower to a RandomEffect term"))
     }
 
     #[test]
-    fn factor_wrapper_is_fixed_while_group_re_are_random_effects() {
-        // Regression for #2137 (sibling of #2102) and the pyGAM audit F1:
-        // `factor(g)` is a FIXED categorical factor (R `factor()` / patsy
-        // `C()`) — treatment-coded, unpenalized, strict on unseen levels.
-        // `group(g)`/`re(g)`/`s(g, bs="re")` are genuine random effects that
-        // tolerate a held-out group (→ population mean). The parse arm once
-        // lowered all four wrappers to the same penalized block, so
-        // `factor(g)` was silently shrunk. Pin the per-wrapper kind at the
-        // parse layer, where the distinction is decided.
+    fn factor_wrapper_is_strict_on_unseen_levels_while_group_re_are_lenient() {
+        // Regression for #2137 (sibling of #2102): `factor(g)` names the
+        // categorical level effect of a column seen in training, so an out-of-vocabulary
+        // level at predict is a schema mismatch that must raise — NOT be shrunk to
+        // the centering point. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine
+        // random effects that tolerate a held-out group (→ population mean). The
+        // parse arm once hardcoded `lenient_unseen: true` for all four wrappers,
+        // so `factor(g)` silently averaged an unseen level. Pin the per-wrapper
+        // policy at the parse layer, where the whole distinction now lives.
         assert!(
-            categorical_term_is_fixed("y ~ factor(g)"),
-            "factor(g) is a fixed categorical factor"
+            !random_effect_lenient_unseen("y ~ factor(g)"),
+            "factor(g) is strict (lenient_unseen=false) on unseen levels"
         );
-        for random in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=re)"] {
+        for lenient in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=re)"] {
             assert!(
-                !categorical_term_is_fixed(random),
-                "{random} is a genuine random effect"
+                random_effect_lenient_unseen(lenient),
+                "{lenient} is a genuine random effect: lenient (lenient_unseen=true) on unseen levels"
             );
         }
     }
@@ -1631,7 +1630,7 @@ mod tests {
         let c = parse_formula("y ~ C(g) + x").expect("C() parses");
         let f = parse_formula("y ~ factor(g) + x").expect("factor() parses");
         assert_eq!(format!("{:?}", c.terms), format!("{:?}", f.terms));
-        assert!(categorical_term_is_fixed("y ~ C(g)"));
+        assert!(!random_effect_lenient_unseen("y ~ C(g)"));
         // Lowercase `c()` is R's vector constructor, not patsy's C().
         let err = parse_formula("y ~ c(g)").expect_err("c() is not a term");
         assert!(err.to_string().contains("C()"), "{err}");
@@ -1740,20 +1739,19 @@ pub enum ParsedTerm {
         prior: BoundedCoefficientPriorSpec,
         double_penalty: bool,
     },
-    /// `group(g)` / `re(g)` / `s(g, bs="re")`: a genuine **random effect** —
-    /// one column per observed level under a REML-estimated ridge. A held-out
-    /// group is shrunk to the population mean, so an unseen level at predict
-    /// is tolerated.
     RandomEffect {
         name: String,
-    },
-    /// `factor(g)`: a **fixed** categorical factor (R `factor()` / patsy
-    /// `C()` convention), materialized exactly like a bare `+ g` categorical
-    /// main effect — treatment coding (L-1 columns against a reference
-    /// level), unpenalized, no smoothing parameter. An unseen level at
-    /// predict is a schema mismatch that raises (#2137/#2102).
-    Factor {
-        name: String,
+        /// Unseen-level policy, fixed at parse time by the wrapper the user
+        /// wrote. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine **random
+        /// effects**: a held-out group is shrunk to the population mean, so an
+        /// unseen level at predict is tolerated (`true`). `factor(g)` (and
+        /// patsy's `C(g)` spelling) names a categorical level effect: like a
+        /// bare `+ g` categorical main effect, an unseen
+        /// level is a schema mismatch that must raise rather than collapse onto
+        /// the factor's centering point (`false`, #2137/#2102). Both wrappers
+        /// share the penalized-categorical materialization; only this policy
+        /// distinguishes them, so seen-level fits are identical.
+        lenient_unseen: bool,
     },
     Smooth {
         label: String,
@@ -1812,8 +1810,7 @@ pub fn parsed_term_column_names(
         match term {
             ParsedTerm::Linear { name, .. }
             | ParsedTerm::BoundedLinear { name, .. }
-            | ParsedTerm::RandomEffect { name }
-            | ParsedTerm::Factor { name } => {
+            | ParsedTerm::RandomEffect { name, .. } => {
                 out.insert(name.clone());
             }
             ParsedTerm::Smooth { vars, options, .. } => {
@@ -1842,8 +1839,7 @@ pub(crate) fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &
     terms.iter().any(|term| match term {
         ParsedTerm::Linear { name, .. }
         | ParsedTerm::BoundedLinear { name, .. }
-        | ParsedTerm::RandomEffect { name }
-        | ParsedTerm::Factor { name } => name == column_name,
+        | ParsedTerm::RandomEffect { name, .. } => name == column_name,
         ParsedTerm::Smooth { vars, options, .. } => {
             vars.iter().any(|var| var == column_name)
                 || options.get("by").is_some_and(|by| by == column_name)
@@ -3102,7 +3098,6 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                 ParsedTerm::Linear { .. }
                     | ParsedTerm::BoundedLinear { .. }
                     | ParsedTerm::RandomEffect { .. }
-                    | ParsedTerm::Factor { .. }
                     | ParsedTerm::Smooth { .. }
                     | ParsedTerm::Interaction { .. }
             )
@@ -3163,11 +3158,12 @@ fn unquote_parsed_term(term: ParsedTerm) -> ParsedTerm {
             prior,
             double_penalty,
         },
-        ParsedTerm::RandomEffect { name } => ParsedTerm::RandomEffect {
+        ParsedTerm::RandomEffect {
+            name,
+            lenient_unseen,
+        } => ParsedTerm::RandomEffect {
             name: unquote_column(&name),
-        },
-        ParsedTerm::Factor { name } => ParsedTerm::Factor {
-            name: unquote_column(&name),
+            lenient_unseen,
         },
         ParsedTerm::Smooth {
             label,
@@ -3391,21 +3387,21 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                // None of the categorical wrappers take options: the random
-                // effect's ridge strength is REML-estimated and the fixed
-                // factor has no penalty at all, so `factor(g, foo=1)` or
+                // None of the categorical wrappers take options: every one
+                // lowers to a level block whose ridge strength is
+                // REML-estimated, so `factor(g, foo=1)` or
                 // `group(g, double_penalty=false)` is a typo, not a request.
                 validate_known_term_options(&name, &options, &[], raw)?;
-                // `factor(g)` is a FIXED categorical factor (R `factor()` /
-                // patsy `C()`): treatment-coded, unpenalized, strict on unseen
-                // levels — the same term a bare `+ g` categorical lowers to.
+                // `factor(g)` forces categorical encoding of the column and,
+                // like a bare `+ g` main effect, is strict on unseen levels.
                 // `group(g)`/`re(g)` are genuine random effects that shrink a
-                // held-out group to the population mean (#2137/#2102).
-                let column = vars[0].clone();
-                return Ok(if name == "factor" {
-                    ParsedTerm::Factor { name: column }
-                } else {
-                    ParsedTerm::RandomEffect { name: column }
+                // held-out group to the population mean, so they tolerate
+                // unseen levels. Both share the penalized-categorical block;
+                // only the unseen policy differs (#2137/#2102).
+                let lenient_unseen = name != "factor";
+                return Ok(ParsedTerm::RandomEffect {
+                    name: vars[0].clone(),
+                    lenient_unseen,
                 });
             }
             "tensor" | "interaction" | "te" => {
@@ -3514,6 +3510,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     // unseen levels (held-out group → population mean).
                     return Ok(ParsedTerm::RandomEffect {
                         name: vars[0].clone(),
+                        lenient_unseen: true,
                     });
                 }
                 if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {
