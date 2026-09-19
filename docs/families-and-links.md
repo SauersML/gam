@@ -36,8 +36,11 @@ it off whether `y` happens to be integer-valued:
 ```python
 gamfit.fit(df, "count ~ s(x)")                 # integer counts -> Poisson/log (auto)
 gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
-gamfit.fit(df, "cost ~ s(x)", family="gamma", link="log")     # explicit
-gamfit.fit(df, "cost ~ s(x)", link="log")      # error: name one with family=
+gamfit.fit(df, "prop ~ s(x)", family="gamma", link="log")     # explicit
+try:
+    gamfit.fit(df, "prop ~ s(x)", link="log")
+except gamfit.errors.GamError as err:          # name one with family=
+    print(err)
 ```
 
 ## Setting family and link
