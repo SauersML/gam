@@ -38,12 +38,12 @@ use gam_problem::types::ColIdx;
 /// Default B-spline degree when a smooth's `degree=` option is absent. Cubic
 /// (degree 3) is the standard GAM convention: C² continuity with a low knot
 /// count.
-const DEFAULT_BSPLINE_DEGREE: usize = 3;
+pub(crate) const DEFAULT_BSPLINE_DEGREE: usize = 3;
 
 /// Default difference-penalty order when a smooth's `penalty_order=` (alias
 /// `m=`) option is absent. Second-order (curvature) is the standard P-spline
 /// convention.
-const DEFAULT_PENALTY_ORDER: usize = 2;
+pub(crate) const DEFAULT_PENALTY_ORDER: usize = 2;
 
 /// Admissible `lmax=` for the truncated Wahba sphere kernels, matching the
 /// documented range on [`SphereWahbaKernel::SobolevTruncated`]. The lower end
@@ -2690,8 +2690,7 @@ pub(crate) fn build_smooth_basis(
             // functions this cap and the open-spline default coincide, so it now
             // acts as an explicit floor/guard that keeps the cyclic default lean
             // even if the open-spline heuristic is later widened.
-            let cyclic_default_basis_cap = CYCLIC_DEFAULT_BASIS_DIM.max(degree + 1);
-            let default_basis = (default_internal + degree + 1).min(cyclic_default_basis_cap);
+            let default_basis = default_cyclic_basis_dim(default_internal, degree);
             let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
                 .unwrap_or(default_basis);
             if num_basis < degree + 1 {
@@ -3364,8 +3363,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                heuristic_knots_for_column(ds.values.column(cols[0]))
-                    .saturating_add(DEFAULT_BSPLINE_DEGREE + 1)
+                univariate_spline_basis_dim(ds.values.column(cols[0]))
             } else {
                 0
             };
@@ -3560,8 +3558,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                heuristic_knots_for_column(ds.values.column(cols[0]))
-                    .saturating_add(DEFAULT_BSPLINE_DEGREE + 1)
+                univariate_spline_basis_dim(ds.values.column(cols[0]))
             } else {
                 0
             };
@@ -4514,6 +4511,20 @@ pub(crate) const MAX_DEFAULT_INTERNAL_KNOTS: usize = 8;
 pub(crate) fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     let unique = unique_count_column(col);
     (unique / 4).clamp(4, MAX_DEFAULT_INTERNAL_KNOTS)
+}
+
+/// #1867: the basis dimension the default open cubic `s(x)` gets on `col`, the
+/// floor under a 1-D radial smooth's default so it is not dimensioned coarser
+/// than the spline it competes with on the same data.
+pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>) -> usize {
+    heuristic_knots_for_column(col).saturating_add(DEFAULT_BSPLINE_DEGREE + 1)
+}
+
+/// The default basis dimension of a degree-`degree` cyclic B-spline whose open
+/// counterpart would take `default_internal` internal knots, capped at
+/// [`CYCLIC_DEFAULT_BASIS_DIM`] (never below `degree + 1`).
+pub(crate) fn default_cyclic_basis_dim(default_internal: usize, degree: usize) -> usize {
+    (default_internal + degree + 1).min(CYCLIC_DEFAULT_BASIS_DIM.max(degree + 1))
 }
 
 /// Per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
@@ -5512,7 +5523,7 @@ fn default_matern_center_count(
         .max(1)
 }
 
-fn default_duchon_center_count(
+pub(crate) fn default_duchon_center_count(
     n: usize,
     d: usize,
     planned_count: usize,

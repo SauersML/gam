@@ -106,7 +106,7 @@ pub(crate) use gam::terms::basis::{
     build_duchon_operator_penalty_matrices,
     build_matern_basis_literal_aniso, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
-    cyclic_bspline_derivative_penalty_matrix, duchon_cubic_default,
+    cyclic_bspline_derivative_penalty_matrix,
     duchon_nullspace_order_from_m,
     duchon_sae_atom_basis_with_jet,
     matern_input_location_hessian_nd, matern_input_location_jet_nd,
@@ -117,6 +117,16 @@ pub(crate) use gam::terms::basis::{
 };
 
 pub(crate) use gam::terms::basis::input_loc_derivatives::contract_input_loc_gradient;
+
+pub(crate) use gam::terms::basis::position_basis::{
+    PositionBasisLocations, PositionPenaltyRequest, ResolvedPositionBasis, resolve_position_basis,
+    validate_position_period,
+};
+
+pub(crate) use gam::terms::basis::{
+    duchon_cubic_default_with_periodicity,
+    duchon_function_norm_penalty as core_duchon_function_norm_penalty,
+};
 
 pub(crate) use gam::terms::decoders::interchange_decoder::{
     InterchangeDecodeForward as CoreInterchangeDecodeForward,
@@ -194,7 +204,7 @@ pub(crate) use pyo3::exceptions::{PyTypeError, PyValueError};
 
 pub(crate) use pyo3::prelude::*;
 
-pub(crate) use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple, PyType};
+pub(crate) use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyInt, PyList, PyString, PyTuple, PyType};
 
 pub(crate) use serde::de::{MapAccess, Visitor};
 

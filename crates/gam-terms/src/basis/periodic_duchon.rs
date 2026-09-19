@@ -1597,6 +1597,77 @@ pub fn duchon_cubic_default(dim: usize) -> (DuchonNullspaceOrder, f64) {
     (DuchonNullspaceOrder::Linear, (dim as f64 - 1.0) / 2.0)
 }
 
+/// [`duchon_cubic_default`] for a basis that may have a periodic axis. The
+/// mixed-periodicity reproducing kernel is derived only for the pure
+/// polyharmonic spectrum (Sobolev tail `s = 0`): the periodic Bernoulli Green's
+/// function has no validated fractional-power generalization. A periodic
+/// request therefore keeps the cubic `Linear` null space and pins the power to
+/// 0.
+pub fn duchon_cubic_default_with_periodicity(
+    dim: usize,
+    any_periodic: bool,
+) -> (DuchonNullspaceOrder, f64) {
+    let (nullspace_order, power) = duchon_cubic_default(dim);
+    (nullspace_order, if any_periodic { 0.0 } else { power })
+}
+
+/// The single-λ function-norm penalty of the Duchon basis on `centers`: the
+/// native reproducing-norm Gram the basis builder emits as its
+/// `PenaltySource::Primary` block, from the mixed-periodicity (cylinder/torus
+/// chord-distance) builder when any axis is periodic and from the Euclidean
+/// builder otherwise.
+///
+/// `period_1d` is the explicit domain wrap of a 1-D periodic basis. It is
+/// honoured instead of being derived from the center span, which undershoots on
+/// a half-open grid and gave a non-PSD Gram (gam#580). A multi-D periodic basis
+/// derives its per-axis periods from the centers.
+pub fn duchon_function_norm_penalty(
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+    power: f64,
+    periodic_per_axis: &[bool],
+    period_1d: Option<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let spec = DuchonBasisSpec {
+        radial_reparam: None,
+        center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
+        length_scale,
+        power,
+        nullspace_order,
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic: None,
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let built = if periodic_per_axis.iter().any(|&periodic| periodic) {
+        let periods_1d = if centers.ncols() == 1 {
+            period_1d.map(|period| [period])
+        } else {
+            None
+        };
+        build_duchon_basis_mixed_periodicity_auto(
+            centers,
+            &spec,
+            periodic_per_axis,
+            periods_1d.as_ref().map(|periods| periods.as_slice()),
+        )?
+    } else {
+        build_duchon_basis(centers, &spec)?
+    };
+    built
+        .active_penalties
+        .into_iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .map(|penalty| penalty.matrix)
+        .ok_or_else(|| {
+            BasisError::InvalidInput(
+                "the Duchon builder emitted no Primary function-norm Gram".to_string(),
+            )
+        })
+}
+
 /// Build the **analytic** Duchon penalty for a non-periodic Euclidean Duchon
 /// basis: the native reproducing-norm Gram `ω = α²·Zᵀ K_CC Z` (the kernel
 /// evaluated at center pairs, projected through the polynomial-constraint null

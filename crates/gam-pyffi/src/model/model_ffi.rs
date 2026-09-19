@@ -3077,87 +3077,15 @@ fn duchon_function_norm_penalty<'py>(
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
     };
-    // Any periodic axis (1D or multi-D) routes through the mixed-periodicity
-    // builder (cylinder/torus chord-distance polyharmonic).
-    if any_periodic {
-        let spec = DuchonBasisSpec {
-            radial_reparam: None,
-            center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-            length_scale: spec_length_scale,
-            power: spec_power,
-            nullspace_order: spec_nullspace,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: Default::default(),
-            periodic: None,
-            boundary: OneDimensionalBoundary::Open,
-        };
-        // Honor an explicit 1D `period` (the domain wrap) instead of
-        // auto-deriving it from the center span, which undershoots on a
-        // half-open grid and produced a non-PSD Gram (gam#580). For d>1 the
-        // per-axis periods are auto-derived in the core.
-        let periods_1d: Option<[f64; 1]> = if d == 1 { period.map(|p| [p]) } else { None };
-        let built = build_duchon_basis_mixed_periodicity_auto(
-            center_matrix.view(),
-            &spec,
-            &periodic_flags,
-            periods_1d.as_ref().map(|p| p.as_slice()),
-        )
-        .map_err(basis_error_to_pyerr)?;
-        // Mixed-periodicity builder emits a single Primary candidate (the
-        // function-norm Gram).
-        let penalty = built
-            .active_penalties
-            .iter()
-            .find(|penalty| {
-                matches!(
-                    penalty.info.source,
-                    gam::terms::basis::PenaltySource::Primary
-                )
-            })
-            .ok_or_else(|| {
-                py_value_error(
-                    "mixed-periodicity Duchon function-norm penalty was not built".to_string(),
-                )
-            })?
-            .matrix
-            .clone();
-        return Ok(penalty.into_pyarray(py).unbind());
-    }
-    let spec = DuchonBasisSpec {
-        radial_reparam: None,
-        center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-        length_scale: spec_length_scale,
-        power: spec_power,
-        nullspace_order: spec_nullspace,
-        identifiability: SpatialIdentifiability::None,
-        aniso_log_scales: None,
-        operator_penalties: Default::default(),
-        periodic: None,
-        boundary: OneDimensionalBoundary::Open,
-    };
-    let built = build_duchon_basis(center_matrix.view(), &spec).map_err(basis_error_to_pyerr)?;
-    // The redesigned non-periodic Euclidean path emits a single native
-    // reproducing-norm Gram as the `Primary` candidate (the function-norm
-    // penalty on the scale-free polyharmonic basis) plus a null-space shrinkage
-    // ridge; it no longer ships the mass/tension/stiffness operator triplet.
-    // The function norm is the Primary block.
-    let penalty = built
-        .active_penalties
-        .iter()
-        .find(|penalty| {
-            matches!(
-                penalty.info.source,
-                gam::terms::basis::PenaltySource::Primary
-            )
-        })
-        .ok_or_else(|| {
-            py_value_error(
-                "Duchon function-norm penalty (Primary native-norm Gram) was not built".to_string(),
-            )
-        })?
-        .matrix
-        .clone();
+    let penalty = core_duchon_function_norm_penalty(
+        center_matrix.view(),
+        spec_length_scale,
+        spec_nullspace,
+        spec_power,
+        &periodic_flags,
+        period,
+    )
+    .map_err(basis_error_to_pyerr)?;
     Ok(penalty.into_pyarray(py).unbind())
 }
 
@@ -5946,13 +5874,64 @@ fn gaussian_reml_fit_batched_backward<'py>(
     Ok(out.unbind())
 }
 
+/// Read a position fit's `knots_or_centers`: `None`, an integer basis size, or
+/// an explicit float64 vector. [`resolve_position_basis`] owns all three.
+fn position_basis_locations_arg(
+    value: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PositionBasisLocations> {
+    let Some(value) = value else {
+        return Ok(PositionBasisLocations::Default);
+    };
+    if value.is_instance_of::<PyInt>() && !value.is_instance_of::<PyBool>() {
+        let count: i64 = value.extract()?;
+        let count = usize::try_from(count).map_err(|_| {
+            py_value_error(format!(
+                "knots_or_centers: an integer basis size must be non-negative, got {count}"
+            ))
+        })?;
+        return Ok(PositionBasisLocations::Count(count));
+    }
+    let given: PyReadonlyArray1<'_, f64> = value.extract()?;
+    Ok(PositionBasisLocations::Given(given.as_array().to_owned()))
+}
+
+/// Read a position fit's `penalty`: `None`, the name of the kind's canonical
+/// penalty, or an explicit float64 matrix.
+fn position_penalty_arg(value: Option<&Bound<'_, PyAny>>) -> PyResult<PositionPenaltyRequest> {
+    let Some(value) = value else {
+        return Ok(PositionPenaltyRequest::Canonical);
+    };
+    if value.is_instance_of::<PyString>() {
+        return Ok(PositionPenaltyRequest::Named(value.extract()?));
+    }
+    let given: PyReadonlyArray2<'_, f64> = value.extract()?;
+    Ok(PositionPenaltyRequest::Given(given.as_array().to_owned()))
+}
+
+/// The basis state a forward position fit ran on, returned so a caller can
+/// replay the same basis at predict time.
+fn set_position_basis_items(
+    py: Python<'_>,
+    out: &Bound<'_, PyDict>,
+    basis: ResolvedPositionBasis,
+    periodic: bool,
+) -> PyResult<()> {
+    out.set_item("knots_or_centers", basis.locations.into_pyarray(py))?;
+    out.set_item("penalty", basis.penalty.into_pyarray(py))?;
+    out.set_item("basis_kind", basis.display_kind)?;
+    out.set_item("basis_order", basis.order)?;
+    out.set_item("periodic", periodic)?;
+    out.set_item("period", basis.period)?;
+    Ok(())
+}
+
 #[pyfunction(signature = (
     t,
     y,
-    basis_kind,
-    knots_or_centers,
-    penalty,
-    basis_order = 3,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -5964,10 +5943,10 @@ fn gaussian_reml_fit_positions<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
-    basis_order: usize,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -5975,23 +5954,31 @@ fn gaussian_reml_fit_positions<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let n_rows = t_values.len();
     let n_outputs = y_values.ncols();
-    let n_coefficients = penalty_values.nrows();
-    let result = detach_py_result(py, "gaussian_reml_fit_positions", move || {
-        let x = position_basis_design(
+    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions", move || {
+        let basis = resolve_position_basis(
             t_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
+        )?;
+        let x = position_basis_design(
+            t_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
         )?;
         let gated_x =
             gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
@@ -6001,42 +5988,44 @@ fn gaussian_reml_fit_positions<'py>(
             by_values.as_ref().map(|b| b.view()),
             x.nrows(),
         )?;
-        match gaussian_reml_multi_closed_form_with_cache(
+        let fit = match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
-            penalty_values.view(),
+            basis.penalty.view(),
             gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
         ) {
-            Ok(fit) => Ok(Some(fit)),
-            Err(EstimationError::ModelIsIllConditioned { .. }) => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
+            Ok(fit) => Some(fit),
+            Err(EstimationError::ModelIsIllConditioned { .. }) => None,
+            Err(err) => return Err(err.to_string()),
+        };
+        Ok((fit, basis))
     })?;
     let out = PyDict::new(py);
     match result {
         Some(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
         None => {
-            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, n_coefficients)?;
+            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, basis.penalty.nrows())?;
         }
     }
+    set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }
 
 #[pyfunction(signature = (
     t,
     y,
-    basis_kind,
-    knots_or_centers,
-    penalty,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
     grad_lambda = 0.0,
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = 0.0,
     grad_edf = 0.0,
     forward_state = None,
-    basis_order = 3,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6048,16 +6037,16 @@ fn gaussian_reml_fit_positions_backward<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
     grad_lambda: f64,
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: f64,
     grad_edf: f64,
     forward_state: Option<&Bound<'py, PyDict>>,
-    basis_order: usize,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6069,24 +6058,33 @@ fn gaussian_reml_fit_positions_backward<'py>(
         .map(gaussian_reml_fit_state_from_pydict)
         .transpose()
         .map_err(py_value_error)?;
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
     let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let backward = detach_py_result(py, "gaussian_reml_fit_positions_backward", move || {
-        gaussian_reml_fit_positions_backward_impl(
+        let basis = resolve_position_basis(
             t_values.view(),
-            y_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
-            penalty_values.view(),
+        )?;
+        gaussian_reml_fit_positions_backward_impl(
+            t_values.view(),
+            y_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
+            basis.penalty.view(),
             weight_values.as_ref().map(|w| w.view()),
             init_lambda,
             grad_lambda,
@@ -6117,10 +6115,10 @@ fn gaussian_reml_fit_positions_backward<'py>(
     t,
     y,
     row_offsets,
-    basis_kind,
-    knots_or_centers,
-    penalty,
-    basis_order = 3,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6133,10 +6131,10 @@ fn gaussian_reml_fit_positions_batched<'py>(
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     row_offsets: PyReadonlyArray1<'py, usize>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
-    basis_order: usize,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6144,32 +6142,44 @@ fn gaussian_reml_fit_positions_batched<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let row_offset_values = row_offsets.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let result = detach_py_result(py, "gaussian_reml_fit_positions_batched", move || {
-        gaussian_reml_fit_positions_batched_impl(
+    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions_batched", move || {
+        // The basis locations are placed on the concatenated positions of every group.
+        let basis = resolve_position_basis(
             t_values.view(),
-            y_values.view(),
-            row_offset_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
-            penalty_values.view(),
+        )?;
+        let result = gaussian_reml_fit_positions_batched_impl(
+            t_values.view(),
+            y_values.view(),
+            row_offset_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
+            basis.penalty.view(),
             weight_values.as_ref().map(|w| w.view()),
             init_lambda,
             by_values.as_ref().map(|b| b.view()),
             by_start_col,
-        )
+        )?;
+        Ok((result, basis))
     })?;
     let out = PyDict::new(py);
     set_batched_gaussian_reml_dict_items(py, &out, result)?;
+    set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }
 
@@ -6177,16 +6187,16 @@ fn gaussian_reml_fit_positions_batched<'py>(
     t,
     y,
     row_offsets,
-    basis_kind,
-    knots_or_centers,
-    penalty,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
     grad_lambda = None,
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = None,
     grad_edf = None,
     forward_state = None,
-    basis_order = 3,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6199,16 +6209,16 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     row_offsets: PyReadonlyArray1<'py, usize>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
     grad_lambda: Option<PyReadonlyArray1<'py, f64>>,
     grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
     grad_edf: Option<PyReadonlyArray1<'py, f64>>,
     forward_state: Option<&Bound<'py, PyDict>>,
-    basis_order: usize,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6220,11 +6230,11 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         .map(|state| batched_gaussian_reml_fits_from_pydict(state, row_offsets.as_array()))
         .transpose()
         .map_err(py_value_error)?;
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let row_offset_values = row_offsets.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let grad_lambda_values = grad_lambda.as_ref().map(|g| g.as_array().to_owned());
     let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
@@ -6236,16 +6246,25 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         py,
         "gaussian_reml_fit_positions_batched_backward",
         move || {
+            let basis = resolve_position_basis(
+                t_values.view(),
+                basis_kind.as_deref(),
+                locations,
+                penalty_request,
+                basis_order,
+                periodic,
+                period,
+            )?;
             gaussian_reml_fit_positions_batched_backward_impl(
                 t_values.view(),
                 y_values.view(),
                 row_offset_values.view(),
-                knot_or_center_values.view(),
-                &basis_kind,
-                basis_order,
+                basis.locations.view(),
+                basis.kind.engine_name(),
+                basis.order,
                 periodic,
-                period,
-                penalty_values.view(),
+                basis.period,
+                basis.penalty.view(),
                 weight_values.as_ref().map(|w| w.view()),
                 init_lambda,
                 grad_lambda_values.as_ref().map(|g| g.view()),

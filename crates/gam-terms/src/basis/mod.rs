@@ -48,6 +48,7 @@ mod invariant_tie_break;
 pub mod matern_gradient;
 mod matern_kernel;
 mod periodic_duchon;
+pub mod position_basis;
 mod radial_jets_nd;
 mod sphere_basis;
 pub mod sphere_gpu;

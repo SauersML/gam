@@ -3019,54 +3019,6 @@ fn periodic_position_domain(
     Ok((left, right, knots_or_centers.len() - 1))
 }
 
-fn validate_position_period(
-    label: &str,
-    knots_or_centers: ArrayView1<'_, f64>,
-    periodic: bool,
-    period: Option<f64>,
-) -> Result<(), String> {
-    if periodic {
-        let left = knots_or_centers
-            .iter()
-            .fold(f64::INFINITY, |a, &b| a.min(b));
-        let right = knots_or_centers
-            .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        if !left.is_finite() || !right.is_finite() || left >= right {
-            return Err(format!(
-                "{label} periodic support must have increasing finite endpoints"
-            ));
-        }
-        let implied = right - left;
-        if let Some(period) = period {
-            if !period.is_finite() || period <= 0.0 {
-                return Err(format!(
-                    "{label} period must be finite and positive; got {period}"
-                ));
-            }
-            // The period is the domain WRAP, not the sample/center span. Centers
-            // on a half-open grid [start, start+period) (e.g. linspace(0,1,K,
-            // endpoint=False) with period 1.0) span only `period − one_spacing`,
-            // so requiring span == period rejected every legitimate explicit
-            // period (gam#580). The only real constraint is that every center
-            // fits inside a single period, i.e. `period >= span`.
-            if period < implied - 1.0e-10 * implied.max(1.0) {
-                return Err(format!(
-                    "{label} explicit period ({period}) is smaller than the center span \
-                     ({implied}); every center must lie within a single period"
-                ));
-            }
-        } else if label != "duchon" {
-            return Err(format!(
-                "{label} periodic position basis requires an explicit period"
-            ));
-        }
-    } else if period.is_some() {
-        return Err(format!("{label} period is only valid when periodic=true"));
-    }
-    Ok(())
-}
-
 fn normalized_position_basis_kind(basis_kind: &str) -> Result<String, String> {
     let normalized = basis_kind
         .trim()

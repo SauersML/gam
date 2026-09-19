@@ -2418,114 +2418,23 @@ def gaussian_reml_fit_batched_backward(
     return coerce_grad_payload(out)
 
 
-def _resolve_position_basis_inputs(
-    t: Any,
-    basis_kind: str | None,
-    knots_or_centers: Any,
-    penalty: Any | None,
-    *,
-    basis_order: int | None,
-    periodic: bool,
-    period: float | None = None,
-) -> tuple[str, str, int, Any, Any, Any, float | None]:
-    """Resolve the shared position-basis FFI inputs for every positions face.
-
-    All four position-based Gaussian REML entrypoints (forward / backward /
-    batched / batched-backward) opened with this identical preamble. Returns
-    ``(display_kind, effective_kind, order, t_np, knots_np, penalty_np,
-    eff_period)``. ``eff_period`` is the domain-wrap period the basis and penalty
-    must share: the explicit ``period`` when given, else (for periodic Duchon) a
-    value auto-derived from the resolved knots so the half-open grid wraps
-    cleanly (gam#580). The caller passes ``eff_period`` to the FFI basis build so
-    basis and penalty stay consistent.
-    """
-    import numpy as np
-
-    display_kind = str(basis_kind if basis_kind is not None else "bspline")
-    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
-    t_np = _numeric_vector(t, "t")
-    kind_norm = str(display_kind).strip().lower().replace("_", "").replace("-", "")
-    if periodic and effective_kind == "bspline" and (
-        knots_or_centers is None
-        or (isinstance(knots_or_centers, int) and not isinstance(knots_or_centers, bool))
+def _position_locations_arg(knots_or_centers: Any) -> Any:
+    """Marshal ``knots_or_centers``: ``None`` and an integer basis size pass
+    through, anything else becomes a float64 vector. The Rust owner resolves the
+    basis from it."""
+    if knots_or_centers is None or (
+        isinstance(knots_or_centers, int) and not isinstance(knots_or_centers, bool)
     ):
-        knots_np = _resolve_periodic_position_bspline_knots(
-            knots_or_centers,
-            t_np,
-            degree=order,
-            period=period,
-        )
-        eff_order = order
-    else:
-        knots_np, eff_order, _shrunk = _resolve_basis_locations(
-            knots_or_centers,
-            t_np,
-            basis_kind=effective_kind,
-            label="knots_or_centers",
-            degree=order,
-        )
-    # Resolve the effective wrap period for periodic Duchon. The period is the
-    # domain wrap, not the knot span: on a half-open grid the knots span only
-    # (period − one_spacing). When the caller gives no explicit period, derive it
-    # as span + one mean knot spacing so points near the two ends are a single
-    # spacing apart across the wrap (an undersized period gave a non-PSD Gram —
-    # gam#580). Non-periodic / non-Duchon bases ignore this.
-    eff_period = period
-    if periodic and period is None and kind_norm in {"duchon", "duchonspline", "thinplate", "thinplatespline", "tps"}:
-        k = np.asarray(knots_np, dtype=float)
-        if k.size >= 2:
-            span = float(k.max() - k.min())
-            mean_spacing = span / max(k.size - 1, 1)
-            eff_period = span + mean_spacing
-    # Auto-knot derivation may downgrade the degree for small n (#340); the
-    # resolved knot vector is clamped for ``eff_order``, so the penalty and the
-    # downstream FFI basis build must both use the effective order to stay
-    # consistent with it.
-    penalty_np = _resolve_position_penalty(
-        penalty,
-        knots_np,
-        basis_kind=display_kind,
-        basis_order=eff_order,
-        periodic=periodic,
-        period=eff_period,
-    )
-    return display_kind, effective_kind, eff_order, t_np, knots_np, penalty_np, eff_period
+        return knots_or_centers
+    return _numeric_vector(knots_or_centers, "knots_or_centers")
 
 
-def _resolve_periodic_position_bspline_knots(
-    count: Any,
-    t_arr: Any,
-    *,
-    degree: int,
-    period: float | None,
-) -> Any:
-    """Resolve count-based periodic position B-splines to K cyclic controls.
-
-    ``gaussian_reml_fit_positions(..., periodic=True)`` documents integer
-    ``knots_or_centers`` as a basis count. The Rust position kernel accepts an
-    explicit half-open knot/control grid and derives ``num_basis = len(grid)-1``.
-    Therefore the public count K must become K+1 grid endpoints, not the open
-    B-spline auto-knot vector used by non-periodic fits.
-    """
-    import numpy as np
-
-    degree_i = int(degree)
-    k = int(_DEFAULT_BASIS_K if count is None else count)
-    if k < degree_i + 1:
-        raise ValueError(
-            "periodic B-spline position basis count must be at least "
-            f"degree + 1 (got {k} for degree {degree_i})"
-        )
-    if period is None:
-        raise ValueError("periodic B-spline position fits require a finite positive period")
-    period_f = float(period)
-    if not np.isfinite(period_f) or period_f <= 0.0:
-        raise ValueError(f"period must be finite and positive, got {period}")
-    t_np = np.asarray(t_arr, dtype=float)
-    if t_np.size == 0:
-        raise ValueError("t must contain at least one value")
-    origin = float(np.min(t_np))
-    return np.linspace(origin, origin + period_f, k + 1, dtype=float)
+def _position_penalty_arg(penalty: Any | None) -> Any:
+    """Marshal ``penalty``: ``None`` and a penalty name pass through, anything
+    else becomes a float64 matrix."""
+    if penalty is None or isinstance(penalty, str):
+        return penalty
+    return _numeric_matrix(penalty, "penalty")
 
 
 def gaussian_reml_fit_positions(
@@ -2545,34 +2454,26 @@ def gaussian_reml_fit_positions(
 ) -> dict[str, Any]:
     """Fit closed-form Gaussian REML from 1D positions and an internal basis.
 
-    ``knots_or_centers`` may be ``None``, an ``int`` (basis count), or an
-    array; the basis-location vector is auto-derived from ``t`` when not
-    supplied. ``penalty`` may be ``None`` for a neutral identity ridge of
-    matching size.
+    ``knots_or_centers`` may be ``None``, an ``int`` (basis size), or an
+    array; an omitted size takes the formula front door's default for the
+    same basis on ``t``. ``penalty`` may be ``None`` (the basis's canonical
+    single-λ penalty), its name, or an explicit matrix. The Rust engine
+    resolves the basis, and the result carries the resolved
+    ``knots_or_centers``, ``penalty``, ``basis_kind``, ``basis_order``,
+    ``periodic`` and ``period`` so the same basis can be replayed.
     """
     import numpy as np
 
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
-            str(effective_kind),
-            knots_np,
-            penalty_np,
-            order,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2580,15 +2481,7 @@ def gaussian_reml_fit_positions(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return _attach_basis_state(
-        _coerce_gaussian_reml_payload(out, np),
-        knots_or_centers=knots_np,
-        penalty=penalty_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
-        period=period,
-    )
+    return _coerce_gaussian_reml_payload(out, np)
 
 
 def gaussian_reml_fit_positions_backward(
@@ -2614,27 +2507,16 @@ def gaussian_reml_fit_positions_backward(
 ) -> dict[str, Any]:
     """Run the analytic VJP for ``gaussian_reml_fit_positions`` outputs.
 
-    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
-    defaults as :func:`gaussian_reml_fit_positions`.
+    ``knots_or_centers`` and ``penalty`` accept the same forms and defaults
+    as :func:`gaussian_reml_fit_positions`.
     """
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions_backward(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
-            str(effective_kind),
-            knots_np,
-            penalty_np,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
             float(grad_lambda),
             None
             if grad_coefficients is None
@@ -2643,9 +2525,9 @@ def gaussian_reml_fit_positions_backward(
             float(grad_reml_score),
             float(grad_edf),
             forward_state,
-            order,
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2674,34 +2556,23 @@ def gaussian_reml_fit_positions_batched(
 ) -> dict[str, Any]:
     """Fit packed ragged closed-form Gaussian REML problems from positions.
 
-    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
-    defaults as :func:`gaussian_reml_fit_positions`. The basis locations
-    are inferred from the concatenated positions across all groups.
+    ``knots_or_centers`` and ``penalty`` accept the same forms and defaults
+    as :func:`gaussian_reml_fit_positions`. The basis locations are placed on
+    the concatenated positions across all groups.
     """
     import numpy as np
 
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
             _index_vector(row_offsets, "row_offsets"),
-            str(effective_kind),
-            knots_np,
-            penalty_np,
-            order,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2709,15 +2580,7 @@ def gaussian_reml_fit_positions_batched(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return _attach_basis_state(
-        _coerce_gaussian_reml_payload(out, np),
-        knots_or_centers=knots_np,
-        penalty=penalty_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
-        period=period,
-    )
+    return _coerce_gaussian_reml_payload(out, np)
 
 
 def gaussian_reml_fit_positions_batched_backward(
@@ -2744,30 +2607,19 @@ def gaussian_reml_fit_positions_batched_backward(
 ) -> dict[str, Any]:
     """Run the analytic VJP for packed position-based Gaussian REML fits.
 
-    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
-    defaults as :func:`gaussian_reml_fit_positions_batched`.
+    ``knots_or_centers`` and ``penalty`` accept the same forms and defaults
+    as :func:`gaussian_reml_fit_positions_batched`.
     """
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched_backward(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
             offsets,
-            str(effective_kind),
-            knots_np,
-            penalty_np,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
             _optional_batch_vector(grad_lambda, batch, "grad_lambda"),
             None
             if grad_coefficients is None
@@ -2776,9 +2628,9 @@ def gaussian_reml_fit_positions_batched_backward(
             _optional_batch_vector(grad_reml_score, batch, "grad_reml_score"),
             _optional_batch_vector(grad_edf, batch, "grad_edf"),
             forward_state,
-            order,
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -3716,17 +3568,6 @@ def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
     return out
 
 
-def _position_basis_order(basis_kind: str, basis_order: int | None) -> int:
-    if basis_order is not None:
-        order = int(basis_order)
-    else:
-        normalized = basis_kind.strip().lower().replace("_", "").replace("-", "")
-        order = 2 if normalized in {"duchon", "duchonspline"} else 3
-    if order < 1:
-        raise ValueError("basis_order must be at least 1")
-    return order
-
-
 def _optional_batch_vector(values: Any | None, batch: int, label: str) -> Any | None:
     import numpy as np
 
@@ -3961,202 +3802,6 @@ def _numpy_module() -> Any:
     import numpy as np
 
     return np
-
-
-def _resolve_basis_locations(
-    arg: Any,
-    t_arr: Any,
-    *,
-    basis_kind: str,
-    label: str = "knots_or_centers",
-    degree: int = 3,
-) -> _ResolvedBasisLocations:
-    """Resolve the basis-location argument for kind-dispatched primitives.
-
-    Mirrors :func:`_resolve_centers` for ``basis_kind == "duchon"`` and
-    :func:`_resolve_knots` for B-spline-like kinds.
-    """
-    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
-    if kind in {"duchon", "duchonspline"}:
-        # Duchon centers carry no degree concept and are never auto-shrunk, so
-        # the requested order passes straight through.
-        return _ResolvedBasisLocations(
-            _resolve_centers(arg, t_arr, label=label), int(degree), False
-        )
-    return _resolve_knots(arg, t_arr, label=label, degree=degree)
-
-
-def _attach_basis_state(
-    payload: dict[str, Any],
-    *,
-    knots_or_centers: Any,
-    penalty: Any,
-    basis_kind: str,
-    basis_order: int,
-    periodic: bool,
-    period: float | None,
-) -> dict[str, Any]:
-    """Embed the resolved basis state in a REML position-fit payload.
-
-    The keys ``knots_or_centers``, ``penalty``, ``basis_kind``,
-    ``basis_order``, ``periodic``, and ``period`` are added so a caller
-    can replay the exact same basis at predict time without recomputing
-    anything — pass them straight back into ``duchon_basis`` or
-    ``bspline_basis``.
-    """
-    payload["knots_or_centers"] = knots_or_centers
-    payload["penalty"] = penalty
-    payload["basis_kind"] = str(basis_kind)
-    payload["basis_order"] = int(basis_order)
-    payload["periodic"] = bool(periodic)
-    payload["period"] = None if period is None else float(period)
-    return payload
-
-
-def _resolve_position_penalty(
-    penalty: Any | None,
-    knots_or_centers: Any,
-    *,
-    basis_kind: str,
-    basis_order: int,
-    periodic: bool,
-    period: float | None = None,
-) -> Any:
-    """Resolve the canonical single-λ penalty for position-based REML helpers.
-
-    These helpers fit ONE smoothing ``λ`` against a position-indexed design,
-    so each basis maps to a single SPD penalty matrix. Power users can
-    override with an explicit matrix in ``penalty``; the string form selects
-    a non-default canonical penalty for the same basis.
-
-    Basis → default single-λ penalty:
-
-    * ``"duchon"``  → single-λ smoothness penalty for the cubic basis
-      (:func:`duchon_function_norm_penalty`). This is the convenience single-λ
-      object, **not** the multi-λ structural smoother. For the amplitude/slope/
-      curvature smoother with three separate REML ``λ``s — the object the
-      formula API and :class:`gamfit.smooth.Duchon` fit — use the formula
-      smooth; there is no way to express three independent ``λ``s through this
-      single-penalty position helper.
-    * ``"thinplate"`` (1D ``t``) → 1D thin-plate ≡ cubic smoothing spline,
-      routed through the cubic-basis single-λ penalty at ``m=2``.
-    * ``"bspline"``  → exact integrated second-derivative roughness of the
-      represented B-spline basis (open or periodic).
-    """
-    import numpy as np
-
-    if isinstance(penalty, str):
-        penalty_kind = str(penalty).strip().lower().replace("_", "-")
-    else:
-        penalty_kind = None
-
-    if isinstance(penalty, str) or penalty is None:
-        kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
-        if kind in {"duchon", "duchonspline"}:
-            if penalty_kind in {None, "function-norm", "functionnorm", "rkhs", "smoothness"}:
-                return duchon_function_norm_penalty(
-                    np.asarray(knots_or_centers, dtype=float).reshape(-1, 1),
-                    m=int(basis_order),
-                    periodic_per_axis=[True] if periodic else None,
-                    # Honor the explicit domain-wrap period so the periodic Gram
-                    # matches the basis (both now use the same period). Passing
-                    # None here auto-derived the center span and produced a
-                    # non-PSD penalty (gam#580).
-                    period=period,
-                )
-            if penalty_kind in {"triple-operator", "tripleoperator", "operator"}:
-                raise ValueError(
-                    "the triple-operator (amplitude + slope + curvature) penalty has THREE "
-                    "independent REML smoothing parameters and cannot be collapsed into the "
-                    "single-λ position helper. Fit it through the formula API "
-                    "(gamfit.smooth.Duchon / basis_kind='duchon'), which routes each operator "
-                    "to its own λ."
-                )
-            raise ValueError(f"unsupported Duchon penalty {penalty!r}")
-        if kind in {"duchonmultipenalty", "duchontripleoperator"}:
-            # The amplitude/slope/curvature smoother has THREE independent REML
-            # smoothing parameters; summing the three operators into one matrix
-            # here would force them to share a single λ, which is a different
-            # (and weaker) object than the structural smoother. The position
-            # helper only carries one λ, so there is no faithful single-matrix
-            # representation — route the user to the formula smooth instead.
-            raise ValueError(
-                "basis_kind='duchon_multipenalty' is the multi-λ amplitude/slope/curvature "
-                "smoother and cannot be expressed as a single position-helper penalty. Fit it "
-                "through the formula API (gamfit.smooth.Duchon / basis_kind='duchon'), which "
-                "gives each operator its own REML λ."
-            )
-        if kind in {"bspline", "spline"}:
-            if penalty_kind not in {
-                None,
-                "roughness",
-                "bending-energy",
-                "bendingenergy",
-            }:
-                raise ValueError(f"unsupported B-spline penalty {penalty!r}")
-            if periodic:
-                knots = np.asarray(knots_or_centers, dtype=float)
-                k = int(knots.size - 1)
-                effective_period = (
-                    float(period)
-                    if period is not None
-                    else float(knots[-1] - knots[0])
-                )
-                return np.asarray(
-                    rust_module().cyclic_bspline_roughness_penalty(
-                        k,
-                        int(basis_order),
-                        effective_period,
-                        2,
-                    ),
-                    dtype=float,
-                )
-            s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
-            return s
-        if kind in {"thinplate", "thinplatespline", "tps"}:
-            # 1D thin-plate spline = cubic smoothing spline = Duchon m=2 with
-            # bending-energy ``∫(f'')² dx``. Position-API positions are 1D,
-            # so route the bending-energy penalty through the Duchon m=2
-            # function-norm helper rather than the multi-dimensional thin-plate
-            # path (which expects 2D centers and a different kernel).
-            if penalty_kind not in {None, "function-norm", "functionnorm", "bending-energy", "bendingenergy"}:
-                raise ValueError(f"unsupported thin-plate penalty {penalty!r}")
-            return duchon_function_norm_penalty(
-                np.asarray(knots_or_centers, dtype=float).reshape(-1, 1),
-                m=2,
-                periodic_per_axis=[True] if periodic else None,
-                period=None,
-            )
-    return _numeric_matrix(penalty, "penalty")
-
-
-def _normalize_position_basis(
-    basis_kind: str,
-    basis_order: int | None,
-) -> tuple[str, int, str]:
-    """Resolve user-facing basis names to the engine's basis kind + order.
-
-    Returns ``(effective_kind, effective_order, display_kind)``.
-
-    * ``thinplate`` (1D positions): an alias for Duchon ``m=2`` — the cubic
-      smoothing spline is the canonical 1D thin-plate spline.
-
-    ``duchon_multipenalty`` is rejected here: the amplitude/slope/curvature
-    smoother carries three independent REML ``λ``s and has no single-λ
-    position-helper form — fit it through the formula API instead.
-    """
-    raw = str(basis_kind)
-    kind = raw.strip().lower().replace("_", "").replace("-", "")
-    if kind in {"thinplate", "thinplatespline", "tps"}:
-        order = 2 if basis_order is None else int(basis_order)
-        return ("duchon", order, raw)
-    if kind in {"duchonmultipenalty", "duchontripleoperator"}:
-        raise ValueError(
-            "basis_kind='duchon_multipenalty' is the multi-λ amplitude/slope/curvature "
-            "smoother and has no single-λ position-helper representation. Fit it through the "
-            "formula API (gamfit.smooth.Duchon / basis_kind='duchon')."
-        )
-    return (raw, _position_basis_order(raw, basis_order), raw)
 
 
 def _numeric_tensor3(values: Any, label: str) -> Any:
