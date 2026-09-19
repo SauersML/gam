@@ -72,17 +72,19 @@ Inverse link `eta`. Default for continuous Gaussian responses.
 
 ### `logit`
 
-Inverse link `1 / (1 + exp(-eta))`. Default for binary `{0, 1}` responses.
+Inverse link `1 / (1 + exp(-eta))` (alias `binomial-logit`). Default for
+binary `{0, 1}` responses.
 
 ### `probit`
 
-Inverse link `Phi(eta)`, the standard normal CDF. Required for the
-Bernoulli marginal-slope family (see [marginal-slope.md](marginal-slope.md)).
+Inverse link `Phi(eta)` (alias `binomial-probit`), the standard normal CDF.
+Required for the Bernoulli marginal-slope family (see
+[marginal-slope.md](marginal-slope.md)).
 
 ### `cloglog`
 
-Inverse link `1 - exp(-exp(eta))`. Used for grouped discrete-time hazards
-and rare-event Bernoulli data.
+Inverse link `1 - exp(-exp(eta))` (alias `binomial-cloglog`). Used for
+grouped discrete-time hazards and rare-event Bernoulli data.
 
 ### `log`
 
