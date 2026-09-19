@@ -446,7 +446,8 @@ pub(crate) fn exact_survival_response_moments_row(
                 // `E[S²]` are smooth and do not.
                 crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
                     quadctx,
-                    [x[0] + q0 + w_mean],
+                    // The scale divides the time transform too (#2695).
+                    [x[0] * exp_sigma_inverse_from_eta_scalar(x[2]) + q0 + w_mean],
                     [[w_var]],
                     21,
                     |eta| {
@@ -469,7 +470,7 @@ pub(crate) fn exact_survival_response_moments_row(
         |x, _| {
             let p = inverse_link_survival_prob_checked(
                 &input.inverse_link,
-                x[0] + survival_q0_from_eta(x[1], x[2]),
+                x[0] * exp_sigma_inverse_from_eta_scalar(x[2]) + survival_q0_from_eta(x[1], x[2]),
             )?;
             Ok((p, p * p))
         },

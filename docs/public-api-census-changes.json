@@ -4437,5 +4437,24 @@
     },
     "reason": "#2961 landing 4: JointSpecification::history, the law's own rank-zero record builder, is deleted. joint/data.rs's FrozenJointSchema is the one encoder the fit, conditioning and every surface use; history()'s refusals are the cohort's, reached through that encoder.",
     "evidence": "Direct lane dy6 run ad-nuts-l4-g2 (gate8, base 309d02a7bc, exact tree 3ea9320389, patch md5 57909cfe) had public_api_census.py refuse exactly this one removal. Its only production callers were joint/model.rs's fit and condition, which this landing rewrites to encode through FrozenJointSchema. Re-gated on direct lane dy5 run jls-l4-g3 (gate8), on the same code plus one comment in data_tests.rs and the A12 bench's joint-rank0 arm ported to the table API (code patch md5 758b354f), with these entries in its tree."
+  },
+  {
+    "base": "3101e933be2e80bcea0c1765b47519c2c37042a5",
+    "removed": {
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::assign_block": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::assign_symmetric_block": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mask_row_vec": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mxtwx": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mxtwx_psi": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mxtwxd": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::safe_fast_xt_diag_x": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::weighted_crossprod_dense": 1,
+      "crates/gam-models/src/survival/location_scale/numeric_guards.rs::safe_sum3": 1,
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs::collect_joint_quantities": 1,
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs::collect_joint_quantities_rescaled": 1,
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs::row_predictor_state": 1
+    },
+    "reason": "#2695 whole-residual survival location-scale kernel (i2940's unit, landed by surv-ls-1). These crate-visible helpers served only the location-only kernel's q-chain assembly (collect_joint_quantities -> SurvivalJointQuantities -> the mxtwx/mxtwxd/mxtwx_psi/mask_row_vec/assign_symmetric_block crossproducts in family_solver.rs), which is deleted because its chain dq/d(eta_t) = -exp(-eta_ls) holds only for u = h - eta_t*exp(-eta_ls). Consumers now read the one row program (exact_row_kernel / exact_row_kernel_rescaled) and row_predictor_state_at(dynamic, row). weighted_crossprod_dense's last caller (a tests.rs pin) moves to weighted_crossprod_dense_with_parallelism, safe_sum3's callers regroup the entry-exit gap channel by channel, and assign_block and safe_fast_xt_diag_x had no caller.",
+    "evidence": "git grep -w at 34ea9c6ca2b1043b39389c2ab70403d086ce6e17 names these only inside crates/gam-models/src/survival/location_scale (dense_linalg.rs, numeric_guards.rs, row_kernel.rs, family_solver.rs, mod.rs, wiggle_geometry.rs, time_block.rs, tests.rs); the landing tree declares and calls none of them. public_api_census.py refused exactly these 12 at job 1286875 (i2940's p10 tree); Slurm job 1338925 (lane sw5c) ran it on this tree at 34ea9c6ca2 with RC 0."
   }
 ]

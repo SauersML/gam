@@ -88,14 +88,26 @@ pub(crate) fn event_mix(d: f64, event_val: f64, censored_val: f64) -> f64 {
     }
 }
 
+/// Build the row predictor state with possibly distinct entry/exit
+/// evaluations of threshold and sigma.
+///
+/// `h0` and `h1` are the time transform's scaled shares of the residuals
+/// (`hs_*` in [`SurvivalDynamicGeometry`]). `d_raw` and `qdot1` are the time
+/// transform's and the location channel's shares of the unscaled event
+/// Jacobian `ĝ` (`time_rate_exit` and `qdot_exit`), and `log_rate_scale` is
+/// `−eta_ls` at exit. `entry_active` is false for a row entering at the origin,
+/// which carries no `S(entry)` factor. For time-invariant blocks, the caller
+/// passes the same value for both entry and exit.
 #[inline]
-fn survival_predictor_state(
+pub(crate) fn survival_predictor_state(
     h0: f64,
     h1: f64,
     d_raw: f64,
     q0: f64,
     q1: f64,
     qdot1: f64,
+    log_rate_scale: f64,
+    entry_active: bool,
 ) -> SurvivalPredictorState {
     let g_diff = compensated_difference(d_raw, -qdot1);
     SurvivalPredictorState {
@@ -106,6 +118,8 @@ fn survival_predictor_state(
         q1,
         g_roundoff_slack: g_diff.roundoff_slack,
         g_operand_scale: g_diff.operand_scale,
+        log_rate_scale,
+        entry_active,
     }
 }
 
@@ -121,6 +135,14 @@ impl SurvivalExactRowKernel {
                 self.log_pdf1_minus_log_s0 + self.log_g,
                 self.log_s1_minus_log_s0,
             )
+    }
+
+    /// The row log-likelihood at `state`. The kernel's rate stack is taken at
+    /// the unscaled `ĝ`, so the event log-density adds the scale's
+    /// `log_rate_scale` here (#2695).
+    #[inline]
+    pub(crate) fn log_likelihood_at(self, state: &SurvivalPredictorState) -> f64 {
+        self.log_likelihood() + self.w * self.d * state.log_rate_scale
     }
 }
 
@@ -140,33 +162,6 @@ fn softplus_diff(a: f64, b: f64) -> f64 {
         // difference is at least min(|a|,|b|)-scale, so the naked form is fine.
         softplus(a) - softplus(b)
     }
-}
-
-pub(crate) struct SurvivalJointQuantities {
-    /// Entry-only derivatives of ell w.r.t. q0.
-    pub(crate) d1_q0: Array1<f64>,
-    pub(crate) d2_q0: Array1<f64>,
-    pub(crate) d3_q0: Array1<f64>,
-    /// Exit-only derivatives of ell w.r.t. q1.
-    pub(crate) d1_q1: Array1<f64>,
-    pub(crate) d2_q1: Array1<f64>,
-    pub(crate) d3_q1: Array1<f64>,
-    /// Exit-side dq/d(eta_t) = -exp(-eta_ls_exit).
-    pub(crate) dq_t: Array1<f64>,
-    /// Exit-side dq/d(eta_ls).
-    pub(crate) dq_ls: Array1<f64>,
-    pub(crate) d2q_tls: Array1<f64>,
-    pub(crate) d2q_ls: Array1<f64>,
-    pub(crate) d3q_tls_ls: Array1<f64>,
-    pub(crate) d3q_ls: Array1<f64>,
-    /// Entry-side dq0/d(eta_t_entry) = -exp(-eta_ls_entry) (only for time-varying).
-    pub(crate) dq_t_entry: Option<Array1<f64>>,
-    /// Entry-side q-chain derivatives at entry (only for time-varying sigma).
-    pub(crate) dq_ls_entry: Option<Array1<f64>>,
-    pub(crate) d2q_tls_entry: Option<Array1<f64>>,
-    pub(crate) d2q_ls_entry: Option<Array1<f64>>,
-    pub(crate) d3q_tls_ls_entry: Option<Array1<f64>>,
-    pub(crate) d3q_ls_entry: Option<Array1<f64>>,
 }
 
 pub(crate) struct SurvivalJointPsiDirection {
@@ -304,36 +299,42 @@ impl SurvivalJointPsiDirection {
 /// location-scale row kernel (non-wiggle configurations).
 ///
 /// The row likelihood `ell = w[d(log f(u1)+log g) + (1-d)log S(u1) - log S(u0)]`
-/// depends on three indices `(u0, u1, g)`, each an **affine** function of the
-/// model's linear predictors. We make those linear predictors the primary
-/// space so the row Jacobian is fixed (the `RowKernel` framework requires
-/// this), and fold the nonlinear scale map `q = -eta_t·exp(-eta_ls)` into the
-/// per-row kernel. The nine channels are:
+/// depends on three indices: the standardized residuals
+/// `u = (h − eta_t)·exp(-eta_ls)` at entry and exit, and their time derivative
+/// `du1/dt = exp(-eta_ls)·g` at exit, with `g = ḣ − eta_t' − (h − eta_t)·eta_ls'`
+/// the event Jacobian with the scale factored out. The scale divides the whole
+/// residual, time transform included, so `log(du1/dt) = log g − eta_ls` carries
+/// the `−eta_ls` Jacobian that identifies σ(x) (#2695). That term is linear in a
+/// primary, so the index `g` itself never sees the scale and its log stack stays
+/// representable however extreme `exp(-eta_ls)` is. We make the model's linear
+/// predictors the primary space so the row Jacobian is fixed (the `RowKernel`
+/// framework requires this), and fold the nonlinear scale map into the per-row
+/// kernel. The nine channels are:
 ///
 /// | idx | predictor       | design                              | feeds |
 /// |-----|-----------------|-------------------------------------|-------|
 /// | 0   | h0  (time entry)| `time_jac_entry`                    | u0    |
-/// | 1   | h1  (time exit) | `time_jac_exit`                     | u1    |
+/// | 1   | h1  (time exit) | `time_jac_exit`                     | u1, g |
 /// | 2   | d_raw (time dot)| `time_jac_deriv`                    | g     |
 /// | 3   | eta_t_exit      | `x_threshold`                       | u1, g |
 /// | 4   | eta_t_entry     | `x_threshold_entry` (or threshold)  | u0    |
 /// | 5   | eta_t_deriv     | `x_threshold_deriv` (or none)       | g     |
-/// | 6   | eta_ls_exit     | `x_log_sigma`                       | u1, g |
+/// | 6   | eta_ls_exit     | `x_log_sigma`                       | u1, log-scale term |
 /// | 7   | eta_ls_entry    | `x_log_sigma_entry` (or log_sigma)  | u0    |
 /// | 8   | eta_ls_deriv    | `x_log_sigma_deriv` (or none)       | g     |
 ///
 /// `H[a][b] = -Σ_i (ell_ii·D_i[a]·D_i[b] + ell_i·D2_i[a][b])` is lowered by
 /// [`SurvivalLocationScaleFamily::survival_ls_coefficient_hessian`] through the
-/// 24 structurally live upper-triangle pairs. Indices `i ∈ {u0,u1,g}` are
-/// functionally independent, so the index-space derivative tensors are diagonal.
+/// 24 structurally live upper-triangle pairs; the linear log-scale term has no
+/// curvature. Indices `i ∈ {u0,u1,g}` are functionally independent, so the
+/// index-space derivative tensors are diagonal.
 pub(crate) const SLS_ROW_K: usize = 9;
 const SLS_U0_AXES: [usize; 3] = [0, 4, 7];
 const SLS_U1_AXES: [usize; 3] = [1, 3, 6];
-const SLS_G_AXES: [usize; 5] = [2, 3, 5, 6, 8];
+const SLS_G_AXES: [usize; 5] = [1, 2, 3, 5, 8];
 
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
 /// (non-wiggle path). Holds the per-β quantities already computed by
-/// [`SurvivalLocationScaleFamily::collect_joint_quantities_rescaled`] and
 /// [`SurvivalLocationScaleFamily::build_dynamic_geometry`]; every trait method
 /// is a pure repackaging of those scalars into linear-predictor primary space,
 /// so every coefficient-space target consumes the same row program by construction.
@@ -738,14 +739,7 @@ impl SurvivalLsRowKernel<'_> {
         row: usize,
     ) -> Result<Option<([f64; SLS_ROW_K], SurvivalExactRowKernel)>, String> {
         let p = self.row_primary_values(row);
-        let state = self.family.row_predictor_state(
-            self.dynamic.h_entry[row],
-            self.dynamic.h_exit[row],
-            self.dynamic.hdot_exit[row],
-            self.dynamic.q_entry[row],
-            self.dynamic.q_exit[row],
-            self.dynamic.qdot_exit[row],
-        );
+        let state = self.family.row_predictor_state_at(self.dynamic, row);
         let kernel = self
             .family
             .exact_row_kernel_rescaled(row, state, self.deriv_log_scale)?;
@@ -761,14 +755,7 @@ impl SurvivalLsRowKernel<'_> {
         row: usize,
     ) -> Result<Option<([f64; SLS_ROW_K], SurvivalExactRowKernel, SlsFifthEntries)>, String> {
         let p = self.row_primary_values(row);
-        let state = self.family.row_predictor_state(
-            self.dynamic.h_entry[row],
-            self.dynamic.h_exit[row],
-            self.dynamic.hdot_exit[row],
-            self.dynamic.q_entry[row],
-            self.dynamic.q_exit[row],
-            self.dynamic.qdot_exit[row],
-        );
+        let state = self.family.row_predictor_state_at(self.dynamic, row);
         let fifth = SurvivalLocationScaleFamily::exact_row_kernel_fifth_from_parts(
             &self.family.inverse_link,
             self.family.derivative_guard,
@@ -808,10 +795,10 @@ impl SurvivalLsRowKernel<'_> {
 /// eta_t_entry, eta_t_deriv, eta_ls_exit, eta_ls_entry, eta_ls_deriv)` — see
 /// [`SurvivalLsRowKernel::row_primary_values`]. From them the survival index
 /// quantities are
-///   `u0 = h_entry − eta_t_entry·e^{−eta_ls_entry}`  (entry / left-truncation),
-///   `u1 = h_exit  − eta_t_exit ·e^{−eta_ls_exit}`   (exit),
-///   `g  = hdot_exit + e^{−eta_ls_exit}·(eta_t_exit·eta_ls_deriv − eta_t_deriv)`
-/// (the event log-density's Jacobian factor), and the NLL is
+///   `u0 = (h_entry − eta_t_entry)·e^{−eta_ls_entry}`  (entry / left-truncation),
+///   `u1 = (h_exit  − eta_t_exit) ·e^{−eta_ls_exit}`   (exit),
+///   `g  = e^{−eta_ls_exit}·(hdot_exit − eta_t_deriv − (h_exit − eta_t_exit)·eta_ls_deriv)`
+/// (the event log-density's Jacobian factor, `du1/dt`), and the NLL is
 ///   `w[ logS0(u0) − (1−d)·logS1(u1) − d·(logφ1(u1) + log g(g)) ]`,
 /// each residual-distribution stack `logS/logφ/log g` supplied as a hand-certified
 /// `[f64; 5]` derivative stack on the kernel and entered through
@@ -822,17 +809,21 @@ struct SlsOuterPlan<const ORDER: usize> {
     u0: [f64; ORDER],
     u1: Option<[f64; ORDER]>,
     g: Option<[f64; ORDER]>,
+    /// The NLL's coefficient on `eta_ls_exit` from the event log-density's
+    /// `log(du1/dt) = log g − eta_ls` (#2695): the event weight wherever the rate
+    /// stack is live, zero otherwise. It is linear, so only the value and the
+    /// gradient see it.
+    g_log_scale: f64,
 }
 
-/// Exactly the eight diagonal index-space NLL channels consumed by the
-/// inner-Newton update: orders one and two for `(u0, u1, g)`, and order three
-/// for `(u0, u1)`. The channel count is encoded in the array widths, so the
-/// unused `d³/dg³` channel cannot be materialized or accidentally consumed.
+/// Exactly the six diagonal index-space NLL channels consumed by the
+/// inner-Newton update: orders one and two for `(u0, u1, g)`. The channel
+/// count is encoded in the array widths, so no unconsumed higher order can be
+/// materialized or accidentally consumed.
 #[derive(Clone, Copy, Debug)]
 struct SlsIndexDerivativeChannels {
     gradient: [f64; 3],
     hessian_diagonal: [f64; 3],
-    third_diagonal: [f64; 2],
 }
 
 /// Project one derivative order from the canonical outer stacks. Both the
@@ -863,7 +854,6 @@ impl SlsOuterPlan<5> {
         SlsIndexDerivativeChannels {
             gradient: project_index_diagonal::<3, 1>(&stacks),
             hessian_diagonal: project_index_diagonal::<3, 2>(&stacks),
-            third_diagonal: project_index_diagonal::<2, 3>(&stacks),
         }
     }
 }
@@ -970,28 +960,37 @@ fn sls_outer_plan_with_fifth<const ORDER: usize>(
         );
         stack
     });
+    // The log-scale term rides with the rate stack: it is the `−η_σ` of the same
+    // `log(du1/dt)`, so a row whose rate stack is exactly zero (an inactive rate
+    // term, or a stack of shape partials that `log g` does not have) carries none.
+    let g_log_scale = if g.as_ref().is_some_and(|stack| !stack_is_exactly_zero(stack)) {
+        event_weight
+    } else {
+        0.0
+    };
     SlsOuterPlan {
         u0,
         u1: (censored_weight != 0.0 || event_weight != 0.0).then_some(u1),
         g,
+        g_log_scale,
     }
 }
 
 row_atom! {
     fn sls_index [generic, order2](h, eta_t, eta_ls) {
-        h - eta_t * exp(-eta_ls)
+        (h - eta_t) * exp(-eta_ls)
     }
 }
 
 row_atom! {
     fn sls_event_rate [generic, order2](
+        h,
         hdot,
         eta_t,
         eta_t_deriv,
-        eta_ls,
         eta_ls_deriv
     ) {
-        hdot + exp(-eta_ls) * (eta_t * eta_ls_deriv - eta_t_deriv)
+        hdot - eta_t_deriv - (h - eta_t) * eta_ls_deriv
     }
 }
 
@@ -1048,15 +1047,16 @@ row_program! {
         g_second,
         g_third,
         g_fourth,
-        g_fifth
+        g_fifth,
+        g_log_scale
     )
     emit [generic, order2, third, fourth, fifth_contracted];
     leaves {
         exponential => sls_program_exp_stack => sls_program_exp_stack_cuda => sls_program_exp_stack_fifth,
         // Each residual-distribution stack (`logS`, `logφ`, `log g`) is
         // supplied: the kernel builder evaluated it at the point the program
-        // recomputes from the same parameters (`u0 = h0 + q0`, likewise `u1`,
-        // `g`), and an inactive slot never reaches the compose. The sixth
+        // recomputes from the same parameters (`u0 = (h0 − η_t)·e^{−η_ls}`,
+        // likewise `u1`, `g`), and an inactive slot never reaches the compose. The sixth
         // entry is read only by the fifth-order surface; every lower order
         // is called with it zero (#2677).
         outer => supplied,
@@ -1065,13 +1065,15 @@ row_program! {
     {
         let neg_eta_ls_entry = neg(eta_ls_entry);
         let inv_sigma_entry = compose(exponential, neg_eta_ls_entry);
-        let u0 = add(h0, neg(mul(eta_t_entry, inv_sigma_entry)));
+        let u0 = mul(add(h0, neg(eta_t_entry)), inv_sigma_entry);
 
         let neg_eta_ls_exit = neg(eta_ls_exit);
         let inv_sigma_exit = compose(exponential, neg_eta_ls_exit);
-        let u1 = add(h1, neg(mul(eta_t_exit, inv_sigma_exit)));
-        let event_inner = add(mul(eta_t_exit, eta_ls_deriv), neg(eta_t_deriv));
-        let g = add(hdot, mul(inv_sigma_exit, event_inner));
+        let residual_exit = add(h1, neg(eta_t_exit));
+        let u1 = mul(residual_exit, inv_sigma_exit);
+        // `du1/dt = e^{−η_ls}·g`: the log stack is taken at `g`, and the scale's
+        // `−η_ls` enters the event log-density as the linear `g_log_scale` term.
+        let g = add(add(hdot, neg(eta_t_deriv)), neg(mul(residual_exit, eta_ls_deriv)));
 
         let mut nll = zero();
         if (u0_value != 0.0 || u0_first != 0.0 || u0_second != 0.0 || u0_third != 0.0 || u0_fourth != 0.0 || u0_fifth != 0.0) {
@@ -1116,6 +1118,9 @@ row_program! {
                 )
             );
         }
+        if (g_log_scale != 0.0) {
+            nll = add(nll, scale(eta_ls_exit, g_log_scale));
+        }
         return nll;
     }
 }
@@ -1143,7 +1148,7 @@ pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
     let (nll, []) = sls_row_program(
         &vars[0], &vars[1], &vars[2], &vars[3], &vars[4], &vars[5], &vars[6], &vars[7], &vars[8],
         plan.u0[0], plan.u0[1], plan.u0[2], plan.u0[3], plan.u0[4], 0.0, u1[0],
-        u1[1], u1[2], u1[3], u1[4], 0.0, g[0], g[1], g[2], g[3], g[4], 0.0,
+        u1[1], u1[2], u1[3], u1[4], 0.0, g[0], g[1], g[2], g[3], g[4], 0.0, plan.g_log_scale,
     );
     Ok(nll)
 }
@@ -1158,7 +1163,7 @@ fn sls_row_vgh_generated(
     let (value, gradient, hessian, []) = sls_row_program_order2(
         primary[0], primary[1], primary[2], primary[3], primary[4], primary[5], primary[6],
         primary[7], primary[8], plan.u0[0], plan.u0[1], plan.u0[2], 0.0, 0.0, 0.0,
-        u1[0], u1[1], u1[2], 0.0, 0.0, 0.0, g[0], g[1], g[2], 0.0, 0.0, 0.0,
+        u1[0], u1[1], u1[2], 0.0, 0.0, 0.0, g[0], g[1], g[2], 0.0, 0.0, 0.0, plan.g_log_scale,
     );
     (value, gradient, hessian)
 }
@@ -1185,7 +1190,7 @@ fn sls_row_third_generated_with_plan(
         primary[0], primary[1], primary[2], primary[3], primary[4], primary[5], primary[6],
         primary[7], primary[8], plan.u0[0], plan.u0[1], plan.u0[2], plan.u0[3],
         plan.u0[4], 0.0, u1[0], u1[1], u1[2], u1[3], u1[4], 0.0, g[0], g[1], g[2], g[3],
-        g[4], 0.0, direction,
+        g[4], 0.0, plan.g_log_scale, direction,
     )
 }
 
@@ -1243,6 +1248,7 @@ fn sls_row_fourth_generated_with_plan(
         g[3],
         g[4],
         0.0,
+        plan.g_log_scale,
         direction_u,
         direction_v,
     )
@@ -1290,6 +1296,7 @@ fn sls_row_fifth_generated(
         g[3],
         g[4],
         g[5],
+        plan.g_log_scale,
         direction_u,
         direction_v,
         direction_w,
@@ -1390,9 +1397,12 @@ fn sls_row_hessian_pairs_compiled(
             SLS_G_AXES,
             stack[1],
             stack[2],
+            // Upper triangle of the event rate's axes (h1, hdot, eta_t, eta_t',
+            // eta_ls'): the pairs among (h1, eta_t) were written by `u1` and
+            // accumulate; every other pair is first written here.
             [
-                false, false, false, false, false, true, false, true, false, false, false, false,
-                true, false, false,
+                true, false, true, false, false, false, false, false, false, true, false, false,
+                false, false, false,
             ],
         );
     }
@@ -1482,7 +1492,10 @@ pub(crate) struct SlsWiggleRowBasis<'b> {
 
 /// #932 link-wiggle: the survival-LS row NLL extended with the link warp
 /// `q = q0 + Σ_j βw_j·B_j(q0)` and the time-derivative coupling
-/// `g = hdot + m1·qdot0`, `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`, written ONCE over
+/// `du1/dt = e^{−η_ls}·g`, `g = (hdot − h·η_ls') + m1·qdot0`,
+/// `qdot0 = η_t·η_ls' − η_t'`, `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`, with the time
+/// channel scaled like the location (`u = h·e^{−η_ls} + q`, #2695) and the
+/// scale's `−η_ls` entering the event log-density linearly, written ONCE over
 /// a generic jet scalar (`KW = SLS_ROW_K + pw`). `vars[0..9]` are the base
 /// channels (exactly [`sls_row_nll`]); `vars[9..9+pw]` are the wiggle
 /// amplitudes βw. The per-row basis stacks are evaluated at the BASE indices
@@ -1507,7 +1520,10 @@ pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
     let q0 = vars[4].mul(&inv_sigma_entry).neg();
     let inv_sigma_exit = vars[6].neg().exp();
     let q1 = vars[3].mul(&inv_sigma_exit).neg();
-    let qdot0 = inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5]));
+    let qdot0 = vars[3].mul(&vars[8]).sub(&vars[5]);
+    let hs0 = vars[0].mul(&inv_sigma_entry);
+    let hs1 = vars[1].mul(&inv_sigma_exit);
+    let time_rate = vars[2].sub(&vars[1].mul(&vars[8]));
     let mut q0w = q0.clone();
     let mut q1w = q1.clone();
     let mut m1 = vars[0].constant_like(1.0);
@@ -1523,9 +1539,9 @@ pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
         q1w = q1w.add(&bw.mul(&q1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], b4x[j]])));
         m1 = m1.add(&bw.mul(&q1.compose_unary([b1x[j], b2x[j], b3x[j], b4x[j], b5x[j]])));
     }
-    let u0w = vars[0].add(&q0w);
-    let u1w = vars[1].add(&q1w);
-    let g = vars[2].add(&m1.mul(&qdot0));
+    let u0w = hs0.add(&q0w);
+    let u1w = hs1.add(&q1w);
+    let g = time_rate.add(&m1.mul(&qdot0));
     // Skip exactly-zero stacks instead of composing them (same #2342 far-tail
     // 0·∞ = NaN guard as [`sls_row_nll`]); `vars[0]` is a plain seed jet with
     // finite channels, so scaling it by zero is a safe zero of the right type.
@@ -1575,6 +1591,8 @@ pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
         ];
         if !stack_is_exactly_zero(&g_stack) {
             nll = nll.add(&g.compose_unary(g_stack).scale(-event_weight));
+            // `log(du1/dt) = log g − η_ls` (#2695).
+            nll = nll.add(&vars[6].scale(event_weight));
         }
     }
     nll
@@ -1644,6 +1662,9 @@ pub struct SurvivalLocationScaleAloRowInput<'a> {
     pub eta_log_sigma_exit: f64,
     pub eta_log_sigma_entry: f64,
     pub eta_log_sigma_derivative_exit: f64,
+    /// Whether the row entered after the origin, so its likelihood conditions on
+    /// surviving to its entry (`SurvivalLocationScaleFamily::entry_active`).
+    pub entry_active: bool,
     pub time_wiggle: Option<SurvivalLocationScaleAloTimeWiggleInput<'a>>,
     pub link_wiggle: Option<SurvivalLocationScaleAloWiggleInput<'a>>,
 }
@@ -1780,9 +1801,8 @@ pub fn survival_location_scale_alo_row_geometry(
     let inv_sigma_exit = exp_sigma_inverse_from_eta_scalar(input.eta_log_sigma_exit);
     let q_base_entry = -input.eta_threshold_entry * inv_sigma_entry;
     let q_base_exit = -input.eta_threshold_exit * inv_sigma_exit;
-    let qdot_base_exit = inv_sigma_exit
-        * (input.eta_threshold_exit * input.eta_log_sigma_derivative_exit
-            - input.eta_threshold_derivative_exit);
+    let qdot_base_exit = input.eta_threshold_exit * input.eta_log_sigma_derivative_exit
+        - input.eta_threshold_derivative_exit;
     let (q_entry, q_exit, qdot_exit) = match input.link_wiggle.as_ref() {
         Some(wiggle) => {
             let mut q_entry = q_base_entry;
@@ -1798,7 +1818,18 @@ pub fn survival_location_scale_alo_row_geometry(
         }
         None => (q_base_entry, q_base_exit, qdot_base_exit),
     };
-    let state = survival_predictor_state(h_entry, h_exit, hdot_exit, q_entry, q_exit, qdot_exit);
+    // The scale divides the time transform too (#2695): `u = h·e^{−η_ls} + q`
+    // and `du1/dt = e^{−η_ls}·g` with `g = (hdot − h·η_ls') + qdot`.
+    let state = survival_predictor_state(
+        h_entry * inv_sigma_entry,
+        h_exit * inv_sigma_exit,
+        hdot_exit - h_exit * input.eta_log_sigma_derivative_exit,
+        q_entry,
+        q_exit,
+        qdot_exit,
+        -input.eta_log_sigma_exit,
+        input.entry_active,
+    );
     let kernel = SurvivalLocationScaleFamily::exact_row_kernel_from_parts(
         input.inverse_link,
         input.derivative_guard,
@@ -1995,9 +2026,9 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
             .wiggle_degree
             .ok_or("link-wiggle kernel: missing wiggle degree")?;
         // The link warp is defined on the unwarped AFT index
-        // `q = q0 + Σ βw_j B_j(q0)`, then the baseline hazard is added:
-        // `u = h + q`. `dynamic.q_*` already contains the warp, so composing at
-        // either that value or `h + q` would apply βB a second time. The base
+        // `q = q0 + Σ βw_j B_j(q0)`, then the scaled time transform is added:
+        // `u = h·e^{−η_ls} + q`. `dynamic.q_*` already contains the warp, so
+        // composing at either that value or `u` would apply βB a second time. The base
         // indices persisted by `build_dynamic_geometry` are the unique centers
         // shared by fit, prediction, and this derivative program.
         let q_exit = &dynamic.q_base_exit;
@@ -2558,10 +2589,11 @@ fn sls_row_nll_onesseed_batch(
     event_on: bool,
 ) -> OneSeedBatch<SLS_ROW_K> {
     let inv_sigma_entry = vars[7].neg().exp();
-    let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
+    let u0 = vars[0].sub(&vars[4]).mul(&inv_sigma_entry);
     let inv_sigma_exit = vars[6].neg().exp();
-    let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
-    let g = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
+    let residual_exit = vars[1].sub(&vars[3]);
+    let u1 = residual_exit.mul(&inv_sigma_exit);
+    let g = vars[2].sub(&vars[5]).sub(&residual_exit.mul(&vars[8]));
 
     // Fold the per-row/censoring/event weights into each `compose_unary`
     // coefficient stack (pre-scale) via the shared `sls_outer_plan`, exactly as
@@ -2603,6 +2635,15 @@ fn sls_row_nll_onesseed_batch(
         let term = select_active_term(
             g.compose_unary(g_stack),
             active_stack_lane_mask(&g_stack),
+            -0.0,
+        );
+        nll = nll.add(&term);
+        // The scale's linear `−η_ls` in the event log-density, on the lanes the
+        // scalar adds it.
+        let log_scale = f64x4::new(std::array::from_fn(|lane| plans[lane].g_log_scale));
+        let term = select_active_term(
+            vars[6].mul(&OneSeedBatch::<SLS_ROW_K>::constant(log_scale)),
+            log_scale.simd_ne(f64x4::splat(0.0)),
             -0.0,
         );
         nll = nll.add(&term);
@@ -3419,6 +3460,258 @@ pub(crate) fn survival_ls_joint_psi_hessian_operator(
     )))
 }
 
+/// Accumulator of the explicit first-order ψ terms over rows.
+struct SurvivalLsPsiFold {
+    objective: f64,
+    score: Array1<f64>,
+    hessian: Option<Array2<f64>>,
+    arena: DynamicJetArena,
+}
+
+/// One row's NLL jets in primary space, with the ψ motion of its primaries.
+#[derive(Clone, Copy)]
+struct SurvivalLsPsiRowJets<'a> {
+    k: usize,
+    gradient: &'a [f64],
+    /// Row-major `k × k`.
+    hessian: &'a [f64],
+    /// Row-major `k × k` third derivative contracted with `psi_direction`;
+    /// `None` when no dense `H_ψ` is being assembled.
+    third: Option<&'a [f64]>,
+    psi_direction: &'a [f64],
+}
+
+/// Add one row's explicit ψ terms from its NLL jets in primary space.
+///
+/// With primaries `p = J β` (base design rows `J`) and the ψ motion of the
+/// primaries `p_ψ = J_ψ β` (ψ-derivative design rows `J_ψ`), the explicit
+/// derivatives of the row NLL value, coefficient gradient and coefficient
+/// Hessian are
+///
+/// ```text
+/// V_ψ = ∇ℓ·p_ψ,   g_ψ = Jᵀ(H p_ψ) + J_ψᵀ∇ℓ,   H_ψ = Jᵀ T₃[p_ψ] J + J_ψᵀ H J + Jᵀ H J_ψ .
+/// ```
+fn add_survival_ls_psi_row(
+    fold: &mut SurvivalLsPsiFold,
+    row_weight: f64,
+    jets: &SurvivalLsPsiRowJets<'_>,
+    base_rows: &[Option<(usize, Array1<f64>)>],
+    psi_rows: &[Option<(usize, Array1<f64>)>],
+) {
+    let SurvivalLsPsiRowJets {
+        k,
+        gradient,
+        hessian,
+        third,
+        psi_direction,
+    } = *jets;
+    fold.objective += row_weight
+        * gradient
+            .iter()
+            .zip(psi_direction)
+            .map(|(&g, &d)| g * d)
+            .sum::<f64>();
+    for a in 0..k {
+        let h_p: f64 = (0..k).map(|b| hessian[a * k + b] * psi_direction[b]).sum();
+        if let Some((offset, design)) = base_rows[a].as_ref() {
+            let scale = row_weight * h_p;
+            if scale != 0.0 {
+                for (i, &value) in design.iter().enumerate() {
+                    fold.score[offset + i] += scale * value;
+                }
+            }
+        }
+        if let Some((offset, design)) = psi_rows[a].as_ref() {
+            let scale = row_weight * gradient[a];
+            if scale != 0.0 {
+                for (i, &value) in design.iter().enumerate() {
+                    fold.score[offset + i] += scale * value;
+                }
+            }
+        }
+    }
+    let (Some(target), Some(third)) = (fold.hessian.as_mut(), third) else {
+        return;
+    };
+    for a in 0..k {
+        for b in 0..k {
+            let Some((off_b, row_b)) = base_rows[b].as_ref() else {
+                continue;
+            };
+            let drift = row_weight * third[a * k + b];
+            let mixed = row_weight * hessian[a * k + b];
+            if let Some((off_a, row_a)) = base_rows[a].as_ref()
+                && drift != 0.0
+            {
+                for (ia, &va) in row_a.iter().enumerate() {
+                    if va == 0.0 {
+                        continue;
+                    }
+                    let left = drift * va;
+                    for (ib, &vb) in row_b.iter().enumerate() {
+                        target[[off_a + ia, off_b + ib]] += left * vb;
+                    }
+                }
+            }
+            if mixed == 0.0 {
+                continue;
+            }
+            let Some((psi_off, psi_row)) = psi_rows[a].as_ref() else {
+                continue;
+            };
+            for (ia, &va) in psi_row.iter().enumerate() {
+                if va == 0.0 {
+                    continue;
+                }
+                let left = mixed * va;
+                for (ib, &vb) in row_b.iter().enumerate() {
+                    target[[psi_off + ia, off_b + ib]] += left * vb;
+                    target[[off_b + ib, psi_off + ia]] += left * vb;
+                }
+            }
+        }
+    }
+}
+
+/// The ψ-derivative design rows of one row, placed in their coefficient blocks.
+/// The time channels have no ψ motion; a wiggle kernel's amplitude channels
+/// (`k > SLS_ROW_K`) have none either.
+fn survival_ls_psi_rows(
+    direction: &SurvivalJointPsiDirection,
+    offsets: &[usize],
+    row: usize,
+    k: usize,
+) -> Result<Vec<Option<(usize, Array1<f64>)>>, String> {
+    (0..k)
+        .map(|channel| {
+            if !(3..SLS_ROW_K).contains(&channel) {
+                return Ok(None);
+            }
+            let block = if channel <= 5 { 1 } else { 2 };
+            direction
+                .channel_row(channel, row)
+                .map(|design_row| design_row.map(|design_row| (offsets[block], design_row)))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+/// The explicit first-order ψ terms `(V_ψ, g_ψ, H_ψ)` of the survival
+/// location-scale NLL, from the same row program as the value, gradient and
+/// Hessian (the #736/#932 single-source contract). `H_ψ` is assembled dense only
+/// when `dense_hessian` is set; the non-wiggle design-action path serves it as
+/// [`survival_ls_joint_psi_hessian_operator`] instead. A link-wiggle family uses
+/// its runtime-width row program, whose amplitude channels carry no ψ motion.
+pub(crate) fn survival_ls_joint_psi_first_order_terms(
+    family: &SurvivalLocationScaleFamily,
+    dynamic: &SurvivalDynamicGeometry,
+    direction: &SurvivalJointPsiDirection,
+    row_mask: Option<&Array1<f64>>,
+    dense_hessian: bool,
+) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
+    let rows = row_set_from_survival_mask(row_mask, family.n);
+    let base_kernel = family.survival_ls_row_kernel_rescaled(dynamic, 0.0);
+    let offsets = base_kernel.offsets.clone();
+    let wiggle_kernel = if family.x_link_wiggle.is_some() {
+        Some(SurvivalLsWiggleRowKernel::new(family, dynamic, 0.0)?)
+    } else {
+        None
+    };
+    let p = match wiggle_kernel.as_ref() {
+        Some(kernel) => kernel.n_coefficients(),
+        None => *offsets
+            .last()
+            .ok_or_else(|| "missing survival joint coefficient offset".to_string())?,
+    };
+    let init = || SurvivalLsPsiFold {
+        objective: 0.0,
+        score: Array1::zeros(p),
+        hessian: dense_hessian.then(|| Array2::zeros((p, p))),
+        arena: DynamicJetArena::new(),
+    };
+    let fold = rows.par_try_reduce_fold(
+        family.n,
+        init,
+        |mut fold, row, row_weight| -> Result<SurvivalLsPsiFold, String> {
+            let base_direction = direction.primary_direction(row);
+            match wiggle_kernel.as_ref() {
+                None => {
+                    let (_, gradient, hessian) =
+                        crate::row_kernel::RowKernel::row_kernel(&base_kernel, row)?;
+                    let third = if dense_hessian {
+                        Some(crate::row_kernel::RowKernel::row_third_contracted(
+                            &base_kernel,
+                            row,
+                            &base_direction,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let hessian_flat: Vec<f64> = hessian.iter().flatten().copied().collect();
+                    let third_flat: Option<Vec<f64>> =
+                        third.map(|third| third.iter().flatten().copied().collect());
+                    let base_rows = base_kernel.cached_channel_rows(row);
+                    let psi_rows = survival_ls_psi_rows(direction, &offsets, row, SLS_ROW_K)?;
+                    add_survival_ls_psi_row(
+                        &mut fold,
+                        row_weight,
+                        &SurvivalLsPsiRowJets {
+                            k: SLS_ROW_K,
+                            gradient: &gradient,
+                            hessian: &hessian_flat,
+                            third: third_flat.as_deref(),
+                            psi_direction: &base_direction,
+                        },
+                        &base_rows,
+                        &psi_rows,
+                    );
+                }
+                Some(kernel) => {
+                    let k = kernel.primary_dimension();
+                    let mut psi_direction = vec![0.0; k];
+                    psi_direction[..SLS_ROW_K].copy_from_slice(&base_direction);
+                    fold.arena.reset();
+                    let order2 = kernel.row_order2(row, &fold.arena)?;
+                    let gradient = order2.g().to_vec();
+                    let hessian = order2.h().to_vec();
+                    let third = if dense_hessian {
+                        let out = kernel.row_third_contracted(row, &psi_direction, &fold.arena)?;
+                        Some(out.contracted_third().to_vec())
+                    } else {
+                        None
+                    };
+                    let base_rows: Vec<Option<(usize, Array1<f64>)>> =
+                        (0..k).map(|channel| kernel.jrow(channel, row)).collect();
+                    let psi_rows = survival_ls_psi_rows(direction, &offsets, row, k)?;
+                    add_survival_ls_psi_row(
+                        &mut fold,
+                        row_weight,
+                        &SurvivalLsPsiRowJets {
+                            k,
+                            gradient: &gradient,
+                            hessian: &hessian,
+                            third: third.as_deref(),
+                            psi_direction: &psi_direction,
+                        },
+                        &base_rows,
+                        &psi_rows,
+                    );
+                }
+            }
+            Ok(fold)
+        },
+        |mut left, right| {
+            left.objective += right.objective;
+            left.score += &right.score;
+            if let (Some(target), Some(part)) = (left.hessian.as_mut(), right.hessian.as_ref()) {
+                *target += part;
+            }
+            Ok(left)
+        },
+    )?;
+    Ok((fold.objective, fold.score, fold.hessian))
+}
+
 fn require_fitted_block_geometry(
     block_states: &[ParameterBlockState],
     context: &'static str,
@@ -3515,19 +3808,25 @@ struct SlsHessianPairGroup {
 
 /// The only structurally live upper-triangle pairs of the canonical
 /// nine-primary survival-LS row program. The ordering is block-major:
-/// TT, TQ, TL, QQ, QL, LL. Symmetry supplies the omitted lower triangle.
+/// TT, TQ, TL, QQ, QL, LL. Symmetry supplies the omitted lower triangle. The
+/// exit time value `h1` reaches the event rate through `−(h1 − eta_t)·eta_ls'`,
+/// which is what makes `(1, 2)`, `(1, 5)` and `(1, 8)` live. The scale reaches
+/// the event log-density only through its linear `−eta_ls` term, so no pair of
+/// `eta_ls_exit` with a rate-only channel is live.
 const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
     (0, 0),
     (1, 1),
     (2, 2),
+    (1, 2),
     (0, 4),
     (1, 3),
     (2, 3),
     (2, 5),
+    (1, 5),
     (0, 7),
     (1, 6),
-    (2, 6),
     (2, 8),
+    (1, 8),
     (3, 3),
     (3, 5),
     (4, 4),
@@ -3535,10 +3834,8 @@ const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
     (3, 6),
     (3, 8),
     (4, 7),
-    (5, 6),
     (5, 8),
     (6, 6),
-    (6, 8),
     (7, 7),
     (8, 8),
 ];
@@ -3738,12 +4035,13 @@ impl SurvivalLocationScaleFamily {
         let mut paired_s2 = Array1::<f64>::zeros(self.n);
         let mut use_paired = vec![false; self.n];
         for row in 0..self.n {
-            let u0 = dynamic.h_entry[row] + dynamic.q_entry[row];
+            let u0 = dynamic.hs_entry[row] + dynamic.q_entry[row];
             if self.w[row] > 0.0
+                && self.entry_active[row]
                 && paired_stacks::paired_contraction_needs_regroup(&self.inverse_link, u0)
             {
-                let u1 = dynamic.h_exit[row] + dynamic.q_exit[row];
-                let delta_u = (dynamic.h_exit[row] - dynamic.h_entry[row])
+                let u1 = dynamic.hs_exit[row] + dynamic.q_exit[row];
+                let delta_u = (dynamic.hs_exit[row] - dynamic.hs_entry[row])
                     + (dynamic.q_exit[row] - dynamic.q_entry[row]);
                 if let Some(sums) = paired_stacks::weighted_paired_index_sums(
                     &self.inverse_link,
@@ -3766,9 +4064,12 @@ impl SurvivalLocationScaleFamily {
             .into_par_iter()
             .enumerate()
             .try_for_each(|(row, mut row_slots)| -> Result<(), String> {
-                let coefficients = match kernel.row_nll_inputs_opt(row)? {
-                    Some((primary, exact)) => sls_row_hessian_pairs_compiled(&primary, &exact),
-                    None => [0.0; SLS_HESSIAN_PAIRS.len()],
+                let (coefficients, entry_stack) = match kernel.row_nll_inputs_opt(row)? {
+                    Some((primary, exact)) => (
+                        sls_row_hessian_pairs_compiled(&primary, &exact),
+                        sls_outer_plan::<5>(&exact).u0,
+                    ),
+                    None => ([0.0; SLS_HESSIAN_PAIRS.len()], [0.0; 5]),
                 };
                 for (slot, group) in groups.iter().enumerate() {
                     let mut coefficient = group
@@ -3788,9 +4089,25 @@ impl SurvivalLocationScaleFamily {
                     {
                         let block = group.left_channel / 3;
                         if block == 2 && self.x_log_sigma_entry.is_none() {
-                            let d1 = dynamic.dq_ls_exit[row];
-                            let d2 = dynamic.d2q_ls_exit[row];
-                            coefficient = -(paired_s1[row] * d2 + paired_s2[row] * d1 * d1);
+                            // The scale divides the time transform too, so the entry
+                            // and exit derivatives `∂u/∂η_ls = ∂q/∂η_ls − hs` differ by
+                            // the scaled time gap. Anchor the stable pair sums at exit
+                            // and carry the entry side's difference exactly: those
+                            // terms are honestly huge, never a cancelling pair. The
+                            // gaps are taken channel by channel, since `hs` rounds
+                            // away inside `d1` and `d2` once `q ~ 1e150`.
+                            let d1_exit = dynamic.dq_ls_exit[row] - dynamic.hs_exit[row];
+                            let d1_entry = dynamic.dq_ls_entry[row] - dynamic.hs_entry[row];
+                            let d2_exit = dynamic.d2q_ls_exit[row] + dynamic.hs_exit[row];
+                            let hs_gap = dynamic.hs_entry[row] - dynamic.hs_exit[row];
+                            let d1_gap =
+                                (dynamic.dq_ls_entry[row] - dynamic.dq_ls_exit[row]) - hs_gap;
+                            let d2_gap =
+                                (dynamic.d2q_ls_entry[row] - dynamic.d2q_ls_exit[row]) + hs_gap;
+                            coefficient = -(paired_s1[row] * d2_exit
+                                + paired_s2[row] * d1_exit * d1_exit)
+                                + entry_stack[1] * d2_gap
+                                + entry_stack[2] * d1_gap * (d1_entry + d1_exit);
                         } else if block == 1 && self.x_threshold_entry.is_none() {
                             // Threshold index is LINEAR in η_t (∂²u/∂η_t² = 0).
                             let d1 = dynamic.dq_t_exit[row];
@@ -4273,120 +4590,6 @@ impl SurvivalLocationScaleFamily {
         ))
     }
 
-    pub(crate) fn collect_joint_quantities(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<SurvivalJointQuantities, String> {
-        self.collect_joint_quantities_rescaled(block_states, 0.0)
-    }
-
-    /// Collect per-row derivative quantities while passing `deriv_log_scale`
-    /// through to row primitives that use it.  The CLogLog log-PDF derivatives
-    /// use this shift; the CLogLog survival ratio derivatives do not.
-    pub(crate) fn collect_joint_quantities_rescaled(
-        &self,
-        block_states: &[ParameterBlockState],
-        deriv_log_scale: f64,
-    ) -> Result<SurvivalJointQuantities, String> {
-        let n = self.n;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        let mut d1_q0 = Array1::<f64>::zeros(n);
-        let mut d2_q0 = Array1::<f64>::zeros(n);
-        let mut d3_q0 = Array1::<f64>::zeros(n);
-        let mut d1_q1 = Array1::<f64>::zeros(n);
-        let mut d2_q1 = Array1::<f64>::zeros(n);
-        let mut d3_q1 = Array1::<f64>::zeros(n);
-
-        // Write each row's six live derivative scalars directly into the
-        // preallocated output arrays in parallel. The previous path collected
-        // a `Vec<Option<SurvivalRowDerivatives>>` and then serially scattered it
-        // into `Array1`s — at large scale that is the
-        // worst-case transient allocation among the family row builders.
-        // Rows where `row_derivatives_rescaled` returns `Ok(None)` keep their
-        // zero-initialized slots (matching the previous `continue` branch).
-        /// Wrapper to send raw pointers across threads for disjoint per-row
-        /// writes.  SAFETY: each parallel iteration writes a unique index `i`
-        /// into a buffer of length `n`, and the pointers do not outlive the
-        /// surrounding scope.
-        #[derive(Clone, Copy)]
-        struct SendPtr(*mut f64);
-        // SAFETY: SendPtr is constructed from Array1::as_mut_ptr() on
-        // length-n buffers; the rayon (0..n).into_par_iter() driver gives
-        // each thread a unique i, so writes via SendPtr never alias.
-        unsafe impl Send for SendPtr {}
-        // SAFETY: same disjoint-index invariant as the Send impl above.
-        unsafe impl Sync for SendPtr {}
-        impl SendPtr {
-            #[inline(always)]
-            // SAFETY: caller passes `i < n` (the buffer length used to take
-            // `self.0`); rayon's `(0..n).into_par_iter()` driver guarantees
-            // exclusive ownership of `i` per thread, so the write is unaliased.
-            unsafe fn write(self, i: usize, v: f64) {
-                // SAFETY: `i < n` from the function contract; `self.0.add(i)`
-                // is in-bounds and the disjoint-index invariant means no other
-                // thread accesses this slot.
-                unsafe { *self.0.add(i) = v };
-            }
-        }
-
-        let p_d1_q0 = SendPtr(d1_q0.as_mut_ptr());
-        let p_d2_q0 = SendPtr(d2_q0.as_mut_ptr());
-        let p_d3_q0 = SendPtr(d3_q0.as_mut_ptr());
-        let p_d1_q1 = SendPtr(d1_q1.as_mut_ptr());
-        let p_d2_q1 = SendPtr(d2_q1.as_mut_ptr());
-        let p_d3_q1 = SendPtr(d3_q1.as_mut_ptr());
-
-        let dyn_ref = &dynamic;
-        (0..n)
-            .into_par_iter()
-            .try_for_each(move |i| -> Result<(), String> {
-                let state = self.row_predictor_state(
-                    dyn_ref.h_entry[i],
-                    dyn_ref.h_exit[i],
-                    dyn_ref.hdot_exit[i],
-                    dyn_ref.q_entry[i],
-                    dyn_ref.q_exit[i],
-                    dyn_ref.qdot_exit[i],
-                );
-                let Some(row) = self.row_derivatives_rescaled(i, state, deriv_log_scale)? else {
-                    return Ok(());
-                };
-                // SAFETY: rayon `(0..n).into_par_iter()` yields each `i < n`
-                // exactly once; pointers target distinct length-`n` `Array1`
-                // buffers not read until the parallel loop completes.
-                unsafe {
-                    p_d1_q0.write(i, row.d1_q0);
-                    p_d2_q0.write(i, row.d2_q0);
-                    p_d3_q0.write(i, row.d3_q0);
-                    p_d1_q1.write(i, row.d1_q1);
-                    p_d2_q1.write(i, row.d2_q1);
-                    p_d3_q1.write(i, row.d3_q1);
-                }
-                Ok(())
-            })?;
-
-        Ok(SurvivalJointQuantities {
-            d1_q0,
-            d2_q0,
-            d3_q0,
-            d1_q1,
-            d2_q1,
-            d3_q1,
-            dq_t: dynamic.dq_t_exit,
-            dq_ls: dynamic.dq_ls_exit,
-            d2q_tls: dynamic.d2q_tls_exit,
-            d2q_ls: dynamic.d2q_ls_exit,
-            d3q_tls_ls: dynamic.d3q_tls_ls_exit,
-            d3q_ls: dynamic.d3q_ls_exit,
-            dq_t_entry: Some(dynamic.dq_t_entry),
-            dq_ls_entry: Some(dynamic.dq_ls_entry),
-            d2q_tls_entry: Some(dynamic.d2q_tls_entry),
-            d2q_ls_entry: Some(dynamic.d2q_ls_entry),
-            d3q_tls_ls_entry: Some(dynamic.d3q_tls_ls_entry),
-            d3q_ls_entry: Some(dynamic.d3q_ls_entry),
-        })
-    }
-
     /// Per-row NLL gradient and curvature with respect to the three additive
     /// time-block offset channels `(o_E, o_X, o_D)` (entry / exit / derivative-
     /// at-exit). The baseline configuration enters the location-scale fit
@@ -4395,23 +4598,30 @@ impl SurvivalLocationScaleFamily {
     /// unpenalized NLL at converged β (envelope theorem on the penalized
     /// objective; the penalty has no θ dependence).
     ///
-    /// Algebra. With `ell_i = w_i[d(log f(u1) + log g) + (1-d) log S(u1) − log S(u0)]`
-    /// and `u0 = h0 + q0`, `u1 = h1 + q1`, `g = d_raw + qdot1`:
+    /// Algebra. With `ell_i = w_i[d(log f(u1) + log g − eta_ls) + (1-d) log S(u1) −
+    /// log S(u0)]`, `u0 = s0·h0 + q0`, `u1 = s1·h1 + q1` and
+    /// `g = (d_raw − h1·eta_ls') + qdot1` (`s = e^{−eta_ls}`: the scale divides the
+    /// whole residual, and `du1/dt = s1·g`, #2695), each offset enters its time
+    /// channel additively, so the map `J` from `(o_E, o_X, o_D)` to `(u0, u1, g)` is
+    /// linear:
     ///
-    ///   ∂(−ell_i)/∂h0   = − w_i r(u0)
-    ///   ∂(−ell_i)/∂h1   = − w_i [d ψ(u1) − (1−d) r(u1)]
-    ///   ∂(−ell_i)/∂dRaw = − w_i d / g                                (event-row only)
+    ///   J = [[s0, 0, 0], [0, s1, 0], [0, −eta_ls', 1]].
     ///
-    /// and the row Hessian is diagonal in (h0, h1, dRaw) because `u0`, `u1`,
-    /// `g` are functionally independent (h0→u0, h1→u1, dRaw→g):
+    /// The row likelihood factors through the functionally independent `u0`,
+    /// `u1`, `g`, whose NLL partials are
     ///
-    ///   ∂²(−ell_i)/∂h0²   = − w_i r'(u0)
-    ///   ∂²(−ell_i)/∂h1²   = − w_i [d ψ'(u1) − (1−d) r'(u1)]
-    ///   ∂²(−ell_i)/∂dRaw² =   w_i d / g²
+    ///   ∂(−ell_i)/∂u0 = − w_i r(u0)
+    ///   ∂(−ell_i)/∂u1 = − w_i [d ψ(u1) − (1−d) r(u1)]
+    ///   ∂(−ell_i)/∂g  = − w_i d / g                                (event-row only)
+    ///
+    /// with a diagonal index-space Hessian `C` (`− w_i r'(u0)`, `− w_i [d ψ'(u1) −
+    /// (1−d) r'(u1)]`, `w_i d / g²`). The offset residual is `Jᵀ ∂(−ell)/∂(u0,u1,g)`
+    /// and the offset curvature `Jᵀ C J`, which couples `o_X` and `o_D` exactly
+    /// when the scale is time-varying.
     ///
     /// The fields `grad_time_eta_*` / `h_time_*` produced by
-    /// [`Self::row_derivatives`] are log-likelihood (not NLL) partials. All
-    /// three time channels (h0, h1, d_raw) are stored as `+∂ℓ`/`+∂²ℓ`, so the
+    /// [`Self::row_derivatives`] are log-likelihood (not NLL) partials in the
+    /// index channels `(u0, u1, g)`, stored as `+∂ℓ`/`+∂²ℓ`, so the
     /// NLL gradient/curvature negates each **uniformly**. This site delegates
     /// that to [`SurvivalRowDerivatives::time_channel_nll_gradient`] /
     /// [`SurvivalRowDerivatives::time_channel_nll_curvature_diag`], which own
@@ -4440,31 +4650,32 @@ impl SurvivalLocationScaleFamily {
             .into_par_iter()
             .map(
                 |i| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), String> {
-                    let state = self.row_predictor_state(
-                        dynamic.h_entry[i],
-                        dynamic.h_exit[i],
-                        dynamic.hdot_exit[i],
-                        dynamic.q_entry[i],
-                        dynamic.q_exit[i],
-                        dynamic.qdot_exit[i],
-                    );
+                    let state = self.row_predictor_state_at(&dynamic, i);
                     let Some(row) = self.row_derivatives(i, state)? else {
                         // `row_derivatives` returns `None` only for a
                         // non-positive-weight observation. Numerical geometry
                         // failures on positive-weight rows propagate as errors.
                         return Ok((i, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
                     };
-                    // NLL gradient + curvature on the three time channels
-                    // (h0, h1, d_raw). Both helpers own the `-∂ℓ`/`-∂²ℓ` sign
-                    // so the channels are negated uniformly (gam#1396); the
-                    // row likelihood factors through the independent indices
-                    // (u0, u1, g), so the curvature is diagonal.
-                    let [r_entry, r_exit, r_deriv] = row.time_channel_nll_gradient();
-                    let curv_diag = row.time_channel_nll_curvature_diag();
+                    // NLL gradient + curvature in the index channels (u0, u1, g).
+                    // Both helpers own the `-∂ℓ`/`-∂²ℓ` sign so the channels are
+                    // negated uniformly (gam#1396); the index-space curvature is
+                    // diagonal because (u0, u1, g) are functionally independent.
+                    let [g_u0, g_u1, g_g] = row.time_channel_nll_gradient();
+                    let [c_u0, c_u1, c_g] = row.time_channel_nll_curvature_diag();
+                    // Pull back through J (see the doc above).
+                    let s0 = dynamic.inv_sigma_entry[i];
+                    let s1 = dynamic.inv_sigma_exit[i];
+                    let j_gx = -dynamic.eta_ls_deriv_exit[i];
+                    let r_entry = s0 * g_u0;
+                    let r_exit = s1 * g_u1 + j_gx * g_g;
+                    let r_deriv = g_g;
                     let mut curv = [[0.0_f64; 3]; 3];
-                    curv[0][0] = curv_diag[0];
-                    curv[1][1] = curv_diag[1];
-                    curv[2][2] = curv_diag[2];
+                    curv[0][0] = s0 * s0 * c_u0;
+                    curv[1][1] = s1 * s1 * c_u1 + j_gx * j_gx * c_g;
+                    curv[1][2] = j_gx * c_g;
+                    curv[2][1] = curv[1][2];
+                    curv[2][2] = c_g;
                     Ok((i, r_entry, r_exit, r_deriv, curv))
                 },
             )
@@ -4496,7 +4707,7 @@ impl SurvivalLocationScaleFamily {
     ///
     /// The per-row log-likelihood is
     ///   ℓ_i = w_i·( event_mix(d_i, logφ(u1_i) + log g_i, log S(u1_i)) − log S(u0_i) ),
-    /// where `u0 = h0 + q0` and `u1 = h1 + q1` are the standardized residuals
+    /// where `u0 = hs0 + q0` and `u1 = hs1 + q1` (`hs = h·e^{−eta_ls}`) are the standardized residuals
     /// the inverse link evaluates (entry/exit), `log g` is the time-derivative
     /// Jacobian (link-independent), and the link enters ONLY through the scalar
     /// `log S(u) = log(1 − μ(u;θ))` and `log φ(u) = log d1(u;θ)` terms. Hence
@@ -4598,8 +4809,8 @@ impl SurvivalLocationScaleFamily {
                 continue;
             }
             let d = self.validated_event_target(i)?;
-            let u0 = dynamic.h_entry[i] + dynamic.q_entry[i];
-            let u1 = dynamic.h_exit[i] + dynamic.q_exit[i];
+            let u0 = dynamic.hs_entry[i] + dynamic.q_entry[i];
+            let u1 = dynamic.hs_exit[i] + dynamic.q_exit[i];
             let dls_u0 = dlog_survival_dtheta(u0)?;
             // Entry channel always contributes (left-truncation term −log S(u0)).
             for k in 0..n_theta {
@@ -4683,8 +4894,8 @@ impl SurvivalLocationScaleFamily {
             };
             let partial_kernel = self.link_param_partial_row_kernel(
                 &row_kernel,
-                dynamic.h_entry[row] + dynamic.q_entry[row],
-                dynamic.h_exit[row] + dynamic.q_exit[row],
+                dynamic.hs_entry[row] + dynamic.q_entry[row],
+                dynamic.hs_exit[row] + dynamic.q_exit[row],
                 axis,
             )?;
             let (_, gradient, hessian) = sls_row_vgh_generated(&primary, &partial_kernel);
@@ -4779,8 +4990,8 @@ impl SurvivalLocationScaleFamily {
                 };
                 let partial_kernel = self.link_param_partial_row_kernel(
                     &row_kernel,
-                    dynamic.h_entry[row] + dynamic.q_entry[row],
-                    dynamic.h_exit[row] + dynamic.q_exit[row],
+                    dynamic.hs_entry[row] + dynamic.q_entry[row],
+                    dynamic.hs_exit[row] + dynamic.q_exit[row],
                     axis,
                 )?;
                 let direction = crate::row_kernel::RowKernel::<SLS_ROW_K>::jacobian_action(
@@ -5448,21 +5659,25 @@ impl SurvivalLocationScaleFamily {
         )
     }
 
-    /// Build the row predictor state with possibly distinct entry/exit
-    /// evaluations of threshold and sigma.
-    ///
-    /// For time-invariant blocks, the caller passes the same value for both
-    /// entry and exit.
-    pub(crate) fn row_predictor_state(
+    /// The predictor state of `row` in `dynamic`: the one construction every
+    /// likelihood consumer shares, so the scaled time channels and the log
+    /// rate scale cannot be paired with the wrong row or left out.
+    #[inline]
+    pub(crate) fn row_predictor_state_at(
         &self,
-        h0: f64,
-        h1: f64,
-        d_raw: f64,
-        q0: f64,
-        q1: f64,
-        qdot1: f64,
+        dynamic: &SurvivalDynamicGeometry,
+        row: usize,
     ) -> SurvivalPredictorState {
-        survival_predictor_state(h0, h1, d_raw, q0, q1, qdot1)
+        survival_predictor_state(
+            dynamic.hs_entry[row],
+            dynamic.hs_exit[row],
+            dynamic.time_rate_exit[row],
+            dynamic.q_entry[row],
+            dynamic.q_exit[row],
+            dynamic.qdot_exit[row],
+            -dynamic.eta_ls_exit[row],
+            self.entry_active[row],
+        )
     }
 
     #[inline]
@@ -5702,7 +5917,7 @@ impl SurvivalLocationScaleFamily {
             0.0
         };
         Some(SlsFifthEntries {
-            ddddr0,
+            ddddr0: if state.entry_active { ddddr0 } else { 0.0 },
             ddddr1,
             d5logphi1,
             d5_log_g,
@@ -5732,7 +5947,9 @@ impl SurvivalLocationScaleFamily {
         let u0 = state.h0 + state.q0;
         let u1 = state.h1 + state.q1;
 
-        let (log_s0, r0, dr0, ddr0, dddr0) =
+        // A row entering at the origin has no `S(entry)` factor: its entry stack
+        // is the exact zero every consumer skips (#2695).
+        let (log_s0, r0, dr0, ddr0, dddr0) = if state.entry_active {
             Self::exact_survival_neglog_derivatives_fourth_rescaled(
                 inverse_link,
                 u0,
@@ -5740,7 +5957,10 @@ impl SurvivalLocationScaleFamily {
             )
             .map_err(|e| {
                 format!("inverse-link survival evaluation failed at row {row} entry: {e}")
-            })?;
+            })?
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        };
 
         // Fast path: for CLogLog the survival and log-pdf evaluators both need
         // `exp(u1)`, and the PDF derivatives also need
@@ -5869,17 +6089,21 @@ impl SurvivalLocationScaleFamily {
         // where `u1 − u0` at far-tail magnitudes cannot even represent the
         // physical difference.
         let delta_u = (state.h1 - state.h0) + (state.q1 - state.q0);
-        let (log_pdf1_minus_log_s0, log_s1_minus_log_s0) = Self::stable_exit_entry_log_pairs(
-            inverse_link,
-            u0,
-            u1,
-            delta_u,
-            log_s0,
-            log_s1,
-            logphi1,
-            r0,
-            r1,
-        );
+        let (log_pdf1_minus_log_s0, log_s1_minus_log_s0) = if state.entry_active {
+            Self::stable_exit_entry_log_pairs(
+                inverse_link,
+                u0,
+                u1,
+                delta_u,
+                log_s0,
+                log_s1,
+                logphi1,
+                r0,
+                r1,
+            )
+        } else {
+            (logphi1, log_s1)
+        };
 
         Ok(Some(SurvivalExactRowKernel {
             w,
@@ -5929,23 +6153,16 @@ impl SurvivalLocationScaleFamily {
         let channels = sls_outer_plan::<5>(&kernel).lower_index_derivative_channels();
         let [nll_d1_q0, nll_d1_q1, nll_d1_qdot1] = channels.gradient;
         let [nll_d2_q0, nll_d2_q1, nll_d2_qdot1] = channels.hessian_diagonal;
-        let [nll_d3_q0, nll_d3_q1] = channels.third_diagonal;
         let d1_q0 = -nll_d1_q0;
         let d2_q0 = -nll_d2_q0;
-        let d3_q0 = -nll_d3_q0;
         let d1_q1 = -nll_d1_q1;
         let d2_q1 = -nll_d2_q1;
-        let d3_q1 = -nll_d3_q1;
         let d1_qdot1 = -nll_d1_qdot1;
         let d2_qdot1 = -nll_d2_qdot1;
         Ok(Some(SurvivalRowDerivatives {
-            ll: kernel.log_likelihood(),
+            ll: kernel.log_likelihood_at(&state),
             d1_q0,
-            d2_q0,
-            d3_q0,
             d1_q1,
-            d2_q1,
-            d3_q1,
             d1_qdot1,
             grad_time_eta_h0: d1_q0,
             grad_time_eta_h1: d1_q1,
@@ -5984,10 +6201,10 @@ mod fifth_order_lowering_tests {
     fn kernel_at(point: &[f64; SLS_ROW_K], d: f64) -> (SurvivalExactRowKernel, SlsFifthEntries) {
         let [h0, h1, hdot, eta_t_exit, eta_t_entry, eta_t_deriv, eta_ls_exit, eta_ls_entry, eta_ls_deriv] =
             *point;
-        let u0 = h0 - eta_t_entry * (-eta_ls_entry).exp();
+        let u0 = (h0 - eta_t_entry) * (-eta_ls_entry).exp();
         let inv_sigma_exit = (-eta_ls_exit).exp();
-        let u1 = h1 - eta_t_exit * inv_sigma_exit;
-        let g = hdot + inv_sigma_exit * (eta_t_exit * eta_ls_deriv - eta_t_deriv);
+        let u1 = (h1 - eta_t_exit) * inv_sigma_exit;
+        let g = hdot - eta_t_deriv - (h1 - eta_t_exit) * eta_ls_deriv;
         let entry = (A * u0).exp();
         let exit = (A * u1).exp();
         let density = (B * u1).exp();
@@ -6152,11 +6369,10 @@ mod index_derivative_lowering_tests {
         SlsIndexDerivativeChannels {
             gradient: [nll.g[0], nll.g[1], nll.g[2]],
             hessian_diagonal: [nll.h[0][0], nll.h[1][1], nll.h[2][2]],
-            third_diagonal: [nll.t3[0][0][0], nll.t3[1][1][1]],
         }
     }
 
-    fn flatten(channels: SlsIndexDerivativeChannels) -> [f64; 8] {
+    fn flatten(channels: SlsIndexDerivativeChannels) -> [f64; 6] {
         [
             channels.gradient[0],
             channels.gradient[1],
@@ -6164,8 +6380,6 @@ mod index_derivative_lowering_tests {
             channels.hessian_diagonal[0],
             channels.hessian_diagonal[1],
             channels.hessian_diagonal[2],
-            channels.third_diagonal[0],
-            channels.third_diagonal[1],
         ]
     }
 
@@ -6216,18 +6430,8 @@ mod index_derivative_lowering_tests {
             / (12.0 * h * h)
     }
 
-    fn finite_difference_third(point: [f64; 3], axis: usize, d: f64) -> f64 {
-        let h = 3.0e-3;
-        (-sample_shifted(point, axis, 3.0 * h, d) + 8.0 * sample_shifted(point, axis, 2.0 * h, d)
-            - 13.0 * sample_shifted(point, axis, h, d)
-            + 13.0 * sample_shifted(point, axis, -h, d)
-            - 8.0 * sample_shifted(point, axis, -2.0 * h, d)
-            + sample_shifted(point, axis, -3.0 * h, d))
-            / (8.0 * h * h * h)
-    }
-
     fn assert_fd_close(d: f64, order: usize, axis: usize, exact: f64, fd: f64) {
-        let tolerance = if order == 3 { 2.0e-5 } else { 2.0e-7 };
+        let tolerance = 2.0e-7;
         let error = (exact - fd).abs();
         assert!(
             error <= tolerance * exact.abs().max(1.0),
@@ -6255,15 +6459,6 @@ mod index_derivative_lowering_tests {
                     axis,
                     channels.hessian_diagonal[axis],
                     finite_difference_second(point, axis, d),
-                );
-            }
-            for axis in 0..2 {
-                assert_fd_close(
-                    d,
-                    3,
-                    axis,
-                    channels.third_diagonal[axis],
-                    finite_difference_third(point, axis, d),
                 );
             }
         }
@@ -6348,33 +6543,43 @@ mod patterned_order2_perf_tests {
             value += g_value;
         }
 
+        // The scale divides the whole residual (#2695): `u = (h − eta_t)·e^{−eta_ls}`
+        // and `du1/dt = e^{−eta_ls}·g` with `g = hdot − eta_t' − (h1 − eta_t)·eta_ls'`,
+        // whose `−eta_ls` enters the event log-density linearly.
+        let u0_value_index = (p[0] - p[4]) * entry_exp;
+        let u0_g0 = entry_exp;
         let u0_g4 = -entry_exp;
-        let u0_g7 = p[4] * entry_exp;
+        let u0_g7 = -u0_value_index;
+        let residual_exit = p[1] - p[3];
+        let u1_value_index = residual_exit * exit_exp;
+        let u1_g1 = exit_exp;
         let u1_g3 = -exit_exp;
-        let u1_g6 = p[3] * exit_exp;
-        let inner = p[3] * p[8] - p[5];
-        let g3 = exit_exp * p[8];
-        let g5 = -exit_exp;
-        let g6 = -exit_exp * inner;
-        let g8 = exit_exp * p[3];
+        let u1_g6 = -u1_value_index;
+        let g1 = -p[8];
+        let g3 = p[8];
+        let g8 = -residual_exit;
+        if g_active {
+            value += event_weight * p[6];
+        }
 
         let mut gradient = [0.0; SLS_ROW_K];
         if u0_active {
-            gradient[0] = u0_first;
+            gradient[0] = u0_first * u0_g0;
             gradient[4] = u0_first * u0_g4;
             gradient[7] = u0_first * u0_g7;
         }
         if u1_active {
-            gradient[1] += u1_first;
+            gradient[1] += u1_first * u1_g1;
             gradient[3] += u1_first * u1_g3;
             gradient[6] += u1_first * u1_g6;
         }
         if g_active {
+            gradient[1] += g_first * g1;
             gradient[2] += g_first;
             gradient[3] += g_first * g3;
-            gradient[5] += g_first * g5;
-            gradient[6] += g_first * g6;
+            gradient[5] -= g_first;
             gradient[8] += g_first * g8;
+            gradient[6] += event_weight;
         }
 
         let mut hessian = [[0.0; SLS_ROW_K]; SLS_ROW_K];
@@ -6389,38 +6594,38 @@ mod patterned_order2_perf_tests {
         }
 
         if u0_active {
-            symmetric!(0, 0, u0_second);
-            symmetric!(0, 4, u0_second * u0_g4);
-            symmetric!(0, 7, u0_second * u0_g7);
+            symmetric!(0, 0, u0_second * u0_g0 * u0_g0);
+            symmetric!(0, 4, u0_second * u0_g0 * u0_g4);
+            symmetric!(0, 7, u0_second * u0_g0 * u0_g7 - u0_first * entry_exp);
             symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
             symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
-            symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
+            symmetric!(7, 7, u0_second * u0_g7 * u0_g7 + u0_first * u0_value_index);
         }
 
         if u1_active {
-            symmetric!(1, 1, u1_second);
-            symmetric!(1, 3, u1_second * u1_g3);
-            symmetric!(1, 6, u1_second * u1_g6);
+            symmetric!(1, 1, u1_second * u1_g1 * u1_g1);
+            symmetric!(1, 3, u1_second * u1_g1 * u1_g3);
+            symmetric!(1, 6, u1_second * u1_g1 * u1_g6 - u1_first * exit_exp);
             symmetric!(3, 3, u1_second * u1_g3 * u1_g3);
             symmetric!(3, 6, u1_second * u1_g3 * u1_g6 + u1_first * exit_exp);
-            symmetric!(6, 6, u1_second * u1_g6 * u1_g6 - u1_first * u1_g6);
+            symmetric!(6, 6, u1_second * u1_g6 * u1_g6 + u1_first * u1_value_index);
         }
 
         if g_active {
+            symmetric!(1, 1, g_second * g1 * g1);
+            symmetric!(1, 2, g_second * g1);
+            symmetric!(1, 3, g_second * g1 * g3);
+            symmetric!(1, 5, -g_second * g1);
+            symmetric!(1, 8, g_second * g1 * g8 - g_first);
             symmetric!(2, 2, g_second);
             symmetric!(2, 3, g_second * g3);
-            symmetric!(2, 5, g_second * g5);
-            symmetric!(2, 6, g_second * g6);
+            symmetric!(2, 5, -g_second);
             symmetric!(2, 8, g_second * g8);
             symmetric!(3, 3, g_second * g3 * g3);
-            symmetric!(3, 5, g_second * g3 * g5);
-            symmetric!(3, 6, g_second * g3 * g6 - g_first * exit_exp * p[8]);
-            symmetric!(3, 8, g_second * g3 * g8 + g_first * exit_exp);
-            symmetric!(5, 5, g_second * g5 * g5);
-            symmetric!(5, 6, g_second * g5 * g6 + g_first * exit_exp);
-            symmetric!(5, 8, g_second * g5 * g8);
-            symmetric!(6, 6, g_second * g6 * g6 + g_first * exit_exp * inner);
-            symmetric!(6, 8, g_second * g6 * g8 - g_first * exit_exp * p[3]);
+            symmetric!(3, 5, -g_second * g3);
+            symmetric!(3, 8, g_second * g3 * g8 + g_first);
+            symmetric!(5, 5, g_second);
+            symmetric!(5, 8, -g_second * g8);
             symmetric!(8, 8, g_second * g8 * g8);
         }
 
@@ -6594,12 +6799,17 @@ mod patterned_order2_perf_tests {
                 SLS_G_AXES,
                 truncate(stack),
                 true,
-                [false, true, false, true, false],
+                [true, false, true, false, false],
                 [
-                    false, false, false, false, false, true, false, true, false, false, false, false,
-                    true, false, false,
+                    true, false, true, false, false, false, false, false, false, true, false, false,
+                    false, false, false,
                 ],
             );
+        }
+        // The event log-density's linear `−eta_ls` (#2695).
+        if plan.g_log_scale != 0.0 {
+            output.value += plan.g_log_scale * primary[6];
+            output.gradient[6] += plan.g_log_scale;
         }
         output.into_channels()
     }
@@ -6612,7 +6822,7 @@ mod patterned_order2_perf_tests {
     ///
     /// - `u0`, depending on primaries `{0,4,7}`;
     /// - `u1`, depending on `{1,3,6}`;
-    /// - `g`, depending on `{2,3,5,6,8}`.
+    /// - `g`, depending on `{1,2,3,5,8}`, plus the linear `eta_ls_exit` term.
     ///
     /// Their symmetric pair union contains 24 channels. This pattern is an
     /// execution schedule for the same generic row expression, not a derivative
@@ -6625,12 +6835,14 @@ mod patterned_order2_perf_tests {
         (0, 4),
         (0, 7),
         (1, 1),
+        (1, 2),
         (1, 3),
+        (1, 5),
         (1, 6),
+        (1, 8),
         (2, 2),
         (2, 3),
         (2, 5),
-        (2, 6),
         (2, 8),
         (3, 3),
         (3, 5),
@@ -6639,10 +6851,8 @@ mod patterned_order2_perf_tests {
         (4, 4),
         (4, 7),
         (5, 5),
-        (5, 6),
         (5, 8),
         (6, 6),
-        (6, 8),
         (7, 7),
         (8, 8),
     ];
@@ -6877,10 +7087,10 @@ mod patterned_order2_perf_tests {
                     kernel.dr0 = 0.0;
                     kernel.ddr0 = 0.0;
                     kernel.dddr0 = 0.0;
-                    p[4] = p[4].abs();
+                    p[4] = p[0].abs() + p[4].abs() + 1.0;
                     p[7] = -1000.0;
                     assert!((-p[7]).exp().is_infinite());
-                    assert_eq!(p[0] - p[4] * (-p[7]).exp(), f64::NEG_INFINITY);
+                    assert_eq!((p[0] - p[4]) * (-p[7]).exp(), f64::NEG_INFINITY);
                 }
                 "exit" => {
                     kernel.d = 0.0;
@@ -6986,47 +7196,49 @@ mod patterned_order2_perf_tests {
             hessian: [[f64; 9]; 9],
         }
 
+        // u0 = (h0 − eta_t_entry)·e^{−eta_ls_entry} (#2695).
         let inv_entry = (-p[7]).exp();
+        let u0_value = (p[0] - p[4]) * inv_entry;
         let mut u0 = Index {
             gradient: [0.0; 9],
             hessian: [[0.0; 9]; 9],
         };
-        u0.gradient[0] = 1.0;
+        u0.gradient[0] = inv_entry;
         u0.gradient[4] = -inv_entry;
-        u0.gradient[7] = p[4] * inv_entry;
-        u0.hessian[4][7] = inv_entry;
-        u0.hessian[7][4] = inv_entry;
-        u0.hessian[7][7] = -p[4] * inv_entry;
+        u0.gradient[7] = -u0_value;
+        for (i, j, value) in [(0, 7, -inv_entry), (4, 7, inv_entry), (7, 7, u0_value)] {
+            u0.hessian[i][j] = value;
+            u0.hessian[j][i] = value;
+        }
 
+        // u1 = (h1 − eta_t_exit)·e^{−eta_ls_exit}.
         let inv_exit = (-p[6]).exp();
+        let residual_exit = p[1] - p[3];
+        let u1_value = residual_exit * inv_exit;
         let mut u1 = Index {
             gradient: [0.0; 9],
             hessian: [[0.0; 9]; 9],
         };
-        u1.gradient[1] = 1.0;
+        u1.gradient[1] = inv_exit;
         u1.gradient[3] = -inv_exit;
-        u1.gradient[6] = p[3] * inv_exit;
-        u1.hessian[3][6] = inv_exit;
-        u1.hessian[6][3] = inv_exit;
-        u1.hessian[6][6] = -p[3] * inv_exit;
+        u1.gradient[6] = -u1_value;
+        for (i, j, value) in [(1, 6, -inv_exit), (3, 6, inv_exit), (6, 6, u1_value)] {
+            u1.hessian[i][j] = value;
+            u1.hessian[j][i] = value;
+        }
 
-        let inner = p[3] * p[8] - p[5];
+        // du1/dt = e^{−eta_ls_exit}·g, g = hdot − eta_t' − (h1 − eta_t_exit)·eta_ls';
+        // the scale's −eta_ls_exit enters the event log-density linearly.
         let mut g = Index {
             gradient: [0.0; 9],
             hessian: [[0.0; 9]; 9],
         };
+        g.gradient[1] = -p[8];
         g.gradient[2] = 1.0;
-        g.gradient[3] = inv_exit * p[8];
-        g.gradient[5] = -inv_exit;
-        g.gradient[6] = -inv_exit * inner;
-        g.gradient[8] = inv_exit * p[3];
-        for (i, j, value) in [
-            (3, 6, -inv_exit * p[8]),
-            (3, 8, inv_exit),
-            (5, 6, inv_exit),
-            (6, 6, inv_exit * inner),
-            (6, 8, -inv_exit * p[3]),
-        ] {
+        g.gradient[3] = p[8];
+        g.gradient[5] = -1.0;
+        g.gradient[8] = -residual_exit;
+        for (i, j, value) in [(1, 8, -1.0), (3, 8, 1.0)] {
             g.hessian[i][j] = value;
             g.hessian[j][i] = value;
         }
@@ -7066,11 +7278,12 @@ mod patterned_order2_perf_tests {
                 [kernel.logphi1, kernel.dlogphi1, kernel.d2logphi1],
                 -event_weight,
             );
-            add(
-                &g,
-                [kernel.log_g, kernel.d_log_g, kernel.d2_log_g],
-                -event_weight,
-            );
+            let rate = [kernel.log_g, kernel.d_log_g, kernel.d2_log_g];
+            add(&g, rate, -event_weight);
+            if rate.iter().any(|value| *value != 0.0) {
+                value += event_weight * p[6];
+                gradient[6] += event_weight;
+            }
         }
         (value, gradient, hessian)
     }
@@ -7944,7 +8157,7 @@ mod event_jacobian_floor_consistency_2695_tests {
     /// `d_raw = 0` so `g` IS the `qdot1` coordinate and the finite difference
     /// moves exactly the channel whose derivative is under test.
     fn kernel_at(g: f64) -> SurvivalExactRowKernel {
-        let state = survival_predictor_state(-0.4, 0.3, 0.0, -0.2, 0.15, g);
+        let state = survival_predictor_state(-0.4, 0.3, 0.0, -0.2, 0.15, g, 0.0, true);
         SurvivalLocationScaleFamily::exact_row_kernel_from_parts(
             &InverseLink::Standard(StandardLink::Probit),
             GUARD,
@@ -8127,5 +8340,107 @@ mod guarded_log_channel_2695_tests {
             at_zero < at_guard - 1.0,
             "g=0 must be materially worse than g=guard: {at_zero} vs {at_guard}"
         );
+    }
+}
+
+/// #2695: dividing the time transform by the scale leaves a constant-scale fit
+/// unchanged. With `eta_ls ≡ 0` the scale is exactly `1.0`, and a constant-σ fit
+/// has no free log-σ coefficient (its constant is the pinned gauge column), so
+/// every coefficient it owns reaches the row program through the time and
+/// threshold primaries alone. On that block the row program's value, gradient and
+/// Hessian must equal the former ratio-only kernel's (`u = h − eta_t·e^{−eta_ls}`,
+/// `g = hdot + e^{−eta_ls}·(eta_t·eta_ls' − eta_t')`) exactly, not to a tolerance.
+#[cfg(test)]
+mod constant_scale_identity_2695_tests {
+    use super::*;
+    use gam_math::jet_scalar::{JetScalar, Order2};
+    use gam_math::nested_dual::JetField;
+
+    /// The former kernel, composed with the same outer plan and the same
+    /// exponential leaf as [`sls_row_program`], kept only as this reference.
+    fn former_row_nll(
+        vars: &[Order2<SLS_ROW_K>; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> Order2<SLS_ROW_K> {
+        let inv_sigma_entry = vars[7]
+            .neg()
+            .compose_unary(sls_program_exp_stack(-vars[7].value()));
+        let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
+        let inv_sigma_exit = vars[6]
+            .neg()
+            .compose_unary(sls_program_exp_stack(-vars[6].value()));
+        let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
+        let g = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
+        let plan = sls_outer_plan::<5>(kernel);
+        let mut nll = u0.compose_unary(plan.u0);
+        if let Some(stack) = plan.u1 {
+            nll = nll.add(&u1.compose_unary(stack));
+        }
+        if let Some(stack) = plan.g {
+            nll = nll.add(&g.compose_unary(stack));
+        }
+        nll
+    }
+
+    #[test]
+    fn a_constant_scale_row_is_the_former_kernel_exactly_2695() {
+        // (h0, h1, hdot, eta_t_exit, eta_t_entry, eta_t_deriv); the three scale
+        // primaries are zero.
+        let points: [[f64; 6]; 3] = [
+            [0.3, 1.1, 0.8, 0.4, 0.2, 0.0],
+            [-0.9, 0.6, 1.3, -0.5, -0.7, 0.1],
+            [1.4, 2.2, 0.35, 1.9, 1.6, -0.05],
+        ];
+        let links = [
+            residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            residual_distribution_inverse_link(ResidualDistribution::Logistic),
+            residual_distribution_inverse_link(ResidualDistribution::Gumbel),
+        ];
+        let mut compared = 0usize;
+        for link in &links {
+            for point in &points {
+                for d in [0.0, 1.0] {
+                    let mut primary = [0.0; SLS_ROW_K];
+                    primary[..6].copy_from_slice(point);
+                    let state = survival_predictor_state(
+                        primary[0],
+                        primary[1],
+                        primary[2],
+                        -primary[4],
+                        -primary[3],
+                        -primary[5],
+                        0.0,
+                        true,
+                    );
+                    let kernel = SurvivalLocationScaleFamily::exact_row_kernel_from_parts(
+                        link, 1.0e-8, 1.3, d, 0, state, 0.0,
+                    )
+                    .expect("row kernel")
+                    .expect("positive-weight row");
+                    let vars: [Order2<SLS_ROW_K>; SLS_ROW_K] =
+                        std::array::from_fn(|axis| Order2::variable(primary[axis], axis));
+                    let (value, gradient, hessian) = sls_row_nll(&vars, &kernel)
+                        .expect("row program")
+                        .into_channels();
+                    let (former_value, former_gradient, former_hessian) =
+                        former_row_nll(&vars, &kernel).into_channels();
+                    assert_eq!(value, former_value, "{link:?} d={d} {point:?}: value");
+                    for a in 0..6 {
+                        assert_eq!(
+                            gradient[a], former_gradient[a],
+                            "{link:?} d={d} {point:?}: gradient[{a}]"
+                        );
+                        for b in 0..6 {
+                            assert_eq!(
+                                hessian[a][b], former_hessian[a][b],
+                                "{link:?} d={d} {point:?}: hessian[{a}][{b}]"
+                            );
+                        }
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, links.len() * points.len() * 2);
     }
 }

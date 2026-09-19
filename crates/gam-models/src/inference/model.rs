@@ -105,10 +105,28 @@ use std::path::Path;
 // `warm_start_from`. It carries a serde default, so a v24 or older payload loads with no
 // point, and `warm_start_from` refuses it by name; a v24 binary refuses a v25 payload by
 // version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 25;
+// v26 divides the whole survival location-scale residual by σ (#2695): the kernel's
+// standardized residual is `u = (h(t) − η_t)·e^{−η_σ}` and the event log-density
+// carries the scale's `−η_σ`. Before it the scale divided the location alone,
+// `u = h(t) − η_t·e^{−η_σ}`. A v25, v24, v23, v22, v21, v20, v19 or v18 survival
+// location-scale payload whose log-σ predictor and time-warp coefficients can both be
+// nonzero describes a different model and is refused by name
+// (`validate_survival_location_scale_saved_fit`). Every other payload of those versions
+// loads: a zero log-σ predictor makes σ ≡ 1, and an all-zero warp (the reduced
+// parametric-AFT lift, the σ-scaled log-t baseline of #892) fits `h ≡ 0`, where the two
+// kernels agree.
+pub const MODEL_PAYLOAD_VERSION: u32 = 26;
+
+/// The first payload version whose survival location-scale kernel divides the whole
+/// residual by σ (#2695).
+pub const WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION: u32 = 26;
+
+/// The schema before [`WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION`]. Its only difference is
+/// the survival location-scale kernel, whose old payloads the family validator judges.
+const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
 
 /// The schema before the certified outer point (`warm_start_from`), whose only difference
-/// is that record's absence.
+/// from [`LOCATION_ONLY_SCALE_PAYLOAD_VERSION`] is that record's absence.
 const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
 
 /// The schema before the residual repair block's covariance declination (gam#2985),
@@ -141,8 +159,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 8] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 9] = [
     MODEL_PAYLOAD_VERSION,
+    LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
     OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
     RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
     LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -1678,6 +1697,35 @@ fn validate_survival_location_scale_saved_fit(
         payload.survival_beta_log_sigma.as_ref(),
         "log-sigma",
     )?;
+    // #2695: before WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION the kernel divided only the
+    // location by σ, `u = h(t) − η_t·e^{−η_σ}`, where it now divides the whole residual,
+    // `u = (h(t) − η_t)·e^{−η_σ}`. The two differ by `h·(1 − e^{−η_σ})`, so an old payload
+    // is refused only when its log-σ predictor can move (a nonzero coefficient, or a
+    // declared noise offset) and its time-warp coefficients can too. The reduced
+    // parametric-AFT lift and the σ-scaled log-t baseline (#892) save an all-zero warp
+    // and fit `h ≡ 0`, so the two kernels agree on their rows. Any other such payload was
+    // fit as a different model, and reading it as the current one would silently move
+    // every prediction.
+    let block_can_move = |role: BlockRole| {
+        fit.block_by_role(role)
+            .is_some_and(|block| block.beta.iter().any(|value| *value != 0.0))
+    };
+    let scale_can_move = block_can_move(BlockRole::Scale) || payload.noise_offset_column.is_some();
+    if payload.version < WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION
+        && scale_can_move
+        && block_can_move(BlockRole::Time)
+    {
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale survival model written at payload version {} was fit under \
+                 the pre-#2695 location-only kernel u = h(t) − η_t/σ, and neither its log-σ \
+                 predictor nor its time warp is identically zero, so it means something else \
+                 under the current kernel u = (h(t) − η_t)/σ; refit required: σ was \
+                 unidentified under the pre-#2695 likelihood",
+                payload.version
+            ),
+        });
+    }
     if let Some(basis) = structure.threshold_time_basis.as_ref() {
         let width =
             validate_survival_covariate_time_basis(basis, "location-scale survival threshold time basis")?;
@@ -7425,6 +7473,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
             RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
             LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -7438,9 +7487,11 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
+        assert_eq!(WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION);
+        assert_eq!(LOCATION_ONLY_SCALE_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
         assert_eq!(
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
-            MODEL_PAYLOAD_VERSION - 1
+            LOCATION_ONLY_SCALE_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
