@@ -21,6 +21,10 @@ use ndarray::array;
 const C_3017: f64 = 100.0;
 const A_MINUS_ONE_3017: f64 = 100_000.0;
 
+/// The observations the whole-run fixture declares, the scale of the
+/// hyperprior's shape: `τ_stat = 1/(2n) = 5e-6`.
+const N_OBS_3017: usize = 100_000;
+
 /// Where the issue's fit started: the Newton step from here, `3.344`, lands at
 /// `ρ = 8.78`, where the criterion is `−2.26e5` against the seed's `−5.208e5`.
 const SEED_3017: f64 = 5.4388;
@@ -42,7 +46,7 @@ fn optimum_3017() -> f64 {
     (A_MINUS_ONE_3017 / C_3017).ln()
 }
 
-/// The whole outer run on the #3017 criterion reaches its optimum, and ARC
+/// The whole outer run on the #3017 criterion certifies its optimum, and ARC
 /// from the seed reaches it itself. Before the repair the guard folded each of
 /// ARC's rejected trials as a non-improving step, filled two windows at the
 /// seed after six trials and stopped the seed's run there with
@@ -59,11 +63,7 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
         .with_hessian(DeclaredHessianForm::Dense)
         .with_initial_rho(array![SEED_3017])
         .with_bounds(array![-30.0], array![30.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_problem_size(N_OBS_3017, 1);
     let mut obj = problem.build_objective(
         State::default(),
         |_: &mut State, theta: &Array1<f64>| Ok(value_3017(theta[0])),
@@ -81,18 +81,14 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
     );
     let config = problem.config();
     let cap = obj.capability();
-    let the_plan = plan(&cap);
-    assert_eq!(the_plan.solver, Solver::Arc, "the fixture must run the dense ARC route");
-    let outcome = run_outer_with_plan(&mut obj, &config, "#3017 rejected trials", &cap, &the_plan, true)
+    assert_eq!(plan(&cap).solver, Solver::Arc, "the fixture must run the dense ARC route");
+    let result = run_outer(&mut obj, &config, "#3017 rejected trials")
         .expect("the #3017 criterion has an interior optimum the run must reach");
-    let result = match outcome {
-        PlanRunOutcome::Converged(result) => result,
-        other => panic!(
-            "the run must converge, not stop short: {:?}; evaluated {:?}",
-            std::mem::discriminant(&other),
-            obj.state.evaluated
-        ),
-    };
+    assert!(
+        result.converged(),
+        "the run must certify its optimum, not stop short; evaluated {:?}",
+        obj.state.evaluated
+    );
     let rho = result.rho[0];
     let evaluated = &obj.state.evaluated;
     assert!(
@@ -101,9 +97,8 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
         optimum_3017(),
     );
     // The seed's own ARC trajectory: every trial from the seed toward its
-    // overshooting first trial, before the seed loop leaves for another start.
-    // The defect stopped this trajectory at the seed, six trials in, and the
-    // run reached ρ* only because a later lattice start happened to.
+    // overshooting first trial, before any later evaluation of the run. The
+    // defect stopped this trajectory at the seed, six trials in.
     let first_trial = evaluated[1];
     let seed_trajectory: Vec<f64> = evaluated
         .iter()
@@ -163,11 +158,8 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     // The guard exactly as the dense ARC route builds and seeds it.
-    let rel_tol = config
-        .rel_cost_tolerance
-        .unwrap_or(config.tolerance * 1.0e-2)
-        .max(COST_STALL_REL_TOL_FLOOR);
-    let mut guard = CostStallGuard::new(rel_tol, ARC_COST_STALL_WINDOW, &config, exit);
+    let resolution = outer_criterion_resolution(&config);
+    let mut guard = CostStallGuard::new(resolution, ARC_COST_STALL_WINDOW, &config, exit);
     guard.observe_second_order_seed(
         &array![SEED_3017],
         value_3017(SEED_3017),
@@ -186,7 +178,7 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-30.0], array![30.0])),
-        curvature_stationary_floor: Some(outer_rel_cost_floor(&config)),
+        curvature_stationary_resolution: Some(resolution),
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: Some(&config),
     };

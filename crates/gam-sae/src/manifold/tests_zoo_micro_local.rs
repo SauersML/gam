@@ -106,11 +106,6 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
     let t0 = Instant::now();
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .expect("zoo-micro full fit must not abort");
     assert!(result.converged(), "zoo fit must be analytically certified");
@@ -187,11 +182,6 @@ fn rank_charge_zoo_arm(train: &Array2<f64>, test: &Array2<f64>) -> RankChargeArm
     let t0 = Instant::now();
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .expect("zoo-micro rank-charge fit must not abort");
     let fit_secs = t0.elapsed().as_secs_f64();
