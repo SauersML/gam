@@ -306,6 +306,7 @@ fn run() -> CliResult<()> {
         Command::TransformationScore(args) => {
             run_transformation_score(args).map_err(CliError::from)
         }
+        Command::LatentResidual(args) => run_latent_residual(args).map_err(CliError::from),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
         Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),

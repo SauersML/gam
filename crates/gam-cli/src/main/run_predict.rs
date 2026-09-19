@@ -1643,6 +1643,48 @@ pub(crate) fn run_transformation_score(args: TransformationScoreArgs) -> Result<
     Ok(())
 }
 
+/// Evaluate the conditional latent residual `ζ = (z − m(a))/√v(a)` of a saved
+/// marginal-slope model on a dataset, through the map its fit applied
+/// (gam#3016). gamfit returns the same values from
+/// `Model.latent_conditional_residual`.
+pub(crate) fn run_latent_residual(args: LatentResidualArgs) -> Result<(), String> {
+    let model = SavedModel::load_from_path(&args.model)?;
+    let columns = model
+        .latent_conditional_residual_columns()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    let dataset = load_datasetwith_model_schema_columns(&args.data, &model, &columns)?;
+    require_dataset_rows("latent-residual", &args.data, dataset.values.nrows())?;
+    let id_values = args
+        .id_column
+        .as_ref()
+        .map(|id_column| {
+            load_prediction_id_values(&args.data, id_column, dataset.values.nrows())
+                .map(|values| (id_column.clone(), values))
+        })
+        .transpose()?;
+    let residual = model
+        .latent_conditional_residual(dataset.values.view(), &dataset.column_map())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "gam latent-residual requires a marginal-slope model fitted with a conditional \
+             latent law (latent_measure = \"conditional-location-scale\"); this model's fit \
+             consumed none"
+                .to_string()
+        })?;
+    let residual_values = residual.to_vec();
+    write_prediction_csv_unified(&args.out, &[("residual", &residual_values)])?;
+    if let Some((id_column, values)) = id_values.as_ref() {
+        prepend_id_column_to_prediction_csv(&args.out, id_column, values)?;
+    }
+    cli_out!(
+        "wrote latent conditional residuals: {} (rows={})",
+        args.out.display(),
+        residual.len()
+    );
+    Ok(())
+}
+
 fn build_saved_latent_window_alo_input(
     model: &SavedModel,
     data: ArrayView2<'_, f64>,

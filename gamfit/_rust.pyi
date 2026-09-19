@@ -264,6 +264,7 @@ __all__ = [
     "intervention_calibration_plan",
     "is_multinomial_family_name",
     "label_shuffle_permutation",
+    "latent_conditional_residual_table",
     "lawley_bartlett_factor",
     "lawley_bartlett_factor_estimated_lambda",
     "layer_transport_fit",
@@ -467,8 +468,6 @@ __all__ = [
     "torch_smooth_dispatch_key",
     "transformation_score_table",
     "validate_formula_json",
-    "vec_to_array1_f64",
-    "weighted_auc_from_predictions",
     "weighted_sum_to_zero_transform",
     "whole_set_containment",
     "write_survival_csv",
@@ -1948,6 +1947,8 @@ def is_multinomial_family_name(family: str) -> bool: ...
 
 def label_shuffle_permutation(n_rows: int, seed: int, draw: int) -> NDArray[np.uint64]: ...
 
+def latent_conditional_residual_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable) -> NDArray[np.float64] | None: ...
+
 def lawley_bartlett_factor(design: NDArray[np.float64], family: str, eta: NDArray[np.float64], tested_start: int, tested_end: int, ref_df: float, penalty: NDArray[np.float64] | None = ..., dispersion: float = ..., prior_weights: NDArray[np.float64] | None = ..., lr_statistic: float | None = ...) -> dict[Any, Any]: ...
 
 def lawley_bartlett_factor_estimated_lambda(design: NDArray[np.float64], family: str, eta: NDArray[np.float64], tested_start: int, tested_end: int, ref_df: float, penalty: NDArray[np.float64], components: Sequence[NDArray[np.float64]], rho_cov: NDArray[np.float64], dispersion: float = ..., prior_weights: NDArray[np.float64] | None = ..., lr_statistic: float | None = ...) -> dict[Any, Any]: ...
@@ -2353,10 +2354,6 @@ def torch_smooth_dispatch_key(spec_kind: str) -> str: ...
 def transformation_score_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable) -> NDArray[np.float64]: ...
 
 def validate_formula_json(headers: Sequence[str], rows: _EncodedTable, formula: str, config_json: str | None) -> str: ...
-
-def vec_to_array1_f64(values: Sequence[float]) -> NDArray[np.float64]: ...
-
-def weighted_auc_from_predictions(observed: Sequence[float], predicted_mean: Sequence[float], weights: Sequence[float]) -> float: ...
 
 def weighted_sum_to_zero_transform(basis: NDArray[np.float64], weights: NDArray[np.float64] | None = ...) -> NDArray[np.float64]: ...
 

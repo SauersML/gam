@@ -114,13 +114,24 @@ pub(crate) fn load_datasetwith_model_schema_extra(
     model: &SavedModel,
     extra_required: &[String],
 ) -> Result<Dataset, String> {
-    let schema = model.require_data_schema()?;
-    let policy =
-        UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
     let mut requested: Vec<String> = model
         .prediction_required_columns()?
         .into_iter()
         .collect::<Vec<_>>();
     requested.extend(extra_required.iter().cloned());
-    load_dataset_auto_with_schema_projected(path, schema, policy, &requested).map_err(String::from)
+    load_datasetwith_model_schema_columns(path, model, &requested)
+}
+
+/// Load a data file against a fitted model's schema, keeping exactly
+/// `columns`, for a command that reads a set of columns the model names other
+/// than its prediction set (`latent-residual` reads no survival time columns).
+pub(crate) fn load_datasetwith_model_schema_columns(
+    path: &Path,
+    model: &SavedModel,
+    columns: &[String],
+) -> Result<Dataset, String> {
+    let schema = model.require_data_schema()?;
+    let policy =
+        UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
+    load_dataset_auto_with_schema_projected(path, schema, policy, columns).map_err(String::from)
 }

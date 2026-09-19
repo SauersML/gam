@@ -491,6 +491,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "torch_from_fitted",
             "predict",
             "transformation_score",
+            "latent_conditional_residual",
             "predict_array",
             "predict_conformal",
             "build_predict_payload_json",
@@ -2011,6 +2012,40 @@ fn transformation_score_table<'py>(
         transformation_score_encoded_table_impl(&model, dataset)
     })?;
     Ok(scores.into_pyarray(py).unbind())
+}
+
+/// The declared conditional latent law's standardized residual
+/// `ζ = (z − m(a))/√v(a)` of a saved marginal-slope model on new rows, through
+/// the map its fit applied (gam#3016). `None` when the fit consumed no
+/// conditional law. The frame needs the score and the conditioning covariates,
+/// not a survival model's time columns.
+#[pyfunction]
+fn latent_conditional_residual_table<'py>(
+    py: Python<'py>,
+    model: PyRef<'_, PyFittedModel>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+) -> PyResult<Option<Py<PyArray1<f64>>>> {
+    let model = Arc::clone(&model.model);
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let residual = detach_pyresult(py, "latent_conditional_residual_table", move || {
+        let required = model
+            .latent_conditional_residual_columns()
+            .map_err(py_value_error)?;
+        let present = dataset.headers.iter().cloned().collect::<BTreeSet<_>>();
+        let missing = required
+            .difference(&present)
+            .map(|name| format!("missing required column '{name}'"))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(SchemaMismatchError::new_err(missing.join(" ")));
+        }
+        model
+            .latent_conditional_residual(dataset.values.view(), &dataset.column_map())
+            .map_err(|error| PredictInputError::new_err(error.to_string()))
+    })?;
+    Ok(residual.map(|values| values.into_pyarray(py).unbind()))
 }
 
 /// Per-row residuals of type `kind` (`response`, `working`, `deviance`,
