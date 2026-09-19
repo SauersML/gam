@@ -282,7 +282,6 @@ fn production_value(fx: &VFixture, p: &[f64]) -> f64 {
         intercept,
         m_a: 1.0,
         intercept_fast_path: false,
-        degree9_cells: None,
     };
     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(fx.primary.total);
     fx.family
@@ -321,7 +320,6 @@ fn production_grad_hess(fx: &VFixture, p: &[f64]) -> (f64, Vec<f64>, Vec<f64>) {
         intercept,
         m_a,
         intercept_fast_path: false,
-        degree9_cells: None,
     };
     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
     let v = fx

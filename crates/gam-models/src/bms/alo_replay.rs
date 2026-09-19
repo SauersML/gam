@@ -495,12 +495,7 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
 
     let mut rows = Vec::with_capacity(n);
     for row in 0..n {
-        let row_context = family.build_row_exact_context_with_stats_and_cell_cache(
-            row,
-            &block_states,
-            None,
-            false,
-        )?;
+        let row_context = family.build_row_exact_context(row, &block_states, None)?;
         let (negative_log_likelihood, nll_score, observed_hessian) = family
             .compute_row_primary_gradient_hessian(row, &block_states, &primary, &row_context)?;
         if nll_score.len() != primary.total
