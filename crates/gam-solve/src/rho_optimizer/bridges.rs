@@ -294,14 +294,13 @@ pub(crate) enum CostStallVerdict {
     },
 }
 
-/// Number of consecutive accepted outer iterates with negligible relative
+/// Number of consecutive accepted outer iterates with no resolvable
 /// objective improvement required before the cost-stall guard declares
 /// convergence. Matches the spirit of `opt`'s own `StallPolicy { window: 3 }`
 /// but, crucially, is gated on the cost alone (not on gradient smallness),
 /// which is the condition `opt` never checks in isolation.
 pub(crate) const COST_STALL_WINDOW: usize = 6;
 pub(crate) const ARC_COST_STALL_WINDOW: usize = 3;
-pub(crate) const COST_STALL_REL_TOL_FLOOR: f64 = 1.0e-7;
 
 /// The search state a stall escape was granted from, compared by raw bits: the
 /// incumbent, and the trial points the window that filled had evaluated.
@@ -385,12 +384,13 @@ pub(crate) struct CostStallExit {
 /// objective has effectively stopped decreasing. See the `cost_stall` field
 /// doc on [`OuterFirstOrderBridge`] for the full rationale (#1089).
 pub(crate) struct CostStallGuard {
-    /// Relative improvement floor, used only where the evaluations carry no
-    /// objective band: an accepted step counts as "no improvement" when
-    /// `(best - cost) <= rel_tol * (1 + |best|)`. Where both the incumbent and
-    /// the trial carry a band, the resolution is their sum instead
+    /// The criterion's absolute resolution `τ`
+    /// ([`super::run::outer_criterion_resolution`]), used only where the
+    /// evaluations carry no objective band: an accepted step counts as "no
+    /// improvement" when `(best - cost) <= τ`. Where both the incumbent and the
+    /// trial carry a band, the resolution is their sum instead
     /// ([`Self::resolution_against_incumbent`], #3018).
-    rel_tol: f64,
+    resolution: f64,
     /// Consecutive accepted-step window with no improvement before declaring
     /// convergence.
     window: usize,
@@ -516,13 +516,13 @@ pub(crate) struct CostStallGuard {
 
 impl CostStallGuard {
     pub(crate) fn new(
-        rel_tol: f64,
+        resolution: f64,
         window: usize,
         claim_config: &OuterConfig,
         exit: Arc<Mutex<Option<CostStallExit>>>,
     ) -> Self {
         Self {
-            rel_tol,
+            resolution,
             window,
             claim_config: claim_config.clone(),
             replay_proven: false,
@@ -809,7 +809,7 @@ impl CostStallGuard {
     }
 
     /// Stage `band_f` of the sample about to be observed ([`Self::objective_band`]).
-    /// A sample staged with `None` is judged by [`Self::rel_tol`].
+    /// A sample staged with `None` is judged by [`Self::resolution`].
     pub(crate) fn stage_objective_band(&mut self, band: Option<f64>) {
         self.staged_band = band;
     }
@@ -822,11 +822,15 @@ impl CostStallGuard {
     /// computed values are further apart than `band_f(V_a) + band_f(V_b)`. A
     /// decrease inside that sum is one the criterion does not represent: it may
     /// be rounding in either evaluation. When either value carries no band, the
-    /// relative floor `rel_tol·(1 + |V_best|)` stands in for it.
+    /// criterion's resolution `τ` stands in for it. Infinite while there is no
+    /// finite incumbent.
     fn resolution_between(&self, band_a: Option<f64>, band_b: Option<f64>) -> f64 {
+        if !self.best_value.is_finite() {
+            return f64::INFINITY;
+        }
         match (band_a, band_b) {
-            (Some(a), Some(b)) if self.best_value.is_finite() => a + b,
-            _ => self.rel_tol * (1.0 + self.best_value.abs()),
+            (Some(a), Some(b)) => a + b,
+            _ => self.resolution,
         }
     }
 
@@ -999,7 +1003,7 @@ impl CostStallGuard {
         // tests the RAW gradient, which points out of the box forever.
         let kkt_stationary_at_bound =
             grad_norm.is_finite() && grad_norm <= self.stationarity_band();
-        // With no incumbent yet the floor is `rel_tol·(1 + ∞) = ∞`. The first
+        // With no incumbent yet the floor is `∞`. The first
         // observation IS an improvement: it is the first incumbent, whatever its
         // gradient, so it never counts toward a window. Counting it (through
         // `∞ ≤ ∞`, or through the at-bound test when its gradient is already
@@ -2330,11 +2334,11 @@ impl OuterFirstOrderBridge<'_> {
                     }
                     log::debug!(
                         "[OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved \
-                         < {:.3e} (relative) over {} accepted outer steps but the projected \
+                         no more than its resolution (τ={:.3e} unbanded) over {} accepted outer steps but the projected \
                          gradient is FAR above the certified-stationary band \
                          (|g|={:.3e} > escape threshold {:.3e}); refusing \
                          to halt-and-ship and continuing the descent (escape {}, value={:.6e}).",
-                        guard.rel_tol,
+                        guard.resolution,
                         guard.window,
                         residual_grad_norm,
                         escape_threshold,
@@ -2360,11 +2364,11 @@ impl OuterFirstOrderBridge<'_> {
                     // tolerance made a band acceptance read as an arithmetic
                     // impossibility in the log.
                     log::debug!(
-                        "[OUTER] cost-stall convergence: REML objective improved < {:.3e} \
-                         (relative) over {} consecutive accepted outer steps AND the projected \
+                        "[OUTER] cost-stall convergence: REML objective improved no more than its \
+                         resolution (τ={:.3e} unbanded) over {} consecutive accepted outer steps AND the projected \
                          gradient cleared a stationarity band (|g|={:.3e}; bound {}); accepting \
                          best-so-far as a stationary optimum (value={:.6e}).",
-                        guard.rel_tol,
+                        guard.resolution,
                         guard.window,
                         guard.best_grad_norm,
                         guard.stationarity_band(),
@@ -2374,12 +2378,12 @@ impl OuterFirstOrderBridge<'_> {
                 }
                 CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                     log::debug!(
-                        "[OUTER] cost-stall FLAT-VALLEY STALL: REML objective improved < {:.3e} \
-                         (relative) over {} consecutive accepted outer steps but the projected \
+                        "[OUTER] cost-stall FLAT-VALLEY STALL: REML objective improved no more than its \
+                         resolution (τ={:.3e} unbanded) over {} consecutive accepted outer steps but the projected \
                          gradient is still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); \
                          halting on a weakly-identified ρ valley floor and reporting NON-CONVERGED \
                          (residual outer non-stationarity, value={:.6e}).",
-                        guard.rel_tol,
+                        guard.resolution,
                         guard.window,
                         residual_grad_norm,
                         guard.stationarity_band(),
@@ -2648,11 +2652,12 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// [`CostStallGuard`] stationarity test consumes. See the matching field on
     /// [`OuterFirstOrderBridge`].
     pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
-    /// The criterion's relative resolution `outer_rel_cost_floor(config)` for
-    /// the online decrement stop, or `None` on a route that does not apply it
-    /// (which is every route with no synchronized analytic Hessian at the
-    /// evaluated point). See [`ARC_CURVATURE_STATIONARY_SENTINEL`].
-    pub(crate) curvature_stationary_floor: Option<f64>,
+    /// The criterion's absolute resolution `τ`
+    /// ([`super::run::outer_criterion_resolution`]) for the online decrement
+    /// stop, or `None` on a route that does not apply it (which is every route
+    /// with no synchronized analytic Hessian at the evaluated point). See
+    /// [`ARC_CURVATURE_STATIONARY_SENTINEL`].
+    pub(crate) curvature_stationary_resolution: Option<f64>,
     /// The last evaluated trial, held until `opt::Arc`'s ratio test decides it,
     /// and the ledger the run's [`OuterAcceptObserver`] reports that decision
     /// through (#3017).
@@ -2662,7 +2667,7 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// takes none. When set, every Hessian evaluation publishes its
     /// certificate evidence and the online decrement stop decides on that
     /// verdict exactly as the certificate does, falling back to the
-    /// `floor·(1 + |V|)` rung only where the verdict is not taken. See
+    /// criterion-resolution `τ` rung only where the verdict is not taken. See
     /// [`Self::curvature_stationary_exit`].
     pub(crate) decrement_verdict_config: Option<&'a OuterConfig>,
 }
@@ -2889,11 +2894,11 @@ impl OuterSecondOrderBridge<'_> {
                 }
                 log::debug!(
                     "[OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved \
-                     < {:.3e} (relative) over {} outer steps but the projected gradient is FAR \
+                     no more than its resolution (τ={:.3e} unbanded) over {} outer steps but the projected gradient is FAR \
                      above the certified-stationary band (|g|={:.3e} > escape threshold \
                      {:.3e}); refusing to halt-and-ship \
                      and continuing the descent (escape {}, value={:.6e}).",
-                    guard.rel_tol,
+                    guard.resolution,
                     guard.window,
                     residual_grad_norm,
                     escape_threshold,
@@ -2912,11 +2917,11 @@ impl OuterSecondOrderBridge<'_> {
             CostStallVerdict::Converged => {
                 log::debug!(
                     "[OUTER] ARC finite cost stall deferred to exact second-order convergence: \
-                     REML objective improved < {:.3e} (relative) over {} consecutive outer \
+                     REML objective improved no more than its resolution (τ={:.3e} unbanded) over {} consecutive outer \
                      steps and the stored best projected gradient is small (|g|={:.3e}; bound \
                      {}), but only ARC owns the synchronized reduced-Hessian certificate \
                      (value={:.6e}).",
-                    guard.rel_tol,
+                    guard.resolution,
                     guard.window,
                     guard.best_grad_norm,
                     guard.stationarity_band(),
@@ -2927,12 +2932,12 @@ impl OuterSecondOrderBridge<'_> {
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                 log::debug!(
-                    "[OUTER] ARC finite cost stall deferred: REML objective improved < {:.3e} \
-                     (relative) over {} consecutive outer steps but the stored best projected \
+                    "[OUTER] ARC finite cost stall deferred: REML objective improved no more than its \
+                     resolution (τ={:.3e} unbanded) over {} consecutive outer steps but the stored best projected \
                      gradient remains above tolerance (|g|={:.3e} > {:.3e}). Returning the \
                      current finite gradient + Hessian to ARC instead of halting at a stale \
                      best point (value={:.6e}).",
-                    guard.rel_tol,
+                    guard.resolution,
                     guard.window,
                     residual_grad_norm,
                     guard.stationarity_band(),
@@ -3013,7 +3018,7 @@ impl OuterSecondOrderBridge<'_> {
     ///
     /// Before this, the loop stopped on the curvature-resolvability rung alone
     /// while the certificate had moved to the verdict, so the two disagreed by
-    /// the gap between `floor·(1 + |V|)` and `band_f`. On a Poisson REML fit
+    /// the gap between the then-relative `floor·(1 + |V|)` and `band_f`. On a Poisson REML fit
     /// whose `V` carries a λ-independent `Σ log y!` of `4.4e4` that gap is five
     /// orders of magnitude (`4.4e-3` against `5e-8`): every seed of the
     /// UCI abalone fit stopped at `½gᵀH⁻¹g ≈ 1e-4`, the screening certificate
@@ -3029,12 +3034,10 @@ impl OuterSecondOrderBridge<'_> {
     ///   certificate would reject — and a strict saddle, where the criterion
     ///   still has a descent direction, fails it outright;
     /// * the Newton decrement `½·gᵀH⁻¹g` of the rail-projected gradient must be
-    ///   finite and no larger than `floor·(1 + |V|)`. This calls
+    ///   finite and no larger than the criterion resolution `τ`. This calls
     ///   `run::newton_predicted_decrease_at_resolution` at
     ///   `run::criterion_curvature_resolution`, the same function at the same
-    ///   resolution the certificate's rung uses, against the same tolerance,
-    ///   anchored at this point's own cost exactly as the certificate anchors it
-    ///   at the certified point's;
+    ///   resolution the certificate's rung uses, against the same tolerance;
     /// * the point must be the best feasible iterate the trajectory has
     ///   produced, so a trial step ARC was about to reject cannot end the run.
     ///
@@ -3067,8 +3070,12 @@ impl OuterSecondOrderBridge<'_> {
         evidence: Option<&crate::estimate::outer_eval_capture::CertificateEvidence>,
         criterion_stalled: bool,
     ) -> Option<ObjectiveEvalError> {
-        let floor = self.curvature_stationary_floor?;
-        if hessian_psd != Some(true) || !cost.is_finite() || !floor.is_finite() || floor <= 0.0 {
+        let resolution = self.curvature_stationary_resolution?;
+        if hessian_psd != Some(true)
+            || !cost.is_finite()
+            || !resolution.is_finite()
+            || resolution <= 0.0
+        {
             return None;
         }
         let hessian = hessian?;
@@ -3130,15 +3137,14 @@ impl OuterSecondOrderBridge<'_> {
                 let decrement = super::run::newton_predicted_decrease_at_resolution(
                     hessian,
                     &projected,
-                    super::run::criterion_curvature_resolution(floor, cost),
+                    super::run::criterion_curvature_resolution(resolution),
                 )?;
-                let tolerance = floor * (1.0 + cost.abs());
-                if !decrement.is_finite() || decrement > tolerance {
+                if !decrement.is_finite() || decrement > resolution {
                     return None;
                 }
                 format!(
-                    "Newton ½gᵀH⁻¹g={decrement:.3e} ≤ criterion resolution {tolerance:.3e} \
-                     (= {floor:.3e}·(1+|V|) at |V|={cost:.6e})"
+                    "Newton ½gᵀH⁻¹g={decrement:.3e} ≤ criterion resolution τ={resolution:.3e} \
+                     at |V|={cost:.6e}"
                 )
             }
         };
@@ -3193,7 +3199,7 @@ impl OuterSecondOrderBridge<'_> {
     /// This calls that function on the incumbent with the certificate's inputs:
     /// the synchronized gradient and Hessian the verdict was taken on, the
     /// margin-railed coordinates of the search box, the objective's declared
-    /// invariance, and the resolution `floor·(1 + |V|)` that the certificate's
+    /// invariance, and the criterion resolution `τ` that the certificate's
     /// `asymptote_objective_tol` equals. It stops ARC only when the claim is
     /// contradicted, or unresolvable at every allowed step (#3036), AND `|Pg|`
     /// is inside the certificate's first-order band at the incumbent's value ([`CostStallGuard::stationarity_band`]); the mandatory final certificate
@@ -3211,7 +3217,7 @@ impl OuterSecondOrderBridge<'_> {
         &mut self,
         x: &Array1<f64>,
     ) -> Option<ObjectiveEvalError> {
-        let floor = self.curvature_stationary_floor?;
+        let objective_resolution = self.curvature_stationary_resolution?;
         let bounds = self.cost_stall_bounds.clone()?;
         let guard = self.cost_stall.as_mut()?;
         if !std::mem::take(&mut guard.strict_saddle_refusal)
@@ -3229,7 +3235,6 @@ impl OuterSecondOrderBridge<'_> {
         let railed: Vec<usize> = curvature.railed.iter().map(|railed| railed.index).collect();
         let curvature_note = curvature.render(guard.claim_config.native_coordinate_order.as_deref());
         let invariance = self.obj.criterion_invariant_directions(&rho);
-        let objective_resolution = floor * (1.0 + value.abs());
         let context = "ARC strict-saddle stall refusal";
         match super::run::adjudicate_negative_curvature(
             &mut *self.obj,
@@ -3491,11 +3496,10 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // adjudication already applies — so negative curvature that no step in
         // the adjudication's range can turn into a resolvable decrease stops
         // reading as a strict saddle that the cost-stall guard must keep escaping
-        // from. No floor configured (or a non-finite cost) keeps the arithmetic
-        // shift alone.
+        // from. No resolution configured keeps the arithmetic shift alone.
         let curvature_resolution = self
-            .curvature_stationary_floor
-            .map_or(0.0, |floor| super::run::criterion_curvature_resolution(floor, eval.cost));
+            .curvature_stationary_resolution
+            .map_or(0.0, super::run::criterion_curvature_resolution);
         let hessian_psd = hessian.as_ref().and_then(|dense| {
             reduced_hessian_psd_at_point(
                 x,
@@ -4289,8 +4293,8 @@ pub(crate) fn rail_projected_gradient_norm(
 /// — the certificate's single owner of "resolvable curvature" (#2748) — rather
 /// than at the arithmetic shift alone (#1082).
 ///
-/// The search route passes `2·ε_f`, with `ε_f = rel_cost_floor·(1 + |V|)` the
-/// criterion's own resolution. Along an eigenvector of `λ < 0` at a stationary
+/// The search route passes `2·ε_f`, with `ε_f = τ`
+/// (`run::outer_criterion_resolution`) the criterion's own resolution. Along an eigenvector of `λ < 0` at a stationary
 /// point the claim predicts the decrease `½|λ|α²`, and the largest step the
 /// negative-curvature adjudication takes is one e-fold of `log λ` (`α = 1`), so
 /// a direction with `½|λ| ≤ ε_f` predicts nothing the criterion can represent
@@ -4578,7 +4582,8 @@ pub(crate) fn build_bridge_hessian_for_source(
 /// A fixed-point walk is not a descent method: neither its cost nor its step is
 /// monotone along it, and a limit cycle of the map buys nothing forever. What
 /// the walk can buy is a better incumbent, a value lower by more than the
-/// criterion's resolution `rel_tol·(1 + |V|)`, or near the fixed point a smaller
+/// criterion's resolution `τ` ([`super::run::outer_criterion_resolution`]), or
+/// near the fixed point a smaller
 /// proposed step at the incumbent. `window` evaluations without a resolved
 /// improvement fill a window, and a filled window continues only when, since
 /// the previous licensed window, the incumbent improved by a resolution or its
@@ -4589,7 +4594,8 @@ pub(crate) fn build_bridge_hessian_for_source(
 /// domain, so resolved improvements are finite, and every other licence strictly
 /// lowers a floating-point step norm bounded below by zero.
 pub(crate) struct FixedPointProgress {
-    rel_tol: f64,
+    /// The criterion's absolute resolution `τ`.
+    resolution: f64,
     window: usize,
     best_value: f64,
     best_step_norm: f64,
@@ -4599,9 +4605,9 @@ pub(crate) struct FixedPointProgress {
 }
 
 impl FixedPointProgress {
-    pub(crate) fn new(rel_tol: f64, window: usize) -> Self {
+    pub(crate) fn new(resolution: f64, window: usize) -> Self {
         Self {
-            rel_tol,
+            resolution,
             window,
             best_value: f64::INFINITY,
             best_step_norm: f64::INFINITY,
@@ -4619,7 +4625,7 @@ impl FixedPointProgress {
             return false;
         }
         if value < self.best_value {
-            let resolved = self.best_value - value > self.rel_tol * (1.0 + value.abs());
+            let resolved = self.best_value - value > self.resolution;
             self.best_value = value;
             self.best_step_norm = step_norm;
             if resolved {
@@ -4635,7 +4641,7 @@ impl FixedPointProgress {
         let licensed = match self.licensed_incumbent {
             None => true,
             Some((previous_value, previous_step_norm)) => {
-                previous_value - self.best_value > self.rel_tol * (1.0 + self.best_value.abs())
+                previous_value - self.best_value > self.resolution
                     || self.best_step_norm < previous_step_norm
             }
         };

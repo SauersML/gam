@@ -18,30 +18,26 @@ use super::*;
 use ndarray::array;
 use opt::OperatorObjective;
 
-/// The criterion resolution floor these fixtures hand the bridge — the same
-/// quantity `outer_rel_cost_floor` returns at the default outer tolerance
-/// (`COST_STALL_REL_TOL_FLOOR`), written out so a fixture states the threshold
-/// it brackets instead of importing it and asserting a tautology.
-const FLOOR_2817: f64 = 1.0e-7;
-
 /// The criterion value the flat fixtures sit at. A REML score of `O(1e3)` is
-/// the ordinary scale of the fits this defect was measured on, and it makes the
-/// resolution `FLOOR_2817·(1 + |V|)` a number worth writing down: `1.001e-4`.
+/// the ordinary scale of the fits this defect was measured on. The resolution
+/// is absolute, so this value only places the fixtures; it does not scale any
+/// threshold.
 const COST_2817: f64 = 1.0e3;
 
-/// The resolution the adjudication is judged against — the certificate's own
-/// `objective_tol` at [`COST_2817`]: `1.001e-4`.
-const RESOLUTION_2817: f64 = FLOOR_2817 * (1.0 + COST_2817);
+/// The criterion resolution these fixtures hand the bridge and its guard: the
+/// statistical resolution `τ_stat = 1/(2n)` of an `n = 5000` fit, `1e-4`,
+/// written out so a fixture states the threshold it brackets instead of
+/// importing it and asserting a tautology.
+const RESOLUTION_2817: f64 = 1.0e-4;
 
 /// The certificate band these fixtures' guards judge claims by (#2817). The guard
 /// reads its band from the run's configuration; this one is the absolute
-/// tolerance with no relative widening, so the band is the same at every value.
+/// tolerance, so the band is the same at every value.
 const CLAIM_BAND_2817: f64 = 1.0e-3;
 
 fn claim_band_config_2817(band: f64) -> OuterConfig {
     OuterConfig {
         tolerance: band,
-        rel_cost_tolerance: Some(0.0),
         ..OuterConfig::default()
     }
 }
@@ -50,7 +46,7 @@ fn claim_band_config_2817(band: f64) -> OuterConfig {
 ///
 /// Chosen to satisfy three things at once, which is what makes the pair sharp:
 /// its Newton decrement `½‖g‖²/(1 + √ε) = 8.45e-5` is INSIDE the criterion's
-/// resolution `1.001e-4` (so the certificate accepts the point); it is three
+/// resolution `1e-4` (so the certificate accepts the point); it is three
 /// orders ABOVE the default absolute outer band `1e-5` (so the solver's own
 /// stopping test never reaches it, which is the whole defect); and it is above
 /// [`CLAIM_BAND_2817`] (so the guard does not read the point as
@@ -176,7 +172,7 @@ fn drive_arc_oracle_publishing_2817(
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(
-        FLOOR_2817,
+        RESOLUTION_2817,
         ARC_COST_STALL_WINDOW,
         &claim_band_config_2817(CLAIM_BAND_2817),
         exit.clone(),
@@ -193,7 +189,7 @@ fn drive_arc_oracle_publishing_2817(
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some(bounds),
-        curvature_stationary_floor: floor,
+        curvature_stationary_resolution: floor,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: verdict_config,
     };
@@ -240,7 +236,7 @@ fn quadratic_criterion_1082(
 }
 
 /// A criterion still buying real decrease every step: each entry improves on
-/// the last by far more than the guard's relative floor.
+/// the last by far more than the guard's resolution.
 fn descending_2817(gradient: Array1<f64>, count: usize) -> Vec<(f64, Array1<f64>)> {
     (0..count)
         .map(|i| (COST_2817 - (i as f64), gradient.clone()))
@@ -251,7 +247,7 @@ fn descending_2817(gradient: Array1<f64>, count: usize) -> Vec<(f64, Array1<f64>
 /// orders ABOVE the absolute band the solver was being driven to.
 ///
 /// [`STOP_GRAD_2817`] against unit curvature is a Newton decrement of `8.45e-5`,
-/// inside the criterion's resolution of `1.001e-4`: no step from here can move
+/// inside the criterion's resolution of `1e-4`: no step from here can move
 /// the criterion by as much as it can be resolved. The default absolute outer
 /// band is `1e-5`, so before this repair the search kept going — toward a
 /// threshold the certificate it was heading for never applies.
@@ -262,7 +258,7 @@ fn a_flatlined_arc_stall_is_adjudicated_by_the_certificates_own_test_2817() {
         flatlined_2817(array![STOP_GRAD_2817], ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     let message = outcomes
         .last()
@@ -312,7 +308,7 @@ fn a_flatlined_arc_stall_is_adjudicated_by_the_certificates_own_test_2817() {
 #[test]
 fn a_creeping_flat_valley_stops_at_its_first_window_by_adjudication_2817() {
     const WALL_2817: usize = 200;
-    // Each evaluation improves by 1e-9, far under the resolution `1.001e-4`, so
+    // Each evaluation improves by 1e-9, far under the resolution `1e-4`, so
     // every one counts toward the window while the incumbent still moves.
     const CREEP_2817: f64 = 1.0e-9;
     // The residual contracts by 1e-4 of itself per evaluation, so each window's
@@ -332,7 +328,7 @@ fn a_creeping_flat_valley_stops_at_its_first_window_by_adjudication_2817() {
         schedule,
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert_eq!(
         outcomes.last().expect("ran").clone().err().as_deref(),
@@ -367,7 +363,7 @@ fn a_still_descending_search_is_never_adjudicated_2817() {
         descending_2817(array![STOP_GRAD_2817], ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert!(
         outcomes.iter().all(|o| o.is_ok()),
@@ -392,7 +388,7 @@ fn a_stall_with_real_available_descent_is_not_certified_2817() {
         flatlined_2817(array![1.0], ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert!(
         outcomes.iter().all(|o| o.is_ok()),
@@ -421,7 +417,7 @@ fn the_adjudication_threshold_is_the_criterion_resolution_2817() {
         flatlined_2817(array![critical * 0.99], ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert_eq!(
         inside.last().expect("ran").clone().err().as_deref(),
@@ -433,7 +429,7 @@ fn the_adjudication_threshold_is_the_criterion_resolution_2817() {
         flatlined_2817(array![critical * 1.01], ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert!(
         outside.iter().all(|o| o.is_ok()),
@@ -479,7 +475,7 @@ fn a_strict_saddle_is_never_adjudicated_stationary_2817() {
         flatlined_2817(gradient, ARC_COST_STALL_WINDOW + 3),
         hessian,
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         move |theta| quadratic_criterion_1082(theta, &center, &claimed_gradient, &claimed_hessian),
     );
     assert!(
@@ -509,7 +505,7 @@ fn a_strict_saddle_claim_the_criterion_contradicts_stops_at_the_incumbent_1082()
         flatlined_2817(array![1.0e-6, 1.0e-6], ARC_COST_STALL_WINDOW + 3),
         array![[1.0, 0.0], [0.0, -1.0]],
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         |_| COST_2817,
     );
     assert_eq!(
@@ -539,7 +535,7 @@ fn a_contradicted_strict_saddle_outside_the_solver_band_keeps_the_search_moving_
         flatlined_2817(array![5.0e-3, 5.0e-3], ARC_COST_STALL_WINDOW + 3),
         array![[1.0, 0.0], [0.0, -1.0]],
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         |_| COST_2817,
     );
     assert!(
@@ -576,7 +572,7 @@ fn a_residual_along_a_flat_direction_keeps_the_search_moving_2817() {
         flatlined_2817(gradient, ARC_COST_STALL_WINDOW + 3),
         hessian,
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert!(
         outcomes.iter().all(|o| o.is_ok()),
@@ -599,7 +595,7 @@ fn a_bound_pinned_outward_pull_is_adjudicated_stationary_2817() {
         flatlined_2817(array![1.0], ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert_eq!(
         outcomes.last().expect("ran").clone().err().as_deref(),
@@ -614,7 +610,7 @@ fn a_bound_pinned_outward_pull_is_adjudicated_stationary_2817() {
     );
 }
 
-/// POSITIVE CONTROL ON THE WIRING. The floor is what performs the
+/// POSITIVE CONTROL ON THE WIRING. The resolution is what performs the
 /// adjudication: the same stall on a route that declares no criterion
 /// resolution behaves exactly as it did before this change.
 #[test]
@@ -702,7 +698,7 @@ fn drive_flat_stall_with_verdict_2954(
         samples,
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         |_| COST_2817,
         Some((config, evidence)),
     )
@@ -711,7 +707,7 @@ fn drive_flat_stall_with_verdict_2954(
 /// The loop does not stop where its certificate refuses (#2954).
 ///
 /// [`STOP_GRAD_2817`] against unit curvature is a model decrease `½g² = 8.45e-5`,
-/// inside `floor·(1 + |V|) = 1.001e-4`, so the curvature-resolvability rung
+/// inside the resolution `1e-4`, so the curvature-resolvability rung
 /// halts ARC there (the control half, on a route that takes no verdict). A route
 /// that declares its size is certified on the verdict instead: at `1e5` rows its
 /// statistical resolution is `τ_stat = 1/(2n) = 5e-6`, and a criterion of `V =
@@ -729,7 +725,7 @@ fn the_online_stop_declines_a_point_the_certificates_verdict_refuses_2954() {
         flatlined_2817(array![STOP_GRAD_2817], 2 * ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert_eq!(
         control.last().expect("ran").clone().err().as_deref(),
@@ -985,10 +981,10 @@ fn the_decrement_travels_with_the_resolution_its_verdict_was_taken_at_2817() {
 /// The stop fires where its own verdict accepts (#2817 with #1082).
 ///
 /// `λ = −1e-6` is resolvable by the arithmetic shift `√ε = 1.49e-8` but not by the
-/// criterion's curvature resolution `2·FLOOR_2817·(1 + |V|) = 2.002e-4`, so the
+/// criterion's curvature resolution `2·RESOLUTION_2817 = 2e-4`, so the
 /// bridge judges this reduced Hessian PSD. The residual [`STOP_GRAD_2817`] lies
 /// along the stiff direction, a Newton decrement of `8.45e-5`, inside the
-/// criterion's resolution `1.001e-4`, exactly as in the unit-curvature fixture
+/// criterion's resolution `1e-4`, exactly as in the unit-curvature fixture
 /// above. Before the decrement travelled with the verdict, the shifted Cholesky
 /// found no factor, this exit returned nothing, and the guard kept escaping a
 /// stall its own verdict called stationary.
@@ -1017,7 +1013,7 @@ fn a_sub_resolution_negative_eigenvalue_does_not_block_the_stationary_stop_2817(
         flatlined_2817(gradient, ARC_COST_STALL_WINDOW + 3),
         hessian,
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert_eq!(
         outcomes.last().expect("ran").clone().err().as_deref(),
@@ -1031,7 +1027,7 @@ fn a_sub_resolution_negative_eigenvalue_does_not_block_the_stationary_stop_2817(
 
 /// NEGATIVE CONTROL: the same sub-resolution negative eigenvalue, with the
 /// residual lying ALONG it. Its decrement at the resolution shift is
-/// `½·(1.3e-2)²/(2.002e-4 − 1e-6) ≈ 0.42`, four thousand times the criterion's
+/// `½·(1.3e-2)²/(2e-4 − 1e-6) ≈ 0.42`, four thousand times the criterion's
 /// resolution, so the search keeps moving. Taking the decrement at the larger
 /// shift errs toward continuing, never toward stopping.
 #[test]
@@ -1043,7 +1039,7 @@ fn a_residual_along_a_sub_resolution_negative_direction_keeps_the_search_moving_
         flatlined_2817(gradient, ARC_COST_STALL_WINDOW + 3),
         hessian,
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert!(
         outcomes.iter().all(|o| o.is_ok()),
@@ -1067,7 +1063,7 @@ fn drive_two_flat_windows_2817(gradient: f64) -> (Vec<Result<f64, String>>, Opti
         flatlined_2817(array![gradient], 2 * ARC_COST_STALL_WINDOW + 3),
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     )
 }
 
@@ -1151,7 +1147,7 @@ fn a_stall_that_bought_resolved_descent_between_windows_keeps_moving_2817() {
         schedule,
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert!(
         outcomes.iter().all(|outcome| outcome.is_ok()),
@@ -1164,7 +1160,7 @@ fn a_stall_that_bought_resolved_descent_between_windows_keeps_moving_2817() {
 /// incumbent's projected gradient halved. The search is buying stationarity,
 /// so the second window is licensed.
 ///
-/// Each step improves by `1e-6`, below the resolution `1.001e-4`, so every step
+/// Each step improves by `1e-6`, below the resolution `1e-4`, so every step
 /// counts toward the window while the incumbent still moves and carries the
 /// gradient of the point that set it.
 #[test]
@@ -1181,7 +1177,7 @@ fn a_stall_whose_residual_contracted_between_windows_keeps_moving_2817() {
         schedule,
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
     );
     assert!(
         outcomes.iter().all(|outcome| outcome.is_ok()),
@@ -1227,7 +1223,7 @@ fn drive_operator_oracle_2817(
     );
     let stop: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(
-        FLOOR_2817,
+        RESOLUTION_2817,
         ARC_COST_STALL_WINDOW,
         &claim_band_config_2817(CLAIM_BAND_2817),
         Arc::new(Mutex::new(None)),
@@ -1325,7 +1321,7 @@ fn a_strict_saddle_stall_escapes_then_stops_on_its_proven_replay_2817() {
         flatlined_2817(array![2.0, 0.0], 3 * ARC_COST_STALL_WINDOW + 3),
         array![[1.0, 0.0], [0.0, -1.0]],
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         |_| COST_2817,
     );
     let replay_window_end = 2 * ARC_COST_STALL_WINDOW;
@@ -1382,7 +1378,7 @@ fn a_strict_saddle_window_on_new_trials_escapes_again_until_it_replays() {
         flatlined_2817(array![2.0, 0.0], points.len()),
         array![[1.0, 0.0], [0.0, -1.0]],
         wide_box_2817(2),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         |_| COST_2817,
     );
     let replay_window_end = 3 * window;
@@ -1420,7 +1416,7 @@ fn a_strict_saddle_window_on_new_trials_escapes_again_until_it_replays() {
 /// cycling walk ran until its iteration count ran out.
 #[test]
 fn a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817() {
-    let mut progress = FixedPointProgress::new(FLOOR_2817, COST_STALL_WINDOW);
+    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
     let stop = 2 * COST_STALL_WINDOW;
     for index in 0..=stop {
         let value = if index % 2 == 0 {
@@ -1440,12 +1436,12 @@ fn a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817() {
 /// NEGATIVE CONTROL: no resolved improvement between the windows, but the step
 /// at the incumbent halved. The walk is converging, so it keeps walking.
 ///
-/// Each evaluation improves by `1e-6`, below the resolution `1.001e-4`, so every
+/// Each evaluation improves by `1e-6`, below the resolution `1e-4`, so every
 /// one counts toward the window while the incumbent still moves and carries the
 /// step of the point that set it.
 #[test]
 fn a_fixed_point_walk_whose_step_contracted_keeps_walking_2817() {
-    let mut progress = FixedPointProgress::new(FLOOR_2817, COST_STALL_WINDOW);
+    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
     for index in 0..=(2 * COST_STALL_WINDOW + 1) {
         let step_norm = if index <= COST_STALL_WINDOW { 0.5 } else { 0.25 };
         let stopped = progress.observe(COST_2817 - 1.0e-6 * index as f64, step_norm);
@@ -1460,7 +1456,7 @@ fn a_fixed_point_walk_whose_step_contracted_keeps_walking_2817() {
 /// windows, which licenses the second.
 #[test]
 fn a_fixed_point_walk_that_bought_resolved_improvement_keeps_walking_2817() {
-    let mut progress = FixedPointProgress::new(FLOOR_2817, COST_STALL_WINDOW);
+    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
     for index in 0..=(2 * COST_STALL_WINDOW + 1) {
         let value = if index <= COST_STALL_WINDOW {
             COST_2817

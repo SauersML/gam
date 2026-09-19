@@ -147,9 +147,11 @@ def test_inverse_gaussian_refuses_a_nonpositive_response() -> None:
 @pytest.mark.parametrize(
     ("family", "link", "legal"),
     [
-        ("gamma", "identity", "log|inverse"),
-        ("inverse-gaussian", "inverse", "log|inverse-squared"),
-        ("gaussian", "log", "identity|inverse"),
+        # Every positive-mean family composes with every link whose range
+        # meets its mean domain; a probability link is not one of them.
+        ("gamma", "logit", "identity|log|sqrt|inverse|inverse-squared"),
+        ("inverse-gaussian", "probit", "identity|log|sqrt|inverse|inverse-squared"),
+        ("gaussian", "cloglog", "identity|log|sqrt|inverse|inverse-squared"),
     ],
 )
 def test_illegal_link_error_lists_the_family_legal_links(family: str, link: str, legal: str) -> None:
