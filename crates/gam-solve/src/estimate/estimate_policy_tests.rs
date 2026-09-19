@@ -525,16 +525,19 @@ fn prefit_binomial_separation_reads_a_smooth_null_space_but_not_its_range() {
     let n = 40;
     let k = 7;
     let p = 1 + k;
-    let xs: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
-    let mut x = Array2::<f64>::zeros((n, p));
-    for (row, &xi) in xs.iter().enumerate() {
-        x[[row, 0]] = 1.0;
-        for j in 0..k {
-            let knot = j as f64 / (k - 1) as f64;
-            x[[row, 1 + j]] = (1.0 - (k - 1) as f64 * (xi - knot).abs()).max(0.0);
+    let hat_design = |xs: &[f64]| {
+        let mut x = Array2::<f64>::zeros((xs.len(), p));
+        for (row, &xi) in xs.iter().enumerate() {
+            x[[row, 0]] = 1.0;
+            for j in 0..k {
+                let knot = j as f64 / (k - 1) as f64;
+                x[[row, 1 + j]] = (1.0 - (k - 1) as f64 * (xi - knot).abs()).max(0.0);
+            }
         }
-    }
-    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x));
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+    };
+    let xs: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
+    let design = hat_design(&xs);
     let w = Array1::ones(n);
     let cfg = RemlConfig::external(
         GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
@@ -603,6 +606,58 @@ fn prefit_binomial_separation_reads_a_smooth_null_space_but_not_its_range() {
         .collect();
     reject_prefit_binomial_separation(&cfg, bump.view(), w.view(), &design, &double_penalty)
         .expect("no linear function of x separates a bump; the bending penalty bounds the rest");
+
+    // Quasi-complete separation: x on the tenths grid, y = 1{x > 0.5} except
+    // that the rows tied at x = 0.5 alternate between the classes. No direction
+    // separates strictly, but x − 0.5 is ≥ 0 on the positives, ≤ 0 on the
+    // negatives and nonzero off the tie, so the likelihood has no maximizer.
+    let tenths: Vec<f64> = (0..44).map(|i| (i % 11) as f64 / 10.0).collect();
+    let tenths_design = hat_design(&tenths);
+    let tenths_w = Array1::ones(tenths.len());
+    let mut tie = 0usize;
+    let quasi: Array1<f64> = tenths
+        .iter()
+        .map(|&xi| {
+            if xi == 0.5 {
+                tie += 1;
+                f64::from(u8::from(tie % 2 == 1))
+            } else {
+                f64::from(u8::from(xi > 0.5))
+            }
+        })
+        .collect();
+    for (label, penalties) in [
+        ("double penalty", &double_penalty),
+        ("bending only", &bending_only),
+    ] {
+        let err = reject_prefit_binomial_separation(
+            &cfg,
+            quasi.view(),
+            tenths_w.view(),
+            &tenths_design,
+            penalties,
+        )
+        .expect_err("a quasi-complete separator in the smooth's null space must be certified");
+        assert!(
+            matches!(
+                err,
+                EstimationError::PrefitLinearSeparationDetected { min_signed_margin, .. }
+                    if min_signed_margin == 0.0
+            ),
+            "{label}: expected a quasi-separation certificate, got {err:?}"
+        );
+    }
+    // One positive below the tie leaves the classes interleaved: the MLE exists.
+    let mut overlapped = quasi.clone();
+    overlapped[1] = 1.0;
+    reject_prefit_binomial_separation(
+        &cfg,
+        overlapped.view(),
+        tenths_w.view(),
+        &tenths_design,
+        &double_penalty,
+    )
+    .expect("classes that cross the threshold are not quasi-separated");
 }
 
 #[test]

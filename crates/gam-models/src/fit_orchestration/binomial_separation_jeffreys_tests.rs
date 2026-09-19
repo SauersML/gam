@@ -16,6 +16,10 @@
 //! path the step never reached the Firth rescue at all: the pre-fit separation
 //! certificate read only parametric columns, so it missed the separator in the
 //! smooth's null space and the flat-prior fit ground on instead of refusing.
+//! The quasi-separated fixture has no strict separator to certify, and its
+//! flat-prior fit returns an optimum with the null-space ridge's λ railed at 0
+//! and |η| near 50, so the pre-fit check also certifies quasi-complete
+//! separation along a null-space direction.
 
 use super::entry::fit_from_formula;
 use super::request::{FitConfig, FitResult, StandardFitResult};

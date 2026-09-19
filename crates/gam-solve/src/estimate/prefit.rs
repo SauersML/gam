@@ -446,6 +446,7 @@ fn certify_prefit_binomial_linear_separator(
 struct PrefitSeparationCoordinate {
     columns: Vec<usize>,
     weights: Vec<f64>,
+    null_space: bool,
 }
 
 impl PrefitSeparationCoordinate {
@@ -453,6 +454,7 @@ impl PrefitSeparationCoordinate {
         Self {
             columns: vec![col],
             weights: vec![1.0],
+            null_space: false,
         }
     }
 
@@ -572,6 +574,7 @@ fn push_null_directions(
         coordinates.push(PrefitSeparationCoordinate {
             columns: range.clone().collect(),
             weights: direction.to_vec(),
+            null_space: true,
         });
     }
 }
@@ -622,7 +625,10 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
         certify_prefit_binomial_linear_separator(&class, x, &column_indices, &beta)
     };
 
-    for direction in prefit_threshold_separator_proposals(&class, x, coordinates)? {
+    let Some(statistics) = prefit_coordinate_statistics(&class, x, coordinates)? else {
+        return Ok(None);
+    };
+    for direction in prefit_threshold_separator_proposals(&statistics)? {
         if let Some(diagnostic) = certify(&direction)? {
             return Ok(Some(diagnostic));
         }
@@ -688,33 +694,58 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
         }
     }
 
-    certify(&direction)
+    if let Some(diagnostic) = certify(&direction)? {
+        return Ok(Some(diagnostic));
+    }
+    Ok(prefit_null_space_quasi_separator(&statistics, coordinates))
 }
 
-/// Exact separator proposals, one per search coordinate whose values the two
-/// classes do not interleave: `±(e_k − t·a)`, with `t` the midpoint of the gap
-/// and `a` the least-squares representation of the constant in the coordinates.
-///
-/// The perceptron needs on the order of `(R/γ)²` updates, and a step response
-/// on a grid of `n` points has a margin `γ` near `R/n`, so it cannot find the
-/// separator of the very step it exists for. A threshold on one coordinate is
-/// that separator whenever the constant lies in the coordinates' span; when it
-/// does not, the proposal fails the certificate and nothing is claimed.
-fn prefit_threshold_separator_proposals(
+/// Per-class extrema, Gram matrix and column sums of the search coordinates
+/// over the rows that carry a class, from one streaming pass over the design.
+struct PrefitCoordinateStatistics {
+    min_pos: Vec<f64>,
+    max_pos: Vec<f64>,
+    min_neg: Vec<f64>,
+    max_neg: Vec<f64>,
+    gram: Array2<f64>,
+    column_sums: Array1<f64>,
+    active_rows: usize,
+    /// The largest `Σ_k |weights[k]·x_i[columns[k]]|` over classed rows: the
+    /// scale of the coordinate's rounding band.
+    max_magnitude: Vec<f64>,
+}
+
+impl PrefitCoordinateStatistics {
+    /// The coordinate's value when it takes one value on every classed row.
+    fn constant_value(&self, k: usize) -> Option<f64> {
+        let value = self.min_pos[k];
+        (value.is_finite()
+            && value == self.max_pos[k]
+            && value == self.min_neg[k]
+            && value == self.max_neg[k])
+            .then_some(value)
+    }
+}
+
+/// `None` when a coordinate is not finite on some classed row.
+fn prefit_coordinate_statistics(
     class: &[Option<bool>],
     x: &DesignMatrix,
     coordinates: &[PrefitSeparationCoordinate],
-) -> Result<Vec<Vec<f64>>, EstimationError> {
+) -> Result<Option<PrefitCoordinateStatistics>, EstimationError> {
     let q = coordinates.len();
     let p = x.ncols();
-    let mut min_pos = vec![f64::INFINITY; q];
-    let mut max_pos = vec![f64::NEG_INFINITY; q];
-    let mut min_neg = vec![f64::INFINITY; q];
-    let mut max_neg = vec![f64::NEG_INFINITY; q];
-    let mut gram = Array2::<f64>::zeros((q, q));
-    let mut column_sums = Array1::<f64>::zeros(q);
+    let mut statistics = PrefitCoordinateStatistics {
+        min_pos: vec![f64::INFINITY; q],
+        max_pos: vec![f64::NEG_INFINITY; q],
+        min_neg: vec![f64::INFINITY; q],
+        max_neg: vec![f64::NEG_INFINITY; q],
+        gram: Array2::<f64>::zeros((q, q)),
+        column_sums: Array1::<f64>::zeros(q),
+        active_rows: 0,
+        max_magnitude: vec![0.0; q],
+    };
     let mut z = vec![0.0_f64; q];
-    let mut active_rows = 0usize;
     let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
     let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
     for start in (0..x.nrows()).step_by(chunk_rows) {
@@ -730,35 +761,140 @@ fn prefit_threshold_separator_proposals(
             let Some(is_positive) = class[start + local_row] else {
                 continue;
             };
-            active_rows += 1;
+            statistics.active_rows += 1;
             let row = chunk.row(local_row);
             for (k, coordinate) in coordinates.iter().enumerate() {
                 let value = coordinate.value(row);
                 if !value.is_finite() {
-                    return Ok(Vec::new());
+                    return Ok(None);
                 }
                 z[k] = value;
+                let magnitude: f64 = coordinate
+                    .columns
+                    .iter()
+                    .zip(&coordinate.weights)
+                    .map(|(&col, &weight)| (weight * row[col]).abs())
+                    .sum();
+                statistics.max_magnitude[k] = statistics.max_magnitude[k].max(magnitude);
                 if is_positive {
-                    min_pos[k] = min_pos[k].min(value);
-                    max_pos[k] = max_pos[k].max(value);
+                    statistics.min_pos[k] = statistics.min_pos[k].min(value);
+                    statistics.max_pos[k] = statistics.max_pos[k].max(value);
                 } else {
-                    min_neg[k] = min_neg[k].min(value);
-                    max_neg[k] = max_neg[k].max(value);
+                    statistics.min_neg[k] = statistics.min_neg[k].min(value);
+                    statistics.max_neg[k] = statistics.max_neg[k].max(value);
                 }
             }
             for a in 0..q {
-                column_sums[a] += z[a];
+                statistics.column_sums[a] += z[a];
                 for b in 0..=a {
-                    gram[[a, b]] += z[a] * z[b];
+                    statistics.gram[[a, b]] += z[a] * z[b];
                 }
             }
         }
     }
     for a in 0..q {
         for b in 0..a {
-            gram[[b, a]] = gram[[a, b]];
+            statistics.gram[[b, a]] = statistics.gram[[a, b]];
         }
     }
+    Ok(Some(statistics))
+}
+
+/// A quasi-complete separator along one penalty null-space direction: the
+/// classes' values of `z_k` meet at a threshold `t` without crossing it,
+/// `max_neg ≤ t ≤ min_pos` (or mirrored), and some row lies strictly past it.
+/// Then `±(z_k − t)` is ≥ 0 on every row and > 0 on some, so the likelihood
+/// rises without bound along that direction toward a supremum it never
+/// attains, and the flat prior leaves the posterior improper there (Albert &
+/// Anderson 1984). The offset `t` must be expressible, so either `t = 0` or a
+/// parametric coordinate takes one nonzero value on every classed row.
+///
+/// Rows tied at the threshold have margin exactly zero, which no rounding band
+/// can certify, so the comparisons read the coordinate values as computed:
+/// identical design rows give identical values, and a row whose value the
+/// arithmetic cannot tell from `t` is tied to it. A strict separator is left to
+/// the exact certificate above; only null-space directions are read, because
+/// their null-space ridge keeps each inner problem bounded while REML drives
+/// its λ to its rail, so a flat-prior fit returns a railed optimum instead of
+/// refusing, and nothing downstream would engage the Jeffreys prior.
+fn prefit_null_space_quasi_separator(
+    statistics: &PrefitCoordinateStatistics,
+    coordinates: &[PrefitSeparationCoordinate],
+) -> Option<PrefitLinearSeparationDiagnostic> {
+    let constant = coordinates
+        .iter()
+        .enumerate()
+        .filter(|(_, coordinate)| !coordinate.null_space)
+        .find_map(|(j, _)| {
+            statistics
+                .constant_value(j)
+                .filter(|&value| value != 0.0)
+                .map(|_| j)
+        });
+    for (k, coordinate) in coordinates.iter().enumerate() {
+        if !coordinate.null_space {
+            continue;
+        }
+        let (min_pos, max_pos) = (statistics.min_pos[k], statistics.max_pos[k]);
+        let (min_neg, max_neg) = (statistics.min_neg[k], statistics.max_neg[k]);
+        // The row past the threshold must clear the coordinate's rounding band,
+        // or a direction the arithmetic cannot tell from constant would qualify.
+        let band = gam_linalg::roundoff::accumulation_growth(coordinate.columns.len())
+            * statistics.max_magnitude[k];
+        let threshold = if max_neg <= min_pos && max_pos - min_neg > band {
+            0.5 * (max_neg + min_pos)
+        } else if max_pos <= min_neg && max_neg - min_pos > band {
+            0.5 * (max_pos + min_neg)
+        } else {
+            continue;
+        };
+        let offset = if threshold == 0.0 {
+            None
+        } else if let Some(j) = constant {
+            Some(j)
+        } else {
+            continue;
+        };
+        let mut column_indices: Vec<usize> = coordinate
+            .columns
+            .iter()
+            .chain(offset.iter().flat_map(|&j| coordinates[j].columns.iter()))
+            .copied()
+            .collect();
+        column_indices.sort_unstable();
+        column_indices.dedup();
+        return Some(PrefitLinearSeparationDiagnostic {
+            min_signed_margin: 0.0,
+            num_unpenalized_columns: column_indices.len(),
+            column_indices,
+        });
+    }
+    None
+}
+
+/// Exact separator proposals, one per search coordinate whose values the two
+/// classes do not interleave: `±(e_k − t·a)`, with `t` the midpoint of the gap
+/// and `a` the least-squares representation of the constant in the coordinates.
+///
+/// The perceptron needs on the order of `(R/γ)²` updates, and a step response
+/// on a grid of `n` points has a margin `γ` near `R/n`, so it cannot find the
+/// separator of the very step it exists for. A threshold on one coordinate is
+/// that separator whenever the constant lies in the coordinates' span; when it
+/// does not, the proposal fails the certificate and nothing is claimed.
+fn prefit_threshold_separator_proposals(
+    statistics: &PrefitCoordinateStatistics,
+) -> Result<Vec<Vec<f64>>, EstimationError> {
+    let PrefitCoordinateStatistics {
+        min_pos,
+        max_pos,
+        min_neg,
+        max_neg,
+        gram,
+        column_sums,
+        active_rows,
+        ..
+    } = statistics;
+    let q = min_pos.len();
 
     // `a = G⁺ Zᵀ1`, the pseudo-inverse cut at the Gram's rounding floor, the
     // same floor the pre-fit rank check reads.
@@ -771,12 +907,12 @@ fn prefit_threshold_separator_proposals(
     let spectral_scale = eigenvalues
         .iter()
         .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
-    let floor = (active_rows.max(q) as f64) * f64::EPSILON * spectral_scale;
+    let floor = ((*active_rows).max(q) as f64) * f64::EPSILON * spectral_scale;
     let mut constant = Array1::<f64>::zeros(q);
     for (i, &value) in eigenvalues.iter().enumerate() {
         if value > floor {
             let v = eigenvectors.column(i);
-            constant.scaled_add(v.dot(&column_sums) / value, &v);
+            constant.scaled_add(v.dot(column_sums) / value, &v);
         }
     }
 
