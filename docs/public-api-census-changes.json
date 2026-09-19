@@ -4456,5 +4456,13 @@
     },
     "reason": "#2695 whole-residual survival location-scale kernel (i2940's unit, landed by surv-ls-1). These crate-visible helpers served only the location-only kernel's q-chain assembly (collect_joint_quantities -> SurvivalJointQuantities -> the mxtwx/mxtwxd/mxtwx_psi/mask_row_vec/assign_symmetric_block crossproducts in family_solver.rs), which is deleted because its chain dq/d(eta_t) = -exp(-eta_ls) holds only for u = h - eta_t*exp(-eta_ls). Consumers now read the one row program (exact_row_kernel / exact_row_kernel_rescaled) and row_predictor_state_at(dynamic, row). weighted_crossprod_dense's last caller (a tests.rs pin) moves to weighted_crossprod_dense_with_parallelism, safe_sum3's callers regroup the entry-exit gap channel by channel, and assign_block and safe_fast_xt_diag_x had no caller.",
     "evidence": "git grep -w at 34ea9c6ca2b1043b39389c2ab70403d086ce6e17 names these only inside crates/gam-models/src/survival/location_scale (dense_linalg.rs, numeric_guards.rs, row_kernel.rs, family_solver.rs, mod.rs, wiggle_geometry.rs, time_block.rs, tests.rs); the landing tree declares and calls none of them. public_api_census.py refused exactly these 12 at job 1286875 (i2940's p10 tree); Slurm job 1338925 (lane sw5c) ran it on this tree at 34ea9c6ca2 with RC 0."
+  },
+  {
+    "base": "1ec9ae7e88215e48c9a7d686f3bc994ad2188e74",
+    "removed": {
+      "crates/gam-solve/src/quadrature.rs::cloglog_posterior_meanwith_deriv_gamma_reference": 1
+    },
+    "reason": "#2469: cloglog_posterior_meanwith_deriv_gamma_reference was a pub(crate) test-module reference built on cloglog_survival_gamma_reference, the Gamma/Mellin-Barnes route this commit deletes (see docs/source-removal-changes.json). The integrated cloglog pin now grades the router against 50-digit mpmath references instead.",
+    "evidence": "At 651eabad3f, git grep -w finds cloglog_posterior_meanwith_deriv_gamma_reference only inside quadrature.rs's test module: its declaration and one call in test_cloglog_gamma_reference_matches_seeded_monte_carlo_small_case, which this commit deletes. public_api_census.py in gate dy6 run spec-lead-q1-g1 refused exactly this one removal."
   }
 ]
