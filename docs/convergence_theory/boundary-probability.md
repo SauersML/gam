@@ -30,9 +30,9 @@ Every claim below carries one of three tags:
 
 7. **gamfit's smooth-term p-values are conservative under the default double penalty**, and the brief counts conservative p-values as a bug. The Wood-type Wald statistic has an atom at 0 of mass ≈ 0.5, because f̂ ≡ 0 when both λ̂ = ∞. Its χ²/F(ref_df) reference ignores that atom. Simulated size under H0 is 0.029–0.034 at nominal 0.05 and 0.115–0.143 at 0.20, i.e. 55–70% of nominal (n = 100, 400) **[checked, §4.3]**. The exact-mixture null is calibrated. With a single penalty, where there is no atom, gamfit's p-value is calibrated (0.053 at 0.05). So the defect is the atom, not the boundary. The equivalent chi-bar ½χ²₀ + ½χ²₁ reference for the RLRT is also conservative for splines by a factor of about 2 (size 0.025 at nominal 0.05) **[checked, `tables.out`]**.
 
-8. **Calibrated replacement: the test statistic is the boundary certificate's own first-order quantity.** The variance-component score U = y'P₀ZZ'P₀y / y'P₀y has an *exact* Gaussian null law, a ratio of quadratic forms, computed deterministically by Imhof inversion. For GLMs it has the first-order null law Σκ_s χ²₁ with κ = eig(Z'P_WZ) (Lin 1997). The Gaussian version is exactly calibrated **[proven]** and the simulations match nominal (§4.4). Other options: the pivotal-T exact null (simulation) and the RLRT with the Crainiceanu–Ruppert exact null.
+8. **Calibrated replacement: the test statistic is the boundary certificate's own first-order quantity.** The variance-component score U = y'P₀ZZ'P₀y / y'P₀y has an *exact* Gaussian null law, a ratio of quadratic forms, computed deterministically by Imhof inversion. For GLMs it has the first-order null law Σκ_s χ²₁ with κ = eig(Z'P_WZ) (Lin 1997). The Gaussian version is exactly calibrated **[proven]**. Simulated sizes are within 1.4 MC s.e. of nominal at n = 100 and 400, and the binomial Lin version is within 1.7 s.e. at n = 100 **[checked, §4.4]**. Other options: the pivotal-T exact null (simulation) and the RLRT with the Crainiceanu–Ruppert exact null.
 
-9. **GLM/LAML analogue.** V'(0) = −½[r'ZZ'r − tr(Z'P_WZ)] + ½tr((X₀'WX₀)⁻¹X₀' diag(w'·η̇) X₀). The first term is Lin's score; the second is the Laplace weight-drift term, which is a relative O(n^{−1/2}) correction. The formula matches finite differences to a median relative error of 3×10⁻⁵. The GLM boundary probability matches the κ-spectral prediction: 0.6745 vs 0.677 at n = 100 **[checked, `glm.out`]**.
+9. **GLM/LAML analogue.** V'(0) = −½[r'ZZ'r − tr(Z'P_WZ)] + ½tr((X₀'WX₀)⁻¹X₀' diag(w'·η̇) X₀). The first term is Lin's score; the second is the Laplace weight-drift term, which is a relative O(n^{−1/2}) correction. The formula matches finite differences to a median relative error of 3×10⁻⁵. The GLM boundary probability matches the κ-spectral prediction: 0.6745 vs 0.677 at n = 100, and 0.695 vs 0.678 ± 0.010 at n = 400 **[checked, `glm.out`]**. Dropping the drift term flips the boundary decision in 2.0% of fits at n = 100 and 0.65% at n = 400, so the certifier needs the full (3.7).
 
 ---
 
@@ -358,7 +358,7 @@ The first term is Lin's (1997) score for the variance component. The second is t
 | \|drift\| / E\|Lin\| | median 4.6×10⁻² |
 | sign disagreement, Lin vs exact | 2.0% |
 
-The n = 400 run is in `glm.out` if it completed; see §4.5.
+At n = 400 (§4.5) the figures are 0.6950 (exact), 0.6925 (Lin only), 0.6950 (Lin + drift) and 0.678 ± 0.010 (prediction). The drift share falls from 4.6% to 1.9%, and the Lin-only sign-disagreement rate from 2.0% to 0.65%.
 
 **GLM null law for tests.** r'ZZ'r → Σκ_sχ²₁ with κ = eig(Z'P_WZ) at the null fit (Lin 1997; Zhang & Lin 2003). The p-value P(Σκ_sχ²₁ ≥ r'ZZ'r) is deterministic by Imhof and first-order accurate. §4.4 checks its size.
 
@@ -443,11 +443,33 @@ All eight entries are within 1.4 MC s.e. of nominal. This is expected, since (3.
 
 **(c) Bernoulli-logit Lin score test.** r'ZZ'r at the null fit, with p-value from Σκ_sχ²₁ by Imhof, κ = eig(Z'P_WZ).
 
-BINOMIAL_SCORE_PLACEHOLDER
+| n | draws | α=.01 | .05 | .10 | .20 | MC s.e. (.01/.05/.10/.20) |
+|---|---|---|---|---|---|---|
+| 100 | 2000 | 0.0065 | 0.0490 | 0.1070 | 0.2150 | .0022/.0049/.0067/.0089 |
+
+All entries are within 1.7 MC s.e. of nominal, so the test is calibrated to first order [checked]. The sign pattern (slightly low at .01, slightly high at .10–.20) is the expected first-order error of the Σκχ²₁ approximation, the non-normal skew of r at n = 100, and it is below MC resolution here. Open problem 4 is whether a saddlepoint correction is needed at α = .01. The n = 400 run (1000 draws) was still running when this report was written, and its line is appended to `scoretest.out` when it finishes.
 
 ### 4.5 LAML derivative and GLM boundary law (`glm.py → glm.out`)
 
-GLM_RESULTS_PLACEHOLDER
+Bernoulli logit, k = 10, single 2nd-difference penalty, η_true linear (H0 for the penalized part), 2000 draws per n. V'(0⁺) is from one-sided Richardson FD (test code only).
+
+| quantity | n = 100 | n = 400 |
+|---|---|---|
+| κ₁ / Σκ | 0.862 | 0.867 |
+| P(boundary), exact local LAML | 0.6745 | 0.6950 |
+| P(boundary), Lin score only | 0.6775 | 0.6925 |
+| P(boundary), Lin + drift (3.7) | 0.6745 | 0.6950 |
+| P(boundary), global (13-point γ grid) | 0.6595 | 0.6880 |
+| prediction π(κ), κ at truth | 0.6773 ± 0.0105 | 0.6779 ± 0.0104 |
+| median / max \|V'(0) − (3.7)\| / E\|Lin\| | 2.9×10⁻⁵ / 9.1×10⁻⁴ | 3.1×10⁻⁵ / 9.0×10⁻⁴ |
+| median \|drift\| / E\|Lin\| | 4.6×10⁻² | 1.9×10⁻² |
+| sign disagreement, Lin vs exact | 2.0% | 0.65% |
+
+Reading:
+
+- **(3.7) is the exact right derivative [checked].** Lin + drift reproduces the sign of V'(0⁺) in every draw at both n, i.e. identical boundary frequencies. The residual relative error of 3×10⁻⁵ is the FD truncation error of the check itself.
+- **The drift term is a relative O(n^{−1/2}) correction [checked].** Its relative size falls by a factor of 2.35 from n = 100 to n = 400, against the predicted 2. Ignoring it flips the boundary decision in 2.0% and 0.65% of fits. **The certifier must use (3.7), not the Lin score alone**, because a 2% wrong-KKT rate is a certification bug even though it is asymptotically negligible.
+- **The boundary probability of the GLM matches the Gaussian κ-spectral law [checked].** The deviations are 0.3 and 1.6 MC s.e. P(boundary) ≈ 0.67–0.70, as in the Gaussian case. The global rate is 0.7–1.5 points below the local one, as in §4.1.
 
 ### 4.6 Resolution and local alternatives
 
