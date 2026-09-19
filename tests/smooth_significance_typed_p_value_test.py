@@ -95,3 +95,27 @@ def test_gaussian_strong_term_tail_is_finite_and_resolved_not_rounding() -> None
     null = rows["s(x2)"]
     assert null["p_value"] is not None and 0.0 < null["p_value"] <= 1.0
     assert null["p_value"] == null["p_value_corrected"]
+
+
+def test_poisson_null_term_is_not_bartlett_corrected_for_selection_twice() -> None:
+    # Replicate 0's `s(x2)` is shrunk to its null (`ref_df ~ 2e-5`). Its λ̂
+    # selection is replayed in the reference, and the estimated-λ Lawley
+    # factor used to add the ρ-variation mean shift on top: an `O(1/n)` shift
+    # over that `ref_df` gave `bartlett_factor = 73.9`, `W* = W/73.9`, and
+    # `p = 0.99945` where the replayed law alone gives `0.626`. Every shrunk
+    # null term was pushed to ~1 that way, 26% of the Poisson cell's null
+    # replicates (bench/pvalue_calibration/pv-lr-refit).
+    row = _rows("poisson", 0)["s(x2)"]
+    assert row["correction_provenance"] == "lawley_lr_fixed_lambda", row["correction_provenance"]
+    assert row["bartlett_factor"] == row["bartlett_factor_conditional"]
+    assert abs(row["bartlett_factor"] - 1.0) < 1e-2, row["bartlett_factor"]
+    # With `c` that close to one the corrected tail is the replayed law's own
+    # tail, to within the reference's stated accuracy.
+    p = row["p_value"]
+    assert p is not None and abs(p - row["p_value_uncorrected"]) <= row["p_value_bound"], (
+        p,
+        row["p_value_uncorrected"],
+        row["p_value_bound"],
+    )
+    assert p < 1.0 - row["p_value_bound"], p
+    assert row["p_value"] == row["p_value_corrected"]

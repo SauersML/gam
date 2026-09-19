@@ -17,8 +17,9 @@ pub enum SmoothLrCorrection {
     LawleyLrEstimatedLambda,
     /// A per-term likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)` that has
     /// been Bartlett-corrected with the fixed-λ Lawley factor `c = E[W|λ]/d`
-    /// (`W* = W/c`, referenced against `χ²_d`). This is used only when the
-    /// estimated-λ handoff is unavailable.
+    /// (`W* = W/c`, referenced against `χ²_d`). This is used when a λ̂-selection
+    /// replay already carries the estimation of `λ` in the reference law, and
+    /// when the estimated-λ handoff is unavailable.
     LawleyLrFixedLambda,
     /// No second-order correction was applied — either the family has no
     /// closed-form Lawley cumulant jets or the null refit did not converge — so
@@ -3446,7 +3447,18 @@ pub fn smooth_term_lr_inference_forspec(
                 {
                     let mut c_applied = c_cond;
                     correction = SmoothLrCorrection::LawleyLrFixedLambda;
-                    if let Some(cov) = rho_covariance
+                    // The ρ-variation mean shift is a first-order account of what
+                    // estimating `λ` does to `W`. A selection replay already puts
+                    // the whole of that into the law — it re-selects `λ` on every
+                    // draw — so adding the shift as well counts it twice. On a
+                    // term REML shrinks to its null the double count is not
+                    // small: an `O(1/n)` shift over `ref_df ~ 1e-5` is a factor
+                    // near 70, and it moved every such term's p-value to ~1.
+                    // With a replay, only the fixed-`λ` factor — the
+                    // non-Gaussian part of the conditional law, which the
+                    // replay's Gaussian quadratic form does not carry — applies.
+                    if reference.selection.replay().is_none()
+                        && let Some(cov) = rho_covariance
                         && let Ok(total_shift) = lawley_lr_mean_shift_with_rho_variation(
                             full_design_dense.view(),
                             &kappas,
