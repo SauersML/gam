@@ -1486,6 +1486,17 @@ fn inference_notes_from_model(model_bytes: Vec<u8>) -> PyResult<Vec<String>> {
     Ok(notes)
 }
 
+/// The LAML-estimated `(σ, ν)` of a scaled Student-t fit, read off the saved
+/// model's likelihood; `None` for every other response family.
+#[pyfunction]
+fn student_t_parameters_from_model(model_bytes: Vec<u8>) -> PyResult<Option<(f64, f64)>> {
+    let model = load_model_impl(&model_bytes).map_err(py_value_error)?;
+    Ok(match model_likelihood_spec(&model).response {
+        ResponseFamily::StudentT { sigma, nu } => Some((sigma, nu)),
+        _ => None,
+    })
+}
+
 fn required_saved_model_payload_string_value(model_bytes: &[u8], key: &str) -> PyResult<String> {
     saved_model_payload_string(model_bytes.to_vec(), key)?
         .ok_or_else(|| py_value_error(format!("saved model payload is missing {key}")))
