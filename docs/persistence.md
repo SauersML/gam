@@ -5,6 +5,14 @@
 ## Models — `.gam`
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test = {"x": np.array([1.5, 2.5, 3.5])}
+
 model = gamfit.fit(train, "y ~ s(x)")
 model.save("model.gam")
 
@@ -15,6 +23,14 @@ preds  = loaded.predict(test)
 In-memory transport:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train, "y ~ s(x)")
+
 blob   = model.dumps()              # bytes
 loaded = gamfit.loads(blob)
 ```
@@ -65,6 +81,16 @@ inputs.
 After loading, every method works as on the original model:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test = {"x": np.array([1.5, 2.5, 3.5])}
+gamfit.fit(train, "y ~ s(x)").save("model.gam")
+loaded = gamfit.load("model.gam")
+
 loaded.predict(test, interval=0.95)
 loaded.summary()
 loaded.diagnose(train)             # diagnostics need the response column
@@ -89,6 +115,14 @@ long-term archival, pin the `gamfit` version or refit after upgrades.
 ### Inspect a model without the training data
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train, "y ~ s(x)")
+
 model.save("model.gam")            # a model saved earlier
 m = gamfit.load("model.gam")
 print(m.summary())
@@ -98,6 +132,15 @@ print(m.model_class, m.formula)
 ### Round-trip in tests
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test = {"x": np.array([1.5, 2.5, 3.5])}
+model = gamfit.fit(train, "y ~ s(x)")
+
 blob = model.dumps()
 assert (gamfit.loads(blob).predict(test)
         == model.predict(test)).all()

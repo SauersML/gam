@@ -9,9 +9,9 @@ No block sets a smoothing parameter, a number of splines or a search
 grid. REML/LAML chooses every smoothing parameter in one optimization,
 and the printed effective degrees of freedom (edf) show what it chose.
 
-gamfit announces the basis size it picked for each smooth with a
-`GamInferenceWarning`; see [Choosing `k`](formulas.md#choosing-k) for
-what that size means.
+A default `s(x)` sizes its own basis, growing it until the fit's adequacy
+test passes; see
+[Choosing `k`](formulas.md#choosing-k).
 
 ## Wages: smooths, a factor and model comparison
 

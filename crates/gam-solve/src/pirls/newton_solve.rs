@@ -1689,7 +1689,7 @@ pub(crate) fn estimate_sparse_native_decision(
 ) -> SparsePirlsDecision {
     let p = x_original.ncols();
     let nnz_s_lambda = count_dense_upper_nnz(s_lambda);
-    let dense_reject = |reason: &'static str, nnz_x: usize| SparsePirlsDecision {
+    let dense_reject = |reason: &'static str, nnz_x: Option<usize>| SparsePirlsDecision {
         path: PirlsLinearSolvePath::DenseTransformed,
         reason,
         p,
@@ -1705,47 +1705,18 @@ pub(crate) fn estimate_sparse_native_decision(
         .map(|lb| lb.iter().any(|bound| bound.is_finite()))
         .unwrap_or(false);
     if has_finite_lower_bounds || linear_constraints_original.is_some() {
-        return dense_reject("constraints_present", 0);
+        return dense_reject("constraints_present", None);
     }
 
-    let x_sparse = if let Some(sparse) = x_original.as_sparse() {
-        sparse
-    } else {
-        // Count nonzeros via chunks so operator-backed dense designs
-        // (e.g. lazy ScaleDeviationOperator) participate in this diagnostic
-        // path without forcing a full materialization.
-        let row_chunk_start = std::time::Instant::now();
-        let n = x_original.nrows();
-        let chunk = row_chunk_for_byte_budget(n, x_original.ncols());
-        let mut nnz: usize = 0;
-        let mut chunks_processed = 0usize;
-        if chunk > 0 && n > 0 {
-            let mut start = 0;
-            while start < n {
-                let end = (start + chunk).min(n);
-                chunks_processed += 1;
-                match x_original.try_row_chunk(start..end) {
-                    Ok(rows) => {
-                        nnz = nnz.saturating_add(rows.iter().filter(|v| **v != 0.0).count());
-                    }
-                    Err(_) => {
-                        nnz = nnz.saturating_add((end - start).saturating_mul(x_original.ncols()));
-                    }
-                }
-                start = end;
-            }
-        }
-        log::debug!(
-            "[STAGE] PIRLS row-chunk generation chunks={} n={} p={} nnz={} elapsed={:.3}s",
-            chunks_processed,
-            n,
-            x_original.ncols(),
-            nnz,
-            row_chunk_start.elapsed().as_secs_f64(),
-        );
-        return dense_reject("design_not_sparse", nnz);
+    // A design with no sparse representation takes the dense path whatever its
+    // entries are, so its nonzeros are left uncounted (`nnz_x=na`, as the REML
+    // twin reports the same route). Counting them meant copying, or for a lazy
+    // operator evaluating, every row of the design on each P-IRLS call, only to
+    // fill a debug field.
+    let Some(x_sparse) = x_original.as_sparse() else {
+        return dense_reject("design_not_sparse", None);
     };
-    let nnz_x = x_sparse.val().len();
+    let nnz_x = Some(x_sparse.val().len());
     match workspace.sparse_penalized_system_stats(x_sparse, s_lambda) {
         Ok(stats) => SparsePirlsDecision {
             path: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
