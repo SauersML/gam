@@ -17,6 +17,7 @@ mod sbc_gaussian_smooth_band_coverage;
 mod sbc_glm_binomial_band_coverage;
 mod sbc_glm_poisson_band_coverage;
 mod sbc_location_scale_predictive_coverage;
+mod sbc_multinomial_joint_smooth_significance_size_curve;
 mod sbc_multinomial_prediction_interval_coverage;
 mod sbc_multinomial_smooth_significance_size_curve;
 mod sbc_skovgaard_rstar_size_curve;

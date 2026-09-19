@@ -482,6 +482,30 @@ impl<'a> MultinomialPredictiveModel<'a> {
 
     /// `Q = T − XᵀW(β̂)X` at `anchor`, symmetrized, with its inertia against its
     /// own rounding band (see `terminal_precision`).
+    /// The training rows' likelihood curvature `XᵀW(θ)X` at `θ`, in the stacked
+    /// class-major order, where `W` holds each row's softmax Fisher block
+    /// `w·p_a(δ_ab − p_b)` over the active classes. At the published mode this
+    /// is the design Gram the Wood smooth test whitens by: the multinomial's
+    /// fitted-value metric couples the class blocks, so it is assembled from the
+    /// rows rather than from any one block.
+    pub(crate) fn likelihood_curvature(
+        &self,
+        theta: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        self.validate()?;
+        let d = self.coefficient_dim();
+        if theta.len() != d {
+            crate::bail_invalid_estim!(
+                "multinomial likelihood curvature needs {d} coefficients, got {}",
+                theta.len()
+            );
+        }
+        let theta: Vec<f64> = theta.iter().copied().collect();
+        let mut curvature = Array2::<f64>::zeros((d, d));
+        self.add_training_rows(&theta, &mut curvature);
+        Ok(curvature)
+    }
+
     fn fitted_quadratic(
         &self,
         anchor: &[f64],

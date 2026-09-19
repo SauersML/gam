@@ -4763,6 +4763,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         multinomial_smooth_significance_pyfunc,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        multinomial_joint_smooth_significance_pyfunc,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(multinomial_summary_text_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(
         posterior_predict_multinomial_pyfunc,

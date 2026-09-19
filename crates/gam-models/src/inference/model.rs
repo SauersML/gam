@@ -6079,16 +6079,27 @@ fn validate_frozen_term_collectionspec(
 /// saved before that has one λ fewer for each such term. The refusal names those
 /// terms when the spec has any.
 ///
-/// `spec` is the mean predictor's spec, so the saved count is the Mean block's
-/// λ when the fit records one, and the fit's λ otherwise.
+/// `spec` is the mean predictor's spec, so the saved count is the λ of the
+/// fit's primary predictor block (Mean, Location or Threshold; see
+/// `UnifiedFitResult::primary_predictor_block`) when the fit records blocks,
+/// and the fit's λ otherwise.
 pub fn saved_lambdas_index_rebuilt_layout(
     spec: &TermCollectionSpec,
     rebuilt_penalties: usize,
     fit: &UnifiedFitResult,
     context: &str,
 ) -> Result<(), FittedModelError> {
-    let saved_lambdas = fit
-        .block_by_role(BlockRole::Mean)
+    let Some(primary) = fit.primary_predictor_block() else {
+        let roles: Vec<&str> = fit.blocks.iter().map(|block| block.role.name()).collect();
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "{context}: the saved spec describes the mean predictor, and this fit's blocks \
+                 {roles:?} include no mean, location or threshold block"
+            ),
+        });
+    };
+    let saved_lambdas = primary
+        .block
         .map_or(fit.lambdas.len(), |block| block.lambdas.len());
     if rebuilt_penalties == saved_lambdas {
         return Ok(());

@@ -44,13 +44,78 @@
 //! rather than a second implementation.
 
 use crate::estimate::summary::{SmoothTermSummary, compute_continuous_smoothness_order};
-use crate::model_types::result_types::UnifiedFitResult;
+use crate::model_types::result_types::{PrimaryPredictorBlock, UnifiedFitResult};
 use gam_terms::basis::{BasisMetadata, PenaltySource};
 use gam_terms::inference::smooth_test::{
     SmoothTestInput, SmoothTestScale, wood_smooth_test,
 };
 use gam_terms::smooth::{ShapeConstraint, TermCollectionDesign, TermCollectionSpec};
 use ndarray::Array2;
+
+/// What a fit block carries AHEAD of the mean-predictor design it holds, when
+/// the design is not the whole block.
+///
+/// A Royston-Parmar (transformation or Weibull) survival fit keeps its time
+/// basis and its covariates in ONE mean block, `[time | covariates]`, with the
+/// time penalties before the covariate penalties. Only the family that built
+/// the block knows that layout, so the caller that knows the family states it;
+/// every other fit's design is its whole block, [`BlockPrologue::NONE`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockPrologue {
+    /// Coefficients of the block before the design's first column.
+    pub columns: usize,
+    /// Smoothing parameters of the block before the design's first penalty.
+    pub penalties: usize,
+}
+
+impl BlockPrologue {
+    /// The design is the whole block.
+    pub const NONE: Self = Self {
+        columns: 0,
+        penalties: 0,
+    };
+}
+
+/// The fit block a mean-predictor design of `design_ncols` columns describes,
+/// with the design's place in the flat layouts
+/// ([`UnifiedFitResult::primary_predictor_block`], shifted past `prologue`).
+///
+/// `Err` when the fit has blocks but none is the mean predictor, or when that
+/// block's width is not the prologue's plus the design's, so no column of the
+/// block is known to be a given term's.
+pub fn mean_predictor_block(
+    fit: &UnifiedFitResult,
+    design_ncols: usize,
+    prologue: BlockPrologue,
+) -> Result<PrimaryPredictorBlock<'_>, String> {
+    let Some(primary) = fit.primary_predictor_block() else {
+        let roles: Vec<&str> = fit.blocks.iter().map(|b| b.role.name()).collect();
+        return Err(format!(
+            "the per-smooth table describes the mean predictor, and this fit's blocks \
+             {roles:?} include no mean, location or threshold block"
+        ));
+    };
+    if let Some(block) = primary.block
+        && block.beta.len() != prologue.columns + design_ncols
+    {
+        let ahead = if prologue.columns == 0 {
+            String::new()
+        } else {
+            format!(" after {} leading columns", prologue.columns)
+        };
+        return Err(format!(
+            "the mean predictor's design has {design_ncols} columns{ahead} but the fit's {} \
+             block has {} coefficients, so its smooths cannot be located in the fit",
+            block.role.name(),
+            block.beta.len()
+        ));
+    }
+    Ok(PrimaryPredictorBlock {
+        block: primary.block,
+        coefficient_offset: primary.coefficient_offset + prologue.columns,
+        penalty_offset: primary.penalty_offset + prologue.penalties,
+    })
+}
 
 /// Build the smooth/random-effect rows of a model summary.
 ///
@@ -66,12 +131,35 @@ use ndarray::Array2;
 ///
 /// Random-effect rows carry EDF only: they are boundary variance-component
 /// tests, and a naive coefficient Wald `χ²` on them is anti-conservative.
+///
+/// `design`/`spec` describe the mean predictor, which in a multi-block fit
+/// (latent survival's `[time, mean, log σ]`, a location-scale fit's
+/// `[location, scale]`) is one block of the flat layout. Every coefficient and
+/// penalty index below is shifted by the widths of the blocks before it
+/// ([`UnifiedFitResult::primary_predictor_block`]), and `whitening_gram` is in
+/// the fit's full flat layout. `Err` when the fit has blocks but none is the
+/// mean predictor, or that block's width is not the design's, so no index into
+/// it is known to belong to the spec's terms.
 pub fn smooth_term_summary_rows(
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
     whitening_gram: Option<&Array2<f64>>,
-) -> Vec<SmoothTermSummary> {
+) -> Result<Vec<SmoothTermSummary>, String> {
+    smooth_term_summary_rows_after(design, spec, fit, whitening_gram, BlockPrologue::NONE)
+}
+
+/// [`smooth_term_summary_rows`] for a design that shares its fit block with
+/// `prologue` leading coefficients and penalties (a Royston-Parmar survival
+/// fit's time basis); see [`BlockPrologue`].
+pub fn smooth_term_summary_rows_after(
+    design: &TermCollectionDesign,
+    spec: &TermCollectionSpec,
+    fit: &UnifiedFitResult,
+    whitening_gram: Option<&Array2<f64>>,
+    prologue: BlockPrologue,
+) -> Result<Vec<SmoothTermSummary>, String> {
+    let primary = mean_predictor_block(fit, design.design.ncols(), prologue)?;
     // The Wald smooth test uses the CONDITIONAL Bayesian covariance
     // `Vb = H⁻¹·φ̂` (mgcv's `Vp`, the covariance mgcv's `testStat` whitens by
     // default), NOT the smoothing-parameter-corrected `Vc`. `Vc` adds the λ̂
@@ -110,13 +198,14 @@ pub fn smooth_term_summary_rows(
     // them in the recorded global ordering rather than re-deriving it — which is
     // what the `.count()` below does, and why it must not be replaced by a
     // boolean.
-    let mut penalty_cursor = design
-        .penaltyinfo
-        .iter()
-        .filter(|info| {
-            matches!(&info.penalty.source, PenaltySource::Other(s) if s == "LinearTermRidge")
-        })
-        .count();
+    let mut penalty_cursor = primary.penalty_offset
+        + design
+            .penaltyinfo
+            .iter()
+            .filter(|info| {
+                matches!(&info.penalty.source, PenaltySource::Other(s) if s == "LinearTermRidge")
+            })
+            .count();
 
     for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
         // The design's RE-penalty loop skips a block when EITHER it is
@@ -138,10 +227,12 @@ pub fn smooth_term_summary_rows(
             .map(|term| term.penalized)
             .unwrap_or(true);
         let k_pen = usize::from(penalized && !range.is_empty());
+        let range =
+            (primary.coefficient_offset + range.start)..(primary.coefficient_offset + range.end);
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
-        let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
+        let edf = fit.per_term_edf(range, penalty_cursor, k_pen);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k_pen);
         penalty_cursor += k_pen;
         // Random-effect smooths are variance-component tests on the boundary; a
@@ -165,10 +256,13 @@ pub fn smooth_term_summary_rows(
     // global `fit.beta` / covariance / influence matrix. Omitting this offset
     // (the #1360 defect) slid each smooth's window one-per-preceding-column off,
     // folding the intercept and a neighbouring term's coefficients into the test.
-    let smooth_start = design
-        .design
-        .ncols()
-        .saturating_sub(design.smooth.total_smooth_cols());
+    // In a multi-block fit that layout is itself one block of the flat vector,
+    // so the blocks before the mean predictor are skipped as well.
+    let smooth_start = primary.coefficient_offset
+        + design
+            .design
+            .ncols()
+            .saturating_sub(design.smooth.total_smooth_cols());
 
     for term in &design.smooth.terms {
         let k = term.active_penalties.len();
@@ -214,7 +308,13 @@ pub fn smooth_term_summary_rows(
                 .unwrap_or(edf.max(0.0)),
             chi_sq: smooth_test.as_ref().map(|test| test.statistic),
             pvalue: smooth_test.as_ref().map(|test| test.p_value),
-            continuous_order: continuous_order_for_term(design, fit, term_penalty_start, k),
+            continuous_order: continuous_order_for_term(
+                design,
+                fit,
+                term_penalty_start,
+                term_penalty_start - primary.penalty_offset,
+                k,
+            ),
             basis_note: match &term.metadata {
                 BasisMetadata::BSpline1D {
                     auto_shrink_note, ..
@@ -225,7 +325,7 @@ pub fn smooth_term_summary_rows(
         });
     }
 
-    rows
+    Ok(rows)
 }
 
 /// The label a term's EDF carries when a penalty block among its `count` blocks from
@@ -253,15 +353,20 @@ fn edf_rank_bound_label(fit: &UnifiedFitResult, start: usize, count: usize) -> O
 /// the physical λ the diagnostic needs is `λ_k = λ̃_k / c_k`. Returns `None`
 /// unless the term owns exactly the three penalty blocks the identity is
 /// written over and every one of them reports a usable normalization scale.
+///
+/// `term_penalty_start` indexes the fit's flat λ vector and
+/// `design_penalty_start` the design's own penalty list; they differ by the
+/// smoothing parameters of the blocks ahead of the mean predictor.
 fn continuous_order_for_term(
     design: &TermCollectionDesign,
     fit: &UnifiedFitResult,
     term_penalty_start: usize,
+    design_penalty_start: usize,
     k: usize,
 ) -> Option<crate::estimate::summary::ContinuousSmoothnessOrder> {
     if k != 3
         || term_penalty_start + 2 >= fit.lambdas.len()
-        || term_penalty_start + 2 >= design.penaltyinfo.len()
+        || design_penalty_start + 2 >= design.penaltyinfo.len()
     {
         return None;
     }
@@ -275,9 +380,9 @@ fn continuous_order_for_term(
         fit.lambdas[term_penalty_start + 2],
     ];
     let scales = [
-        normalized_scale(term_penalty_start)?,
-        normalized_scale(term_penalty_start + 1)?,
-        normalized_scale(term_penalty_start + 2)?,
+        normalized_scale(design_penalty_start)?,
+        normalized_scale(design_penalty_start + 1)?,
+        normalized_scale(design_penalty_start + 2)?,
     ];
     Some(compute_continuous_smoothness_order(lambda_tilde, scales))
 }

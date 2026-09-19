@@ -322,9 +322,15 @@ fn summary_smooth_terms(
         .map_err(|err| format!("frozen-basis design replay failed: {err}"))?;
     // The walk below reads the fit's per-penalty record by the rebuilt layout's
     // global index, so a rebuild with another block count would misread it.
+    // First the design must BE the fit's mean predictor block, or its trailing
+    // columns when that block also carries the time basis (a single-cause
+    // transformation or Weibull survival fit); anything else refuses by name
+    // instead of reading another predictor's coefficients.
+    let prologue = shared_time_block_prologue(model, fit, &design)?;
+    let primary = gam_solve::estimate::mean_predictor_block(fit, design.design.ncols(), prologue)?;
     crate::inference::model::saved_lambdas_index_rebuilt_layout(
         spec,
-        design.penalties.len(),
+        design.penalties.len() + prologue.penalties,
         fit,
         "per-smooth summary",
     )?;
@@ -333,8 +339,22 @@ fn summary_smooth_terms(
     // Prefer the fit's exact weighted Gram `X'WX` when the inference block
     // survived; on the persisted summary path (inference dropped) reconstruct
     // the unweighted `X'X` from the frozen basis. `None` → un-whitened fallback.
+    // The walk slices the gram in the fit's FULL flat coefficient layout, where
+    // the mean predictor sits at its block's offset (a latent-survival fit puts
+    // the time block first). The reconstruction covers only the mean design, so
+    // it is placed at that offset; the other blocks' entries are never sliced.
     let reconstructed_gram = if fit.weighted_gram().is_none() {
-        summary_whitening_gram(spec, ranges, &factor_levels, design.design.ncols())
+        let offset = primary.coefficient_offset;
+        summary_whitening_gram(spec, ranges, &factor_levels, design.design.ncols()).map(
+            |mean_gram| {
+                let p_mean = mean_gram.nrows();
+                let p_total = fit.beta.len().max(offset + p_mean);
+                let mut full = Array2::<f64>::zeros((p_total, p_total));
+                full.slice_mut(ndarray::s![offset..offset + p_mean, offset..offset + p_mean])
+                    .assign(&mean_gram);
+                full
+            },
+        )
     } else {
         None
     };
@@ -353,8 +373,13 @@ fn summary_smooth_terms(
     // that is the only thing handed over. Both reference-distribution inputs
     // (`wald_residual_degrees_of_freedom`, `wald_scale_is_estimated`) are read
     // off the fit inside that walk, which is where `fd998d957` put them.
-    let rows =
-        gam_solve::estimate::smooth_term_summary_rows(&design, spec, fit, whitening_gram_full);
+    let rows = gam_solve::estimate::smooth_term_summary_rows_after(
+        &design,
+        spec,
+        fit,
+        whitening_gram_full,
+        prologue,
+    )?;
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
@@ -365,6 +390,93 @@ fn summary_smooth_terms(
             p_value: row.pvalue,
         })
         .collect())
+}
+
+/// The leading time-basis columns and penalties of the fit block the covariate
+/// design shares, or `BlockPrologue::NONE` when the design is a block of its
+/// own.
+///
+/// A single-cause transformation or Weibull survival fit stacks one predictor
+/// `[time basis | covariates]`: the time columns at `0..p_time`, then the
+/// covariate design, with the time penalties first and then the covariate
+/// penalties `covariate_penalty_blocks` admits, in design order
+/// (`fit_orchestration::fit`). The saved spec replays only the covariate
+/// design, so its smooths start `p_time` columns and the time-penalty count
+/// into that block. Indexing from zero instead tested the time basis under the
+/// covariate smooths' names. The prologue is read off the fit block's widths,
+/// and it is only valid when every design penalty is one the fit carries; a
+/// covariate penalty the fit left out (a non-zero prior mean) would shift every
+/// later penalty, so that refuses by name. Every other family keeps the strict
+/// check that the design is the whole block.
+fn shared_time_block_prologue(
+    model: &FittedModel,
+    fit: &UnifiedFitResult,
+    design: &gam_terms::smooth::TermCollectionDesign,
+) -> Result<gam_solve::estimate::BlockPrologue, String> {
+    let payload = model.payload();
+    let FittedFamily::Survival {
+        survival_likelihood,
+        ..
+    } = &payload.family_state
+    else {
+        return Ok(gam_solve::estimate::BlockPrologue::NONE);
+    };
+    let likelihood = survival_likelihood
+        .as_deref()
+        .or(payload.survival_likelihood.as_deref())
+        .map(str::to_ascii_lowercase);
+    let shares_time_block = matches!(
+        likelihood.as_deref(),
+        Some("transformation" | "royston-parmar" | "weibull")
+    );
+    if !shares_time_block || payload.survival_cause_count.is_some_and(|count| count > 1) {
+        return Ok(gam_solve::estimate::BlockPrologue::NONE);
+    }
+    let Some(primary) = fit.primary_predictor_block() else {
+        return Err("the survival fit records no predictor block, so its covariate smooths \
+                    cannot be located in the fit"
+            .to_string());
+    };
+    let (block_columns, block_penalties) = match primary.block {
+        Some(block) => (block.beta.len(), block.lambdas.len()),
+        None => (fit.beta.len(), fit.lambdas.len()),
+    };
+    let p_cov = design.design.ncols();
+    let time_columns = block_columns
+        .checked_sub(p_cov)
+        .filter(|&columns| columns > 0)
+        .ok_or_else(|| {
+            format!(
+                "the survival fit's predictor block has {block_columns} coefficients, too few \
+                 for a time basis ahead of the {p_cov}-column covariate design, so its smooths \
+                 cannot be located in the fit"
+            )
+        })?;
+    let admitted = crate::survival::covariate_penalty_blocks(
+        &design.penalties,
+        &design.nullspace_dims,
+        p_cov,
+        0,
+    )
+    .len();
+    if admitted != design.penalties.len() {
+        return Err(format!(
+            "the survival fit penalizes {admitted} of the covariate design's {} penalty blocks, \
+             so the saved smoothing parameters cannot be matched to the design's smooths",
+            design.penalties.len()
+        ));
+    }
+    let time_penalties = block_penalties.checked_sub(admitted).ok_or_else(|| {
+        format!(
+            "the survival fit's predictor block has {block_penalties} smoothing parameters, \
+             fewer than the covariate design's {admitted} penalty blocks; the saved smoothing \
+             parameters index a different penalty layout. Refit the model."
+        )
+    })?;
+    Ok(gam_solve::estimate::BlockPrologue {
+        columns: time_columns,
+        penalties: time_penalties,
+    })
 }
 
 /// Read the fitted κ̂ off every `curv(...)` constant-curvature smooth in the

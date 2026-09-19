@@ -757,8 +757,9 @@ fn posterior_predict_multinomial_pyfunc<'py>(
 
 /// Wood rank-truncated Wald smooth-significance table for a saved multinomial
 /// model (#1101). Returns a list of dicts, one per `(active class, smooth term)`:
-/// `class`, `term`, `edf`, `ref_df`, `statistic`, `p_value`. Empty when the
-/// model has no smooth terms or no stored covariance.
+/// `class`, `term`, `edf`, `ref_df`, `statistic`, `p_value`, `unavailable`.
+/// A row whose test could not be formed has `None` in the four numeric keys
+/// and the reason's code in `unavailable` (otherwise `None`).
 #[pyfunction(signature = (model_bytes))]
 fn multinomial_smooth_significance_pyfunc<'py>(
     py: Python<'py>,
@@ -766,19 +767,61 @@ fn multinomial_smooth_significance_pyfunc<'py>(
 ) -> PyResult<Py<pyo3::types::PyList>> {
     let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
         .map_err(estimation_error_to_pyerr)?;
-    let rows = envelope.saved.smooth_significance();
     let list = pyo3::types::PyList::empty(py);
-    for r in rows {
+    for r in envelope.saved.smooth_significance() {
         let row = PyDict::new(py);
         row.set_item("class", r.class_label)?;
         row.set_item("term", r.term_label)?;
-        row.set_item("edf", r.edf)?;
-        row.set_item("ref_df", r.ref_df)?;
-        row.set_item("statistic", r.statistic)?;
-        row.set_item("p_value", r.p_value)?;
+        set_multinomial_wald_test_items(&row, &r.test)?;
         list.append(row)?;
     }
     Ok(list.unbind())
+}
+
+/// Joint (all-classes) Wood smooth-significance table for a saved multinomial
+/// model: one dict per smooth term with `term`, `edf`, `ref_df`, `statistic`,
+/// `p_value`, `unavailable`, keyed exactly like
+/// `multinomial_smooth_significance_pyfunc` minus `class`.
+#[pyfunction(signature = (model_bytes))]
+fn multinomial_joint_smooth_significance_pyfunc<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+) -> PyResult<Py<pyo3::types::PyList>> {
+    let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
+        .map_err(estimation_error_to_pyerr)?;
+    let list = pyo3::types::PyList::empty(py);
+    for r in envelope.saved.joint_smooth_significance() {
+        let row = PyDict::new(py);
+        row.set_item("term", r.term_label)?;
+        set_multinomial_wald_test_items(&row, &r.test)?;
+        list.append(row)?;
+    }
+    Ok(list.unbind())
+}
+
+fn set_multinomial_wald_test_items(
+    row: &Bound<'_, PyDict>,
+    test: &Result<
+        gam::families::multinomial::MultinomialWaldTest,
+        gam::families::multinomial::MultinomialSmoothTestUnavailable,
+    >,
+) -> PyResult<()> {
+    match test {
+        Ok(test) => {
+            row.set_item("edf", test.edf)?;
+            row.set_item("ref_df", test.ref_df)?;
+            row.set_item("statistic", test.statistic)?;
+            row.set_item("p_value", test.p_value)?;
+            row.set_item("unavailable", row.py().None())?;
+        }
+        Err(reason) => {
+            for key in ["edf", "ref_df", "statistic", "p_value"] {
+                row.set_item(key, row.py().None())?;
+            }
+            row.set_item("unavailable", reason.code())?;
+        }
+    }
+    Ok(())
 }
 
 /// Render the summary of a saved multinomial model through

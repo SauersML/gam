@@ -3326,6 +3326,19 @@ pub struct FittedBlock {
     pub lambdas: Array1<f64>,
 }
 
+/// The mean predictor's block and where it starts in a fit's flat coefficient
+/// and penalty layouts (see [`UnifiedFitResult::primary_predictor_block`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PrimaryPredictorBlock<'a> {
+    /// The block itself; `None` for a fit that records no blocks, whose flat
+    /// layout is the single predictor's.
+    pub block: Option<&'a FittedBlock>,
+    /// Number of flat coefficients belonging to the blocks before it.
+    pub coefficient_offset: usize,
+    /// Number of flat smoothing parameters belonging to the blocks before it.
+    pub penalty_offset: usize,
+}
+
 /// Owned diagonal working-set evidence at convergence.
 ///
 /// This evidence is distinct from coefficient geometry: Exact-Newton and
@@ -5984,6 +5997,52 @@ impl UnifiedFitResult {
     /// Find a block by role.
     pub fn block_by_role(&self, role: BlockRole) -> Option<&FittedBlock> {
         self.blocks.iter().find(|b| b.role == role)
+    }
+
+    /// The block a single-predictor term collection describes, with its place
+    /// in the flat layouts.
+    ///
+    /// A saved model persists ONE covariate term spec, the mean predictor's; a
+    /// multi-block fit stores every block's coefficients and smoothing
+    /// parameters concatenated in block order (a validated invariant of this
+    /// type). The mean predictor is the `Mean` block when the fit has one, the
+    /// `Location` block of a location-scale (or marginal-slope) fit, and the
+    /// `Threshold` block of a location-scale survival fit. Anything reading
+    /// that spec's terms out of `beta`, the covariance, `lambdas` or the
+    /// per-penalty traces must shift by the widths of the blocks before it: a
+    /// latent survival fit opens with its time-transform block, so an unshifted
+    /// read takes the time block's coefficients for the mean smooths.
+    ///
+    /// `None` when the fit has blocks but none of those roles, so no block is
+    /// known to be the one the spec describes.
+    pub fn primary_predictor_block(&self) -> Option<PrimaryPredictorBlock<'_>> {
+        if self.blocks.is_empty() {
+            return Some(PrimaryPredictorBlock {
+                block: None,
+                coefficient_offset: 0,
+                penalty_offset: 0,
+            });
+        }
+        let index = self
+            .blocks
+            .iter()
+            .position(|b| b.role == BlockRole::Mean)
+            .or_else(|| {
+                self.blocks
+                    .iter()
+                    .position(|b| b.role == BlockRole::Location)
+            })
+            .or_else(|| {
+                self.blocks
+                    .iter()
+                    .position(|b| b.role == BlockRole::Threshold)
+            })?;
+        let preceding = &self.blocks[..index];
+        Some(PrimaryPredictorBlock {
+            block: Some(&self.blocks[index]),
+            coefficient_offset: preceding.iter().map(|b| b.beta.len()).sum(),
+            penalty_offset: preceding.iter().map(|b| b.lambdas.len()).sum(),
+        })
     }
 
     /// Flat coefficient vector (all blocks concatenated).
