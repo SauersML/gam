@@ -591,9 +591,9 @@ pub struct FitConfig {
     /// reduces exactly to the Gaussian-identity mean fit. The whole penalized
     /// smooth + REML `λ`-selection machinery is reused via a Least
     /// Asymmetrically Weighted Squares (LAWS) outer loop. `None` defaults to
-    /// the median expectile `τ = 0.5` when the family is `"expectile"`; it is
-    /// ignored for every other family. The asymmetry may also be written inline
-    /// as `family = "expectile(0.9)"`, which fills this field at resolve time.
+    /// the median expectile `τ = 0.5` when the family is `"expectile"`; setting
+    /// it with any other family is rejected by [`FitConfig::resolve`]. The
+    /// asymmetry may also be written inline as `family = "expectile(0.9)"`.
     pub expectile_tau: Option<f64>,
     /// Cross-fitted predictive CTN, saved with an ordinary marginal-slope outcome.
     pub ctn_stage1: Option<CtnStage1Recipe>,

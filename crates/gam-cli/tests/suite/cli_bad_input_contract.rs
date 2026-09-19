@@ -120,3 +120,49 @@ fn diagnose_rejects_removed_no_op_alo_flag() {
         stderr(&output)
     );
 }
+
+#[test]
+fn expectile_tau_is_held_to_the_expectile_family_and_the_open_unit_interval() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/bug_hunt_expectile_frailty_guard.csv"
+    );
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let model = scratch.path().join("model.gam");
+    let model = model.to_str().expect("UTF-8 path");
+    let fit = |extra: &[&str]| {
+        let mut args = vec!["fit", fixture, "y ~ s(x)", "--out", model];
+        args.extend_from_slice(extra);
+        gam(&args)
+    };
+
+    // Any family but expectile — the inferred one, an explicit one, and the
+    // `--predict-noise` location-scale route — refuses the asymmetry.
+    for extra in [
+        &["--expectile-tau", "0.9"][..],
+        &["--family", "gaussian", "--expectile-tau", "0.9"],
+        &["--predict-noise", "s(x)", "--expectile-tau", "0.9"],
+    ] {
+        let output = fit(extra);
+        assert_eq!(output.status.code(), Some(1), "{extra:?}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("expectile_tau = 0.9 requires family = \"expectile\""),
+            "{extra:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    // An out-of-range asymmetry is refused while parsing the flag.
+    for tau in ["0", "1", "1.5"] {
+        let output = fit(&["--family", "expectile", "--expectile-tau", tau]);
+        assert!(!output.status.success(), "tau={tau}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("in (0, 1)"),
+            "tau={tau}: {}",
+            stderr(&output)
+        );
+    }
+
+    let expectile = fit(&["--family", "expectile", "--expectile-tau", "0.9"]);
+    assert!(expectile.status.success(), "{}", stderr(&expectile));
+}

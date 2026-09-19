@@ -151,9 +151,6 @@ pub(crate) fn run_fit_multinomial(
     // honored by the shared driver; offsets and the other config fields the
     // softmax family cannot consume are rejected with a typed error inside
     // `fit_penalized_multinomial_formula`, shared with the Python surface.
-    if fit_config.expectile_tau.is_some() {
-        return Err("--expectile-tau requires --family expectile".to_string());
-    }
     let Some(out) = args.out.as_ref() else {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),

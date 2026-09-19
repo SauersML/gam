@@ -839,8 +839,9 @@ def fit(
         the shared request field ``negative_binomial_theta``.
     expectile_tau:
         Optional target in the open interval ``(0, 1)`` for
-        ``family="expectile"``. This is the Python spelling of CLI
-        ``--expectile-tau`` and the shared request field ``expectile_tau``.
+        ``family="expectile"``; passing it with any other family raises.
+        This is the Python spelling of CLI ``--expectile-tau`` and the shared
+        request field ``expectile_tau``.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:

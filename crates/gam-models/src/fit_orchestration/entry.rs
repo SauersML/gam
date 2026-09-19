@@ -205,57 +205,14 @@ pub(crate) fn resolved_resource_policy(
 /// Parse, materialize, and fit a model in one call.
 /// Resolve the expectile asymmetry `τ` requested by `config`, if any.
 ///
-/// Returns `Ok(Some(τ))` when `config.family` is `"expectile"` (optionally with
-/// an inline asymmetry, `"expectile(0.9)"`), `Ok(None)` for every other family,
-/// and `Err` when an expectile request carries an out-of-range `τ`. The inline
-/// form takes precedence over the explicit [`FitConfig::expectile_tau`] field
-/// only when both are present and disagree is rejected as a contradiction; when
-/// neither pins `τ`, the median expectile `τ = 0.5` (the ordinary mean fit) is
-/// the default.
+/// Thin typed-error wrapper over [`FitConfig::resolved_expectile_tau`], the one
+/// rule shared with [`FitConfig::resolve`]: `Some(τ)` for the expectile family,
+/// `None` for every other family, and `Err` for an out-of-range `τ` or an
+/// `expectile_tau` given with a non-expectile family.
 pub(crate) fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowError> {
-    let Some(raw) = config.family.as_deref() else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower == "expectile" || lower.starts_with("expectile(")) {
-        return Ok(None);
-    }
-    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    // Optional inline asymmetry: `expectile(0.9)`.
-    let inline_tau = if let Some(rest) = lower.strip_prefix("expectile(") {
-        let inner = rest.strip_suffix(')').ok_or_else(|| {
-            invalid(format!(
-                "expectile family asymmetry must be written as `expectile(τ)`; got `{trimmed}`"
-            ))
-        })?;
-        let value: f64 = inner.trim().parse().map_err(|_| {
-            invalid(format!(
-                "expectile asymmetry `{}` is not a finite number",
-                inner.trim()
-            ))
-        })?;
-        Some(value)
-    } else {
-        None
-    };
-    let tau = match (inline_tau, config.expectile_tau) {
-        (Some(a), Some(b)) if (a - b).abs() > 0.0 => {
-            return Err(invalid(format!(
-                "expectile asymmetry given both inline (`expectile({a})`) and via expectile_tau \
-                 ({b}); supply exactly one"
-            )));
-        }
-        (Some(a), _) => a,
-        (None, Some(b)) => b,
-        (None, None) => 0.5,
-    };
-    if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
-        return Err(invalid(format!(
-            "expectile asymmetry τ must be finite and strictly in (0, 1); got {tau}"
-        )));
-    }
-    Ok(Some(tau))
+    config
+        .resolved_expectile_tau()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })
 }
 
 /// Per-row asymmetric LAWS weight `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, scaled
@@ -1561,6 +1518,44 @@ fn try_deterministic_gaussian_standard_fit(
     deterministic_gaussian_standard_fit(request, Some(boundary))
 }
 
+/// The training table with every zero-weight row removed.
+///
+/// A prior weight of zero removes the row from the likelihood, and it must
+/// remove it from everything else the fit derives from the rows as well —
+/// knots, covariate ranges, identifiability constraints, standardization,
+/// factor levels, column kinds — so that weight zero is exactly row deletion.
+/// Every fitting entry point runs its data through this one seam. The table
+/// is borrowed unchanged when no weight column is configured or no weight is
+/// exactly zero; rows with a missing or negative weight are kept so the weight
+/// validator still reports them.
+pub fn drop_zero_weight_rows<'a>(
+    data: &'a Dataset,
+    config: &FitConfig,
+) -> Result<std::borrow::Cow<'a, Dataset>, WorkflowError> {
+    use std::borrow::Cow;
+    let Some(name) = config.weight_column.as_deref().map(str::trim) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let Some(column) = data.headers.iter().position(|header| header == name) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let weights = data.values.column(column);
+    let keep: Vec<usize> = (0..weights.len()).filter(|&row| weights[row] != 0.0).collect();
+    if keep.len() == weights.len() {
+        return Ok(Cow::Borrowed(data));
+    }
+    if keep.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
+        });
+    }
+    data.select_rows(&keep)
+        .map(Cow::Owned)
+        .map_err(|error| WorkflowError::InvalidConfig {
+            reason: error.to_string(),
+        })
+}
+
 pub fn fit_from_formula(
     formula: &str,
     data: &Dataset,
@@ -1589,6 +1584,7 @@ pub fn fit_from_formula_with_notes(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    let data = &*drop_zero_weight_rows(data, config)?;
     let automatic = expand_automatic_fit_formula(formula, data, config)?;
     if automatic.notes.is_empty() {
         return fit_expanded_formula_with_notes(formula, data, config);

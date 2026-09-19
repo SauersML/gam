@@ -185,6 +185,7 @@ impl FitConfig {
             let value = value.trim();
             (!value.is_empty()).then(|| value.to_string())
         });
+        self.resolved_expectile_tau()?;
         self.offset_column = normalize_optional_column(self.offset_column, "offset_column")?;
         self.noise_offset_column =
             normalize_optional_column(self.noise_offset_column, "noise_offset_column")?;
@@ -293,6 +294,63 @@ impl FitConfig {
         Ok(self)
     }
 
+    /// The expectile asymmetry `τ` this config requests, if any.
+    ///
+    /// `Ok(Some(τ))` when `family` is `"expectile"` or `"expectile(τ)"`;
+    /// `Ok(None)` for every other family with `expectile_tau` unset. The
+    /// asymmetry is a parameter of the expectile family and never selects it,
+    /// so `expectile_tau` with any other family (including an inferred one) is
+    /// an error rather than an ignored field. An inline `τ` and an explicit
+    /// `expectile_tau` must agree; neither given is the median expectile
+    /// `τ = 0.5`. `τ` must be finite and strictly inside `(0, 1)`.
+    pub fn resolved_expectile_tau(&self) -> Result<Option<f64>, String> {
+        let family = self.family.as_deref().map(str::trim).unwrap_or("");
+        let lower = family.to_ascii_lowercase();
+        if !(lower == "expectile" || lower.starts_with("expectile(")) {
+            return match self.expectile_tau {
+                None => Ok(None),
+                Some(tau) => Err(format!(
+                    "expectile_tau = {tau} requires family = \"expectile\"; got family = {}",
+                    self.family
+                        .as_deref()
+                        .map_or_else(|| "auto".to_string(), |family| format!("\"{family}\""))
+                )),
+            };
+        }
+        // Optional inline asymmetry: `expectile(0.9)`.
+        let inline_tau = match lower.strip_prefix("expectile(") {
+            Some(rest) => {
+                let inner = rest.strip_suffix(')').ok_or_else(|| {
+                    format!(
+                        "expectile family asymmetry must be written as `expectile(τ)`; got `{family}`"
+                    )
+                })?;
+                let value: f64 = inner.trim().parse().map_err(|_| {
+                    format!("expectile asymmetry `{}` is not a finite number", inner.trim())
+                })?;
+                Some(value)
+            }
+            None => None,
+        };
+        let tau = match (inline_tau, self.expectile_tau) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(format!(
+                    "expectile asymmetry given both inline (`expectile({a})`) and via \
+                     expectile_tau ({b}); supply exactly one"
+                ));
+            }
+            (Some(a), _) => a,
+            (None, Some(b)) => b,
+            (None, None) => 0.5,
+        };
+        if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+            return Err(format!(
+                "expectile asymmetry τ must be finite and strictly in (0, 1); got {tau}"
+            ));
+        }
+        Ok(Some(tau))
+    }
+
     /// The survival likelihood mode this config resolves to for a `Surv(...)`
     /// fit.
     ///
@@ -332,6 +390,35 @@ mod tests {
             Some("transformation")
         );
         assert_eq!(resolved.baseline_target, "linear");
+    }
+
+    /// `expectile_tau` is a parameter of the expectile family and never selects
+    /// it: with any other family it is refused rather than ignored, and `τ` is
+    /// held to the open unit interval (pyGAM audit F10).
+    #[test]
+    fn resolve_holds_expectile_tau_to_the_expectile_family_and_the_open_unit_interval() {
+        let config = |family: Option<&str>, tau: Option<f64>| FitConfig {
+            family: family.map(str::to_string),
+            expectile_tau: tau,
+            ..FitConfig::default()
+        };
+        for family in [None, Some("auto"), Some("gaussian"), Some("poisson")] {
+            let error = config(family, Some(0.9)).resolve().unwrap_err();
+            assert!(error.contains("expectile_tau"), "{family:?}: {error}");
+            assert!(config(family, None).resolve().is_ok());
+        }
+        for tau in [0.0, 1.0, 1.5, -0.1, f64::NAN, f64::INFINITY] {
+            let error = config(Some("expectile"), Some(tau)).resolve().unwrap_err();
+            assert!(error.contains("strictly in (0, 1)"), "{tau}: {error}");
+        }
+        assert!(config(Some("expectile(1.5)"), None).resolve().is_err());
+        assert!(config(Some("expectile(0.9)"), Some(0.8)).resolve().is_err());
+        let resolved = config(Some("Expectile"), Some(0.9)).resolve().unwrap();
+        assert_eq!(resolved.resolved_expectile_tau(), Ok(Some(0.9)));
+        let inline = config(Some("expectile(0.25)"), None).resolve().unwrap();
+        assert_eq!(inline.resolved_expectile_tau(), Ok(Some(0.25)));
+        let median = config(Some("expectile"), None).resolve().unwrap();
+        assert_eq!(median.resolved_expectile_tau(), Ok(Some(0.5)));
     }
 
     #[test]

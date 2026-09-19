@@ -1532,6 +1532,7 @@ pub fn fit_formula_to_payload(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
+    let dataset = &*crate::fit_orchestration::drop_zero_weight_rows(dataset, fit_config)?;
     let automatic = crate::fit_orchestration::expand_automatic_fit_formula(
         &formula, dataset, fit_config,
     )?;
