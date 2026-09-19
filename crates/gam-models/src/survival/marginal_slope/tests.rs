@@ -9010,13 +9010,17 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
 /// says `device_selected=false`.
 #[test]
 fn rigid_row_jet_device_admission_and_parity_2900() {
-    use crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_device_selected;
     use crate::row_kernel::{RowKernel, RowSet, build_row_kernel_cache};
     use gam_gpu::policy::GpuDispatchPolicy;
+    let admitted = |n: usize| {
+        rigid_row_jet_decision::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(n)
+            .expect("survival row-jet admission must not fault")
+            .use_gpu
+    };
 
     let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N;
     assert!(
-        !survival_rigid_row_vgh_device_selected(floor - 1).expect("admission below the floor"),
+        !admitted(floor - 1),
         "no reachable policy admits a fused batch below {floor} rows"
     );
     let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
@@ -9039,8 +9043,7 @@ fn rigid_row_jet_device_admission_and_parity_2900() {
         block_states,
     );
 
-    let selected =
-        survival_rigid_row_vgh_device_selected(n).expect("survival row-jet admission must not fault");
+    let selected = admitted(n);
     assert_eq!(
         selected,
         runtime.is_some(),
@@ -9078,6 +9081,39 @@ fn rigid_row_jet_device_admission_and_parity_2900() {
         "survival row jet: batched channel differs from the per-row program by {worst_gap:e} \
          (relative) at row {worst_row}, device_selected={selected}"
     );
+}
+
+/// gam#3000 slice 2: the device row jet declares the four-primary Gaussian
+/// frame only, and each frame's own declarations say what it asks for. A
+/// follow-up-varying or anchored frame is outside the declaration at every row
+/// count, so it is decided on the CPU with the missing capability named.
+#[test]
+fn rigid_row_jet_capability_follows_the_frame_declarations_3000() {
+    use crate::gpu_kernels::survival_rowjet::SURVIVAL_ROWJET_CAPABILITY;
+
+    let gaussian = rigid_row_jet_model::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>();
+    assert_eq!(SURVIVAL_ROWJET_CAPABILITY.missing_for(&gaussian), None);
+    let follow_up = rigid_row_jet_model::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>();
+    assert_eq!(
+        SURVIVAL_ROWJET_CAPABILITY.missing_for(&follow_up),
+        Some("the follow-up-varying slope frame")
+    );
+    let anchored = rigid_row_jet_model::<STATIC_SLOPE_PRIMARIES, AnchoredStaticSlopeGeometry>();
+    assert_eq!(
+        SURVIVAL_ROWJET_CAPABILITY.missing_for(&anchored),
+        Some("the anchored lowering of a declared latent law")
+    );
+    for n in [0, 10_000_000] {
+        for decision in [
+            rigid_row_jet_decision::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>(n),
+            rigid_row_jet_decision::<STATIC_SLOPE_PRIMARIES, AnchoredStaticSlopeGeometry>(n),
+        ] {
+            let decision =
+                decision.expect("auto and off refuse no model; required is never set here");
+            assert!(!decision.use_gpu, "n={n}: {decision:?}");
+            assert!(decision.missing_capability.is_some(), "n={n}: {decision:?}");
+        }
+    }
 }
 
 /// An equal-mass law at `m` standard-normal quantiles: the midpoint rule on the
