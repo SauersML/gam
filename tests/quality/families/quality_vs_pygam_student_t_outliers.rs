@@ -22,7 +22,9 @@ use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, QualityPair, run_python};
 use gam::types::ResponseFamily;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use ndarray::Array2;
 
 const N: usize = 300;
@@ -90,7 +92,10 @@ emit("pygam_pred", pred)
             panic!("a Student-t location smooth must be a standard GAM fit");
         };
 
-        let edf = fit.fit.edf_total().expect("a converged fit reports its EDF");
+        let edf = fit
+            .fit
+            .edf_total()
+            .expect("a converged fit reports its EDF");
         let (sigma, nu) = match fit.fit.likelihood_family.as_ref().map(|f| &f.response) {
             Some(ResponseFamily::StudentT { sigma, nu }) => (*sigma, *nu),
             other => panic!("fold {k}: Student-t fit must carry (sigma, nu); got {other:?}"),
