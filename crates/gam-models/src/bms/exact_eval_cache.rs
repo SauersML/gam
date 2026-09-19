@@ -186,7 +186,7 @@ pub(super) fn decide_row_primary_hessian_cache(
 ///   over the partition's most cells per row, and its per-row flex third
 ///   tensors (two `r×r` f64 per row);
 /// - on the rigid path, three of each of its own store's per-row third and
-///   fourth rigid tensors (8 and 16 f64 per row);
+///   fourth rigid tensor slots (a lazy `Result` of 8 and of 16 f64 per row);
 /// - the row-intercept warm starts: two `u64` and a predictor slot per row,
 ///   each predictor two `r`-vectors of f64;
 /// - the block states' linear predictors, `n` f64 per block;
@@ -234,7 +234,9 @@ pub(super) fn outer_search_working_set_bytes(
     let rigid_tensors = if flex_active {
         0
     } else {
-        3 * n.saturating_mul((8 + 16) * f64_bytes)
+        let row_slots = std::mem::size_of::<RigidRowTensorSlot<[[[f64; 2]; 2]; 2]>>()
+            + std::mem::size_of::<RigidRowTensorSlot<[[[[f64; 2]; 2]; 2]; 2]>>();
+        3 * n.saturating_mul(row_slots as u64)
     };
     let predictor_slot = std::mem::size_of::<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>()
         as u64
@@ -524,6 +526,10 @@ pub(super) struct FlexAxisFourthRowTensors {
     pub(super) gg: Array2<f64>,
 }
 
+/// One row's lazily built rigid third- or fourth-derivative tensor
+/// (`rigid_third_full`, `rigid_fourth_full`).
+pub(super) type RigidRowTensorSlot<T> = gam_runtime::resource::RayonSafeOnce<Result<T, String>>;
+
 /// Lazy derivative-channel cache for one canonical BMS FLEX row program.
 ///
 /// The row has one semantic program identity, while third- and fourth-order
@@ -597,22 +603,27 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// for the standard-normal measure) run at most once per row per cache
     /// lifetime; per-axis callers reduce to a 2×2 [`contract_third_full`].
     ///
-    /// Stored as `Result` because the build is fallible (per-row jet may
-    /// surface a non-finite value). `RayonSafeOnce` keeps lazy initialization
-    /// safe when the first caller is already inside a Rayon row pass; failure
-    /// is sticky and propagated identically to every caller.
+    /// Two-level lazy, like `flex_row_program_derivatives`: the outer slot
+    /// allocates one [`RigidRowTensorSlot`] per row on first touch, and each
+    /// row's tensor is built serially by the first reader of that row. A row
+    /// pass therefore builds each row it reads exactly once, inside its own
+    /// row partition, and a subsampled pass builds only the rows it samples.
+    /// Stored per row as `Result` because the build is fallible (a per-row jet
+    /// may surface a non-finite value); a row's failure is sticky and
+    /// propagated identically to every reader of that row.
     pub(super) rigid_third_full:
-        gam_runtime::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+        gam_runtime::resource::RayonSafeOnce<Vec<RigidRowTensorSlot<[[[f64; 2]; 2]; 2]>>>,
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
-    /// the second-order analogue of `rigid_third_full`. The outer-Hessian
-    /// build at large-scale shape evaluates `rigid_row_fourth_contracted` for
+    /// the second-order analogue of `rigid_third_full`, in the same per-row
+    /// slots. The outer-Hessian build at large-scale shape evaluates
+    /// `rigid_row_fourth_contracted` for
     /// every (ψ-axis-i, ψ-axis-j) pair: `(rank² + rank)/2 ≈ 528` pairs at
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
     pub(super) rigid_fourth_full:
-        gam_runtime::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+        gam_runtime::resource::RayonSafeOnce<Vec<RigidRowTensorSlot<[[[[f64; 2]; 2]; 2]; 2]>>>,
 
     /// One lazy slot per canonical FLEX row program. Each slot owns separate
     /// third/fourth channel cells, preserving order-specific work while making

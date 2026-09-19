@@ -1908,31 +1908,35 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// Look up the per-row rigid uncontracted third-derivative tensor from
-    /// the cache, populating it lazily on first access via one parallel
-    /// row pass. Used by `row_primary_third_contracted` so the
-    /// build-psi-hyper-coords sweep over 32 ψ-axes pays the heavy empirical
-    /// jet at most once per row.
+    /// the cache, building that row's tensor on its first access. Used by
+    /// `row_primary_third_contracted` so the build-psi-hyper-coords sweep over
+    /// 32 ψ-axes pays the heavy empirical jet at most once per row.
     ///
-    /// Concurrent first callers may redundantly run the parallel build; the
-    /// first published value wins and every subsequent caller observes the
-    /// same stored result. A failed build is captured in the `Err` arm of the
-    /// stored `Result` and propagates identically on every subsequent call.
+    /// Readers are row passes that already run in parallel over rows, so a row
+    /// is built serially by the reader that owns it: no reader starts a nested
+    /// full-`n` build. That was the old contract, and `RayonSafeOnce` lets
+    /// every concurrent first caller run its own initializer, so each worker
+    /// that entered a row fold before the first publish rebuilt the whole
+    /// table: up to one full-`n` jet pass per pool thread, the extra work
+    /// growing with the thread count. A failed row's `Err` is stored in that
+    /// row's slot and propagates identically to every reader of the row.
     pub(super) fn rigid_third_full_cached<'a>(
         &self,
         block_states: &[ParameterBlockState],
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Result<&'a [[[f64; 2]; 2]; 2], String> {
-        let stored = cache.rigid_third_full.get_or_compute(|| {
-            self.build_rigid_full_tensor_table(block_states, |r, marginal, slope| {
-                self.rigid_row_third_full(r, marginal, slope)
-            })
-        });
-        let table = stored.as_ref().map_err(|err| err.clone())?;
-        Ok(&table[row])
+        self.rigid_full_tensor_for_row(
+            &cache.rigid_third_full,
+            block_states,
+            row,
+            |marginal, slope| self.rigid_row_third_full(row, marginal, slope),
+        )
     }
 
-    /// Build the per-row rigid full-derivative tensor table over all `n` rows.
+    /// One row of a per-row rigid full-derivative tensor table: allocate the
+    /// table's row slots on first touch, then build and store this row's
+    /// tensor on the row's first read.
     ///
     /// The standard-normal arm of `row_fn` is a compile-time row-program
     /// lowering that emits exactly the requested tensor order; empirical-grid
@@ -1940,29 +1944,32 @@ impl BernoulliMarginalSlopeFamily {
     /// Keeping the order choice outside the row loop avoids both the obsolete
     /// dense `Tower4` channels and materializing a fourth tensor while building
     /// the third-order cache.
-    fn build_rigid_full_tensor_table<T, R>(
+    fn rigid_full_tensor_for_row<'a, T, R>(
         &self,
+        table: &'a gam_runtime::resource::RayonSafeOnce<Vec<RigidRowTensorSlot<T>>>,
         block_states: &[ParameterBlockState],
+        row: usize,
         row_fn: R,
-    ) -> Result<Vec<T>, String>
+    ) -> Result<&'a T, String>
     where
-        T: Copy + Send,
-        R: Fn(usize, BernoulliMarginalLinkMap, f64) -> Result<T, String> + Sync,
+        R: FnOnce(BernoulliMarginalLinkMap, f64) -> Result<T, String>,
     {
-        let n = self.y.len();
-        let marginal_eta = &block_states[0].eta;
-        let slope_eta = &block_states[1].eta;
-        (0..n)
-            .into_par_iter()
-            .map(|r| {
-                let marginal = self.marginal_link_map(marginal_eta[r])?;
-                row_fn(r, marginal, slope_eta[r])
+        let slots = table.get_or_compute(|| {
+            (0..self.y.len())
+                .map(|_| RigidRowTensorSlot::new())
+                .collect::<Vec<_>>()
+        });
+        slots[row]
+            .get_or_compute(|| {
+                let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                row_fn(marginal, block_states[1].eta[row])
             })
-            .collect::<Result<Vec<_>, String>>()
+            .as_ref()
+            .map_err(|err| err.clone())
     }
 
     /// Look up the per-row rigid uncontracted fourth-derivative tensor.
-    /// Same lazy-build pattern as `rigid_third_full_cached`, but serves the
+    /// Same per-row lazy build as `rigid_third_full_cached`, but serves the
     /// outer-Hessian per-pair pullback path: at rank=32 ψ-axes the sweep
     /// touches `(rank² + rank)/2 = 528` (u, v) pairs, all reading the same
     /// per-row tensor. With this cache the empirical-grid 8-direction jet
@@ -1974,13 +1981,12 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Result<&'a [[[[f64; 2]; 2]; 2]; 2], String> {
-        let stored = cache.rigid_fourth_full.get_or_compute(|| {
-            self.build_rigid_full_tensor_table(block_states, |r, marginal, slope| {
-                self.rigid_row_fourth_full(r, marginal, slope)
-            })
-        });
-        let table = stored.as_ref().map_err(|err| err.clone())?;
-        Ok(&table[row])
+        self.rigid_full_tensor_for_row(
+            &cache.rigid_fourth_full,
+            block_states,
+            row,
+            |marginal, slope| self.rigid_row_fourth_full(row, marginal, slope),
+        )
     }
 
     /// Return the lazily-built row-cell-moments bundle at `required_degree`
