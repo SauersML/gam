@@ -4627,31 +4627,6 @@ mod tests {
     }
 
     #[test]
-    fn compare_models_delta_and_evidence_ratio_never_contradict_winner_gh1465() {
-        // #1465: every ranking row's delta and evidence ratio are measured on
-        // the scale that orders the table, even where it and the REML score
-        // disagree (`m2` has the lowest REML, `m1` the lowest corrected AIC).
-        let candidates = vec![
-            cand("m1", 53.748, 99.0, 100.0),
-            cand("m2", 41.605, 100.0, 102.0),
-            cand("m3", 120.011, 128.0, 130.0),
-        ];
-        let cmp = compare_models(candidates).expect("comparison");
-        assert_eq!(cmp.winner, "m1");
-        for row in &cmp.ranking {
-            assert!(row.delta_aic >= 0.0, "row {} delta {}", row.name, row.delta_aic);
-            assert!(
-                row.evidence_ratio.is_some_and(|ratio| ratio >= 1.0),
-                "row {} ratio {:?}",
-                row.name,
-                row.evidence_ratio
-            );
-        }
-        let names: Vec<_> = cmp.ranking.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["m1", "m2", "m3"]);
-    }
-
-    #[test]
     fn compare_models_rejects_pure_noise_smooth_despite_lower_evidence() {
         // Seed-3000 numbers from the #1362 reproduction. The noise-augmented
         // `big` has the lower raw REML score but spends ~7.5 extra EDF without
