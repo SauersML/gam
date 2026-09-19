@@ -6,7 +6,16 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence, cast, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Protocol,
+    Sequence,
+    TypeVar,
+    cast,
+    overload,
+    runtime_checkable,
+)
 
 import numpy as np
 import torch
@@ -23,6 +32,8 @@ from .._penalty_bridge import (
 )
 from .._select_topology import TopologyAutoSelector
 from ._coerce import from_numpy_like, to_numpy_f64
+
+_LossT = TypeVar("_LossT")
 
 
 @runtime_checkable
@@ -61,7 +72,9 @@ class _RustPenaltyFn(torch.autograd.Function):
         latents_json: str,
         penalties_json: str,
     ) -> torch.Tensor:
-        value = _call_rust_value_grad(target, rho, latents_json, penalties_json)[0]
+        value: torch.Tensor = _call_rust_value_grad(
+            target, rho, latents_json, penalties_json
+        )[0]
         ctx.save_for_backward(target, rho)
         ctx.latents_json = latents_json
         ctx.penalties_json = penalties_json
@@ -99,7 +112,7 @@ class _IsometryPenaltyFn(torch.autograd.Function):
             jacobian = basis.unsqueeze(0).expand(target.shape[0], -1, -1)
         else:
             jacobian = basis
-        value = _call_rust_value_grad(
+        value: torch.Tensor = _call_rust_value_grad(
             target,
             rho,
             latents_json,
@@ -620,6 +633,8 @@ class OrderedBetaBernoulliPenalty(_RustPenaltyModule):
 class IvaeRidgeMeanGauge(_RustPenaltyModule):
     """iVAE conditional-mean ridge gauge on latent coordinates."""
 
+    aux: torch.Tensor
+
     def __init__(
         self,
         aux: Any,
@@ -692,6 +707,9 @@ class SmoothThresholdPenalty(_RustPenaltyModule):
         the outer loop.
     """
 
+    thresholds: torch.Tensor
+    log_threshold: torch.Tensor
+
     def __init__(
         self,
         thresholds: torch.Tensor | Sequence[float],
@@ -734,7 +752,8 @@ class SmoothThresholdPenalty(_RustPenaltyModule):
     def gate(self, z: torch.Tensor) -> torch.Tensor:
         """Apply ``z·σ((z−τ)/ε)`` with its exact analytic derivative."""
         tau = self.effective_thresholds(z.dtype).to(z.device)
-        return _SmoothThresholdFn.apply(z, tau, float(self.smoothing_eps))
+        out: torch.Tensor = _SmoothThresholdFn.apply(z, tau, float(self.smoothing_eps))
+        return out
 
     def _prepare(
         self, primary: torch.Tensor, basis: torch.Tensor | None = None
@@ -784,7 +803,9 @@ class _SmoothThresholdFn(torch.autograd.Function):
         return value
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor):
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         dphi_dz, dphi_dtau = ctx.saved_tensors
         grad_z = grad_output * dphi_dz
         grad_tau = (grad_output * dphi_dtau).sum(dim=0)
@@ -806,10 +827,14 @@ class RiemannianGradientDescent(Optimizer):
         defaults = {"lr": float(lr)}
         super().__init__(params, defaults)
 
-    def step(
-        self, closure: Callable[[], torch.Tensor] | None = None
-    ) -> torch.Tensor | None:
-        loss = None
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], _LossT]) -> _LossT: ...
+
+    def step(self, closure: Callable[[], _LossT] | None = None) -> _LossT | None:
+        loss: _LossT | None = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()

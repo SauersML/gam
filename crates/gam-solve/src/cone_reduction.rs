@@ -245,8 +245,7 @@ impl ConeProperness {
 /// For a feasible set `{d : Ad ≥ b}` the recession cone is `{d : Ad ≥ 0}`, and
 /// splitting `d = Zt + Nw` with `Z` a basis of `null(A)` and `w = Ad` leaves the
 /// `w`-marginal precision as the Schur complement
-/// `M = NᵀHN − NᵀHZ(ZᵀHZ)⁻¹ZᵀHN`. This computes it WITHOUT forming `Z`, `N`, or
-/// `H⁻¹`, from the defining variational identity
+/// `M = NᵀHN − NᵀHZ(ZᵀHZ)⁻¹ZᵀHN`, from the defining variational identity
 ///
 /// ```text
 /// wᵀMw = stat{ dᵀHd : Ad = w }
@@ -254,27 +253,48 @@ impl ConeProperness {
 ///
 /// — the stationary value, which is the MINIMUM exactly when `ZᵀHZ ≻ 0` and is
 /// the algebraic Schur complement either way, so this route does not presuppose
-/// the condition the certificate above it goes on to test. Its stationarity
-/// system is the symmetric saddle point
+/// the condition the certificate above it goes on to test. The reason this
+/// module exists is that `H` is INDEFINITE, so `Σ = H⁻¹` may not be a covariance
+/// and `M = (AH⁻¹Aᵀ)⁻¹` — the identity that holds when `H ≻ 0` — cannot be
+/// evaluated by inverting `H`. Only `ZᵀHZ` is inverted, and it has to be
+/// nonsingular for `M` to exist at all.
+///
+/// The reduction exists exactly when `A` has full row rank and `H` is
+/// nonsingular on `null(A)`. Each condition is decided in its own units, and a
+/// failure refuses by naming which of the two the face broke:
+///
+/// * the thin SVD `A = UΣV₁ᵀ` must resolve all `q` singular values above its
+///   backward-error band ([`factor_singular_band`]), or the rows are dependent;
+/// * every eigenvalue of `ZᵀHZ`, for an orthonormal basis `Z` of `null(A)`, must
+///   lie outside the ambient precision's spectral rounding band
+///   ([`symmetric_spectrum_rounding_band`] of `H`), the error that forming `ZᵀHZ`
+///   through a computed `Z` can leave, since `Z`'s rounding leaks `H`'s largest
+///   curvature into it. An eigenvalue inside the band is a lineality direction
+///   without resolved curvature, which is itself impropriety.
+///
+/// With `d = V₁u + Zt` the constraint values are `w = UΣu`, so from the
+/// eigenpairs `(Λ, W)` of `ZᵀHZ`
 ///
 /// ```text
-/// [ H  Aᵀ ] [ d ]   [ 0 ]
-/// [ A  0  ] [ ν ] = [ w ],        M w = −ν
+/// M = (Σ⁻¹Uᵀ)ᵀ (V₁ᵀHV₁ − (V₁ᵀHZW) Λ⁻¹ (V₁ᵀHZW)ᵀ) (Σ⁻¹Uᵀ),
 /// ```
 ///
-/// so one solve per constraint row gives `M` exactly. That matters here: the
-/// reason this module exists is that `H` is INDEFINITE, so `Σ = H⁻¹` may not be
-/// a covariance and `M = (AH⁻¹Aᵀ)⁻¹` — the identity that holds when `H ≻ 0` —
-/// cannot be evaluated by inverting anything. The saddle system is indefinite by
-/// construction and needs no positive definiteness anywhere.
+/// symmetric by construction.
 ///
-/// The system is nonsingular exactly when `A` has full row rank and `H` is
-/// nonsingular on `null(A)`; a failed pivot therefore refuses by naming which of
-/// those two the face broke, rather than returning a matrix built on neither.
+/// gam#3008: this used to eliminate the saddle system `[[H, Aᵀ],[A, 0]]` by
+/// Gaussian elimination against a pivot floor of `1e-12·max|entry|`. The
+/// trailing pivots of that elimination are entries of `−AH⁻¹Aᵀ`, in units of
+/// `H⁻¹`, while the floor was in units of `H`. A survival time block with
+/// curvature near `4.3e6` put the floor at `4.3e-6` and its own pivots near
+/// `1/4.3e6`, so a nonsingular face was refused as singular and a certified
+/// fit's posterior moments were declined.
 pub(crate) fn reduced_cone_precision(
     hessian: ArrayView2<'_, f64>,
     constraints: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, String> {
+    use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+    use gam_linalg::roundoff::{factor_singular_band, symmetric_spectrum_rounding_band};
+
     let p = hessian.nrows();
     if hessian.ncols() != p {
         return Err(format!(
@@ -305,69 +325,130 @@ pub(crate) fn reduced_cone_precision(
              independent row basis first"
         ));
     }
-    let size = p + q;
-    let mut saddle = Array2::<f64>::zeros((size, size));
-    saddle
-        .slice_mut(ndarray::s![0..p, 0..p])
-        .assign(&hessian);
-    saddle
-        .slice_mut(ndarray::s![0..p, p..size])
-        .assign(&constraints.t());
-    saddle
-        .slice_mut(ndarray::s![p..size, 0..p])
-        .assign(&constraints);
-    if saddle.iter().any(|value| !value.is_finite()) {
+    if hessian
+        .iter()
+        .chain(constraints.iter())
+        .any(|value| !value.is_finite())
+    {
         return Err(
-            "cone reduction: the saddle system carries a non-finite entry, so neither the \
-             ambient precision nor the constraint rows can be trusted"
+            "cone reduction: the ambient precision or the constraint rows carry a non-finite \
+             entry, so neither can be trusted"
                 .to_string(),
         );
     }
-    let scale = saddle
-        .iter()
-        .fold(0.0f64, |worst, value| worst.max(value.abs()))
-        .max(1.0);
-    let floor = 1e-12 * scale;
-    let mut reduced = Array2::<f64>::zeros((q, q));
-    for column in 0..q {
-        let mut rhs = Array1::<f64>::zeros(size);
-        rhs[p + column] = 1.0;
-        let Some(solution) = symmetric_solve(&saddle, &rhs, floor) else {
-            return Err(format!(
-                "cone reduction: the saddle system [[H, Aᵀ],[A, 0]] is singular at pivot floor \
-                 {floor:.3e} while eliminating constraint row {column}. Either the {q} \
-                 constraint rows are dependent, or H is singular on null(A) — and the second \
-                 case is itself impropriety, since null(A) is the recession cone's lineality \
-                 space"
-            ));
-        };
-        for row in 0..q {
-            reduced[[row, column]] = -solution[p + row];
+    let mut symmetric = hessian.to_owned();
+    for row in 0..p {
+        for column in (row + 1)..p {
+            let averaged = 0.5 * (symmetric[[row, column]] + symmetric[[column, row]]);
+            symmetric[[row, column]] = averaged;
+            symmetric[[column, row]] = averaged;
         }
     }
-    // `M` is symmetric in exact arithmetic (it is a Schur complement of a
-    // symmetric matrix); the elimination is not symmetry preserving, so the
-    // asymmetry it leaves is measured and then removed rather than assumed
-    // absent.
-    let mut worst_asymmetry = 0.0f64;
-    for row in 0..q {
-        for column in 0..q {
-            let gap = (reduced[[row, column]] - reduced[[column, row]]).abs();
-            worst_asymmetry = worst_asymmetry.max(gap);
-        }
-    }
-    let reduced_scale = reduced
+
+    let (left_vectors, singular, right_transposed) = constraints
+        .svd(true, true)
+        .map_err(|error| format!("cone reduction: the constraint rows' SVD failed: {error}"))?;
+    let (Some(left_vectors), Some(right_transposed)) = (left_vectors, right_transposed) else {
+        return Err(
+            "cone reduction: the constraint rows' SVD returned no singular vectors".to_string(),
+        );
+    };
+    let sigma_max = singular
         .iter()
-        .fold(0.0f64, |worst, value| worst.max(value.abs()))
-        .max(1.0);
-    if worst_asymmetry > 1e-6 * reduced_scale {
+        .fold(0.0f64, |worst, value| worst.max(value.abs()));
+    let rank_band = factor_singular_band(q, p, sigma_max);
+    let resolved = singular.iter().filter(|&&value| value > rank_band).count();
+    if resolved < q {
         return Err(format!(
-            "cone reduction: the reduced precision came back asymmetric by \
-             {worst_asymmetry:.3e} against a scale of {reduced_scale:.3e}, which a Schur \
-             complement of a symmetric matrix cannot be — the saddle solve lost the face's \
-             conditioning"
+            "cone reduction: the {q} constraint rows are dependent: only {resolved} of their \
+             singular values {singular:?} are resolved above the SVD's rounding band \
+             {rank_band:.3e}, so the reduction's coordinates are not well defined; canonicalize \
+             the face to an independent row basis first"
         ));
     }
+    // `V₁`, `p × q`: an orthonormal basis of the row space.
+    let row_space = right_transposed.t().to_owned();
+    let row_curvature = row_space.t().dot(&symmetric).dot(&row_space);
+    let mut schur = Array2::<f64>::zeros((q, q));
+    for row in 0..q {
+        for column in 0..q {
+            schur[[row, column]] =
+                0.5 * (row_curvature[[row, column]] + row_curvature[[column, row]]);
+        }
+    }
+
+    let lineality_dimension = p - q;
+    if lineality_dimension > 0 {
+        // `I − V₁V₁ᵀ` is the orthogonal projector onto `null(A)`: its spectrum is
+        // `q` zeros and `p − q` ones, so the eigenvectors of its `p − q` largest
+        // eigenvalues are an orthonormal basis `Z` of the lineality space.
+        let projector = Array2::<f64>::eye(p) - row_space.dot(&row_space.t());
+        let (projector_values, projector_vectors) = projector
+            .eigh(faer::Side::Lower)
+            .map_err(|error| {
+                format!(
+                    "cone reduction: the null-space projector's eigendecomposition failed: \
+                     {error}"
+                )
+            })?;
+        let mut order: Vec<usize> = (0..p).collect();
+        order.sort_by(|&first, &second| {
+            projector_values[first].total_cmp(&projector_values[second])
+        });
+        let mut lineality_basis = Array2::<f64>::zeros((p, lineality_dimension));
+        for (target, &source) in order[q..].iter().enumerate() {
+            lineality_basis
+                .column_mut(target)
+                .assign(&projector_vectors.column(source));
+        }
+        let (ambient_values, _) = symmetric.eigh(faer::Side::Lower).map_err(|error| {
+            format!("cone reduction: the ambient precision's eigendecomposition failed: {error}")
+        })?;
+        let ambient_spectrum = ambient_values
+            .as_slice()
+            .ok_or_else(|| "cone reduction: the ambient spectrum is not contiguous".to_string())?;
+        let lineality_band = symmetric_spectrum_rounding_band(ambient_spectrum);
+        let lineality_curvature = lineality_basis.t().dot(&symmetric).dot(&lineality_basis);
+        let (lineality_values, lineality_vectors) = lineality_curvature
+            .eigh(faer::Side::Lower)
+            .map_err(|error| {
+                format!("cone reduction: ZᵀHZ's eigendecomposition failed: {error}")
+            })?;
+        if let Some(unresolved) = lineality_values
+            .iter()
+            .copied()
+            .find(|value| value.abs() <= lineality_band)
+        {
+            return Err(format!(
+                "cone reduction: H is singular on null(A): ZᵀHZ carries the eigenvalue \
+                 {unresolved:.3e}, inside the ambient precision's rounding band \
+                 {lineality_band:.3e}. null(A) is the recession cone's lineality space, so a \
+                 direction there without resolved curvature is itself impropriety"
+            ));
+        }
+        let coupling = row_space
+            .t()
+            .dot(&symmetric)
+            .dot(&lineality_basis)
+            .dot(&lineality_vectors);
+        for row in 0..q {
+            for column in 0..q {
+                let mut correction = 0.0;
+                for k in 0..lineality_dimension {
+                    correction +=
+                        coupling[[row, k]] * coupling[[column, k]] / lineality_values[k];
+                }
+                schur[[row, column]] -= correction;
+            }
+        }
+    }
+
+    // `w = UΣu`, so `u = Σ⁻¹Uᵀw` and `M = (Σ⁻¹Uᵀ)ᵀ S (Σ⁻¹Uᵀ)`.
+    let mut lift = left_vectors.t().to_owned();
+    for (index, mut row) in lift.rows_mut().into_iter().enumerate() {
+        row /= singular[index];
+    }
+    let mut reduced = lift.t().dot(&schur).dot(&lift);
     for row in 0..q {
         for column in (row + 1)..q {
             let averaged = 0.5 * (reduced[[row, column]] + reduced[[column, row]]);
@@ -460,8 +541,7 @@ pub(crate) fn cone_properness_certificate(
 /// a singular face carries no isolated stationary point to compare.
 ///
 /// The name records where it is used, not a requirement: the elimination is a
-/// general LU with row pivoting, and `reduced_cone_precision` deliberately feeds
-/// it an indefinite symmetric saddle matrix.
+/// general LU with row pivoting.
 fn symmetric_solve(a: &Array2<f64>, b: &Array1<f64>, floor: f64) -> Option<Array1<f64>> {
     let n = a.nrows();
     let mut work = a.clone();
@@ -929,17 +1009,17 @@ mod tests {
 
     #[test]
     fn dependent_constraint_rows_are_refused_by_name_rather_than_reduced() {
-        // Two copies of one row make the saddle system singular. The reduction
-        // has no coordinates in that case, and the refusal has to say so — a
-        // silently pseudo-inverted `M` would be a matrix built on neither of the
-        // two conditions the certificate reports.
+        // Two copies of one row leave `A` rank-deficient. The reduction has no
+        // coordinates in that case, and the refusal has to say so — a silently
+        // pseudo-inverted `M` would be a matrix built on neither of the two
+        // conditions the certificate reports.
         let hessian = array![[4.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 2.0]];
         let constraints = array![[1.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
         let message = reduced_cone_precision(hessian.view(), constraints.view())
             .expect_err("dependent rows have no reduction");
         assert!(
-            message.contains("dependent") && message.contains("lineality"),
-            "the refusal must name both readings of a singular saddle, got: {message}"
+            message.contains("constraint rows are dependent") && !message.contains("null(A)"),
+            "the refusal must name the rank condition the face broke, and only it, got: {message}"
         );
         // More rows than dimensions cannot be independent at all, and that is
         // decidable without a solve.
@@ -950,6 +1030,97 @@ mod tests {
             message.contains("cannot be independent"),
             "got: {message}"
         );
+    }
+
+    #[test]
+    fn a_flat_lineality_direction_is_refused_as_impropriety_by_name() {
+        // `A` touches only the first coordinate and `H` carries no curvature along
+        // the second, which lies in `null(A)`: `±d` are both feasible there and the
+        // integrand is flat, so the reduction does not exist, and the refusal names
+        // the lineality condition rather than the rank one.
+        let hessian = array![[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 2.0]];
+        let constraints = array![[1.0, 0.0, 0.0]];
+        let message = reduced_cone_precision(hessian.view(), constraints.view())
+            .expect_err("a flat lineality direction has no reduction");
+        assert!(
+            message.contains("H is singular on null(A)")
+                && message.contains("lineality")
+                && !message.contains("dependent"),
+            "the refusal must name the lineality condition, and only it, got: {message}"
+        );
+    }
+
+    /// gam#3008: a coordinate face whose constrained block carries a survival time
+    /// block's curvature (`4.29e6`, the #3008 gout fit's scale), coupled to the
+    /// free block strongly enough that the ambient is indefinite. `null(A)` is the
+    /// free block, which is positive definite, so the reduction exists and is
+    /// `M = τI − C F⁻¹ Cᵀ` in real arithmetic, with one negative direction. The
+    /// saddle elimination this replaced refused it: its trailing pivots are entries
+    /// of `−A H⁻¹ Aᵀ`, near `1/4.29e6`, below its floor `1e-12·4.29e6`.
+    #[test]
+    fn a_large_curvature_face_reduces_in_its_own_units_3008() {
+        let tau = 4.29e6;
+        let free = [2.0, 4.0];
+        let coupling = array![[3000.0, 0.0], [0.0, 1000.0], [500.0, 0.0]];
+        let mut hessian = Array2::<f64>::zeros((5, 5));
+        for row in 0..3 {
+            hessian[[row, row]] = tau;
+            for k in 0..2 {
+                hessian[[row, 3 + k]] = coupling[[row, k]];
+                hessian[[3 + k, row]] = coupling[[row, k]];
+            }
+        }
+        for k in 0..2 {
+            hessian[[3 + k, 3 + k]] = free[k];
+        }
+        let mut constraints = Array2::<f64>::zeros((3, 5));
+        for row in 0..3 {
+            constraints[[row, row]] = 1.0;
+        }
+        let mut expected = Array2::<f64>::zeros((3, 3));
+        for row in 0..3 {
+            for column in 0..3 {
+                let correction: f64 = (0..2)
+                    .map(|k| coupling[[row, k]] * coupling[[column, k]] / free[k])
+                    .sum();
+                expected[[row, column]] = (if row == column { tau } else { 0.0 }) - correction;
+            }
+        }
+        assert!(
+            expected[[0, 0]] < 0.0,
+            "the fixture must put a negative direction on the face, as #3008's indefinite \
+             ambient does: M[0,0] = {:.6e}",
+            expected[[0, 0]]
+        );
+
+        let reduced = reduced_cone_precision(hessian.view(), constraints.view())
+            .expect("a full-rank face with a positive definite lineality block reduces");
+        // The route forms `ZᵀHZ` and `V₁ᵀHZ` through computed bases, so each can
+        // carry the ambient spectral rounding `5·ε·‖H‖₂` (bounded here by
+        // Gershgorin). To first order that moves `C F⁻¹ Cᵀ` by the band times
+        // `1 + 2‖C‖‖F⁻¹‖ + ‖C‖²‖F⁻¹‖²`.
+        let gershgorin = (0..5)
+            .map(|row| hessian.row(row).iter().map(|value| value.abs()).sum::<f64>())
+            .fold(0.0f64, f64::max);
+        let ambient_band = 5.0 * f64::EPSILON * gershgorin;
+        let coupling_max = coupling.iter().fold(0.0f64, |worst, value| worst.max(value.abs()));
+        let free_inverse_max = free.iter().map(|value| value.recip()).fold(0.0f64, f64::max);
+        let amplification = 1.0
+            + 2.0 * coupling_max * free_inverse_max
+            + (coupling_max * free_inverse_max).powi(2);
+        let band = ambient_band * amplification;
+        for row in 0..3 {
+            for column in 0..3 {
+                let gap = (reduced[[row, column]] - expected[[row, column]]).abs();
+                assert!(
+                    gap <= band,
+                    "M[{row},{column}] = {:.12e}, expected {:.12e}: gap {gap:.3e} above the \
+                     rounding band {band:.3e}",
+                    reduced[[row, column]],
+                    expected[[row, column]]
+                );
+            }
+        }
     }
 
     #[test]

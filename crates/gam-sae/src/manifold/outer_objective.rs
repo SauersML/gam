@@ -533,6 +533,11 @@ pub struct OuterProbeTelemetry {
     pub root_unfactorable_no_steps: usize,
     /// Refined roots that did not certify, so the accepted state was priced instead.
     pub root_uncertified_refinements: usize,
+    /// #2822 — root phases that ended with the gate inside its formation band.
+    pub root_rounding_floor_stops: usize,
+    /// #2822 — root steps the strict contraction would have committed, refused because the
+    /// two gates' formation bands overlap.
+    pub root_band_refused_commits: usize,
 }
 
 impl OuterProbeTelemetry {
@@ -1670,6 +1675,8 @@ impl SaeManifoldOuterObjective {
             root_negative_curvature_no_steps: root.negative_curvature_no_steps,
             root_unfactorable_no_steps: root.unfactorable_no_steps,
             root_uncertified_refinements: root.uncertified_refinements,
+            root_rounding_floor_stops: root.rounding_floor_stops,
+            root_band_refused_commits: root.band_refused_commits,
             ..self.probe_telemetry
         }
     }
