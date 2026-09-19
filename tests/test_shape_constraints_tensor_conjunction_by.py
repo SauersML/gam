@@ -163,6 +163,10 @@ def test_numeric_by_constrains_the_multiplied_function() -> None:
         ("y ~ s(x, shape=[convex, concave])", "affine"),
         ("y ~ te(x, z, shape=[monotone_increasing])", "2 margins"),
         ("y ~ ti(x, z, shape=[monotone_increasing, none])", "ti() removes"),
+        (
+            "y ~ te(x, z, bs=[ps, cr], shape=[monotone_increasing, none])",
+            "negative values",
+        ),
     ],
 )
 def test_unsatisfiable_or_ill_formed_shapes_are_refused_by_name(

@@ -623,6 +623,29 @@ fn validate_tensor_shape_request(
     }
     for (j, (set, marginal)) in margins.iter().zip(&spec.marginalspecs).enumerate() {
         if set.is_empty() {
+            // The cone makes every fibre along a shaped margin carry the
+            // shape; the surface is a combination of those fibres weighted by
+            // this margin's basis functions, which inherits the shape only
+            // when those weights are non-negative. Open and periodic
+            // B-splines are; a cr cardinal basis and a boundary-conditioned
+            // B-spline basis take negative values.
+            let signed = if matches!(
+                &marginal.knotspec,
+                BSplineKnotSpec::NaturalCubicRegression { .. }
+            ) {
+                Some("a cubic regression (cr) basis")
+            } else if !marginal.boundary_conditions.is_free() {
+                Some("an endpoint-conditioned B-spline basis")
+            } else {
+                None
+            };
+            if let Some(kind) = signed {
+                return Err(format!(
+                    "margin {j} is {kind}, whose basis functions take negative values, so a \
+                     shape along another margin holding on every coefficient fibre does not \
+                     make the surface hold it; use bs=\"ps\" on margin {j}"
+                ));
+            }
             continue;
         }
         if spec.periods.get(j).copied().flatten().is_some() {

@@ -128,7 +128,9 @@ class Smooth(_BasisDescriptor):
         takes one entry per margin in margin order, each an atom, ``None`` or
         a list: ``["monotone_increasing", None]`` makes the surface
         non-decreasing along the first margin at every value of the second.
-        The constraint is the exact B-spline control-polygon cone
+        Every margin of a shaped tensor must be a B-spline (``ps``/``bs``):
+        with no ``bs=`` given all margins default to ``ps`` rather than
+        ``cr``, whose basis takes negative values. The constraint is the exact B-spline control-polygon cone
         ``A·β ≥ 0``, so it certifies the shape on the whole domain, not on a
         grid; when constraints are active at convergence the outer REML
         score uses the tangent-projected LAML formulation. With a numeric
