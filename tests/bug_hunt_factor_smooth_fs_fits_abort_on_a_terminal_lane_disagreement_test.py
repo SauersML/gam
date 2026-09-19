@@ -47,8 +47,8 @@ line 2873); the derivative-bearing orders fall through to the
 ``EvalMode::ValueAndGradient`` / ``ValueGradientHessian`` assembly and *are*
 served from / written to the LRU keyed by ``rhokey_sanitized``
 (``crates/gam-solve/src/reml/gradient_hessian.rs:4133``), whose identity also
-carries ``screening_max_inner_iterations`` and ``outer_inner_cap``.  A
-multi-lambda ``fs`` block -- one lambda per group plus the shared smooth -- is
+carries ``outer_inner_cap``.  A multi-lambda ``fs`` block -- one lambda per
+group plus the shared smooth -- is
 exactly the configuration that makes the two routes' inner states drift apart.
 
 Where the search is when it happens: every failure reports an

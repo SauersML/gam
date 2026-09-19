@@ -739,7 +739,7 @@ pub fn gaussian_reml_fit_blocks_exact(
         .column(0)
         .to_owned();
     // #2812: the ρ domain is derived per block from the weighted design Gram
-    // and the block's penalty; the seed lattice spans the same domain.
+    // and the block's penalty; the outer start is clamped into the same domain.
     let (rho_lower, rho_upper) = crate::estimate::rho_domain::resolvability_domain_from_gram_blocks(
         &xtwx,
         blockwise_penalties
@@ -764,9 +764,28 @@ pub fn gaussian_reml_fit_blocks_exact(
         penalty_spectrum,
     };
 
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
-    let mut problem = OuterProblem::new(f_blocks)
+    // One start: the caller's ρ, else the commensurate-curvature start of each
+    // block (its data-curvature trace against its penalty trace), clamped into
+    // the block's resolvability domain. The certified outer search refines it.
+    let xtwx_diag = xtwx.diag();
+    let start_rho = match init_rhos {
+        Some(rhos) => Array1::from_iter(rhos.iter().copied()),
+        None => Array1::from_iter(blockwise_penalties.iter().map(|penalty| {
+            crate::seeding::commensurate_curvature_rho(
+                xtwx_diag,
+                penalty.col_range.clone(),
+                penalty.local.diag().sum(),
+            )
+            .unwrap_or(0.0)
+        })),
+    };
+    let start_rho = Array1::from_iter(start_rho.iter().enumerate().map(|(k, rho)| {
+        rho.clamp(
+            rho_lower.get(k).copied().unwrap_or(f64::NEG_INFINITY),
+            rho_upper.get(k).copied().unwrap_or(f64::INFINITY),
+        )
+    }));
+    let problem = OuterProblem::new(f_blocks)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(false)
@@ -774,22 +793,10 @@ pub fn gaussian_reml_fit_blocks_exact(
         .with_tolerance(1.0e-10)
         .with_required_projected_gradient_norm(Some(1.0e-8))
         .with_bounds(rho_lower.clone(), rho_upper.clone())
-        .with_seed_config(seed_config)
         .with_rho_canonical_keys(Some(canonical_keys))
         .with_fallback_policy(FallbackPolicy::Disabled)
-        .with_problem_size(n, p_total);
-    if let Some(rhos) = init_rhos {
-        problem = problem
-            .with_initial_rho(Array1::from_iter(rhos.iter().enumerate().map(
-                |(k, rho)| {
-                    rho.clamp(
-                        rho_lower.get(k).copied().unwrap_or(f64::NEG_INFINITY),
-                        rho_upper.get(k).copied().unwrap_or(f64::INFINITY),
-                    )
-                },
-            )))
-            .with_screen_initial_rho(true);
-    }
+        .with_problem_size(n, p_total)
+        .with_initial_rho(start_rho);
     let mut objective = problem.build_objective(
         profile,
         gaussian_reml_blocks_profile_cost,
@@ -6343,8 +6350,17 @@ mod tests {
 
     /// #2830: assembling `X'X + exp(rho) S` in the user's coordinates loses
     /// positive definiteness around rho=30 even when X is full rank and S is
-    /// PSD.  Both starts exercise that numerical wall; they must describe the
-    /// same converged fit rather than making feasibility depend on the seed.
+    /// PSD. A start on that wall must stay numerically feasible and converge.
+    ///
+    /// The two starts do not describe the same fit, and are not required to:
+    /// the criterion has an interior minimum and, at λ → ∞ in both blocks, a
+    /// flat top whose slope and curvature decay like `e^{-ρ}` below what the
+    /// criterion resolves. The search from the ordinary start finds the
+    /// interior minimum; the search from the wall certifies the flat top it
+    /// starts on, which is the penalty-null-space fit. Nothing a
+    /// derivative-based search reads at ρ = 30 points at a basin about 40
+    /// e-folds away, and the seed lattice that used to find it was a grid
+    /// search.
     #[test]
     fn block_reml_large_strength_start_is_coordinate_stable_2830() {
         let mut first = Array2::<f64>::zeros((12, 2));
@@ -6376,15 +6392,47 @@ mod tests {
         )
         .expect("large-strength block-REML start must remain numerically feasible");
 
-        let fitted_difference = ordinary
+        assert!(
+            ordinary.reml_score < boundary.reml_score,
+            "the ordinary start must reach the interior minimum below the flat top: \
+             ordinary rho {:?} criterion {:e}, boundary rho {:?} criterion {:e}",
+            ordinary.log_lambdas,
+            ordinary.reml_score,
+            boundary.log_lambdas,
+            boundary.reml_score,
+        );
+
+        // The λ → ∞ limit: least squares on each block's penalty null space,
+        // the column X_k·(1, 1).
+        let null_columns: Vec<Array1<f64>> = designs
+            .iter()
+            .map(|design| design.column(0).to_owned() + design.column(1))
+            .collect();
+        let gram = |a: &Array1<f64>, b: &Array1<f64>| a.dot(b);
+        let (a, b) = (&null_columns[0], &null_columns[1]);
+        let (aa, ab, bb) = (gram(a, a), gram(a, b), gram(b, b));
+        let (ay, by) = (a.dot(&y), b.dot(&y));
+        let determinant = aa * bb - ab * ab;
+        let coef_a = (bb * ay - ab * by) / determinant;
+        let coef_b = (aa * by - ab * ay) / determinant;
+        let limit = a * coef_a + &(b * coef_b);
+
+        // The fit leaves the limit at the rate the penalty releases the range
+        // space, `e^{-ρ}` in the least-penalized block.
+        let min_log_lambda = boundary.log_lambdas.iter().copied().fold(f64::INFINITY, f64::min);
+        let scale = y.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let tolerance = scale * (-min_log_lambda).exp();
+        let limit_difference = boundary
             .fitted
             .iter()
-            .zip(boundary.fitted.iter())
-            .map(|(left, right)| (left - right).abs())
+            .zip(limit.iter())
+            .map(|(fitted, limit)| (fitted - limit).abs())
             .fold(0.0_f64, f64::max);
         assert!(
-            fitted_difference < 1.0e-8,
-            "converged fitted values depend on the start: max difference {fitted_difference:e}"
+            limit_difference <= tolerance,
+            "the boundary start must certify the penalty-null-space fit: max difference \
+             {limit_difference:e} against {tolerance:e} at rho {:?}",
+            boundary.log_lambdas,
         );
     }
 

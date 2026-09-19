@@ -208,7 +208,7 @@ pub use row_metric::{
     WeightField,
 };
 pub use schedule::{GumbelTemperatureSchedule, ScheduleKind};
-pub use seeding::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
+pub use seeding::OrderedRhoBounds;
 pub use solver_contract::{
     DeclaredHessianForm,
     Derivative,

@@ -557,6 +557,7 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // Row quantities float64 cannot represent at the current coefficients:
         // numerical failures of the solve, not properties of the input.
         EstimationError::InverseLinkDomainViolation { .. }
+        | EstimationError::LinkFeasibilityBoundaryOptimum { .. }
         | EstimationError::PirlsRowGeometryUnrepresentable { .. }
         | EstimationError::LogStrengthDomainViolation { .. } => FitNumericalError::new_err(message),
         EstimationError::MonotoneRoot(_) => MonotoneRootError::new_err(message),
