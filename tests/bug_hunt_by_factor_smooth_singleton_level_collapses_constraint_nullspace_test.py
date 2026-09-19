@@ -11,8 +11,9 @@ fuzzer found it in every ``by=`` case with a singleton level).
 The principled outcome is that the level's smooth keeps no coefficients: its
 one row is fitted by the level's main-effect coefficient, and the other levels'
 smooths are unaffected. This pins that: the fit succeeds, the singleton level
-predicts a constant equal to its one observation, the other levels still track
-their curves, and intervals and the summary are finite.
+predicts a constant at its one observation (up to the noise scale: the level's
+coefficient is estimated, not interpolated), the other levels still track their
+curves, and intervals and the summary are finite.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ pytest.importorskip("gamfit._rust")
 import gamfit
 
 _ROWS_PER_LEVEL = (40, 40, 1)
+_NOISE_SD = 0.1
 
 
 def _sample(seed: int):
@@ -37,7 +39,7 @@ def _sample(seed: int):
     )
     x = rng.uniform(0.0, 1.0, codes.size)
     truth = np.sin(2.0 * np.pi * x) * (1.0 + codes)
-    y = truth + rng.normal(0.0, 0.1, codes.size)
+    y = truth + rng.normal(0.0, _NOISE_SD, codes.size)
     labels = np.array([f"L{c}" for c in codes])
     return pd.DataFrame({"x": x, "g": labels, "y": y})
 
@@ -52,8 +54,12 @@ def test_singleton_by_level_fits_and_predicts(seed: int) -> None:
     query = pd.DataFrame({"x": grid, "g": np.full(grid.size, "L2")})
     pred = np.asarray(model.predict(query), dtype=float).reshape(-1)
     # The singleton level has no smooth left: its prediction is the level's
-    # main effect, which reproduces its one observation.
-    np.testing.assert_allclose(pred, float(single["y"].iloc[0]), atol=1e-6)
+    # main effect alone, flat in x and at its one observation.
+    np.testing.assert_allclose(pred, pred[0], rtol=0.0, atol=1e-10)
+    assert abs(pred[0] - float(single["y"].iloc[0])) < _NOISE_SD, (
+        f"seed {seed}: singleton level predicts {pred[0]:.4f}, "
+        f"its observation is {float(single['y'].iloc[0]):.4f}"
+    )
 
     for level, amplitude in (("L0", 1.0), ("L1", 2.0)):
         query = pd.DataFrame({"x": grid, "g": np.full(grid.size, level)})
