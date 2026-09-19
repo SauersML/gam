@@ -325,58 +325,55 @@ pub(crate) fn estimate_dispersion_phi_from_eta(
             ),
         }
     };
-    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
-            if wi == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            let mu = mean(i)?;
-            if !mu.is_finite() {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "mean", eta[i], mu));
-            }
-            let statistic = if inverse_gaussian {
-                if !(y[i].is_finite() && y[i] > 0.0) {
-                    return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                        i,
-                        "inverse Gaussian response",
-                        eta[i],
-                        y[i],
-                    ));
-                }
-                let resid = y[i] - mu;
-                // w (y−μ)²/(y μ²) = w · y · (1/μ − 1/y)²; assembled in logs so
-                // neither the squared residual nor μ² has to be representable.
-                if resid == 0.0 {
-                    0.0
-                } else {
-                    (wi.ln() + 2.0 * resid.abs().ln() - y[i].ln() - 2.0 * mu.ln()).exp()
-                }
-            } else {
-                if !y[i].is_finite() {
-                    return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                        i,
-                        "Gaussian response",
-                        eta[i],
-                        y[i],
-                    ));
-                }
-                let resid = y[i] - mu;
-                wi * resid * resid
-            };
-            if !(statistic.is_finite() && statistic >= 0.0) {
+    let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok((0.0, 0.0));
+        }
+        let mu = mean(i)?;
+        if !mu.is_finite() {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "mean", eta[i], mu));
+        }
+        let statistic = if inverse_gaussian {
+            if !(y[i].is_finite() && y[i] > 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     i,
-                    "dispersion statistic",
+                    "inverse Gaussian response",
                     eta[i],
-                    statistic,
+                    y[i],
                 ));
             }
-            Ok((statistic, wi))
-        })
-        .collect();
-    let (weighted_deviance, total_weight) = certified_pairs_sum(rows)?;
+            let resid = y[i] - mu;
+            // w (y−μ)²/(y μ²) = w · y · (1/μ − 1/y)²; assembled in logs so
+            // neither the squared residual nor μ² has to be representable.
+            if resid == 0.0 {
+                0.0
+            } else {
+                (wi.ln() + 2.0 * resid.abs().ln() - y[i].ln() - 2.0 * mu.ln()).exp()
+            }
+        } else {
+            if !y[i].is_finite() {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                    i,
+                    "Gaussian response",
+                    eta[i],
+                    y[i],
+                ));
+            }
+            let resid = y[i] - mu;
+            wi * resid * resid
+        };
+        if !(statistic.is_finite() && statistic >= 0.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "dispersion statistic",
+                eta[i],
+                statistic,
+            ));
+        }
+        Ok((statistic, wi))
+    })?;
+    let (weighted_deviance, total_weight) = certified_pairs_sum(&rows)?;
     if !(total_weight > 0.0 && weighted_deviance > 0.0) {
         crate::bail_invalid_estim!(
             "dispersion MLE is not finite and positive (deviance={weighted_deviance:?}, weight={total_weight:?})"
