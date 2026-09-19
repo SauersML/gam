@@ -344,9 +344,9 @@ scores = cross_val_score(
 ## Choose between formulas
 
 Fit each candidate and rank the fits with `gamfit.compare_models`, which
-scores them by conditional AIC. There is nothing to grid-search: REML
-already chose every smoothing parameter inside each fit, so the candidates
-differ only in structure.
+scores them by AIC corrected for smoothing-parameter selection. There is
+nothing to grid-search: REML already chose every smoothing parameter inside
+each fit, so the candidates differ only in structure.
 
 ```python
 import numpy as np
@@ -362,8 +362,8 @@ fits = [gamfit.fit(data, formula) for formula in candidates]
 comparison = gamfit.compare_models(fits, names=candidates)
 
 print("winner:", comparison["winner"])
-for name, score, delta, evidence_ratio, edf in comparison["ranking"]:
-    print(f"{name:18s} delta={delta:7.2f}  edf={edf:.2f}")
+for row in comparison["ranking"]:
+    print(f"{row['name']:18s} delta={row['delta_aic']:7.2f}  edf={row['edf_corrected']:.2f}")
 ```
 
 Here `z` bends symmetrically around 0.5, so a straight line in `z`

@@ -114,7 +114,8 @@ support; REML then shrinks `s(year)` to an almost straight line.
   point, and its cost multiplies with the number of terms.
 - **`lam=`.** A hand-set smoothing parameter overrides the estimate with a
   guess. To compare structurally different models, fit each one and pass
-  them to `gamfit.compare_models`, which ranks them by conditional AIC.
+  them to `gamfit.compare_models`, which ranks them by AIC corrected for smoothing-parameter
+  selection.
 - **`n_splines` as the smoothness knob.** In pyGAM, 20 splines with a
   fixed `lam` fixes the flexibility. In gamfit `k` only caps it, and REML
   decides how much of the basis the data support. Raise `k` when

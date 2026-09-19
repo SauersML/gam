@@ -34,15 +34,17 @@ fits = [gamfit.fit(wage, formula) for formula in candidates.values()]
 
 comparison = gamfit.compare_models(fits, names=list(candidates))
 print(comparison["evidence_summary"])
-for name, score, delta, evidence_ratio, edf in comparison["ranking"]:
-    print(f"{name:12s}  delta={delta:8.2f}  evidence ratio={evidence_ratio:.3g}  edf={edf:.2f}")
+for row in comparison["ranking"]:
+    print(f"{row['name']:12s}  delta={row['delta_aic']:8.2f}  "
+          f"evidence ratio={row['evidence_ratio']:.3g}  edf={row['edf_corrected']:.2f}")
 
 print(fits[-1].summary().smooth_terms_frame())
 ```
 
-`compare_models` ranks the fits by conditional AIC and reports each
-one's Akaike evidence ratio against the winner; the full model wins by a
-ratio of several hundred over the model without `year`. The term table
+`compare_models` ranks the fits by AIC corrected for smoothing-parameter
+selection and reports each one's Akaike evidence ratio against the winner;
+the full model wins by a ratio of about a hundred over the model without
+`year`. The term table
 shows `s(year, k=5)` with an edf near 1: `year` has only seven distinct
 values, and REML shrank its smooth to an almost straight line instead of
 chasing them. `education` is a string column, so it enters as a factor
