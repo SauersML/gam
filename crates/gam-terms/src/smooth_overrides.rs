@@ -746,7 +746,7 @@ fn apply_bspline_1d(
     } else if let Some(n) = descriptor.get("n_knots").and_then(JsonValue::as_u64) {
         // `BSpline(knots=K)` means K INTERIOR knots — the one meaning the
         // integer has everywhere else it is read: the public evaluator
-        // (`gamfit.bspline_basis`, `BSpline.evaluate`) and the formula DSL's
+        // (`gamfit.basis.bspline_basis`, `BSpline.evaluate`) and the formula DSL's
         // `knots=K`. An open basis therefore spans `K + degree + 1` functions
         // and a cyclic one, by the `cyclic(x, knots=K)` convention, has
         // `K + degree + 1` cyclic controls. This bridge used to read the same
@@ -1297,6 +1297,7 @@ mod tests {
             linear_terms: Vec::new(),
             random_effect_terms: Vec::new(),
             smooth_terms: vec![term],
+            level: Default::default(),
         }
     }
 

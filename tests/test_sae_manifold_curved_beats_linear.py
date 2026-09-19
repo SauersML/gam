@@ -68,7 +68,7 @@ def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
 def test_curved_atom_beats_linear_shards_on_one_harmonic():
     z = _synthetic_one_harmonic()
 
-    curved = gamfit.sae_manifold_fit(
+    curved = gamfit.sae.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis="periodic",
@@ -78,7 +78,7 @@ def test_curved_atom_beats_linear_shards_on_one_harmonic():
         learning_rate=0.04,
         random_state=0,
     )
-    linear = gamfit.sae_manifold_fit(
+    linear = gamfit.sae.sae_manifold_fit(
         X=z,
         K=10,
         atom_basis="duchon",

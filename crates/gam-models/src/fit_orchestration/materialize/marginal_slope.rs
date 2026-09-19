@@ -65,35 +65,70 @@ fn validate_bernoulli_marginal_slope_z_column_variance(
     })
 }
 
-/// Resolve a marginal-slope fit's base link from the main formula's `link(...)`.
-/// The calibrated de-nested kernel is probit-only, so another link, a
-/// `flexible(...)` wrapper, or link parameters that only another link reads are
-/// refused rather than fitted as probit without a word.
-pub(super) fn resolve_marginal_slope_base_link(
+/// Resolve a marginal-slope fit's link from the main formula's `link(...)` and the
+/// request's `link` and `flexible_link` arguments (gamfit's `link=` and
+/// `flexible_link=`). The calibrated de-nested kernel is probit-only, so another
+/// link named in either place, or link parameters that only another link reads,
+/// are refused rather than fitted as probit without a word. The returned choice is
+/// flexible when either place asks for `flexible(probit)` or `flexible_link` is
+/// set; the caller turns that into the default link deviation through
+/// [`effectivelinkwiggle_formulaspec`], as every other family does.
+pub(super) fn resolve_marginal_slope_link(
     linkspec: Option<&gam_terms::inference::formula_dsl::LinkFormulaSpec>,
+    link_argument: Option<&str>,
+    flexible_link: bool,
     context: &'static str,
-) -> Result<InverseLink, WorkflowError> {
+) -> Result<(InverseLink, Option<LinkChoice>), WorkflowError> {
+    use gam_terms::inference::formula_dsl::LinkMode;
     let refuse = |refusal| WorkflowError::MarginalSlopeLink { context, refusal };
-    let Some(linkspec) = linkspec else {
-        return Ok(InverseLink::Standard(StandardLink::Probit));
-    };
-    let Some(choice) = parse_link_choice(Some(&linkspec.link), false).map_err(|error| {
-        WorkflowError::InvalidConfig {
+    let parse = |raw: Option<&str>, flexible: bool| {
+        parse_link_choice(raw, flexible).map_err(|error| WorkflowError::InvalidConfig {
             reason: String::from(error),
-        }
-    })?
-    else {
-        return Ok(InverseLink::Standard(StandardLink::Probit));
+        })
     };
-    if matches!(
-        choice.mode,
-        gam_terms::inference::formula_dsl::LinkMode::Flexible
-    ) {
-        return Err(refuse(MarginalSlopeLinkRefusal::Flexible));
-    }
-    if choice.mixture_components.is_some() || choice.link != LinkFunction::Probit {
+    let is_probit = |choice: &LinkChoice| {
+        choice.mixture_components.is_none() && choice.link == LinkFunction::Probit
+    };
+    let formula_choice = match linkspec {
+        Some(linkspec) => parse(Some(&linkspec.link), false)?,
+        None => None,
+    };
+    if formula_choice.as_ref().is_some_and(|choice| !is_probit(choice)) {
         return Err(refuse(MarginalSlopeLinkRefusal::NonProbit));
     }
+    let argument_choice = parse(link_argument, flexible_link)?;
+    if let Some(link) = link_argument
+        && argument_choice.as_ref().is_some_and(|choice| !is_probit(choice))
+    {
+        return Err(refuse(MarginalSlopeLinkRefusal::NonProbitArgument {
+            link: link.to_string(),
+        }));
+    }
+    if let Some(linkspec) = linkspec {
+        validate_marginal_slope_link_parameters(linkspec, context)?;
+    }
+    let flexible = [&formula_choice, &argument_choice]
+        .into_iter()
+        .flatten()
+        .any(|choice| matches!(choice.mode, LinkMode::Flexible));
+    let choice = (formula_choice.is_some() || argument_choice.is_some()).then(|| LinkChoice {
+        mode: if flexible {
+            LinkMode::Flexible
+        } else {
+            LinkMode::Strict
+        },
+        link: LinkFunction::Probit,
+        mixture_components: None,
+    });
+    Ok((InverseLink::Standard(StandardLink::Probit), choice))
+}
+
+/// Refuse the formula `link(...)` parameters that only a non-probit link reads.
+fn validate_marginal_slope_link_parameters(
+    linkspec: &gam_terms::inference::formula_dsl::LinkFormulaSpec,
+    context: &'static str,
+) -> Result<(), WorkflowError> {
+    let refuse = |refusal| WorkflowError::MarginalSlopeLink { context, refusal };
     if linkspec.sas_init.is_some() {
         return Err(refuse(MarginalSlopeLinkRefusal::ForeignParameter {
             parameter: "sas_init",
@@ -112,7 +147,7 @@ pub(super) fn resolve_marginal_slope_base_link(
             requires: "blended(...)/mixture(...)",
         }));
     }
-    Ok(InverseLink::Standard(StandardLink::Probit))
+    Ok(())
 }
 
 pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
@@ -154,8 +189,12 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         }
         .into());
     }
-    let base_link =
-        resolve_marginal_slope_base_link(parsed.linkspec.as_ref(), "bernoulli marginal-slope")?;
+    let (base_link, link_choice) = resolve_marginal_slope_link(
+        parsed.linkspec.as_ref(),
+        config.link.as_deref(),
+        config.flexible_link,
+        "bernoulli marginal-slope",
+    )?;
     validate_marginal_slope_z_column_exclusion(
         parsed,
         &parsed_slope,
@@ -218,8 +257,12 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let slope_offset =
         resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
+    // A flexible link, however it was asked for, is the main formula's default link
+    // deviation, the one `linkwiggle()` gives; an explicit `linkwiggle(...)` wins.
+    let main_linkwiggle =
+        effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
     let routing = route_marginal_slope_deviation_blocks(
-        parsed.linkwiggle.as_ref(),
+        main_linkwiggle.as_ref(),
         parsed_slope.linkwiggle.as_ref(),
     )?;
 

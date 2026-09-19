@@ -137,7 +137,7 @@ def main() -> int:
     def run(name, Aop, extra=None):
         t0 = time.perf_counter()
         try:
-            rep = gamfit.certify_chart_transfer(
+            rep = gamfit.sae.certify_chart_transfer(
                 np.ascontiguousarray(Aop),
                 np.ascontiguousarray(G_CIRCLE),
                 np.ascontiguousarray(G_CIRCLE))

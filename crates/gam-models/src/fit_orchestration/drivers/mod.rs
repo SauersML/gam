@@ -61,7 +61,6 @@ use gam_terms::smooth::penalty_priors::realize_keyed_penalty_block_gamma_priors;
 
 use gam_terms::smooth::shape_constraints::{
     linear_constraints_from_lower_bounds_global, merge_linear_constraints_global,
-    shape_lower_bounds_local,
 };
 
 // Every `pub` item that `gam_terms::smooth` exposes (the `term_specs.rs`

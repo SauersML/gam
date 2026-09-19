@@ -56,7 +56,7 @@ def build_manifold_saebench_sae(
 ):
     """Return a ``BaseSAE`` instance backed by the live curved fit ``model``.
 
-    ``model`` is the object returned by ``gamfit.sae_manifold_fit(...)`` (has
+    ``model`` is the object returned by ``gamfit.sae.sae_manifold_fit(...)`` (has
     ``.encode``/``.reconstruct``/``.atoms``/``.training_mean``). ``d_in``/``d_sae``
     are inferred from the fit when omitted (P = len(training_mean), K =
     len(atoms)). Constructor kwargs are signature-filtered so this survives
@@ -203,7 +203,7 @@ def main() -> None:
     X = _load_chunk_dir(args.chunk_dir, args.rows, args.seed)
     print(f"[manifold-adapter] X={X.shape}; fitting manifold SAE "
           f"K={args.K} d_atom={args.d_atom} top_k={args.top_k} topology={args.topology}", flush=True)
-    model = gamfit.sae_manifold_fit(
+    model = gamfit.sae.sae_manifold_fit(
         X, K=args.K, d_atom=args.d_atom, atom_topology=args.topology,
         assignment="topk", top_k=args.top_k, random_state=args.seed,
     )

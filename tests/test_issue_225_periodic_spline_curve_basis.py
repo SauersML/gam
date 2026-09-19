@@ -44,7 +44,7 @@ def test_standalone_cyclic_roughness_kernel_is_registered_and_identical() -> Non
 
 def test_top_level_periodic_spline_curve_basis_returns_basis_and_penalty() -> None:
     t = np.array([0.0, 0.07, 0.25, 0.5, 0.999_999, 1.0, 1.07, -0.93], dtype=float)
-    basis, penalty = gamfit.periodic_spline_curve_basis(t, n_knots=12, degree=3)
+    basis, penalty = gamfit.basis.periodic_spline_curve_basis(t, n_knots=12, degree=3)
     assert basis.shape == (t.size, 12)
     assert penalty.shape == (12, 12)
     # Partition of unity.
@@ -59,20 +59,20 @@ def test_top_level_periodic_spline_curve_basis_returns_basis_and_penalty() -> No
 
 
 def test_periodic_spline_curve_descriptor_evaluate_runs() -> None:
-    """`gamfit.PeriodicSplineCurve` evaluates without raising the missing-pyfunction error."""
-    spec = gamfit.PeriodicSplineCurve(n_knots=10, degree=3, output_dim=1)
+    """`gamfit.smooth.PeriodicSplineCurve` evaluates without raising the missing-pyfunction error."""
+    spec = gamfit.smooth.PeriodicSplineCurve(n_knots=10, degree=3, output_dim=1)
     t = np.linspace(0.0, 1.0, 25, dtype=float)
-    design, _ = gamfit.periodic_spline_curve_basis(t, n_knots=spec.n_knots, degree=spec.degree)
+    design, _ = gamfit.basis.periodic_spline_curve_basis(t, n_knots=spec.n_knots, degree=spec.degree)
     assert design.shape == (t.size, spec.n_knots)
 
 
 def test_circle_topology_smooth_builds_periodic_basis() -> None:
-    """`gamfit.Circle()` must produce a working periodic smooth descriptor."""
-    smooth = gamfit.Circle(n_knots=12, degree=3)
+    """`gamfit.topology.Circle()` must produce a working periodic smooth descriptor."""
+    smooth = gamfit.topology.Circle(n_knots=12, degree=3)
     # Construction alone should not raise; the descriptor must carry a
     # periodic 1D basis spec that the engine can lower.
     assert smooth is not None
-    basis, penalty = gamfit.periodic_spline_curve_basis(
+    basis, penalty = gamfit.basis.periodic_spline_curve_basis(
         np.linspace(0.0, 1.0, 9, dtype=float),
         n_knots=12,
         degree=3,
