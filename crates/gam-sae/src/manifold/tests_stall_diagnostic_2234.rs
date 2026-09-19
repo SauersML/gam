@@ -158,8 +158,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         1.0e-6,
         1.0e-6,
     );
-    let problem = OuterProblem::new(n_params)
-        .with_initial_rho(initial_flat.clone());
+    let problem = OuterProblem::new(n_params).with_initial_rho(initial_flat.clone());
     let outcome = problem.run(&mut objective, "zz stall diagnostic 2234");
     match &outcome {
         Ok(result) => eprintln!(

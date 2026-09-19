@@ -26,10 +26,7 @@ pub(super) fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
 /// under a search cap must not alias the uncapped stationary mode at identical
 /// rho.  Keeping the construction here makes bundle, PIRLS, and outer-eval
 /// caches share one identity convention.
-pub(super) fn sanitized_eval_state_key(
-    rho: &Array1<f64>,
-    outer_cap: usize,
-) -> Option<Vec<u64>> {
+pub(super) fn sanitized_eval_state_key(rho: &Array1<f64>, outer_cap: usize) -> Option<Vec<u64>> {
     let mut key = sanitized_rhokey(rho)?;
     key.push(outer_cap as u64);
     Some(key)

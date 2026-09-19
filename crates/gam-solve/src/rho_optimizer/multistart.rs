@@ -130,11 +130,13 @@ impl OuterProblem {
         additional_levels: &[f64],
     ) -> Result<Vec<Array1<f64>>, EstimationError> {
         let config = self.config();
-        let model_domain_bounds =
-            outer_model_domain_bounds_template(&config, self.n_params);
+        let model_domain_bounds = outer_model_domain_bounds_template(&config, self.n_params);
         let bounds = outer_search_bounds_template(&config, self.n_params);
-        let own =
-            crate::rho_optimizer::run_plan::outer_start_point(&config, self.n_params, &model_domain_bounds)?;
+        let own = crate::rho_optimizer::run_plan::outer_start_point(
+            &config,
+            self.n_params,
+            &model_domain_bounds,
+        )?;
         let mut seeds: Vec<Array1<f64>> = Vec::with_capacity(1 + additional_levels.len());
         for start in std::iter::once(own).chain(
             additional_levels

@@ -22,7 +22,9 @@ fn quadratic_bowl_objective(
             Ok(0.5 * d.dot(&d))
         },
         move |_: &mut (), theta: &Array1<f64>| {
-            seen.lock().expect("evaluation log lock").push(theta.clone());
+            seen.lock()
+                .expect("evaluation log lock")
+                .push(theta.clone());
             let d = theta - &center;
             Ok(OuterEval {
                 cost: 0.5 * d.dot(&d),
@@ -60,7 +62,11 @@ fn outer_search_follows_one_trajectory_from_one_start() {
     let dist = |p: &Array1<f64>| (p - &center).mapv(|v| v * v).sum().sqrt();
     assert!(dist(&result.rho) < 1e-4, "converged rho={:?}", result.rho);
     let seen = seen.lock().expect("evaluation log lock");
-    assert_eq!(seen.first(), Some(&start), "the first evaluation is the declared start");
+    assert_eq!(
+        seen.first(),
+        Some(&start),
+        "the first evaluation is the declared start"
+    );
     let reached = seen
         .iter()
         .position(|p| dist(p) < 1e-3)
@@ -246,7 +252,9 @@ fn run_arc_projects_seed_before_seed_validation_eval() {
         {
             let seen = Arc::clone(&seen);
             move |_: &mut (), theta: &Array1<f64>| {
-                seen.lock().expect("evaluation log lock").push(theta.clone());
+                seen.lock()
+                    .expect("evaluation log lock")
+                    .push(theta.clone());
                 Ok(OuterEval {
                     cost: (theta[0] - 0.25).powi(2),
                     gradient: array![2.0 * (theta[0] - 0.25)],
@@ -283,7 +291,9 @@ fn run_bfgs_projects_seed_before_seed_validation_eval() {
         {
             let seen = Arc::clone(&seen);
             move |_: &mut (), theta: &Array1<f64>| {
-                seen.lock().expect("evaluation log lock").push(theta.clone());
+                seen.lock()
+                    .expect("evaluation log lock")
+                    .push(theta.clone());
                 Ok(OuterEval {
                     cost: (theta[0] - 0.25).powi(2),
                     gradient: array![2.0 * (theta[0] - 0.25)],
