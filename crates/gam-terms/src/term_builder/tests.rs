@@ -5202,6 +5202,306 @@ fn domain_is_validated_against_the_data_and_its_own_shape() {
     }
 }
 
+fn prediction_design_dataset(n: usize) -> Dataset {
+    let rows = (0..n)
+        .map(|i| {
+            let x = ((i * 37) % n) as f64 / (n - 1) as f64;
+            let z = ((i * 53) % n) as f64 / (n - 1) as f64;
+            let g = (i % 3) as f64;
+            vec![(4.0 * x).sin() + z * z + 0.3 * g, x, z, g]
+        })
+        .collect::<Vec<_>>();
+    let mut ds = continuous_dataset(&["y", "x", "z", "g"], rows);
+    ds.schema.columns[3].kind = ColumnKindTag::Categorical;
+    ds.schema.columns[3].levels = vec!["a".into(), "b".into(), "c".into()];
+    ds.column_kinds[3] = ColumnKindTag::Categorical;
+    ds
+}
+
+/// Prediction evaluates a fitted (frozen) spec on new rows, and reads only the
+/// design and its affine offset. The prediction builder must return exactly
+/// what the full build returns for those, while realizing no penalty for a
+/// frozen smooth: the full build re-ran every term's penalty normalization,
+/// PSD projection and collection-chart filtering on each prediction call.
+#[test]
+fn prediction_design_matches_full_build_without_realizing_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((37, 4), |(i, j)| match j {
+        0 => 0.0,
+        1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
+        _ => (i % 3) as f64,
+    });
+    for formula in [
+        "y ~ s(x) + s(z)",
+        "y ~ x + s(x)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ te(x, z)",
+        "y ~ s(x) + te(x, z)",
+        "y ~ s(x, z)",
+        "y ~ matern(x, z)",
+        "y ~ duchon(x, z)",
+        "y ~ g + s(x, by=g)",
+        "y ~ s(x, g, bs=\"fs\")",
+        "y ~ s(x) + s(g, x, bs=\"sz\")",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+
+        let full = crate::smooth::build_term_collection_design(new_rows.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` full rebuild: {err}"));
+        let prediction =
+            crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
+                .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
+        assert_eq!(
+            prediction.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the prediction design must equal the full rebuild's"
+        );
+        assert_eq!(
+            prediction.affine_offset, full.affine_offset,
+            "`{formula}`: the prediction offset must equal the full rebuild's"
+        );
+        assert_eq!(
+            prediction.linear_ranges, full.linear_ranges,
+            "`{formula}`: the prediction linear ranges must equal the full rebuild's"
+        );
+        let width = |ranges: &[(String, std::ops::Range<usize>)]| -> usize {
+            ranges.iter().map(|(_, range)| range.len()).sum()
+        };
+        let smooth_start = full.intercept_range.len()
+            + width(&full.linear_ranges)
+            + width(&full.random_effect_ranges);
+        let full_ranges: Vec<_> = full
+            .smooth
+            .terms
+            .iter()
+            .map(|term| {
+                let range = &term.coeff_range;
+                let columns = (smooth_start + range.start)..(smooth_start + range.end);
+                (term.name.clone(), columns)
+            })
+            .collect();
+        assert_eq!(
+            prediction.smooth_ranges, full_ranges,
+            "`{formula}`: the prediction smooth ranges must be the full rebuild's, placed after \
+             the intercept, linear and random-effect columns"
+        );
+        assert!(
+            !full.smooth.penalties.is_empty(),
+            "`{formula}`: the full rebuild realizes the smooth penalties"
+        );
+
+        for term in &frozen.smooth_terms {
+            // These kinds place their outer design from the inner penalties.
+            if matches!(
+                term.basis,
+                crate::smooth::SmoothBasisSpec::BySmooth { .. }
+                    | crate::smooth::SmoothBasisSpec::FactorSmooth { .. }
+                    | crate::smooth::SmoothBasisSpec::FactorSumToZero { .. }
+            ) {
+                continue;
+            }
+            let mut workspace = crate::basis::BasisWorkspace::default();
+            let local = crate::smooth::build_single_local_smooth_term_for(
+                new_rows.view(),
+                term,
+                &mut workspace,
+                crate::smooth::SmoothPenaltyDemand::DesignOnly,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` term {}: {err}", term.name));
+            assert!(
+                local.active_penalties.is_empty() && local.dropped_penalties.is_empty(),
+                "`{formula}`: frozen term {} must not realize penalties for a design-only build",
+                term.name
+            );
+        }
+    }
+}
+
+/// Partial dependence evaluates one term on a grid. Its columns must be the
+/// full prediction design's columns over the term's range, while the terms the
+/// block does not read are never built: realizing every term's basis on the
+/// grid made the cost scale with the model's width, not the term's.
+#[test]
+fn term_prediction_columns_match_the_full_prediction_design() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((37, 4), |(i, j)| match j {
+        0 => 0.0,
+        1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
+        _ => (i % 3) as f64,
+    });
+    for formula in [
+        "y ~ s(x) + s(z)",
+        "y ~ x + s(x)",
+        "y ~ x + s(x) + s(z)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ te(x, z)",
+        "y ~ s(x) + te(x, z)",
+        "y ~ s(x) + s(z) + ti(x, z)",
+        "y ~ s(x, z)",
+        "y ~ matern(x, z)",
+        "y ~ duchon(x, z)",
+        "y ~ g + s(x, by=g)",
+        "y ~ s(x, g, bs=\"fs\")",
+        "y ~ s(x) + s(g, x, bs=\"sz\")",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let full = crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
+        for (name, range) in full.linear_ranges.iter().chain(&full.smooth_ranges) {
+            let columns =
+                crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, name)
+                    .unwrap_or_else(|err| panic!("`{formula}` term {name}: {err}"));
+            assert_eq!(
+                columns,
+                full.design
+                    .extract_columns(&range.clone().collect::<Vec<_>>()),
+                "`{formula}`: term {name}'s columns must be the full design's over {range:?}"
+            );
+        }
+    }
+
+    // `s(x)` reads nothing of `s(z)`, so a grid whose `z` the full build
+    // rejects still evaluates it.
+    let spec = build_formula("y ~ s(x) + s(z)", &train);
+    let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+        .expect("training design");
+    let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted).expect("freeze");
+    let mut grid = new_rows.clone();
+    grid.column_mut(2).fill(f64::NAN);
+    assert!(
+        crate::smooth::build_term_collection_prediction_design(grid.view(), &frozen).is_err(),
+        "the full build must reject a non-finite `z`"
+    );
+    let reference = crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, "s(x)")
+        .expect("s(x) on finite rows");
+    let columns = crate::smooth::build_term_prediction_columns(grid.view(), &frozen, "s(x)")
+        .expect("s(x) must not build s(z)");
+    assert_eq!(columns, reference);
+}
+
+#[test]
+fn frozen_tensor_design_is_built_without_its_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((29, 4), |(i, j)| match j {
+        1 | 2 => ((i * (j + 5)) % 29) as f64 / 28.0,
+        _ => 0.0,
+    });
+    for formula in [
+        "y ~ te(x, z)",
+        "y ~ ti(x, z)",
+        "y ~ t2(x, z)",
+        "y ~ te(x, z, double_penalty=true)",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let (feature_cols, tensor) = frozen
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+                    Some((feature_cols, spec))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{formula}` has no tensor term"));
+        let build = |realize_penalties: bool| {
+            crate::smooth::build_tensor_bspline_basis(
+                new_rows.view(),
+                feature_cols,
+                tensor,
+                realize_penalties,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` tensor build: {err}"))
+        };
+        let full = build(true);
+        let design_only = build(false);
+        assert!(
+            !full.active_penalties.is_empty(),
+            "`{formula}`: the full build realizes penalties"
+        );
+        assert!(
+            design_only.active_penalties.is_empty() && design_only.dropped_penalties.is_empty(),
+            "`{formula}`: a design-only tensor build must not assemble penalties"
+        );
+        assert_eq!(
+            design_only.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the tensor design must not depend on its penalties"
+        );
+    }
+}
+
+#[test]
+fn frozen_bspline_1d_design_is_built_without_its_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((31, 4), |(i, j)| match j {
+        1 | 2 => ((i * (j + 7)) % 31) as f64 / 30.0,
+        _ => 0.0,
+    });
+    for formula in [
+        "y ~ s(x)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ s(x, bs=\"cr\")",
+        "y ~ s(x, bs=\"cr\", double_penalty=true)",
+        "y ~ s(x, bs=\"cc\")",
+        "y ~ s(x, shape=monotone_increasing)",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let (feature_col, basis_spec) = frozen
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                crate::smooth::SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+                    Some((*feature_col, spec))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{formula}` has no 1-D spline term"));
+        let build = |realize_penalties: bool| {
+            crate::basis::build_bspline_basis_1d_realizing(
+                new_rows.column(feature_col),
+                basis_spec,
+                realize_penalties,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` 1-D spline build: {err}"))
+        };
+        let full = build(true);
+        let design_only = build(false);
+        assert!(
+            !full.active_penalties.is_empty(),
+            "`{formula}`: the full build realizes penalties"
+        );
+        assert!(
+            design_only.active_penalties.is_empty() && design_only.dropped_penalties.is_empty(),
+            "`{formula}`: a design-only 1-D spline build must not assemble penalties"
+        );
+        assert_eq!(
+            design_only.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the 1-D spline design must not depend on its penalties"
+        );
+        assert_eq!(
+            design_only.affine_offset, full.affine_offset,
+            "`{formula}`: the 1-D spline offset must not depend on its penalties"
+        );
+    }
+}
+
 /// A continuous `x` with distinct values beside a categorical `g` whose level
 /// labels are `levels`; row `i` holds level `i % levels.len()`.
 fn categorical_coordinate_dataset(levels: &[&str]) -> Dataset {

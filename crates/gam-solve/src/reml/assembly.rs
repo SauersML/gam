@@ -11,7 +11,7 @@ use super::reml_outer_engine::{
     BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
     HessianDerivativeProvider, HessianFactorization, HyperCoord, HyperCoordPairResult,
     InnerSolution, InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs,
-    PenaltySubspaceTrace, RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
+    PenaltySubspaceTrace, RemlLamlResult, reml_laml_evaluate,
 };
 use crate::model_types::ProjectedKktResidual;
 use gam_linalg::faer_ndarray::{fast_xt_diag_x, fast_xt_diag_y};
@@ -320,39 +320,6 @@ pub fn evaluate_solution(
     prior: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
 ) -> Result<RemlLamlResult, super::reml_outer_engine::RemlLamlError> {
     reml_laml_evaluate(solution, rho, mode, prior)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Penalty coordinate helpers for family modules
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Descriptor for a single penalty block within the parameter vector.
-pub struct PenaltyBlockDesc<'a> {
-    pub matrix: &'a Array2<f64>,
-    pub range_start: usize,
-    pub range_end: usize,
-}
-
-/// Build `PenaltyCoordinate`s from block descriptors.
-///
-/// Replaces the manual `penalty_matrix_root` + `from_block_root` loops
-/// in `survival.rs` and `custom_family.rs`.
-pub fn penalty_coords_from_blocks(
-    blocks: &[PenaltyBlockDesc],
-    total_dim: usize,
-) -> Result<Vec<PenaltyCoordinate>, String> {
-    blocks
-        .iter()
-        .map(|b| {
-            let root = penalty_matrix_root(b.matrix)?;
-            Ok(PenaltyCoordinate::from_block_root(
-                root,
-                b.range_start,
-                b.range_end,
-                total_dim,
-            ))
-        })
-        .collect()
 }
 
 #[cfg(test)]
