@@ -1580,7 +1580,7 @@
     "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
   },
   {
-    "base": "b0efd45a15f5cbf747f8825fcc6fe0774bf60e09",
+    "base": "fb8743205e07b99be01514dd7ae14e4fbddafc85",
     "items": [
       "crates/gam-terms/src/basis/center_selection.rs:const:LOWER_MASK",
       "crates/gam-terms/src/basis/center_selection.rs:const:M",
