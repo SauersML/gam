@@ -627,6 +627,11 @@ pub(crate) fn compute_outer_hessian(
 
                 let correction = if let Some(corrections) = batched_rho_pair_corrections.as_ref() {
                     corrections[pair_idx]
+                } else if !effective_deriv.has_corrections() {
+                    // Fixed curvature (Gaussian identity): the second mode
+                    // response has no drift to trace, so the pair RHS is never
+                    // formed.
+                    0.0
                 } else {
                     let rhs = build_rho_pair_rhs(kk, ll)?;
                     compute_ift_correction_trace(
