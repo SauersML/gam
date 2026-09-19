@@ -246,6 +246,8 @@ pub struct OrthantLogMass {
     /// The share of its full update each site took on the last sweep: 1 unless a sweep failed to
     /// contract.
     fraction: f64,
+    /// `(I − ∂F/∂s)⁻¹` of the linearized fixed point, formed on the first derivative request.
+    site_system_inverse: std::sync::OnceLock<Array2<f64>>,
 }
 
 impl OrthantLogMass {
@@ -264,6 +266,7 @@ impl OrthantLogMass {
             log_mass: 0.0,
             sweeps: 0,
             fraction: 1.0,
+            site_system_inverse: std::sync::OnceLock::new(),
         };
         if q == 0 {
             return Ok(state);
@@ -274,8 +277,19 @@ impl OrthantLogMass {
         loop {
             state.sweeps += 1;
             let (mut at_fixed_point, mut moved) = (true, false);
+            // Sequential EP: each site reads the posterior its predecessors in the sweep left.
+            // Moving site `j` by `(Δτ, Δν)` is a rank-one change of `I + WT`, so the posterior
+            // follows by Sherman–Morrison in O(q²),
+            //   `Σ ← Σ − c s sᵀ`, `μ ← μ + (Δν(1 − cΣ_jj) − cμ_j) s`,
+            //   `s = Σ_{:j}`, `c = Δτ/(1 + ΔτΣ_jj)`,
+            // where `1 + ΔτΣ_jj = Σ_jj(τ_c + τ̃_j^new) > 0` for an admissible cavity. `E` is
+            // re-formed from the sites once per sweep, which also resets the rank-one updates'
+            // accumulated rounding before `ln Z_EP` is read.
+            let (mut sigma, mut mu) = state.posterior();
             for j in 0..q {
-                let (tau_c, nu_c) = state.cavity(j);
+                let s_jj = sigma[[j, j]];
+                let tau_c = 1.0 / s_jj - state.tau[j];
+                let nu_c = mu[j] / s_jj - state.nu[j];
                 if !(tau_c > 0.0 && tau_c.is_finite()) {
                     return Err(ConeNormalizerRefusal::CavityPrecision {
                         row: j,
@@ -288,10 +302,24 @@ impl OrthantLogMass {
                 let tau = (1.0 - fraction) * state.tau[j] + fraction * update.tau;
                 let nu = (1.0 - fraction) * state.nu[j] + fraction * update.nu;
                 moved |= tau != state.tau[j] || nu != state.nu[j];
+                let (delta_tau, delta_nu) = (tau - state.tau[j], nu - state.nu[j]);
                 state.tau[j] = tau;
                 state.nu[j] = nu;
-                state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
+                if delta_tau == 0.0 && delta_nu == 0.0 {
+                    continue;
+                }
+                let c = delta_tau / (1.0 + delta_tau * s_jj);
+                let column = sigma.column(j).to_owned();
+                let mean_step = delta_nu * (1.0 - c * s_jj) - c * mu[j];
+                mu.scaled_add(mean_step, &column);
+                for a in 0..q {
+                    let scaled = c * column[a];
+                    for b in 0..q {
+                        sigma[[a, b]] -= scaled * column[b];
+                    }
+                }
             }
+            state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
             let (log_mass, magnitude) = state.evaluate_log_mass()?;
             let change = (log_mass - previous).abs();
             // Every term of ln Z_EP is formed in O(q²) rounded operations. A damped sweep moves
@@ -326,6 +354,9 @@ impl OrthantLogMass {
         (sigma, mu)
     }
 
+    /// Site `j`'s cavity read from a freshly formed posterior: the re-inverted reference the
+    /// fixed-point tests sweep with.
+    #[cfg(test)]
     fn cavity(&self, j: usize) -> (f64, f64) {
         let (sigma, mu) = self.posterior();
         let s_jj = sigma[[j, j]];
@@ -465,11 +496,35 @@ impl OrthantLogMass {
     ) -> Result<(Array1<f64>, Array1<f64>), ConeNormalizerRefusal> {
         let q = self.m0.len();
         let (sigma, mu) = self.posterior();
-        let d_sigma = self.e.dot(dw).dot(&self.e.t());
+        // Only the diagonal of `dΣ = E dW Eᵀ` enters a cavity.
+        let e_dw = self.e.dot(dw);
         let shift = &self.nu - &(&self.tau * &mu);
-        let d_mu = self.e.dot(dm0) + self.e.dot(&dw.dot(&shift));
-        let mut system = Array2::<f64>::eye(2 * q);
+        let d_mu = self.e.dot(dm0) + e_dw.dot(&shift);
         let mut rhs = Array1::<f64>::zeros(2 * q);
+        for j in 0..q {
+            let s_jj = sigma[[j, j]];
+            let tau_c = 1.0 / s_jj - self.tau[j];
+            let nu_c = mu[j] / s_jj - self.nu[j];
+            let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = site_update(tau_c, nu_c).jacobian;
+            let s2 = s_jj * s_jj;
+            let d_sjj = e_dw.row(j).dot(&self.e.row(j));
+            let (dtc, dnc) = (-d_sjj / s2, d_mu[j] / s_jj - mu[j] * d_sjj / s2);
+            rhs[j] = dt_dtc * dtc + dt_dnc * dnc;
+            rhs[q + j] = dn_dtc * dtc + dn_dnc * dnc;
+        }
+        let ds = self.site_fixed_point_inverse()?.dot(&rhs);
+        Ok((ds.slice(s![0..q]).to_owned(), ds.slice(s![q..2 * q]).to_owned()))
+    }
+
+    /// `(I − ∂F/∂s)⁻¹` at the converged sites. It depends on the fixed point alone, not on the
+    /// direction `(dm₀, dW)`, so it is formed once and shared by every coordinate and pair.
+    fn site_fixed_point_inverse(&self) -> Result<&Array2<f64>, ConeNormalizerRefusal> {
+        if let Some(inverse) = self.site_system_inverse.get() {
+            return Ok(inverse);
+        }
+        let q = self.m0.len();
+        let (sigma, mu) = self.posterior();
+        let mut system = Array2::<f64>::eye(2 * q);
         for j in 0..q {
             let s_jj = sigma[[j, j]];
             let tau_c = 1.0 / s_jj - self.tau[j];
@@ -490,12 +545,9 @@ impl OrthantLogMass {
                 system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
                 system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
             }
-            let (dtc, dnc) = cavity_rate(d_sigma[[j, j]], d_mu[j]);
-            rhs[j] = dt_dtc * dtc + dt_dnc * dnc;
-            rhs[q + j] = dn_dtc * dtc + dn_dnc * dnc;
         }
-        let ds = invert(system, "the linearized EP fixed point")?.dot(&rhs);
-        Ok((ds.slice(s![0..q]).to_owned(), ds.slice(s![q..2 * q]).to_owned()))
+        let inverse = invert(system, "the linearized EP fixed point")?;
+        Ok(self.site_system_inverse.get_or_init(|| inverse))
     }
 }
 
@@ -896,6 +948,48 @@ mod tests {
                 gamma[i]
             );
         }
+    }
+
+    /// gam#3037: EP re-formed `E = (I + WT)⁻¹` by a fresh `q × q` inversion after every site, an
+    /// `O(q⁴)` sweep that held the 3828-row delayed-entry location-scale fit inside one normalizer
+    /// evaluation for over ten minutes. Each site move is a rank-one change of `I + WT`, so the
+    /// sweep follows it by Sherman–Morrison. The fixed point is unchanged: a sweep taken the old
+    /// way, re-inverting after every site, from where the rank-one sweeps stop moves `ln P` by no
+    /// more than its rounding band, and the posterior the sweeps carried agrees with the one
+    /// re-formed from the sites.
+    #[test]
+    fn rank_one_ep_sweeps_reach_the_re_inverted_fixed_point_3037() {
+        let q = 24;
+        // A smooth monotone-guard-like covariance: neighbouring rows strongly correlated.
+        let w = Array2::from_shape_fn((q, q), |(i, j)| {
+            let d = (i as f64 - j as f64) / 4.0;
+            (-0.5 * d * d).exp() + if i == j { 0.05 } else { 0.0 }
+        });
+        let m0 = Array1::from_shape_fn(q, |i| 0.6 * ((i as f64) * 0.7).sin() - 0.2);
+        let mass = OrthantLogMass::converge(&m0, &w)
+            .unwrap_or_else(|refusal| panic!("EP settles on the correlated orthant: {refusal}"));
+        let mut checked = mass.clone();
+        for j in 0..q {
+            let (tau_c, nu_c) = checked.cavity(j);
+            let update = site_update(tau_c, nu_c);
+            checked.tau[j] = update.tau;
+            checked.nu[j] = update.nu;
+            checked.e = inverse_i_plus_wt(&checked.w, &checked.tau).expect("admissible sites");
+        }
+        let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
+        let step_band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
+        eprintln!(
+            "[3037-EP] ln P {:.15e} after {} sweeps; a re-inverted sweep moves it {:e} (band {step_band:e})",
+            mass.log_mass(),
+            mass.sweeps(),
+            (after - mass.log_mass()).abs()
+        );
+        assert!(
+            (after - mass.log_mass()).abs() <= step_band,
+            "a re-inverted sweep from the rank-one stop moves ln P by {:e}, above the band {step_band:e}",
+            (after - mass.log_mass()).abs()
+        );
+        assert!(mass.log_mass() < 0.0 && mass.log_mass().is_finite());
     }
 
     #[test]
