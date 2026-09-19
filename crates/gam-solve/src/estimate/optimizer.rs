@@ -5,7 +5,7 @@ use crate::estimate::evaluation::{
     sas_log_deltaridgeweight,
 };
 use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
-use crate::estimate::penalty::{REML_SEED_SCREENING_RHO_CAP, scaled_covariance};
+use crate::estimate::penalty::scaled_covariance;
 use crate::estimate::prefit::{
     reject_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
     reject_prefit_unpenalized_rank_deficiency,
@@ -14,7 +14,7 @@ use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
-use gam_problem::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
+use gam_problem::OrderedRhoBounds;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -532,62 +532,6 @@ where
     )
 }
 
-pub(crate) fn external_reml_seed_config(k: usize, gaussian_identity: bool) -> SeedConfig {
-    if gaussian_identity {
-        // Profiled Gaussian REML already constructs and scores two
-        // data-derived starts below: the commensurate-curvature `initial.sp`
-        // point and the certified summed-penalty diagonal profile.  Sending
-        // their winner into the generic generated-seed lattice repeats the
-        // same basin decision with arbitrary global shifts and an absolute
-        // `rho=8` probe.  Besides violating SPEC's no-grid-search contract,
-        // that screen dominates small fits: a converged zero-iteration
-        // `y ~ s(x)` fit paid 68 outer cost evaluations / 104 inner solves,
-        // while a ten-penalty saturated fold paid 415 inner solves.
-        //
-        // The analytic candidates are evaluated against the true coupled REML
-        // criterion and adopted only on strict improvement, so they retain the
-        // #1074 over-smoothing escape without a second heuristic search.  A
-        // single generated seed is still required when neither analytic point
-        // beats the invariant neutral anchor.  The ordinary optimizer and its
-        // analytic terminal certificate remain mandatory either way.
-        return SeedConfig {
-            max_seeds: 1,
-            // The generic lattice remains disabled. The three budget slots are
-            // for the unique analytic candidates assembled below: base,
-            // initial.sp, and the summed-penalty diagonal restriction.
-            seed_budget: 3,
-            risk_profile: SeedRiskProfile::Gaussian,
-            screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
-            num_auxiliary_trailing: 0,
-            over_smoothing_probe_rho: None,
-        };
-    }
-    if k >= REML_SEED_SCREENING_RHO_CAP {
-        return SeedConfig {
-            max_seeds: 2,
-            seed_budget: 2,
-            risk_profile: SeedRiskProfile::GeneralizedLinear,
-            screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
-            num_auxiliary_trailing: 0,
-            over_smoothing_probe_rho: None,
-        };
-    }
-    SeedConfig {
-        max_seeds: if k <= 4 {
-            6
-        } else if k <= 12 {
-            8
-        } else {
-            10
-        },
-        seed_budget: 2,
-        risk_profile: SeedRiskProfile::GeneralizedLinear,
-        screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
-        num_auxiliary_trailing: 0,
-        over_smoothing_probe_rho: None,
-    }
-}
-
 /// The resolution the outer certificate's curvature verdict was decided at,
 /// when that verdict admitted the point (#2748, #1561).
 ///
@@ -887,7 +831,7 @@ pub(crate) fn conditioned_outer_response(
 /// load-bearing, and was wrong, is WHERE ψ got captured.
 ///
 /// Until this call existed, ψ was captured opportunistically at the first
-/// non-screening solve that happened to converge — and the persistent warm-start
+/// inner solve that happened to converge — and the persistent warm-start
 /// cache decides which solve that is. It donates `initial_rho`, which
 /// `run_outer_with_plan` inserts as seed 0, and it donates the warm β that
 /// decides whether the pre-search reference solve at ρ = 0 converges at all. So
@@ -903,8 +847,9 @@ pub(crate) fn conditioned_outer_response(
 /// label ρ-coordinates) on a state that has no warm start attached and no
 /// persistent session open, and let the ordinary capture path freeze ψ at THAT
 /// solve's converged η. If the reference point's inner solve does not converge,
-/// the deterministic seed candidates are walked in their generated order, so the
-/// anchor stays a pure function of the problem in every branch.
+/// the caller's full-length heuristic ρ (clamped into the design's
+/// resolvability envelope) is the one other anchor tried, so the anchor stays a
+/// pure function of the problem in every branch.
 ///
 /// The warm-start slots are emptied on the way IN, so the anchor solve cannot
 /// inherit a caller-supplied β. They are deliberately NOT emptied on the way out:
@@ -936,14 +881,12 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor(
     resolved_likelihood_scale: &gam_problem::ResolvedLikelihoodScale,
     k: usize,
     heuristic_log_lambdas: Option<&[f64]>,
-    seed_config: &SeedConfig,
 ) -> Result<(), EstimationError> {
     freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         reml_state,
         resolved_likelihood_scale,
         k,
         heuristic_log_lambdas,
-        seed_config,
         0,
     )
 }
@@ -960,7 +903,6 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
     resolved_likelihood_scale: &gam_problem::ResolvedLikelihoodScale,
     k: usize,
     heuristic_log_lambdas: Option<&[f64]>,
-    seed_config: &SeedConfig,
     external_hyper_count: usize,
 ) -> Result<(), EstimationError> {
     let (frozen, family) = match resolved_likelihood_scale {
@@ -1003,20 +945,17 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
             &reml_state.canonical_penalties,
         )
         .map_err(EstimationError::LayoutError)?;
+    let envelope = gam_problem::OrderedRhoBounds::envelope(
+        domain_lower.iter().copied(),
+        domain_upper.iter().copied(),
+    )?;
     let mut anchors = vec![Array1::<f64>::zeros(k)];
-    anchors.extend(
-        crate::seeding::generate_rho_candidates(
-            k,
-            heuristic_log_lambdas,
-            seed_config,
-            gam_problem::OrderedRhoBounds::envelope(
-                domain_lower.iter().copied(),
-                domain_upper.iter().copied(),
-            )?,
-        )
-        .into_iter()
-        .filter(|candidate| candidate.iter().any(|value| *value != 0.0)),
-    );
+    if let Some(heuristic) = heuristic_log_lambdas.filter(|h| h.len() == k) {
+        let clamped = Array1::from_iter(heuristic.iter().map(|&value| envelope.clamp(value)));
+        if clamped.iter().any(|value| *value != 0.0) {
+            anchors.push(clamped);
+        }
+    }
     for anchor in &anchors {
         if let Err(error) =
             reml_state.compute_cost_with_ext_count(anchor, external_hyper_count)
@@ -1044,10 +983,10 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         // No deterministic anchor produced a converged inner solve. The search
         // is about to try the same points and will report its own refusal;
         // leaving the freeze unset keeps the pre-existing capture path rather
-        // than converting a seed-cascade failure into a different error here.
+        // than converting an outer-search failure into a different error here.
         log::debug!(
             "[OUTER] no deterministic anchor converged for the {family} λ-search freeze; \
-             the outer criterion cannot be pinned before the seed cascade"
+             the outer criterion cannot be pinned before the outer search"
         );
     }
     Ok(())
@@ -1264,7 +1203,6 @@ where
             .store(theta_seed.to_bits(), Ordering::Relaxed);
     }
 
-    let reml_seed_config = external_reml_seed_config(k, cfg.likelihood.spec.is_gaussian_identity());
     // #2363: pin the λ-search nuisance BEFORE any warm start — external, in
     // memory, or on disk — can reach this state. `freeze_lambda_search_nuisance_at_canonical_anchor`
     // documents why the criterion is otherwise a function of the search path.
@@ -1273,7 +1211,6 @@ where
         &resolved_likelihood_scale,
         k,
         heuristic_log_lambdas,
-        &reml_seed_config,
     )?;
     if let Some(store) = opts.persistent_warm_start_store.clone() {
         // Attach only after the canonical nuisance anchor so cache history
@@ -1392,41 +1329,7 @@ where
                     ),
                 )
                 .with_tolerance(reml_tol)
-                // The corrected continuation starts from the certified Laplace
-                // optimum alone: a seed plan would price the correction at every
-                // start for a criterion whose admission that optimum decided.
-                .with_seed_config(if corrected_continuation {
-                    SeedConfig {
-                        max_seeds: 1,
-                        seed_budget: 1,
-                        ..reml_seed_config
-                    }
-                } else {
-                    reml_seed_config
-                })
-                .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
-                // n-scaled absolute gradient floor for EVERY family (#1082).
-                //
-                // The REML/LAML profiled criterion is a sum over n rows
-                // (deviance / −2·loglik + the penalty/logdet terms), so it and its
-                // ∂/∂logλ gradient inherit an O(n) scale for Poisson, NB, binomial,
-                // Tweedie, beta — exactly as for Gaussian-identity. The previous gate
-                // restricted `with_objective_scale` to the Gaussian-identity arm on
-                // the (incorrect) premise that only that criterion is O(n). For a
-                // non-Gaussian tensor/cyclic/CI/badhealth fit at n≈1.5k–5k the fixed
-                // `abs = tol ≈ 1e-6` gradient floor is then orders of magnitude below
-                // the n-scaled gradient's converged residual: the relative-from-seed
-                // test declares convergence iters earlier, but the binding abs floor
-                // keeps the outer optimizer chasing sub-floor log-λ changes, paying a
-                // full inner convergence per phantom iteration until it exhausts
-                // the iteration budget — the #1082 outer-loop "cycling"
-                // timeout. Lifting the floor to ~n·1e-9 (the same calibration the
-                // spatial/custom-family outer already uses via `with_problem_size`,
-                // #1053/#1066/#1069) lets the loop terminate as soon as the relative
-                // reduction is met, for every family, while the relative-to-cost
-                // component still owns the actual convergence decision.
-                .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
                 .with_bounds(rho_model_domain.0.clone(), rho_model_domain.1.clone())
                 // #2954: which of those faces are the terms' limit models, so a
@@ -1483,251 +1386,51 @@ where
             // weights 1 (or any fixed-dispersion family) the anchor is exactly 0, so
             // those fits stay byte-identical.
             let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
-            let gaussian_risk = matches!(
-                reml_seed_config.risk_profile,
-                SeedRiskProfile::Gaussian | SeedRiskProfile::GaussianLocationScale
-            );
-            // Score a small set of analytic, data-derived starts before the outer
-            // solve. These are initial conditions only: the optimizer must converge
-            // from the selected start, and no seed is promoted directly to a fit.
-            // `rho_weight_anchor` is exactly 0 for unit weights and fixed dispersion (#2469).
-            let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean != 0.0;
-            // A caller-supplied rho seed (`init_rhos`/`heuristic_log_lambdas`, now in
-            // rho-space) is an explicit warm-start installed via `with_initial_rho`
-            // above. It still ANCHORS the initial.sp prepass below rather than
-            // short-circuiting it: the prepass only adopts its analytic candidate
-            // when that STRICTLY lowers the true REML/LAML cost, so a healthy warm
-            // seed is returned unchanged (the candidate never beats it → byte-
-            // identical behaviour). What the anchor-and-adopt rescues is a warm seed
-            // TRAPPED in a shallow under-smoothing local basin: when the design's
-            // kernel collapses (e.g. the constant-curvature `curv()` smooth fitted
-            // at a trial κ on the +chart side — the geodesic-exponential kernel's
-            // off-diagonals → 1, so its global REML optimum is a LARGE λ that the
-            // local outer optimizer, warm-started from the previous-κ λ̂, slides away
-            // from into the spurious low-λ optimum). The shallow optimum's
-            // spuriously-low deviance made the κ outer objective monotone toward the
-            // +chart bound for any curved data (gam#1464 — hyperbolic truth recovered
-            // as spherical); the analytic high-λ `initial.sp` candidate lets the
-            // prepass jump into the correct high-λ basin so the per-κ REML cost
-            // matches the textbook profiled-REML and the curvature SIGN is
-            // identifiable. Same machinery as the gam#1266 double-penalty rescue.
-            let caller_seeded_rho = rho_warm_start.is_some_and(|h| h.len() == k);
-            let prepass_candidates: Vec<Array1<f64>> = 'prepass: {
-                // The corrected continuation has one start, the optimum that
-                // admitted the correction (#1082).
-                if corrected_continuation {
-                    break 'prepass Vec::new();
-                }
-                // The prepass scores its analytic candidates against the TRUE
-                // REML/LAML cost and adopts one only on strict improvement, so its
-                // window is the domain the outer optimizer itself searches: the
-                // envelope of the #2812 resolvability domain, both faces (#2902
-                // row 9). A double-penalty null-space smooth (gam#1266) or a
-                // collapsing-kernel spatial smooth (gam#1464) has its global REML
-                // optimum at a large λ beyond a fixed seed band, and a
-                // well-determined smooth can have its commensurate-curvature start
-                // below one. Clamping either to a picked wall moves a data-derived
-                // start onto a face the search does not have. The default anchor is
-                // itself data-derived (the risk shift on the weight scale), so the
-                // lower face is a clamp, not an origin. With no penalty there is no
-                // coordinate to place, and the precision box stands in for the empty
-                // envelope. `OrderedRhoBounds::new` still refuses a non-finite or
-                // inverted interval (#2379).
-                let (envelope_lower, envelope_upper) = if rho_model_domain.0.is_empty() {
-                    crate::estimate::rho_domain::coordinate_domain(None, None)
-                } else {
-                    (
-                        rho_model_domain.0.iter().copied().fold(f64::INFINITY, f64::min),
-                        rho_model_domain.1.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                    )
-                };
-                let seed_bounds = OrderedRhoBounds::new(envelope_lower, envelope_upper)?;
-                // risk_shift is the default seed bias when no caller warm-start is given;
-                // it is NOT applied on top of a caller-supplied rho seed.
-                let risk_shift: f64 = match reml_seed_config.risk_profile {
-                    SeedRiskProfile::Gaussian | SeedRiskProfile::GaussianLocationScale => 0.0,
-                    SeedRiskProfile::GeneralizedLinear => 1.0,
-                    SeedRiskProfile::Survival => 2.0,
-                };
-                // Anchor the prepass at the caller-supplied `heuristic_log_lambdas` when
-                // one is present (it is already in rho-space, used as-is) — the
-                // analytic candidate is scored relative to the warm start and keeps
-                // it unless it is strictly better. Otherwise anchor the default
-                // risk-shift origin to the weight scale (issue #877).
-                let base = if let Some(h) = rho_warm_start.filter(|h| h.len() == k) {
-                    Array1::from_iter(h.iter().map(|&v| seed_bounds.clamp(v)))
-                } else {
-                    Array1::from_elem(k, seed_bounds.clamp(risk_shift + weight_log_geom_mean))
-                };
-                // #2069 / #1575: the analytic mgcv-style `initial.sp` seed
-                // replaces the banned log-λ grid prepass. One commensurate-
-                // curvature estimate — `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` — proposes a
-                // single candidate relative to `base` (the caller warm-start or the
-                // weight-anchored origin). A smooth whose penalized subspace carries
-                // little data support gets a large `λ_j` by construction, so the
-                // #1266/#1464 high-λ basin is reached analytically without a lattice
-                // search; `seed_bounds` spans the domain's faces so a
-                // genuinely large `λ_j` is not clipped to the seed band. The seed is
-                // order-independent, so no canonical permutation is needed.
-                // Two principled, data-derived candidates are scored against the
-                // anchor, each adopted only when it STRICTLY lowers the true
-                // REML/LAML cost — exactly the criterion the old grid used, but
-                // scoring a handful of hand-derived candidates instead of a
-                // lattice. A healthy warm start stays byte-identical (no candidate
-                // beats it → none adopted).
-                //
-                //   1. The mgcv-style analytic `initial.sp` seed
-                //      `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` (#2069/#1575) — a
-                //      commensurate-curvature start that jumps a warm seed
-                //      trapped in a shallow UNDER-smoothing basin into the
-                //      analytic high-λ basin (#1266 double-penalty null-space,
-                //      #1464 collapsing-kernel spatial).
-                //
-                // The generated-seed screen (`generate_rho_candidates` +
-                // `rank_seeds_with_screening`) remains the multi-basin backstop.
-                let initial_sp = reml_state.analytic_initial_sp_rho(&base, seed_bounds);
-                //   2. The certified single-λ (diagonal) profiled optimum on the
-                //      SUMMED penalty `Σ_j S_j`, broadcast to a uniform per-block
-                //      ρ. This is an honest one-dimensional restriction of the
-                //      coupled multi-λ objective: overlapping penalty blocks make
-                //      the penalty pseudo-determinant nonseparable, so there is no
-                //      per-block "exact" cyclic closed form. The candidate is
-                //      admitted only after the true coupled REML cost scores it.
-                // A FAILED seed heuristic must never be fatal. The summed-penalty
-                // profiled-diagonal candidate solves a closed-form REML on the
-                // collapsed 1-D restriction; on a tiny / near-degenerate design
-                // (e.g. `n ≈ nullity` of the summed penalty, the `p ≥ n` corner
-                // reached by `y ~ s(x)` on very few rows, #2355) that closed form
-                // can honestly refuse. That refusal only means "this ONE seed is
-                // unavailable" — the generated-seed screen and the neutral/base
-                // anchors remain, and the outer optimizer is the sole authority on
-                // whether the fit certifies. Propagating the seed error with `?`
-                // instead killed the entire fit for a mere unavailable candidate.
-                // Treat an errored candidate as absent (`None`) so the search still
-                // runs from the surviving seeds.
-                let summed_diagonal = reml_state
-                    .analytic_gaussian_profiled_diagonal_rho(seed_bounds)
-                    .ok()
-                    .flatten()
-                    .map(|rho_blocks| {
-                        let mut seed = base.clone();
-                        for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
-                            *coord = seed_bounds.clamp(r);
-                        }
-                        seed
-                    });
-                let base_cost = reml_state
-                    .compute_cost(&base)
-                    .ok()
-                    .filter(|c| c.is_finite());
-                let mut ranked_candidates: Vec<(f64, Array1<f64>)> = base_cost
-                    .map(|cost| vec![(cost, base.clone())])
-                    .unwrap_or_default();
-                // Keep the strictly-cheapest certified/scored candidate.
-                //
-                // #2607: this choice is a COMPARISON OF NUMBERS, and until now the
-                // log recorded only its outcome (`base -> refined`). That is not
-                // enough to read a seed that lands on a wall. On `hifreq_tensor_k10`
-                // the selected seed is the ρ ceiling in every coordinate and the fit
-                // converges in ONE outer iteration at `edf = 1.294` of `p = 576` —
-                // the intercept — and from the old line alone there is no way to
-                // tell whether the heuristic malfunctioned or whether the criterion
-                // genuinely scores the wall below the origin. Those two call for
-                // completely different fixes, so the costs that decided it are now
-                // reported next to the point they scored.
-                let mut refined = base.clone();
-                let mut best_cost = base_cost;
-                let mut scored: Vec<(&str, Option<f64>)> = vec![("base", base_cost)];
-                for (name, candidate) in [
-                    ("initial_sp", initial_sp),
-                    ("summed_diagonal", summed_diagonal),
-                ] {
-                    let Some(candidate) = candidate else {
-                        scored.push((name, None));
-                        continue;
-                    };
-                    let candidate_cost = reml_state
-                        .compute_cost(&candidate)
-                        .ok()
-                        .filter(|c| c.is_finite());
-                    scored.push((name, candidate_cost));
-                    if let Some(cost) = candidate_cost {
-                        ranked_candidates.push((cost, candidate.clone()));
-                    }
-                    let candidate_beats_best = match (candidate_cost, best_cost) {
-                        (Some(cc), Some(bc)) => cc < bc,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                    if candidate_beats_best {
-                        refined = candidate;
-                        best_cost = candidate_cost;
-                    }
-                }
-                let scored_report = scored
-                    .iter()
-                    .map(|(name, cost)| match cost {
-                        Some(value) => format!("{name}={value:.9e}"),
-                        None => format!("{name}=unavailable"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let seed_moved = refined
-                    .iter()
-                    .zip(base.iter())
-                    // `refined` is `base` bit for bit unless a strictly cheaper candidate
-                    // replaced it, so moved means differs (#2469).
-                    .any(|(&a, &b)| a != b);
-                // For a caller-seeded fit, adopt the analytic result only when it
-                // strictly moved the warm seed (found a strictly-cheaper basin); an
-                // unmoved result leaves the warm start exactly as installed above, so
-                // healthy warm-started fits stay byte-identical. The Gaussian
-                // weight-anchored emit only applies on the non-caller-seeded origin.
-                if seed_moved || (run_gaussian_anchored_prepass && !caller_seeded_rho) {
-                    // Report the start-point comparison, but do not confuse its
-                    // cheapest point with the eventual fit: Gaussian sends every
-                    // unique finite analytic candidate through a certified full
-                    // solve below and keeps the best converged REML value.
-                    log::debug!(
-                        "[OUTER] standard REML analytic-start ranking: {:?} -> {:?} \
-                         (scored: {scored_report}; bounds {:.3}..{:.3})",
-                        base.as_slice().unwrap_or(&[]),
-                        refined.as_slice().unwrap_or(&[]),
-                        seed_bounds.lower(),
-                        seed_bounds.upper(),
-                    );
-                }
-
-                if gaussian_risk {
-                    // A start-point cost is not a basin certificate. Preserve
-                    // every unique finite analytic candidate, ordered only to
-                    // put the cheapest start first; the outer runner performs a
-                    // full certified solve from each and keeps the lowest
-                    // converged REML value. This restores multimodal robustness
-                    // without restoring the arbitrary log-lambda lattice.
-                    ranked_candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let mut candidates = Vec::with_capacity(ranked_candidates.len());
-                    for (_, candidate) in ranked_candidates {
-                        if !candidates.iter().any(|existing| existing == &candidate) {
-                            candidates.push(candidate);
-                        }
-                    }
-                    candidates
-                } else if seed_moved
-                    || (run_gaussian_anchored_prepass && !caller_seeded_rho)
-                {
-                    vec![refined]
-                } else {
-                    Vec::new()
-                }
-            };
-            let problem = if let Some((first, remaining)) = prepass_candidates.split_first() {
-                problem
-                    .with_initial_rho(first.clone())
-                    .with_initial_rho_candidates(remaining.to_vec())
+            // The outer search enters from ONE deterministic, data-derived start
+            // and the certified second-order search owns everything after it.
+            // No candidate is scored, ranked or restarted: a start-point cost is
+            // not a basin certificate, and a lattice of starts is a grid search.
+            //
+            // A caller-supplied full-length ρ (a warm start, a cached optimum, or
+            // the Negative-Binomial alternation's previous ρ̂) is that start as
+            // given, clamped into the search box. Otherwise the start is the
+            // mgcv-style commensurate-curvature `initial.sp` point
+            // `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` (#2069/#1575), which balances each
+            // penalty block against the data curvature it regularizes, so a
+            // block with little data support starts at a large λ_j by
+            // construction (#1266/#1464). Coordinates it cannot place fall back
+            // to the weight-scale anchor `rho_weight_anchor` (exactly 0 for unit
+            // weights and every fixed-dispersion family; #877/#893).
+            //
+            // The window is the domain the outer optimizer itself searches: the
+            // envelope of the #2812 resolvability domain (#2902 row 9). With no
+            // penalty there is no coordinate to place, and the precision box
+            // stands in for the empty envelope. `OrderedRhoBounds::new` refuses a
+            // non-finite or inverted interval (#2379).
+            let (envelope_lower, envelope_upper) = if rho_model_domain.0.is_empty() {
+                crate::estimate::rho_domain::coordinate_domain(None, None)
             } else {
-                problem
+                (
+                    rho_model_domain.0.iter().copied().fold(f64::INFINITY, f64::min),
+                    rho_model_domain.1.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
             };
+            let start_bounds = OrderedRhoBounds::new(envelope_lower, envelope_upper)?;
+            let outer_start = if let Some(h) = rho_warm_start.filter(|h| h.len() == k) {
+                Array1::from_iter(h.iter().map(|&v| start_bounds.clamp(v)))
+            } else {
+                let anchor = Array1::from_elem(k, start_bounds.clamp(weight_log_geom_mean));
+                reml_state
+                    .analytic_initial_sp_rho(&anchor, start_bounds)
+                    .unwrap_or(anchor)
+            };
+            log::debug!(
+                "[OUTER] standard REML single start: {:?} (bounds {:.3}..{:.3})",
+                outer_start.as_slice().unwrap_or(&[]),
+                start_bounds.lower(),
+                start_bounds.upper(),
+            );
+            let problem = problem.with_initial_rho(outer_start);
             // Attach the outer-loop cache session. The session shares its
             // realized-fit-context key with the inner beta record (different
             // payload namespace), so a SIGKILL mid-outer-iter leaves both the
@@ -1738,7 +1441,7 @@ where
                 None => problem,
             };
 
-            let obj = problem.build_objective_with_screening_proxy(
+            let obj = problem.build_objective_with_eval_order(
                 &mut reml_state,
                 |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                     state.compute_cost(rho)
@@ -1774,9 +1477,6 @@ where
                         state.compute_efs_steps(rho)
                     },
                 ),
-                |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
-                    state.compute_screening_proxy(rho)
-                },
             );
             // #2348 Inc 5: standard REML can form its own λ→∞ face limit
             // exactly (the null-space-restricted fit plus the analytic
@@ -1863,13 +1563,6 @@ where
             } else {
                 None
             };
-            let aux_dim_outer = mixture_dim + sas_dim + student_t_dim;
-            let mut reml_seed_config_mix = reml_seed_config;
-            reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
-            if theta_dim >= REML_SEED_SCREENING_RHO_CAP {
-                reml_seed_config_mix.max_seeds = 1;
-                reml_seed_config_mix.seed_budget = 1;
-            }
             use crate::rho_optimizer::OuterProblem;
             use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
             let initial_link_kind = cfg.link_kind.clone();
@@ -1930,7 +1623,6 @@ where
                 // on every evaluation. Use it: BFGS can lose the changing
                 // link/scale coupling and stall with a nonstationary shape.
                 .with_prefer_gradient_only(false)
-                .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
                 .with_psi_dim(mixture_dim + sas_dim + student_t_dim)
                 .with_barrier(
@@ -1939,8 +1631,6 @@ where
                     ),
                 )
                 .with_tolerance(reml_tol)
-                .with_seed_config(reml_seed_config_mix)
-                .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
                 .with_bounds(theta_lower, theta_upper);
             let problem = if let Some(h) = heuristic_theta_ref {
@@ -2378,6 +2068,8 @@ where
                     && reml_state.block_correction_admission_deferred()
                     && reml_state.decide_block_correction_admission(&final_rho)?
                 {
+                    // The corrected search continues from that optimum, its one
+                    // start (#1082).
                     negbin_rho_seed = Some(final_rho.clone());
                     corrected_continuation = true;
                     continuation_curvature = outer_result.final_hessian.clone();
@@ -2442,6 +2134,8 @@ where
             && reml_state.block_correction_admission_deferred()
             && reml_state.decide_block_correction_admission(&final_rho)?
         {
+            // The corrected search continues from that optimum, its one start
+            // (#1082).
             negbin_rho_seed = Some(final_rho.clone());
             corrected_continuation = true;
             continuation_curvature = outer_result.final_hessian.clone();

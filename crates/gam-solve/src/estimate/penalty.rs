@@ -1,12 +1,5 @@
 use super::*;
 
-/// Above this rho dimension, startup work must be linear in "one real solve",
-/// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
-/// deterministic and already centered on the current penalty scale; BFGS/ARC
-/// globalizes from there. Low-dimensional classic smooths keep screening
-/// because the extra probes are cheap and sometimes useful.
-pub(crate) const REML_SEED_SCREENING_RHO_CAP: usize = 4;
-
 const KAHAN_SWITCH_ELEMS: usize = 10_000;
 
 pub(crate) fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {
