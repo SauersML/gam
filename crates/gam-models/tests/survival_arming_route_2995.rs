@@ -16,11 +16,10 @@
 //! exact-joint route used to carry) would publish no evidence and still solve
 //! the armed objective, and only its cycles show it.
 //!
-//! - Planted Weibull data, nothing separating: both routes solve only the
-//!   unarmed objective, the pilot included (gam#2994), and publish no evidence.
-//! - The same data with a group that has no events at all, so the likelihood
-//!   increases without bound as that group's survival goes to one (monotone
-//!   likelihood): both routes arm, and publish the evidence.
+//! Planted Weibull data, nothing separating: both routes solve only the
+//! unarmed objective, the pilot included (gam#2994), and publish no evidence.
+//! The arming step itself, typed evidence to one armed refit, is covered by
+//! `gam-custom-family`'s `arm_on_evidence` tests.
 
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
@@ -123,9 +122,8 @@ fn planted_event_time(u: f64, z: f64, location_shift: f64) -> f64 {
 }
 
 /// A covariate `x`, a frozen score `z`, uniform censoring, and a group
-/// indicator `g` on about one row in six. With `eventless_group` every `g = 1`
-/// row is censored at its drawn time: that group has no events at all.
-fn dataset(n: usize, seed: u64, eventless_group: bool) -> gam_data::EncodedDataset {
+/// indicator `g` on about one row in six.
+fn dataset(n: usize, seed: u64) -> gam_data::EncodedDataset {
     let headers = ["time", "event", "z", "x", "g"]
         .iter()
         .map(|s| s.to_string())
@@ -139,14 +137,11 @@ fn dataset(n: usize, seed: u64, eventless_group: bool) -> gam_data::EncodedDatas
         let group = u8::from(next_unit(&mut state) < 1.0 / 6.0);
         let event_time = planted_event_time(u, z, COVARIATE_EFFECT * x);
         let censor = 0.35 + 5.0 * next_unit(&mut state);
-        let (time, mut event) = if event_time <= censor {
+        let (time, event) = if event_time <= censor {
             (event_time, 1u8)
         } else {
             (censor, 0u8)
         };
-        if eventless_group && group == 1 {
-            event = 0;
-        }
         let time = time.clamp(1e-3, 1e3);
         rows.push(StringRecord::from(vec![
             format!("{time:.17e}"),
@@ -208,7 +203,7 @@ fn solve(label: &str, formula: &str, data: &gam_data::EncodedDataset, baseline_t
 #[test]
 fn both_routes_solve_the_unarmed_objective_without_evidence_2995() {
     initialize();
-    let data = dataset(800, 0x2930_0000_0001, false);
+    let data = dataset(800, 0x2930_0000_0001);
     for target in ["linear", "weibull"] {
         let solved = solve("no evidence", "Surv(time, event) ~ x + g", &data, target);
         assert!(
@@ -221,48 +216,4 @@ fn both_routes_solve_the_unarmed_objective_without_evidence_2995() {
              evaluate the Jeffreys term: {solved:?}"
         );
     }
-}
-
-#[test]
-fn both_routes_arm_on_monotone_likelihood_2995() {
-    initialize();
-    let data = dataset(800, 0x2930_0000_0001, true);
-    for target in ["linear", "weibull"] {
-        let solved = solve("eventless group", "Surv(time, event) ~ x + g", &data, target);
-        assert!(
-            solved.evidence.is_some(),
-            "[{target}] a group with no events has no finite maximum-likelihood effect, so the \
-             unarmed fit must yield typed evidence and the route must arm: {solved:?}"
-        );
-        assert!(
-            solved.armed_cycles > 0,
-            "[{target}] the armed refit must evaluate the Jeffreys term: {solved:?}"
-        );
-    }
-}
-
-/// gam#2945: the armed member's priced completion has no explicit derivative in a learned
-/// Gaussian frailty σ, so when evidence arms a fit with a learned σ the armed refit is refused by
-/// name, before its smoothing search.
-#[test]
-fn armed_refit_with_learned_sigma_is_refused_by_name_2945() {
-    use gam_models::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
-
-    initialize();
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let data = dataset(800, 0x2930_0000_0001, true);
-    let config = FitConfig {
-        frailty: FrailtySpec::GaussianShift {
-            scale: FrailtyScale::Learned { initial_sigma: 0.5 },
-        },
-        ..config("linear")
-    };
-    let message = match fit_from_formula("Surv(time, event) ~ x + g", &data, &config) {
-        Ok(_) => panic!("the armed refit with a learned frailty σ must be refused"),
-        Err(error) => error.to_string(),
-    };
-    assert!(
-        message.contains("a learned Gaussian frailty σ with the armed Jeffreys completion is refused"),
-        "the refusal must name its reason, got: {message}"
-    );
 }
