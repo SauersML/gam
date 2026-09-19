@@ -6994,7 +6994,7 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
                 ((row + 3 * (a + b + c)) as f64 * 0.17).sin()
             })))
         }).collect();
-        let assembled = kernel.all_axes_primary_tensor_pullback(&tensors).unwrap();
+        let assembled = kernel.all_axes_primary_tensor_pullback(&RowSet::All, &tensors).unwrap();
         for axis in 0..p {
             let mut direction = vec![0.0; p];
             direction[axis] = 1.0;
@@ -7185,7 +7185,7 @@ fn rigid_survival_all_axes_tensor_pullback_is_accurate_and_width_invariant_2337(
             .num_threads(workers)
             .build()
             .expect("test worker pool")
-            .install(|| kernel.all_axes_primary_tensor_pullback(&tensors))
+            .install(|| kernel.all_axes_primary_tensor_pullback(&crate::row_kernel::RowSet::All, &tensors))
             .expect("all-axes tensor pullback")
     };
     let one_worker = pullback(1);

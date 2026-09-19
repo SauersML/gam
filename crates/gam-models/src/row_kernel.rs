@@ -1271,6 +1271,41 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// `J·F` for walk positions `[start, end)` of `rows`, one output row per
+/// position. Under `RowSet::All` a position is its row, so this is exactly
+/// [`RowKernel::jacobian_action_matrix_rows`]; under a subsample each run of
+/// consecutive stored rows is one row-range block, so a kernel's structured
+/// GEMM path still serves the gathered rows.
+fn row_set_jacobian_tile<const P: usize, R: RowKernel<P> + ?Sized>(
+    kern: &R,
+    rows: &RowSet,
+    factor: ArrayView2<'_, f64>,
+    start: usize,
+    end: usize,
+) -> Array2<f64> {
+    let RowSet::Subsample { rows: stored, .. } = rows else {
+        return kern.jacobian_action_matrix_rows(factor, start, end);
+    };
+    let positions = &stored[start..end];
+    let mut tile = Array2::<f64>::zeros((positions.len(), P * factor.ncols()));
+    let mut run_start = 0;
+    while run_start < positions.len() {
+        let mut run_end = run_start + 1;
+        while run_end < positions.len() && positions[run_end].index == positions[run_end - 1].index + 1 {
+            run_end += 1;
+        }
+        let first = positions[run_start].index;
+        let block = kern.jacobian_action_matrix_rows(factor, first, first + run_end - run_start);
+        if block.dim() != (run_end - run_start, tile.ncols()) {
+            // Surface the kernel's wrong shape through the caller's tile check.
+            return block;
+        }
+        tile.slice_mut(s![run_start..run_end, ..]).assign(&block);
+        run_start = run_end;
+    }
+    tile
+}
+
 /// Why [`all_axes_symmetric_tensor_pullback`] refused its inputs.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AllAxesPullbackError {
@@ -1289,8 +1324,10 @@ pub(crate) enum AllAxesPullbackError {
 /// axis: `Hdot[e_a] = Σ_i J_iᵀ T_i[J_i e_a] J_i` for every canonical axis `e_a`,
 /// with `J_i` the row's Jacobian from [`RowKernel::jacobian_action_matrix_rows`].
 /// Higher information derivatives first contract their fixed directions into
-/// `tensors`, so every order shares this one assembly. The result is
-/// bit-identical at every thread count.
+/// `tensors`, so every order shares this one assembly. `tensors` holds one
+/// tensor per walk position of `rows`, each pulled back at that position's row
+/// and scaled by its Horvitz–Thompson weight, so every `RowSet` is handled. The
+/// result is bit-identical at every thread count.
 ///
 /// Two contracts, which the assembly does not check:
 /// - Each `tensors[i]` must be FULLY symmetric in `(α, β, γ)`. Only one
@@ -1302,6 +1339,7 @@ pub(crate) enum AllAxesPullbackError {
 ///   caller adds the terms carrying the primaries' own second derivatives.
 pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P> + ?Sized>(
     kern: &R,
+    rows: &RowSet,
     tensors: &[[[[f64; P]; P]; P]],
 ) -> Result<Vec<Array2<f64>>, AllAxesPullbackError> {
     use faer::Accum;
@@ -1317,7 +1355,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
     const ALL_AXES_PULLBACK_ACCUMULATOR_BYTES: usize = 256 << 20;
 
     let p = kern.n_coefficients();
-    let n = gam_math::jet_tower::RowProgram::n_rows(kern);
+    let n = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(kern));
     if tensors.len() != n {
         return Err(AllAxesPullbackError::TensorRowCount {
             tensors: tensors.len(),
@@ -1360,7 +1398,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
             for tile_index in group * n_tiles / n_groups..(group + 1) * n_tiles / n_groups {
                 let start = tile_index * tile;
                 let end = (start + tile).min(n);
-                let jacobian = kern.jacobian_action_matrix_rows(identity.view(), start, end);
+                let jacobian = row_set_jacobian_tile(kern, rows, identity.view(), start, end);
                 if jacobian.dim() != (end - start, P * p) {
                     return Err(AllAxesPullbackError::TileShape {
                         got: jacobian.dim(),
@@ -1384,6 +1422,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
                 for local in 0..end - start {
                     let row = &jacobian_flat[local * P * p..][..P * p];
                     let tensor = &tensors[start + local];
+                    let weight = rows.row_at(start + local).1;
                     let primary_rows: [&[f64]; P] =
                         std::array::from_fn(|primary| &row[primary * p..][..p]);
                     for beta in 0..P {
@@ -1394,7 +1433,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
                                 for alpha in 0..P {
                                     sum += tensor[alpha][beta][gamma] * primary_rows[alpha][a];
                                 }
-                                *value = sum;
+                                *value = weight * sum;
                             }
                         }
                     }
