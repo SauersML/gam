@@ -97,6 +97,13 @@ PCG systems. The BMS marginal-slope FLEX row-Hessian path consults
 `row_primary_hessian_decision(model, n)`, which selects the device kernel
 only for a model the kernel declares. Once the device kernel is selected,
 a GPU error propagates under every policy and is never retried on the CPU.
+The survival marginal-slope rigid row jet takes the same decision,
+`decide_row_kernel`: it declares the four-primary Gaussian frame, so a
+follow-up-varying slope or a declared latent law runs the CPU row program
+under `gpu=auto` and is refused at fit entry under `gpu=required`. Both
+decisions probe the device only when the answer depends on it; a model
+outside the declaration, `gpu=off`, or an `auto` workload below the floor
+every dispatch policy shares never creates a CUDA context.
 
 ## Transfer And Precision Policy
 

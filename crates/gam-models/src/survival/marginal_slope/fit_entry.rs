@@ -1834,6 +1834,19 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             FlexActivation::On,
         )
         .map_err(FitFailure::invariant)?;
+        // The row-jet decision every rigid cache build reads, made once before
+        // the search: `gpu=required` for a frame the device row jet does not
+        // compute is refused here, naming the missing capability, instead of at
+        // every trial point (gam#3000). Flexible, time-wiggle and per-score fits
+        // never build a rigid row-kernel cache.
+        if !(initial_family.flex_active()
+            || initial_family.flex_timewiggle_active()
+            || initial_family.per_z_slope_active())
+        {
+            in_slope_frame!(initial_family, P, Frame, {
+                rigid_row_jet_decision::<P, Frame>(initial_family.n).map_err(FitFailure::input)?;
+            });
+        }
         let (joint_gradient, joint_hessian) =
             custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
         let analytic_joint_gradient_available = analytic_joint_derivatives_available
