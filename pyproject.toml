@@ -76,7 +76,7 @@ cuda = [
   "nvidia-cusparse-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
   "nvidia-nvjitlink-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
-pandas = ["pandas>=2.0", "pyarrow>=14"]
+pandas = ["pandas>=2.0"]
 plot = ["matplotlib>=3.8"]
 sklearn = ["scikit-learn>=1.4"]
 all = [
@@ -93,6 +93,7 @@ test = [
   "pytest>=8",
   "pandas>=2.0",
   "pyarrow>=14",
+  "polars>=1",
   "matplotlib>=3.8",
   "scikit-learn>=1.4",
 ]

@@ -18,7 +18,8 @@ top_function_call = { SOI ~ function_call ~ EOI }
 top_expr = { SOI ~ expr ~ EOI }
 formula = { SOI ~ expr ~ "~" ~ rhs ~ EOI }
 rhs = { term ~ ("+" ~ term)* }
-term = { expr }
+term = { automatic_rest | expr }
+automatic_rest = @{ "." ~ !ASCII_DIGIT }
 
 expr = { sum }
 sum = { product ~ (add_op ~ product)* }
@@ -2491,6 +2492,16 @@ pub fn parse_surv_interval_response(
 /// [`parse_formula`] stores as the response. `None` when the formula does not
 /// parse, or when the response is a `Surv(...)` or `SurvInterval(...)` call
 /// naming several columns.
+/// Source text of the automatic `.` term: "every data column the rest of the
+/// fit does not already use". It is expanded against the data schema by
+/// [`crate::inference::automatic_formula::expand_automatic_formula`].
+pub const AUTOMATIC_REST_TERM: &str = ".";
+
+pub(crate) fn formula_rhs_terms(formula: &str) -> Result<(String, Vec<String>), String> {
+    let parsed = parse_formula_dsl(formula)?;
+    Ok((parsed.response_expr, parsed.rhs_terms))
+}
+
 pub fn formula_response_column(formula: &str) -> Option<String> {
     let response = parse_formula_dsl(formula).ok()?.response_expr;
     match (
@@ -2661,6 +2672,13 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
         if t == "0" || t == "-1" {
             return Err(FormulaDslError::IncompatibleTerm {
                 reason: "formula terms '0'/'-1' (intercept removal) are not supported yet"
+                    .to_string(),
+            });
+        }
+        if t == AUTOMATIC_REST_TERM {
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: "the `.` term (every remaining column) must be expanded against the \
+                         data before parsing; fit entry points expand it automatically"
                     .to_string(),
             });
         }
