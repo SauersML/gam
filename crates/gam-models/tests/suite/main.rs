@@ -17,4 +17,5 @@ mod multinomial_predictive_ratio_2612;
 mod multinomial_separation_arming_2612;
 mod production_row_program_policy;
 mod standard_reml_outer_search_2817;
+mod two_level_label_response_and_row_floor;
 mod warm_start_from;

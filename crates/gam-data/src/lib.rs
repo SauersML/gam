@@ -7,7 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
-fn natural_level_cmp(a: &str, b: &str) -> Ordering {
+/// The canonical order of categorical level labels: byte order, except that
+/// runs of ASCII digits compare by numeric value (`"x2" < "x10"`). Every
+/// surface that sorts levels (canonical codes, two-level response coding)
+/// uses this one comparator.
+pub fn natural_level_cmp(a: &str, b: &str) -> Ordering {
     let mut ia = 0;
     let mut ib = 0;
     let ba = a.as_bytes();

@@ -18,6 +18,7 @@ pub use columns::{
     resolve_weight_column,
 };
 pub(crate) use columns::resolve_continuous_column;
+pub(crate) use family::code_two_level_label_response;
 pub use family::{
     FamilyNuisanceOverrides, is_multinomial_family_name, resolve_family, response_column_kind,
     scalar_family_from_name,

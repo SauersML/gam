@@ -23,9 +23,11 @@ pub(crate) fn materialize_standard<'a>(
         });
     }
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
-    let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
+    let mut y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
     let y_kind = response_column_kind(data, y_col);
     let mut inference_notes = FitNotes::default();
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    reject_too_few_rows_for_formula(parsed, weights.view())?;
 
     let link_choice = effective_link_choice_for_materialize(parsed, config)?;
     let family = resolve_family(
@@ -33,9 +35,16 @@ pub(crate) fn materialize_standard<'a>(
         config.negative_binomial_theta,
         link_choice.as_ref(),
         y.view(),
-        y_kind,
+        y_kind.clone(),
         &parsed.response,
     )?;
+    code_two_level_label_response(
+        &family,
+        &y_kind,
+        &mut y,
+        &parsed.response,
+        &mut inference_notes,
+    );
 
     // Per-family response-support validation (#335 Gamma requires y > 0;
     // #337 Poisson/NegativeBinomial require y ≥ 0; mirrors the Beta
@@ -117,7 +126,6 @@ pub(crate) fn materialize_standard<'a>(
         }
     }
 
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let latent_cloglog = if family.is_latent_cloglog() {
         let sigma = match config.frailty.clone() {

@@ -1105,10 +1105,15 @@ impl ResponseFamily {
     /// Auto-infer a likelihood family when the user did not specify one.
     ///
     /// Policy:
-    ///   * A string-valued (`Categorical`) response column is refused —
-    ///     numeric-encoded level indices (e.g. `"yes"`/`"no"` → `0.0`/`1.0`)
-    ///     would otherwise be silently interpreted as a binary outcome,
-    ///     producing a probability model the user never asked for.
+    ///   * A string-valued (`Categorical`) response column with exactly two
+    ///     levels (e.g. `"yes"`/`"no"`) is a binary outcome and maps to
+    ///     `Binomial`. The fit orchestration layer codes its levels to `0`/`1`
+    ///     in canonical sorted level order before the fit, so the second
+    ///     level in sorted order is the event.
+    ///   * Any other string-valued response column is refused: its level
+    ///     indices (`0.0, 1.0, 2.0, ...`) are labels, not counts or magnitudes,
+    ///     and reading them as either would produce a model the user never
+    ///     asked for.
     ///   * A strictly-binary numeric response (`Binary` kind, or `Numeric`
     ///     with only `{0, 1}` values) maps to `Binomial`.
     ///   * A non-negative integer-valued count response (every value finite,
@@ -1128,6 +1133,7 @@ impl ResponseFamily {
         y_kind: ResponseColumnKind,
     ) -> Result<Self, ResponseInferenceRefusal> {
         match y_kind {
+            ResponseColumnKind::Categorical { levels } if levels.len() == 2 => Ok(Self::Binomial),
             ResponseColumnKind::Categorical { levels } => Err(ResponseInferenceRefusal {
                 reason: ResponseInferenceRefusalReason::NonNumericResponse,
                 levels,
@@ -1333,7 +1339,8 @@ impl std::error::Error for ResponseDegeneracy {}
 ///
 /// `Categorical { levels }` flags a column that arrived as non-numeric strings
 /// (the ingest layer encoded its levels to `0.0, 1.0, ...` indices) — the
-/// `levels` list is preserved so the auto-inference refusal can echo them
+/// `levels` list is preserved so a two-level column can be coded as a binary
+/// outcome and any other level count's auto-inference refusal can echo them
 /// back to the user verbatim. `Binary` is the ingest-layer signal that a
 /// numeric column already contains only `{0, 1}` (used to short-circuit the
 /// scan inside [`ResponseFamily::infer_from_response`]). `Numeric` is the
@@ -1381,10 +1388,12 @@ impl ResponseInferenceRefusal {
                     format!("[{head}]")
                 };
                 format!(
-                    "response column '{name}' contains non-numeric values {preview}. \
-                     Did you mean to use family='binomial' for a binary outcome, \
-                     or does '{name}' contain categorical labels that should be encoded first?",
+                    "response column '{name}' holds {count} distinct non-numeric label(s) \
+                     {preview}; a family is inferred only for a two-level label column \
+                     (binomial). Name the family explicitly (family='multinomial' for a \
+                     categorical outcome), or encode '{name}' numerically first.",
                     name = response_name,
+                    count = self.levels.len(),
                     preview = preview,
                 )
             }
@@ -3676,15 +3685,34 @@ mod tests {
     }
 
     #[test]
-    fn infer_categorical_kind_refuses() {
-        let y = arr1(&[0.0_f64, 1.0]);
+    fn infer_two_level_categorical_kind_gives_binomial() {
+        let y = arr1(&[0.0_f64, 1.0, 1.0]);
         let result = ResponseFamily::infer_from_response(
             y.view(),
             ResponseColumnKind::Categorical {
                 levels: vec!["yes".to_string(), "no".to_string()],
             },
         );
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(ResponseFamily::Binomial)));
+    }
+
+    #[test]
+    fn infer_categorical_kind_with_other_level_counts_refuses() {
+        for levels in [vec!["a"], vec!["a", "b", "c"]] {
+            let y = arr1(&vec![0.0_f64; levels.len()]);
+            let levels: Vec<String> = levels.into_iter().map(str::to_string).collect();
+            let count = levels.len();
+            let refusal = ResponseFamily::infer_from_response(
+                y.view(),
+                ResponseColumnKind::Categorical { levels },
+            )
+            .expect_err("only a two-level label column infers a family");
+            let message = refusal.message_for("y");
+            assert!(
+                message.contains(&format!("holds {count} distinct non-numeric")),
+                "{message}"
+            );
+        }
     }
 
     #[test]
