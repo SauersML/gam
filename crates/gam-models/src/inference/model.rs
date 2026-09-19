@@ -115,14 +115,28 @@ use std::path::Path;
 // loads: a zero log-σ predictor makes σ ≡ 1, and an all-zero warp (the reduced
 // parametric-AFT lift, the σ-scaled log-t baseline of #892) fits `h ≡ 0`, where the two
 // kernels agree.
-// v27 stops persisting per-row training data in a standard fit (speed F6): the exact
+// v27 records which rule selected a custom-family fit's coefficient mode
+// (`FitArtifacts::coefficient_mode_selection`, gam#2661): the #2661 anchored continuation, a
+// family objective homotopy, a unique mode, or the caller's seed when no rule applied. The field
+// carries a serde default, so an older payload loads as `NotRecorded`, which claims nothing; a
+// v26 binary refuses a v27 payload by version.
+// v28 stops persisting per-row training data in a standard fit (speed F6): the exact
 // full-conformal field keeps only the p × p frozen penalty `s_lambda` (the labeled rows are
 // supplied again at prediction time), and `FitGeometry::working` (the final PIRLS weights and
 // working response, n each) is no longer serialized, so a saved standard GAM no longer grows
-// with the training rows. A v26 or older payload still loads: its conformal `x` and `y` and
-// its working geometry are read past and dropped. A v26 binary refuses a v27 payload by
+// with the training rows. A v27 or older payload still loads: its conformal `x` and `y` and
+// its working geometry are read past and dropped. A v27 binary refuses a v28 payload by
 // version instead of failing on the conformal field's missing `x`.
-pub const MODEL_PAYLOAD_VERSION: u32 = 27;
+pub const MODEL_PAYLOAD_VERSION: u32 = 28;
+
+/// The schema before the saved model stopped persisting training rows (speed F6), whose
+/// only difference is the conformal field's `x` and `y` and the serialized working
+/// geometry, both of which this binary reads past.
+const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = 27;
+
+/// The schema before the coefficient-mode record (gam#2661), whose only difference from
+/// [`TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION`] is that field's absence.
+const MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 26;
 
 /// The first payload version whose survival location-scale kernel divides the whole
 /// residual by σ (#2695).
@@ -131,11 +145,6 @@ pub const WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION: u32 = 26;
 /// The schema before [`WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION`]. Its only difference is
 /// the survival location-scale kernel, whose old payloads the family validator judges.
 const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
-
-/// The schema before the saved model stopped persisting training rows (speed F6), whose
-/// only difference is the conformal field's `x` and `y` and the serialized working
-/// geometry, both of which this binary reads past.
-const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION;
 
 /// The schema before the certified outer point (`warm_start_from`), whose only difference
 /// from [`LOCATION_ONLY_SCALE_PAYLOAD_VERSION`] is that record's absence.
@@ -171,9 +180,10 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 10] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 11] = [
     MODEL_PAYLOAD_VERSION,
     TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+    MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
     LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
     OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
     RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
@@ -6651,6 +6661,8 @@ mod tests {
                 covariance_declined: None,
                 jeffreys_arming_evidence: None,
                 outer_warm_start: None,
+                coefficient_mode_selection:
+                    gam_solve::model_types::CoefficientModeSelection::NotRecorded,
             },
             inner_cycles: 0,
         })
@@ -7488,6 +7500,7 @@ mod tests {
         for version in [
             MODEL_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
             RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
@@ -7503,10 +7516,17 @@ mod tests {
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
         assert_eq!(TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
-        assert_eq!(WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION, TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION);
+        assert_eq!(
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
+            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION
+        );
         assert_eq!(
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
-            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,

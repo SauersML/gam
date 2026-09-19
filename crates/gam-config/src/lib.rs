@@ -245,9 +245,6 @@ pub(crate) fn resolve_fit_request_config(
     if let Some(root) = json_config.persistent_warm_start_root {
         fit_config = fit_config.with_persistent_warm_start_root(root);
     }
-    // Validated in `FitConfig::resolve()` below, like the survival anchor.
-    fit_config.outer_tol = json_config.outer_tol;
-    fit_config.inner_tol = json_config.inner_tol;
     if let Some(raw_gpu) = json_config.gpu {
         fit_config.gpu_policy = parse_gpu_policy(&raw_gpu)?;
     }
@@ -425,28 +422,22 @@ mod tests {
         );
     }
 
-    /// gnomon-c9: a converged reference fit needs tighter solver tolerances than
-    /// the defaults, and the wire document had no key for them. Absent keys stay
-    /// `None` so each route keeps its own default; set keys reach `FitConfig`
-    /// exactly; a tolerance that is not finite and positive is refused by name.
+    /// Solver tolerances are derived from the problem (gam SPEC 18-23), so the wire
+    /// document has no key for one: `outer_tol` and `inner_tol` are refused by
+    /// name, like `outer_max_iter` above.
     #[test]
-    fn solver_tolerances_thread_from_the_wire_document() {
-        let defaulted = resolved_json(json!({})).expect("empty config resolves");
-        assert_eq!(defaulted.outer_tol, None);
-        assert_eq!(defaulted.inner_tol, None);
-
-        let set = resolved_json(json!({"outer_tol": 1e-8, "inner_tol": 1e-9}))
-            .expect("explicit tolerances resolve");
-        assert_eq!(set.outer_tol, Some(1e-8));
-        assert_eq!(set.inner_tol, Some(1e-9));
-
-        for (key, value) in [("outer_tol", 0.0), ("inner_tol", -1e-6)] {
+    fn solver_tolerances_are_refused_by_the_wire_document() {
+        for key in ["outer_tol", "inner_tol"] {
             let config = Value::Object(serde_json::Map::from_iter([(
                 key.to_string(),
-                json!(value),
+                json!(1e-8),
             )]));
-            let error = resolved_json(config).expect_err("a non-positive tolerance is refused");
-            assert!(error.contains(key), "{error}");
+            let error = serde_json::from_value::<FitRequestConfigDocument>(config)
+                .expect_err("the wire document has no tolerance key");
+            assert!(
+                error.to_string().contains(&format!("unknown field `{key}`")),
+                "{error}"
+            );
         }
     }
 

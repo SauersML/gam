@@ -11,10 +11,16 @@ Three stages, each one job:
              set and writes, into ``--out-dir``:
                post_norm.npy       float32 (rows x hidden) MLP input at ``layer``,
                                    i.e. the post-norm activation the MLP sees
+               pre_norm.npy        float32 (rows x hidden) input of that layer's
+                                   ``post_attention_layernorm``: the stream the
+                                   norm in front of the MLP reads, same rows
                <param>.npy         float64, every parameter of that MLP under
                                    its torch name (e.g. ``gate_proj.weight``)
+               post_attention_layernorm.<param>.npy
+                                   float64, every parameter of that norm
                meta.json           checkpoint revision, config fields, context
-                                   set definition, row count, library versions
+                                   set definition, row count, the norm's class
+                                   and epsilon, library versions
 
 ``pair``     runs the first ``layer + 2`` blocks over the same kind of context
              set and writes, for composing the MLP of block ``layer`` into the
@@ -133,6 +139,7 @@ def harvest(args: argparse.Namespace) -> int:
     tok = AutoTokenizer.from_pretrained(args.model, revision=args.revision, local_files_only=True)
     backbone = model
     mlp = backbone.layers[args.layer].mlp
+    norm = backbone.layers[args.layer].post_attention_layernorm
     hidden = int(cfg.hidden_size)
     print(
         f"[harvest] model={args.model} type={cfg.model_type} act={cfg.hidden_act} "
@@ -144,34 +151,50 @@ def harvest(args: argparse.Namespace) -> int:
 
     keep = args.seq_len - args.skip_positions
     rows = args.windows * keep
-    acts = np.lib.format.open_memmap(
-        os.path.join(args.out_dir, "post_norm.npy"),
-        mode="w+",
-        dtype=np.float32,
-        shape=(rows, hidden),
-    )
+    arrays = {
+        key: np.lib.format.open_memmap(
+            os.path.join(args.out_dir, f"{key}.npy"),
+            mode="w+",
+            dtype=np.float32,
+            shape=(rows, hidden),
+        )
+        for key in ("post_norm", "pre_norm")
+    }
     captured: dict[str, torch.Tensor] = {}
 
-    def grab(_module, inputs):
-        captured["h"] = inputs[0]
+    def grab(key: str):
+        def hook(_module, inputs):
+            captured[key] = inputs[0]
 
-    handle = mlp.register_forward_pre_hook(grab)
+        return hook
+
+    handles = [
+        mlp.register_forward_pre_hook(grab("post_norm")),
+        norm.register_forward_pre_hook(grab("pre_norm")),
+    ]
     filled = 0
     with torch.no_grad():
         for start in range(0, args.windows, args.batch):
             backbone(input_ids=windows[start : start + args.batch], use_cache=False)
-            block = captured["h"][:, args.skip_positions :, :].reshape(-1, hidden)
-            acts[filled : filled + block.shape[0]] = block.numpy()
+            for key, acts in arrays.items():
+                block = captured[key][:, args.skip_positions :, :].reshape(-1, hidden)
+                acts[filled : filled + block.shape[0]] = block.numpy()
             filled += block.shape[0]
             print(f"[harvest] windows {start + block.shape[0] // keep}/{args.windows}", flush=True)
-    handle.remove()
-    acts.flush()
+    for handle in handles:
+        handle.remove()
+    for acts in arrays.values():
+        acts.flush()
 
     params = {}
     for name, p in mlp.named_parameters():
         path = os.path.join(args.out_dir, f"{name}.npy")
         np.save(path, p.detach().to(torch.float64).numpy())
         params[name] = list(p.shape)
+    norm_params = {}
+    for name, p in norm.named_parameters():
+        np.save(os.path.join(args.out_dir, f"post_attention_layernorm.{name}.npy"), p.detach().to(torch.float64).numpy())
+        norm_params[name] = list(p.shape)
 
     meta = {
         "stage": "harvest",
@@ -188,8 +211,12 @@ def harvest(args: argparse.Namespace) -> int:
         "forward_dtype": "float32",
         "mlp_class": type(mlp).__name__,
         "mlp_params": params,
+        "norm_class": type(norm).__name__,
+        "norm_epsilon": float(getattr(norm, "variance_epsilon", getattr(norm, "eps", float("nan")))),
+        "norm_params": norm_params,
         "context_set": context_set,
         "post_norm_rows": rows,
+        "pre_norm_rows": rows,
         "versions": _versions(),
         "seconds": round(time.time() - t0, 1),
     }

@@ -3167,6 +3167,7 @@ fn fit_bounded_term_collection_with_design(
                     // search's stationarity certificate, which the custom-family
                     // fit already carries; it is threaded through, not dropped.
                     criterion_certificate: fit.artifacts.criterion_certificate.clone(),
+                    coefficient_mode_selection: fit.artifacts.coefficient_mode_selection.clone(),
                     ..Default::default()
                 },
                 inner_cycles: 0,

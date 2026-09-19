@@ -3563,7 +3563,7 @@ mod tests {
         }
     }
 
-    /// A v26 payload persisted the training `x` and `y` beside `s_lambda` in the
+    /// A v27 or older payload persisted the training `x` and `y` beside `s_lambda` in the
     /// conformal field. It must still load (reading `s_lambda` alone), and the
     /// field it re-serializes to carries no per-row data.
     #[test]
@@ -3580,7 +3580,7 @@ mod tests {
         });
 
         let penalty: ExactFullConformalPenalty =
-            serde_json::from_value(legacy).expect("a v26 conformal substrate must load");
+            serde_json::from_value(legacy).expect("a v27 conformal substrate must load");
         assert_eq!(penalty.p(), p);
 
         let reencoded = serde_json::to_value(&penalty).expect("serialize penalty");

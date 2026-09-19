@@ -77,7 +77,7 @@ struct PyPredictOptions {
 /// makes detaching work from the GIL a constant-time ownership transfer without
 /// cloning the fitted payload. The summary is derived from the typed model on
 /// first use and retained, so summary-backed accessors never rebuild it.
-#[pyclass(name = "_FittedModel", frozen)]
+#[pyclass(module = "gamfit._rust", name = "_FittedModel", frozen)]
 struct PyFittedModel {
     model: Arc<FittedModel>,
     summary: std::sync::OnceLock<serde_json::Value>,

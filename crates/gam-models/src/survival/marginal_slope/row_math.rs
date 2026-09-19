@@ -1982,12 +1982,13 @@ pub(crate) fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f
 }
 
 /// Row-level primary value, gradient, and Hessian lowered from the canonical
-/// [`rigid_row_nll`] program.
+/// [`rigid_row_nll`] program, for a caller that holds a row's primaries and
+/// scalar inputs without a family (the pilot baseline slope).
 ///
-/// Every live K=1 caller (pilot initialization, sigma evaluation,
-/// identifiability compilation, KKT refusal, and the `RowKernel`) therefore
-/// executes the same direct scalar schedule, including its leaf curvature and
-/// cross terms.
+/// `covariance_ones` is the row's latent-score variance `1ᵀΣ(a)1`, the
+/// conditional covariance the family's own row inputs read (gam#2766). A
+/// caller states it; a hidden unit value made the trust region score its
+/// trials on another likelihood than the frame kernel's (gam#2952).
 ///
 /// `w_entry` weighs the entry survival factor: `w` for a delayed entry and `0`
 /// for a row entering at the time origin, which has none (gnomon#2336).
@@ -1998,6 +1999,7 @@ pub(crate) fn row_primary_closed_form(
     qd1: f64,
     g: f64,
     z: f64,
+    covariance_ones: f64,
     w: f64,
     w_entry: f64,
     d: f64,
@@ -2010,7 +2012,7 @@ pub(crate) fn row_primary_closed_form(
         wi_entry: w_entry,
         di: d,
         z_sum: z,
-        covariance_ones: 1.0,
+        covariance_ones,
         probit_scale,
         qd1_lower: derivative_guard,
         anchor: None,
@@ -2616,7 +2618,7 @@ mod tests {
         for &(q0, q1, qd1, g, z, w, d, scale) in &cases {
             // Parity pin on the exact benchmarked inputs (the richer sweep
             // lives in `canonical_rigid_order2_matches_strongest_hand_schedule_932`).
-            let canonical = row_primary_closed_form(q0, q1, qd1, g, z, w, w, d, 1.0e-8, scale)
+            let canonical = row_primary_closed_form(q0, q1, qd1, g, z, 1.0, w, w, d, 1.0e-8, scale)
                 .expect("canonical rigid row");
             let hand = test_support::row_primary_closed_form_hand_reference(
                 q0, q1, qd1, g, z, w, d, 1.0e-8, scale,
@@ -2640,7 +2642,7 @@ mod tests {
                 0x9320_5CA1 ^ (d.to_bits() >> 60),
                 batched(64, |nudge| {
                     let (value, gradient, hessian) =
-                        row_primary_closed_form(q0, q1, qd1, g + nudge, z, w, w, d, 1.0e-8, scale)
+                        row_primary_closed_form(q0, q1, qd1, g + nudge, z, 1.0, w, w, d, 1.0e-8, scale)
                             .expect("canonical rigid row");
                     value + gradient[0] + hessian[0][0]
                 }),
@@ -2691,7 +2693,7 @@ mod tests {
         };
 
         for (case, &(q0, q1, qd1, g, z, w, d, scale)) in cases.iter().enumerate() {
-            let canonical = row_primary_closed_form(q0, q1, qd1, g, z, w, w, d, 1.0e-8, scale)
+            let canonical = row_primary_closed_form(q0, q1, qd1, g, z, 1.0, w, w, d, 1.0e-8, scale)
                 .expect("canonical rigid row");
             let hand = test_support::row_primary_closed_form_hand_reference(
                 q0, q1, qd1, g, z, w, d, 1.0e-8, scale,
