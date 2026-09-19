@@ -3404,11 +3404,10 @@ pub(crate) fn fit_survival_transformation_model(
                 // column carrying the shape. The `−shape·log_scale` LOCATION that
                 // the dropped constant column used to seed is folded into the mean
                 // intercept instead. This REQUIRES the covariate block to carry an
-                // intercept to absorb the location — guaranteed because intercept
-                // removal (`~ x - 1`) is a typed refusal at formula_dsl.rs:2456. The
-                // check below is a real invariant guard, not a comment: if that ban
-                // is ever lifted, the location has no home and the fit must refuse
-                // here rather than silently mis-seed a singular direction.
+                // intercept to absorb the location. A formula whose terms leave no
+                // model constant (`~ x - 1` with nothing spanning 1, i.e.
+                // `ModelLevel::NoIntercept`) gives the location no home, so the fit
+                // refuses below rather than mis-seed a singular direction.
                 if p_time_total < 1 {
                     return Err(FitFailure::raised(
                         gam_problem::FailureCategory::Invariant,
@@ -3421,8 +3420,8 @@ pub(crate) fn fit_survival_transformation_model(
                     return Err(FitFailure::raised(
                         gam_problem::FailureCategory::Input,
                         "weibull survival fit requires a mean intercept to carry the baseline \
-                         location, but the covariate design has none (intercept suppression such \
-                         as `~ x - 1` is unsupported; see formula_dsl.rs:2456)",
+                         location, but the covariate design has none (the formula removes the \
+                         intercept, e.g. `~ x - 1`, and no term spans the constant)",
                     ));
                 }
                 beta0[0] = shape;
@@ -3443,7 +3442,19 @@ pub(crate) fn fit_survival_transformation_model(
             Ok::<_, FitFailure>((prepared, penalty_blocks, beta0, structural_lower_bounds, model))
         };
 
-    if baseline_cfg.target != SurvivalBaselineTarget::Linear {
+    if let Some(direct_sum) = crate::survival::construction::weibull_scaffold_direct_sum(
+        &baseline_cfg,
+        &spec.time_build,
+        true,
+        spec.timewiggle.is_some(),
+        spec.covariate_spec.level,
+    ) {
+        // The Weibull scaffold lies in span{1, log t} = the location's constant
+        // plus a flat, cone-interior direction of the I-spline time block, so
+        // the fit's model space is exactly the Linear-target one and there is
+        // no θ to search (Thm 5.1; see `weibull_scaffold_direct_sum`).
+        baseline_cfg = direct_sum;
+    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
         // Analytic-gradient BFGS over the baseline shape params (weibull
         // scale/shape; gompertz rate/shape; gompertz-makeham rate/shape/makeham).
         //
@@ -3462,8 +3473,10 @@ pub(crate) fn fit_survival_transformation_model(
         // with r^* = WorkingModelSurvival::offset_channel_residuals(β̂) and the
         // η-channel offset partials supplied by baseline_offset_theta_partials
         // (contracted by baseline_chain_rule_gradient). See the derivation header
-        // on baseline_chain_rule_gradient. BFGS over this exact gradient converges
-        // in ≲10 outer evaluations on the 2–3 dim surface.
+        // on baseline_chain_rule_gradient. Only scaffolds outside the Weibull
+        // direct sum reach this search (Gompertz / Gompertz-Makeham shapes, a
+        // time-wiggle, a non-I-spline time basis, or no model constant), where θ
+        // is not absorbed by the time block.
         // The search takes text (survival construction), so a candidate's
         // failure is kept typed here (#2937). The outer engine never retries a
         // thrown objective error: it ends the search, so the kept failure is the

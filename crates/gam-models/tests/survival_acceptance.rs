@@ -24,6 +24,8 @@ mod location_scale_heteroscedastic_globalization_1569;
 mod margslope_face_criterion_fd_2894;
 #[path = "survival_acceptance/moving_law_certificate_2926.rs"]
 mod moving_law_certificate_2926;
+#[path = "survival_acceptance/weibull_scaffold_direct_sum_1561.rs"]
+mod weibull_scaffold_direct_sum_1561;
 
 fn initialize_cpu_fitting() {
     static INIT: std::sync::Once = std::sync::Once::new();
