@@ -4745,58 +4745,6 @@ pub struct CurvatureWalkReport {
     pub reseeds: usize,
 }
 
-pub(crate) fn sae_cholesky_solve_neg_gradient(
-    h: ArrayView2<'_, f64>,
-    g: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let n = h.nrows();
-    if h.ncols() != n || g.len() != n {
-        return Err(format!(
-            "sae_cholesky_solve_neg_gradient: shape mismatch H={:?}, g={}",
-            h.dim(),
-            g.len()
-        ));
-    }
-    let mut l = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = h[[i, j]];
-            for k in 0..j {
-                sum -= l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if !(sum.is_finite() && sum > 0.0) {
-                    return Err(format!("non-positive Cholesky pivot at {i}: {sum}"));
-                }
-                l[[i, j]] = sum.sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]];
-            }
-        }
-    }
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut sum = -g[i];
-        for k in 0..i {
-            sum -= l[[i, k]] * y[k];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    for ii in 0..n {
-        let i = n - 1 - ii;
-        let mut sum = y[i];
-        for k in i + 1..n {
-            sum -= l[[k, i]] * x[k];
-        }
-        x[i] = sum / l[[i, i]];
-    }
-    if !x.iter().all(|v| v.is_finite()) {
-        return Err("sae_cholesky_solve_neg_gradient: non-finite solution".into());
-    }
-    Ok(x)
-}
-
 pub(crate) fn solve_basis_transport(
     new_phi: ArrayView2<'_, f64>,
     old_phi: ArrayView2<'_, f64>,

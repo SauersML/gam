@@ -3,11 +3,7 @@ use super::*;
 // their classifier marker rather than restating it.
 use super::outer_objective::ProbeRefusalKind;
 use crate::chart_coordinate_solve::PeriodicCurveExtrema;
-use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
-
-/// Maximum number of LM ridge-escalation attempts before declaring the per-row
-/// Hessian unfactorable.
-const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
+use opt::{BacktrackConfig, backtracking_line_search};
 
 const SAE_MANIFOLD_LM_RATIO_LOW: f64 = 0.25;
 const SAE_MANIFOLD_LM_RATIO_HIGH: f64 = 0.75;
@@ -5679,10 +5675,19 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Per-row fixed-decoder step `δ = −(|H| + ridge·I)⁻¹ g` (#3090).
+    ///
+    /// `|H| = V diag(|λ|) Vᵀ` is the saddle-free absolute-value Hessian: for a
+    /// PSD row Hessian it equals `H`, so the step is the ridged Newton step;
+    /// for an indefinite one (the Riemannian correction and a zero-curvature
+    /// ARD majorizer on a periodic axis can make it so) every eigendirection
+    /// keeps a positive weight `1/(|λ|+ridge)`, so `−gᵀδ > 0` whenever
+    /// `g ≠ 0`. The step is a descent direction by construction, which is
+    /// what the line search needs, and there is no ridge escalation schedule.
     pub(crate) fn solve_fixed_decoder_row_step(
         h: ArrayView2<'_, f64>,
         g: ArrayView1<'_, f64>,
-        base_ridge: f64,
+        ridge: f64,
     ) -> Result<Array1<f64>, String> {
         let d = h.nrows();
         if h.ncols() != d || g.len() != d {
@@ -5692,36 +5697,31 @@ impl SaeManifoldTerm {
                 g.len()
             ));
         }
+        if !(ridge.is_finite() && ridge > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::solve_fixed_decoder_row_step: ridge must be finite and positive, got {ridge}"
+            ));
+        }
         if d == 0 {
             return Ok(Array1::<f64>::zeros(0));
         }
-        let mut last_err = String::new();
-        escalate_ridge(
-            RidgeSchedule {
-                initial: base_ridge.max(SAE_MANIFOLD_ROW_RIDGE_FLOOR),
-                growth: SAE_MANIFOLD_ROW_RIDGE_GROWTH,
-                max_escalations: SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS,
-            },
-            |ridge| {
-                let mut a = h.to_owned();
-                for axis in 0..d {
-                    a[[axis, axis]] += ridge;
-                }
-                match sae_cholesky_solve_neg_gradient(a.view(), g) {
-                    Ok(delta) => Some(delta),
-                    Err(err) => {
-                        last_err = err;
-                        None
-                    }
-                }
-            },
-        )
-        .map(|success| success.value)
-        .map_err(|_| {
-            format!(
-                "SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian did not factor after LM escalation; last error: {last_err}"
-            )
-        })
+        if !h.iter().chain(g.iter()).all(|value| value.is_finite()) {
+            return Err(
+                "SaeManifoldTerm::solve_fixed_decoder_row_step: non-finite row Hessian or gradient"
+                    .to_string(),
+            );
+        }
+        let (evals, evecs) = h.to_owned().eigh(Side::Lower).map_err(|err| {
+            format!("SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian eigh failed: {err}")
+        })?;
+        let projected = evecs.t().dot(&g);
+        let scaled = Array1::from_iter(
+            projected
+                .iter()
+                .zip(evals.iter())
+                .map(|(&coeff, &lambda)| coeff / (lambda.abs() + ridge)),
+        );
+        Ok(-evecs.dot(&scaled))
     }
 
     pub(crate) fn fixed_decoder_step_from_rows(
@@ -9214,6 +9214,65 @@ mod projection_policy_tests {
     use crate::basis::{AmbientSphereHarmonicEvaluator, SaeBasisEvaluator};
     use ndarray::array;
     use std::sync::Arc;
+
+    /// Closed-form `−(A)⁻¹ g` for a symmetric 2×2 `A`, independent of any
+    /// factorization the solver uses.
+    fn neg_inverse_2x2_times(a: &Array2<f64>, g: &Array1<f64>) -> Array1<f64> {
+        let det = a[[0, 0]] * a[[1, 1]] - a[[0, 1]] * a[[1, 0]];
+        array![
+            -(a[[1, 1]] * g[0] - a[[0, 1]] * g[1]) / det,
+            -(-a[[1, 0]] * g[0] + a[[0, 0]] * g[1]) / det,
+        ]
+    }
+
+    /// #3090 — the fixed-decoder row step is the saddle-free Newton step
+    /// `−(|H| + ridge·I)⁻¹ g`, with no ridge escalation. On an indefinite row
+    /// Hessian the old LM schedule inflated the ridge by decades until
+    /// `H + ridge·I` factored (here to ridge 10, shrinking the step ~10×); the
+    /// eigen solve keeps the curvature magnitudes and is a descent direction.
+    /// On a PSD Hessian it is the ridged Newton step exactly. A non-positive or
+    /// non-finite ridge is refused rather than floored.
+    #[test]
+    fn fixed_decoder_row_step_is_saddle_free_newton_without_escalation_3090() {
+        let ridge = 1.0e-6;
+        let g = array![0.7, -1.3];
+        let (c, s) = (0.3_f64.cos(), 0.3_f64.sin());
+        let rotation = array![[c, -s], [s, c]];
+        let signed = rotation
+            .dot(&Array2::from_diag(&array![3.0, -2.0]))
+            .dot(&rotation.t());
+        let absolute = rotation
+            .dot(&Array2::from_diag(&array![3.0, 2.0]))
+            .dot(&rotation.t());
+        let delta =
+            SaeManifoldTerm::solve_fixed_decoder_row_step(signed.view(), g.view(), ridge).unwrap();
+        let expected = neg_inverse_2x2_times(&(&absolute + &(Array2::<f64>::eye(2) * ridge)), &g);
+        for axis in 0..2 {
+            assert!(
+                (delta[axis] - expected[axis]).abs() <= 1.0e-12 * expected[axis].abs().max(1.0),
+                "indefinite H: delta {delta} != saddle-free step {expected}"
+            );
+        }
+        assert!(-g.dot(&delta) > 0.0, "saddle-free step must descend");
+
+        let psd = array![[4.0, 1.0], [1.0, 3.0]];
+        let delta =
+            SaeManifoldTerm::solve_fixed_decoder_row_step(psd.view(), g.view(), ridge).unwrap();
+        let expected = neg_inverse_2x2_times(&(&psd + &(Array2::<f64>::eye(2) * ridge)), &g);
+        for axis in 0..2 {
+            assert!(
+                (delta[axis] - expected[axis]).abs() <= 1.0e-12 * expected[axis].abs().max(1.0),
+                "PSD H: delta {delta} != ridged Newton step {expected}"
+            );
+        }
+
+        for bad in [0.0, -1.0e-6, f64::NAN, f64::INFINITY] {
+            assert!(
+                SaeManifoldTerm::solve_fixed_decoder_row_step(psd.view(), g.view(), bad).is_err(),
+                "ridge {bad} must be refused, not floored"
+            );
+        }
+    }
 
     /// #2899 — only stationarity and no strict decrease certify a joint fit. The
     /// objective-stall approximation, a non-finite pre-step objective, a failed
