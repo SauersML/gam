@@ -555,13 +555,15 @@ fn reporting_scale(
 ///
 /// Gaussian profiles σ̂² (one extra dof) unless φ was user-fixed; Gamma / Beta /
 /// Tweedie / Negative-Binomial add one only when their dispersion is *estimated*
-/// from data; Poisson and Binomial carry φ ≡ 1 and add none.
+/// from data; Poisson and Binomial carry φ ≡ 1 and add none. Student-t always
+/// estimates both its scale σ and its degrees of freedom ν, so it adds two.
 fn scale_parameter_count(
     spec: &LikelihoodSpec,
     scale: &gam_problem::types::LikelihoodScaleMetadata,
 ) -> f64 {
     use gam_problem::types::{LikelihoodScaleMetadata, ResponseFamily};
     let estimated = match spec.response {
+        ResponseFamily::StudentT { .. } => return 2.0,
         ResponseFamily::Gaussian => {
             !matches!(scale, LikelihoodScaleMetadata::FixedDispersion { .. })
         }

@@ -712,6 +712,7 @@ def fit(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     constraints: Mapping[str, Any] | None = None,
     response_geometry: str | None = None,

@@ -4123,7 +4123,7 @@ impl FittedModel {
         let curved_family = match &family.response {
             // Identity-link Gaussian: inverse link is linear, so the posterior
             // mean equals the plug-in and the cheaper exact path is taken.
-            ResponseFamily::Gaussian => false,
+            ResponseFamily::Gaussian | ResponseFamily::StudentT { .. } => false,
             // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η).
             ResponseFamily::Poisson
             | ResponseFamily::Gamma

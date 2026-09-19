@@ -3043,6 +3043,53 @@ impl<'a> RemlState<'a> {
         self.invalidate_link_dependent_state();
     }
 
+    /// Install the Student-t `(σ, ν)` the next evaluation is taken at. They are
+    /// outer hyperparameters on the same footing as a flexible link's shape, so
+    /// a change invalidates exactly what [`Self::set_link_states`] does.
+    pub(crate) fn set_student_t_state(
+        &mut self,
+        sigma: f64,
+        nu: f64,
+    ) -> Result<(), EstimationError> {
+        if self.config.likelihood.student_t_parameters().is_none() {
+            crate::bail_invalid_estim!(
+                "Student-t (sigma, nu) installed on a {} fit",
+                self.config.likelihood.spec.response.name()
+            );
+        }
+        self.install_student_t_state(sigma, nu);
+        Ok(())
+    }
+
+    /// Restore the Student-t `(σ, ν)` carried by `likelihood` — the outer
+    /// seed-reset hook's counterpart of [`Self::set_student_t_state`]. A no-op
+    /// for every other family.
+    pub(crate) fn restore_student_t_state(&mut self, likelihood: &GlmLikelihoodSpec) {
+        if self.config.likelihood.student_t_parameters().is_some()
+            && let Some(Ok((sigma, nu))) = likelihood.student_t_parameters()
+        {
+            self.install_student_t_state(sigma, nu);
+        }
+    }
+
+    fn install_student_t_state(&mut self, sigma: f64, nu: f64) {
+        if let Some(Ok(current)) = self.config.likelihood.student_t_parameters()
+            && current == (sigma, nu)
+        {
+            return;
+        }
+        let mut config = self.config.as_ref().clone();
+        config.likelihood = config.likelihood.clone().with_student_t(sigma, nu);
+        self.config = Arc::new(config);
+        *self
+            .persistent_warm_start_key
+            .write()
+            .expect("persistent warm-start key lock poisoned") = None;
+        self.persistent_warm_start_loaded
+            .store(false, Ordering::Relaxed);
+        self.invalidate_link_dependent_state();
+    }
+
     /// Returns the eta-derivative carriers (c = dW/deta, d = d^2W/deta^2) for
     /// the exact Hessian surface that PIRLS accepted at the mode.
     ///
