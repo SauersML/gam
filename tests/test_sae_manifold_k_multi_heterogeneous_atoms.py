@@ -94,7 +94,7 @@ def test_heterogeneous_mixed_topology_atoms_reconstruct():
     atom_basis = ["periodic", "sphere", "torus"]
     atom_dim = [1, 2, 2]
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=3,
         atom_basis=atom_basis,

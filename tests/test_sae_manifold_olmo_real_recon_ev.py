@@ -1,7 +1,7 @@
 """#1026 — RED e2e: production manifold-SAE on REAL OLMo-3-32B activations.
 
 This is the real end-to-end task the manifold-SAE machinery exists for:
-fit the production SAE (`gamfit.sae_manifold_fit` / `ManifoldSAE`) on a
+fit the production SAE (`gamfit.sae.sae_manifold_fit` / `ManifoldSAE`) on a
 train split of genuine LLM residual-stream activations, reconstruct a
 *held-out* split via the OOS path (`m.reconstruct(z_test)`), and require a
 principled, defensible held-out reconstruction-quality bar.
@@ -115,7 +115,7 @@ def _fit_and_score_olmo_real(queue: mp.Queue) -> None:
         z_train = z[:_N_TRAIN]
         z_test = z[_N_TRAIN : _N_TRAIN + _N_TEST]
         linear_ceiling = _heldout_linear_ceiling(z_train, z_test, _K)
-        fit = gamfit.sae_manifold_fit(
+        fit = gamfit.sae.sae_manifold_fit(
             X=z_train,
             K=_K,
             atom_basis="periodic",

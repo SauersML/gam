@@ -22,12 +22,12 @@ def main() -> None:
     ]
     y += 0.04 * rng.standard_normal(y.shape)
 
-    schedule = gamfit.GumbelTemperatureSchedule(
+    schedule = gamfit.sae.GumbelTemperatureSchedule(
         tau_start=1.0,
         tau_min=0.1,
         decay="geometric",
     )
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         y,
         K=3,
         d_atom=1,

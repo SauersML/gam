@@ -204,7 +204,7 @@ fn trust_region_step_should_never_exceed_radius() {
 // `RiemannianManifold::exp_map_vjp` must return the *exact* transpose-Jacobian
 // of the ambient map `exp_p(v)` as implemented (NOT a straight-through
 // identity). We pin it on the Sphere — the curved manifold reachable from the
-// Python `gamfit.Sphere` autograd wrapper — by central finite-differencing the
+// Python `gamfit.smooth.Sphere` autograd wrapper — by central finite-differencing the
 // scalar `L(p, v) = g · exp_p(v)` for an arbitrary cotangent `g`; then
 // `dL/dp == grad_p` and `dL/dv == grad_v` componentwise. The probe perturbs
 // both `p` (deliberately taken slightly OFF the unit sphere) and `v`, so it

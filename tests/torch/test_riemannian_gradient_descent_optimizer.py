@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from gamfit import RustExtensionUnavailableError
+from gamfit.errors import RustExtensionUnavailableError
 
 
 torch = pytest.importorskip("torch")

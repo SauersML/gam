@@ -143,13 +143,13 @@ model.report("report.html")
 | `gamfit.load(path)` / `gamfit.loads(bytes)` | Reload a saved model. |
 | `gamfit.validate_formula(data, formula, ...)` | Type-check a formula without fitting. |
 | `gamfit.build_info()` | Native extension build metadata. |
-| `gamfit.cuda_diagnostics()` / `gamfit.format_cuda_diagnostics()` | CUDA probe results. |
+| `gamfit.cuda.cuda_diagnostics()` / `gamfit.cuda.format_cuda_diagnostics()` | CUDA probe results. |
 | `gamfit.explain_error(exc)` | Human-readable hint for a gamfit exception. |
 | `gamfit.Model` | Fitted model: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `sample`, `save`. |
-| `gamfit.SurvivalPrediction` | Per-row hazard / survival surface. |
-| `gamfit.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
+| `gamfit.results.SurvivalPrediction` | Per-row hazard / survival surface. |
+| `gamfit.results.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
 | `gamfit.MultinomialModel` | Multinomial-logit / softmax model. |
-| `gamfit.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
+| `gamfit.results.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
 | `gamfit.ResponseGeometryModel`, `sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`, `closure` | Response-geometry utilities. |
 | `gamfit.smooth.Duchon`, `Matern`, `BSpline`, `TensorBSpline`, `MeasureJet`, `Sphere` | Smooth descriptors for `smooths=` and torch. |
 | `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |
@@ -177,7 +177,7 @@ thresholds are derived at probe time from measured GPU FP64 throughput,
 CPU FP64 throughput, and PCIe bandwidth, so small kernels stay on the
 CPU. Inspect the calibrated thresholds with
 `gamfit.build_info()["cuda_diagnostics"]` or
-`gamfit.format_cuda_diagnostics()`.
+`gamfit.cuda.format_cuda_diagnostics()`.
 
 The wheel uses the CUDA 12 ABI. If PyTorch has already mapped a complete CUDA
 stack, gamfit continues that same stack rather than preloading a second system

@@ -5,7 +5,7 @@ Two public selectors are exposed:
 * :func:`select_topology` builds candidate formulas around an
   ``s(..., type=AUTO)`` smooth and ranks fitted models by evidence-like scores.
 * :class:`TopologyAutoSelector` is a multi-fit orchestrator for selecting the
-  topology of one :class:`gamfit.LatentCoord` block while preserving the rest
+  topology of one :class:`gamfit.smooth.LatentCoord` block while preserving the rest
   of the caller's fit configuration.
 """
 
@@ -18,7 +18,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
-from . import topology
 from ._api import fit
 from ._binding import rust_module
 from ._compare import _extract_reml_score_raw
@@ -570,6 +569,9 @@ def _default_candidates(feature_dim: int) -> list[_Candidate]:
 
 
 def _default_topology_candidate(name: str, feature_dim: int) -> _Candidate:
+    # `gamfit.topology` re-exports this module, so it is bound at call time.
+    from . import topology
+
     if name == "euclidean":
         return _Candidate("euclidean", topology.EuclideanPatch(d=feature_dim, name="x"))
     if name == "circle":
@@ -1061,7 +1063,7 @@ def _single_latent(
         name, latent = requested, latents[requested]
     if not isinstance(latent, LatentCoord):
         raise TypeError(
-            "TopologyAutoSelector latents entries must be gamfit.LatentCoord"
+            "TopologyAutoSelector latents entries must be gamfit.smooth.LatentCoord"
         )
     return str(name), latent
 

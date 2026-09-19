@@ -130,7 +130,7 @@ effects. In gamfit a string column, `factor(g)` and `group(g)` also put a
 ridge penalty on them, but its strength is estimated by REML like every
 other smoothing parameter. With plenty of rows per level the penalty is
 negligible and the estimates match an unpenalized factor; with sparse
-levels they are pulled toward the overall mean. A level that was not seen in training raises `gamfit.GamError` for a
+levels they are pulled toward the overall mean. A level that was not seen in training raises `gamfit.errors.GamError` for a
 string column or `factor(g)`, and is predicted at the population level for
 `group(g)`. The [formula reference](formulas.md#factor-terms) has the
 details.

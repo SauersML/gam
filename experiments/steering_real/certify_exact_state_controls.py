@@ -67,7 +67,7 @@ def certify(gamfit, X, t, B, *, lam_smooth, lam_ard, lam_sparse,
         kw["top_k"] = 1
     t0 = time.perf_counter()
     try:
-        rep = gamfit.sae_manifold_certify_external(np.ascontiguousarray(X), **kw)
+        rep = gamfit.sae.sae_manifold_certify_external(np.ascontiguousarray(X), **kw)
         ik = rep.get("inner_kkt") or {}
         raw, bound = ik.get("raw_gradient_norm"), ik.get("stationarity_bound")
         return {"status": rep.get("status"), "raw": raw,

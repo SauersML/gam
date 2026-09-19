@@ -113,7 +113,7 @@ def main():
             # Dispatch on the payload's own schema tag: the flagship fits here
             # are overcomplete (K > P) and carry the support tag, which the
             # /v6-pinned ManifoldSAE parser rejects outright (#2567).
-            m = gamfit.model_from_dict(pickle.load(f))
+            m = gamfit.sae.model_from_dict(pickle.load(f))
         t0 = time.time()
         R = np.empty_like(Z)
         step = 4096
