@@ -1782,6 +1782,14 @@
   {
     "base": "1e82fb0eb466f64fc310e9e4a3951a6d1591c31d",
     "items": [
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:cavity"
+    ],
+    "reason": "#1082 / #3135: EP's sweep now carries the posterior from site to site by the rank-one update a site's move makes to its precision, so no site re-forms the posterior to read its cavity. cavity(j) formed the whole posterior (Sigma = E W and mu, O(q^3)) to read one site's cavity; its only callers were the per-site path of OrthantLogMass::converge, which this commit deletes, and the damped-sweep test's reference sweep, which now reads the cavity from posterior() through the test helper sequential_site_sweep.",
+    "evidence": "cone_normalizer.rs is unchanged from 700c8e6300 to this commit's parent, where fn cavity is declared once and called twice, both in that file: converge (:278) and the damped-sweep test (:803). At the head tree git grep finds no .cavity( under crates, src or tests. source_removal_guard.py against the parent reports exactly this identity. At 9939aaf412 plus this change gam-solve passes 2077 of 2078 test targets; inner_fit_core_scaling, a multi-core scaling test, fails only under the gate's RAYON_NUM_THREADS=1 with four tests at once and passes alone (18.3 s, 18.1 s). The cone_normalizer tests pass 8 of 8, including the new the_rank_one_sweep_stops_at_a_fixed_point_of_the_sequential_site_sweep_3135 and a_repeated_row_enters_the_normalizer_once_1082."
+  },
+  {
+    "base": "e4504c160e99acb8e6ed747f1c47eb33dc55c5db",
+    "items": [
       "crates/gam-models/src/bms/cell_moment_assembly.rs:fn:empirical_fixed_third_trace_dispatch",
       "crates/gam-models/src/bms/cell_moment_assembly.rs:fn:empirical_fixed_third_trace_from_plan",
       "crates/gam-models/src/bms/row_kernel.rs:fn:fourth_full_cache",
@@ -1797,6 +1805,6 @@
       "crates/gam-models/src/row_kernel.rs:fn:validate_row_kernel_cache_lengths_reports_all_mismatches"
     ],
     "reason": "#3022 and #2998: the rigid BMS row kernel builds each row's derivative tensors once and hands the same tensors to every consumer, so the per-row third/fourth full-tensor caches (RigidThirdFull, RigidFourthFull, their get/insert helpers and the third_full_cache/fourth_full_cache accessors) and the cache-length validator that policed them (validate_row_kernel_cache_lengths with its test) have no remaining purpose. The empirical third directional trace is contracted in factored form through gam-math jet_trace, whose cost does not depend on the flex width, so the fixed-width third-trace dispatch (empirical_fixed_third_trace_dispatch, empirical_fixed_third_trace_from_plan) is deleted. The degree-9 cell cache flag is gone, so build_row_exact_context_with_stats_and_cell_cache is renamed build_row_exact_context.",
-    "evidence": "source_removal_guard.py and public_api_census.py run against base 1e82fb0eb4 report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-models third_trace_2998, rigid_row_tensors_3022 (3), multistart_member_2359, flex_measure_932 pass; gam-math jet_trace 2/2; gam-custom-family warm_start 14/14."
+    "evidence": "source_removal_guard.py and public_api_census.py run against base e4504c160e report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-models third_trace_2998, rigid_row_tensors_3022 (3), multistart_member_2359, flex_measure_932 pass; gam-math jet_trace 2/2; gam-custom-family warm_start 14/14."
   }
 ]
