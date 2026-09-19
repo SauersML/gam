@@ -31,7 +31,7 @@ use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam_solve::estimate::smooth_term_summary_rows;
+use gam_solve::estimate::{SummaryBlockOffset, smooth_term_summary_rows};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Beta, Distribution, Gamma, Normal, Poisson, Uniform};
@@ -172,7 +172,11 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
     let FitResult::Standard(fit) = result else {
         panic!("{family:?} rep {rep}: expected a standard fit");
     };
-    let rows = smooth_term_summary_rows(&fit.design, &fit.resolvedspec, &fit.fit);
+    let rows = smooth_term_summary_rows(
+        &fit.design,
+        &fit.fit,
+        SummaryBlockOffset::default(),
+    );
     let row = rows
         .iter()
         .find(|row| row.name.contains(NULL_TERM))

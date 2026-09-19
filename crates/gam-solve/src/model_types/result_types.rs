@@ -2583,6 +2583,16 @@ pub struct FitArtifacts {
     /// which objective its coefficients are the mode of, and why.
     #[serde(default)]
     pub jeffreys_arming_evidence: Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
+    /// Set when this fit certified an unarmed, unconstrained mode whose
+    /// penalized information is singular on the directions no smoothing
+    /// parameter reaches (#3164): its Laplace posterior is improper, which is
+    /// the evidence the custom-family arming lifecycle arms on. The terminal
+    /// posterior assembly measures it from the same precision it publishes.
+    /// Re-derivable from that precision and consumed only by the lifecycle, so
+    /// not serialized.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub improper_penalty_null_posterior:
+        Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
     /// Set when this fit could have published a coefficient covariance and
     /// deliberately did not (gam#2718). `None` is the ordinary case and carries
     /// NO claim either way: a covariance may be present, or absent because it
@@ -2872,6 +2882,10 @@ impl std::fmt::Debug for FitArtifacts {
             )
             .field("jeffreys_arming_evidence", &self.jeffreys_arming_evidence)
             .field(
+                "improper_penalty_null_posterior",
+                &self.improper_penalty_null_posterior,
+            )
+            .field(
                 "outer_warm_start",
                 &self
                     .outer_warm_start
@@ -2949,15 +2963,11 @@ pub enum SmoothingCorrectionMethod {
         active_rank: usize,
         rho_dimension: usize,
     },
-    /// Sigma-point integration is a named approximation: it integrates the
-    /// smoothing-parameter posterior over a finite node set rather than in
-    /// closed form, so it must never be reported as exact WPS.
-    ///
-    /// It no longer carries a `rho_hessian_stabilization` ledger. That field
-    /// recorded a relative ridge this branch used to add to the rho-Hessian
-    /// before inverting it for its own copy of `V_rho`; the branch now reuses
-    /// the certified, UNPERTURBED inverse the first-order path produces, so
-    /// there is no perturbation left to record (#2728).
+    /// Sigma-point integration of the smoothing-parameter posterior over a
+    /// finite node set. No fit mints this any more: the correction is the
+    /// analytic first-order one for every smoothing dimension. The variant is
+    /// kept only so models saved by earlier releases still deserialize, and it
+    /// is never reported as exact WPS.
     SigmaPointCubature {
         rank: usize,
         n_points: usize,
@@ -2992,6 +3002,10 @@ pub enum SmoothingCorrectionAbsence {
     /// outer search ran first-order.
     OuterHessianNotAnalytic { detail: String },
     /// The optimum is certified on an infinite-smoothing rail, where ρ has no finite variance.
+    ///
+    /// No longer produced: the correction excludes railed coordinates exactly as the outer
+    /// certificate does (at a rail `∂β̂/∂ρ_k → 0`, so they contribute nothing). Kept so fits
+    /// saved before that change still load.
     RailCertified { detail: String },
     /// The corrected covariance could not be truncated to the constrained feasible set.
     ConstrainedTruncationRefused { detail: String },
@@ -3084,24 +3098,19 @@ pub struct FitInference {
     /// Method that produced `smoothing_correction`. Required whenever a matrix
     /// is present; `None` means no correction was retained.
     pub smoothing_correction_method: Option<SmoothingCorrectionMethod>,
-    /// The exact first-order IFT smoothing-parameter-uncertainty correction,
-    /// RETAINED even when `smoothing_correction`/`smoothing_correction_method`
-    /// above hold a cubature upgrade instead. `compute_smoothing_correction_auto`
-    /// always computes the first-order correction before deciding whether to
-    /// escalate to sigma-point cubature; discarding it once cubature is chosen
-    /// made the #946 WPS-corrected-EDF/AIC channel go dark precisely when
-    /// smoothing-parameter uncertainty is large enough to matter — the regime
-    /// the correction exists for (see `model_comparison_from_unified`'s
-    /// `method_certified_exact` gate, which is exact-provenance-only by
-    /// design). `Some` exactly when `smoothing_correction_method_first_order`
+    /// The exact first-order IFT smoothing-parameter-uncertainty correction
+    /// read by the #946 WPS-corrected-EDF/AIC channel (see
+    /// `model_comparison_from_unified`'s `method_certified_exact` gate). A fresh
+    /// fit sets it equal to `smoothing_correction`; it differs only on models
+    /// saved by earlier releases whose primary pair held a sigma-point
+    /// cubature. `Some` exactly when `smoothing_correction_method_first_order`
     /// is `Some(FirstOrderIdentifiedSubspace{..})`; `None` when the first-order
-    /// geometry itself was unavailable (mirrors `smoothing_correction` in that
-    /// case — there is nothing to retain either way).
+    /// geometry itself was unavailable.
     #[serde(default)]
     pub smoothing_correction_first_order: Option<Array2<f64>>,
     /// Provenance for `smoothing_correction_first_order`. Always either `None`
     /// or `Some(FirstOrderIdentifiedSubspace{..})` — this field never holds
-    /// `SigmaPointCubature`, unlike `smoothing_correction_method` above.
+    /// `SigmaPointCubature`.
     #[serde(default)]
     pub smoothing_correction_method_first_order: Option<SmoothingCorrectionMethod>,
     /// The typed reason a fit that selected smoothing parameters publishes no
@@ -4435,6 +4444,96 @@ mod assembly_inner_status_gate_tests {
             error.to_string().contains("training_sample_size"),
             "zero-row rejection reported an unrelated error: {error}"
         );
+    }
+
+    /// A fit solved on a reduced second block (`X_fit = X_saved·T`, `T` 2×1)
+    /// with its active geometry and covariance, plus the saved-frame lift
+    /// `J = blockdiag(I₂, T)`.
+    fn reduced_frame_fit() -> (UnifiedFitResult, gam_problem::Gauge, Array2<f64>) {
+        let mut parts = parts_with_inner_status(PirlsStatus::Converged);
+        let active_beta = [
+            Array1::from_vec(vec![0.5, -1.0]),
+            Array1::from_vec(vec![2.0]),
+        ];
+        parts.blocks[0].beta = active_beta[0].clone();
+        parts.blocks.push(FittedBlock {
+            beta: active_beta[1].clone(),
+            role: BlockRole::Scale,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        });
+        parts.block_states = active_beta
+            .iter()
+            .map(|beta| gam_problem::ParameterBlockState {
+                beta: beta.clone(),
+                eta: Array1::zeros(3),
+            })
+            .collect();
+        let hessian = ndarray::array![[4.0, 1.0, 0.0], [1.0, 3.0, 0.5], [0.0, 0.5, 2.0]];
+        let covariance = ndarray::array![[0.3, -0.1, 0.02], [-0.1, 0.4, -0.1], [0.02, -0.1, 0.6]];
+        parts.covariance_conditional = Some(covariance.clone());
+        if let Some(inference) = parts.inference.as_mut() {
+            inference.penalized_hessian =
+                gam_problem::dispersion_cov::UnscaledPrecision::wrap(hessian.clone());
+        }
+        parts.geometry = Some(FitGeometry {
+            coefficient_gauge: gam_problem::Gauge::from_block_transforms(&[
+                Array2::eye(2),
+                Array2::eye(1),
+            ]),
+            penalized_hessian: hessian.into(),
+            constrained_posterior: None,
+            working: None,
+        });
+        let fit = UnifiedFitResult::try_from_parts(parts).expect("reduced-frame fixture assembles");
+        let frame = gam_problem::Gauge::from_block_transforms(&[
+            Array2::eye(2),
+            ndarray::array![[0.6], [0.8]],
+        ]);
+        (fit, frame, covariance)
+    }
+
+    /// gam#3021: the saved-frame lift carries every coefficient-indexed
+    /// quantity at once. β and the block states move to the raw widths, the
+    /// covariance pushes forward as `JΣJᵀ`, and the Hessian stays in its active
+    /// frame behind the composed gauge — the result passes the same invariants
+    /// a saved model is decoded through.
+    #[test]
+    fn lift_to_saved_frame_moves_every_coefficient_quantity_together_3021() {
+        let (mut fit, frame, covariance) = reduced_frame_fit();
+        let active_hessian = fit.geometry.as_ref().unwrap().penalized_hessian.as_array().clone();
+        fit.lift_to_saved_frame(&frame).expect("exact lift succeeds");
+
+        let saved_slope = ndarray::array![1.2, 1.6];
+        assert_eq!(fit.blocks[1].beta, saved_slope);
+        assert_eq!(fit.block_states[1].beta, saved_slope);
+        assert_eq!(fit.beta, ndarray::array![0.5, -1.0, 1.2, 1.6]);
+        let lifted_covariance = fit.covariance_conditional.as_ref().unwrap();
+        assert_eq!(lifted_covariance, &frame.lift_covariance(&covariance));
+        assert!((lifted_covariance[[2, 3]] - 0.6 * 0.8 * 0.6).abs() < 1e-15);
+        let geometry = fit.geometry.as_ref().unwrap();
+        assert_eq!(geometry.coefficient_gauge.raw_widths(), vec![2, 2]);
+        assert_eq!(geometry.coefficient_gauge.reduced_total(), 3);
+        assert_eq!(geometry.penalized_hessian.as_array(), &active_hessian);
+        fit.validate_numeric_finiteness()
+            .expect("the lifted fit satisfies the decode invariants");
+    }
+
+    /// A quantity with no unique pushforward through a non-square lift is
+    /// refused, and the refused lift leaves the fit untouched.
+    #[test]
+    fn lift_to_saved_frame_refuses_a_pullback_and_leaves_the_fit_3021() {
+        let (mut fit, frame, _) = reduced_frame_fit();
+        if let Some(inference) = fit.inference.as_mut() {
+            inference.weighted_gram = Some(Array2::eye(3));
+        }
+        let before = fit.beta.clone();
+        let error = fit
+            .lift_to_saved_frame(&frame)
+            .expect_err("a weighted Gram cannot be pushed forward");
+        assert!(error.to_string().contains("weighted Gram"), "{error}");
+        assert_eq!(fit.beta, before);
+        assert_eq!(fit.blocks[1].beta.len(), 1);
     }
 }
 
@@ -5784,19 +5883,15 @@ impl UnifiedFitResult {
     ///     Var(β|y) = E_ρ[φ·H(ρ)⁻¹] + Cov_ρ[β̂(ρ)],
     /// ```
     ///
-    /// which integrates conditional covariance over the smoothing posterior.
-    /// Its difference from covariance conditional on the mode can have either
-    /// sign: total covariance compares against the *average* conditional
-    /// covariance, not its value at `ρ̂`. Interval calibration must therefore
-    /// be checked against the intended posterior or repeated-data coverage. Use
+    /// evaluated to first order at `ρ̂` (Wood, Pya & Säfken 2016):
+    /// `Vp = Vβ + J V_ρ Jᵀ`, with `J = ∂β̂/∂ρ` from the implicit function
+    /// theorem and `V_ρ` the inverse outer Hessian on its identified subspace.
+    /// Interval calibration is checked against repeated-data coverage. Use
     /// [`Self::beta_covariance`] instead only when `λ` is fixed by the caller,
     /// or when you specifically want the conditional-on-`λ̂` object.
     ///
     /// The smoothing contribution is small where the outer criterion is sharply
-    /// determined and can be large where it is broad. Large differences require
-    /// inspecting the posterior integration diagnostics;
-    /// [`SmoothingCorrectionMethod::SigmaPointCubature::max_node_criterion_rise`]
-    /// is the published diagnostic for the one that produced #2728.
+    /// determined and can be large where it is broad.
     pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
         self.covariance_corrected.as_ref().or_else(|| {
             has_no_smoothing_coordinate(&self.log_lambdas, &self.artifacts)
@@ -5894,6 +5989,155 @@ impl UnifiedFitResult {
         }
         self.covariance_conditional = conditional;
         self.covariance_corrected = corrected;
+        Ok(())
+    }
+
+    /// Carry the whole fit from the solver's coefficient frame θ to the saved
+    /// frame `β = J·θ + a` through one exact lift `frame` (gam#3021).
+    ///
+    /// A family that fits on a reparameterized design (`X_fit = X_saved·J`)
+    /// reports in the saved frame, and every coefficient-indexed quantity moves
+    /// together or the fit describes two models at once:
+    ///
+    /// * the block coefficients, their block states' copies and the flat β are
+    ///   lifted by `J`; the linear predictors are unchanged, `X_saved·Jθ = X_fit·θ`;
+    /// * the covariances (conditional, corrected, frequentist) and both
+    ///   smoothing-parameter corrections push forward as `JΣJᵀ`;
+    /// * the penalized Hessian and its identified subspace are covariant and
+    ///   stay in their active frame, whose coefficient gauge becomes `J∘gauge`.
+    ///
+    /// A quantity with no unique lift through a non-square `J` is refused, not
+    /// dropped: standard errors published without their covariance, the
+    /// influence matrix `H⁻¹XᵀWX`, the weighted Gram `XᵀWX` (a pullback, which
+    /// cannot be pushed forward), and a stored reparameterization basis. The fit
+    /// is rebuilt through the constructor's invariants before it replaces
+    /// `self`, so a refused lift leaves the fit as it was.
+    pub fn lift_to_saved_frame(
+        &mut self,
+        frame: &gam_problem::gauge::Gauge,
+    ) -> Result<(), EstimationError> {
+        frame.validate().map_err(|reason| {
+            EstimationError::InvalidInput(format!("saved-frame lift is invalid: {reason}"))
+        })?;
+        let active_widths: Vec<usize> = self.blocks.iter().map(|block| block.beta.len()).collect();
+        let frame_active_widths: Vec<usize> = frame
+            .block_starts_reduced
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect();
+        if active_widths != frame_active_widths {
+            crate::bail_invalid_estim!(
+                "saved-frame lift expects fitted block widths {frame_active_widths:?}, the fit has {active_widths:?}"
+            );
+        }
+        if self.block_states.len() != self.blocks.len() {
+            crate::bail_invalid_estim!(
+                "saved-frame lift needs one block state per fitted block, got {} for {}",
+                self.block_states.len(),
+                self.blocks.len()
+            );
+        }
+        if self.beta != flatten_block_betas(&self.blocks) {
+            crate::bail_invalid_estim!(
+                "saved-frame lift: the flat coefficients disagree with the fitted blocks before the lift"
+            );
+        }
+        let active_total = frame.reduced_total();
+        let push_forward = |matrix: &Array2<f64>, label: &str| -> Result<Array2<f64>, EstimationError> {
+            if matrix.dim() != (active_total, active_total) {
+                crate::bail_invalid_estim!(
+                    "saved-frame lift: the {label} is {}x{}, the solver frame is {active_total}x{active_total}",
+                    matrix.nrows(),
+                    matrix.ncols()
+                );
+            }
+            Ok(frame.lift_covariance(matrix))
+        };
+
+        let mut lifted = self.clone();
+        let block_betas: Vec<Array1<f64>> = self.blocks.iter().map(|b| b.beta.clone()).collect();
+        for (block, beta) in lifted.blocks.iter_mut().zip(frame.lift_block_betas(&block_betas)) {
+            block.beta = beta;
+        }
+        let state_betas: Vec<Array1<f64>> =
+            self.block_states.iter().map(|s| s.beta.clone()).collect();
+        if state_betas.iter().map(Array1::len).ne(active_widths.iter().copied()) {
+            crate::bail_invalid_estim!(
+                "saved-frame lift: the block states are not at the fitted block widths {active_widths:?}"
+            );
+        }
+        for (state, beta) in lifted
+            .block_states
+            .iter_mut()
+            .zip(frame.lift_block_betas(&state_betas))
+        {
+            state.beta = beta;
+        }
+        lifted.beta = flatten_block_betas(&lifted.blocks);
+        lifted.covariance_conditional = self
+            .covariance_conditional
+            .as_ref()
+            .map(|v| push_forward(v, "conditional covariance"))
+            .transpose()?;
+        lifted.covariance_corrected = self
+            .covariance_corrected
+            .as_ref()
+            .map(|v| push_forward(v, "corrected covariance"))
+            .transpose()?;
+        if let Some(inference) = lifted.inference.as_mut() {
+            for (present, label) in [
+                (
+                    inference.factorized_standard_errors.is_some(),
+                    "standard errors published without their covariance",
+                ),
+                (
+                    inference.coefficient_influence.is_some(),
+                    "coefficient influence matrix",
+                ),
+                (inference.weighted_gram.is_some(), "weighted Gram"),
+                (inference.reparam_qs.is_some(), "reparameterization basis"),
+            ] {
+                if present {
+                    crate::bail_invalid_estim!(
+                        "saved-frame lift: the fit carries a {label}, which has no unique lift to the saved frame"
+                    );
+                }
+            }
+            for (slot, label) in [
+                (
+                    &mut inference.beta_covariance_frequentist,
+                    "frequentist covariance",
+                ),
+                (&mut inference.smoothing_correction, "smoothing correction"),
+                (
+                    &mut inference.smoothing_correction_first_order,
+                    "first-order smoothing correction",
+                ),
+            ] {
+                if let Some(matrix) = slot.take() {
+                    *slot = Some(push_forward(&matrix, label)?);
+                }
+            }
+        }
+        match lifted.geometry.as_mut() {
+            Some(geometry) => {
+                geometry.coefficient_gauge =
+                    geometry.coefficient_gauge.left_compose(frame).map_err(|reason| {
+                        EstimationError::InvalidInput(format!(
+                            "saved-frame lift cannot compose with the active geometry: {reason}"
+                        ))
+                    })?;
+            }
+            None if lifted.inference.is_some() => {
+                crate::bail_invalid_estim!(
+                    "saved-frame lift: a penalized Hessian without its coefficient geometry is in the \
+                     solver frame and has no pushforward to the saved frame"
+                );
+            }
+            None => {}
+        }
+        lifted.validate_numeric_finiteness()?;
+        *self = lifted;
         Ok(())
     }
 
@@ -5999,12 +6243,11 @@ impl UnifiedFitResult {
             .and_then(|inference| inference.smoothing_correction_method)
     }
 
-    /// The exact first-order IFT smoothing-parameter-uncertainty correction,
-    /// retained even when [`Self::smoothing_correction`] holds a cubature
-    /// upgrade instead. This is the accessor the #946 WPS corrected-EDF/AIC
-    /// channel must read from: it is populated whenever the first-order
-    /// geometry was computable, independent of whether the fit's PRIMARY
-    /// correction escalated to sigma-point cubature for some other consumer.
+    /// The exact first-order IFT smoothing-parameter-uncertainty correction.
+    /// This is the accessor the #946 WPS corrected-EDF/AIC channel reads: it is
+    /// populated whenever the first-order geometry was computable, including on
+    /// models saved by earlier releases whose primary correction was a
+    /// sigma-point cubature.
     pub fn smoothing_correction_first_order(&self) -> Option<&Array2<f64>> {
         self.inference
             .as_ref()

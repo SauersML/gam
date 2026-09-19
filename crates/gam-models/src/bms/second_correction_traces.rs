@@ -27,7 +27,7 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::{BernoulliMarginalSlopeRowExactContext, PrimarySlices};
 use crate::custom_family::BlockwiseFitOptions;
-use gam_math::jet_scalar::{DynamicJetBatchWorkspace, DynamicTwoSeedBatch};
+use gam_math::jet_scalar::DynamicTwoSeedBatch;
 use gam_problem::ParameterBlockState;
 use ndarray::{Array1, Array2};
 
@@ -280,8 +280,7 @@ impl BernoulliMarginalSlopeFamily {
             .collect();
         let lanes = empirical_bms_runtime_batch_lanes(m);
         let mut total = Array2::<f64>::zeros((m, m));
-        SECOND_CORRECTION_FOURTH_WORKSPACE.with(|workspace| -> Result<(), String> {
-            let mut workspace = workspace.borrow_mut();
+        self.jet_scratch.batch.with(|workspace| -> Result<(), String> {
             for chunk in seeds.chunks(lanes) {
                 workspace.reset(chunk.len());
                 let vars = workspace.alloc_slice_fill_with(r, |axis| {
@@ -306,13 +305,6 @@ impl BernoulliMarginalSlopeFamily {
         })?;
         Ok(total)
     }
-}
-
-thread_local! {
-    /// Per-worker jet workspace for the projected fourth contractions. The largest
-    /// batch is retained across rows.
-    static SECOND_CORRECTION_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
-        std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
 }
 
 #[cfg(test)]

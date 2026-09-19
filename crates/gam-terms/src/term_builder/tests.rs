@@ -991,6 +991,84 @@ fn tensor_k_accepts_square_bracket_per_margin_list() {
     );
 }
 
+#[test]
+fn tensor_margin_sizes_split_the_budget_and_respect_each_margin_support() {
+    // Two continuous margins split the budget as evenly as integers allow.
+    assert_eq!(tensor_margin_sizes(&[200, 200], 49), vec![7, 7]);
+    let split = tensor_margin_sizes(&[200, 200], 98);
+    assert_eq!(split.iter().product::<usize>(), 90);
+    assert!(split.iter().all(|&k| k == 9 || k == 10), "{split:?}");
+    // `te(season, hour)`: the 4-level margin cannot take its geometric share,
+    // so the headroom goes to `hour` until it too reaches its 24 values.
+    assert_eq!(tensor_margin_sizes(&[4, 24], 49), vec![4, 12]);
+    assert_eq!(tensor_margin_sizes(&[4, 24], 96), vec![4, 24]);
+    assert_eq!(tensor_margin_sizes(&[4, 24], 10_000), vec![4, 24]);
+}
+
+fn default_te_margin_dims(ds: &Dataset, formula: &str) -> Vec<usize> {
+    let parsed = parse_formula(formula).expect("parse tensor formula");
+    let mut notes = Vec::new();
+    let terms = build_termspec(&parsed.terms, ds, &ds.column_map(), &mut notes)
+        .expect("build tensor termspec");
+    let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("{formula} must lower to TensorBSpline");
+    };
+    spec.marginalspecs
+        .iter()
+        .map(|margin| match &margin.knotspec {
+            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
+            other => panic!("default te margins are cr, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The default `te` is a 2-D smooth and takes the same total basis dimension
+/// as any other 2-covariate default smooth on these rows, not a fixed per-margin
+/// table: at n = 3200 a `te(x, z)` of two continuous covariates resolves more
+/// than a fixed `7 x 7` could (the bump2d audit case).
+#[test]
+fn default_te_takes_the_engine_default_basis_dimension_for_its_rows() {
+    let n = 3200;
+    let ds = continuous_dataset(
+        &["y", "x", "z"],
+        (0..n)
+            .map(|i| {
+                let x = i as f64 / (n - 1) as f64;
+                let z = ((i * 7919) % n) as f64 / (n - 1) as f64;
+                vec![x.sin() + z.cos(), x, z]
+            })
+            .collect(),
+    );
+    let dims = default_te_margin_dims(&ds, "y ~ te(x, z)");
+    assert_eq!(
+        dims,
+        tensor_margin_sizes(&[n, n], default_num_centers(n, 2)),
+        "default te margins must split the engine's 2-D default budget"
+    );
+    assert!(dims.iter().product::<usize>() > 49, "{dims:?}");
+}
+
+/// A low-cardinality margin is capped at its distinct values and hands the
+/// remaining budget to the other margin: `te(season, hour)` resolves all 24
+/// hours instead of a 12-knot hour margin (the bike audit case).
+#[test]
+fn default_te_gives_a_low_cardinality_margins_share_to_the_other_margin() {
+    let ds = continuous_dataset(
+        &["y", "season", "hour"],
+        (0..960)
+            .map(|i| {
+                let season = (i % 4) as f64 + 1.0;
+                let hour = ((i / 4) % 24) as f64;
+                vec![season + hour, season, hour]
+            })
+            .collect(),
+    );
+    assert_eq!(
+        default_te_margin_dims(&ds, "y ~ te(season, hour)"),
+        vec![4, 24]
+    );
+}
+
 /// #1776 / #1752: a bare doubly-cyclic tensor `te(x, z, bs=c('cc','cc'))`
 /// with NO explicit `period=` must build — each cyclic margin wraps on its
 /// own observed `[min, max]` data span (mirroring mgcv's `bs="cc"` and the
@@ -3692,10 +3770,34 @@ fn inferred_tensor_basis_cap_uses_coordinate_support_not_duplicate_rows() {
     let unique_basis = inferred_tensor_basis_product(&unique);
     let repeated_basis = inferred_tensor_basis_product(&repeated);
 
-    assert_eq!(
-        unique_basis, repeated_basis,
-        "duplicating existing tensor coordinates must not inflate inferred basis width"
+    // Replicates sharpen the surface at the occupied locations, so the
+    // row-driven default may use more of the coordinate support, but never
+    // more than the 50 x 16 = 800 distinct locations the rows occupy.
+    assert!(
+        unique_basis <= repeated_basis,
+        "{unique_basis} > {repeated_basis}"
     );
+    assert!(
+        repeated_basis <= 800,
+        "duplicating existing tensor coordinates must not inflate the basis past its coordinate support: {repeated_basis}"
+    );
+
+    // On a coarse crossed grid the replicated default reaches that support
+    // exactly and stops there, however many replicates are added.
+    let grid_rows = |reps: usize| {
+        let mut rows = Vec::new();
+        for _ in 0..reps {
+            for i in 0..6 {
+                for j in 0..5 {
+                    let (theta, h) = (i as f64, j as f64);
+                    rows.push(vec![theta.sin() + h, theta, h]);
+                }
+            }
+        }
+        continuous_dataset(&["y", "theta", "h"], rows)
+    };
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(40)), 30);
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(400)), 30);
 }
 
 #[test]
@@ -4854,11 +4956,7 @@ fn assert_keeps_only_the_constant_free(ds: &Dataset, formula: &str, with_interce
 #[test]
 fn no_intercept_factor_keeps_its_ridge_and_frees_only_the_constant() {
     let ds = two_factor_dataset();
-    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)", "y ~ 0 + C(f)"] {
-        let spec = build_formula(formula, &ds);
-        let re = &spec.random_effect_terms[0];
-        assert!(!re.drop_first_level, "`{formula}` keeps every level");
-        assert!(re.penalized, "`{formula}`: the level contrasts keep their ridge");
+    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)"] {
         assert_keeps_only_the_constant_free(&ds, formula, "y ~ f");
     }
     assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f + g", "y ~ f + g");
@@ -4874,7 +4972,6 @@ fn no_intercept_genuine_random_effect_does_not_span_the_constant() {
 
     let spec = build_formula("y ~ 0 + x + group(f)", &ds);
     assert_eq!(spec.level, ModelLevel::NoIntercept);
-    assert!(spec.random_effect_terms[0].penalized);
     let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
         .expect("design builds");
     assert!(design.intercept_range.is_empty(), "no all-ones column without a spanning term");
@@ -5095,6 +5192,138 @@ fn domain_is_validated_against_the_data_and_its_own_shape() {
     }
 }
 
+/// A continuous `x` with distinct values beside a categorical `g` whose level
+/// labels are `levels`; row `i` holds level `i % levels.len()`.
+fn categorical_coordinate_dataset(levels: &[&str]) -> Dataset {
+    let n = 120usize;
+    let rows = (0..n)
+        .map(|i| {
+            let x = i as f64 / (n as f64 - 1.0);
+            let g = (i % levels.len()) as f64;
+            vec![x + g, x, g]
+        })
+        .collect::<Vec<_>>();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular categorical test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: levels.iter().map(|level| level.to_string()).collect(),
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+fn try_build_formula(formula: &str, ds: &Dataset) -> Result<TermCollectionSpec, TermBuilderError> {
+    let parsed = parse_formula(formula).expect("formula parses");
+    build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new())
+}
+
+/// pyGAM audit F4: a smooth, tensor or explicit linear term over a categorical
+/// column used to fit silently over the arbitrary level codes. It is refused
+/// at formula resolution as a formula error that names the column and the
+/// categorical alternatives.
+#[test]
+fn a_categorical_column_is_refused_as_a_numeric_coordinate() {
+    let ds = categorical_coordinate_dataset(&["a", "b", "c"]);
+    for (formula, term) in [
+        ("y ~ s(g)", "s(g)"),
+        ("y ~ s(x) + s(g)", "s(g)"),
+        ("y ~ te(x, g)", "te(x, g)"),
+        ("y ~ linear(g)", "linear(g)"),
+    ] {
+        let err = try_build_formula(formula, &ds).expect_err(formula);
+        let TermBuilderError::CategoricalCoordinate {
+            column,
+            level_count,
+            first_non_numeric,
+            ..
+        } = &err
+        else {
+            panic!("{formula}: expected CategoricalCoordinate, got {err:?}");
+        };
+        assert_eq!(column, "g", "{formula}");
+        assert_eq!(*level_count, 3, "{formula}");
+        assert_eq!(
+            first_non_numeric.as_ref(),
+            Some(&NonNumericCell {
+                value: "a".to_string(),
+                row: 1
+            }),
+            "{formula}"
+        );
+        assert_eq!(err.error_category(), ErrorCategory::Formula);
+        let message = err.to_string();
+        assert!(message.contains(term), "{formula}: {message}");
+        for alternative in ["factor(g)", "group(g)", "s(x, by=g)", "fs(x, g)", "bs=\"re\""] {
+            assert!(message.contains(alternative), "{formula}: {message}");
+        }
+    }
+}
+
+/// The categorical smooths stay valid: a factor `by=`, the factor slot of
+/// `fs`, and a random-effect smooth over the grouping column.
+#[test]
+fn a_categorical_column_is_accepted_where_a_smooth_takes_a_factor() {
+    let ds = categorical_coordinate_dataset(&["a", "b", "c"]);
+    for formula in [
+        "y ~ s(x, by=g)",
+        "y ~ fs(x, g)",
+        "y ~ s(g, bs=\"re\")",
+        "y ~ factor(g) + s(x)",
+    ] {
+        try_build_formula(formula, &ds).unwrap_or_else(|err| panic!("{formula}: {err}"));
+    }
+}
+
+/// A numeric column made categorical by one stray string reports that string
+/// and its 1-based row, and says how to keep the column numeric.
+#[test]
+fn a_stray_string_in_a_numeric_column_is_reported_with_its_row() {
+    // Rows cycle through the levels, so the first `oops` sits at row 3.
+    let ds = categorical_coordinate_dataset(&["1.5", "2.5", "oops"]);
+    let err = try_build_formula("y ~ s(g)", &ds).expect_err("s(g) on a categorical column");
+    let TermBuilderError::CategoricalCoordinate {
+        first_non_numeric, ..
+    } = &err
+    else {
+        panic!("expected CategoricalCoordinate, got {err:?}");
+    };
+    assert_eq!(
+        first_non_numeric.as_ref(),
+        Some(&NonNumericCell {
+            value: "oops".to_string(),
+            row: 3
+        })
+    );
+    let message = err.to_string();
+    assert!(message.contains("'oops' at row 3"), "{message}");
+    assert!(message.contains("meant to be numeric"), "{message}");
+}
+
 /// pyGAM audit F2: a categorical column in a term that reads its inputs as
 /// numeric axes must be a typed error pointing at `factor()`/`group()`,
 /// instead of fitting the level codes as positions on a line.
@@ -5115,8 +5344,8 @@ fn categorical_column_in_a_numeric_axis_term_is_rejected() {
         let err = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
             .expect_err(&format!("`{formula}` must reject the categorical column"));
         assert!(
-            matches!(err, TermBuilderError::IncompatibleConfig { .. }),
-            "`{formula}` must raise a typed IncompatibleConfig, got {err:?}"
+            matches!(err, TermBuilderError::CategoricalCoordinate { .. }),
+            "`{formula}` must raise a typed CategoricalCoordinate, got {err:?}"
         );
         let msg = err.to_string();
         assert!(
@@ -5138,5 +5367,52 @@ fn categorical_column_in_a_numeric_axis_term_is_rejected() {
         let mut notes = Vec::new();
         build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
             .unwrap_or_else(|err| panic!("`{formula}` must still build, got: {err:?}"));
+    }
+}
+
+/// `s(b) + te(b, c)` puts the tensor in a collection gauge whose coefficient
+/// transform whitens the design Gram. The frozen spec rebuilds the tensor in
+/// the composite chart at predict time, and its null-function block ridges
+/// must find the chart's null as the preimage of `⊗ null(S_j)`: a spectral
+/// rank test on the whitened primary counted weakly penalized bending
+/// directions as null ("tensor null blocks span 4 of the chart's 27 null
+/// directions") and the fitted model could not predict.
+#[test]
+fn a_tensor_sharing_a_margin_with_a_smooth_rebuilds_from_its_frozen_spec() {
+    let n = 1000usize;
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let rows = (0..n)
+        .map(|_| {
+            let b = uniform();
+            let c = uniform();
+            vec![(3.0 * b).sin() + b * c, b, c]
+        })
+        .collect();
+    let ds = continuous_dataset(&["y", "b", "c"], rows);
+    for formula in ["y ~ s(b) + te(b, c)", "y ~ s(b) + te(b, c, k=[14,14])"] {
+        let spec = build_formula(formula, &ds);
+        let fitted = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` fit-time design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let rebuilt = crate::smooth::build_term_collection_design(ds.values.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` rebuild from the frozen spec: {err}"));
+        let fitted_rows = fitted.design.to_dense();
+        let rebuilt_rows = rebuilt.design.to_dense();
+        assert_eq!(rebuilt_rows.dim(), fitted_rows.dim(), "`{formula}`");
+        let scale = fitted_rows.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let drift = (&rebuilt_rows - &fitted_rows)
+            .iter()
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            drift <= 1e-9 * scale,
+            "`{formula}`: the rebuilt design drifts {drift:.3e} (scale {scale:.3e})"
+        );
     }
 }

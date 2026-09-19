@@ -1466,6 +1466,64 @@ pub(crate) struct JointPosteriorAssembly {
     pub(crate) covariance_conditional: Option<Array2<f64>>,
     pub(crate) geometry: FitGeometry,
     pub(crate) reported_beta: Option<Array1<f64>>,
+    /// [`improper_penalty_null_posterior`] of the unarmed, unconstrained
+    /// precision this assembly publishes; `None` for an armed or constrained
+    /// mode, whose properness is decided elsewhere.
+    pub(crate) improper_penalty_null_posterior:
+        Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
+}
+
+/// Whether a certified unarmed mode's Laplace posterior is improper on the
+/// directions no smoothing parameter reaches (#3164, #979 ruling (b)).
+///
+/// `penalty` is the selected `S_λ` and `precision` is `H + S_λ` at the mode. On
+/// `ker(S_λ)` the precision IS the likelihood information for every `λ`, so a
+/// singular reduced information there is curvature no smoothing parameter can
+/// supply: the objective is non-coercive along it, the posterior is improper,
+/// and the "mode" is a point on a likelihood ray where the solve stopped because
+/// its Newton decrement fell below the objective's resolution. A separated
+/// binary likelihood saturating along an unpenalized coefficient is the case:
+/// its information along the ray decays with the likelihood itself, so the
+/// decrement vanishes before any iterate is refused.
+///
+/// `ker(S_λ)` is measured by `jeffreys_subspace_from_penalty`, the rule the
+/// Jeffreys term's own span is built with, and the singularity verdict is
+/// `JointJeffreysPlan::reduced_information_is_singular`, the plan's own zero
+/// for "a proper prior is required": the same two decisions the multinomial
+/// separation certificate reads, so both lifecycles arm on one geometry.
+///
+/// REJECTED: the penalized Hessian's numerical rank (`λ_max·√p·ε`). Its zero
+/// scales with the largest penalized eigenvalue, so the same saturated ray reads
+/// singular on one route and resolved on another whose penalty is weaker.
+fn improper_penalty_null_posterior(
+    penalty: &Array2<f64>,
+    precision: &Array2<f64>,
+) -> Result<Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>, CustomFamilyError> {
+    let unreached =
+        gam_solve::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
+            penalty.view(),
+        )
+        .map_err(CustomFamilyError::trial_point)?
+        .columns;
+    if unreached.ncols() == 0 {
+        return Ok(None);
+    }
+    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::diagnose(
+        precision.view(),
+        unreached.view(),
+    )
+    .map_err(CustomFamilyError::trial_point)?;
+    if !plan.reduced_information_is_singular() {
+        return Ok(None);
+    }
+    let (information_min, _) = plan.information_extrema();
+    Ok(Some(
+        gam_problem::jeffreys_arming::JeffreysArmingEvidence::ImproperPenaltyNullPosterior {
+            unreached_dim: unreached.ncols(),
+            information_min,
+            information_floor: plan.floor(),
+        },
+    ))
 }
 
 fn terminal_score_from_working_sets(
@@ -1674,7 +1732,8 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
         &unpenalized_hessian,
     )?;
     let mode = flatten_state_betas(states, specs);
-    let penalty_score = (&precision - &unpenalized_hessian).dot(&mode);
+    let penalty = &precision - &unpenalized_hessian;
+    let penalty_score = penalty.dot(&mode);
     let mut jeffreys_gradient = Array1::<f64>::zeros(total);
     if family.joint_jeffreys_term_required() {
         let jeffreys_ranges = block_param_ranges(specs);
@@ -1747,8 +1806,12 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
         .iter()
         .map(|spec| spec.design.ncols())
         .collect::<Vec<_>>();
+    let mut improper_posterior = None;
     let (covariance_conditional, constrained_posterior, reported_beta) = match joint_constraints {
         None => {
+            if !family.joint_jeffreys_term_required() {
+                improper_posterior = improper_penalty_null_posterior(&penalty, &precision)?;
+            }
             let covariance = options
                 .compute_covariance
                 .then(|| {
@@ -1892,6 +1955,7 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                                     working,
                                 },
                                 reported_beta: Some(reported),
+                                improper_penalty_null_posterior: None,
                             });
                         }
                         Err(refusal) => {
@@ -1925,6 +1989,7 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                         // Its typed decline prevents every posterior-mean model
                         // assembler and predictor from consuming it as a mean.
                         reported_beta: None,
+                        improper_penalty_null_posterior: None,
                     });
                 }
             };
@@ -1975,6 +2040,7 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
             working,
         },
         reported_beta,
+        improper_penalty_null_posterior: improper_posterior,
     })
 }
 
@@ -2189,9 +2255,18 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
         }
         h_proj_inverse[[out_col, out_col]] = 1.0 / m_evals[src_col];
     }
-    let u_m = match face_tangent {
-        Some(z) => z.dot(&kept_basis),
-        None => kept_basis,
+    // The eigenpairs the kernel drops, from the same decomposition: its derivative couples them to
+    // the kept ones (`PenaltySubspaceTrace::pseudo_inverse_rotation`).
+    let dropped: Vec<usize> = (0..m_evals.len()).filter(|index| !kept.contains(index)).collect();
+    let mut dropped_basis = Array2::<f64>::zeros((precision_dim, dropped.len()));
+    let mut dropped_eigenvalues = Array1::<f64>::zeros(dropped.len());
+    for (out_col, &src_col) in dropped.iter().enumerate() {
+        dropped_basis.column_mut(out_col).assign(&m_evecs.column(src_col));
+        dropped_eigenvalues[out_col] = m_evals[src_col];
+    }
+    let (u_m, dropped_basis) = match face_tangent {
+        Some(z) => (z.dot(&kept_basis), z.dot(&dropped_basis)),
+        None => (kept_basis, dropped_basis),
     };
 
     Ok((
@@ -2199,6 +2274,8 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
         Some(PenaltySubspaceTrace {
             u_s: u_m,
             h_proj_inverse,
+            dropped_basis,
+            dropped_eigenvalues,
             // Filled by the caller, which is the only place that holds the
             // operator's own `logdet()` this pseudo-determinant replaces.
             logdet_correction: 0.0,
@@ -3177,6 +3254,45 @@ mod required_covariance_tests {
             }
             other => panic!("a PD joint precision must yield a finite covariance; got {other:?}"),
         }
+    }
+
+    /// #3164: an unpenalized direction the likelihood carries no information
+    /// along is an improper posterior, recorded as arming evidence; the same
+    /// direction with information, a zero-information direction the penalty
+    /// reaches, and a full-rank penalty are not.
+    #[test]
+    fn improper_penalty_null_posterior_reads_information_on_the_penalty_null_space_3164() {
+        let null_penalty = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+        let saturated = array![[4.0, 0.2, 0.0], [0.2, 9.0, 0.0], [0.0, 0.0, 0.0]];
+        match improper_penalty_null_posterior(&null_penalty, &(&null_penalty + &saturated))
+            .expect("diagnosis")
+        {
+            Some(gam_problem::jeffreys_arming::JeffreysArmingEvidence::ImproperPenaltyNullPosterior {
+                unreached_dim,
+                information_min,
+                information_floor,
+            }) => {
+                assert_eq!(unreached_dim, 1);
+                assert!(information_min <= information_floor);
+            }
+            other => panic!("zero information on ker(S_λ) is an improper posterior; got {other:?}"),
+        }
+
+        let informed = array![[4.0, 0.2, 0.0], [0.2, 9.0, 0.0], [0.0, 0.0, 3.0]];
+        assert!(
+            improper_penalty_null_posterior(&null_penalty, &(&null_penalty + &informed))
+                .expect("diagnosis")
+                .is_none(),
+            "likelihood information on ker(S_λ) makes the posterior proper there"
+        );
+
+        let full_penalty = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(
+            improper_penalty_null_posterior(&full_penalty, &(&full_penalty + &saturated))
+                .expect("diagnosis")
+                .is_none(),
+            "a direction the penalty reaches is closed by the penalty"
+        );
     }
 
     #[test]

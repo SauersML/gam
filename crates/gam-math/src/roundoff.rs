@@ -74,6 +74,20 @@ pub fn gram_schmidt_residual_band(passes: usize, directions: usize, dim: usize, 
     passes.saturating_mul(directions) as f64 * accumulation_growth(dim.saturating_add(4)) * norm
 }
 
+/// Smallest eigenvalue above which an f64 Cholesky of a symmetric `dim × dim` matrix, with diagonal entries at most
+/// `max_diagonal`, is guaranteed to run to completion with strictly positive pivots.
+///
+/// The derivation is Demmel's theorem (Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., Thm 10.7).
+/// The computed factor satisfies `R̂ᵀR̂ = A + ΔA` with `|ΔA| ≤ γ_{dim+1}·|R̂ᵀ||R̂|`. Each row `r̂ᵢ` has
+/// `‖r̂ᵢ‖² ≤ aᵢᵢ/(1 − γ_{dim+1})`, so Cauchy–Schwarz gives
+/// `|ΔAᵢⱼ| ≤ γ_{dim+1}/(1 − γ_{dim+1})·√(aᵢᵢaⱼⱼ)`. In the unit-diagonal scaling `H = D^{-1/2}AD^{-1/2}`, the
+/// perturbation is at most `dim·γ_{dim+1}/(1 − γ_{dim+1})` in spectral norm. The factorization therefore completes
+/// when `λ_min(H)` exceeds that value, and `λ_min(H) ≥ λ_min(A)/max_diagonal` makes the band below sufficient.
+pub fn cholesky_completion_band(dim: usize, max_diagonal: f64) -> f64 {
+    let growth = accumulation_growth(dim.saturating_add(1));
+    dim as f64 * growth / (1.0 - growth) * max_diagonal
+}
+
 /// Backward-error band on the eigenvalues of a symmetric `n × n` matrix whose inertia was read off an `LDLᵀ`
 /// factorization `P A Pᵀ = L̂ D̂ L̂ᵀ` (#2901).
 ///

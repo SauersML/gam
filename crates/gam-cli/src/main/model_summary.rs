@@ -152,7 +152,7 @@ pub(crate) fn build_model_summary(
     // Python API reads (#2470). It was written out here and again in
     // `gam-pyffi`, which is why #1219, #1277, #1360, #1368 and #1372 each had to
     // be landed twice.
-    let smooth_terms = smooth_term_summary_rows(design, spec, fit);
+    let smooth_terms = smooth_term_summary_rows(design, fit, SummaryBlockOffset::default());
 
     Ok(ModelSummary {
         family: family.pretty_name().to_string(),

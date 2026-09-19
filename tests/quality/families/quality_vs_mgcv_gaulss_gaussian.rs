@@ -36,7 +36,8 @@
 //! Both engines are fit on the IDENTICAL training rows and scored on the
 //! IDENTICAL test rows. mgcv `gaulss()` models the *reciprocal* sd through
 //! `1/sigma = b + exp(eta_sigma)` (default `b = 0.01`); gam floors `sigma` via
-//! `sigma = LOGB_SIGMA_FLOOR + exp(eta)` with `LOGB_SIGMA_FLOOR = 0.01`. The
+//! `sigma = response_scale*sigma_floor + exp(eta)`, where `sigma_floor` is the
+//! fit's recording-grid bound δ/√12 of the standardized response. The
 //! parameterizations differ, but the NLL is computed in the convention-free
 //! physical `(mu, sigma)` coordinates for both, so the comparison is fair.
 //!
@@ -54,10 +55,6 @@ use ndarray::{Array2, s};
 use std::path::Path;
 
 const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
-
-/// gam's sigma link offset (`sigma = LOGB_SIGMA_FLOOR + exp(eta)`). Numerically
-/// equal to mgcv `gaulss()`'s default `b = 0.01` (mgcv places it on `1/sigma`).
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 /// Every 5th row (0-based) is held out for testing; the rest train. Deterministic.
 const TEST_STRIDE: usize = 5;
@@ -203,11 +200,12 @@ fn gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv()
 
     // Mean is identity-link: response-scale mu = X_mean * beta_mean.
     let gam_mu: Vec<f64> = mean_design.design.apply(&beta_mean).to_vec();
-    // log-sigma link: sigma = LOGB_SIGMA_FLOOR + exp(eta_scale).
+    // log-sigma link: sigma = response_scale*sigma_floor + exp(eta_scale), the
+    // fit's own floor mapped to the raw units of the returned coefficients.
     let eta_scale = noise_design.design.apply(&beta_scale);
     let gam_sigma: Vec<f64> = eta_scale
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| fit.response_scale * fit.sigma_floor + e.exp())
         .collect();
 
     // ---- gam held-out objective scores ------------------------------------

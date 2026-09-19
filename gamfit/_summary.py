@@ -273,6 +273,10 @@ class Summary:
         ``"not_identified"``, ``"indefinite_curvature"`` (a custom family's
         observed information leaves the term's score no covariance), or
         ``"residual_df_unavailable"``.
+        A model with more than one linear predictor (the Bernoulli
+        marginal-slope family) tags each record with ``predictor`` —
+        ``"marginal"`` or ``"slope"`` — naming the formula the smooth belongs
+        to; each row is tested against its own predictor's block.
         Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
@@ -305,6 +309,8 @@ class Summary:
         record per smooth term with ``name``, ``term_idx``, ``basis_dim`` (the
         realized ``k'``), ``nullspace_dim``, ``edf``, ``enrichment_dim``,
         ``enrichment_rank``, ``statistic``, ``p_value`` and ``provenance``. A
+        field the check did not measure is omitted, so a row whose
+        ``provenance`` is not ``"radial_enrichment"`` carries no ``p_value``. A
         small ``p_value`` says the fit's residuals still carry structure in that
         smooth's covariates which its realized basis cannot represent. See
         :meth:`gamfit.Model.basis_check` for the construction and its limits.
@@ -518,7 +524,9 @@ class Summary:
         (``chi_sq`` / ``p_value`` are absent for random-effect smooths and any
         shape-constrained term, matching the engine, which only computes the
         Wood Wald test for ordinary penalized smooths). A shape-constrained row
-        adds a ``p_value_unavailable`` column naming the reason.
+        adds a ``p_value_unavailable`` column naming the reason, and a
+        multi-predictor model adds a ``predictor`` column (``"marginal"`` /
+        ``"slope"``).
         """
         import pandas as pd
 
