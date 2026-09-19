@@ -329,6 +329,8 @@ pub enum DataError {
         /// The 1-based data row, as the message prints it.
         row: usize,
         problem: CellProblem,
+        /// The data file the row came from, when the table was read from one.
+        source: Option<String>,
     },
     /// A complete table reached the fitting boundary but one of its columns
     /// cannot identify a model effect. Unlike `InvalidValue`, this retains
@@ -384,6 +386,7 @@ impl DataError {
             column: column.to_string(),
             row,
             problem: CellProblem::NonFinite,
+            source: None,
         }
     }
 
@@ -394,6 +397,7 @@ impl DataError {
             column: column.to_string(),
             row,
             problem: CellProblem::MissingLevel,
+            source: None,
         }
     }
 
@@ -407,15 +411,17 @@ impl DataError {
                 level: level.to_string(),
                 known_levels: known_levels.to_vec(),
             },
+            source: None,
         }
     }
 
     /// Attach the source file to errors produced while loading a table.
     ///
-    /// Column lookup, degenerate-column and invalid-cell errors already
-    /// identify the offending column and expose structured fields to the
-    /// Python boundary, so they deliberately remain unchanged. All other ingest failures need
-    /// the file identity as well.
+    /// Column lookup and degenerate-column errors already identify the
+    /// offending column and expose structured fields to the Python boundary,
+    /// so they deliberately remain unchanged. An invalid cell keeps its
+    /// structured column and row and records the file beside them; all other
+    /// ingest failures need the file identity in their reason.
     #[must_use]
     fn with_source_path(self, path: &Path) -> Self {
         let qualify = |reason: String| {
@@ -433,7 +439,17 @@ impl DataError {
             Self::InvalidValue { reason } => Self::InvalidValue { reason: qualify(reason) },
             column @ Self::ColumnNotFound { .. } => column,
             degenerate @ Self::DegenerateColumn { .. } => degenerate,
-            cell @ Self::InvalidCell { .. } => cell,
+            Self::InvalidCell {
+                column,
+                row,
+                problem,
+                source: _,
+            } => Self::InvalidCell {
+                column,
+                row,
+                problem,
+                source: Some(path.display().to_string()),
+            },
         }
     }
 
@@ -521,23 +537,29 @@ impl fmt::Display for DataError {
                 column,
                 row,
                 problem,
-            } => match problem {
-                CellProblem::NonFinite => {
-                    write!(f, "non-finite value at row {row}, column '{column}'")
+                source,
+            } => {
+                if let Some(source) = source {
+                    write!(f, "data file '{source}': ")?;
                 }
-                CellProblem::MissingLevel => {
-                    write!(f, "missing value at row {row}, categorical column '{column}'")
+                match problem {
+                    CellProblem::NonFinite => {
+                        write!(f, "non-finite value at row {row}, column '{column}'")
+                    }
+                    CellProblem::MissingLevel => {
+                        write!(f, "missing value at row {row}, categorical column '{column}'")
+                    }
+                    CellProblem::UnseenLevel {
+                        level,
+                        known_levels,
+                    } => write!(
+                        f,
+                        "unseen level '{level}' in categorical column '{column}' at row {row}; \
+                         allowed levels: {}",
+                        known_levels.join(",")
+                    ),
                 }
-                CellProblem::UnseenLevel {
-                    level,
-                    known_levels,
-                } => write!(
-                    f,
-                    "unseen level '{level}' in categorical column '{column}' at row {row}; \
-                     allowed levels: {}",
-                    known_levels.join(",")
-                ),
-            },
+            }
             DataError::ColumnNotFound {
                 name,
                 role,
@@ -4002,7 +4024,7 @@ mod tests {
         assert!(
             matches!(
                 &non_finite,
-                DataError::InvalidCell { column, row: 2, problem: CellProblem::NonFinite }
+                DataError::InvalidCell { column, row: 2, problem: CellProblem::NonFinite, .. }
                     if column == "x"
             ),
             "{non_finite:?}"
@@ -4020,6 +4042,7 @@ mod tests {
                     column,
                     row: 2,
                     problem: CellProblem::UnseenLevel { level, known_levels },
+                    ..
                 } if column == "g" && level == "z" && known_levels == &["a", "b"]
             ),
             "{unseen:?}"
@@ -4038,7 +4061,7 @@ mod tests {
         assert!(
             matches!(
                 &missing,
-                DataError::InvalidCell { column, row: 2, problem: CellProblem::MissingLevel }
+                DataError::InvalidCell { column, row: 2, problem: CellProblem::MissingLevel, .. }
                     if column == "g"
             ),
             "{missing:?}"
