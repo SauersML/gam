@@ -1383,5 +1383,59 @@
     ],
     "reason": "#2469 (SPEC 6 and the one-route directive): below sigma = 8 the integrated cloglog mean and derivative, and the survival value, were routed across a heat-kernel Taylor series, extreme-input asymptotics, the Miles erfc series, a Clenshaw-Curtis rule, a Gamma/Mellin-Barnes inversion (with its Complex/Lanczos log-Gamma helpers) and adaptive Simpson, chosen by these constants and checked by an adaptive-Simpson drift test. Probe 1336291 with a 40-digit truth pass found that routed result up to 336% wrong in the mean and 26% in the derivative, which the drift test's absolute floors did not see, while the #2714 log-survival panel held 6.8e-15. cloglog_posterior_meanwith_deriv_controlled and cloglog_survival_term_controlled now read that panel at every sigma > 0, so every route here, its constants and its size struct have no caller. log_half_erfc_stable was the Miles series' only helper. COEFFS and G were the Lanczos coefficients inside complex_log_gamma_lanczos. The tests that pinned the removed routing or compared two removed routes go with them. test_cloglog_taylor_negative_tail_matches_mathematical_target is restated as test_cloglog_negative_tail_matches_mathematical_target against the router.",
     "evidence": "At 651eabad3f, git grep -w finds every listed name only in crates/gam-solve/src/quadrature.rs; no other crate, test, bench, doc or Python file names one. The guard in gate dy6 run spec-lead-q1-g1 at 651eabad3f listed exactly these items, apart from CloglogCcSize, which that gate's check then flagged as never constructed."
+  },
+  {
+    "base": "19f9aa099f0fb48f5b5865eb3bcda315dc21c33e",
+    "items": [
+      "crates/gam-config/src/lib.rs:fn:solver_tolerances_thread_from_the_wire_document",
+      "crates/gam-models/src/bms/block_specs.rs:fn:floor_default_outer_tol",
+      "crates/gam-models/src/bms/block_specs.rs:fn:the_floor_raises_the_default_and_passes_a_requested_outer_tol",
+      "crates/gam-models/src/fit_orchestration/materialize/mod.rs:fn:with_caller_solver_settings",
+      "crates/gam-models/src/fit_orchestration/materialize/tests.rs:fn:a_standard_fit_refuses_inner_tol_and_takes_outer_tol",
+      "crates/gam-models/src/fit_orchestration/materialize/tests.rs:fn:caller_tolerances_reach_the_solver_and_absent_keys_keep_the_defaults"
+    ],
+    "reason": "Removes the user-settable outer_tol/inner_tol that 1f865f880d added (gam SPEC 18-23: tolerances are derived; SPEC 25: no unnecessary options; SPEC 9: Python stays thin; gam-62 ruling). The need behind them was the literal outer band outer_tol = 1e-5 times n_obs (options.rs:584, read at run.rs:8954), which stopped gnomon-c9's binary marginal-slope fit at |g| = 0.796 inside 0.80 (#2954). That band is answered by one derived band on every route (strike-1b, #2954), not by a request knob. floor_default_outer_tol existed only to spare a requested tolerance from the BMS 2e-5 floor, so the floor is back to applying unconditionally, as before 1f865f880d. with_caller_solver_settings becomes with_caller_warm_start, which keeps only the warm_start_from point (15345469d4). The four tests pinned the removed keys; the wire document now refuses both keys by name (solver_tolerances_are_refused_by_the_wire_document).",
+    "evidence": "Direct gate on acn112 (strike-wall lane, gate-untol.sh and pins-untol2.sh at a8cd6c996c on 3101e933be): source_removal_guard.py verified 585 -> 582 Rust items with these 6 guarded removals; public_api_census 13314 -> 13314 public functions; test_census 12042 -> 12040 tests; cargo check --workspace --all-targets RC 0; gam-config lib plus the gam-models warm-start and payload pins 25/25. Read-proof: git grep -n floor_default_outer_tol 3101e933be shows the fn at block_specs.rs:1916, its two callers at 1959 and 1974 and its test at 1932 and 1940, nothing else; git grep -n with_caller_solver_settings 3101e933be shows only materialize mod.rs, location_scale.rs and standard.rs, which this commit renames to with_caller_warm_start."
+  },
+  {
+    "base": "e773b365bdc12c3e2161da12e360e09f233bae61",
+    "items": [
+      "crates/gam-sae/src/parameter_decomposition/attention.rs:fn:normalize_heads",
+      "crates/gam-sae/src/parameter_decomposition/block_program.rs:fn:a_gated_block_program_refuses_what_it_cannot_express_or_bind"
+    ],
+    "reason": "#2951 A12: a Qwen3 decoder block had no mechanism program because GatedBlockProgram::new refused any per-head query/key norm (GatedBlockProgramError::QueryKeyNorm). The refusal was a missing capability, so the program gains a HeadRmsNorm primitive and the refusal is deleted. attention.rs's private normalize_heads(rows with radius, heads, head_dim, epsilon, gain) is replaced by the pub head_rms_norm (values) and head_rms_norm_with_radius (values and l8's mean-value radius, unchanged), which derive the head count from the width, so NativeAttention and the program node run one owner; its two callers (normalize_queries, normalize_keys) and the norm-radius test call the new owner. The test a_gated_block_program_refuses_what_it_cannot_express_or_bind is renamed a_gated_block_program_refuses_what_it_cannot_bind: the per-head-norm refusal it asserted no longer exists, and it now asserts the normed block's two gain parameters instead.",
+    "evidence": "Direct gate dx1 run mpd-lead-qk-g2 (direct-dx1-mpd-lead-qk-g2.log) at d10950d360 (this unit stacked on l8 and the attention governor): RC_CHECK 0, RC_PYFFI 0, 365/365 parameter_decomposition:: tests, DONE_SENTINEL_0. Mutant arms dx1 run mpd-lead-qk-m2 (direct-dx1-mpd-lead-qk-m2.log): control 3/3 PASS, eps and swap arms FIRED. Stack check-only dx1 run mpd-lead-stack-c1 (direct-dx1-mpd-lead-stack-c1.log) at 3fbbf95bc0: RC_CHECK 0, RC_PYFFI 0."
+  },
+  {
+    "base": "52389090ca99fe8caf15b4c92b6e0e2406d37779",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:certificate_curvature_shift",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:certificate_hessian_is_psd_at_resolution",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:max_feasible_step_along",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:newton_predicted_decrease",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:newton_predicted_decrease_at_resolution",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:shifted_newton_predicted_decrease"
+    ],
+    "reason": "#2900 row 24.2 (SPEC rule 24: general outer-optimizer machinery lives in opt). The outer certificate's curvature shift, its PSD-at-resolution verdict, the Newton decrement taken at that shift (with its private Cholesky helper) and the exact box intersection along a ray were generic bound-constrained second-order helpers in gam-solve's rho_optimizer. They are opt::second_order at opt 53ce029 (from 6f2d85f), ported with the same bodies, and run.rs re-exports them (certificate_hessian_is_psd_at_resolution as an alias of opt::hessian_is_psd_at_resolution), so every call site keeps its name. max_feasible_step_along's one caller passes the box's two bounds to opt's version.",
+    "evidence": "git grep -c -w at d10950d360 finds certificate_hessian_is_psd_at_resolution in run.rs (10), bridges.rs (3) and run_plan_tests.rs (4); certificate_curvature_shift in run.rs (6); newton_predicted_decrease in run.rs (7), run_plan_tests.rs (5), rail_projection_tests.rs (6) and arc_curvature_stationary_2817_tests.rs (6); newton_predicted_decrease_at_resolution in run.rs (4), bridges.rs (2) and arc_curvature_stationary_2817_tests.rs (4); max_feasible_step_along and shifted_newton_predicted_decrease only in run.rs. All of them resolve to the pub(crate) re-export of opt's functions in run.rs. None is named in gam-pyffi, Python or benches; docs/issue-1082-validation.md:243 names certificate_curvature_shift in prose, which still describes the same function (now opt::certificate_curvature_shift through the re-export). opt's bodies diff equal to the removed ones except two clippy rewrites of the same predicates (opt 6f2d85f message)."
+  },
+  {
+    "base": "6687a9e706f2415a6d9cdd71758359298625fea8",
+    "items": [
+      "crates/gam-solve/src/evidence.rs:fn:ring_mixture_log_likelihood_derivatives",
+      "crates/gam-solve/src/evidence.rs:fn:ring_mixture_newton_derivatives_match_central_differences_2822",
+      "crates/gam-solve/src/evidence.rs:fn:ring_mixture_newton_proposal"
+    ],
+    "reason": "#2822: the ring-of-clusters generalized EM now takes a squared-extrapolation (SQUAREM S3) update, ring_mixture_squarem_update, in place of the EM-or-Newton choice. At an over-fitted order EM contracts along one fixed direction (successive updates parallel, cosine 1.000000, rate 0.9989-0.9999), and the S3 extrapolation is that direction's limit. The Newton proposal stepped only along resolvably positive curvature and was not an ascent above EM along the split. It is deleted with its analytic gradient and Hessian, ring_mixture_log_likelihood_derivatives, which had no other consumer, and with their central-difference test.",
+    "evidence": "At 5cd50a7d95, git grep -n -w finds ring_mixture_log_likelihood_derivatives only in crates/gam-solve/src/evidence.rs (its declaration at 2179, its call in ring_mixture_newton_proposal at 2315 and the test at 4538/4548), ring_mixture_newton_proposal only there (declaration 2308, the fit loop's call at 2498), and ring_mixture_newton_derivatives_match_central_differences_2822 only at its declaration at 4508. All of these are deleted in this commit. The guard of direct gate dy5 run sc-ring-g1 (base 5cd50a7d95, tree 848e475b54) names exactly these three items: two production fns with production_occurrences 4 and 2, and one test-scoped fn. That gate: workspace --all-targets check RC 0, gam-pyffi RC 0, gam-solve evidence:: and topology_selector:: tests RC 0, public API census 0, assertionless 0. Lane-only job 1335942 at eded626399: gam-solve 68/68 and gam-sae atom_shape_race 13/13 pass with the change, and the alpha = -1 mutant fails both ring pins."
+  },
+  {
+    "base": "6340572d96f6ae5606e5bfc2de6c5233031f5c8c",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/newton_decrement_certificate_2954_tests.rs:fn:a_tail_heading_to_a_representability_face_is_refused_by_type_2954",
+      "crates/gam-solve/src/rho_optimizer/newton_decrement_certificate_2954_tests.rs:fn:a_tail_toward_an_unidentified_unpenalized_fit_is_refused_by_type_2954"
+    ],
+    "reason": "#3012: the two #2954 stage-1 pins asserted that an exponential tail heading to a representability face is refused by type after the two Newton steps the quadratic-convergence budget allowed. That refusal was the budget's, not the face's: the polish now continues past the budget while the decrement contracts and never steps into a literal face's rail margin, so both tails are followed inside the box and certified once the decrease left, lambda^2 = V - V_inf on a tail, is below the band. They are replaced by a_tail_heading_to_a_representability_face_is_certified_inside_the_box_3012 and a_tail_toward_an_unidentified_unpenalized_fit_is_certified_inside_the_box_3012, which check that nothing is railed at the literal face and that lambda^2 equals the decrease left at the certified point, and by a_tail_that_needs_a_representability_face_is_refused_by_type_3012, which keeps the refusal by type where the face is nearer than the band allows.",
+    "evidence": "At 7c67b5261e git grep -c finds each name only in crates/gam-solve/src/rho_optimizer/newton_decrement_certificate_2954_tests.rs (its declaration, one occurrence each); the guard reports both as test_scoped true with production_occurrences 0. The landing tree names neither. Gate e stage pe1 on acl42 (base d10950d360, patch md5 3831cef4): cargo nextest run -p gam-solve, every target, 2010/2010 passed, including the three replacing pins."
   }
 ]
