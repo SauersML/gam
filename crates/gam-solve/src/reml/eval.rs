@@ -10,27 +10,10 @@ use std::sync::atomic::Ordering;
 // neither boundary contact nor large outer-gradient flags fired.
 pub(crate) const AUTO_CUBATURE_RHOVAR_TRIGGER: f64 = 0.1;
 
-/// Severity classifier for first-order fallbacks taken by
-/// [`RemlState::compute_smoothing_correction_auto`].
-///
-/// `Routine` covers by-design eligibility gates (dimension limits, the
-/// near-boundary/highgrad linearization gate, rank-deficient `V_ρ` where
-/// cubature would inject spurious variance, `n_rho == 0`, etc.). These
-/// log at `info` and do not count as failures.
-///
-/// `NumericalFailure` covers situations where cubature was requested by
-/// the eligibility logic but a downstream numerical step refused to
-/// produce a usable second-order correction: Hessian compute / inversion
-/// failed, the inverse Hessian's spectrum is non-positive, a sigma-point
-/// inner PIRLS diverged, or the assembled total covariance is
-/// non-finite. These log at `warn` and increment
-/// `SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT` so they are visible
-/// in long-running fits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SmoothingCorrectionFallbackSeverity {
-    Routine,
-    NumericalFailure,
-}
+use crate::model_types::SmoothingCorrectionFallback;
+
+/// A unit ρ-vector the certified `V_ρ` gives variance, and that variance.
+pub(crate) type RhoProposalAxis = (Array1<f64>, f64);
 
 /// Structured outcome of [`RemlState::compute_smoothing_correction_auto`].
 ///
@@ -67,20 +50,32 @@ pub enum SmoothingCorrectionOutcome {
         /// Provenance for `first_order_correction`. Always either `None` or
         /// `Some(FirstOrderIdentifiedSubspace{..})` — never `SigmaPointCubature`.
         first_order_method: Option<SmoothingCorrectionMethod>,
+        /// The ρ-directions the certified `V_ρ` gives variance, each with that
+        /// variance, railed coordinates conditioned on their face
+        /// ([`sigma_cubature_axes`]): the plug-in Gaussian over ρ this fit
+        /// reports, which the Tier-0 ρ-posterior diagnostic grades. Empty when
+        /// no direction is identified; `None` when no certified spectrum was
+        /// formed.
+        rho_proposal_axes: Option<Vec<RhoProposalAxis>>,
     },
     /// Principled first-order linearization was returned.
     FirstOrder {
         correction: Option<Array2<f64>>,
         rho_covariance: Option<Array2<f64>>,
-        /// Why the cubature upgrade was not taken. `Cow` rather than
-        /// `&'static str` because one of these reasons is not a fixed
-        /// classification but a propagated numerical failure — the typed error
-        /// from a sigma point's inner solve — and collapsing that to a constant
-        /// would discard the only description of what actually went wrong
-        /// (#2601).
+        /// Why the cubature upgrade was not taken: a statement about the fit
+        /// under which the first-order linearization is the correction (no
+        /// identified direction, a point-mass integrand, a dimension the
+        /// cubature is not run at). A cubature that was run and failed is never
+        /// reported here; it is the fit's typed `SmoothingCubatureRefused`.
         reason: std::borrow::Cow<'static, str>,
-        severity: SmoothingCorrectionFallbackSeverity,
         method: Option<SmoothingCorrectionMethod>,
+        /// The ρ-directions the certified `V_ρ` gives variance, each with that
+        /// variance, railed coordinates conditioned on their face
+        /// ([`sigma_cubature_axes`]): the plug-in Gaussian over ρ this fit
+        /// reports, which the Tier-0 ρ-posterior diagnostic grades. Empty when
+        /// no direction is identified; `None` when no certified spectrum was
+        /// formed.
+        rho_proposal_axes: Option<Vec<RhoProposalAxis>>,
     },
     /// Exact first-order geometry was unavailable. The typed reason is
     /// preserved instead of presenting a missing matrix as a routine skip.
@@ -155,17 +150,39 @@ impl SmoothingCorrectionOutcome {
         }
     }
 
+    /// The certified ρ-directions and their variances; see the
+    /// `rho_proposal_axes` field.
+    pub(crate) fn rho_proposal_axes(&self) -> Option<&[RhoProposalAxis]> {
+        match self {
+            SmoothingCorrectionOutcome::Cubature {
+                rho_proposal_axes, ..
+            }
+            | SmoothingCorrectionOutcome::FirstOrder {
+                rho_proposal_axes, ..
+            } => rho_proposal_axes.as_deref(),
+            SmoothingCorrectionOutcome::Unavailable { .. } => None,
+        }
+    }
+
+    /// Why the cubature upgrade was not taken, when the outcome is the
+    /// first-order linearization. `None` for a cubature upgrade and for an
+    /// unavailable correction, which carries its own typed reason.
+    pub(crate) fn fallback(&self) -> Option<SmoothingCorrectionFallback> {
+        match self {
+            SmoothingCorrectionOutcome::FirstOrder { reason, .. } => {
+                Some(SmoothingCorrectionFallback { reason: reason.to_string() })
+            }
+            SmoothingCorrectionOutcome::Cubature { .. }
+            | SmoothingCorrectionOutcome::Unavailable { .. } => None,
+        }
+    }
+
     /// Human-readable label naming the branch taken.
     pub(crate) fn branch_label(&self) -> &'static str {
         match self {
             SmoothingCorrectionOutcome::Cubature { .. } => "cubature",
             SmoothingCorrectionOutcome::Unavailable { .. } => "unavailable",
-            SmoothingCorrectionOutcome::FirstOrder { severity, .. } => match severity {
-                SmoothingCorrectionFallbackSeverity::Routine => "first-order (routine)",
-                SmoothingCorrectionFallbackSeverity::NumericalFailure => {
-                    "first-order (numerical failure)"
-                }
-            },
+            SmoothingCorrectionOutcome::FirstOrder { .. } => "first-order",
         }
     }
 }
@@ -667,6 +684,36 @@ fn sigma_cubature_axes(
         .collect())
 }
 
+/// Map an escalation run in the certified coordinates `t`, `ρ = ρ̂ + A·t`,
+/// back to `ρ`: every node and draw, the mean `ρ̂ + A·t̄` and the covariance
+/// `A·Σ_t·Aᵀ`. The weights, `R̂` and ESS are properties of the draws, not of
+/// the coordinates, and carry over unchanged.
+fn lift_rho_posterior_escalation(
+    escalation: gam_problem::rho_posterior::RhoPosteriorEscalation,
+    rho_hat: &Array1<f64>,
+    basis: &Array2<f64>,
+) -> gam_problem::rho_posterior::RhoPosteriorEscalation {
+    use gam_problem::rho_posterior::RhoPosteriorEscalation;
+    let lift_covariance = |covariance: &Array2<f64>| basis.dot(covariance).dot(&basis.t());
+    match escalation {
+        RhoPosteriorEscalation::Quadrature(mut mixture) => {
+            for node in &mut mixture.nodes {
+                node.rho = rho_hat + &basis.dot(&node.rho);
+            }
+            mixture.mean = rho_hat + &basis.dot(&mixture.mean);
+            mixture.covariance = lift_covariance(&mixture.covariance);
+            RhoPosteriorEscalation::Quadrature(mixture)
+        }
+        RhoPosteriorEscalation::Nuts(mut samples) => {
+            samples.samples = &samples.samples.dot(&basis.t()) + rho_hat;
+            samples.mean = rho_hat + &basis.dot(&samples.mean);
+            samples.covariance = lift_covariance(&samples.covariance);
+            RhoPosteriorEscalation::Nuts(samples)
+        }
+        unavailable @ RhoPosteriorEscalation::Unavailable { .. } => unavailable,
+    }
+}
+
 impl<'a> RemlState<'a> {
     /// Integrate the sampler's declared density, including the distribution
     /// prior and precision-to-log-precision Jacobian, rather than treating
@@ -1036,22 +1083,37 @@ impl<'a> RemlState<'a> {
     /// (`Self::compute_gradient`) for `K ≤ 16`, honest `Unavailable` beyond.
     /// Post-hoc escalation after the `RemlState` is gone would need an owned
     /// rebuild recipe; running at the live seam avoids that entirely. When
-    /// `allow_escalation` is `false` the returned escalation is always `None`, so
-    /// ordinary interactive formula/CLI fits emit the cheap diagnostic WITHOUT
-    /// ever turning into a NUTS-over-ρ sampler benchmark.
+    /// `allow_escalation` is `false` no tier runs, so ordinary interactive
+    /// formula/CLI fits emit the cheap diagnostic WITHOUT ever turning into a
+    /// sampler benchmark.
     ///
     /// [`Escalate`]: gam_problem::rho_posterior::RhoProposalAdequacy::Escalate
     ///
     /// `rho_domain` is the box the outer arm searched and certified against
-    /// (the #2812 resolvability domain). It is the support of `π(ρ|y)`: a
-    /// proposal outside it is not a model, so it carries zero importance weight
-    /// and is never handed to the inner solve. A railed coordinate's Laplace
+    /// (the #2812 resolvability domain). It is the support of `π(ρ|y)`, so the
+    /// Tier-0 proposal is the plug-in Gaussian truncated to it (#3010): a draw
+    /// outside it is not a model, it is rejected before the inner solve, and
+    /// the truncation's normalizer cancels in the self-normalized weights. A
+    /// domain holding under `1/M` of the Gaussian is refused with
+    /// `ProposalOutsideSupport` rather than graded. A railed coordinate's Laplace
     /// proposal is near-flat, so without this its draws land hundreds of
     /// log-units past the face, where P-IRLS has no valid minimum to report.
+    ///
+    /// `rho_proposal_axes` is the plug-in Gaussian the fit reports: the
+    /// directions its certified `V_ρ` gives variance, railed coordinates
+    /// conditioned on their face (see [`SmoothingCorrectionOutcome`]). When it
+    /// is supplied the diagnostic and its escalation run in those coordinates,
+    /// `ρ = ρ̂ + Σ_j t_j a_j` with `t_j ~ N(0, v_j)`, so they grade the object
+    /// the fit publishes. The raw outer Hessian instead keeps every direction
+    /// the certificate declined to identify — a saturated or railed `λ` whose
+    /// curvature is at roundoff — and its Laplace proposal throws every draw
+    /// orders of magnitude past the box, where the grade has nothing to read.
+    /// The escalation's nodes, draws and moments are mapped back to `ρ`.
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
         rho_domain: &(Array1<f64>, Array1<f64>),
+        rho_proposal_axes: Option<&[RhoProposalAxis]>,
         allow_escalation: bool,
         n_samples: Option<usize>,
     ) -> (
@@ -1079,18 +1141,48 @@ impl<'a> RemlState<'a> {
                 None,
             );
         };
-        let outer_hessian = match self.compute_lamlhessian_consistent(final_rho) {
-            Ok(outer_hessian) => outer_hessian,
-            Err(error) => {
+        // The coordinates the tiers work in: `ρ = centre + basis·t`, with the
+        // proposal precision in `t`. Without certified axes the tiers take `ρ`
+        // itself under the outer Hessian.
+        let (centre, basis, proposal_hessian) = match rho_proposal_axes {
+            Some([]) => {
                 return (
                     RhoPosteriorOutcome::NotComputed(
-                        RhoPosteriorNotComputed::OuterHessianUnavailable {
-                            reason: error.to_string(),
-                        },
+                        RhoPosteriorNotComputed::NoIdentifiedDirection,
                     ),
                     None,
                 );
             }
+            Some(axes) => {
+                let mut basis = Array2::<f64>::zeros((final_rho.len(), axes.len()));
+                let mut precision = Array2::<f64>::zeros((axes.len(), axes.len()));
+                for (column, (axis, variance)) in axes.iter().enumerate() {
+                    basis.column_mut(column).assign(axis);
+                    precision[[column, column]] = variance.recip();
+                }
+                (Array1::<f64>::zeros(axes.len()), Some(basis), precision)
+            }
+            None => match self.compute_lamlhessian_consistent(final_rho) {
+                Ok(outer_hessian) => (final_rho.clone(), None, outer_hessian),
+                Err(error) => {
+                    return (
+                        RhoPosteriorOutcome::NotComputed(
+                            RhoPosteriorNotComputed::OuterHessianUnavailable {
+                                reason: error.to_string(),
+                            },
+                        ),
+                        None,
+                    );
+                }
+            },
+        };
+        let to_rho = |t: &Array1<f64>| match basis.as_ref() {
+            Some(basis) => final_rho + &basis.dot(t),
+            None => t.clone(),
+        };
+        let to_coordinates = |gradient: Array1<f64>| match basis.as_ref() {
+            Some(basis) => basis.t().dot(&gradient),
+            None => gradient,
         };
         let in_domain = |rho: &Array1<f64>| {
             rho.iter().enumerate().all(|(k, &value)| {
@@ -1099,13 +1191,13 @@ impl<'a> RemlState<'a> {
             })
         };
         let outcome = match escalator.rho_posterior_adequacy(
-            final_rho,
-            &outer_hessian,
-            &|rho| {
-                in_domain(rho)
-                    .then(|| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()))
-                    .flatten()
+            &centre,
+            &proposal_hessian,
+            &|t| {
+                let rho = to_rho(t);
+                self.without_persistent_warm_start_store(|| self.compute_cost(&rho).ok())
             },
+            &|t| in_domain(&to_rho(t)),
             n_samples,
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
@@ -1119,13 +1211,12 @@ impl<'a> RemlState<'a> {
             }
         };
         let escalation = match &outcome {
-            // The diagnostic grades the plug-in `Escalate`, but escalation
-            // (Tier-1 quadrature / Tier-2 NUTS over ρ) is the expensive tier;
-            // only run it when the caller opts in. Interactive formula/CLI fits
-            // pass `allow_escalation = false`, so they surface the cheap Tier-0
-            // diagnostic while never launching the sampler.
+            // The diagnostic grades the plug-in `Escalate`. The escalation
+            // only runs when the caller opts in: interactive formula/CLI fits
+            // pass `allow_escalation = false`, so they publish the grade and
+            // never launch a sampler.
             RhoPosteriorOutcome::Assessed(adequacy)
-                if adequacy.adequacy == RhoProposalAdequacy::Escalate && allow_escalation =>
+                if allow_escalation && adequacy.adequacy == RhoProposalAdequacy::Escalate =>
             {
                 // #2450 — THE SAMPLER TARGETS A DISTRIBUTION; THE CRITERION DOES NOT.
                 //
@@ -1153,22 +1244,24 @@ impl<'a> RemlState<'a> {
                 // adequate, which is a question about the object the fit
                 // reports, and moving it is a separate decision recorded on
                 // #2450.
-                Some(escalator.escalate_rho_posterior(
-                    final_rho,
-                    &outer_hessian,
-                    &mut |rho| {
-                        if !in_domain(rho) {
+                let escalation = escalator.escalate_rho_posterior(
+                    &centre,
+                    &proposal_hessian,
+                    &mut |t| {
+                        let rho = to_rho(t);
+                        if !in_domain(&rho) {
                             return None;
                         }
-                        self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
+                        self.without_persistent_warm_start_store(|| self.compute_cost(&rho).ok())
                             .and_then(|cost| {
-                                self.rho_prior_distribution_correction(rho)
+                                self.rho_prior_distribution_correction(&rho)
                                     .ok()
                                     .map(|(prior_cost, _)| cost + prior_cost)
                             })
                     },
-                    &mut |rho| {
-                        if !in_domain(rho) {
+                    &mut |t| {
+                        let rho = to_rho(t);
+                        if !in_domain(&rho) {
                             return None;
                         }
                         self.without_persistent_warm_start_store(|| {
@@ -1176,17 +1269,21 @@ impl<'a> RemlState<'a> {
                             // gradient at the same rho; compute them through one
                             // value+gradient outer evaluation so the inner PIRLS
                             // solve and IFT state are shared by construction.
-                            self.compute_cost_and_gradient(rho).ok()
+                            self.compute_cost_and_gradient(&rho).ok()
                         })
                         .and_then(|(cost, gradient)| {
-                            self.rho_prior_distribution_correction(rho)
+                            self.rho_prior_distribution_correction(&rho)
                                 .ok()
                                 .map(|(prior_cost, prior_gradient)| {
-                                    (cost + prior_cost, gradient + prior_gradient)
+                                    (cost + prior_cost, to_coordinates(gradient + prior_gradient))
                                 })
                         })
                     },
-                ))
+                );
+                Some(match basis.as_ref() {
+                    Some(basis) => lift_rho_posterior_escalation(escalation, final_rho, basis),
+                    None => escalation,
+                })
             }
             _ => None,
         };
@@ -1210,8 +1307,6 @@ impl<'a> RemlState<'a> {
         // the cubature conditions on them (see [`sigma_cubature_axes`]).
         railed_coordinates: &[usize],
     ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
-        use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
-
         // Always compute the fast first-order correction first.
         let first_order = super::compute_smoothing_correction(
             self,
@@ -1237,24 +1332,43 @@ impl<'a> RemlState<'a> {
                 rho_covariance: first_order_rho_covariance,
             });
         }
+        // Railed coordinates are conditioned at their face and the cubature
+        // integrates the free ones (`sigma_cubature_axes`). A coordinate lying
+        // exactly on a face is railed whatever the caller reports: it has no
+        // chord on the outward side, so it cannot be integrated across.
+        let railed: Vec<bool> = (0..final_rho.len())
+            .map(|k| {
+                railed_coordinates.contains(&k)
+                    || rho_domain.0.get(k) == Some(&final_rho[k])
+                    || rho_domain.1.get(k) == Some(&final_rho[k])
+            })
+            .collect();
+        // The plug-in Gaussian over ρ this fit reports, read off the certified
+        // spectrum whatever the cubature gates below decide, so the Tier-0
+        // ρ-posterior diagnostic grades the object the fit publishes. With no
+        // identified direction that Gaussian is a point mass at ρ̂.
+        let rho_proposal_axes = match first_order.spectrum.as_ref() {
+            Some(spectrum) => match sigma_cubature_axes(spectrum, &railed) {
+                Ok(axes) => Some(axes),
+                Err(error) => {
+                    log::debug!("certified rho proposal axes unavailable: {error}");
+                    None
+                }
+            },
+            None => matches!(
+                first_order.status,
+                SmoothingCorrectionStatus::ZeroNoIdentifiedOuterDirections
+            )
+            .then(Vec::new),
+        };
         let first_order_routine =
             |correction: Option<Array2<f64>>, reason: std::borrow::Cow<'static, str>| {
                 SmoothingCorrectionOutcome::FirstOrder {
                     correction,
                     rho_covariance: first_order_rho_covariance.clone(),
                     reason,
-                    severity: Routine,
                     method: first_order_method,
-                }
-            };
-        let first_order_numerical =
-            |correction: Option<Array2<f64>>, reason: std::borrow::Cow<'static, str>| {
-                SmoothingCorrectionOutcome::FirstOrder {
-                    correction,
-                    rho_covariance: first_order_rho_covariance.clone(),
-                    reason,
-                    severity: NumericalFailure,
-                    method: first_order_method,
+                    rho_proposal_axes: rho_proposal_axes.clone(),
                 }
             };
         let n_rho = final_rho.len();
@@ -1331,9 +1445,20 @@ impl<'a> RemlState<'a> {
         // in hand there is nothing to bail out of: a direction that is not
         // `Active` is simply not a candidate node (#2728).
         let Some(spectrum) = first_order.spectrum.as_ref() else {
+            // Past the `Unavailable` return above, the certified spectrum is
+            // absent only when no ρ-direction is identified.
+            let reason = if matches!(
+                first_order.status,
+                SmoothingCorrectionStatus::ZeroNoIdentifiedOuterDirections
+            ) {
+                "no identified rho direction: the certified rho covariance is zero, so the \
+                 correction is exactly zero"
+            } else {
+                "certified rho spectrum unavailable: nothing for cubature to reuse"
+            };
             return self.finalize_smoothing_outcome(first_order_routine(
                 first_order_correction,
-                "certified rho spectrum unavailable: nothing for cubature to reuse".into(),
+                reason.into(),
             ));
         };
         let active_directions = spectrum.active_directions();
@@ -1370,24 +1495,16 @@ impl<'a> RemlState<'a> {
         };
         let p = base_cov.nrows();
         if spectrum.sensitivity_orig.nrows() != p {
-            return self.finalize_smoothing_outcome(first_order_numerical(
-                first_order_correction,
-                "certified sensitivities do not match the base covariance dimension".into(),
-            ));
+            return Err(EstimationError::FitResultInvariantViolated(format!(
+                "certified rho sensitivities have {} rows but the base covariance is {p}x{p}",
+                spectrum.sensitivity_orig.nrows()
+            )));
         }
 
-        // Railed coordinates are conditioned at their face and the cubature
-        // integrates the free ones (`sigma_cubature_axes`). A coordinate lying
-        // exactly on a face is railed whatever the caller reports: it has no
-        // chord on the outward side, so it cannot be integrated across.
-        let railed: Vec<bool> = (0..n_rho)
-            .map(|k| {
-                railed_coordinates.contains(&k)
-                    || final_rho[k] == rho_domain.0[k]
-                    || final_rho[k] == rho_domain.1[k]
-            })
-            .collect();
-        let axes = sigma_cubature_axes(spectrum, &railed)?;
+        let axes = match rho_proposal_axes.clone() {
+            Some(axes) => axes,
+            None => sigma_cubature_axes(spectrum, &railed)?,
+        };
         if axes.is_empty() {
             return self.finalize_smoothing_outcome(first_order_routine(
                 first_order_correction,
@@ -1462,10 +1579,12 @@ impl<'a> RemlState<'a> {
         // and importance weights from the posterior density. Its two covariance
         // terms therefore integrate the same positive probability measure.
         //
-        // Every refusal in this calibration is a statement about the UPGRADE: a
-        // node the criterion cannot calibrate, contain, or evaluate. The outer
-        // loop has already certified the fit and there is no trial left to
-        // refuse, so a refusal returns the first-order outcome with its reason.
+        // Every refusal in this calibration is a node the criterion cannot
+        // calibrate, contain, or evaluate at a fit the outer loop has already
+        // certified. There is no trial left to refuse and the first-order
+        // linearization is not the integral the fit reports, so a refusal is the
+        // fit's typed `SmoothingCubatureRefused`, never a downgraded covariance
+        // (SPEC.md: "In general, do not paper over solver issues.").
         let calibrated_nodes = (|| -> Result<Vec<CalibratedSigmaNode>, EstimationError> {
         let centre_cost = self.compute_rho_posterior_cost_uncharged(final_rho)?;
         if !centre_cost.is_finite() {
@@ -1550,10 +1669,9 @@ impl<'a> RemlState<'a> {
         let nodes = match calibrated_nodes {
             Ok(nodes) => nodes,
             Err(error) => {
-                return self.finalize_smoothing_outcome(first_order_numerical(
-                    first_order_correction,
-                    format!("smoothing cubature could not calibrate its nodes: {error}").into(),
-                ));
+                return Err(EstimationError::SmoothingCubatureRefused {
+                    reason: format!("could not calibrate its nodes: {error}"),
+                });
             }
         };
         // The Gaussian proposal density is equal at every spherical node.
@@ -1570,16 +1688,13 @@ impl<'a> RemlState<'a> {
         let sigma_points: Vec<Array1<f64>> = nodes.iter().map(|node| node.rho.clone()).collect();
         // A node whose inner fit fails, or whose penalized Hessian does not
         // certify SPD at its perturbed ρ, leaves the cubature measure
-        // unintegrable. That refuses the UPGRADE, not the fit the outer loop
-        // certified: the first-order correction at ρ̂ stays the outcome, with the
-        // node's refusal as its numerical-failure reason.
+        // unintegrable, and the fit names that as its typed refusal.
         let point_results = match sigma_cubature_dispatch(self, &sigma_points, Some(final_fit)) {
             Ok(results) => results,
             Err(error) => {
-                return self.finalize_smoothing_outcome(first_order_numerical(
-                    first_order_correction,
-                    format!("sigma-point cubature could not integrate its nodes: {error}").into(),
-                ));
+                return Err(EstimationError::SmoothingCubatureRefused {
+                    reason: format!("could not integrate its nodes: {error}"),
+                });
             }
         };
 
@@ -1696,6 +1811,7 @@ impl<'a> RemlState<'a> {
             max_rho_var: max_rhovar,
             first_order_correction,
             first_order_method,
+            rho_proposal_axes,
         })
     }
 
@@ -1731,33 +1847,13 @@ impl<'a> RemlState<'a> {
                 );
             }
             SmoothingCorrectionOutcome::FirstOrder {
-                reason,
-                severity,
-                correction,
-                ..
+                reason, correction, ..
             } => {
-                let has_matrix = correction.is_some();
-                match severity {
-                    SmoothingCorrectionFallbackSeverity::Routine => {
-                        log::debug!(
-                            "[smoothing-correction] branch=first-order severity=routine \
-                             has_matrix={} reason=\"{}\"",
-                            has_matrix,
-                            reason
-                        );
-                    }
-                    SmoothingCorrectionFallbackSeverity::NumericalFailure => {
-                        SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT
-                            .fetch_add(1, Ordering::Relaxed);
-                        log::debug!(
-                            "[smoothing-correction] branch=first-order severity=numerical-failure \
-                             has_matrix={} reason=\"{}\" failure_count={}",
-                            has_matrix,
-                            reason,
-                            SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed),
-                        );
-                    }
-                }
+                log::debug!(
+                    "[smoothing-correction] branch=first-order has_matrix={} reason=\"{}\"",
+                    correction.is_some(),
+                    reason
+                );
             }
             SmoothingCorrectionOutcome::Unavailable {
                 reason: SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { error },
@@ -2029,11 +2125,86 @@ mod sigma_cubature_axes_tests {
 }
 
 #[cfg(test)]
+mod rho_posterior_lift_tests {
+    use super::lift_rho_posterior_escalation;
+    use gam_problem::rho_posterior::{
+        RhoMixtureNode, RhoPosteriorEscalation, RhoPosteriorMixture, RhoPosteriorSamples,
+    };
+    use ndarray::{Array2, array};
+
+    fn max_abs(matrix: &Array2<f64>) -> f64 {
+        matrix.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    }
+
+    /// A 3-dimensional ρ with a 2-dimensional certified subspace: every node,
+    /// draw and moment in `t` lands at `ρ̂ + A·t`, and `Σ_t` becomes `A Σ_t Aᵀ`.
+    #[test]
+    fn quadrature_and_nuts_lift_back_to_rho() {
+        let rho_hat = array![1.0, -2.0, 0.5];
+        let root_half = 0.5_f64.sqrt();
+        let basis = array![[root_half, 0.0], [root_half, 0.0], [0.0, 1.0]];
+        let covariance_t = array![[2.0, 0.3], [0.3, 0.5]];
+        let expected_covariance = basis.dot(&covariance_t).dot(&basis.t());
+
+        let node = |t: [f64; 2]| RhoMixtureNode {
+            rho: array![t[0], t[1]],
+            weight: 0.5,
+            log_weight: 0.5_f64.ln(),
+            cost: 0.0,
+        };
+        let mixture = RhoPosteriorMixture {
+            nodes: vec![node([1.0, 0.0]), node([0.0, -1.0])],
+            mean: array![0.5, -0.5],
+            covariance: covariance_t.clone(),
+            effective_sample_size: 2.0,
+        };
+        let RhoPosteriorEscalation::Quadrature(lifted) = lift_rho_posterior_escalation(
+            RhoPosteriorEscalation::Quadrature(mixture),
+            &rho_hat,
+            &basis,
+        ) else {
+            panic!("quadrature must stay quadrature");
+        };
+        let first = &lifted.nodes[0].rho - &array![1.0 + root_half, -2.0 + root_half, 0.5];
+        let second = &lifted.nodes[1].rho - &array![1.0, -2.0, -0.5];
+        assert!(first.iter().chain(second.iter()).all(|value| value.abs() < 1e-15));
+        let mean = &lifted.mean - &array![1.0 + 0.5 * root_half, -2.0 + 0.5 * root_half, 0.0];
+        assert!(mean.iter().all(|value| value.abs() < 1e-15));
+        assert!(max_abs(&(&lifted.covariance - &expected_covariance)) < 1e-15);
+        assert_eq!(lifted.effective_sample_size, 2.0);
+
+        let samples = RhoPosteriorSamples {
+            samples: array![[0.0, 0.0], [2.0, 1.0]],
+            mean: array![1.0, 0.5],
+            covariance: covariance_t,
+            rhat: 1.0,
+            ess: 2.0,
+            converged: true,
+        };
+        let RhoPosteriorEscalation::Nuts(lifted) = lift_rho_posterior_escalation(
+            RhoPosteriorEscalation::Nuts(samples),
+            &rho_hat,
+            &basis,
+        ) else {
+            panic!("NUTS must stay NUTS");
+        };
+        let expected_draws = array![
+            [1.0, -2.0, 0.5],
+            [1.0 + 2.0 * root_half, -2.0 + 2.0 * root_half, 1.5]
+        ];
+        assert!(max_abs(&(&lifted.samples - &expected_draws)) < 1e-15);
+        let mean = &lifted.mean - &array![1.0 + root_half, -2.0 + root_half, 1.0];
+        assert!(mean.iter().all(|value| value.abs() < 1e-15));
+        assert!(max_abs(&(&lifted.covariance - &expected_covariance)) < 1e-15);
+        assert!(lifted.converged);
+    }
+}
+
+#[cfg(test)]
 mod smoothing_correction_outcome_tests {
     //! Unit tests for the structured [`SmoothingCorrectionOutcome`] type
     //! introduced by issue #201. These tests cover variant
-    //! classification helpers, the routine-vs-numerical-failure
-    //! severity distinction, that `None` correction is only possible
+    //! classification helpers, that `None` correction is only possible
     //! in `FirstOrder` outcomes, and that the failure-reason strings
     //! used in the function body are non-empty and distinct (a
     //! tripwire so future refactors cannot silently lose a
@@ -2047,7 +2218,6 @@ mod smoothing_correction_outcome_tests {
 
     pub(crate) fn make_first_order(
         reason: std::borrow::Cow<'static, str>,
-        severity: SmoothingCorrectionFallbackSeverity,
         with_matrix: bool,
     ) -> SmoothingCorrectionOutcome {
         let correction = if with_matrix {
@@ -2059,13 +2229,13 @@ mod smoothing_correction_outcome_tests {
             correction,
             rho_covariance: None,
             reason,
-            severity,
             method: with_matrix.then_some(
                 SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
                     active_rank: 1,
                     rho_dimension: 1,
                 },
             ),
+            rho_proposal_axes: None,
         }
     }
 
@@ -2088,6 +2258,7 @@ mod smoothing_correction_outcome_tests {
                 active_rank: 1,
                 rho_dimension: 1,
             }),
+            rho_proposal_axes: None,
         };
         assert_eq!(outcome.branch_label(), "cubature");
         let (mat, method, first_order_mat, first_order_method) =
@@ -2129,34 +2300,15 @@ mod smoothing_correction_outcome_tests {
     }
 
     #[test]
-    pub(crate) fn first_order_routine_branch_label_and_extraction() {
-        let outcome = make_first_order(
-            "n_rho == 0".into(),
-            SmoothingCorrectionFallbackSeverity::Routine,
-            true,
-        );
-        assert_eq!(outcome.branch_label(), "first-order (routine)");
-        assert!(outcome.into_correction_with_method().0.is_some());
-    }
-
-    #[test]
-    pub(crate) fn first_order_numerical_branch_label_and_extraction() {
-        let outcome = make_first_order(
-            "rho Hessian inversion failed after ridge regularization".into(),
-            SmoothingCorrectionFallbackSeverity::NumericalFailure,
-            true,
-        );
-        assert_eq!(outcome.branch_label(), "first-order (numerical failure)");
+    pub(crate) fn first_order_branch_label_and_extraction() {
+        let outcome = make_first_order("n_rho == 0".into(), true);
+        assert_eq!(outcome.branch_label(), "first-order");
         assert!(outcome.into_correction_with_method().0.is_some());
     }
 
     #[test]
     pub(crate) fn first_order_without_matrix_returns_none() {
-        let outcome = make_first_order(
-            "no base covariance supplied".into(),
-            SmoothingCorrectionFallbackSeverity::Routine,
-            false,
-        );
+        let outcome = make_first_order("no base covariance supplied".into(), false);
         assert!(outcome.into_correction_with_method().0.is_none());
     }
 
@@ -2578,56 +2730,6 @@ mod smoothing_correction_outcome_tests {
             a = corr1[[wi, wj]],
             b = corrc[[wi, wj]],
             e = c2 * corr1[[wi, wj]],
-        );
-    }
-
-    #[test]
-    pub(crate) fn classification_reason_strings_are_nonempty_and_distinct() {
-        let reasons = [
-            // Routine gates.
-            "n_rho == 0: unified corrected covariance equals H^{-1}",
-            "n_rho exceeds AUTO_CUBATURE_MAX_RHO_DIM: cubature cost prohibitive",
-            "beta dimension exceeds AUTO_CUBATURE_MAX_BETA_DIM: cubature cost prohibitive",
-            "first-order V_rho rank-deficient: cubature would impute spurious variance",
-            "post-inversion rho posterior variance below trigger threshold",
-            "no base covariance supplied: nothing for cubature to upgrade",
-            // Numerical failures.
-            "rho Hessian compute_lamlhessian_consistent failed",
-            "rho Hessian inversion failed after ridge regularization",
-            "eigendecomposition of inverse rho-Hessian failed",
-            "inverse rho-Hessian has no positive eigenvalues above numerical floor",
-            "positive-eigenvalue total mass non-finite or non-positive",
-            "variance-truncation produced rank 0 (unreachable guard)",
-            "empty sigma-point set (unreachable guard)",
-            // A sigma point's inner solve failing is a NUMERICAL-severity
-            // fallback carrying the propagated typed error, not a fixed
-            // classification string — hence the `Cow` (#2601).
-            "sigma-point inner solve failed at an off-trajectory rho: <typed error>",
-            "assembled total covariance contains non-finite entries",
-        ];
-        for r in reasons.iter() {
-            assert!(!r.is_empty(), "classification reason must not be empty");
-            let routine = make_first_order(
-                std::borrow::Cow::Borrowed(r),
-                SmoothingCorrectionFallbackSeverity::Routine,
-                true,
-            );
-            let numerical = make_first_order(
-                std::borrow::Cow::Borrowed(r),
-                SmoothingCorrectionFallbackSeverity::NumericalFailure,
-                true,
-            );
-            assert_eq!(routine.branch_label(), "first-order (routine)");
-            assert_eq!(numerical.branch_label(), "first-order (numerical failure)");
-        }
-
-        let mut sorted: Vec<&'static str> = reasons.to_vec();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            reasons.len(),
-            "classification reasons must be distinct so callers can disambiguate"
         );
     }
 }

@@ -2327,6 +2327,12 @@ where
     let mut smoothing_correction_first_order = None;
     let mut smoothing_correction_method_first_order = None;
     let mut smoothing_correction_absence = None;
+    // Why the published correction is first-order rather than the cubature
+    // upgrade; the reason reaches the fit instead of only a log.
+    let mut smoothing_correction_fallback = None;
+    // The certified V_ρ axes the Tier-0 grade samples along; absent when the
+    // correction was unavailable.
+    let mut rho_proposal_axes: Option<Vec<super::reml::eval::RhoProposalAxis>> = None;
     let mut rho_covariance = None;
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
@@ -3544,6 +3550,8 @@ where
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
+                    smoothing_correction_fallback = outcome.fallback();
+                    rho_proposal_axes = outcome.rho_proposal_axes().map(<[_]>::to_vec);
                     (
                         smoothing_correction,
                         smoothing_correction_method,
@@ -3552,6 +3560,19 @@ where
                     ) = outcome.into_correction_with_method();
                 }
             }
+        } else if opts.compute_inference && !final_rho.is_empty() {
+            // The governor refused the dense bundle, so there is no `V_β` for
+            // `J·V_ρ·Jᵀ` to correct and the published standard errors are the
+            // factorized conditional ones. Name that instead of leaving the
+            // conditional source unexplained.
+            smoothing_correction_absence = Some(
+                crate::model_types::SmoothingCorrectionAbsence::DenseCovarianceNotReserved {
+                    detail: format!(
+                        "the memory governor refused a {p} x {p} coefficient covariance bundle",
+                        p = pirls_res.reparam_result.qs.nrows()
+                    ),
+                },
+            );
         }
 
         // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML objective
@@ -3577,6 +3598,7 @@ where
             &final_rho,
             // The searched and certified box is the posterior's support.
             &rho_model_domain,
+            rho_proposal_axes.as_deref(),
             !opts.skip_rho_posterior_inference,
             None,
         );
@@ -3846,6 +3868,7 @@ where
         smoothing_correction_first_order,
         smoothing_correction_method_first_order,
         smoothing_correction_absence,
+        smoothing_correction_fallback,
         penalized_hessian: penalized_hessian.clone().into(),
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,
@@ -4034,6 +4057,7 @@ where
             pirls: Some(pirls_res),
             criterion_certificate: outer_result.criterion_certificate.clone(),
             rho_posterior,
+            rho_posterior_escalation_record: rho_posterior_escalation.as_ref().map(Into::into),
             rho_posterior_escalation,
             rho_covariance,
             // Persist the optimized target's Firth state so saved-model

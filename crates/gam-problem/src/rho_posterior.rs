@@ -116,6 +116,11 @@ pub enum RhoPosteriorRefusal {
     TailShapeNotFinite,
     /// The smoothed importance weights do not sum to a positive finite total.
     SmoothedWeightsNotNormalizable,
+    /// The plug-in Gaussian truncated to the `ρ` domain has no usable mass:
+    /// `requested²` draws produced only `accepted < requested` inside the
+    /// domain, so the domain holds under `1/requested` of the proposal — below
+    /// what a `requested`-draw diagnostic resolves.
+    ProposalOutsideSupport { accepted: usize, drawn: usize, requested: usize },
 }
 
 impl fmt::Display for RhoPosteriorRefusal {
@@ -137,6 +142,11 @@ impl fmt::Display for RhoPosteriorRefusal {
             Self::SmoothedWeightsNotNormalizable => {
                 f.write_str("smoothed importance weights do not sum to a positive finite total")
             }
+            Self::ProposalOutsideSupport { accepted, drawn, requested } => write!(
+                f,
+                "the plug-in Gaussian puts under 1/{requested} of its mass inside the rho \
+                 domain: {accepted} of {drawn} draws landed in it"
+            ),
         }
     }
 }
@@ -155,6 +165,10 @@ pub enum RhoPosteriorNotComputed {
     EscalatorUnregistered,
     /// The outer Hessian at `ρ̂` could not be formed.
     OuterHessianUnavailable { reason: String },
+    /// The certified `V_ρ` gives no `ρ`-direction any variance, so the plug-in
+    /// posterior of `ρ` is a point mass at `ρ̂`: no proposal draw moves off it,
+    /// and there is no importance ratio to grade.
+    NoIdentifiedDirection,
 }
 
 impl fmt::Display for RhoPosteriorNotComputed {
@@ -170,6 +184,10 @@ impl fmt::Display for RhoPosteriorNotComputed {
             Self::OuterHessianUnavailable { reason } => {
                 write!(f, "the outer Hessian at rho_hat is unavailable: {reason}")
             }
+            Self::NoIdentifiedDirection => f.write_str(
+                "the certified rho covariance identifies no direction, so the plug-in rho \
+                 posterior is a point mass at rho_hat with nothing to grade",
+            ),
         }
     }
 }
@@ -270,6 +288,99 @@ pub enum RhoPosteriorEscalation {
     Unavailable { n_params: usize, reason: String },
 }
 
+/// What a fit's `ρ`-posterior escalation concluded, in the form a saved model
+/// carries.
+///
+/// [`RhoPosteriorEscalation`] holds the quadrature nodes or NUTS draws, which
+/// are large and carry values outside the reals (an infeasible node's `+∞`
+/// cost, a degenerate chain's `NaN` R̂) that a saved model refuses. The
+/// posterior moments of `ρ` and the tier's own diagnostics are what a summary
+/// reports, so those are what persist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "tier", rename_all = "snake_case")]
+pub enum RhoPosteriorEscalationRecord {
+    /// Tier 1 ran: the moments of `ρ` under the Gauss-Hermite mixture.
+    Quadrature {
+        n_nodes: usize,
+        mean: Vec<f64>,
+        covariance: Vec<Vec<f64>>,
+        /// Kish ESS of the node weights (maximum `n_nodes`).
+        effective_sample_size: f64,
+    },
+    /// Tier 2 ran: the moments of `ρ` under the NUTS draws.
+    Nuts {
+        n_draws: usize,
+        mean: Vec<f64>,
+        covariance: Vec<Vec<f64>>,
+        /// Split-chain R̂; `None` when the chains give no finite value.
+        rhat: Option<f64>,
+        /// Effective sample size; `None` when the chains give no finite value.
+        ess: Option<f64>,
+        converged: bool,
+    },
+    /// No escalated posterior, and why.
+    Unavailable { n_params: usize, reason: String },
+}
+
+impl RhoPosteriorEscalationRecord {
+    /// The token naming the tier: `"quadrature"`, `"nuts"` or `"unavailable"`.
+    pub fn tier(&self) -> &'static str {
+        match self {
+            Self::Quadrature { .. } => "quadrature",
+            Self::Nuts { .. } => "nuts",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+}
+
+impl From<&RhoPosteriorEscalation> for RhoPosteriorEscalationRecord {
+    fn from(escalation: &RhoPosteriorEscalation) -> Self {
+        fn rows(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
+            matrix.rows().into_iter().map(|row| row.to_vec()).collect()
+        }
+        let moments_finite = |mean: &Array1<f64>, covariance: &Array2<f64>| {
+            mean.iter().chain(covariance.iter()).all(|value| value.is_finite())
+        };
+        match escalation {
+            RhoPosteriorEscalation::Quadrature(mixture)
+                if moments_finite(&mixture.mean, &mixture.covariance)
+                    && mixture.effective_sample_size.is_finite() =>
+            {
+                Self::Quadrature {
+                    n_nodes: mixture.nodes.len(),
+                    mean: mixture.mean.to_vec(),
+                    covariance: rows(&mixture.covariance),
+                    effective_sample_size: mixture.effective_sample_size,
+                }
+            }
+            RhoPosteriorEscalation::Nuts(samples)
+                if moments_finite(&samples.mean, &samples.covariance) =>
+            {
+                Self::Nuts {
+                    n_draws: samples.samples.nrows(),
+                    mean: samples.mean.to_vec(),
+                    covariance: rows(&samples.covariance),
+                    rhat: Some(samples.rhat).filter(|value| value.is_finite()),
+                    ess: Some(samples.ess).filter(|value| value.is_finite()),
+                    converged: samples.converged,
+                }
+            }
+            RhoPosteriorEscalation::Quadrature(mixture) => Self::Unavailable {
+                n_params: mixture.mean.len(),
+                reason: "tier-1 quadrature produced non-finite posterior moments".to_string(),
+            },
+            RhoPosteriorEscalation::Nuts(samples) => Self::Unavailable {
+                n_params: samples.mean.len(),
+                reason: "tier-2 NUTS produced non-finite posterior moments".to_string(),
+            },
+            RhoPosteriorEscalation::Unavailable { n_params, reason } => Self::Unavailable {
+                n_params: *n_params,
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
 // ───────────────────────── injected escalator trait (#1521) ──────────────────
 
 /// The gam-inference-tier producer of the Tier-0 `ρ`-adequacy diagnostic and the
@@ -291,14 +402,17 @@ pub enum RhoPosteriorEscalation {
 /// leaving the plug-in + first-order intervals.
 pub trait RhoPosteriorEscalator: Send + Sync {
     /// Tier-0 PSIS `ρ`-adequacy diagnostic. `criterion` evaluates the outer criterion
-    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). Returns
-    /// `Ok(None)` when there is nothing to grade (`K = 0`) and the typed
-    /// [`RhoPosteriorRefusal`] when the diagnostic cannot be formed.
+    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`); `support` is
+    /// the `ρ` domain the proposal is truncated to — draws outside it are
+    /// rejected before `criterion` is evaluated. Returns `Ok(None)` when there
+    /// is nothing to grade (`K = 0`) and the typed [`RhoPosteriorRefusal`] when
+    /// the diagnostic cannot be formed.
     fn rho_posterior_adequacy(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
         criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        support: &dyn Fn(&Array1<f64>) -> bool,
         n_samples: Option<usize>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 
@@ -407,6 +521,7 @@ mod tests {
             RhoPosteriorOutcome::NotComputed(RhoPosteriorNotComputed::OuterHessianUnavailable {
                 reason: "singular".to_string(),
             }),
+            RhoPosteriorOutcome::NotComputed(RhoPosteriorNotComputed::NoIdentifiedDirection),
             RhoPosteriorOutcome::Refused(RhoPosteriorRefusal::HessianNotPositiveDefinite {
                 detail: "Cholesky(NonPositivePivot { index: 0 })".to_string(),
             }),
@@ -505,6 +620,104 @@ mod tests {
         assert_eq!(
             (mirror.k_hat, mirror.n_samples, mirror.effective_sample_size),
             (0.25, 64, 61.5)
+        );
+    }
+
+    fn two_node_mixture(mean: [f64; 2]) -> RhoPosteriorMixture {
+        let node = |rho: [f64; 2], cost: f64| RhoMixtureNode {
+            rho: Array1::from(rho.to_vec()),
+            weight: 0.5,
+            log_weight: 0.5_f64.ln(),
+            cost,
+        };
+        RhoPosteriorMixture {
+            // An infeasible node's `+∞` cost is exactly what the record must not carry.
+            nodes: vec![node([0.0, 1.0], 3.0), node([1.0, 2.0], f64::INFINITY)],
+            mean: Array1::from(mean.to_vec()),
+            covariance: Array2::from_shape_vec((2, 2), vec![0.25, 0.0, 0.0, 0.25])
+                .expect("2 x 2 covariance"),
+            effective_sample_size: 2.0,
+        }
+    }
+
+    /// A finite Tier-1 mixture persists as its moments, tagged `"quadrature"`, and
+    /// reads back unchanged even though a node carries a `+∞` cost.
+    #[test]
+    fn escalation_record_keeps_finite_quadrature_moments() {
+        let record = RhoPosteriorEscalationRecord::from(&RhoPosteriorEscalation::Quadrature(
+            two_node_mixture([0.5, 1.5]),
+        ));
+        assert_eq!(
+            record,
+            RhoPosteriorEscalationRecord::Quadrature {
+                n_nodes: 2,
+                mean: vec![0.5, 1.5],
+                covariance: vec![vec![0.25, 0.0], vec![0.0, 0.25]],
+                effective_sample_size: 2.0,
+            }
+        );
+        assert_eq!(record.tier(), "quadrature");
+        let json = serde_json::to_string(&record).expect("a finite record serializes");
+        assert!(json.starts_with(r#"{"tier":"quadrature","#), "{json}");
+        let read: RhoPosteriorEscalationRecord =
+            serde_json::from_str(&json).expect("the record reads back");
+        assert_eq!(read, record);
+    }
+
+    /// Non-finite escalated moments are no posterior: the record names the tier
+    /// that failed instead of persisting a value a saved model refuses.
+    #[test]
+    fn escalation_record_reports_non_finite_moments_as_unavailable() {
+        let record = RhoPosteriorEscalationRecord::from(&RhoPosteriorEscalation::Quadrature(
+            two_node_mixture([f64::NAN, 1.5]),
+        ));
+        assert_eq!(
+            record,
+            RhoPosteriorEscalationRecord::Unavailable {
+                n_params: 2,
+                reason: "tier-1 quadrature produced non-finite posterior moments".to_string(),
+            }
+        );
+        let samples = RhoPosteriorSamples {
+            samples: Array2::zeros((4, 2)),
+            mean: Array1::from(vec![0.0, 0.0]),
+            covariance: Array2::from_elem((2, 2), f64::INFINITY),
+            rhat: f64::NAN,
+            ess: 3.0,
+            converged: false,
+        };
+        let record = RhoPosteriorEscalationRecord::from(&RhoPosteriorEscalation::Nuts(samples));
+        assert_eq!(record.tier(), "unavailable");
+        let json = serde_json::to_string(&record).expect("an unavailable record serializes");
+        assert_eq!(
+            json,
+            r#"{"tier":"unavailable","n_params":2,"reason":"tier-2 NUTS produced non-finite posterior moments"}"#
+        );
+    }
+
+    /// A NUTS run with finite moments keeps them and drops only the non-finite
+    /// diagnostic, so R̂ reads `None` rather than refusing the whole record.
+    #[test]
+    fn escalation_record_drops_only_non_finite_nuts_diagnostics() {
+        let samples = RhoPosteriorSamples {
+            samples: Array2::zeros((4, 1)),
+            mean: Array1::from(vec![0.3]),
+            covariance: Array2::from_elem((1, 1), 0.1),
+            rhat: f64::NAN,
+            ess: 3.0,
+            converged: false,
+        };
+        let record = RhoPosteriorEscalationRecord::from(&RhoPosteriorEscalation::Nuts(samples));
+        assert_eq!(
+            record,
+            RhoPosteriorEscalationRecord::Nuts {
+                n_draws: 4,
+                mean: vec![0.3],
+                covariance: vec![vec![0.1]],
+                rhat: None,
+                ess: Some(3.0),
+                converged: false,
+            }
         );
     }
 }

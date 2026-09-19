@@ -167,7 +167,7 @@ pub use result_types::{
     OuterHessianAbsence, OuterStationarityCertificate, OuterWarmStartRecord, RailCoordinate,
     RailTailEvidence,
     RailedCoordinateFact, RankConstancyNotEvaluated, SmoothingCorrectionAbsence,
-    SmoothingCorrectionMethod, UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,
+    SmoothingCorrectionFallback, SmoothingCorrectionMethod, UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,
     ensure_finite_scalar, is_zero_dispersion_boundary,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
     validate_all_finite, validate_dense_hessian_export,

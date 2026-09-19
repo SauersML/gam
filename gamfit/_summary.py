@@ -320,6 +320,29 @@ class Summary:
         gauge, so a caller can impose a tolerance of their own without reading a
         log. ``None`` for routes that certify no optimizer (the O(n) spline
         scan).
+
+        It also says where the published standard errors come from.
+        ``covariance_source`` is ``"smoothing-corrected"`` or
+        ``"conditional"`` (the same token as :attr:`coefficient_se_source`);
+        ``covariance_source_reason`` says why, and is always set when the source
+        is ``"conditional"`` or the correction is the first-order one.
+        ``smoothing_correction_method`` names the retained correction and
+        ``smoothing_correction_fallback`` carries the ``reason`` the first-order
+        form is exact (no identified rho direction to integrate). A sigma-point
+        cubature that fails raises ``IntegrationError`` instead of publishing a
+        downgraded covariance.
+
+        The rho-posterior adequacy diagnostic is reported as
+        ``rho_posterior_status`` (``"assessed"``, ``"refused"``,
+        ``"not_computed"`` or ``"not_applicable"``), ``rho_posterior_khat`` (the
+        PSIS tail shape of the Laplace proposal over the log smoothing
+        parameters, finite when assessed), ``rho_posterior_adequacy``
+        (``"plug_in_adequate"``, ``"importance_correct"`` or ``"escalate"``),
+        ``rho_posterior_effective_sample_size``, ``rho_posterior_samples`` and
+        ``rho_posterior_reason``. An ``"escalate"`` grade with at most four
+        smoothing parameters runs deterministic Gauss-Hermite quadrature over
+        them, whose ``tier``, node count and posterior moments appear in
+        ``rho_posterior_escalation``.
     notes : list of str
         The notes the fit recorded, as in :attr:`gamfit.Model.notes`:
         advisories (the model differs from the literal request, also raised as

@@ -159,6 +159,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_correction_fallback: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(36)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -270,6 +271,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_correction_fallback: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -343,6 +345,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_correction_fallback: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -546,6 +549,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_correction_fallback: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -2552,6 +2556,13 @@ pub struct FitArtifacts {
     /// live-objective seam as the grade; re-derivable, not serialized.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub rho_posterior_escalation: Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
+    /// The persisted digest of [`Self::rho_posterior_escalation`]: the tier that
+    /// ran with the posterior moments of `ρ` it produced, or why none did.
+    /// `None` exactly when the escalation is `None`. It persists with the fit, so
+    /// a reloaded model's summary reports the same escalation.
+    #[serde(default)]
+    pub rho_posterior_escalation_record:
+        Option<gam_problem::rho_posterior::RhoPosteriorEscalationRecord>,
     /// Regularized inverse REML/LAML outer Hessian over `rho = log(lambda)`,
     /// aligned with [`UnifiedFitResult::lambdas`]. This is the narrow #740
     /// handoff consumed by estimated-lambda Lawley LR corrections; it is
@@ -2858,6 +2869,10 @@ impl std::fmt::Debug for FitArtifacts {
             .field("rho_posterior", &self.rho_posterior)
             .field("rho_posterior_escalation", &self.rho_posterior_escalation)
             .field(
+                "rho_posterior_escalation_record",
+                &self.rho_posterior_escalation_record,
+            )
+            .field(
                 "rho_covariance",
                 &self.rho_covariance.as_ref().map(|m| m.dim()),
             )
@@ -2995,6 +3010,23 @@ pub enum SmoothingCorrectionAbsence {
     RailCertified { detail: String },
     /// The corrected covariance could not be truncated to the constrained feasible set.
     ConstrainedTruncationRefused { detail: String },
+    /// The memory governor refused the dense covariance bundle, so the fit formed only the
+    /// factorized conditional standard errors and no `V_β` to correct.
+    DenseCovarianceNotReserved { detail: String },
+}
+
+/// Why a fit's published smoothing correction is the first-order
+/// linearization rather than the sigma-point cubature upgrade.
+///
+/// Minted where the first-order form was chosen, at fit time, so the
+/// mathematical reason (no ρ to integrate, or a certified `V_ρ` whose
+/// identified subspace makes the linearization exact) travels with the fit
+/// instead of reaching only a log. A cubature that fails is not a fallback:
+/// it is the typed `EstimationError::SmoothingCubatureRefused` (SPEC.md: "In
+/// general, do not paper over solver issues.").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SmoothingCorrectionFallback {
+    pub reason: String,
 }
 
 /// Why a custom-family outer search declares no analytic ρ-Hessian.
@@ -3047,6 +3079,10 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
             Self::ConstrainedTruncationRefused { detail } => write!(
                 f,
                 "the corrected covariance could not be truncated to the feasible set: {detail}"
+            ),
+            Self::DenseCovarianceNotReserved { detail } => write!(
+                f,
+                "the dense coefficient covariance was not reserved, so only factorized conditional standard errors were formed: {detail}"
             ),
         }
     }
@@ -3109,6 +3145,12 @@ pub struct FitInference {
     /// fit has no smoothing coordinate.
     #[serde(default)]
     pub smoothing_correction_absence: Option<SmoothingCorrectionAbsence>,
+    /// Why `smoothing_correction` is the first-order linearization instead of
+    /// the sigma-point cubature upgrade. `None` when the cubature was taken,
+    /// when no correction was formed (see `smoothing_correction_absence`), and
+    /// on a fit saved before this field existed.
+    #[serde(default)]
+    pub smoothing_correction_fallback: Option<SmoothingCorrectionFallback>,
     /// Penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
     /// When [`UnifiedFitResult::geometry`] is present, this matrix shares its
     /// exact active coefficient frame and therefore has dimension
@@ -3189,6 +3231,8 @@ struct FitInferenceWire {
     smoothing_correction_method_first_order: Option<SmoothingCorrectionMethod>,
     #[serde(default)]
     smoothing_correction_absence: Option<SmoothingCorrectionAbsence>,
+    #[serde(default)]
+    smoothing_correction_fallback: Option<SmoothingCorrectionFallback>,
     penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision,
     reparam_qs: Option<Array2<f64>>,
     dispersion: Dispersion,
@@ -3226,6 +3270,7 @@ impl From<FitInferenceWire> for FitInference {
             smoothing_correction_first_order: wire.smoothing_correction_first_order,
             smoothing_correction_method_first_order: wire.smoothing_correction_method_first_order,
             smoothing_correction_absence: wire.smoothing_correction_absence,
+            smoothing_correction_fallback: wire.smoothing_correction_fallback,
             penalized_hessian: wire.penalized_hessian,
             reparam_qs: wire.reparam_qs,
             dispersion: wire.dispersion,
@@ -3792,6 +3837,7 @@ mod assembly_inner_status_gate_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_correction_fallback: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(hessian),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -5939,6 +5985,46 @@ impl UnifiedFitResult {
             })
     }
 
+    /// Why [`Self::display_coefficient_uncertainty`] reads the covariance it
+    /// does, rendered from the typed evidence the fit carries.
+    ///
+    /// Always `Some` when the published standard errors are the ρ̂-conditional
+    /// ones on a fit that estimated smoothing parameters: the fit either
+    /// recorded why no smoothing correction reached its covariance, or its
+    /// correction was never formed on this route. For a smoothing-corrected
+    /// covariance it is `Some` when the correction is the first-order
+    /// linearization (the reason the cubature was declined) or when there is
+    /// no smoothing parameter to correct for, and `None` for the cubature.
+    pub fn coefficient_covariance_source_reason(&self) -> Option<String> {
+        let view = self.display_coefficient_uncertainty()?;
+        let no_smoothing_coordinate = has_no_smoothing_coordinate(&self.log_lambdas, &self.artifacts);
+        match view.definition {
+            CoefficientCovarianceDefinition::SmoothingCorrected if no_smoothing_coordinate => Some(
+                "no smoothing parameter was estimated, so the rho-hat-conditional covariance \
+                 is already the marginal one"
+                    .to_string(),
+            ),
+            CoefficientCovarianceDefinition::SmoothingCorrected => self
+                .smoothing_correction_fallback()
+                .map(|fallback| format!("first-order smoothing correction: {}", fallback.reason)),
+            CoefficientCovarianceDefinition::Conditional => Some(
+                match (self.smoothing_correction_absence(), self.smoothing_correction_fallback()) {
+                    (Some(absence), _) => absence.to_string(),
+                    (None, Some(fallback)) => {
+                        format!("no smoothing correction could be formed: {}", fallback.reason)
+                    }
+                    (None, None) => "this fit's route forms no smoothing correction, so its \
+                                     standard errors are conditional on the estimated smoothing \
+                                     parameters"
+                        .to_string(),
+                },
+            ),
+            // The display view never resolves to the sandwich; it is a
+            // requested definition, so it needs no reason for being chosen.
+            CoefficientCovarianceDefinition::FrequentistSandwich => None,
+        }
+    }
+
     /// Get the penalized Hessian if available.
     ///
     /// The matrix is in the active geometry coordinate frame when
@@ -6017,6 +6103,14 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inference| inference.smoothing_correction_absence.as_ref())
+    }
+
+    /// Why this fit's smoothing correction is the first-order linearization
+    /// rather than the cubature upgrade, minted where the cubature was declined.
+    pub fn smoothing_correction_fallback(&self) -> Option<&SmoothingCorrectionFallback> {
+        self.inference
+            .as_ref()
+            .and_then(|inference| inference.smoothing_correction_fallback.as_ref())
     }
 
     /// Total effective degrees of freedom.

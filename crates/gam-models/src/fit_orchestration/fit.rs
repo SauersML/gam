@@ -2501,6 +2501,7 @@ fn survival_unified_fit_result(
             .as_ref()
             .map(|(_, method)| *method),
         smoothing_correction_absence,
+        smoothing_correction_fallback: None,
         penalized_hessian: penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,

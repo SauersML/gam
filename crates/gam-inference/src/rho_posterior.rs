@@ -86,9 +86,10 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
         criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        support: &dyn Fn(&Array1<f64>) -> bool,
         n_samples: Option<usize>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal> {
-        rho_posterior_adequacy(rho_hat, outer_hessian, criterion, n_samples)
+        rho_posterior_adequacy(rho_hat, outer_hessian, criterion, support, n_samples)
     }
 
     fn escalate_rho_posterior(
@@ -539,22 +540,42 @@ where
 ///   objective) at a trial `ρ`; returns `None` for infeasible `ρ`. This is the
 ///   `OuterObjective::eval_cost` contract, supplied by the caller that retains
 ///   (or rebuilds) the objective.
+/// * `support` — whether a trial `ρ` lies in the support of `π(ρ|y)`, the ρ
+///   domain the fit searched and certified. The proposal is the Laplace
+///   Gaussian TRUNCATED to it (#3010): a draw outside is rejected before the
+///   criterion is evaluated, so it costs one Gaussian sample and no inner
+///   solve. The truncated density is the Gaussian's times a normalizer common
+///   to every accepted draw, which cancels in the self-normalized weights and
+///   leaves the tail shape unchanged, so the weight formula above holds as is.
+///   Along a direction the certificate identifies but the criterion barely
+///   curves, the untruncated Gaussian throws almost every draw past the box
+///   face, where there is no model to weigh it against.
 /// * `n_samples` — proposal draw count `M` (defaults to 64 when `None`).
+///
+/// At most `M²` Gaussian draws are spent collecting the `M` accepted ones. A
+/// support holding at least `1/M` of the Gaussian's mass yields `M` in
+/// expectation within that many; one holding less is a Gaussian that puts under
+/// one draw in `M` on the model at all, a mass fraction below the resolution of
+/// an `M`-draw diagnostic, and the grade is refused as
+/// [`RhoPosteriorRefusal::ProposalOutsideSupport`].
 ///
 /// Returns `Ok(None)` when `K = 0`: there is nothing to grade. Returns the typed
 /// [`RhoPosteriorRefusal`] naming the site when the diagnostic cannot be formed —
 /// an outer Hessian whose shape does not match `ρ̂` or that is not positive
-/// definite, an infeasible or non-finite criterion at `ρ̂`, no proposal draw with a
-/// finite criterion, too few finite weights for the Pareto tail fit, a non-finite
-/// tail shape, or smoothed weights that do not normalize.
-pub fn rho_posterior_adequacy<F>(
+/// definite, an infeasible or non-finite criterion at `ρ̂`, a proposal whose mass
+/// lies outside the support, no proposal draw with a finite criterion, too few
+/// finite weights for the Pareto tail fit, a non-finite tail shape, or smoothed
+/// weights that do not normalize.
+pub fn rho_posterior_adequacy<F, S>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
     criterion: F,
+    support: S,
     n_samples: Option<usize>,
 ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>
 where
     F: Fn(&Array1<f64>) -> Option<f64>,
+    S: Fn(&Array1<f64>) -> bool,
 {
     let k = rho_hat.len();
     if k == 0 {
@@ -567,6 +588,9 @@ where
             k,
         });
     }
+    if !support(rho_hat) {
+        return Err(RhoPosteriorRefusal::CriterionInfeasibleAtRhoHat);
+    }
     let cost_hat = criterion(rho_hat).ok_or(RhoPosteriorRefusal::CriterionInfeasibleAtRhoHat)?;
     if !cost_hat.is_finite() {
         return Err(RhoPosteriorRefusal::CriterionNotFiniteAtRhoHat);
@@ -578,7 +602,17 @@ where
 
     let mut rng = DetNormal::new(ADEQUACY_SEED);
     let mut raw_weights: Vec<f64> = Vec::with_capacity(m);
-    for _ in 0..m {
+    let max_draws = m.saturating_mul(m);
+    let mut draws = 0usize;
+    while raw_weights.len() < m {
+        if draws == max_draws {
+            return Err(RhoPosteriorRefusal::ProposalOutsideSupport {
+                accepted: raw_weights.len(),
+                drawn: draws,
+                requested: m,
+            });
+        }
+        draws += 1;
         let z: Array1<f64> = Array1::from_iter((0..k).map(|_| rng.normal()));
         // ρ_m = ρ̂ + L_inv z.
         let mut rho_m = rho_hat.clone();
@@ -588,6 +622,9 @@ where
                 acc += l_inv[[i, j]] * z[j];
             }
             rho_m[i] += acc;
+        }
+        if !support(&rho_m) {
+            continue;
         }
         let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
         // log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖².
@@ -668,6 +705,11 @@ mod tests {
     use super::*;
     use ndarray::array;
 
+    /// The unbounded `ρ` domain: every finite point is in it.
+    fn all_finite(rho: &Array1<f64>) -> bool {
+        rho.iter().all(|v| v.is_finite())
+    }
+
     /// CLOSED-FORM FIXTURE: when the criterion IS exactly the Gaussian
     /// `−log π(ρ|y) = ½(ρ−ρ̂)ᵀ H_ρ (ρ−ρ̂)` that the Laplace proposal assumes,
     /// the importance weights are all identically 1 — the proposal is the
@@ -688,7 +730,7 @@ mod tests {
             }
             Some(0.5 * q)
         };
-        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(256))
+        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, all_finite, Some(256))
             .expect("diagnostic formed")
             .expect("diagnostic present");
         // All weights equal ⇒ ESS == M and k̂ small ⇒ plug-in adequate.
@@ -720,7 +762,7 @@ mod tests {
             let r = rho[0];
             Some((1.0 + r * r).ln())
         };
-        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(512))
+        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, all_finite, Some(512))
             .expect("diagnostic formed")
             .expect("diagnostic present");
         assert!(
@@ -764,10 +806,10 @@ mod tests {
             let d = rho[0] - 1.0;
             Some(0.5 * d * d)
         };
-        let a = rho_posterior_adequacy(&rho_hat, &h, crit, Some(64))
+        let a = rho_posterior_adequacy(&rho_hat, &h, crit, all_finite, Some(64))
             .expect("a formed")
             .expect("a present");
-        let b = rho_posterior_adequacy(&rho_hat, &h, crit, Some(64))
+        let b = rho_posterior_adequacy(&rho_hat, &h, crit, all_finite, Some(64))
             .expect("b formed")
             .expect("b present");
         // Kish's (Σw)²/Σw² of self-normalized weights lies in [1, M]: Σw = 1 and
@@ -811,7 +853,7 @@ mod tests {
         let rho_hat: Array1<f64> = array![];
         let h = Array2::<f64>::zeros((0, 0));
         assert!(matches!(
-            rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), None),
+            rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), all_finite, None),
             Ok(None)
         ));
     }
@@ -839,11 +881,63 @@ mod tests {
         let rho_hat = array![0.0, 0.0];
         let h = array![[1.0, 1.0], [1.0, 1.0]];
         assert!(whitening_factor_from_outer_hessian(&h).is_err());
-        let refusal = rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), Some(64))
+        let refusal = rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), all_finite, Some(64))
             .expect_err("a singular outer Hessian must be refused");
         assert!(
             matches!(refusal, RhoPosteriorRefusal::HessianNotPositiveDefinite { .. }),
             "the refusal names its reason, got {refusal}"
+        );
+    }
+
+    /// #3010: the proposal is the Laplace Gaussian truncated to the `ρ`
+    /// domain. The target here is a slightly tighter Gaussian (precision `1.1`
+    /// against the proposal's `1`) restricted to a half-space through `ρ̂`, so
+    /// on the support every weight is `exp(−0.05‖ρ‖²)`: bounded, a light tail,
+    /// and an ESS within a few percent of `M`. Weighing the out-of-domain half
+    /// at zero instead caps ESS at `M/2`. The criterion is never asked about a
+    /// `ρ` outside the domain.
+    #[test]
+    fn truncated_proposal_matches_a_truncated_gaussian_target_3010() {
+        let rho_hat = array![0.0, 0.0];
+        let h = array![[1.0, 0.0], [0.0, 1.0]];
+        let outside_calls = std::cell::Cell::new(0usize);
+        let support = |rho: &Array1<f64>| rho[0] >= 0.0;
+        let crit = |rho: &Array1<f64>| {
+            if !support(rho) {
+                outside_calls.set(outside_calls.get() + 1);
+                return None;
+            }
+            Some(0.55 * rho.dot(rho))
+        };
+        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, support, Some(256))
+            .expect("diagnostic formed")
+            .expect("diagnostic present");
+        assert_eq!(outside_calls.get(), 0, "out-of-domain draws must be rejected unevaluated");
+        assert_eq!(graded.n_samples, 256);
+        assert!(
+            graded.effective_sample_size > 0.9 * graded.n_samples as f64,
+            "the truncated proposal is near the target on its support: ess={} M={}",
+            graded.effective_sample_size,
+            graded.n_samples
+        );
+        assert!(graded.k_hat < 0.5, "k̂ = {}", graded.k_hat);
+        assert_eq!(graded.adequacy, RhoProposalAdequacy::PlugInAdequate);
+    }
+
+    /// A domain holding far under `1/M` of the Gaussian's mass (here the tail
+    /// beyond 8 standard deviations, mass `≈ 6e-16`) cannot supply `M` draws
+    /// within `M²`; the diagnostic names that mathematical reason instead of
+    /// grading an empty sample.
+    #[test]
+    fn proposal_outside_support_is_refused_with_its_counts_3010() {
+        let rho_hat = array![0.0];
+        let h = array![[1.0]];
+        let support = |rho: &Array1<f64>| rho[0] == 0.0 || rho[0] > 8.0;
+        let refusal = rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), support, Some(64))
+            .expect_err("a support below the proposal's resolution must be refused");
+        assert_eq!(
+            refusal,
+            RhoPosteriorRefusal::ProposalOutsideSupport { accepted: 0, drawn: 64 * 64, requested: 64 }
         );
     }
 }
