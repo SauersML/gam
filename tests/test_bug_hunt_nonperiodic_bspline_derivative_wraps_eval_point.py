@@ -1,6 +1,6 @@
 """Regression for gam#1348 — non-periodic B-spline derivative must not wrap.
 
-`gamfit.bspline_basis_derivative(..., periodic=False)` on a UNIFORM OPEN knot
+`gamfit.basis.bspline_basis_derivative(..., periodic=False)` on a UNIFORM OPEN knot
 vector (e.g. ``np.linspace(a, b, m)`` with no repeated boundary knots) used to
 run the evaluation point through a *periodic* wrap in the two boundary spans, so
 the analytic derivative was supported on the wrong basis columns and disagreed
@@ -32,8 +32,8 @@ def test_boundary_span_derivative_supported_on_value_columns() -> None:
     # A point inside the first knot span [knots[0], knots[1]).
     t = np.array([knots[1] - 0.25 * (knots[1] - knots[0])])
 
-    value = gamfit.bspline_basis(t, knots, degree=degree, periodic=False)
-    deriv = gamfit.bspline_basis_derivative(
+    value = gamfit.basis.bspline_basis(t, knots, degree=degree, periodic=False)
+    deriv = gamfit.basis.bspline_basis_derivative(
         t, knots, degree=degree, order=1, periodic=False
     )
 
@@ -56,10 +56,10 @@ def test_full_range_first_derivative_matches_central_difference() -> None:
     tt = np.linspace(knots[0], knots[-1], 121)
     h = 1e-6
     fd = (
-        gamfit.bspline_basis(tt + h, knots, degree=degree, periodic=False)
-        - gamfit.bspline_basis(tt - h, knots, degree=degree, periodic=False)
+        gamfit.basis.bspline_basis(tt + h, knots, degree=degree, periodic=False)
+        - gamfit.basis.bspline_basis(tt - h, knots, degree=degree, periodic=False)
     ) / (2 * h)
-    d1 = gamfit.bspline_basis_derivative(
+    d1 = gamfit.basis.bspline_basis_derivative(
         tt, knots, degree=degree, order=1, periodic=False
     )
     assert np.max(np.abs(d1 - fd)) < 1e-5
@@ -84,14 +84,14 @@ def test_full_range_second_derivative_matches_central_difference() -> None:
     h = 1e-5
     tt = np.linspace(left + 10 * h, right - 10 * h, 121)
     fd = (
-        gamfit.bspline_basis_derivative(
+        gamfit.basis.bspline_basis_derivative(
             tt + h, knots, degree=degree, order=1, periodic=False
         )
-        - gamfit.bspline_basis_derivative(
+        - gamfit.basis.bspline_basis_derivative(
             tt - h, knots, degree=degree, order=1, periodic=False
         )
     ) / (2 * h)
-    d2 = gamfit.bspline_basis_derivative(
+    d2 = gamfit.basis.bspline_basis_derivative(
         tt, knots, degree=degree, order=2, periodic=False
     )
     assert np.max(np.abs(d2 - fd)) < 1e-4
@@ -117,7 +117,7 @@ def test_exterior_derivative_is_zero_interior_is_not() -> None:
             knots[-2] + 0.25 * (knots[-1] - knots[-2]),  # last span, > right
         ]
     )
-    deriv_ext = gamfit.bspline_basis_derivative(
+    deriv_ext = gamfit.basis.bspline_basis_derivative(
         exterior, knots, degree=degree, order=1, periodic=False
     )
     assert np.max(np.abs(deriv_ext)) < 1e-9, (
@@ -128,7 +128,7 @@ def test_exterior_derivative_is_zero_interior_is_not() -> None:
     # Interior points: the derivative is a genuine, non-trivial B-spline
     # derivative (guards against a fix that just zeros everything).
     interior = np.linspace(left, right, 17)
-    deriv_int = gamfit.bspline_basis_derivative(
+    deriv_int = gamfit.basis.bspline_basis_derivative(
         interior, knots, degree=degree, order=1, periodic=False
     )
     assert np.max(np.abs(deriv_int)) > 1e-6

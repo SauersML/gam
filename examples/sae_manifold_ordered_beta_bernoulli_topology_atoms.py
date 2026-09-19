@@ -52,13 +52,13 @@ def main() -> None:
     x = planted_gates[:, [0]] * circle_atom + planted_gates[:, [1]] * torus_atom
     x += 0.025 * rng.standard_normal(x.shape)
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         x,
         K=2,
         atom_basis=["periodic", "torus"],
         d_atom=[1, 2],
         assignment="ordered_beta_bernoulli",
-        schedule=gamfit.GumbelTemperatureSchedule(
+        schedule=gamfit.sae.GumbelTemperatureSchedule(
             tau_start=1.0,
             tau_min=0.2,
             decay="geometric",

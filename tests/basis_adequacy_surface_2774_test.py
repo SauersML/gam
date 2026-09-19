@@ -10,7 +10,7 @@ through the ordinary surfaces, without the caller knowing to look.
 Four independent angles on the same fix, so a regression is caught even if one
 assertion drifts:
 
-1. ``gamfit.fit`` raises a :class:`~gamfit.GamInferenceWarning` at fit time.
+1. ``gamfit.fit`` raises a :class:`~gamfit.errors.GamInferenceWarning` at fit time.
    This is the channel the user cannot miss; everything else requires them to
    go looking.
 2. ``summary().basis_checks`` carries the evidence with NO data and no refit —
@@ -143,7 +143,7 @@ def _adequacy_warnings(caught) -> list[str]:
     return [
         str(record.message)
         for record in caught
-        if issubclass(record.category, gamfit.GamInferenceWarning)
+        if issubclass(record.category, gamfit.errors.GamInferenceWarning)
         and "basis adequacy" in str(record.message)
     ]
 

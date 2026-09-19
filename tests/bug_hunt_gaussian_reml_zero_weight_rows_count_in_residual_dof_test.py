@@ -47,7 +47,7 @@ def _scalar(out: dict[str, Any], key: str) -> float:
 
 def _base_problem(n: int = 150, knots: int = 8, seed: int = 1):
     x = np.linspace(0.0, 1.0, n)
-    design = np.asarray(gamfit.bspline_basis(x, knots=knots))
+    design = np.asarray(gamfit.basis.bspline_basis(x, knots=knots))
     penalty = _pspline_penalty(design.shape[1])
     y = (
         np.sin(2 * np.pi * x)
@@ -61,14 +61,14 @@ def test_zero_weight_padding_matches_positive_weight_subset() -> None:
     design, penalty, y = _base_problem()
     n = design.shape[0]
 
-    sub = gamfit.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
+    sub = gamfit.reml.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
 
     rng = np.random.default_rng(2)
     g = 200
     design_full = np.vstack([design, rng.normal(0.0, 1.0, (g, design.shape[1]))])
     y_full = np.vstack([y, rng.normal(0.0, 1.0, (g, 1))])
     weights_full = np.concatenate([np.ones(n), np.zeros(g)])
-    full = gamfit.gaussian_reml_fit(design_full, y_full, penalty, weights=weights_full)
+    full = gamfit.reml.gaussian_reml_fit(design_full, y_full, penalty, weights=weights_full)
 
     coef_sub = np.asarray(sub["coefficients"]).ravel()
     coef_full = np.asarray(full["coefficients"]).ravel()
@@ -89,7 +89,7 @@ def test_bias_does_not_scale_with_zero_weight_row_count(n_pad: int) -> None:
     """The original bug's coefficient shift grew with the padding count."""
     design, penalty, y = _base_problem()
     n = design.shape[0]
-    sub = gamfit.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
+    sub = gamfit.reml.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
     coef_sub = np.asarray(sub["coefficients"]).ravel()
 
     rng = np.random.default_rng(7)
@@ -98,7 +98,7 @@ def test_bias_does_not_scale_with_zero_weight_row_count(n_pad: int) -> None:
     )
     y_full = np.vstack([y, rng.normal(0.0, 10.0, (n_pad, 1))])
     weights_full = np.concatenate([np.ones(n), np.zeros(n_pad)])
-    full = gamfit.gaussian_reml_fit(design_full, y_full, penalty, weights=weights_full)
+    full = gamfit.reml.gaussian_reml_fit(design_full, y_full, penalty, weights=weights_full)
     coef_full = np.asarray(full["coefficients"]).ravel()
 
     assert np.abs(coef_full - coef_sub).max() < 1e-9
@@ -123,8 +123,8 @@ def test_zero_weight_rows_response_is_irrelevant() -> None:
     y_a = np.vstack([y, rng.normal(0.0, 1.0, (g, 1))])
     y_b = np.vstack([y, rng.normal(0.0, 1e4, (g, 1))])
 
-    fit_a = gamfit.gaussian_reml_fit(design_full, y_a, penalty, weights=weights_full)
-    fit_b = gamfit.gaussian_reml_fit(design_full, y_b, penalty, weights=weights_full)
+    fit_a = gamfit.reml.gaussian_reml_fit(design_full, y_a, penalty, weights=weights_full)
+    fit_b = gamfit.reml.gaussian_reml_fit(design_full, y_b, penalty, weights=weights_full)
 
     np.testing.assert_allclose(
         np.asarray(fit_a["coefficients"]).ravel(),
@@ -153,8 +153,8 @@ def test_all_positive_weights_are_unaffected() -> None:
     # Reference: replicate the row-count semantics by hand — a positive weight
     # never changes the effective count, so the fit must be identical to itself
     # across repeated calls and independent of ordering.
-    fit1 = gamfit.gaussian_reml_fit(design, y, penalty, weights=weights)
-    fit2 = gamfit.gaussian_reml_fit(design, y, penalty, weights=weights)
+    fit1 = gamfit.reml.gaussian_reml_fit(design, y, penalty, weights=weights)
+    fit2 = gamfit.reml.gaussian_reml_fit(design, y, penalty, weights=weights)
     np.testing.assert_array_equal(
         np.asarray(fit1["coefficients"]), np.asarray(fit2["coefficients"])
     )
@@ -172,7 +172,7 @@ def test_zero_weight_padding_inert_for_multi_output() -> None:
     subset. The other tests use ``d == 1``; this exercises the per-output loop.
     """
     x = np.linspace(0.0, 1.0, 140)
-    design = np.asarray(gamfit.bspline_basis(x, knots=8))
+    design = np.asarray(gamfit.basis.bspline_basis(x, knots=8))
     penalty = _pspline_penalty(design.shape[1])
     n = design.shape[0]
     rng = np.random.default_rng(202)
@@ -183,13 +183,13 @@ def test_zero_weight_padding_inert_for_multi_output() -> None:
         ]
     )
 
-    sub = gamfit.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
+    sub = gamfit.reml.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
 
     g = 175
     design_full = np.vstack([design, rng.normal(0.0, 2.0, (g, design.shape[1]))])
     y_full = np.vstack([y, rng.normal(0.0, 50.0, (g, 2))])
     weights_full = np.concatenate([np.ones(n), np.zeros(g)])
-    full = gamfit.gaussian_reml_fit(design_full, y_full, penalty, weights=weights_full)
+    full = gamfit.reml.gaussian_reml_fit(design_full, y_full, penalty, weights=weights_full)
 
     np.testing.assert_allclose(
         np.asarray(full["coefficients"]),
@@ -218,7 +218,7 @@ def test_zero_weight_rows_inert_when_interleaved() -> None:
     """
     design, penalty, y = _base_problem(seed=23)
     n = design.shape[0]
-    sub = gamfit.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
+    sub = gamfit.reml.gaussian_reml_fit(design, y, penalty, weights=np.ones(n))
 
     rng = np.random.default_rng(303)
     g = 90
@@ -231,7 +231,7 @@ def test_zero_weight_rows_inert_when_interleaved() -> None:
 
     # Shuffle rows so the zero-weight rows are interleaved with the real ones.
     perm = rng.permutation(n + g)
-    mixed = gamfit.gaussian_reml_fit(
+    mixed = gamfit.reml.gaussian_reml_fit(
         design_mix[perm], y_mix[perm], penalty, weights=weights_mix[perm]
     )
 

@@ -31,7 +31,7 @@ def test_audit_sae_loads_npy_checkpoint_and_returns_report(tmp_path):
         [[[0.8]], [[0.7]], [[0.3]], [[0.9]]], dtype=np.float32
     )
 
-    report = gamfit.audit_sae(
+    report = gamfit.sae.audit_sae(
         checkpoint,
         activations,
         random_weight_codes=(donor_indices, donor_values),
@@ -39,7 +39,7 @@ def test_audit_sae_loads_npy_checkpoint_and_returns_report(tmp_path):
         score_mode="off",
     )
 
-    assert report["api"] == "gamfit.audit_sae"
+    assert report["api"] == "gamfit.sae.audit_sae"
     assert report["checkpoint"]["format"] == "npy"
     assert report["decoder_shape"] == (2, 3)
     assert report["dual_certificate"]["n_rows"] == activations.shape[0]
@@ -64,7 +64,7 @@ def test_audit_sae_surfaces_atlas_nerve_covering_side_next_to_betti():
     route_values = dense_codes.reshape(n_rows, 2, 2)
     donor_values = random_weight_dense.reshape(n_rows, 2, 2)
 
-    report = gamfit.audit_sae(
+    report = gamfit.sae.audit_sae(
         decoder,
         activations,
         codes=(route_indices, route_values),

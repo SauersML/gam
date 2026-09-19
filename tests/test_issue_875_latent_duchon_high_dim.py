@@ -69,7 +69,7 @@ def test_latent_duchon_constructs_for_high_dim(k: int) -> None:
     # This is a basis-construction regression, so hold the latent coordinate
     # fixed instead of coupling it to the separate latent-optimizer convergence
     # contract.
-    res = gamfit.gaussian_reml_fit_latent(
+    res = gamfit.reml.gaussian_reml_fit_latent(
         t_true.reshape(-1),
         y,
         n,

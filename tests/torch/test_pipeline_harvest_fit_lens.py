@@ -4,8 +4,8 @@ This is the *first* full-stack test of the output-Fisher pullback metric (#980).
 A tiny fixed torch model is harvested for per-token output-Fisher factors
 (:func:`gamfit.torch.harvest.harvest_output_fisher_factors`), the resulting
 shard is installed into an SAE-manifold fit
-(:func:`gamfit.sae_manifold_fit(..., fisher_factors=...)`), and the fitted
-:class:`gamfit.ManifoldSAE` is interrogated through the post-fit lens / gauge.
+(:func:`gamfit.sae.sae_manifold_fit(..., fisher_factors=...)`), and the fitted
+:class:`gamfit.sae.ManifoldSAE` is interrogated through the post-fit lens / gauge.
 
 The load-bearing contracts asserted here are the *amended-contract* invariants
 of #980:
@@ -47,7 +47,7 @@ torch = pytest.importorskip("torch")
 # require the rebuild).
 gamfit = pytest.importorskip("gamfit")
 
-from gamfit import ManifoldSAE, sae_manifold_fit  # noqa: E402
+from gamfit.sae import ManifoldSAE, sae_manifold_fit  # noqa: E402
 from gamfit._binding import rust_module  # noqa: E402
 from gamfit.torch.harvest import (  # noqa: E402
     HarvestShard,

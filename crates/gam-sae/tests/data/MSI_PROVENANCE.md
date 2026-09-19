@@ -17,7 +17,7 @@ genuine model transport.
   activation cloud (the same 2-plane the `chart_transport_l11_l23.py` plane frame
   recovers), computed directly from the real activations.
 - **Why not the SAE atom angle**: the example's `fit_layer_circle` reads the
-  angle off a K=1 cyclic SAE atom (`gamfit.sae_manifold_fit`). At the MSI wheel
+  angle off a K=1 cyclic SAE atom (`gamfit.sae.sae_manifold_fit`). At the MSI wheel
   (gamfit 0.1.248) that fit **live-locks** on this data — the Strong-Wolfe line
   search fails at BFGS iter 1 and backtracks for 13+ minutes without advancing,
   the K=1 pathology its own code comments flag. The top-2 plane angle needs no

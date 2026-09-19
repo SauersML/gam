@@ -11,7 +11,7 @@ So the fitted surface ``ŝ(x, z)`` must be invariant to shifting *either*
 coordinate by a full period: ``ŝ(x+1, z) == ŝ(x, z)`` and
 ``ŝ(x, z+1) == ŝ(x, z)``, to machine precision (the closed-curve seam is
 exact for a correctly assembled cyclic basis — see the 1-D
-``gamfit.periodic_spline_curve_basis`` whose rows at ``t`` and ``t+1`` agree to
+``gamfit.basis.periodic_spline_curve_basis`` whose rows at ``t`` and ``t+1`` agree to
 ~1e-16, and the 1-D ``s(x, bs="cc")`` smooth whose endpoints coincide exactly).
 
 Observed: the **second** margin (axis 1, here ``z``) wraps perfectly

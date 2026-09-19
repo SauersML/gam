@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Massive-K manifold SAE end-to-end validation harness (#1026).
 
-Drives ``gamfit.sae_manifold_fit`` directly (NOT the stale ``sae_ev_vs_k_frontier``
+Drives ``gamfit.sae.sae_manifold_fit`` directly (NOT the stale ``sae_ev_vs_k_frontier``
 helper) at a sweep of dictionary sizes K to verify the whole pipeline RUNS at
 scale and to capture the wall-time scaling curve.
 
@@ -130,7 +130,7 @@ def main() -> int:
         r2 = float("nan")
         try:
             tk = time.perf_counter()
-            model = gamfit.sae_manifold_fit(
+            model = gamfit.sae.sae_manifold_fit(
                 train,
                 K=k,
                 d_atom=args.d_atom,
