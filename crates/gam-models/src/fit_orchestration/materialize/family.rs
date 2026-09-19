@@ -969,9 +969,13 @@ mod tweedie_power_tests {
         for (link, admitting) in [
             (
                 LinkFunction::Log,
-                "poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
+                "gaussian|binomial|poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
             ),
-            (LinkFunction::Inverse, "gaussian|gamma"),
+            (
+                LinkFunction::Inverse,
+                "gaussian|poisson|gamma|inverse-gaussian",
+            ),
+            (LinkFunction::Sqrt, "gaussian|poisson|gamma|inverse-gaussian"),
         ] {
             let choice = LinkChoice {
                 mode: LinkMode::Strict,
