@@ -31,9 +31,8 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
 
 /// Knot-span-scaled second-order cumulative transform for the convex/concave
 /// box reparameterization on a B-spline coefficient vector `θ` (raw control
-/// points; the shape-constrained B-spline arm forces
-/// `BSplineIdentifiability::None`, so the design columns are the raw basis
-/// functions and `θ` carries the control-polygon geometry).
+/// points, so `θ` carries the control-polygon geometry; the shape cone chart in
+/// `shape_constraints::bspline_shape_cone_chart` builds on this `T`).
 ///
 /// The plain integer second-difference cone `θ_{i+2} − 2θ_{i+1} + θ_i ≥ 0`
 /// only certifies convexity of the *function* when the Greville abscissae are
@@ -54,7 +53,7 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
 /// common rescaling of `sign · [D²θ]_{i−2}`; the common scale comes from
 /// normalizing the supplied spans by their maximum so the coefficient chart is
 /// invariant to physical covariate units. Pairing this `T` with the lower bounds
-/// `γ_i ≥ 0` (`i ≥ 2`) from [`shape_lower_bounds_local`] therefore enforces
+/// `γ_i ≥ 0` (`i ≥ 2`) from `shape_lower_bounds_local` therefore enforces
 /// convexity (`sign = +1`) or concavity (`sign = −1`) exactly for arbitrary
 /// (clamped / quantile) knot geometry. `γ_0` is the level and `γ_1` the initial
 /// slope, both unconstrained. When ξ is uniform this reduces (column-scaled) to
