@@ -1919,5 +1919,13 @@
     ],
     "reason": "#3036 follow-up to 16db27c9a8: the gam-local NegativeCurvatureClaim and negative_curvature_claim move to opt (SauersML/opt 17dea8b4539a526ec311bc312945bb0d8a1f761f, SPEC 24: general outer-optimizer work lives in opt), beside opt::unresolvable_curvature_magnitude(alpha_max, res) = 2*res/alpha_max^2, which the predicate reads. gam re-exports both from opt under their old paths (rho_optimizer/run.rs `pub(crate) use opt::{...}`, next to certificate_curvature_shift), so every call site and the #3036 tests resolve unchanged, and gam's criterion_curvature_resolution now calls the same magnitude at NEGATIVE_CURVATURE_LADDER_LARGEST_STEP. One number decides resolvability for the adjudication and for the definiteness, seed and decrement verdicts.",
     "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
+  },
+  {
+    "base": "c14c88d3ab59a78e5741d37a295c4132826cab29",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/time_block.rs:fn:append_linear_constraints"
+    ],
+    "reason": "gam#3037: the flexible survival location-scale time block declared its coordinate cone and, appended to it by append_linear_constraints, one derivative-guard row per training row. The cone implies every one of those rows (the I-spline derivative design is non-negative entrywise, every column carrying it is bounded at zero, and the offsets encode the guard), so the block now declares the cone alone. The flexible path was its only caller, so the concatenation helper is deleted with it.",
+    "evidence": "At the base, git grep finds append_linear_constraints only in crates/gam-models/src/survival/location_scale/time_block.rs: its declaration and its one call in prepare_identified_time_block's flexible path, which this commit replaces with the cone. No bench, script, example or Python file names it. source_removal_guard.py, run without this acknowledgement, refused exactly this one identity (public, 0 production occurrences)."
   }
 ]

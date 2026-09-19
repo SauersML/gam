@@ -3625,6 +3625,7 @@ fn test_periodic_bspline_wraps_design_at_cylinder_seam() {
         knotspec: BSplineKnotSpec::PeriodicUniform {
             data_range: (0.0, 1.0),
             num_basis: 7,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -3653,6 +3654,7 @@ fn test_periodic_bspline_with_sum_to_zero_keeps_wrapped_rows_equal() {
         knotspec: BSplineKnotSpec::PeriodicUniform {
             data_range: (0.0, 1.0),
             num_basis: 6,
+            adaptive: false,
         },
         double_penalty: true,
         identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },

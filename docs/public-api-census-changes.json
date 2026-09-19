@@ -4596,5 +4596,21 @@
     },
     "reason": "#3036 follow-up to 16db27c9a8: the gam-local NegativeCurvatureClaim and negative_curvature_claim move to opt (SauersML/opt 17dea8b4539a526ec311bc312945bb0d8a1f761f, SPEC 24: general outer-optimizer work lives in opt), beside opt::unresolvable_curvature_magnitude(alpha_max, res) = 2*res/alpha_max^2, which the predicate reads. gam re-exports both from opt under their old paths (rho_optimizer/run.rs `pub(crate) use opt::{...}`, next to certificate_curvature_shift), so every call site and the #3036 tests resolve unchanged, and gam's criterion_curvature_resolution now calls the same magnitude at NEGATIVE_CURVATURE_LADDER_LARGEST_STEP. One number decides resolvability for the adjudication and for the definiteness, seed and decrement verdicts.",
     "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
+  },
+  {
+    "base": "c8f927327ae4b3fa476d8ceb9242798c2d3d7578",
+    "removed": {
+      "crates/gam-sae/src/inference/intervention_shard.rs::kl_measurement_band_nats": 1
+    },
+    "reason": "gh#2263 F3: kl_measurement_floor is now the one owner of a KL measurement's floor, max(B, control), and returns the band B beside it. kl_measurement_band_nats stays as its private component, so a caller cannot rebuild the floor as band.max(control) beside the owner. The function and its formula are unchanged; only its visibility narrows.",
+    "evidence": "public_api_census.py, run with this base and the landing commit, reports exactly this identity. git grep -w kl_measurement_band_nats finds it only in crates/gam-sae/src/inference/intervention_shard.rs at the head tree: its definition, kl_measurement_floor, and the module's tests. cargo nextest run -p gam-sae --lib on the intervention_shard tests passes, including a_measurement_floor_is_its_band_raised_only_by_stochastic_control_evidence_2263."
+  },
+  {
+    "base": "c14c88d3ab59a78e5741d37a295c4132826cab29",
+    "removed": {
+      "crates/gam-models/src/survival/location_scale/time_block.rs::append_linear_constraints": 1
+    },
+    "reason": "gam#3037: append_linear_constraints concatenated the flexible survival location-scale time block's coordinate cone with its per-row derivative-guard rows. The cone implies every guard row, so the block now declares the cone alone and nothing concatenates two time constraint systems. It was pub(crate), with one caller.",
+    "evidence": "public_api_census.py, run without this acknowledgement against a candidate with this change, reported exactly this identity as removed (13546 public function declarations before, 13545 after). git grep finds append_linear_constraints only at its declaration and its one call in prepare_identified_time_block, both in time_block.rs, which this commit replaces."
   }
 ]

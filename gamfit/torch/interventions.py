@@ -30,6 +30,8 @@ from .harvest import _capture_activations
 __all__ = [
     "InterventionPlan",
     "InterventionShardData",
+    "kl_and_logit_extent",
+    "logit_format_name",
     "run_interventions",
 ]
 
@@ -136,7 +138,18 @@ _LOGIT_FORMATS = {
 }
 
 
-def _kl_and_logit_extent(
+def logit_format_name(dtype: torch.dtype) -> str:
+    """The measurement-band name of a logit dtype: the format the logits were rounded in.
+
+    Pass the dtype the model produced its logits in, before any cast: bfloat16 logits
+    cast to float32 still carry bfloat16 spacing.
+    """
+    if dtype not in _LOGIT_FORMATS:
+        raise ValueError(f"logits must be float16, bfloat16, float32 or float64; got {dtype}")
+    return _LOGIT_FORMATS[dtype]
+
+
+def kl_and_logit_extent(
     clean: torch.Tensor, patched: torch.Tensor
 ) -> tuple[float, float, float]:
     """``KL(softmax(clean) ‖ softmax(patched))`` in nats, unclamped, with the
@@ -212,7 +225,7 @@ def run_interventions(
             patched = logits_from_act(x_row + delta, r)
             logit_dtypes.update((clean.dtype, patched.dtype))
             vocab_sizes.update((int(clean.shape[-1]), int(patched.shape[-1])))
-            nu_measured[i], logit_max_abs[i], logit_max_abs_change[i] = _kl_and_logit_extent(
+            nu_measured[i], logit_max_abs[i], logit_max_abs_change[i] = kl_and_logit_extent(
                 clean, patched
             )
             is_control[i] = bool(np.all(dx[i] == 0.0))
@@ -223,10 +236,7 @@ def run_interventions(
             f"{sorted(map(str, logit_dtypes))} and sizes {sorted(vocab_sizes)}"
         )
     (logit_dtype,) = logit_dtypes
-    if logit_dtype not in _LOGIT_FORMATS:
-        raise ValueError(
-            f"logits must be float16, bfloat16, float32 or float64; got {logit_dtype}"
-        )
+    logit_format = logit_format_name(logit_dtype)
     (vocab_size,) = vocab_sizes
 
     return InterventionShardData(
@@ -244,7 +254,7 @@ def run_interventions(
         is_control=is_control,
         layer=int(layer),
         seed=int(seed),
-        logit_format=_LOGIT_FORMATS[logit_dtype],
+        logit_format=logit_format,
         vocab_size=vocab_size,
     )
 

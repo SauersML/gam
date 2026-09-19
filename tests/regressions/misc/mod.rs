@@ -3,6 +3,7 @@ mod arrow_schur_bug_hunt;
 mod beta_generative_noise_ignores_estimated_phi;
 mod beta_observation_interval_ignores_estimated_phi;
 mod beta_phi_reported_at_fitted_eta;
+mod bounded_default_prior_shrinks_a_null_coefficient;
 mod bounded_term_identifiability_audit_zero_column;
 mod box_constrained_coefficient_is_the_truncated_mean_2705;
 mod build_rs_ban_gates_present;

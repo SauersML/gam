@@ -2570,6 +2570,7 @@ fn parse_bounded_priorspec(
 
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
+            "shrinkage" => Ok(BoundedCoefficientPriorSpec::Shrinkage),
             "none" => Ok(BoundedCoefficientPriorSpec::None),
             "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
                 Ok(BoundedCoefficientPriorSpec::Uniform)
@@ -2577,7 +2578,7 @@ fn parse_bounded_priorspec(
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
             _ => Err(FormulaDslError::InvalidArgument {
                 reason: format!(
-                    "bounded() prior must currently be one of none|uniform|log-jacobian|center, got '{}': {raw}",
+                    "bounded() prior must currently be one of shrinkage|none|uniform|log-jacobian|center, got '{}': {raw}",
                     priorname
                 ),
             }
@@ -2626,7 +2627,8 @@ fn parse_bounded_priorspec(
         return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
     }
 
-    Ok(BoundedCoefficientPriorSpec::None)
+    // No prior option: shrink toward the null with a REML-estimated strength.
+    Ok(BoundedCoefficientPriorSpec::Shrinkage)
 }
 
 // ---------------------------------------------------------------------------

@@ -296,22 +296,38 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     // `β_j -> β_j/c`, the quadratic functional is unchanged. Keeping each
     // term in its own one-column block also lets REML remove unsupported
     // effects independently instead of forcing unrelated slopes to share λ.
+    //
+    // A `bounded()` coefficient under the default shrinkage prior instead owns
+    // a unit ridge on its latent logit coordinate, centred at the null. The
+    // latent coordinate is dimensionless, so the unit scale carries no
+    // covariate units; the bounded fit applies this block in latent space.
     for (j, linear) in spec.linear_terms.iter().enumerate() {
-        let Some(function_mass) = linear_function_masses.get(j).copied().flatten() else {
-            continue;
+        let (mass, source) = match linear_function_masses.get(j).copied().flatten() {
+            Some(function_mass) => (function_mass, "LinearTermRidge"),
+            None if matches!(
+                linear.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded {
+                    prior: BoundedCoefficientPriorSpec::Shrinkage,
+                    ..
+                }
+            ) =>
+            {
+                (1.0, BOUNDED_SHRINKAGE_PENALTY_SOURCE)
+            }
+            None => continue,
         };
         let col = p_intercept + j;
         let global_index = penalties.len();
         penalties.push(BlockwisePenalty::new(
             col..(col + 1),
-            Array2::from_elem((1, 1), function_mass),
+            Array2::from_elem((1, 1), mass),
         ));
         nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: Some(linear.name.clone()),
             penalty: ActivePenaltyInfo {
-                source: PenaltySource::Other("LinearTermRidge".to_string()),
+                source: PenaltySource::Other(source.to_string()),
                 original_index: j,
                 effective_rank: 1,
                 normalization_scale: 1.0,
@@ -1052,29 +1068,32 @@ fn derive_smooth_collection_coefficient_transform(
     design_local: &DesignMatrix,
     arm: SmoothCollectionGaugeArm,
     block: ArrayView2<'_, f64>,
-    has_owner_terms: bool,
+    block_is_owned: bool,
 ) -> Result<Array2<f64>, BasisError> {
-    match arm {
+    let derived = match arm {
         SmoothCollectionGaugeArm::Delete => {
-            match orthogonality_transform_for_design(design_local, block, None) {
-                Ok(transform) => Ok(transform),
-                // Mirrors the collection's historical fallback: a constraint
-                // block made entirely of owner columns may consume the whole
-                // dependent block.
-                Err(BasisError::ConstraintNullspaceCollapsed { .. }) if has_owner_terms => {
-                    Ok(Array2::zeros((design_local.ncols(), 0)))
-                }
-                Err(error) => Err(error),
-            }
+            orthogonality_transform_for_design(design_local, block, None)
         }
         SmoothCollectionGaugeArm::Residualize => {
-            Ok(crate::basis::parametric_residualization_for_design(
+            crate::basis::parametric_residualization_for_design(
                 design_local,
                 block,
                 None, // fixed subspace: never use iteration-varying PIRLS weights
-            )?
-            .coefficient_transform)
+            )
+            .map(|residualization| residualization.coefficient_transform)
         }
+    };
+    match derived {
+        Ok(transform) => Ok(transform),
+        // The design lies wholly inside a constraint block that other terms of
+        // the model carry, so it adds no function they do not already fit: every
+        // one of its coefficient directions is unidentified, and the realized
+        // block keeps none of them. This is the spectral frame's drop-the-null-
+        // directions rule at its extreme.
+        Err(BasisError::ConstraintNullspaceCollapsed { .. }) if block_is_owned => {
+            Ok(Array2::zeros((design_local.ncols(), 0)))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1785,6 +1804,16 @@ fn apply_global_smooth_identifiability(
         // is recomputed by projecting `X_local(psi) T0` through the fixed `C`.
         // This keeps the objective out of arbitrary moving RRQR/eigenvector
         // coordinates (#2760).
+        // Whether the whole constraint block is carried by other terms, so a
+        // design lying wholly inside it may be consumed entirely (see
+        // `derive_smooth_collection_coefficient_transform`). A factor-by level's
+        // block is its gated level indicator plus any owner smooths, and the
+        // indicator is that factor's main-effect column: the term builder
+        // always places a main effect beside the per-level smooths. Otherwise
+        // only a deletion against owner columns may consume the design, the
+        // collection's historical rule.
+        let factor_by_level = factor_by_level_gate(termspec).is_some();
+        let delete_block_is_owned = factor_by_level || !owner_indices.is_empty();
         // Read the term-local chart BEFORE the gauge composes its own into the
         // metadata below (gam#2760): after `with_identifiability_transform` the
         // two are one matrix and cannot be told apart.
@@ -1795,7 +1824,7 @@ fn apply_global_smooth_identifiability(
                     &design_local,
                     SmoothCollectionGaugeArm::Delete,
                     block.view(),
-                    !owner_indices.is_empty(),
+                    delete_block_is_owned,
                 )?,
             ),
             GlobalIdentifiabilityPlan::Residualize { block } => Some(
@@ -1803,7 +1832,7 @@ fn apply_global_smooth_identifiability(
                     &design_local,
                     SmoothCollectionGaugeArm::Residualize,
                     block.view(),
-                    !owner_indices.is_empty(),
+                    factor_by_level,
                 )?,
             ),
         };
