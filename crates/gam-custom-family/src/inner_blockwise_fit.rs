@@ -3375,6 +3375,169 @@ pub(crate) fn inner_blockwise_coefficient_mode<
     )
 }
 
+/// The Newton correction and Deuflhard's simplified correction of a single-block coefficient
+/// solve at a predictor (gam#2973).
+pub(crate) struct SimplifiedNewtonCorrections {
+    /// `‖Δ⁰‖`, the block's Newton correction at the predictor `x⁰`.
+    pub(crate) first_correction: f64,
+    /// `‖Δ̄¹‖`, the simplified correction at `x¹ = x⁰ + Δ⁰`: the gradient at `x¹`, the
+    /// curvature frozen at `x⁰`.
+    pub(crate) second_correction: f64,
+    /// The block coefficients at `x¹`.
+    pub(crate) after_first: Vec<Array1<f64>>,
+}
+
+/// Whether [`single_block_simplified_newton_corrections`] covers a solve: one block, no joint
+/// penalty, no Jeffreys term, and no Hessian-vector workspace. That is exactly the solve this
+/// file runs block by block; a workspace or a second block sends a coupled family to the joint
+/// Newton path, whose frozen-curvature re-solve is gam#2973's second slice.
+pub(crate) fn single_block_newton_region_probe_applies<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+) -> bool {
+    specs.len() == 1
+        && !family.inner_coefficient_hessian_hvp_available(specs)
+        && !family.joint_jeffreys_term_required()
+        && options
+            .joint_penalties
+            .as_deref()
+            .is_none_or(|bundle| bundle.is_empty())
+}
+
+/// The Newton-region probe of a single-block coefficient solve at `predictor` (gam#2973).
+///
+/// `Δ⁰` is the block's own update step at `x⁰` — the step this file's cycle takes before any
+/// trust-region truncation or line search — and `Δ̄¹` is the same update step at `x¹ = x⁰ + Δ⁰`
+/// with the exact-Newton curvature frozen at `x⁰`, which is Deuflhard's simplified correction.
+/// Both go through [`ExactNewtonBlockUpdater`], so the penalty, the linear constraints and the
+/// stabilized solve are the ones the solver uses. A block that does not publish exact-Newton
+/// curvature has no frozen curvature to reuse and is refused.
+pub(crate) fn single_block_simplified_newton_corrections<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    block_log_lambdas: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
+    predictor: &[Array1<f64>],
+) -> Result<SimplifiedNewtonCorrections, CustomFamilyError> {
+    if !single_block_newton_region_probe_applies(family, specs, options) {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "the Newton-region probe covers a single-block solve with no joint penalty, \
+                     Jeffreys term or Hessian-vector workspace (gam#2973)"
+                .to_string(),
+        });
+    }
+    let (Some(spec), Some(block_log_lambda), Some(predictor_beta)) =
+        (specs.first(), block_log_lambdas.first(), predictor.first())
+    else {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "the Newton-region probe needs one block's spec, smoothing and predictor"
+                .to_string(),
+        });
+    };
+    if block_log_lambda.len() != spec.penalties.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "Newton-region probe: log-smoothing length {} does not match penalties {}",
+                block_log_lambda.len(),
+                spec.penalties.len()
+            ),
+        });
+    }
+    let p = spec.design.ncols();
+    let lambdas =
+        exact_lambdas_from_log_strengths(block_log_lambda, "Newton-region probe log strength")?;
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    for (k, s) in spec.penalties.iter().enumerate() {
+        s.add_scaled_to(lambdas[k], &mut s_lambda);
+    }
+    let mut states = buildblock_states(family, specs)?;
+    if predictor_beta.len() != states[0].beta.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "Newton-region probe: predictor has {} coefficients, the block {}",
+                predictor_beta.len(),
+                states[0].beta.len()
+            ),
+        });
+    }
+    let seated = family.post_update_block_beta(&states, 0, spec, predictor_beta.clone())?;
+    states[0].beta.assign(&seated);
+    refresh_all_block_etas(family, specs, &mut states)?;
+    seat_inner_start_inside_block_constraints(family, specs, &mut states)?;
+    let at_predictor = family.evaluate(&states)?;
+    let Some(BlockWorkingSet::ExactNewton {
+        gradient: predictor_gradient,
+        hessian: frozen_hessian,
+        ..
+    }) = at_predictor.blockworking_sets.first()
+    else {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "the Newton-region probe needs the block's exact-Newton curvature at the \
+                     predictor"
+                .to_string(),
+        });
+    };
+    let predictor_constraints = family.block_linear_constraints(&states, 0, spec)?;
+    let first = ExactNewtonBlockUpdater {
+        gradient: predictor_gradient,
+        hessian: frozen_hessian,
+    }
+    .compute_update_step(&BlockUpdateContext {
+        family,
+        states: &states,
+        spec,
+        block_idx: 0,
+        s_lambda: &s_lambda,
+        options,
+        linear_constraints: predictor_constraints.as_ref(),
+        cached_active_set: None,
+    })?;
+    let x0 = states[0].beta.clone();
+    let x1 = family.post_update_block_beta(&states, 0, spec, first.beta_new_raw)?;
+    let first_correction = (&x1 - &x0).mapv(|value| value * value).sum().sqrt();
+    states[0].beta.assign(&x1);
+    refresh_all_block_etas(family, specs, &mut states)?;
+    let at_first = family.evaluate(&states)?;
+    let Some(BlockWorkingSet::ExactNewton {
+        gradient: first_gradient,
+        ..
+    }) = at_first.blockworking_sets.first()
+    else {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "the Newton-region probe needs the block's exact-Newton gradient after the \
+                     first correction"
+                .to_string(),
+        });
+    };
+    let first_constraints = family.block_linear_constraints(&states, 0, spec)?;
+    let second = ExactNewtonBlockUpdater {
+        gradient: first_gradient,
+        hessian: frozen_hessian,
+    }
+    .compute_update_step(&BlockUpdateContext {
+        family,
+        states: &states,
+        spec,
+        block_idx: 0,
+        s_lambda: &s_lambda,
+        options,
+        linear_constraints: first_constraints.as_ref(),
+        cached_active_set: first.active_set.as_deref(),
+    })?;
+    let x2 = family.post_update_block_beta(&states, 0, spec, second.beta_new_raw)?;
+    let second_correction = (&x2 - &x1).mapv(|value| value * value).sum().sqrt();
+    Ok(SimplifiedNewtonCorrections {
+        first_correction,
+        second_correction,
+        after_first: vec![x1],
+    })
+}
+
 /// Refuse a workspace-source family whose declared dense joint curvature carries a
 /// non-finite entry at the spec seed state (gam#1088, #979).
 ///
