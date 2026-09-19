@@ -7,6 +7,11 @@ two-sided KS test and ``P(p <= a) = a`` within Monte Carlo error at every
 level, so a conservative p-value fails exactly as an anti-conservative one
 does. On a ``k=4`` fit of a ``sin(6x)`` truth it should reject.
 
+The binomial and Poisson null cells repeat at two lower baselines, ``sin(2 pi
+x) - 1`` and ``sin(2 pi x) - 2``, where counts are small and events rare. A row
+whose conditional reference is unavailable reports no p-value; it is counted
+under its provenance and left out of ``tested``.
+
 Surface 1, ``compare_models``: it returns no nested-model p-value, only an
 information-criterion ranking and its gaps. The null-nested cells record how
 often that ranking picks a model whose extra smooth is pure noise, and that
@@ -64,7 +69,10 @@ def summarize(p_values: list[float], reps: int) -> dict:
 TRUTHS = {
     "sin2pi": lambda x: np.sin(2.0 * np.pi * x),
     "sin6": lambda x: np.sin(6.0 * x),
+    "sin2pi_minus1": lambda x: np.sin(2.0 * np.pi * x) - 1.0,
+    "sin2pi_minus2": lambda x: np.sin(2.0 * np.pi * x) - 2.0,
 }
+LOW_RATE_TRUTHS = ("sin2pi_minus1", "sin2pi_minus2")
 
 
 def basis_check_cell(family, n, formula, truth, reps, seed):
@@ -83,7 +91,8 @@ def basis_check_cell(family, n, formula, truth, reps, seed):
             continue
         row = model.summary().basis_checks[0]
         provenances[row["provenance"]] = provenances.get(row["provenance"], 0) + 1
-        if row["p_value"] is not None:
+        # A row that is not measured omits its p-value.
+        if row.get("p_value") is not None:
             p_values.append(float(row["p_value"]))
     result = summarize(p_values, reps)
     result.update(
@@ -136,6 +145,11 @@ def cells(null_reps: int, power_reps: int, compare_reps: int, with_compare: bool
         for n in SIZES:
             seed += 1
             out.append(("null", basis_check_cell, (family, n, "y ~ s(x)", "sin2pi", null_reps, seed)))
+    for truth in LOW_RATE_TRUTHS:
+        for family in ("binomial", "poisson"):
+            for n in SIZES:
+                seed += 1
+                out.append(("null", basis_check_cell, (family, n, "y ~ s(x)", truth, null_reps, seed)))
     for family in FAMILIES:
         for n in SIZES:
             seed += 1

@@ -119,9 +119,10 @@ def _low_rate(x):
     ("family", "truth", "reps", "not_measured_rate"),
     [
         pytest.param("gaussian", _sin2pi, 300, 0.0, id="gaussian"),
-        # The not-measured rates are the bench's: 346 of 5000 binomial
-        # replicates, 286 of 2000 low-count Poisson and 433 of 2000 low-rate
-        # binomial ones.
+        # The not-measured rates were measured on independent seeds: 346 of
+        # 5000 binomial replicates, 286 of 2000 low-count Poisson and 433 of
+        # 2000 low-rate binomial ones. The bench's 1000-replicate cells read
+        # 66, 149 and 190 per 1000.
         pytest.param("binomial", _sin2pi, 300, 346 / 5000, id="binomial"),
         # The unconditional chi^2 reference this replaced fails the Poisson cell
         # at this seed (KS p = 6.5e-6). Its binomial deficit (75 of 1000 at
