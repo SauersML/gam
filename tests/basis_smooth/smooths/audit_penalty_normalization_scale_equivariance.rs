@@ -43,6 +43,7 @@ fn open_spec(penalty_order: usize) -> BSplineBasisSpec {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(20),
             placement: BSplineKnotPlacement::Uniform,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },
@@ -63,6 +64,7 @@ fn cyclic_spec(penalty_order: usize) -> BSplineBasisSpec {
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(20),
             placement: BSplineKnotPlacement::Uniform,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,

@@ -1,4 +1,9 @@
-"""The thin Python API preserves Rust's bit-reproducible fit contract."""
+"""The thin Python API preserves Rust's bit-reproducible fit contract.
+
+The 240-row fixtures sit below every parallel threshold. ``gaussian_wide``
+mirrors the Rust suite's fixture of the same name: enough rows that the dense
+row contractions split into several blocks and the row reductions fan out.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,18 @@ def test_python_fits_are_bit_identical_across_rayon_thread_counts_and_runs() -> 
     program = r'''
 import json, math
 import gamfit
+
+WIDE_ROWS = 40_000
+
+def wide_frame():
+    at = lambda i, stride: -2.4 + 4.8 * ((i * stride) % WIDE_ROWS) / WIDE_ROWS
+    out = {"y": [], "x1": [], "x2": [], "x3": []}
+    for i in range(WIDE_ROWS):
+        x1, x2, x3 = at(i, 1), at(i, 7919), at(i, 104729)
+        mean = math.sin(2.1 * x1) + 0.5 * x2 * x2 - 0.3 * math.cos(1.7 * x3)
+        out["y"].append(mean + 0.07 * ((i * 37 % 17) - 8.0))
+        out["x1"].append(x1); out["x2"].append(x2); out["x3"].append(x3)
+    return out
 
 def frame(kind):
     out = {"x": []}
@@ -28,7 +45,10 @@ def frame(kind):
     return out
 
 kind = __import__('os').environ['GAM_REPRO_KIND']
-if kind == "survival":
+if kind == "gaussian_wide":
+    model = gamfit.fit(wide_frame(), "y ~ s(x1, k=12) + s(x2, k=12) + s(x3, k=12)",
+                       family="gaussian")
+elif kind == "survival":
     model = gamfit.fit(frame(kind), "Surv(time, event) ~ s(x, k=8)",
                        survival_likelihood="transformation")
 else:
@@ -39,7 +59,7 @@ print("RESULT " + json.dumps({"coefficients": [v.hex() for v in coef],
     "lambdas": [v.hex() for v in summary.lambdas],
     "log_likelihood": summary.log_likelihood.hex()}, sort_keys=True))
 '''
-    for kind in ("gaussian", "binomial", "survival"):
+    for kind in ("gaussian", "gaussian_wide", "binomial", "survival"):
         expected = None
         for threads in (1, 2, 8):
             for _run in range(2):

@@ -162,6 +162,24 @@ fn uniform_placement_default_and_explicit_uses_generate() {
 }
 
 #[test]
+fn unsized_default_smooth_is_an_adaptive_uniform_pilot() {
+    // `s(x)` with no size starts at the pilot resolution and is left for the
+    // fit's adaptive resolution loop to grow; its knots stay uniform.
+    match &bspline_spec(&build("y ~ s(x)")).knotspec {
+        BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(num_internal_knots),
+            placement,
+            adaptive,
+        } => {
+            assert_eq!(*num_internal_knots, 8);
+            assert_eq!(*placement, BSplineKnotPlacement::Uniform);
+            assert!(adaptive, "an unsized s(x) must be eligible for adaptive growth");
+        }
+        other => panic!("default s(x) should be an adaptive Automatic pilot, got {other:?}"),
+    }
+}
+
+#[test]
 fn scalar_knots_count_still_means_internal_knot_count() {
     // Back-compat: knots=<int> is a COUNT and yields Generate with that many
     // internal knots — unchanged from before this feature.

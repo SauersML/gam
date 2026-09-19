@@ -157,15 +157,9 @@ mod tests {
     pub(crate) fn dense_workspace_xtwx_preserves_signed_observed_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [-2.0, 4.0], [0.5, -3.0]];
         let weights = array![2.0, -1.5, 0.25, -3.0];
-        let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols());
         let mut streamed = Array2::<f64>::zeros((x.ncols(), x.ncols()).f());
 
-        PirlsWorkspace::add_dense_xtwx_signed(
-            &weights,
-            &mut workspace.weighted_x_chunk,
-            &x,
-            &mut streamed,
-        );
+        PirlsWorkspace::add_dense_xtwx_signed(&weights, &x, &mut streamed);
 
         let wx = Array2::from_shape_fn(x.raw_dim(), |(i, j)| weights[i] * x[[i, j]]);
         let expected = x.t().dot(&wx);
@@ -4601,9 +4595,8 @@ mod root_cause_tests {
     pub(crate) fn dense_xtwx_signed_assembly_preserves_negative_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]];
         let weights = array![2.0, -3.0, 0.25];
-        let mut chunk = Array2::<f64>::zeros((0, 0));
         let mut got = Array2::<f64>::zeros((2, 2));
-        PirlsWorkspace::add_dense_xtwx_signed(&weights, &mut chunk, &x, &mut got);
+        PirlsWorkspace::add_dense_xtwx_signed(&weights, &x, &mut got);
 
         let mut expected = Array2::<f64>::zeros((2, 2));
         for i in 0..x.nrows() {
