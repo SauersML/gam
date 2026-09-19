@@ -20,16 +20,16 @@ impl<E: ToString> WorkflowCauseCountResult for Result<usize, E> {
     }
 }
 
-/// Why a marginal-slope fit refuses the link its main formula names. The calibrated
-/// de-nested kernel is probit-only, so every other request is refused with the rule it
-/// breaks rather than fitted as probit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a marginal-slope fit refuses the link its main formula or its `link` argument names.
+/// The calibrated de-nested kernel is probit-only, so every other request is refused with
+/// the rule it breaks rather than fitted as probit.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarginalSlopeLinkRefusal {
-    /// `link(type=flexible(...))`: link deviations are learned by `linkwiggle(...)` around a
-    /// fixed base link.
-    Flexible,
-    /// A base link other than probit, or a blend of links.
+    /// A base link other than probit, or a blend of links, in the main formula's `link(...)`.
     NonProbit,
+    /// A base link other than probit, or a blend of links, named by the request's `link`
+    /// argument (gamfit's `link=`).
+    NonProbitArgument { link: String },
     /// A link parameter that only `link(type=<requires>)` reads.
     ForeignParameter {
         parameter: &'static str,
@@ -186,13 +186,13 @@ impl std::fmt::Display for WorkflowError {
                 }
             }
             WorkflowError::MarginalSlopeLink { context, refusal } => match refusal {
-                MarginalSlopeLinkRefusal::Flexible => write!(
-                    f,
-                    "{context} does not accept flexible(...) inside link(); use link(type=<base-link>) plus linkwiggle(...) to learn anchored link deviations"
-                ),
                 MarginalSlopeLinkRefusal::NonProbit => write!(
                     f,
                     "{context} requires link(type=probit); non-probit marginal-slope links are not supported by the calibrated de-nested probit kernel"
+                ),
+                MarginalSlopeLinkRefusal::NonProbitArgument { link } => write!(
+                    f,
+                    "{context} requires link='probit'; the link argument names '{link}', and non-probit marginal-slope links are not supported by the calibrated de-nested probit kernel"
                 ),
                 MarginalSlopeLinkRefusal::ForeignParameter {
                     parameter,

@@ -176,11 +176,7 @@ impl NativeNorm {
         let normalized = self.as_masked_norm().apply(rows)?;
         let width = rows.ncols();
         let band = match self {
-            Self::Rms { .. } => {
-                let dominance = 1.0 - accumulation_growth(width + 12);
-                let growth = accumulation_growth(width + 6);
-                normalized.mapv(|value| growth * value.abs() / (1.0 - growth) / dominance)
-            }
+            Self::Rms { .. } => rms_norm_band(normalized.view()),
             Self::Layer { epsilon, gain, bias } => {
                 let (mean_growth, own_growth) = (accumulation_growth(width), accumulation_growth(width + 7));
                 let dominance = 1.0 - accumulation_growth(2 * width + 20);
@@ -223,6 +219,18 @@ impl NativeNorm {
         };
         Ok((normalized, band))
     }
+}
+
+/// The rounding band of one binary64 evaluation of an RMSNorm, `MaskedNorm::Rms`'s program, against
+/// the exact RMSNorm of the same input rows, from its computed rows `normalized`: the squares, `d − 1`
+/// additions, the mean, `+ ε`, the square root, the reciprocal and the products with the row and the
+/// gain are `γ_(d+6)` relative, so the band is `γ_(d+6) |fl(N(h))| / (1 − γ_(d+6))`, divided by
+/// `1 − γ_(d+12)` for its own arithmetic ([`NativeNorm::apply_with_band`]).
+pub fn rms_norm_band(normalized: ArrayView2<'_, f64>) -> Array2<f64> {
+    let width = normalized.ncols();
+    let dominance = 1.0 - accumulation_growth(width + 12);
+    let growth = accumulation_growth(width + 6);
+    normalized.mapv(|value| growth * value.abs() / (1.0 - growth) / dominance)
 }
 
 /// One of a decoder block's two sublayers.

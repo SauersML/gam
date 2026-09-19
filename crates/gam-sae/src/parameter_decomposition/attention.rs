@@ -97,7 +97,7 @@ use std::fmt;
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::categorical::{CategoricalError, log_softmax_with_error};
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, CowArray, Ix2, ShapeBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::parameter_decomposition::gated_rewrite::{GatedRewriteError, MaskedNorm};
@@ -494,9 +494,47 @@ fn project_affine(projection: &AffineProjection, x: ArrayView2<f64>) -> (Array2<
     (value, radius)
 }
 
-/// The source's per-head RMS norm (Qwen3 `q_norm`, `k_norm`) on every head of
-/// `tokens × heads·head_dim` rows, evaluated by the gated-rewrite owner on the
-/// current summed rows.
+/// `tokens × width` rows as `tokens·heads × head_dim` head rows, one per contiguous
+/// `head_dim` block. A width that is not a whole, nonzero number of heads is refused.
+/// A contiguous view is reshaped in place; any other view (e.g. a zero-stride exact radius) is copied.
+fn head_rows<'a>(rows: &'a ArrayView2<'_, f64>, head_dim: usize) -> Result<CowArray<'a, f64, Ix2>, GatedRewriteError> {
+    let (tokens, width) = rows.dim();
+    let heads = width.checked_div(head_dim).unwrap_or(0);
+    let mismatch = GatedRewriteError::ShapeMismatch {
+        what: "per-head query/key rows",
+        expected: (tokens * heads, head_dim),
+        found: (tokens, width),
+    };
+    if heads == 0 || heads * head_dim != width {
+        return Err(mismatch);
+    }
+    rows.to_shape((tokens * heads, head_dim)).map_err(|_| mismatch)
+}
+
+/// The source's per-head RMS norm (Qwen3 `q_norm`, `k_norm`) of `tokens × heads·head_dim`
+/// rows: `w ⊙ x (mean x² + ε)^{-1/2}` on each contiguous `head_dim` block of a row, with one
+/// gain `w` of length `head_dim` shared by every head, evaluated by the gated-rewrite owner.
+/// [`NativeAttention::with_query_key_norm`] and the mechanism program's `HeadRmsNorm` node
+/// both run it, so their rows agree bit for bit.
+pub fn head_rms_norm(
+    rows: ArrayView2<'_, f64>,
+    head_dim: usize,
+    epsilon: f64,
+    gain: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, GatedRewriteError> {
+    let (tokens, width) = rows.dim();
+    let per_head = head_rows(&rows, head_dim)?;
+    let normalized = MaskedNorm::Rms { epsilon, gain }.apply(per_head.view())?;
+    normalized
+        .into_shape_with_order((tokens, width))
+        .map_err(|_| GatedRewriteError::ShapeMismatch {
+            what: "per-head query/key rows",
+            expected: (tokens, width),
+            found: (tokens * width / head_dim, head_dim),
+        })
+}
+
+/// [`head_rms_norm`] of rows given with a per-entry radius, and the radius of the result.
 ///
 /// For one head row `x̂` with radius `r`, `y(x) = w ⊙ x ν(x)` with
 /// `ν = s^{-1/2}`, `s(x) = mean x² + ε`. The radius bounds `|y_c(x) − fl(y_c(x̂))|` for
@@ -515,34 +553,31 @@ fn project_affine(projection: &AffineProjection, x: ArrayView2<f64>) -> (Array2<
 /// evaluation's own rounding `γ_{d+6} |fl(y_c)|` (`ν` from the stored row is `γ_{d+4}`
 /// relative, the two products `γ_2`). The total is divided by `1 − γ_{d+12}` for the
 /// radius's own arithmetic.
-fn normalize_heads(
-    (values, radius): (Array2<f64>, Array2<f64>),
-    heads: usize,
+pub fn head_rms_norm_with_radius(
+    rows: ProjectedRows<'_>,
     head_dim: usize,
     epsilon: f64,
     gain: ArrayView1<'_, f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), GatedRewriteError> {
-    let (tokens, width) = values.dim();
-    let mismatch = GatedRewriteError::ShapeMismatch {
-        what: "per-head query/key rows",
-        expected: (tokens * heads, head_dim),
-        found: (tokens, width),
-    };
-    let per_head = values
-        .into_shape_with_order((tokens * heads, head_dim))
-        .ok()
-        .ok_or(mismatch.clone())?;
-    let per_head_radius = radius
-        .into_shape_with_order((tokens * heads, head_dim))
-        .ok()
-        .ok_or(mismatch.clone())?;
-    let normalized = MaskedNorm::Rms { epsilon, gain }.apply(per_head.view())?;
+    let (tokens, width) = rows.values.dim();
+    if rows.radius.dim() != (tokens, width) {
+        return Err(GatedRewriteError::ShapeMismatch {
+            what: "per-head query/key radius",
+            expected: (tokens, width),
+            found: rows.radius.dim(),
+        });
+    }
+    let values = head_rms_norm(rows.values, head_dim, epsilon, gain)?;
+    let per_head = head_rows(&rows.values, head_dim)?;
+    let per_head_radius = head_rows(&rows.radius, head_dim)?;
     let evaluation = accumulation_growth(head_dim + 6);
     let square_growth = accumulation_growth(head_dim + 2);
     let spread_growth = accumulation_growth(head_dim + 4);
     let floor_growth = accumulation_growth(7);
     let dominance = 1.0 - accumulation_growth(head_dim + 12);
     let head_width = head_dim as f64;
+    let values_view = values.view();
+    let normalized = head_rows(&values_view, head_dim)?;
     let mut normalized_radius = Array2::zeros(normalized.dim());
     for (row, (x, r)) in per_head.rows().into_iter().zip(per_head_radius.rows()).enumerate() {
         let computed = x.iter().map(|value| value * value).sum::<f64>() / head_width + epsilon;
@@ -562,14 +597,13 @@ fn normalize_heads(
                 / dominance;
         }
     }
-    let values = normalized
-        .into_shape_with_order((tokens, width))
-        .ok()
-        .ok_or(mismatch.clone())?;
     let radius = normalized_radius
         .into_shape_with_order((tokens, width))
-        .ok()
-        .ok_or(mismatch)?;
+        .map_err(|_| GatedRewriteError::ShapeMismatch {
+            what: "per-head query/key radius",
+            expected: (tokens, width),
+            found: (tokens * width / head_dim, head_dim),
+        })?;
     Ok((values, radius))
 }
 
@@ -934,9 +968,11 @@ impl NativeAttention {
     ) -> Result<(Array2<f64>, Array2<f64>), AttentionProgramError> {
         match &self.query_key_norm {
             None => Ok(rows),
-            Some(norm) => normalize_heads(
-                rows,
-                self.attention.geometry.n_heads,
+            Some(norm) => head_rms_norm_with_radius(
+                ProjectedRows {
+                    values: rows.0.view(),
+                    radius: rows.1.view(),
+                },
                 self.attention.geometry.head_dim,
                 norm.epsilon,
                 norm.query_gain.view(),
@@ -952,9 +988,11 @@ impl NativeAttention {
     ) -> Result<(Array2<f64>, Array2<f64>), AttentionProgramError> {
         match &self.query_key_norm {
             None => Ok(rows),
-            Some(norm) => normalize_heads(
-                rows,
-                self.attention.geometry.n_kv_heads,
+            Some(norm) => head_rms_norm_with_radius(
+                ProjectedRows {
+                    values: rows.0.view(),
+                    radius: rows.1.view(),
+                },
                 self.attention.geometry.head_dim,
                 norm.epsilon,
                 norm.key_gain.view(),
@@ -2483,7 +2521,8 @@ mod tests {
         let radius = array![[0.0, 0.25]];
         let gain = array![1.0, 1.0];
         let (normalized, bound) =
-            normalize_heads((rows.clone(), radius.clone()), 1, 2, epsilon, gain.view()).expect("finite head row");
+            head_rms_norm_with_radius(ProjectedRows { values: rows.view(), radius: radius.view() }, 2, epsilon, gain.view())
+                .expect("finite head row");
         let quad = Quad::from_f64;
         let encloses = |x: [f64; 2], c: usize, center: f64, reach: f64| {
             let s = (quad(x[0]) * quad(x[0]) + quad(x[1]) * quad(x[1])) / quad(2.0) + quad(epsilon);
