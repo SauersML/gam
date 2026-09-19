@@ -23,7 +23,6 @@
 //! each smooth term directly from the data.
 
 use crate::estimate::reml::{DirectionalHyperParam, RemlState};
-use std::fmt;
 
 // Crate-level imports
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
@@ -64,6 +63,7 @@ mod evaluation;
 mod external_options;
 mod fit;
 mod identified_hessian;
+mod information_criteria;
 mod joint_hyper;
 mod null_space_normalizer;
 mod optimizer;
@@ -72,6 +72,7 @@ pub mod rho_domain;
 mod penalty;
 mod prefit;
 pub(crate) mod smoothing_correction;
+mod parametric_term_summary;
 mod smooth_term_summary;
 mod summary;
 
@@ -95,6 +96,7 @@ pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
 };
+pub use information_criteria::{AkaikeCriteria, CorrectedEdf, CorrectedEdfUnavailable, akaike_criterion};
 pub use fit::{fit_gam_with_penalty_specs, fit_gamwith_heuristic_log_lambdas};
 pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub use joint_hyper::{
@@ -119,9 +121,10 @@ pub(crate) use smoothing_correction::{
 pub use smoothing_correction::{
     EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
 };
+pub use parametric_term_summary::parametric_term_summary_rows;
 pub use smooth_term_summary::smooth_term_summary_rows;
 pub use summary::{
-    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ModelSummary,
+    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus,
     ParametricTermSummary, SmoothTermSummary,
 };
 

@@ -344,6 +344,20 @@ pub enum InverseLink {
 }
 
 impl InverseLink {
+    /// The link's name as a model reports it. Unlike
+    /// [`InverseLink::link_function`], every state-bearing link keeps its own
+    /// name: a blended mixture is not a logit link.
+    #[inline]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Standard(link) => link.name(),
+            Self::LatentCLogLog(_) => "latent-cloglog",
+            Self::Sas(_) => "sas",
+            Self::BetaLogistic(_) => "beta-logistic",
+            Self::Mixture(_) => "mixture",
+        }
+    }
+
     #[inline]
     pub const fn link_function(&self) -> LinkFunction {
         match self {
@@ -1831,13 +1845,7 @@ impl std::error::Error for UnsupportedLinkError {}
 
 #[inline]
 pub(crate) fn inverse_link_diagnostic_name(link: &InverseLink) -> String {
-    match link {
-        InverseLink::Standard(lf) => lf.name().to_string(),
-        InverseLink::LatentCLogLog(_) => "latent-cloglog".to_string(),
-        InverseLink::Sas(_) => "sas".to_string(),
-        InverseLink::BetaLogistic(_) => "beta-logistic".to_string(),
-        InverseLink::Mixture(_) => "mixture".to_string(),
-    }
+    link.name().to_string()
 }
 
 /// Resolve a binomial-flavoured `LikelihoodSpec` from an `InverseLink`.

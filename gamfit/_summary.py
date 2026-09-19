@@ -18,7 +18,15 @@ from ._binding import rust_module
 
 
 #: Columns of :meth:`Summary.smooth_terms_frame`, in the documented order.
-_SMOOTH_TERM_COLUMNS: tuple[str, ...] = ("name", "edf", "ref_df", "chi_sq", "p_value")
+_SMOOTH_TERM_COLUMNS: tuple[str, ...] = (
+    "name",
+    "edf",
+    "ref_df",
+    "chi_sq",
+    "statistic",
+    "p_value",
+    "lambdas",
+)
 
 # Canonical schema mirrors ``SummaryPayload`` in
 # ``crates/gam-models/src/inference/saved_summary.rs``. Adding a new field on the
@@ -28,10 +36,20 @@ _SMOOTH_TERM_COLUMNS: tuple[str, ...] = ("name", "edf", "ref_df", "chi_sq", "p_v
 _SUMMARY_FIELDS: tuple[str, ...] = (
     "formula",
     "family_name",
+    "link",
     "model_class",
     "n_obs",
     "deviance",
+    "null_deviance",
+    "deviance_explained",
+    "adjusted_r_squared",
+    "deviance_explained_unavailable",
+    "scale",
     "log_likelihood",
+    "conditional_aic",
+    "conditional_aic_unavailable",
+    "corrected_aic",
+    "corrected_aic_unavailable",
     "reml_score",
     "raw_reml_score",
     "reml_score_unavailable",
@@ -42,6 +60,10 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "edf_rank_bound",
     "lambdas",
     "coefficients",
+    "parametric_statistic",
+    "parametric_terms",
+    "parametric_terms_unavailable",
+    "smooth_statistic",
     "smooth_terms",
     "smooth_terms_unavailable",
     "curvature_estimands",
@@ -53,6 +75,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "group_metadata",
     "deployment_extensions",
     "convergence",
+    "text",
 )
 
 
@@ -160,6 +183,8 @@ class Summary:
         The Wilkinson formula string the model was fitted with.
     family_name : str
         Human-readable family + link label, e.g. ``"Gaussian Identity"``.
+    link : str
+        The link function's name, e.g. ``"identity"`` or ``"logit"``.
     model_class : str
         Internal model class, e.g. ``"standard"`` / ``"marginal-slope"``.
     n_obs : int or None
@@ -169,10 +194,35 @@ class Summary:
     deviance : float or None
         Model deviance at the converged fit. ``None`` for models that do not
         report a deviance.
+    null_deviance : float or None
+        Deviance of the intercept-only model on the training data, recorded at
+        fit time. ``None`` for a fit with no single intercept, with an offset,
+        or saved before it was recorded.
+    deviance_explained : float or None
+        The proportion of null deviance explained, :math:`1 - D/D_0`,
+        unclamped.
+    adjusted_r_squared : float or None
+        :math:`1 - (D/(n - \\mathrm{edf})) / (D_0/(n - 1))` for a Gaussian
+        response; ``None`` for every other family.
+    deviance_explained_unavailable : str or None
+        Why :attr:`deviance_explained` is ``None``. Present exactly when it is.
+    scale : float or None
+        The response dispersion :math:`\\hat\\varphi` (the residual variance for
+        a Gaussian response, ``1`` for a fixed-scale family).
     log_likelihood : float or None
         Ordinary reported log-likelihood at the converged fit. Every rankable
         model carries a finite value; ``None`` is reserved for the exact
         zero-dispersion boundary where no normalized Gaussian density exists.
+    conditional_aic : float or None
+        :math:`-2\\ell + 2(\\mathrm{edf} + \\text{scale dof})`, conditional on the
+        fitted smoothing parameters.
+    conditional_aic_unavailable : str or None
+        Why :attr:`conditional_aic` is ``None``. Present exactly when it is.
+    corrected_aic : float or None
+        The Wood-Pya-Säfken (2016) AIC, which also charges for estimating the
+        smoothing parameters.
+    corrected_aic_unavailable : str or None
+        Why :attr:`corrected_aic` is ``None``. Present exactly when it is.
     reml_score : float or None
         Comparable REML / LAML cost at convergence, including the
         rank-aware Tierney-Kadane null-space normalizer. ``None`` in two cases,
@@ -220,11 +270,27 @@ class Summary:
         and ``std_error`` (when available). Posterior summaries use a lazy
         columnar sequence so indexing and iteration do not require an eager
         list of per-coefficient dictionaries.
+    parametric_statistic : str or None
+        The Wald reference of :attr:`parametric_terms`: ``"t"`` (Student-t on
+        the residual degrees of freedom) when the scale is estimated, ``"z"``
+        when it is known.
+    parametric_terms : list of dict
+        The intercept and linear-term coefficients, one record per coefficient
+        with ``name``, ``estimate``, ``std_error``, ``statistic`` and
+        ``p_value``.
+    parametric_terms_unavailable : str or None
+        Why :attr:`parametric_terms` could not be built; the same causes as
+        :attr:`smooth_terms_unavailable`.
+    smooth_statistic : str or None
+        The reference of each smooth record's ``statistic``: ``"F"`` when the
+        scale is estimated, ``"Chi.sq"`` when it is known.
     smooth_terms : list of dict
         The mgcv-style per-smooth significance table: one record per
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
-        and — for penalized smooths — ``chi_sq`` (Wood 2013 rank-truncated
-        Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
+        ``lambdas`` (the term's smoothing parameters) and — for penalized
+        smooths — ``chi_sq`` (Wood 2013 rank-truncated Wald statistic),
+        ``statistic`` (``chi_sq`` on the :attr:`smooth_statistic` scale) and
+        ``p_value``. Random-effect smooths report ``edf``
         only. Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
@@ -286,6 +352,11 @@ class Summary:
         gauge, so a caller can impose a tolerance of their own without reading a
         log. ``None`` for routes that certify no optimizer (the O(n) spline
         scan).
+    text : str or None
+        The rendered report ``print(summary)`` shows: the same string
+        ``gam summary MODEL`` prints, rendered in Rust from these fields.
+        ``None`` for summaries that are not of a fitted model (posterior-draw
+        summaries).
     extras : dict
         Any keys returned by the Rust engine that are not in the typed
         schema. Kept so newer engine versions can add fields without
@@ -303,10 +374,20 @@ class Summary:
 
     formula: str = ""
     family_name: str = ""
+    link: str = ""
     model_class: str = ""
     n_obs: int | None = None
     deviance: float | None = None
+    null_deviance: float | None = None
+    deviance_explained: float | None = None
+    adjusted_r_squared: float | None = None
+    deviance_explained_unavailable: str | None = None
+    scale: float | None = None
     log_likelihood: float | None = None
+    conditional_aic: float | None = None
+    conditional_aic_unavailable: str | None = None
+    corrected_aic: float | None = None
+    corrected_aic_unavailable: str | None = None
     reml_score: float | None = None
     raw_reml_score: float | None = None
     reml_score_unavailable: str | None = None
@@ -318,6 +399,10 @@ class Summary:
     edf_rank_bound: list[Any] = field(default_factory=list)
     lambdas: list[float] = field(default_factory=list)
     coefficients: Sequence[Mapping[str, Any]] = field(default_factory=list)
+    parametric_statistic: str | None = None
+    parametric_terms: list[dict[str, Any]] = field(default_factory=list)
+    parametric_terms_unavailable: str | None = None
+    smooth_statistic: str | None = None
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)
     smooth_terms_unavailable: str | None = None
     #: Fitted curvature κ̂ point estimates for any ``curv(...)`` constant-curvature
@@ -360,6 +445,7 @@ class Summary:
     #: ``kind``, ``gradient_norm``, ``projected_gradient_norm``,
     #: ``stationarity_bound``, ``hessian_psd`` and ``lambdas_railed``.
     convergence: dict[str, Any] | None = None
+    text: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -443,8 +529,9 @@ class Summary:
         """Return :attr:`smooth_terms` as a :class:`pandas.DataFrame`.
 
         This is the canonical mgcv ``summary.gam`` per-smooth significance
-        table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq``, ``p_value``
-        (``chi_sq`` / ``p_value`` are absent for random-effect smooths and any
+        table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq``,
+        ``statistic``, ``p_value``, ``lambdas`` (``chi_sq`` / ``statistic`` /
+        ``p_value`` are absent for random-effect smooths and any
         shape-constrained term, matching the engine, which only computes the
         Wood Wald test for ordinary penalized smooths).
         """
@@ -460,40 +547,12 @@ class Summary:
     # -- presentation -----------------------------------------------------------
 
     def __str__(self) -> str:
-        """Multi-line human-readable summary (the ``print(summary)`` form).
+        """The rendered report (the ``print(summary)`` form); see :attr:`text`.
 
-        ``Model.__str__`` delegates here so the rendering lives in one place.
+        ``Model.__str__`` delegates here. A summary without rendered text
+        prints its compact form.
         """
-        lines = ["GAM fitted model"]
-        if self.formula:
-            lines.append(f"  Formula: {self.formula}")
-        if self.family_name:
-            lines.append(f"  Family:  {self.family_name}")
-        if self.model_class:
-            lines.append(f"  Class:   {self.model_class}")
-        if self.n_obs is not None:
-            lines.append(f"  Training rows: {self.n_obs}")
-        if self.deviance is not None:
-            lines.append(f"  Deviance: {self.deviance:g}")
-        if (
-            self.reml_score is not None
-            or self.raw_reml_score is not None
-            or self.reml_score_unavailable is not None
-        ):
-            # gam-report owns the words for an absent criterion, so this line
-            # names a fit without null-space metadata apart from an exact fit
-            # the same way `gam fit` and the HTML report do (#2627).
-            lines.append(
-                f"  REML score: {rust_module().summary_criterion_row(self.to_dict())}"
-            )
-        if self.edf_total is not None:
-            lines.append(f"  Effective dof: {self.edf_total:g}")
-        if self.iterations is not None:
-            lines.append(f"  Outer iterations: {self.iterations}")
-        n_coef = len(self.coefficients)
-        if n_coef:
-            lines.append(f"  Coefficients: {n_coef}")
-        return "\n".join(lines)
+        return self.text if self.text is not None else repr(self)
 
     def __repr__(self) -> str:
         """Compact developer one-liner. Stable across engine versions."""

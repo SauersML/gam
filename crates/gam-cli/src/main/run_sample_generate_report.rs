@@ -1,5 +1,6 @@
 use super::*;
-use gam::families::inference::saved_summary::saved_model_report_input;
+use gam::families::inference::saved_summary::{saved_model_report_input, saved_model_summary};
+use gam::families::inference::summary_text::render_summary_text;
 
 
 fn saved_alo_report_data(
@@ -356,6 +357,18 @@ pub(crate) fn run_generate_unified(
     .map_err(|error| error.to_string())
 }
 
+pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
+    reject_multinomial_model(&args.model, "summary")?;
+    let model = SavedModel::load_from_path(&args.model)?;
+    // One renderer owns the text; gamfit's `Model.summary()` prints the same
+    // string from the same payload.
+    let text = render_summary_text(&saved_model_summary(&model)?);
+    use std::io::Write as _;
+    std::io::stdout()
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("failed to write the summary: {error}"))
+}
+
 pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
     reject_multinomial_model(&args.model, "report")?;
     let model = SavedModel::load_from_path(&args.model)?;
@@ -536,16 +549,9 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 }
 
                 // Continuous smoothness order
-                let reportweights = Array1::<f64>::ones(ds.values.nrows());
-                let summary = build_model_summary(
-                    &design,
-                    &spec,
-                    &fit,
-                    family.clone(),
-                    y.view(),
-                    reportweights.view(),
-                )?;
-                for st in &summary.smooth_terms {
+                let smooth_rows =
+                    smooth_term_summary_rows(&design, &spec, &fit, fit.weighted_gram());
+                for st in &smooth_rows {
                     if let Some(ord) = st.continuous_order.as_ref() {
                         let status = match ord.status {
                             ContinuousSmoothnessOrderStatus::Ok => "Ok",

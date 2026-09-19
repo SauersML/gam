@@ -4044,7 +4044,7 @@ fn resolve_average_derivative_column(
 #[pyfunction]
 fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
     let payload = detach_py_result(py, "summary_payload_from_model", move || {
-        summary_payload_value_from_model_bytes(&model_bytes)
+        summary_value_with_text_impl(&model_bytes)
     })?;
     json_object_to_py_dict(py, payload)
 }
@@ -4177,27 +4177,18 @@ fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
     Ok(format!("Summary({})", fields.join(", ")))
 }
 
-/// The summary's criterion row in gam-report's words, so the printed summary
-/// names a fit without null-space metadata apart from an exact fit the same way
-/// `gam fit` and the HTML report do (#2627).
-#[pyfunction]
-fn summary_criterion_row(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    let criterion = |key: &str| -> PyResult<Option<f64>> {
-        match payload.get_item(key)? {
-            Some(value) if !value.is_none() => Ok(Some(value.extract::<f64>()?)),
-            _ => Ok(None),
-        }
-    };
-    Ok(gam::report::criterion_row(
-        criterion("reml_score")?,
-        criterion("raw_reml_score")?,
-        summary_render::summary_format_float,
-    ))
-}
-
 #[pyfunction]
 fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    // Pure presentation layer; no math.
+    // Pure presentation layer; no math. A fitted model's summary carries the
+    // one rendered report, which the notebook shows verbatim.
+    if let Some(text) = payload.get_item("text")?
+        && !text.is_none()
+    {
+        return Ok(format!(
+            "<pre style='font-family: ui-monospace, monospace;'>{}</pre>",
+            summary_html_escape(&text.extract::<String>()?)
+        ));
+    }
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         let key_text = key.str()?.extract::<String>()?;

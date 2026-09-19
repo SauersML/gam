@@ -16,6 +16,7 @@ use gam::families::inference::saved_summary::{
     prediction_model_class_label, saved_model_report_input, saved_model_summary,
     scan_introspection, scan_smooth_label,
 };
+use gam::families::inference::summary_text::render_summary_text;
 
 use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
 
