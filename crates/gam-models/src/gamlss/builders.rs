@@ -1448,6 +1448,17 @@ fn finalize_binomial_mean_wiggle_saved_frame(
                 "smoothing covariance correction",
             )?);
         }
+        if let Some(residual) = inference
+            .smoothing_marginal
+            .as_mut()
+            .and_then(|measure| measure.residual_linear_covariance_mut())
+        {
+            *residual = binomial_mean_wiggle_saved_covariance(
+                residual,
+                &saved_frame,
+                "smoothing marginal residual covariance",
+            )?;
+        }
     }
 
     fit.blocks[0].beta = saved_blocks[0].clone();

@@ -1,7 +1,7 @@
 use super::inner_strategy::GeometryBackendKind;
 use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
-use crate::model_types::SmoothingCorrectionMethod;
+use crate::model_types::{SmoothingCorrectionMethod, SmoothingMarginalMeasure, SmoothingMarginalNode};
 use gam_linalg::matrix::symmetrize_in_place;
 use std::sync::atomic::Ordering;
 
@@ -56,6 +56,12 @@ pub enum SmoothingCorrectionOutcome {
         near_boundary: bool,
         grad_norm: f64,
         max_rho_var: f64,
+        /// The nodes and normalised weights `correction` integrated, as
+        /// offsets from `ρ̂`, so a sampler draws from the same measure.
+        marginal_nodes: Vec<SmoothingMarginalNode>,
+        /// `Σ_k c_k c_kᵀ` over the active directions the cubature did not
+        /// upgrade (first-order, original basis); `None` when all were upgraded.
+        residual_linear_covariance: Option<Array2<f64>>,
         /// The exact first-order IFT correction computed BEFORE the decision
         /// to escalate to cubature, retained rather than discarded (#946).
         /// `Some` exactly when `first_order_method` is
@@ -139,6 +145,33 @@ impl SmoothingCorrectionOutcome {
                 (correction, method, first_order_correction, method)
             }
             SmoothingCorrectionOutcome::Unavailable { .. } => (None, None, None, None),
+        }
+    }
+
+    /// The smoothing-parameter measure the retained correction integrated
+    /// over, for samplers that must draw from the same `ρ`-marginal posterior.
+    /// `None` when no correction is retained.
+    pub(crate) fn smoothing_marginal_measure(&self) -> Option<SmoothingMarginalMeasure> {
+        match self {
+            SmoothingCorrectionOutcome::Cubature {
+                marginal_nodes,
+                residual_linear_covariance,
+                ..
+            } => Some(SmoothingMarginalMeasure::Cubature {
+                nodes: marginal_nodes.clone(),
+                residual_linear_covariance: residual_linear_covariance.clone(),
+            }),
+            SmoothingCorrectionOutcome::FirstOrder {
+                correction: Some(_),
+                reason,
+                ..
+            } => Some(SmoothingMarginalMeasure::Linearised {
+                reason: reason.to_string(),
+            }),
+            SmoothingCorrectionOutcome::FirstOrder {
+                correction: None, ..
+            }
+            | SmoothingCorrectionOutcome::Unavailable { .. } => None,
         }
     }
 
@@ -1548,6 +1581,21 @@ impl<'a> RemlState<'a> {
             .iter()
             .map(|node| node.achieved_rise)
             .fold(f64::NEG_INFINITY, f64::max);
+        let mass: f64 = node_weights.iter().sum();
+        let marginal_nodes = nodes
+            .iter()
+            .zip(&node_weights)
+            .map(|(node, weight)| SmoothingMarginalNode {
+                log_lambda_offset: &node.rho - final_rho,
+                weight: weight / mass,
+            })
+            .collect();
+        let residual_linear_covariance = (!residual_columns.is_empty()).then(|| {
+            let columns = Array2::from_shape_fn((p, residual_columns.len()), |(row, col)| {
+                residual_columns[col][row]
+            });
+            columns.dot(&columns.t())
+        });
         self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {
             correction: corr,
             rho_covariance: first_order_rho_covariance.clone(),
@@ -1557,6 +1605,8 @@ impl<'a> RemlState<'a> {
             near_boundary,
             grad_norm,
             max_rho_var: max_rhovar,
+            marginal_nodes,
+            residual_linear_covariance,
             first_order_correction,
             first_order_method,
         })
@@ -1820,6 +1870,8 @@ mod smoothing_correction_outcome_tests {
             near_boundary: true,
             grad_norm: 1.5,
             max_rho_var: 0.7,
+            marginal_nodes: Vec::new(),
+            residual_linear_covariance: None,
             // Deliberately DIFFERENT from `correction` above so the test can
             // prove the retained first-order pair is not silently aliased to
             // the primary cubature pair (#946).

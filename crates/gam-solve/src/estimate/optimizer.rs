@@ -2499,6 +2499,7 @@ where
     let mut smoothing_correction_first_order = None;
     let mut smoothing_correction_method_first_order = None;
     let mut smoothing_correction_absence = None;
+    let mut smoothing_marginal = None;
     let mut rho_covariance = None;
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
@@ -3568,6 +3569,7 @@ where
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
+                    smoothing_marginal = outcome.smoothing_marginal_measure();
                     (
                         smoothing_correction,
                         smoothing_correction_method,
@@ -3954,6 +3956,7 @@ where
         smoothing_correction_first_order,
         smoothing_correction_method_first_order,
         smoothing_correction_absence,
+        smoothing_marginal,
         penalized_hessian: penalized_hessian.clone().into(),
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,

@@ -774,6 +774,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
                 },
             ),
             smoothing_correction_absence: None,
+            smoothing_marginal: None,
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
             reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
             // Coherent with this fixture's own scale: the family is

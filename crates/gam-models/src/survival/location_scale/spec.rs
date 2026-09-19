@@ -812,6 +812,12 @@ pub fn survival_fit_from_parts(
             smoothing_correction: smoothing_correction_matrix.clone(),
             smoothing_correction_method,
             smoothing_correction_absence: smoothing_correction_absence.clone(),
+            smoothing_marginal: smoothing_correction_matrix.as_ref().map(|_| {
+                gam_solve::model_types::SmoothingMarginalMeasure::Linearised {
+                    reason: "the survival location-scale lane computes the first-order correction only"
+                        .to_string(),
+                }
+            }),
             penalized_hessian: geom.penalized_hessian.clone(),
             reparam_qs: None,
             dispersion: gam_solve::estimate::Dispersion::UNIT,

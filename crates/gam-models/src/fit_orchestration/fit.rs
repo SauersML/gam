@@ -1405,6 +1405,13 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
         if let Some(correction) = inference.smoothing_correction.as_mut() {
             rescale_covariance_coordinates(correction, &row_factors);
         }
+        if let Some(residual) = inference
+            .smoothing_marginal
+            .as_mut()
+            .and_then(|measure| measure.residual_linear_covariance_mut())
+        {
+            rescale_covariance_coordinates(residual, &row_factors);
+        }
         for se in [
             inference.beta_standard_errors.as_mut(),
             inference.beta_standard_errors_corrected.as_mut(),
@@ -2461,6 +2468,12 @@ fn survival_unified_fit_result(
             .as_ref()
             .map(|(_, method)| *method),
         smoothing_correction_absence,
+        smoothing_marginal: smoothing_corrected.as_ref().map(|_| {
+            gam_solve::model_types::SmoothingMarginalMeasure::Linearised {
+                reason: "the survival transformation lane computes the first-order correction only"
+                    .to_string(),
+            }
+        }),
         penalized_hessian: penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
