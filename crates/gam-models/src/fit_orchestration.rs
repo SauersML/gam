@@ -169,6 +169,9 @@ mod perfect_binomial_separation_2273_tests;
 mod smooth_significance_ref_df_floor_1766_tests;
 
 #[cfg(test)]
+mod smooth_lr_nested_null_tests;
+
+#[cfg(test)]
 mod gaussian_reml_stall_edf_collapse_1788_tests;
 
 #[cfg(test)]

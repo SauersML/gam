@@ -2671,10 +2671,17 @@ pub enum SmoothLrUnavailable {
     /// The full model could not be refitted from the supplied data, so no term
     /// has an `ℓ_full` to be compared against.
     FullRefitFailed(String),
-    /// The reduced model (this term dropped) did not reach a converged
+    /// The reduced model (this term's block fixed at zero, every other
+    /// smoothing parameter at the full fit's `λ̂`) did not reach a converged
     /// optimum. A fit object is only ever the product of a converged
     /// optimization, so there is no `ℓ_null` and no statistic.
-    NullRefitFailed(String),
+    NullFitNotConverged(String),
+    /// The reduced model is not the full model with this term's block
+    /// constrained to zero at the full fit's `λ̂` — a penalty spans the tested
+    /// block and a surviving one, a constraint needs the tested block, the
+    /// link shape was estimated jointly, or the fit uses the bounded-linear
+    /// route — so no nested likelihood ratio is defined for it here.
+    NullFitUnsupported(String),
     /// The reduced model converged but its log-likelihood is not finite.
     NullLogLikelihoodNotFinite,
     /// The statistic was formed but the reference returned no finite tail or
@@ -2690,7 +2697,8 @@ impl SmoothLrUnavailable {
             Self::EmptyCoefficientBlock => "empty_coefficient_block",
             Self::DegenerateReference => "degenerate_reference",
             Self::FullRefitFailed(_) => "full_refit_failed",
-            Self::NullRefitFailed(_) => "null_refit_failed",
+            Self::NullFitNotConverged(_) => "null_fit_not_converged",
+            Self::NullFitUnsupported(_) => "null_fit_unsupported",
             Self::NullLogLikelihoodNotFinite => "null_log_likelihood_not_finite",
             Self::TailNotComputable => "tail_not_computable",
         }
@@ -2708,8 +2716,11 @@ impl std::fmt::Display for SmoothLrUnavailable {
                 f.write_str("the term's null law has no positive mean, shape or scale")
             }
             Self::FullRefitFailed(message) => write!(f, "full-model refit failed: {message}"),
-            Self::NullRefitFailed(message) => {
-                write!(f, "reduced-model refit (term dropped) failed: {message}")
+            Self::NullFitNotConverged(message) => {
+                write!(f, "the reduced model (term fixed at zero) did not converge: {message}")
+            }
+            Self::NullFitUnsupported(message) => {
+                write!(f, "no nested reduced model for this term: {message}")
             }
             Self::NullLogLikelihoodNotFinite => {
                 f.write_str("the reduced model's log-likelihood is not finite")
@@ -2910,8 +2921,13 @@ fn fitted_rho_penalty_components(
 /// 1. Fit the full model and read `ℓ_full` and the per-term coefficient ranges /
 ///    EDF / influence block. The full design's column layout fixes the tested
 ///    block for the Lawley factor.
-/// 2. For each penalized smooth term, refit a null model with that term dropped
-///    from the spec; `W = max(2(ℓ_full − ℓ_null), 0)`.
+/// 2. For each penalized smooth term, fit the nested null model: the full
+///    design and likelihood with that term's coefficient block fixed at zero and
+///    every surviving smoothing parameter held at the full fit's `λ̂`
+///    ([`gam_solve::estimate::fit_nested_at_fitted_log_lambdas`]). Re-selecting
+///    `λ` for the reduced model would make `W` the difference of two REML
+///    optima, which at a null-railed term is the outer search's tolerance and
+///    not a likelihood ratio. `W = 2(ℓ_full − ℓ_null)`.
 /// 3. The reference d.f. `d` is the Wood truncation `tr(F)²/tr(F²)` on the
 ///    term's influence block (the same `ref_df` the summary Wald row reports),
 ///    floored at `max(edf, null_dim, 1)`: this LR test drops the whole term, so
@@ -2981,26 +2997,6 @@ pub fn smooth_term_lr_inference_forspec(
                 })
                 .collect());
         }
-    };
-    // The reduced models are fitted for ONE number, `ℓ_null`, plus `β_null`
-    // for the Lawley jets. Neither depends on whether inference is requested —
-    // the optimizer's own contract is that standard errors cannot move `β̂`
-    // or `ρ̂` — but the inference block is where the smoothing-parameter
-    // cubature, the covariance inverse and the influence matrix are built, and
-    // a reduced model has no use for any of them. Running it there turns
-    // every failure of that machinery on a model nobody reports into a
-    // missing p-value for the model that IS reported.
-    //
-    // The one published quantity that differs is `σ̂` on the profiled
-    // Gaussian: it divides by `n` rather than `n − edf` with inference off.
-    // That moves `ℓ_null` and therefore `W`, and it is exactly what the
-    // estimated-scale reference's `B = n·ln(ν_f/ν_0) + (ν_0 − ν_f)` absorbs:
-    // `ν_0` is read back from the null fit's own `D/σ̂²`
-    // ([`profiled_residual_degrees_of_freedom`]) rather than assumed, so
-    // `W − B = n·ln(D_0/D_f)` is identical under either convention.
-    let null_options = FitOptions {
-        compute_inference: false,
-        ..options.clone()
     };
     let ll_full = full.fit.log_likelihood;
     let p_total = full.design.design.ncols();
@@ -3096,6 +3092,28 @@ pub fn smooth_term_lr_inference_forspec(
             None => (Vec::new(), residual_df),
         },
     );
+
+    // The nested null of every term is the full problem with one block fixed at
+    // zero, solved at the full fit's `ρ̂` on the offset the full fit was solved
+    // with. The bounded-linear route solves a different problem (a box on the
+    // bounded coefficients) that this nested fit does not reproduce.
+    let null_offset = full
+        .design
+        .compose_offset(offset, "smooth likelihood-ratio null model")
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let bounded_linear = resolvedspec.has_bounded_linear_terms();
+    let nested_inputs = gam_solve::estimate::NestedFixedLambdaInputs {
+        design: &full.design.design,
+        y,
+        weights,
+        offset: null_offset.view(),
+        penalties: &full.design.penalties,
+        nullspace_dims: &full.design.nullspace_dims,
+        linear_constraints: full.design.linear_constraints.as_ref(),
+        fit: &full.fit,
+        tol: options.tol,
+        link_shape_estimated: options.optimize_sas || options.optimize_mixture,
+    };
 
     let mut out = Vec::<SmoothTermLrReport>::new();
     for (term_idx, design_term) in full.design.smooth.terms.iter().enumerate() {
@@ -3254,57 +3272,38 @@ pub fn smooth_term_lr_inference_forspec(
             continue;
         }
 
-        // Null model: drop this smooth term from the spec and refit. The term's
-        // name pins which spec entry to remove (design and spec share names;
-        // the design was BUILT from this spec, so a design term with no spec
-        // entry is a broken invariant rather than a property of the data).
-        let mut null_spec = resolvedspec.clone();
-        let spec_pos = null_spec
-            .smooth_terms
-            .iter()
-            .position(|t| t.name == design_term.name)
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(format!(
-                    "smooth_term_lr_inference: design term '{}' has no entry in the \
-                     resolved spec it was built from",
-                    design_term.name
-                ))
-            })?;
-        null_spec.smooth_terms.remove(spec_pos);
-        let null = match fit_term_collection_forspec(
-            data,
-            y,
-            weights,
-            offset,
-            &null_spec,
-            family.clone(),
-            &null_options,
-        ) {
-            Ok(null) => null,
-            Err(error) => {
-                out.push(report(Err(SmoothLrUnavailable::NullRefitFailed(
-                    error.to_string(),
-                ))));
+        // Null model: this term's block fixed at zero, at the full fit's `ρ̂`.
+        if bounded_linear {
+            out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(
+                "the model has bounded linear terms, whose box-constrained fit the \
+                 nested fixed-lambda null does not reproduce"
+                    .to_string(),
+            ))));
+            continue;
+        }
+        let null = match gam_solve::estimate::fit_nested_at_fitted_log_lambdas(
+            &nested_inputs,
+            coeff_range.clone(),
+        )? {
+            gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null) => null,
+            gam_solve::estimate::NestedFixedLambdaOutcome::NotConverged(message) => {
+                out.push(report(Err(SmoothLrUnavailable::NullFitNotConverged(message))));
+                continue;
+            }
+            gam_solve::estimate::NestedFixedLambdaOutcome::Unsupported(message) => {
+                out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(message))));
                 continue;
             }
         };
-        if !null.fit.log_likelihood.is_finite() {
+        if !null.log_likelihood.is_finite() {
             out.push(report(Err(SmoothLrUnavailable::NullLogLikelihoodNotFinite)));
             continue;
         }
-        let log_likelihood_ratio = 2.0 * (ll_full - null.fit.log_likelihood);
-        // η at the null fit: X_null β_null + affine_offset + offset (per-row
-        // linear predictor; design-layout independent — Lawley reads it on the
-        // full design rows). `compose_offset` folds the design's fixed affine
-        // channel (non-zero endpoint anchor, #2297) into the user offset.
-        let null_offset = null
-            .design
-            .compose_offset(offset, "smooth likelihood-ratio null model")
-            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-        let mut eta = null.design.design.dot(&null.fit.beta);
-        eta += &null_offset;
-        let eta_null = Some(eta);
-        let null_residual_df = profiled_residual_degrees_of_freedom(&null.fit, profiled_observations);
+        let log_likelihood_ratio = 2.0 * (ll_full - null.log_likelihood);
+        // η at the null fit, offset included: Lawley reads it on the full
+        // design's rows.
+        let eta_null = Some(null.eta);
+        let null_residual_df = null.profiled_residual_df;
 
         // The estimated-scale channel needs BOTH fits' residual degrees of
         // freedom, so it is completed here rather than where the rest of the

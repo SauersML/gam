@@ -1033,11 +1033,12 @@ struct SmoothTermLrRow {
     p_value_upper_bound: Option<f64>,
     /// Why this term has no LR p-value, when it has none:
     /// `"shape_constrained"`, `"empty_coefficient_block"`,
-    /// `"degenerate_reference"`, `"full_refit_failed"`, `"null_refit_failed"`,
+    /// `"degenerate_reference"`, `"full_refit_failed"`,
+    /// `"null_fit_not_converged"`, `"null_fit_unsupported"`,
     /// `"null_log_likelihood_not_finite"`, or `"tail_not_computable"`.
     unavailable_reason: Option<&'static str>,
-    /// The human-readable form of `unavailable_reason`, carrying the refit's
-    /// own error for the two refit reasons.
+    /// The human-readable form of `unavailable_reason`, carrying the solver's
+    /// own message for the full-refit and reduced-fit reasons.
     unavailable_message: Option<String>,
     /// Uncorrected likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)`: `≥ 0`
     /// at a known scale, and supported on `[reference_deterministic_offset, ∞)`
@@ -1243,7 +1244,8 @@ fn curvature_inference_dataset_json_impl(
 /// in a fitted model, Bartlett-corrected by default. The summary table reports
 /// Wood's rank-truncated **Wald** statistic, which the Lawley LR factor would
 /// correct wrongly under penalization; this entry computes a genuine LR
-/// statistic by a constrained refit (the smooth dropped) and corrects *that*.
+/// statistic by a constrained fit (the smooth's block fixed at zero, every
+/// other smoothing parameter held at the full fit's `λ̂`) and corrects *that*.
 ///
 /// Like `curvature_inference_json`, the honest LR needs the model's training
 /// data: we materialize a Standard fit request from the model's training formula

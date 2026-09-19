@@ -522,7 +522,9 @@ class Model:
         :math:`T` by the LR factor would correct the wrong statistic. This method
         instead computes a genuine per-term LR statistic
         :math:`W = 2(\\ell_{\\text{full}} - \\ell_{\\text{null}})` by a
-        constrained refit dropping the smooth, then Bartlett-corrects *that*:
+        constrained fit that fixes the smooth's coefficients at zero while
+        holding every other smoothing parameter at the full fit's
+        :math:`\\hat\\lambda`, then Bartlett-corrects *that*:
         :math:`W^* = W / c`, :math:`c = 1 + \\Delta\\varepsilon / d`.
 
         The reference :math:`W` is scored against is the statistic's own null
@@ -577,7 +579,8 @@ class Model:
           residue such as ``0.0`` or ``1e-15``;
         * ``unavailable_reason`` — a stable label (``"shape_constrained"``,
           ``"empty_coefficient_block"``, ``"degenerate_reference"``,
-          ``"full_refit_failed"``, ``"null_refit_failed"``,
+          ``"full_refit_failed"``, ``"null_fit_not_converged"``,
+          ``"null_fit_unsupported"``,
           ``"null_log_likelihood_not_finite"``, ``"tail_not_computable"``)
           with ``unavailable_message`` saying what happened; every inference
           field of such a row is ``None``.
@@ -602,7 +605,7 @@ class Model:
         factor is computable at this ``n``, else
         ``"none"`` (the uncorrected reference stands, never weakened).
 
-        Needs the training ``data`` for the per-term null refits, exactly as
+        Needs the training ``data`` for the per-term null fits, exactly as
         :meth:`curvature` does. Returns an empty list when the model has no
         penalized smooth term.
         """
