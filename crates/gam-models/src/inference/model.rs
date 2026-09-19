@@ -6976,6 +6976,7 @@ mod tests {
                 firth_bias_reduction: false,
                 covariance_declined: None,
                 jeffreys_arming_evidence: None,
+                improper_penalty_null_posterior: None,
                 outer_warm_start: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
