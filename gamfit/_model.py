@@ -593,7 +593,10 @@ class Model:
         ``selection`` is ``"replayed"`` when that replay was applied, else the
         reason it was not (``"no_penalty_components"``, ``"no_information"``,
         ``"window_closed"`` — a term with nothing to select, whose conditional
-        law already is its selection law). No uncorrected or conditional
+        law already is its selection law). When a penalized term's replay could
+        not be computed (``"geometry_refused"``, ``"grid_refused"``,
+        ``"selection_unresolved"``) ``p_value`` is NaN: its :math:`\\hat\\lambda`
+        was chosen and nothing prices the choice. No uncorrected or conditional
         p-value is offered alongside it: both price :math:`\\hat\\lambda` as
         known and are anti-conservative under the null.
 
