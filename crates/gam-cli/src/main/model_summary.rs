@@ -167,7 +167,12 @@ pub(crate) fn build_model_summary(
     // `gam-pyffi`, which is why #1219, #1277, #1360, #1368 and #1372 each had to
     // be landed twice. This surface's only distinctive input is the whitening
     // Gram, because it holds the real training design.
-    let smooth_terms = smooth_term_summary_rows(design, fit, whitening_gram_full);
+    let smooth_terms = smooth_term_summary_rows(
+        design,
+        fit,
+        whitening_gram_full,
+        SummaryBlockOffset::default(),
+    );
 
     Ok(ModelSummary {
         family: family.pretty_name().to_string(),

@@ -165,7 +165,12 @@ fn domain_that_excludes_training_data_is_rejected_by_name() {
         "--out",
         path_str(&model),
     ]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(gam::ErrorCategory::Formula.exit_code()),
+        "{}",
+        stderr(&out)
+    );
     let error = stderr(&out);
     assert!(error.contains("domain"), "{error}");
     assert!(error.contains("s(x"), "{error}");
@@ -197,7 +202,12 @@ fn malformed_option_values_fail_naming_term_and_option() {
         ("y ~ s(x, degree=2, penalty_order=3)", &["s(x", "penalty_order=3"][..]),
     ] {
         let out = gam(&["fit", path_str(&data), formula, "--out", path_str(&model)]);
-        assert_eq!(out.status.code(), Some(1), "`{formula}`: {}", stderr(&out));
+        assert_eq!(
+            out.status.code(),
+            Some(gam::ErrorCategory::Formula.exit_code()),
+            "`{formula}`: {}",
+            stderr(&out)
+        );
         let error = stderr(&out);
         for needle in needles {
             assert!(error.contains(needle), "`{formula}` error lacks `{needle}`: {error}");

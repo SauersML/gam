@@ -1125,6 +1125,40 @@ mod tests {
         }
     }
 
+    /// #3090: the mass-matrix configs carry no jitter and no dense-metric cap.
+    /// Their diagonal metric is `(1 - regularize)·var + regularize` with
+    /// `var ≥ 0`, so its positive floor is the regularization itself, for every
+    /// dimension on both sides of the high-dimension threshold.
+    #[test]
+    fn mass_matrix_configs_floor_by_regularization_not_jitter_3090() {
+        for dim in [
+            1usize,
+            super::HIGH_DIM_THRESHOLD,
+            super::HIGH_DIM_THRESHOLD + 1,
+            200,
+        ] {
+            for cfg in [
+                super::robust_mass_matrix_config(dim),
+                super::robust_survival_mass_matrix_config(dim),
+            ] {
+                assert_eq!(cfg.jitter, 0.0, "dim={dim}: mass-matrix jitter must be absent");
+                assert!(
+                    cfg.regularize > 0.0 && cfg.regularize < 1.0,
+                    "dim={dim}: regularize={} must bound the diagonal metric away from zero",
+                    cfg.regularize
+                );
+                assert!(matches!(
+                    cfg.adaptation,
+                    super::MassMatrixAdaptation::Diagonal
+                ));
+                assert_eq!(
+                    cfg.dense_max_dim, 0,
+                    "dim={dim}: no dense-metric cap under diagonal adaptation"
+                );
+            }
+        }
+    }
+
     use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
@@ -4405,8 +4439,7 @@ fn draw_logit_pg1_omega(
 /// Parameter dimension above which the posterior is treated as "high-dimensional"
 /// for the purpose of the more conservative sampler heuristics below: a higher
 /// target-acceptance floor (smaller leapfrog steps) and stronger mass-matrix
-/// regularization. The boundary matches the `dense_max_dim` cap at which the
-/// engine stops attempting dense mass-matrix adaptation.
+/// regularization.
 const HIGH_DIM_THRESHOLD: usize = 50;
 
 /// Target-acceptance floor enforced for high-dimensional posteriors
@@ -4419,11 +4452,6 @@ const LOW_DIM_TARGET_ACCEPT_FLOOR: f64 = 0.90;
 /// 1 collapses the step size and stalls mixing, so we cap the requested value.
 const MAX_TARGET_ACCEPT: f64 = 0.95;
 
-/// Largest parameter dimension for which the engine attempts *dense* mass-matrix
-/// adaptation; above this it falls back to a diagonal metric (an `O(p²)` dense
-/// metric is neither affordable nor reliably estimable from limited warmup).
-const DENSE_MASS_MATRIX_MAX_DIM: usize = 75;
-
 /// Mass-matrix ridge (added to the diagonal of the estimated metric) for the
 /// general (mean-family) sampler. The high-dimensional value is larger because
 /// the warmup metric estimate is noisier relative to its scale as `p` grows.
@@ -4433,10 +4461,6 @@ const MASS_REGULARIZE_LOW_DIM: f64 = 0.10;
 /// censoring / rare events and so warrant a heavier ridge than the mean family.
 const SURVIVAL_MASS_REGULARIZE_HIGH_DIM: f64 = 0.18;
 const SURVIVAL_MASS_REGULARIZE_LOW_DIM: f64 = 0.12;
-
-/// Jitter added during mass-matrix inversion to keep the metric strictly
-/// positive-definite against round-off in the warmup covariance estimate.
-const MASS_MATRIX_JITTER: f64 = 1e-5;
 
 #[inline]
 fn robust_target_accept(requested: f64, dim: usize) -> f64 {
@@ -4475,8 +4499,12 @@ fn robust_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
         } else {
             MASS_REGULARIZE_LOW_DIM
         },
-        jitter: MASS_MATRIX_JITTER,
-        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
+        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
+        // so its entries are bounded below by `regularize > 0` and a floor could
+        // never bind (#3090). `dense_max_dim` is read only under dense
+        // adaptation, and both configs are diagonal.
+        jitter: 0.0,
+        dense_max_dim: 0,
     }
 }
 
@@ -4494,8 +4522,12 @@ fn robust_survival_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
         } else {
             SURVIVAL_MASS_REGULARIZE_LOW_DIM
         },
-        jitter: MASS_MATRIX_JITTER,
-        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
+        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
+        // so its entries are bounded below by `regularize > 0` and a floor could
+        // never bind (#3090). `dense_max_dim` is read only under dense
+        // adaptation, and both configs are diagonal.
+        jitter: 0.0,
+        dense_max_dim: 0,
     }
 }
 

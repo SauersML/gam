@@ -2801,6 +2801,9 @@ fn reference_gaussian_no_wiggle(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     let fit = fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
         .expect("reference gaussian no-wiggle terms fit");
     let mut result = GaussianLocationScaleFitResult {
@@ -2809,6 +2812,7 @@ fn reference_gaussian_no_wiggle(
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
     rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
     result
@@ -2824,6 +2828,9 @@ fn reference_gaussian_wiggle(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     let ref_pilot = fit_gaussian_location_scale_terms(data, spec.clone(), options, kappa_options)
         .expect("reference gaussian pilot");
     let ref_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
@@ -2858,6 +2865,7 @@ fn reference_gaussian_wiggle(
         wiggle_degree: Some(ref_solved.wiggle_degree),
         beta_link_wiggle,
         response_scale: 1.0,
+        sigma_floor,
     };
     rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
     result
@@ -2909,6 +2917,9 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
     // remap) so the remap under test is applied exactly once, by this test.
     let mut spec = spec;
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     assert!(
         (s - 1.0).abs() > 10.0,
         "fixture response scale must make the remap non-trivial, got s={s}"
@@ -2921,6 +2932,7 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
 
     // Install the #2346-shaped covariance state: the corrected matrix mirrored
@@ -3050,6 +3062,9 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
     } = request;
     let mut spec = spec;
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     assert!(
         (s - 1.0).abs() > 10.0,
         "fixture response scale must make the remap non-trivial, got s={s}"
@@ -3075,6 +3090,7 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
     let mut rescaled = wrap(fit.clone());
     let mut composed = wrap(fit);
@@ -4460,4 +4476,73 @@ fn multinomial_family_names_are_one_predicate() {
     for name in ["binomial", "gaussian", "poisson", "ordinal", "auto"] {
         assert!(!is_multinomial_family_name(name), "{name}");
     }
+}
+
+/// gam#3014: on the standard, location-scale and survival paths every link spelling
+/// is read. `flexible_link` flexes the formula's `link(...)` as it flexes a `link`
+/// argument, a `flexible(...)` in either place makes the choice flexible, and a `link`
+/// argument naming a different base link from the formula's is refused by name.
+#[test]
+fn every_link_spelling_is_read_and_a_disagreeing_link_argument_is_refused_3014() {
+    use gam_terms::inference::formula_dsl::LinkMode;
+    let resolve = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let parsed =
+            gam_terms::inference::formula_dsl::parse_formula(formula).expect("main formula");
+        super::validation::resolve_link_spellings(parsed.linkspec.as_ref(), link, flexible_link)
+    };
+    let choice = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        resolve(formula, link, flexible_link)
+            .unwrap_or_else(|err| {
+                panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}")
+            })
+            .map(|choice| (choice.link, matches!(choice.mode, LinkMode::Flexible)))
+    };
+    assert_eq!(choice("y ~ x", None, false), None);
+    assert_eq!(choice("y ~ x", None, true), Some((LinkFunction::Probit, true)));
+    for (formula, link, flexible_link, expected) in [
+        ("y ~ x + link(type=probit)", None, false, (LinkFunction::Probit, false)),
+        ("y ~ x + link(type=probit)", None, true, (LinkFunction::Probit, true)),
+        ("y ~ x + link(type=logit)", None, true, (LinkFunction::Logit, true)),
+        ("y ~ x + link(type=probit)", Some("probit"), false, (LinkFunction::Probit, false)),
+        ("y ~ x + link(type=probit)", Some("probit"), true, (LinkFunction::Probit, true)),
+        (
+            "y ~ x + link(type=probit)",
+            Some("flexible(probit)"),
+            false,
+            (LinkFunction::Probit, true),
+        ),
+        (
+            "y ~ x + link(type=flexible(probit))",
+            Some("probit"),
+            false,
+            (LinkFunction::Probit, true),
+        ),
+        ("y ~ x", Some("logit"), false, (LinkFunction::Logit, false)),
+        ("y ~ x", Some("logit"), true, (LinkFunction::Logit, true)),
+    ] {
+        assert_eq!(
+            choice(formula, link, flexible_link),
+            Some(expected),
+            "{formula} link={link:?} flexible_link={flexible_link}"
+        );
+    }
+    for (formula, link) in [
+        ("y ~ x + link(type=probit)", "logit"),
+        ("y ~ x + link(type=probit)", "flexible(logit)"),
+        ("y ~ x + link(type=flexible(probit))", "cloglog"),
+        ("y ~ x + link(type=logit)", "blended(logit,probit)"),
+    ] {
+        let err = resolve(formula, Some(link), false)
+            .expect_err("a link argument that disagrees with the formula must be refused");
+        let message = err.to_string();
+        assert!(
+            matches!(err, WorkflowError::InvalidConfig { .. })
+                && message.contains("link(type=")
+                && message.contains(&format!("link=\"{link}\"")),
+            "{formula} link={link}: {message}"
+        );
+    }
+    // A flexible request of a link the joint wiggle cannot flex is still refused,
+    // now also when the link is named in the formula.
+    assert!(resolve("y ~ x + link(type=sas)", None, true).is_err());
 }

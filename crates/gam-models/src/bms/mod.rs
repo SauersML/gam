@@ -14,6 +14,7 @@ use crate::fit_orchestration::drivers::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint_typed,
     spatial_length_scale_term_indices,
 };
+use crate::inference::predict_io::FittedLatentScoreMap;
 use crate::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
     add_optional_vector, add_two_surface_psi_outer,
@@ -194,6 +195,12 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
     /// applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
+    /// The latent score of each training row as the kernel consumed it: the raw
+    /// score through the fitted score map (the saved normalisation, then the
+    /// conditional calibration when one was minted). Under the conditional law
+    /// a saved model returns these same values at these rows through
+    /// `FittedModel::latent_conditional_residual` (gam#3016).
+    pub latent_score: Array1<f64>,
     /// The fitted residual repair geometry (gam#2924) when a residual block was
     /// supplied: column names, the pooled joint `(z, r)` covariance, the
     /// conditional model when the pairwise gate escalated, and the centring
@@ -2496,12 +2503,14 @@ pub(crate) fn fit_conditional_latent_calibration(
         theta1_cov,
     };
 
-    // Sanity-check post-correction moments on the training sample.
-    let calibrated = calibration.apply(z.view(), a_block)?;
+    // Sanity-check post-correction moments on the training sample, whose
+    // calibrated score is the fitted score map's (gam#3016).
+    let calibrated = FittedLatentScoreMap::conditional_only(&calibration)
+        .calibrate(z.view(), Some(a_block))?;
     let post_mean = weighted_mean(
         calibrated
             .as_slice()
-            .expect("calibration.apply returns an owned standard-layout 1-D array"),
+            .expect("the fitted score map returns an owned standard-layout 1-D array"),
         weights.view(),
         total_weight,
     );
@@ -2876,7 +2885,8 @@ pub(crate) fn build_latent_measure_decision(
                     // closed form: a two-point residual survives location-scale
                     // correction unchanged in shape, and only a declaration may
                     // make it Gaussian.
-                    let zeta = cal.apply(z.view(), a_block)?;
+                    let zeta = FittedLatentScoreMap::conditional_only(&cal)
+                        .calibrate(z.view(), Some(a_block))?;
                     let (kind, build) =
                         build_global_empirical_latent_measure(&zeta, weights, grid_size)?;
                     log::debug!(
@@ -3320,7 +3330,6 @@ pub(crate) fn weighted_tail_mass(
 // Cross-module constants — declared here so all submodules can reach them
 // via `use super::*` without promoting implementation details to pub(crate).
 // ---------------------------------------------------------------------------
-pub(super) const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 /// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
 /// row-accumulation phases.
 ///
@@ -3683,8 +3692,7 @@ pub(crate) use family::{
 pub(crate) use gradient_paths::MarginalSlopeCovarianceRef;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{
-    empirical_intercept_from_marginal, empirical_intercept_from_marginal_within,
-    empirical_intercept_tail_tolerance, signed_probit_neglog_derivatives_up_to_fourth,
+    empirical_intercept, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };

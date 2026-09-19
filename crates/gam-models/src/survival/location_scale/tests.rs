@@ -1246,6 +1246,50 @@ fn survival_ls_joint_oracle_states(primaries: &[[f64; SLS_ROW_K]]) -> Vec<Parame
     ]
 }
 
+/// gam#3035: the all-axes dense overrides agree with the generic per-row
+/// reductions on the full data and on a Horvitz–Thompson-weighted subsample.
+#[test]
+fn survival_ls_dense_overrides_match_generic_on_every_row_set_3035() {
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+                [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+                [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+                [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
+                [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+            ];
+            let event = [1.0, 1.0, 1.0, 0.35];
+            let weight = [1.0, 1.2, 1.1, 1.3];
+            for distribution in [
+                ResidualDistribution::Gaussian,
+                ResidualDistribution::Gumbel,
+                ResidualDistribution::Logistic,
+            ] {
+                let inverse_link = residual_distribution_inverse_link(distribution);
+                let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+                let states = survival_ls_joint_oracle_states(&primaries);
+                let dynamic = family.build_dynamic_geometry(&states).expect("dynamic geometry");
+                let kernel = SurvivalLsRowKernel {
+                    family: &family,
+                    dynamic: &dynamic,
+                    deriv_log_scale: 0.0,
+                    offsets: family.joint_block_offsets(),
+                };
+                crate::test_support::row_set_overrides::assert_dense_overrides_match_generic(
+                    &format!("survival location-scale {distribution:?}"),
+                    &kernel,
+                    &[0.7, -0.5, 0.9],
+                    &[-1.1, 0.8, 0.3],
+                    1e-13,
+                );
+            }
+        })
+        .expect("spawn wide-stack override thread")
+        .join();
+    assert!(join_result.is_ok(), "survival LS override pinning thread must complete");
+}
+
 /// The hand-derived analytic joint-Hessian directional derivative
 /// (`exact_newton_joint_hessian_directional_derivative_from_parts`) must agree
 /// with the jet-tower-certified generic row-kernel directional derivative on a
