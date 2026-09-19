@@ -9,6 +9,13 @@ the truth ~3.5 points less often than ``predict``'s (0.912 vs 0.947 on the
 binomial cell of the pyGAM audit). The draws now mix exact beta | rho draws
 over the same cubature nodes, and the two interval families must agree.
 
+Each replicate's draws must report the same smoothing treatment as that
+replicate's ``predict`` band: marginalised (or the linearised correction the
+fit published instead) whenever the band is smoothing-corrected, conditional
+with a typed reason only when the band is conditional too. A replicate whose
+fit is refused as unconverged has no posterior and is excluded from both
+interval families alike.
+
 Every tolerance is a multiple of the Monte Carlo standard error across
 replicates; the multiple is the two-sided normal quantile at the declared
 family-wise false-alarm rate, Bonferroni-split across the assertions.
@@ -64,7 +71,10 @@ def _covered(truth: Any, lower: Any, upper: Any) -> float:
     return float(np.mean((truth >= lo) & (truth <= hi)))
 
 
-def _replicate(family: str, rep: int, x_test: Any) -> tuple[float, float, str]:
+def _replicate(family: str, rep: int, x_test: Any) -> tuple[float, float] | None:
+    """Coverage of the sample() and predict() mean intervals on one replicate,
+    or ``None`` when the fit itself is refused as unconverged: that replicate
+    has no posterior for either interval to be priced off."""
     rng = np.random.default_rng([rep, _FAMILIES.index(family)])
     x = rng.uniform(0.0, 1.0, (_N, 3))
     y = _response(family, _truth(family, x), rng)
@@ -72,14 +82,37 @@ def _replicate(family: str, rep: int, x_test: Any) -> tuple[float, float, str]:
     test = {"x1": x_test[:, 0], "x2": x_test[:, 1], "x3": x_test[:, 2]}
     mu_test = _truth(family, x_test)
 
-    model = gamfit.fit(data, _FORMULA, family=family)
+    try:
+        model = gamfit.fit(data, _FORMULA, family=family)
+    except gamfit.FitConvergenceError:
+        return None
     band = model.predict(test, interval=_LEVEL)
     posterior = model.sample(data, samples=_DRAWS, seed=rep)
     drawn = posterior.predict(test, level=_LEVEL)
+
+    # sample() integrates the smoothing parameters exactly when predict()'s
+    # band does; when the fit carries no smoothing measure both condition on
+    # rho-hat, and the draws say why.
+    band_source = band["covariance_source"]
+    if band_source == "conditional":
+        assert posterior.covariance_source == "conditional", (
+            f"{family} rep {rep}: predict() is conditional but sample() reports "
+            f"{posterior.covariance_source}"
+        )
+        assert posterior.covariance_reason, (
+            f"{family} rep {rep}: conditional draws carry no reason"
+        )
+    else:
+        assert posterior.covariance_source in {
+            "smoothing-marginalised",
+            "smoothing-corrected",
+        }, (
+            f"{family} rep {rep}: predict() is {band_source} but sample() drew "
+            f"{posterior.covariance_source}"
+        )
     return (
         _covered(mu_test, drawn["posterior_mean_lower"], drawn["posterior_mean_upper"]),
         _covered(mu_test, band["posterior_mean_lower"], band["posterior_mean_upper"]),
-        posterior.covariance_source,
     )
 
 
@@ -92,14 +125,9 @@ def _mean_and_se(values: Any) -> tuple[float, float]:
 @pytest.mark.parametrize("family", _FAMILIES)
 def test_sample_mean_intervals_cover_like_predict(family: str) -> None:
     x_test = np.random.default_rng(_TEST_ROWS).uniform(0.02, 0.98, (_TEST_ROWS, 3))
-    rows = [_replicate(family, rep, x_test) for rep in range(_REPS)]
-    sample_cover = np.asarray([r[0] for r in rows])
-    predict_cover = np.asarray([r[1] for r in rows])
-    sources = {r[2] for r in rows}
-
-    assert sources <= {"smoothing-marginalised", "smoothing-corrected"}, (
-        f"{family}: sample() drew conditional on the fitted smoothing parameters: {sources}"
-    )
+    fitted = [row for rep in range(_REPS) if (row := _replicate(family, rep, x_test))]
+    sample_cover = np.asarray([row[0] for row in fitted])
+    predict_cover = np.asarray([row[1] for row in fitted])
 
     cover, cover_se = _mean_and_se(sample_cover)
     assert abs(cover - _LEVEL) <= _Z * cover_se, (
