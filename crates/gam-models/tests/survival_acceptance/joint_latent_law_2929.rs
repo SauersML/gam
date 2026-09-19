@@ -97,6 +97,12 @@ impl Fixture {
 /// Simulate `S(t | x, z) = Φ(−(q(t)·c(x) + bᵀz))`: the closed form at the
 /// CONDITIONAL covariance, whose marginal survival is `Φ(−q(t))` at every `x`.
 fn build_fixture(seed: u64) -> Fixture {
+    build_fixture_with(seed, |e| e)
+}
+
+/// [`build_fixture`] with the first score's standard-normal innovation mapped
+/// through `plant`, and the outcome simulated on the scores as planted.
+fn build_fixture_with(seed: u64, plant: impl Fn(f64) -> f64) -> Fixture {
     let headers = ["time", "event", "x", "x2", "z0", "z1"]
         .iter()
         .map(|name| name.to_string())
@@ -110,7 +116,7 @@ fn build_fixture(seed: u64) -> Fixture {
         let x = 2.0 * next_unit(&mut state) - 1.0;
         let radius = (-2.0 * next_unit(&mut state).ln()).sqrt();
         let angle = std::f64::consts::TAU * next_unit(&mut state);
-        let (e0, e1) = (radius * angle.cos(), radius * angle.sin());
+        let (e0, e1) = (plant(radius * angle.cos()), radius * angle.sin());
         let rho = CORRELATION_AMPLITUDE * x;
         let z = [e0, rho * e0 + (1.0 - rho * rho).sqrt() * e1];
         let drive = SLOPES[0] * z[0] + SLOPES[1] * z[1];
@@ -238,28 +244,22 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
     // pair gate has no span to condition on and one `Σ̄` serves every row.
     let pooled = fit(&fixture.data, "Surv(time, event) ~ 1", &config("standard-normal"));
     assert!(!pooled.joint_law_present);
-    // gam#2926: one of these exact-Gaussian scores has a point beyond 4σ, which
-    // fails the fixed shape screen at n = 3 000. The declaration is fitted with a
-    // warning, and records its excess anchoring loss on the joint law, which on
-    // Gaussian scores stays at the level of its sampling noise.
+    // gam#2926: one of these exact-Gaussian scores has a point beyond 4σ, which the
+    // former fixed shape screen failed at n = 3 000 (its 4σ tail bound was 0.41 of a
+    // point there). The screen's bounds are now its statistics' null quantiles at
+    // this n, and one point beyond 4σ is inside the Poisson bound of two, so the
+    // declaration is fitted as the Gaussian law it is, with nothing to warn about.
     let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
-        adequacy: Some(_),
-        residual: Some(certificate),
+        adequacy: None,
+        residual: None,
         ..
     } = &pooled.latent_law_consumed
     else {
         panic!(
-            "a Gaussian declaration whose score fails the shape screen must be fitted and record \
-             its excess anchoring loss; got {:?}",
+            "a Gaussian declaration on exact Gaussian scores must pass the shape screen; got {:?}",
             pooled.latent_law_consumed
         )
     };
-    eprintln!("[2926 declared K=2] shape screen failed; recorded {certificate:?}");
-    assert!(
-        certificate.excess_kl <= certificate.noise_energy,
-        "on exact Gaussian scores the declaration's excess anchoring loss must stay at noise \
-         level: {certificate:?}"
-    );
     // The anchored fit: the marginal-index span carries `x`, and the joint law
     // is transported by the conditional covariance fitted on it.
     let anchored_config = config("global-empirical");
@@ -349,6 +349,90 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
             SLOPES[k]
         );
     }
+}
+
+/// The record of a Gaussian declaration on K = 2 scores whose first score's
+/// innovation is planted through `plant`: the failing ledger and the declaration's
+/// excess anchoring loss on the joint law, which the screen's failure makes the
+/// fit measure (gam#2926).
+fn declared_on_planted_scores(
+    seed: u64,
+    plant: impl Fn(f64) -> f64,
+) -> (
+    gam_models::bms::LatentNormalAdequacy,
+    gam_models::bms::ClosedFormAnchorResidual,
+) {
+    let fixture = build_fixture_with(seed, plant);
+    let declared = fit(&fixture.data, "Surv(time, event) ~ 1", &config("standard-normal"));
+    let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
+        adequacy: Some(adequacy),
+        residual: Some(certificate),
+        ..
+    } = &declared.latent_law_consumed
+    else {
+        panic!(
+            "a Gaussian declaration on a score planted non-Gaussian must fail the shape screen and \
+             record its excess anchoring loss; got {:?}",
+            declared.latent_law_consumed
+        )
+    };
+    assert_eq!(
+        certificate.anchors,
+        2 * N,
+        "the declaration's certificate reads every row's exit and entry anchor on the joint law: \
+         {certificate:?}"
+    );
+    (adequacy.clone(), certificate.clone())
+}
+
+/// gam#2926: lighter tails beyond 1.8σ on the first of K = 2 scores, the bulk
+/// untouched, fail the adequacy screen on the score's own kurtosis at n = 3 000,
+/// and the declaration's certificate is measured on the joint law. The departure
+/// is symmetric, so it moves each anchor only at second order: its anchoring error
+/// stays below the estimated law's own sampling error, and the certificate keeps
+/// the closed form. The screen rejects a departure the anchor does not pay for.
+#[test]
+fn a_gaussian_declaration_on_lighter_k2_tails_fails_the_screen_and_keeps_its_certificate_2926() {
+    install();
+    let lighter_tails = |e: f64| {
+        if e.abs() > 1.8 {
+            e.signum() * (1.8 + 0.5 * (e.abs() - 1.8))
+        } else {
+            e
+        }
+    };
+    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0005, lighter_tails);
+    eprintln!("[2926 declared K=2 lighter tails] {adequacy:?} | {certificate:?}");
+    assert!(
+        adequacy.excess_kurtosis.abs() > adequacy.excess_kurtosis_tol,
+        "the lighter tails must fail the screen on the score's own kurtosis: {adequacy:?}"
+    );
+    assert!(
+        certificate.residual_energy < certificate.noise_energy && certificate.closed_form_chosen,
+        "a symmetric tail departure must leave the anchor within its sampling error: \
+         {certificate:?}"
+    );
+}
+
+/// gam#2926: the first of K = 2 scores stretched above +1σ, a skew that moves each
+/// anchor at first order, fails the adequacy screen at n = 3 000, and the
+/// declaration's recorded excess anchoring loss on the joint law is positive: the
+/// certificate prefers the estimated law.
+#[test]
+fn a_gaussian_declaration_on_a_skewed_k2_score_records_a_certificate_beyond_noise_2926() {
+    install();
+    let upper_stretch = |e: f64| if e > 1.0 { 1.0 + 1.5 * (e - 1.0) } else { e };
+    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0006, upper_stretch);
+    eprintln!("[2926 declared K=2 skewed] {adequacy:?} | {certificate:?}");
+    assert!(
+        adequacy.skew.abs() > adequacy.skew_tol,
+        "the stretched upper tail must fail the screen on the score's own skewness: {adequacy:?}"
+    );
+    assert!(
+        certificate.excess_kl > 0.0 && !certificate.closed_form_chosen,
+        "a skewed score must cost the declaration's anchor beyond the estimated law's own \
+         sampling error: {certificate:?}"
+    );
 }
 
 #[test]

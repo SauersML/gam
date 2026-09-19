@@ -217,28 +217,23 @@ pub enum LatentZNormalizationMode {
 }
 
 pub(crate) const DEFAULT_EMPIRICAL_LATENT_GRID_SIZE: usize = 65;
-pub(crate) const AUTO_Z_NORMAL_SKEW_TOL: f64 = 0.10;
-pub(crate) const AUTO_Z_NORMAL_KURT_TOL: f64 = 0.25;
-pub(crate) const AUTO_Z_NORMAL_KS_TOL: f64 = 0.025;
-pub(crate) const AUTO_Z_NORMAL_MAX_ABS: f64 = 8.0;
+/// The standard-normal adequacy screen's design false-fail rate (gam#2926): the
+/// probability that a score drawn exactly N(0, 1) fails it. It is a stated
+/// policy, not a tuning knob. Each clause's bound is the null quantile of its own
+/// statistic at the sample's Kish effective size, at this level split evenly over
+/// the clauses, so no bound is a constant and the screen's family-wise
+/// false-fail rate is at most this. The screen decides only which route a fit
+/// starts on; the post-fit `D̂` certificate carries the accuracy claim.
+pub(crate) const AUTO_Z_NORMAL_SCREEN_ALPHA: f64 = 0.05;
+/// The screen's clauses: mean, sd, skewness, excess kurtosis, KS distance, the
+/// two tail masses and the largest `|z|`.
+const AUTO_Z_NORMAL_SCREEN_CLAUSES: f64 = 8.0;
 /// Inner σ level at which the empirical tail mass of latent z is compared
-/// against the standard normal's theoretical two-sided tail in the auto
-/// normality gate. Chosen well inside `AUTO_Z_NORMAL_MAX_ABS` so a fat inner
-/// tail is caught before any single observation trips the hard `max |z|` bound.
+/// against the standard normal's two-sided tail in the adequacy screen.
 pub(crate) const AUTO_Z_NORMAL_TAIL_SIGMA_INNER: f64 = 4.0;
 /// Outer σ level for the same tail-mass comparison; catches heavier far-tail
 /// excess that the inner level can miss.
 pub(crate) const AUTO_Z_NORMAL_TAIL_SIGMA_OUTER: f64 = 6.0;
-/// Multiplier applied to the normal's theoretical tail mass before comparison:
-/// the empirical tail may be up to this many times the Gaussian tail at the
-/// same σ before the gate fails, allowing for finite-sample sampling noise.
-pub(crate) const AUTO_Z_NORMAL_TAIL_MASS_SLACK: f64 = 2.0;
-/// Absolute additive floor on the inner-σ tail comparison, so the gate does
-/// not fail on round-off when the Gaussian tail itself is already tiny.
-pub(crate) const AUTO_Z_NORMAL_TAIL_FLOOR_INNER: f64 = 1e-5;
-/// Absolute additive floor on the outer-σ tail comparison; smaller than the
-/// inner floor because the 6σ Gaussian tail is many orders smaller than 4σ.
-pub(crate) const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
 /// Significance level for the conditional `E[z|C]` / `Var(z|C)` Rao gate in the
 /// core Auto path (#905). When the latent score's conditional mean or variance
 /// on the marginal-index span `a(C)` is significant at this level, the Auto
@@ -2993,6 +2988,106 @@ impl LatentNormalAdequacy {
     }
 }
 
+/// The adequacy screen's bounds at Kish effective size `n` (gam#2926). Each is the
+/// level-`α/8` null quantile of its clause's statistic for `n` draws of an exact
+/// N(0, 1) score, so such a score fails the screen with probability at most
+/// [`AUTO_Z_NORMAL_SCREEN_ALPHA`], at every `n`. The mean and sd bounds are the
+/// two-sided normal quantile over their standard errors, skewness and excess
+/// kurtosis the same over their exact normal-sample moments, the KS distance
+/// Kolmogorov's critical value in Stephens' finite-`n` form, each tail mass the
+/// Poisson upper quantile of its expected count, and `max |z|` the level `n` draws
+/// exceed with probability `α/8`. A stricter policy cap still binds the mean, sd,
+/// skewness and kurtosis. Skewness and kurtosis are not testable below four
+/// effective draws, and do not bound there.
+struct NormalScreenBounds {
+    mean: f64,
+    sd: f64,
+    skew: f64,
+    excess_kurtosis: f64,
+    ks: f64,
+    tail_inner: f64,
+    tail_outer: f64,
+    max_abs: f64,
+}
+
+fn normal_screen_bounds(n: f64, policy: &LatentZPolicy) -> Result<NormalScreenBounds, String> {
+    let alpha = AUTO_Z_NORMAL_SCREEN_ALPHA / AUTO_Z_NORMAL_SCREEN_CLAUSES;
+    let two_sided = standard_normal_quantile(1.0 - alpha / 2.0)?;
+    let (skew, excess_kurtosis) = if n > 3.0 {
+        let skew_sd = (6.0 * (n - 2.0) / ((n + 1.0) * (n + 3.0))).sqrt();
+        let kurtosis_mean = -6.0 / (n + 1.0);
+        let kurtosis_sd = (24.0 * n * (n - 2.0) * (n - 3.0)
+            / ((n + 1.0) * (n + 1.0) * (n + 3.0) * (n + 5.0)))
+            .sqrt();
+        (
+            two_sided * skew_sd,
+            kurtosis_mean.abs() + two_sided * kurtosis_sd,
+        )
+    } else {
+        (f64::INFINITY, f64::INFINITY)
+    };
+    let root_n = n.sqrt();
+    let ks = kolmogorov_upper_quantile(alpha) / (root_n + 0.12 + 0.11 / root_n);
+    let tail = |sigma: f64| {
+        poisson_upper_quantile(n * normal_two_sided_probability(sigma), alpha) / n
+    };
+    // 1 − (1 − α)^{1/n}: the per-draw exceedance that n draws reach with
+    // probability α.
+    let per_draw = -((-alpha).ln_1p() / n).exp_m1();
+    let max_abs = -standard_normal_quantile(per_draw / 2.0)?;
+    Ok(NormalScreenBounds {
+        mean: policy.mean_tol_multiplier.min(two_sided) / root_n,
+        sd: policy.sd_tol_multiplier.min(two_sided) / (2.0 * (n - 1.0).max(1.0)).sqrt(),
+        skew: policy.max_abs_skew.min(skew),
+        excess_kurtosis: policy.max_abs_excess_kurtosis.min(excess_kurtosis),
+        ks,
+        tail_inner: tail(AUTO_Z_NORMAL_TAIL_SIGMA_INNER),
+        tail_outer: tail(AUTO_Z_NORMAL_TAIL_SIGMA_OUTER),
+        max_abs,
+    })
+}
+
+/// `λ` with `P(K > λ) = α` for Kolmogorov's limit law,
+/// `P(K > λ) = 2 Σ_{j≥1} (−1)^{j−1} e^{−2 j² λ²}`, by bisection on its
+/// decreasing survival function.
+fn kolmogorov_upper_quantile(alpha: f64) -> f64 {
+    let survival = |lambda: f64| {
+        let mut sum = 0.0;
+        for j in 1..=100_u32 {
+            let jf = f64::from(j);
+            let term = (-2.0 * jf * jf * lambda * lambda).exp();
+            sum += if j % 2 == 1 { term } else { -term };
+            if term < 1e-18 {
+                break;
+            }
+        }
+        2.0 * sum
+    };
+    let (mut low, mut high) = (0.2_f64, 5.0_f64);
+    for _ in 0..200 {
+        let middle = 0.5 * (low + high);
+        if survival(middle) > alpha {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    high
+}
+
+/// The smallest count `k` with `P(X > k) ≤ α` for `X ~ Poisson(mean)`.
+fn poisson_upper_quantile(mean: f64, alpha: f64) -> f64 {
+    let mut log_pmf = -mean;
+    let mut cdf = log_pmf.exp();
+    let mut k = 0.0_f64;
+    while 1.0 - cdf > alpha {
+        k += 1.0;
+        log_pmf += mean.ln() - k.ln();
+        cdf += log_pmf.exp();
+    }
+    k
+}
+
 /// Measure a latent-z sample against the standard-normal adequacy gate,
 /// returning every statistic and bound rather than only the verdict.
 pub(crate) fn latent_z_normal_adequacy(
@@ -3036,10 +3131,9 @@ pub(crate) fn latent_z_normal_adequacy(
         .sum::<f64>()
         / weight_sum;
     let sd = var.sqrt();
-    // The two moment bounds depend only on the effective sample size, so they
-    // are formed before the degeneracy check and stated once for both exits.
-    let mean_tol = policy.mean_tol_multiplier / effective_n.sqrt();
-    let sd_tol = policy.sd_tol_multiplier / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
+    // Every bound depends only on the effective sample size, so they are formed
+    // before the degeneracy check and stated once for both exits.
+    let bounds = normal_screen_bounds(effective_n, policy)?;
     if !(mean.is_finite() && sd.is_finite() && sd > 0.0) {
         // A constant or non-finite sample has no shape: every standardized
         // statistic divides by `sd`, so skewness, kurtosis and the tail masses
@@ -3051,25 +3145,21 @@ pub(crate) fn latent_z_normal_adequacy(
         return Ok(LatentNormalAdequacy {
             effective_n,
             mean,
-            mean_tol,
+            mean_tol: bounds.mean,
             sd,
-            sd_tol,
+            sd_tol: bounds.sd,
             skew: f64::NAN,
-            skew_tol: policy.max_abs_skew.min(AUTO_Z_NORMAL_SKEW_TOL),
+            skew_tol: bounds.skew,
             excess_kurtosis: f64::NAN,
-            excess_kurtosis_tol: policy.max_abs_excess_kurtosis.min(AUTO_Z_NORMAL_KURT_TOL),
+            excess_kurtosis_tol: bounds.excess_kurtosis,
             ks: f64::NAN,
-            ks_tol: AUTO_Z_NORMAL_KS_TOL,
+            ks_tol: bounds.ks,
             tail_mass_inner: f64::NAN,
-            tail_bound_inner: AUTO_Z_NORMAL_TAIL_MASS_SLACK
-                * normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_INNER)
-                + AUTO_Z_NORMAL_TAIL_FLOOR_INNER,
+            tail_bound_inner: bounds.tail_inner,
             tail_mass_outer: f64::NAN,
-            tail_bound_outer: AUTO_Z_NORMAL_TAIL_MASS_SLACK
-                * normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_OUTER)
-                + AUTO_Z_NORMAL_TAIL_FLOOR_OUTER,
+            tail_bound_outer: bounds.tail_outer,
             max_abs: f64::NAN,
-            max_abs_tol: AUTO_Z_NORMAL_MAX_ABS,
+            max_abs_tol: bounds.max_abs,
         });
     }
     let skew = z
@@ -3095,28 +3185,24 @@ pub(crate) fn latent_z_normal_adequacy(
     let tail_mass_4 = weighted_tail_mass(z, weights, weight_sum, AUTO_Z_NORMAL_TAIL_SIGMA_INNER);
     let tail_mass_6 = weighted_tail_mass(z, weights, weight_sum, AUTO_Z_NORMAL_TAIL_SIGMA_OUTER);
     let max_abs_z = z.iter().fold(0.0_f64, |acc, &zi| acc.max(zi.abs()));
-    let normal_tail_4 = normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_INNER);
-    let normal_tail_6 = normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_OUTER);
     Ok(LatentNormalAdequacy {
         effective_n,
         mean,
-        mean_tol,
+        mean_tol: bounds.mean,
         sd,
-        sd_tol,
+        sd_tol: bounds.sd,
         skew,
-        skew_tol: policy.max_abs_skew.min(AUTO_Z_NORMAL_SKEW_TOL),
+        skew_tol: bounds.skew,
         excess_kurtosis,
-        excess_kurtosis_tol: policy.max_abs_excess_kurtosis.min(AUTO_Z_NORMAL_KURT_TOL),
+        excess_kurtosis_tol: bounds.excess_kurtosis,
         ks: ks_to_normal,
-        ks_tol: AUTO_Z_NORMAL_KS_TOL,
+        ks_tol: bounds.ks,
         tail_mass_inner: tail_mass_4,
-        tail_bound_inner: AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_4
-            + AUTO_Z_NORMAL_TAIL_FLOOR_INNER,
+        tail_bound_inner: bounds.tail_inner,
         tail_mass_outer: tail_mass_6,
-        tail_bound_outer: AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_6
-            + AUTO_Z_NORMAL_TAIL_FLOOR_OUTER,
+        tail_bound_outer: bounds.tail_outer,
         max_abs: max_abs_z,
-        max_abs_tol: AUTO_Z_NORMAL_MAX_ABS,
+        max_abs_tol: bounds.max_abs,
     })
 }
 
@@ -3489,6 +3575,8 @@ mod empirical_intercept_solve_tests;
 mod empirical_measure_2484_tests;
 #[cfg(test)]
 mod anchor_law_2926_tests;
+#[cfg(test)]
+mod normal_screen_2926_tests;
 mod standard_normal_flex_fifth;
 pub(crate) mod empirical_measure_sensitivity;
 // #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT

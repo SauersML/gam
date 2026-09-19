@@ -103,6 +103,14 @@
   one estimated finite law, or on local laws by context where the law moves,
   with the score on its own axis. The rank inverse-normal and automatic
   conditional standardisation are gone from the default.
+- The standard-normal adequacy screen's bounds are the null quantiles of its
+  own statistics at the sample's effective size, at level 0.05 split over its
+  eight clauses (the KS bound is Kolmogorov's critical value, about
+  `1.70/√n`), instead of fixed skewness, kurtosis, KS, tail and `|z|`
+  constants. An exactly Gaussian score fails it at most 5% of the time at any
+  `n` (by Kolmogorov's law the fixed KS bound of 0.025 failed about 16% of
+  them at n = 2000), and a departure fails it once `n` resolves it (the fixed
+  bound passed KS up to 0.025 at any `n`).
 - `latent_measure="gaussian"`, `frozen_score=True` and the CTN chain declare
   the Gaussian closed form. A declaration is refused when the score's
   conditional law moves on the span; when the pooled score fails the

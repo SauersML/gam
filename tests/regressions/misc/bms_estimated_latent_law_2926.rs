@@ -564,9 +564,16 @@ fn declared_gauss_hermite_law_agrees_with_the_closed_form_on_a_gaussian_score_29
     );
 }
 
-/// The standard-normal adequacy check's skewness bound, which the fit also
-/// records beside the statistic; the fixture aims at a fraction of it.
-const ADEQUACY_SKEW_BOUND: f64 = 0.10;
+/// The standard-normal adequacy screen's skewness bound at the fixture's size, which
+/// the fit also records beside the statistic: the two-sided normal quantile at the
+/// screen's level 0.05 split over its 8 clauses, over the exact standard error of a
+/// normal sample's skewness (gam#2926). The fixture aims at a fraction of it.
+fn adequacy_skew_bound() -> f64 {
+    let n = SKEW_N as f64;
+    let z = gam::probability::standard_normal_quantile(1.0 - 0.05 / 16.0)
+        .expect("a probability inside (0, 1)");
+    z * (6.0 * (n - 2.0) / ((n + 1.0) * (n + 3.0))).sqrt()
+}
 /// How far inside the bound the fixture's sample skewness is placed.
 const JUST_INSIDE_SKEW_RATIO: f64 = 0.9;
 
@@ -605,7 +612,7 @@ fn just_inside_fixture(
         let pq = FAR_WEIGHT * (1.0 - FAR_WEIGHT);
         pq * (1.0 - 2.0 * FAR_WEIGHT) * theta.powi(3) / (1.0 + pq * theta * theta).powf(1.5)
     };
-    let target = JUST_INSIDE_SKEW_RATIO * ADEQUACY_SKEW_BOUND;
+    let target = JUST_INSIDE_SKEW_RATIO * adequacy_skew_bound();
     let (mut low, mut high) = (0.0_f64, 3.0_f64);
     for _ in 0..200 {
         let mid = 0.5 * (low + high);

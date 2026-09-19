@@ -315,9 +315,14 @@ on its own axis:
    standardised moment over the marginal-index span;
 2. if none moves and the score passes the standard-normal adequacy screen
    (mean, SD, skewness, kurtosis, KS distance, tail mass, largest `|z|`),
-   the closed form, provisionally. The screen says nothing directly about
-   the anchoring error, so at the converged fit one pass over the rows
-   measures each row's residual `r = Σ_k w_k Φ(a_cf + h_k) − π` under the
+   the closed form, provisionally. Each of the screen's eight bounds is the
+   null quantile of its own statistic at the sample's Kish effective size,
+   at level 0.05 split over the eight, so an exactly Gaussian score fails the
+   screen at most 5% of the time at every `n`, and a departure fails it once
+   `n` resolves it: the KS bound is Kolmogorov's critical value, about
+   `1.70/√n`. The screen only decides which route the fit starts on and says
+   nothing directly about the anchoring error, so at the converged fit one
+   pass over the rows measures each row's residual `r = Σ_k w_k Φ(a_cf + h_k) − π` under the
    estimated law at the closed-form intercept, and its sampling standard
    error `se` under that law. `r² − 2·se²` estimates without bias how much
    less accurate the closed form is than the estimated law's own anchor on
@@ -364,10 +369,10 @@ fit is refused with the p-values. When the pooled score fails the
 standard-normal adequacy screen (mean, SD, skewness, kurtosis, KS distance,
 tail mass, largest `|z|`), the declaration is fitted and the fit warns with
 the adequacy ledger and the declaration's estimated excess anchoring loss
-`D̂` at the converged fit, both recorded with the model. The screen's
-tolerances are fixed: at small `n` they reject exact Gaussian scores, and at
-large `n` departures that cost no anchoring accuracy, so they are not grounds
-to refuse a declaration; `D̂` measures what it costs. To fit the closed form
+`D̂` at the converged fit, both recorded with the model. The screen is a
+level-0.05 test of the standard normal, and a failed test is not grounds to
+refuse a declaration: at large `n` it detects departures that cost no
+anchoring accuracy, and `D̂` measures what the departure costs. To fit the closed form
 on purpose on a score that is not normal without the warning, declare a
 Gauss–Hermite law: it is the Gaussian case to quadrature tolerance.
 
