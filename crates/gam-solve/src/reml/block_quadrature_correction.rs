@@ -300,6 +300,29 @@ impl<'a> RemlState<'a> {
             );
             return Ok(zero());
         }
+        // A Firth fit's posterior carries the Jeffreys prior ½ log|I(β)|, and its
+        // mode solves S β̂ = ∇ℓ(β̂) + ∇½ log|I(β̂)|. `Gam784BlockTarget` integrates
+        // the flat-prior posterior −ℓ + ½ βᵀSβ and reduces its remainder through
+        // the flat-prior mode condition S β̂ = ∇ℓ(β̂), so on a Firth fit its value
+        // omits the Jeffreys remainder and its gradient channels are not the
+        // derivative of that value. Under (quasi-)separation, the case Firth
+        // exists for, the flat-prior posterior it integrates is improper along
+        // the separating direction: no Gauss–Hermite order resolves it, so the
+        // order search raised orders until the fit ground to a halt on a
+        // perfectly separated step, and on a quasi-separated one the spliced
+        // gradient left the outer search stalled at |g| = 0.23. The Firth
+        // criterion's own higher-order term is the Tierney–Kadane refinement of
+        // the same Jeffreys objective (`tierney_kadane_terms`), so the
+        // correction is declined — value and gradient together — whenever the
+        // Jeffreys term is armed.
+        if reml_robust_jeffreys_link(&self.config).is_some() {
+            log::debug!(
+                "[#784] block-local fallback declined before the skewness diagnostic: the \
+                 Jeffreys (Firth) prior is armed and the block target integrates the \
+                 flat-prior posterior"
+            );
+            return Ok(zero());
+        }
 
         // Resolve the injected gam-inference corrector. When the inference tier
         // is not linked / registered, decline the correction (zero contribution) —

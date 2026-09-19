@@ -440,27 +440,197 @@ fn certify_prefit_binomial_linear_separator(
     }))
 }
 
+/// One coordinate of the linear-separation search, `z_i = Σ_k weights[k]·x_i[columns[k]]`:
+/// a parametric column (weight one), or a direction of a penalty block's null space.
+#[derive(Clone, Debug, PartialEq)]
+struct PrefitSeparationCoordinate {
+    columns: Vec<usize>,
+    weights: Vec<f64>,
+}
+
+impl PrefitSeparationCoordinate {
+    fn column(col: usize) -> Self {
+        Self {
+            columns: vec![col],
+            weights: vec![1.0],
+        }
+    }
+
+    fn value(&self, row: ArrayView1<'_, f64>) -> f64 {
+        self.columns
+            .iter()
+            .zip(&self.weights)
+            .map(|(&col, &weight)| weight * row[col])
+            .sum()
+    }
+}
+
+/// The directions of each multi-column penalty block on which the prior is flat,
+/// or bounded only by the block's null-space ridge.
+///
+/// A smooth's roughness penalty leaves its low-order polynomial part unpenalized,
+/// and a double-penalty smooth adds a second penalty on exactly that null space
+/// (Marra & Wood 2011). Along a separating direction in the null space REML sends
+/// the ridge's λ toward zero, as it does for a parametric column's one-column
+/// ridge (b7b874a2a), so the ridge bounds nothing there; without the ridge the
+/// prior is flat there to begin with. Either way the posterior is improper along
+/// a separator in that space. The null space is the smooth's polynomial part, not
+/// a basis expansion, so it cannot separate an arbitrary response (#2898).
+///
+/// A penalty is read as its block's null-space ridge when its rank and the rank
+/// of the rest of the block sum to the rank of the whole block (the ranges are
+/// complementary) and its rank is strictly the smaller (a tie names no ridge, so
+/// the block reads as unridged); the directions returned are then
+/// the null space of the rest of the block. A block with no such ridge returns
+/// the null space of the whole block. Ranks are read off each penalty's root,
+/// scaled to unit Frobenius norm so that no penalty's scale buries another's, by
+/// [`gam_linalg::roundoff::factor_rank_partition`].
+fn penalty_null_space_directions(
+    penalties: &[CanonicalPenalty],
+    p: usize,
+) -> Result<Vec<PrefitSeparationCoordinate>, EstimationError> {
+    let mut coordinates = Vec::new();
+    let mut visited: Vec<std::ops::Range<usize>> = Vec::new();
+    for penalty in penalties {
+        let range = penalty.col_range.clone();
+        if range.len() < 2 || range.end > p || visited.contains(&range) {
+            continue;
+        }
+        visited.push(range.clone());
+        let overlaps_another_block = penalties.iter().any(|other| {
+            other.col_range != range
+                && other.col_range.start < range.end
+                && range.start < other.col_range.end
+        });
+        if overlaps_another_block {
+            continue;
+        }
+        let block: Vec<&CanonicalPenalty> = penalties
+            .iter()
+            .filter(|other| other.col_range == range)
+            .collect();
+        let dim = range.len();
+        let mut roots = Vec::with_capacity(block.len());
+        for member in &block {
+            let frobenius = member.root.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if member.root.ncols() != dim || !frobenius.is_finite() || frobenius <= 0.0 {
+                roots.clear();
+                break;
+            }
+            roots.push(member.root.mapv(|v| v / frobenius));
+        }
+        if roots.len() != block.len() {
+            continue;
+        }
+        let stacked_rank = |members: &mut dyn Iterator<Item = &Array2<f64>>| {
+            let members: Vec<_> = members.map(|root| root.view()).collect();
+            let stack = ndarray::concatenate(Axis(0), &members).map_err(|err| {
+                EstimationError::LayoutError(format!(
+                    "pre-fit null-space separation check failed to stack penalty roots: {err}"
+                ))
+            })?;
+            gam_linalg::roundoff::factor_rank_partition(&stack)
+                .map_err(EstimationError::EigendecompositionFailed)
+        };
+        let whole = stacked_rank(&mut roots.iter())?;
+        // A lone penalty has no rest of the block to be complementary to.
+        let ridge_candidates = if roots.len() > 1 { 0..roots.len() } else { 0..0 };
+        let mut ridge_released = false;
+        for ridge in ridge_candidates {
+            let ridge_rank = gam_linalg::roundoff::factor_rank_partition(&roots[ridge])
+                .map_err(EstimationError::EigendecompositionFailed)?
+                .rank;
+            let rest = stacked_rank(
+                &mut roots
+                    .iter()
+                    .enumerate()
+                    .filter(|&(k, _)| k != ridge)
+                    .map(|(_, root)| root),
+            )?;
+            if ridge_rank == 0 || ridge_rank >= rest.rank || ridge_rank + rest.rank != whole.rank
+            {
+                continue;
+            }
+            ridge_released = true;
+            push_null_directions(&mut coordinates, &range, &rest);
+        }
+        if !ridge_released {
+            push_null_directions(&mut coordinates, &range, &whole);
+        }
+    }
+    Ok(coordinates)
+}
+
+/// The right singular vectors past `partition.rank` span the null space of the
+/// partitioned factor's quadratic.
+fn push_null_directions(
+    coordinates: &mut Vec<PrefitSeparationCoordinate>,
+    range: &std::ops::Range<usize>,
+    partition: &gam_linalg::roundoff::FactorRankPartition,
+) {
+    for direction in partition.right_vectors.rows().into_iter().skip(partition.rank) {
+        coordinates.push(PrefitSeparationCoordinate {
+            columns: range.clone().collect(),
+            weights: direction.to_vec(),
+        });
+    }
+}
+
 fn detect_prefit_binomial_linear_combination_separation_in_design(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: &DesignMatrix,
-    unpenalized_columns: &[bool],
+    coordinates: &[PrefitSeparationCoordinate],
 ) -> Result<Option<PrefitLinearSeparationDiagnostic>, EstimationError> {
-    if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
+    if x.nrows() != y.len() || x.nrows() != w.len() {
+        return Ok(None);
+    }
+    let p = x.ncols();
+    if coordinates
+        .iter()
+        .any(|coordinate| coordinate.columns.iter().any(|&col| col >= p))
+    {
         return Ok(None);
     }
     let Some(class) = prefit_binary_response_classes(y, w) else {
         return Ok(None);
     };
-    let column_indices = unpenalized_column_indices(unpenalized_columns);
-    let q = column_indices.len();
+    let q = coordinates.len();
     if q == 0 {
         return Ok(None);
     }
 
-    let p = x.ncols();
+    // Certify in the design's own columns: the search coordinates only propose
+    // a direction, and the certificate's rounding band is read off the columns
+    // the fit actually multiplies.
+    let mut column_indices: Vec<usize> = coordinates
+        .iter()
+        .flat_map(|coordinate| coordinate.columns.iter().copied())
+        .collect();
+    column_indices.sort_unstable();
+    column_indices.dedup();
+    let certify = |direction: &[f64]| {
+        let mut beta = vec![0.0_f64; column_indices.len()];
+        for (coordinate, &d) in coordinates.iter().zip(direction) {
+            for (&col, &weight) in coordinate.columns.iter().zip(&coordinate.weights) {
+                let slot = column_indices
+                    .binary_search(&col)
+                    .expect("every coordinate column is in the certified support");
+                beta[slot] += d * weight;
+            }
+        }
+        certify_prefit_binomial_linear_separator(&class, x, &column_indices, &beta)
+    };
+
+    for direction in prefit_threshold_separator_proposals(&class, x, coordinates)? {
+        if let Some(diagnostic) = certify(&direction)? {
+            return Ok(Some(diagnostic));
+        }
+    }
+
     let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
     let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    let mut z = vec![0.0_f64; q];
     let mut direction = vec![0.0_f64; q];
     let max_passes = (8 * q.max(1)).clamp(16, 128);
     for _ in 0..max_passes {
@@ -479,14 +649,16 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
                     continue;
                 };
                 let sign = if is_positive { 1.0 } else { -1.0 };
+                let row = chunk.row(local_row);
                 let mut dot = 0.0;
                 let mut magnitude = 0.0;
                 let mut row_norm_sq = 0.0;
-                for (local_col, &global_col) in column_indices.iter().enumerate() {
-                    let value = chunk[[local_row, global_col]];
+                for (local_col, coordinate) in coordinates.iter().enumerate() {
+                    let value = coordinate.value(row);
                     if !value.is_finite() {
                         return Ok(None);
                     }
+                    z[local_col] = value;
                     let term = direction[local_col] * value;
                     dot += term;
                     magnitude += term.abs();
@@ -506,22 +678,122 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
                     continue;
                 }
                 let update_scale = sign / row_norm_sq;
-                for (local_col, &global_col) in column_indices.iter().enumerate() {
-                    direction[local_col] += update_scale * chunk[[local_row, global_col]];
+                for (local_col, &value) in z.iter().enumerate() {
+                    direction[local_col] += update_scale * value;
                 }
             }
         }
         if mistakes == 0 {
-            return certify_prefit_binomial_linear_separator(
-                &class,
-                x,
-                &column_indices,
-                &direction,
-            );
+            break;
         }
     }
 
-    certify_prefit_binomial_linear_separator(&class, x, &column_indices, &direction)
+    certify(&direction)
+}
+
+/// Exact separator proposals, one per search coordinate whose values the two
+/// classes do not interleave: `±(e_k − t·a)`, with `t` the midpoint of the gap
+/// and `a` the least-squares representation of the constant in the coordinates.
+///
+/// The perceptron needs on the order of `(R/γ)²` updates, and a step response
+/// on a grid of `n` points has a margin `γ` near `R/n`, so it cannot find the
+/// separator of the very step it exists for. A threshold on one coordinate is
+/// that separator whenever the constant lies in the coordinates' span; when it
+/// does not, the proposal fails the certificate and nothing is claimed.
+fn prefit_threshold_separator_proposals(
+    class: &[Option<bool>],
+    x: &DesignMatrix,
+    coordinates: &[PrefitSeparationCoordinate],
+) -> Result<Vec<Vec<f64>>, EstimationError> {
+    let q = coordinates.len();
+    let p = x.ncols();
+    let mut min_pos = vec![f64::INFINITY; q];
+    let mut max_pos = vec![f64::NEG_INFINITY; q];
+    let mut min_neg = vec![f64::INFINITY; q];
+    let mut max_neg = vec![f64::NEG_INFINITY; q];
+    let mut gram = Array2::<f64>::zeros((q, q));
+    let mut column_sums = Array1::<f64>::zeros(q);
+    let mut z = vec![0.0_f64; q];
+    let mut active_rows = 0usize;
+    let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
+    let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    for start in (0..x.nrows()).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(x.nrows());
+        let rows = end - start;
+        x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
+            .map_err(|err| {
+                EstimationError::LayoutError(format!(
+                    "pre-fit binomial threshold-separation check failed to stream design rows: {err}"
+                ))
+            })?;
+        for local_row in 0..rows {
+            let Some(is_positive) = class[start + local_row] else {
+                continue;
+            };
+            active_rows += 1;
+            let row = chunk.row(local_row);
+            for (k, coordinate) in coordinates.iter().enumerate() {
+                let value = coordinate.value(row);
+                if !value.is_finite() {
+                    return Ok(Vec::new());
+                }
+                z[k] = value;
+                if is_positive {
+                    min_pos[k] = min_pos[k].min(value);
+                    max_pos[k] = max_pos[k].max(value);
+                } else {
+                    min_neg[k] = min_neg[k].min(value);
+                    max_neg[k] = max_neg[k].max(value);
+                }
+            }
+            for a in 0..q {
+                column_sums[a] += z[a];
+                for b in 0..=a {
+                    gram[[a, b]] += z[a] * z[b];
+                }
+            }
+        }
+    }
+    for a in 0..q {
+        for b in 0..a {
+            gram[[b, a]] = gram[[a, b]];
+        }
+    }
+
+    // `a = G⁺ Zᵀ1`, the pseudo-inverse cut at the Gram's rounding floor, the
+    // same floor the pre-fit rank check reads.
+    let (eigenvalues, eigenvectors) = gram
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    if eigenvalues.iter().any(|value| !value.is_finite()) {
+        return Ok(Vec::new());
+    }
+    let spectral_scale = eigenvalues
+        .iter()
+        .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
+    let floor = (active_rows.max(q) as f64) * f64::EPSILON * spectral_scale;
+    let mut constant = Array1::<f64>::zeros(q);
+    for (i, &value) in eigenvalues.iter().enumerate() {
+        if value > floor {
+            let v = eigenvectors.column(i);
+            constant.scaled_add(v.dot(&column_sums) / value, &v);
+        }
+    }
+
+    let mut proposals = Vec::new();
+    for k in 0..q {
+        let (threshold, sign) = if min_pos[k] > max_neg[k] {
+            (0.5 * (min_pos[k] + max_neg[k]), 1.0)
+        } else if min_neg[k] > max_pos[k] {
+            (0.5 * (min_neg[k] + max_pos[k]), -1.0)
+        } else {
+            continue;
+        };
+        let mut direction: Vec<f64> = constant.iter().map(|&c| -sign * threshold * c).collect();
+        direction[k] += sign;
+        proposals.push(direction);
+    }
+    Ok(proposals)
 }
 
 fn prefit_binomial_separation_supported_link(link: &InverseLink) -> bool {
@@ -571,12 +843,18 @@ pub(crate) fn reject_prefit_binomial_separation(
             positive_above_threshold: diagnostic.positive_above_threshold,
         });
     }
-    if let Some(diagnostic) = detect_prefit_binomial_linear_combination_separation_in_design(
-        y,
-        w,
-        x_fit,
-        &certified_columns,
-    )? {
+    // A smooth's null space (its intercept-free polynomial part) is penalized only
+    // by its double-penalty ridge, which REML releases along a separator exactly as
+    // it releases a one-column ridge, so its directions join the search.
+    let coordinates: Vec<PrefitSeparationCoordinate> =
+        unpenalized_column_indices(&certified_columns)
+            .into_iter()
+            .map(PrefitSeparationCoordinate::column)
+            .chain(penalty_null_space_directions(penalties, x_fit.ncols())?)
+            .collect();
+    if let Some(diagnostic) =
+        detect_prefit_binomial_linear_combination_separation_in_design(y, w, x_fit, &coordinates)?
+    {
         return Err(EstimationError::PrefitLinearSeparationDetected {
             min_signed_margin: diagnostic.min_signed_margin,
             num_unpenalized_columns: diagnostic.num_unpenalized_columns,
