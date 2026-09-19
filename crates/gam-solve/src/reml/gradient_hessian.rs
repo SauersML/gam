@@ -3201,9 +3201,11 @@ impl<'a> RemlState<'a> {
         }
 
         // General observed-information path for the non-canonical Bernoulli
-        // links (Probit, CLogLog, SAS, BetaLogistic, Mixture). Its only caller
-        // is the Tierney-Kadane correction, armed for Firth-penalized binomial
-        // fits (`reml_jeffreys_supported_link`).
+        // links (Probit, CLogLog, SAS, BetaLogistic, Mixture), armed by the
+        // Tierney-Kadane correction for Firth-penalized binomial fits
+        // (`reml_jeffreys_supported_link`). The EDM formula is the family's own,
+        // so it also serves the #784 mixed-axis term on every exact-curvature
+        // family, Poisson-log included.
         let likelihood = &pirls_result.likelihood;
         let weight_family = pirls::weight_family_for_glm_likelihood(likelihood)?;
         let phi = reml_fixed_glm_dispersion(likelihood)?;

@@ -25,7 +25,7 @@ solve and evidence evaluation:
 rng = np.random.default_rng(0)
 angle = rng.uniform(0.0, 2.0 * np.pi, 200)
 X = np.column_stack([np.cos(angle), np.sin(angle)]) + 0.05 * rng.standard_normal((200, 2))
-gamfit.sae_manifold_fit(X, K=2, d_atom=1, gpu="off")
+gamfit.sae.sae_manifold_fit(X, K=2, d_atom=1, gpu="off")
 ```
 
 The fence's fit uses the default penalty-gated assignment, which takes the dense

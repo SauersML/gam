@@ -380,7 +380,7 @@ def _manifold_fit_worker(
 ):
     """Fit one dense/curved manifold arm and run coherent OOS inference."""
     _install_solver_log(solver_log)
-    from gamfit import sae_manifold_fit
+    from gamfit.sae import sae_manifold_fit
 
     topology = "circle" if arm == "curved" else "linear"
     fit_options = {}
@@ -500,7 +500,7 @@ def _linear_sparse_fit_worker(
 ):
     """Fit the production sparse-linear lane and explicitly route both splits."""
     _install_solver_log(solver_log)
-    from gamfit import sparse_dictionary_fit
+    from gamfit.sae import sparse_dictionary_fit
 
     fit_started = time.perf_counter()
     m = sparse_dictionary_fit(

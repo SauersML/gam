@@ -144,7 +144,7 @@ def main() -> int:
             kw["top_k"] = 1
         t0 = time.perf_counter()
         try:
-            rep = gamfit.sae_manifold_certify_external(
+            rep = gamfit.sae.sae_manifold_certify_external(
                 np.ascontiguousarray(X), **kw)
             wall = time.perf_counter() - t0
             ik = rep.get("inner_kkt") or {}

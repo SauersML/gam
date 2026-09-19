@@ -34,7 +34,7 @@ def test_summary_topology_matches_atom_basis(
     atom_basis: str, expected_topology: str, atom_dim: int
 ) -> None:
     X = _toy_inputs()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=X,
         K=1,
         atom_basis=atom_basis,
@@ -64,7 +64,7 @@ def test_payload_round_trip_preserves_topology(
     attribute (not just summary), to guard against fix-only-the-formatter
     regressions."""
     X = _toy_inputs()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=X,
         K=1,
         atom_basis=atom_basis,
@@ -84,7 +84,7 @@ def test_geometry_plans_and_topology_are_internally_consistent() -> None:
     not contradict each other. Pin the consistency rule directly so future
     drift in either field fails this test."""
     X = _toy_inputs()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=X,
         K=2,
         atom_basis="sphere",
@@ -104,7 +104,7 @@ def test_linear_topology_is_distinct_from_euclidean_quadratic_patch() -> None:
     """The #1026 EV-vs-K driver must compare curved atoms against the genuine
     linear atom, not the degree-2 Euclidean patch."""
     X = _toy_inputs()
-    linear = gamfit.sae_manifold_fit(
+    linear = gamfit.sae.sae_manifold_fit(
         X=X,
         K=1,
         atom_topology="linear",
@@ -113,7 +113,7 @@ def test_linear_topology_is_distinct_from_euclidean_quadratic_patch() -> None:
         n_iter=1,
         random_state=0,
     )
-    euclidean = gamfit.sae_manifold_fit(
+    euclidean = gamfit.sae.sae_manifold_fit(
         X=X,
         K=1,
         atom_topology="euclidean",
@@ -141,7 +141,7 @@ def test_explicit_conflicting_topology_and_basis_raises() -> None:
     `sae_manifold_fit` (gamfit/_sae_manifold.py:401-409)."""
     X = _toy_inputs()
     with pytest.raises((ValueError, TypeError)):
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=X,
             K=1,
             atom_basis="sphere",

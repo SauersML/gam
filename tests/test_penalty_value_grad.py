@@ -17,14 +17,14 @@ import pytest
 torch = pytest.importorskip("torch")
 
 import gamfit
-from gamfit import (
+from gamfit.penalties import (
     ARDPenalty,
     BlockOrthogonalityPenalty,
     OrderedBetaBernoulliPenalty,
 )
 
 
-def _autograd_grad(penalty: gamfit.PenaltyDescriptor, t: torch.Tensor) -> torch.Tensor:
+def _autograd_grad(penalty: gamfit.penalties.PenaltyDescriptor, t: torch.Tensor) -> torch.Tensor:
     t = t.detach().clone().requires_grad_(True)
     v = penalty.value(t)
     (g,) = torch.autograd.grad(v, t, create_graph=False)
@@ -32,7 +32,7 @@ def _autograd_grad(penalty: gamfit.PenaltyDescriptor, t: torch.Tensor) -> torch.
 
 
 def _autograd_hvp(
-    penalty: gamfit.PenaltyDescriptor, t: torch.Tensor, v: torch.Tensor
+    penalty: gamfit.penalties.PenaltyDescriptor, t: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
     t = t.detach().clone().requires_grad_(True)
     val = penalty.value(t)

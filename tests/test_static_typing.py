@@ -2,7 +2,7 @@
 
 gamfit ships ``py.typed``, so its annotations are part of the public API: a
 strict user must be able to call ``gamfit.fit``, ``gamfit.load`` and every other
-name in ``gamfit.__all__`` without "does not explicitly export" or untyped-call
+name in ``gamfit.__all__`` and its public submodules without "does not explicitly export" or untyped-call
 errors. Checking the package itself keeps those annotations honest, and the
 deliberately wrong snippet proves the check sees real types rather than ``Any``.
 
@@ -53,7 +53,7 @@ def test_mypy_strict_rejects_a_misuse_of_the_public_api(tmp_path: Path) -> None:
         "import gamfit\n"
         "\n"
         "model: gamfit.Model = gamfit.fit({'y': [1.0]}, 3)\n"
-        "gamfit.adjudicate_atom_shape(model, folds='five')\n",
+        "gamfit.sae.adjudicate_atom_shape(model, folds='five')\n",
         encoding="utf-8",
     )
     result = _mypy(str(misuse))

@@ -159,8 +159,8 @@ against the frozen dictionary, memory `O(N·top_k)` — the LLM-scale path).
 Fits mint only from a converged, certificate-checked optimization.
 
 ```python no-exec
-fit = gamfit.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
-                              assignment="topk", top_k=8)   # K >> p, topology=auto
+fit = gamfit.sae.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
+                                  assignment="topk", top_k=8)   # K >> p, topology=auto
 census = Counter(fit.atom_topologies)     # which shapes the evidence kept
 codes = fit.encode(acts_new)              # sparse support + amplitude + coordinate
 curve = fit.atom_curve(k, ts)             # the atom's decoded manifold, sampled
@@ -361,7 +361,7 @@ print the calibrated thresholds:
 
 ```python
 import gamfit
-print(gamfit.format_cuda_diagnostics())
+print(gamfit.cuda.format_cuda_diagnostics())
 ```
 
 The wheel is compiled against the CUDA 12 driver/userspace ABI. If PyTorch has

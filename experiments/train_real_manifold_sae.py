@@ -19,7 +19,7 @@ This is the honest end-to-end run the manifold-SAE machinery exists for:
     held-out EV too.
 
 NO fitting math lives here. This is the #977 numeric boundary: activations are
-just a response matrix fed to ``gamfit.sae_manifold_fit`` and read back through
+just a response matrix fed to ``gamfit.sae.sae_manifold_fit`` and read back through
 ``ManifoldSAE``. The honest question it answers: does the discovered-geometry
 dictionary beat a matched degree-2 quadratic "euclidean" patch baseline on
 held-out real activations, and what topology did it discover? (#1201: the
@@ -129,7 +129,7 @@ def _fit(z_tr, z_te, k, topology, seed, n_iter, lift=None, x_te_raw=None):
     number to compare against raw PCA variance or a raw linear-SAE. ``ev_raw`` is
     ``nan`` when the raw test matrix / lift were not supplied.
     """
-    from gamfit import sae_manifold_fit
+    from gamfit.sae import sae_manifold_fit
 
     t0 = time.perf_counter()
     m = sae_manifold_fit(

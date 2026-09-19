@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-import gamfit.manifold_crosscoder as facade
+import gamfit._manifold_crosscoder as facade
 
 
 class _RustStub:

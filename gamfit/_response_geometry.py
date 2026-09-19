@@ -425,7 +425,7 @@ class ResponseGeometryModel:
         serialized as a small JSON container that embeds each constituent
         ``Model`` through its own binary archive (base64-encoded ``Model.dumps``)
         plus the base point, coordinate chart, and geometry metadata. Passed to
-        :func:`gamfit.loads` (or written by :meth:`save` / :func:`gamfit.save`)
+        :func:`gamfit.loads` (or written by :meth:`save`)
         it reconstructs a :class:`ResponseGeometryModel` that reproduces
         :meth:`predict`.
         """
@@ -496,7 +496,6 @@ def fit_response_geometry(
     coordinates: str | None = None,
     reference: int = -1,
     weights: str | None = None,
-    persistent_warm_start_root: Any | None = None,
     fisher_rao_w: Any | None = None,
     scale_dimensions: bool | None = None,
     firth: bool | None = None,
@@ -564,7 +563,6 @@ def fit_response_geometry(
         "family": "gaussian",
         "link": "identity",
         "weights": weights,
-        "persistent_warm_start_root": persistent_warm_start_root,
         "scale_dimensions": scale_dimensions,
         "firth": firth,
         "precision_hyperpriors": precision_hyperpriors,

@@ -4615,6 +4615,19 @@ pub(crate) struct FirthDesignFactor {
     pub(crate) n: usize,
 }
 
+/// The Jeffreys log-density `½ log|I(β)|` of a fixed design under one inverse
+/// link, as a function of `η = Xβ` alone.
+///
+/// It holds the β-independent [`FirthDesignFactor`] and evaluates the same
+/// identifiable-subspace value [`FirthDenseOperator`] carries, without the
+/// Fisher inverse, hat diagonal, and weight derivatives only the gradient
+/// needs: the per-state cost is `X_rᵀ W X_r` and one factorization. A
+/// Metropolis ratio `|I(β')|^½ / |I(β)|^½` needs nothing more.
+pub struct JeffreysHalfLogDet {
+    pub(crate) factor: FirthDesignFactor,
+    pub(crate) link: InverseLink,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthDirection {
     pub(crate) deta: Array1<f64>,
@@ -5551,6 +5564,20 @@ pub(crate) enum BlockCorrectionDecision {
     AdmittedAtOptimum,
 }
 
+/// The #784 block quadrature latched beside the admission (#2623): the
+/// Gauss–Hermite order of each block axis, and whether the block marginal is
+/// integrated axis by axis with the analytic mixed-axis term, or as one tensor
+/// rule over the whole block. Beside them sit the paired-rule errors measured
+/// at that admission: the certificate every later evaluation at those orders
+/// carries, since the paired error no longer switches anything once the
+/// orders are latched (#2748).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BlockQuadratureLatch {
+    pub(crate) axis_orders: Vec<usize>,
+    pub(crate) axis_quadrature_errors: Vec<f64>,
+    pub(crate) axis_split: bool,
+}
+
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5627,11 +5654,9 @@ pub(crate) struct RemlState<'a> {
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve
     /// `min(|Δ_b|, 1/n_eff²)`, and held for the fit, so the nodes, and with them
-    /// the value, gradient and moments, are one measure at every ρ. Beside them
-    /// sit the paired-rule errors measured at that admission: the certificate
-    /// every later evaluation at those orders carries, since the paired error
-    /// no longer switches anything once the orders are latched (#2748).
-    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<(Vec<usize>, Vec<f64>)>>,
+    /// the value, gradient and moments, are one measure at every ρ. Whether the
+    /// block is integrated axis by axis is latched with them, for the same reason.
+    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<BlockQuadratureLatch>>,
     /// Adaptive IFT step-cap controller, the hypergradient budget controller,
     /// and the two mode-response caches.
     ///
