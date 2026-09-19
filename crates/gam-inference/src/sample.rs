@@ -1151,7 +1151,7 @@ fn sample_standard_bounded(
 
 /// Exact posterior draws for a standard GLM whose coefficients carry linear
 /// *inequality* constraints `A β ≥ b` — `nonnegative()` / `linear(min,max)` /
-/// `constrain()` box bounds on a parametric term (#1507) and the
+/// `linear(min=, max=)` box bounds on a parametric term (#1507) and the
 /// monotone/convex/concave shape cone `γ_j ≥ 0` on a spline (#1509).
 ///
 /// The posterior is the Laplace Gaussian `N(mode, φ·H⁻¹)` *truncated* to the

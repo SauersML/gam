@@ -1,5 +1,5 @@
 //! Owed-work regression gate for issue #1378 — the default univariate thin-plate
-//! smooth `s(x, bs="tp")` was NOT invariant to a pure row permutation of the
+//! smooth `s(x, bs="tps")` was NOT invariant to a pure row permutation of the
 //! training data.
 //!
 //! ## The defect (now fixed)
@@ -7,7 +7,7 @@
 //! A GAM fit is a functional of the *unordered set* of `(x, y)` observations, so
 //! reordering the rows of an identical dataset must reproduce the identical fit
 //! (up to round-off). The local bases `bs="cr"` and `bs="ps"` honour this
-//! bit-for-bit. The default `bs="tp"` did not: permuting the rows moved the
+//! bit-for-bit. The default `bs="tps"` did not: permuting the rows moved the
 //! fitted curve by ~3% of the signal range (the issue measured a worst-case
 //! prediction drift of 0.0756, ~1.5× the fit's own RMSE-to-truth).
 //!
@@ -353,7 +353,7 @@ fn worst_permutation_drift(bs: &str) -> PermutationReport {
     }
 }
 
-/// #1378: the default `s(x, bs="tp")` fit must be invariant to a pure row
+/// #1378: the default `s(x, bs="tps")` fit must be invariant to a pure row
 /// permutation of the training data. A correct fit is a functional of the
 /// unordered observation set, so every reordering must reach the same certified
 /// optimum.
@@ -363,7 +363,7 @@ fn default_thin_plate_fit_is_row_permutation_invariant_1378() {
 
     let tp = worst_permutation_drift("tp");
     eprintln!(
-        "#1378 bs=tp row-permutation drift = {:.3e} ({:.4}% of signal range {:.3e})",
+        "#1378 bs=tps row-permutation drift = {:.3e} ({:.4}% of signal range {:.3e})",
         tp.worst_drift,
         100.0 * tp.worst_drift / tp.signal_range,
         tp.signal_range
@@ -404,12 +404,12 @@ fn default_thin_plate_fit_is_row_permutation_invariant_1378() {
     // optimum. Before #1378 the curve moved by ~0.0756 (~3% of the signal range).
     assert!(
         tp.certified,
-        "default s(x, bs=\"tp\") published no certified outer optimum, so row-permutation \
+        "default s(x, bs=\"tps\") published no certified outer optimum, so row-permutation \
          invariance of its λ̂ cannot be judged"
     );
     assert!(
         tp.optimum_violations.is_empty(),
-        "default s(x, bs=\"tp\") is NOT row-permutation invariant: a permuted fit left the \
+        "default s(x, bs=\"tps\") is NOT row-permutation invariant: a permuted fit left the \
          unpermuted fit's certified optimum (worst prediction drift {:.3e}, {:.4}% of signal \
          range). The greedy maximin knot tie-break must break ties value-lexicographically \
          (duchon_thinplate.rs select_thin_plate_knots `value_less`, #93f938970) and the default \

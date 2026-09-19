@@ -200,12 +200,12 @@ fn gam_arm_scores(truth: Truth, xs: &[f64], ys: &[f64], grid_x: &[f64]) -> (f64,
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         noise_formula: Some(
-            "1 + s(x, bs='cc', period_start=0, period_end=6.283185307179586)".to_string(),
+            "1 + s(x, bs='cyclic', period_start=0, period_end=6.283185307179586)".to_string(),
         ),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "y ~ s(x, bs='cc', period_start=0, period_end=6.283185307179586)",
+        "y ~ s(x, bs='cyclic', period_start=0, period_end=6.283185307179586)",
         &ds,
         &cfg,
     )
@@ -571,11 +571,11 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
     // and matches the `knots = c(0.5, 12.5)` we hand mgcv inside gamlss below.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(month, bs='cc', period_start=0.5, period_end=12.5)".to_string()),
+        noise_formula: Some("1 + s(month, bs='cyclic', period_start=0.5, period_end=12.5)".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "temp ~ s(month, bs='cc', period_start=0.5, period_end=12.5)",
+        "temp ~ s(month, bs='cyclic', period_start=0.5, period_end=12.5)",
         &train_ds,
         &cfg,
     )

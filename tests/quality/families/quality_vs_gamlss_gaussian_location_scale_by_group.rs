@@ -160,10 +160,10 @@ fn gam_location_scale_by_group_matches_gamlss() {
     //      log σ ----------------------------------------------------------
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("s(x, bs='tp', by=group)".to_string()),
+        noise_formula: Some("s(x, bs='tps', by=group)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp', by=group)", &data, &cfg)
+    let result = fit_from_formula("y ~ s(x, bs='tps', by=group)", &data, &cfg)
         .expect("gam Gaussian location-scale by-group fit");
     let FitResult::GaussianLocationScale(fit) = result else {
         panic!("expected a GaussianLocationScale fit result for a noise_formula model");

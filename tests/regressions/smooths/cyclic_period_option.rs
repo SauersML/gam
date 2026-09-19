@@ -1,4 +1,4 @@
-//! Regression coverage for the `cyclic()` / `cc()` / `cp()` period-declaration
+//! Regression coverage for the `cyclic()` period-declaration
 //! bugs #815 and #816.
 //!
 //! Both are "documented option silently ignored" failures in the cyclic

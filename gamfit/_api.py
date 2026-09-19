@@ -812,14 +812,15 @@ def fit(
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
-        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
-        ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
-        ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
-        estimated by LAML jointly with the smoothing parameters; the fitted
-        values are reported as ``student_t_sigma`` / ``student_t_nu``).
+        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"``, ``"negative-binomial"``,
+        and the heavy-tailed ``"student-t"`` (identity link, scale and degrees
+        of freedom estimated by LAML jointly with the smoothing parameters; the
+        fitted values are reported as ``student_t_sigma`` / ``student_t_nu``).
+        Each family has one spelling; any other spelling (``"nb"``, ``"tw"``,
+        ``"student_t"``, ...) is refused with an error naming the accepted one.
         Binomial/Bernoulli link spellings accept
-        ``"-logit"``, ``"-probit"``, ``"-cloglog"``, or mgcv-style
-        parentheses such as ``"bernoulli(probit)"``. Specialized values include
+        ``"-logit"``, ``"-probit"``, ``"-cloglog"``, or a parenthesized link
+        such as ``"bernoulli(probit)"``. Specialized values include
         ``"gaussian-location-scale"`` when ``noise_formula`` is supplied,
         ``"bernoulli-marginal-slope"``, ``"royston-parmar"``, and
         ``"transformation-normal"``. With ``family="auto"`` (the default) the
@@ -956,7 +957,7 @@ def fit(
         scale. The family is magic-routed from ``family``: with the default
         ``"gaussian"`` it models ``log σ``; with ``"binomial"`` it models the
         latent-threshold scale; and with the genuine-dispersion mean families
-        ``"gamma"``, ``"beta"``, ``"nb"`` (negative-binomial) or ``"tweedie"``
+        ``"gamma"``, ``"beta"``, ``"negative-binomial"`` or ``"tweedie"``
         the noise formula models that family's own overdispersion channel
         (Gamma shape, Beta φ, NB θ, Tweedie 1/φ), giving a full dispersion
         GAMLSS (#913). Corresponds to the ``--predict-noise`` CLI path
@@ -3061,7 +3062,7 @@ def glm_reml_fit_latent(
 
     ``family`` accepts ``"binomial-logit"``, ``"binomial-probit"``,
     ``"binomial-cloglog"``, ``"poisson-log"``, ``"tweedie-log"``,
-    ``"negbin-log"``, ``"beta-regression-logit"``, ``"gamma-log"``,
+    ``"negative-binomial-log"``, ``"beta-regression-logit"``, ``"gamma-log"``,
     ``"gaussian-identity"``, and the multi-output families
     ``"multinomial-logit"`` (aliases ``"multinomial"`` / ``"softmax"`` /
     ``"categorical-logit"``) and a multi-column binomial-logit fit (pass a

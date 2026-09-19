@@ -217,7 +217,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .into_iter()
         .collect::<Vec<_>>();
-    // Force `group(g)` / `factor(g)` / `re(g)` grouping columns to a factor
+    // Force `group(g)` / `factor(g)` grouping columns to a factor
     // encoding even when their labels are numeric. An untyped CSV cannot carry
     // the typed-frame categorical sentinel the Python path uses, so without this
     // a numeric-coded grouping column would be demoted to a single continuous

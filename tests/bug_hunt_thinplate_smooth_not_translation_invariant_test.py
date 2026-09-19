@@ -1,6 +1,6 @@
 """Translation invariance of a univariate thin-plate smooth (issue #1269).
 
-A univariate thin-plate regression spline ``s(x, bs="tp")`` is a functional of
+A univariate thin-plate regression spline ``s(x, bs="tps")`` is a functional of
 the radial kernel ``phi(x_i - x_j)`` (coordinate *differences*) plus a polynomial
 nullspace ``{1, x}`` penalised by ``integral (f'')**2``.  Both pieces depend on
 the covariate only through differences and a smoothness functional that is itself
@@ -89,7 +89,7 @@ def test_thinplate_fit_is_invariant_to_covariate_translation() -> None:
     drift, signal_range = _max_drift("tp")
     rel = drift / signal_range
     assert rel < 1e-3, (
-        f"thin-plate s(x, bs='tp') is NOT translation invariant: "
+        f"thin-plate s(x, bs='tps') is NOT translation invariant: "
         f"max drift {drift:.3e} = {rel:.3%} of signal range {signal_range:.3f} "
         f"(ceiling 1e-3)"
     )

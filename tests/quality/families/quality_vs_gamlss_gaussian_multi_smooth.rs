@@ -44,13 +44,13 @@
 //!
 //! Each engine's default smoother (#1561). gamlss fits its default `pb()`
 //! (penalized cubic B-splines on 20 intervals) in both predictors, so gam fits
-//! its default `s()`. An earlier version forced gam to `s(x, bs='tp', k=6)`, a
+//! its default `s()`. An earlier version forced gam to `s(x, bs='tps', k=6)`, a
 //! basis about a quarter the size of the reference's 23, while describing the
 //! reference as the same thin-plate basis through `ga()`, which it is not. Measured over
 //! the 23 draws gamlss fits (MSI jobs 1219883 and 1255785, per-draw gamlss
 //! errors from job 1206812), mean paired log(gam/gamlss) RMSE:
-//! - `bs='tp', k=6`: mu +0.114 (gam resolved worse), log sigma -0.302;
-//! - `bs='tp'` at its default size: mu +0.030 (still resolved worse), log sigma -0.129;
+//! - `bs='tps', k=6`: mu +0.114 (gam resolved worse), log sigma -0.302;
+//! - `bs='tps'` at its default size: mu +0.030 (still resolved worse), log sigma -0.129;
 //! - `bs='ps', k=23`, the size of `pb()`'s basis: mu -0.068, log sigma -0.139;
 //! - default `s()`: mu -0.075, log sigma -0.202 (gam resolved better on both).
 //!

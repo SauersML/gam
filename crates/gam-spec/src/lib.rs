@@ -165,33 +165,43 @@ impl LinkFunction {
         }
     }
 
-    /// Accepted spellings beyond the canonical [`Self::name`], normalized
-    /// (lower-case, `_` read as `-`). These are the names other GAM/GLM
-    /// packages use for the same link (R's `1/mu^2`, pyGAM's `inv_squared`).
-    const fn aliases(self) -> &'static [&'static str] {
-        match self {
-            Self::Inverse => &["1/mu"],
-            Self::InverseSquared => &["inv-squared", "1/mu^2"],
-            Self::BetaLogistic => &["betalogistic"],
-            Self::Logit
-            | Self::Probit
-            | Self::CLogLog
-            | Self::LogLog
-            | Self::Cauchit
-            | Self::Sas
-            | Self::Identity
-            | Self::Log => &[],
-        }
+    /// Link spellings that are not accepted, each with the one canonical
+    /// [`Self::name`] that means the same link (SPEC R25: one spelling per
+    /// behavior). [`UnknownLinkName`] names the canonical spelling when a
+    /// caller writes one of these.
+    const REMOVED_SPELLINGS: [(&'static str, Self); 5] = [
+        ("1/mu", Self::Inverse),
+        ("1/mu^2", Self::InverseSquared),
+        ("inv-squared", Self::InverseSquared),
+        ("inv_squared", Self::InverseSquared),
+        ("betalogistic", Self::BetaLogistic),
+    ];
+
+    /// Parse a link name: one of the canonical [`Self::name`]s, compared
+    /// case-insensitively. Returns `None` for any other spelling; callers
+    /// report it through [`UnknownLinkName`], whose message lists
+    /// [`Self::ALL`] and names the canonical spelling of a removed one.
+    pub fn from_name(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|link| link.name() == normalized)
     }
 
-    /// Parse a link name. Case-insensitive; `_` and `-` are interchangeable.
-    /// Returns `None` for an unknown name; callers report it through
-    /// [`UnknownLinkName`], whose message lists [`Self::ALL`].
-    pub fn from_name(raw: &str) -> Option<Self> {
-        let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
-        Self::ALL.into_iter().find(|link| {
-            link.name() == normalized || link.aliases().iter().any(|alias| *alias == normalized)
-        })
+    /// The canonical link a refused spelling stands for: a removed alias, or
+    /// an underscore spelling of a hyphenated name (`inverse_squared`).
+    pub fn canonical_for_unknown(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        Self::REMOVED_SPELLINGS
+            .into_iter()
+            .find(|(removed, _)| *removed == normalized)
+            .map(|(_, link)| link)
+            .or_else(|| {
+                normalized
+                    .contains('_')
+                    .then(|| Self::from_name(&normalized.replace('_', "-")))
+                    .flatten()
+            })
     }
 
     /// `a|b|c` listing of the given links' canonical names.
@@ -211,12 +221,20 @@ pub struct UnknownLinkName(pub String);
 
 impl std::fmt::Display for UnknownLinkName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unsupported link type '{}'; use one of {}",
-            self.0,
-            LinkFunction::join_names(&LinkFunction::ALL)
-        )
+        match LinkFunction::canonical_for_unknown(&self.0) {
+            Some(canonical) => write!(
+                f,
+                "unknown link `{}`; use `{}`",
+                self.0.trim(),
+                canonical.name()
+            ),
+            None => write!(
+                f,
+                "unsupported link type '{}'; use one of {}",
+                self.0,
+                LinkFunction::join_names(&LinkFunction::ALL)
+            ),
+        }
     }
 }
 
@@ -4269,17 +4287,36 @@ mod tests {
         for link in LinkFunction::ALL {
             assert_eq!(LinkFunction::from_name(link.name()), Some(link));
             assert_eq!(
-                LinkFunction::from_name(&link.name().to_ascii_uppercase().replace('-', "_")),
+                LinkFunction::from_name(&link.name().to_ascii_uppercase()),
                 Some(link),
-                "case and `_`/`-` spelling must not matter for {}",
+                "case must not matter for {}",
                 link.name()
             );
         }
-        // Other packages' spellings of the reciprocal links.
-        assert_eq!(LinkFunction::from_name("inv_squared"), Some(LinkFunction::InverseSquared));
-        assert_eq!(LinkFunction::from_name("1/mu^2"), Some(LinkFunction::InverseSquared));
-        assert_eq!(LinkFunction::from_name("1/mu"), Some(LinkFunction::Inverse));
         assert_eq!(LinkFunction::from_name("sqrt"), None);
+    }
+
+    /// SPEC R25: each link has one spelling. The other spellings are refused,
+    /// and the error names the canonical one.
+    #[test]
+    fn removed_link_spellings_are_refused_and_name_the_canonical_one() {
+        for (raw, canonical) in [
+            ("1/mu", "inverse"),
+            ("1/mu^2", "inverse-squared"),
+            ("inv_squared", "inverse-squared"),
+            ("inv-squared", "inverse-squared"),
+            ("betalogistic", "beta-logistic"),
+            ("inverse_squared", "inverse-squared"),
+            ("Beta_Logistic", "beta-logistic"),
+        ] {
+            assert_eq!(LinkFunction::from_name(raw), None, "{raw} must be refused");
+            let message = UnknownLinkName(raw.to_string()).to_string();
+            assert_eq!(
+                message,
+                format!("unknown link `{raw}`; use `{canonical}`"),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

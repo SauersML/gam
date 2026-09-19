@@ -2993,11 +2993,11 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
     let dataset =
         encode_recordswith_inferred_schema(headers, rows).expect("encode homoscedastic fixture");
     let result = fit_from_formula(
-        "y ~ s(x, bs='tp')",
+        "y ~ s(x, bs='tps')",
         &dataset,
         &FitConfig {
             family: Some("gaussian".to_string()),
-            noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+            noise_formula: Some("1 + s(x, bs='tps')".to_string()),
             ..FitConfig::default()
         },
     )

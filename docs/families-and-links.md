@@ -103,7 +103,7 @@ Pass the offset column via `offset=`; do not include it on the formula RHS.
 
 ### `inverse`
 
-Inverse link `1 / eta` (alias `1/mu`), canonical for the Gamma family and
+Inverse link `1 / eta`, canonical for the Gamma family and
 also legal for the Gaussian family. The mean is only defined on `eta > 0`.
 There is no hand-supplied bound: an inner Newton/PIRLS step or an outer
 trial point that would put any weighted row at `eta <= 0` is reported as an
@@ -119,8 +119,10 @@ gamfit.fit(df, "y ~ s(x)", family="gamma", link="inverse")
 
 ### `inverse-squared`
 
-Inverse link `eta^(-1/2)` (`eta = 1 / mu^2`, aliases `inv-squared` and
-`1/mu^2`), canonical for the inverse Gaussian family and legal only there.
+Inverse link `eta^(-1/2)` (`eta = 1 / mu^2`), canonical for the inverse
+Gaussian family and legal only there. Other spellings (`1/mu^2`,
+`inv-squared`, `inv_squared`) are refused with an error naming
+`inverse-squared`.
 The `eta > 0` domain is handled exactly as for `inverse`.
 
 ### Link legality
@@ -182,7 +184,7 @@ negative-binomial size parameter when a constant-size model is desired.
 
 ### Student-t
 
-`family="student-t"` (aliases `"student_t"`, `"t"`) is a heavy-tailed
+`family="student-t"` is a heavy-tailed
 alternative to the Gaussian for a continuous response with outliers. The
 link is the identity. The scale `σ` and the degrees of freedom `ν` are
 estimated by LAML jointly with the smoothing parameters. The fitted model

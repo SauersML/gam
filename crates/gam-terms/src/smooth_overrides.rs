@@ -7,7 +7,7 @@
 //! patches per-term tunables (explicit center matrices, knot vectors, kernel
 //! hyperparameters) into the spec in place. The output is bit-identical to
 //! what the formula DSL would have produced for an equivalent
-//! `smooth(..., centers=..., m=..., length_scale=..., ...)` invocation —
+//! `smooth(..., centers=..., length_scale=..., ...)` invocation —
 //! the only difference is that user-provided `centers` arrays travel as
 //! `CenterStrategy::UserProvided(...)` rather than a data-driven strategy.
 //!
@@ -376,6 +376,14 @@ fn apply_kind_specific(
 
     let normalized = kind.to_ascii_lowercase();
     let normalized = normalized.as_str();
+    if let Some(canonical) = crate::removed_spellings::canonical_for(
+        crate::removed_spellings::DESCRIPTOR_KINDS,
+        normalized,
+    ) {
+        return Err(format!(
+            "smooths[{symbol:?}] unknown descriptor kind `{normalized}`; use `{canonical}`"
+        ));
+    }
     match (normalized, &mut *basis) {
         ("duchon", SmoothBasisSpec::Duchon { spec, .. })
         | ("tps", SmoothBasisSpec::Duchon { spec, .. }) => apply_duchon(spec, descriptor, symbol),
@@ -386,16 +394,10 @@ fn apply_kind_specific(
         ("matern", SmoothBasisSpec::Matern { spec, .. }) => apply_matern(spec, descriptor, symbol),
         ("sphere", SmoothBasisSpec::Sphere { spec, .. })
         | ("s2", SmoothBasisSpec::Sphere { spec, .. }) => apply_sphere(spec, descriptor, symbol),
-        ("curvature", SmoothBasisSpec::ConstantCurvature { spec, .. })
-        | ("curv", SmoothBasisSpec::ConstantCurvature { spec, .. })
-        | ("constant_curvature", SmoothBasisSpec::ConstantCurvature { spec, .. })
-        | ("mkappa", SmoothBasisSpec::ConstantCurvature { spec, .. }) => {
+        ("curv", SmoothBasisSpec::ConstantCurvature { spec, .. }) => {
             apply_constant_curvature(spec, descriptor, symbol)
         }
-        ("mjs", SmoothBasisSpec::MeasureJet { spec, .. })
-        | ("measurejet", SmoothBasisSpec::MeasureJet { spec, .. })
-        | ("measure_jet", SmoothBasisSpec::MeasureJet { spec, .. })
-        | ("web", SmoothBasisSpec::MeasureJet { spec, .. }) => {
+        ("mjs", SmoothBasisSpec::MeasureJet { spec, .. }) => {
             apply_measure_jet(spec, descriptor, symbol)
         }
         ("bspline", SmoothBasisSpec::BSpline1D { spec, .. })
@@ -803,7 +805,7 @@ fn apply_bspline_1d(
         };
     }
     // `BSpline(periodic=True)` — promote the spec to a cyclic basis, producing
-    // a knot/boundary pair bit-identical to the formula DSL `cyclic()`/`cc()`
+    // a knot/boundary pair bit-identical to the formula DSL `cyclic()`
     // build (see `term_builder.rs` periodic arm). Python emits the key only
     // when `True`.
     if descriptor.get("periodic").and_then(JsonValue::as_bool) == Some(true) {
@@ -823,13 +825,13 @@ fn apply_bspline_1d(
                     "smooths[{symbol:?}]: periodic=True needs a known data range, but the \
                      term uses automatically inferred knots whose domain is not resolved at \
                      override time. Pass knots= with an explicit range, or build the smooth \
-                     periodically via the formula DSL `cyclic()`/`cc()`."
+                     periodically via the formula DSL `cyclic()`."
                 ));
             }
             BSplineKnotSpec::Provided(_) => {
                 return Err(format!(
                     "smooths[{symbol:?}]: periodic=True is ambiguous against an explicit open \
-                     knot vector. Build the periodic smooth via the formula DSL `cc()`/`cyclic()`."
+                     knot vector. Build the periodic smooth via the formula DSL `cyclic()`."
                 ));
             }
             BSplineKnotSpec::PeriodicUniform { .. } => {
@@ -840,7 +842,7 @@ fn apply_bspline_1d(
                 return Err(format!(
                     "smooths[{symbol:?}]: periodic=True is incompatible with a natural cubic \
                      regression spline (bs=\"cr\"/\"cs\"), which is non-periodic. Build the \
-                     periodic smooth via the formula DSL `cc()`/`cyclic()` instead."
+                     periodic smooth via the formula DSL `cyclic()` instead."
                 ));
             }
         };

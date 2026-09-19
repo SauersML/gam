@@ -201,7 +201,7 @@ pub fn kl_measurement_band_nats(
 /// The one production calibration model.  Keeping the model description next
 /// to the design builder makes the Rust library, CLI, and Python binding
 /// consume one contract instead of spelling model policy in each front-end.
-pub const CHART_CALIBRATION_FORMULA: &str = "log_nu ~ s(log_nu_hat) + re(atom)";
+pub const CHART_CALIBRATION_FORMULA: &str = "log_nu ~ s(log_nu_hat) + group(atom)";
 pub const CHART_CALIBRATION_SMOOTH_TERM: &str = "s(log_nu_hat)";
 pub const CHART_CALIBRATION_SMOOTH_CONSTRAINT: &str = "monotone_increasing";
 

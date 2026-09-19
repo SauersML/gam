@@ -139,7 +139,7 @@ pub(crate) const SMOOTH_HEAD_KEYWORDS: [&str; 11] = [
 /// `shape=<kind>` option understood by the formula DSL.
 ///
 /// `constraints` pairs the smooth-term text as it appears in the formula
-/// (e.g. `"s(x)"` or `"s(x, type=duchon, centers=8)"`) with a `shape=` value
+/// (e.g. `"s(x)"` or `"s(x, bs=duchon, centers=8)"`) with a `shape=` value
 /// in the grammar of [`parse_shape_expr`] (an atom, a conjunction
 /// `[monotone_increasing, concave]`, or a per-margin `te()` list); comparison
 /// is exact after whitespace removal. A `"none"` constraint is a no-op.
@@ -1204,13 +1204,13 @@ pub struct RandomEffectTermSpec {
     /// time (encoded as an out-of-vocabulary code and shrunk toward the
     /// population mean) instead of raising a schema mismatch.
     ///
-    /// Only a genuine random effect — `group(g)`/`re(g)`/`s(g, bs="re")` — is
+    /// Only a genuine random effect — `group(g)`/`s(g, bs="re")` — is
     /// lenient: the held-out-group policy is a deliberate contract. A FIXED
     /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
     /// materialized as a penalized one-hot block, must raise on an
     /// out-of-vocabulary level at predict rather than being silently mapped to
     /// the factor's centering point (#2102/#2137). `factor(g)` originally shared
-    /// the `group()`/`re()` parse arm and so wrongly inherited the lenient policy
+    /// the `group()` parse arm and so wrongly inherited the lenient policy
     /// (#2137). For a string factor the typed schema encode rejects the unseen
     /// level upstream; for a numeric-coded `factor(year)` the reject is enforced
     /// by `build_random_effect_block`, which owns the frozen vocabulary. The
@@ -1284,7 +1284,7 @@ pub struct TermCollectionSpec {
 ///    released. Either way it becomes `level_smooth`, and its null-space
 ///    ridge is dropped unless `double_penalty=true` was written.
 ///
-/// A genuine random effect (`group(g)`, `re(g)`) never carries the level: its
+/// A genuine random effect (`group(g)`) never carries the level: its
 /// levels are mean-zero deviations. When no term can carry it the model has
 /// no level: every surviving effect passes through the origin, as a
 /// parametric no-intercept fit does.

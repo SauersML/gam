@@ -14,7 +14,7 @@
 //! whose catch-all arm now ERRORS rather than silently no-ops. The shipped
 //! regression (`gam_thin_plate_by_factor_predict_replays_frozen_basis`) covers
 //! the thin-plate inner kind. This test guards the *generality* of that fix
-//! across the other data-dependent radial-kernel inner kinds — Matérn (`bs='gp'`)
+//! across the other data-dependent radial-kernel inner kinds — Matérn (`bs='matern'`)
 //! and Duchon (`bs='duchon'`) — which the original silent-no-op bug hit
 //! identically. It is R-free: it asserts the frozen replay reproduces the
 //! fitted η exactly and that fresh single-level grids neither panic nor collapse.

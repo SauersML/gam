@@ -3,7 +3,7 @@ effect — silently mapped an out-of-vocabulary level to the unweighted
 across-level average at ``predict``, and ``Model.check(...)`` reported
 ``ok=True``.
 
-Root cause: ``factor(g)`` shared the ``group()``/``re()`` parse arm in
+Root cause: ``factor(g)`` shared the ``group()`` parse arm in
 ``formula_dsl`` and was lowered as a *lenient* random effect
 (``lenient_unseen: true``), so an unseen level at predict collapsed onto the
 factor's sum-to-zero centering point instead of raising. ``factor()`` is a fixed
@@ -11,7 +11,7 @@ categorical factor (R ``factor()`` / patsy ``C()`` convention), not a
 random-effect alias: like a bare ``+ g`` categorical main effect (#2102), an
 unseen level is a schema mismatch that must raise. The unseen policy is now
 carried on ``ParsedTerm::RandomEffect`` and set by the wrapper the user wrote —
-``factor()`` strict, ``group()``/``re()``/``s(bs="re")`` lenient — so seen-level
+``factor()`` strict, ``group()``/``s(bs="re")`` lenient — so seen-level
 fits stay identical while only the held-out-level policy differs.
 
 ``docs/exceptions.md`` requires that an unseen categorical level either raise

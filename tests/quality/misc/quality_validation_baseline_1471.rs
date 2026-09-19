@@ -47,7 +47,7 @@
 //!
 //!   * #1477 proves the Tweedie `s(x)` mean is BIASED *specifically* on the
 //!     explicit P-spline basis (`bs='ps'`) — right-boundary blow-up — while
-//!     gamfit's own `bs='cr'` and the thin-plate `bs='tp'` recover truth. Arm 1
+//!     gamfit's own `bs='cr'` and the thin-plate `bs='tps'` recover truth. Arm 1
 //!     pins `bs="tp"` (matched on both sides) — the clean cell — and adds an
 //!     explicit right-boundary fitted-mean assertion so a #1477-style boundary
 //!     blow-up cannot leak into the thin-plate path undetected. Arm 1 does NOT
@@ -207,7 +207,7 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
             ..FitConfig::default()
         };
         // gam: matched basis (tp) + matched penalty model (double_penalty=false).
-        let result = fit_from_formula("y ~ s(x, bs=\"tp\", k=10, double_penalty=false)", &ds, &cfg)
+        let result = fit_from_formula("y ~ s(x, bs=\"tps\", k=10, double_penalty=false)", &ds, &cfg)
             .expect("gam tweedie fit");
         let FitResult::Standard(fit) = result else {
             panic!("Tweedie(log) is a scalar GLM family => expected FitResult::Standard");

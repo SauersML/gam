@@ -79,7 +79,7 @@ fn by_fs_sz_and_random_slope_build_termspec() {
         "y ~ s(x, by=fac) + fac",
         "y ~ s(x) + s(x, by=ord_fac)",
         "y ~ s(x, fac, bs=\"fs\")",
-        "y ~ s(x, fac, bs=\"fs\", m=1, k=10)",
+        "y ~ s(x, fac, bs=\"fs\", penalty_order=1, k=10)",
         "y ~ fs(x, fac)",
         "y ~ s(fac, x, bs=\"sz\") + s(x)",
         "y ~ sz(fac, x)",

@@ -2629,7 +2629,7 @@ pub fn stable_reparameterizationwith_invariant(
         // iteration, not evidence that the pencil is unusable.  Selecting on the
         // shape alone turned that into a fatal `LayoutError` raised one branch
         // away from a trusted routine for the same quantity, aborting a whole
-        // converging fit (measured: nottem `cc(month, k=12)`, one 75% partition,
+        // converging fit (measured: nottem `cyclic(month, k=12)`, one 75% partition,
         // λ ≈ 5, an 11×11 `E` — the outer BFGS had already certified a nearby ρ
         // before the refinement pass hit it).
         //
@@ -2681,7 +2681,7 @@ pub fn stable_reparameterizationwith_invariant(
                     // direct SVD promises, on a `penalized_rank`-square problem
                     // instead of a `total_root_rows`-tall one.
                     //
-                    // Measured on the refusing input (nottem `cc(month, k=12)`,
+                    // Measured on the refusing input (nottem `cyclic(month, k=12)`,
                     // split 1, an 11×11 `E`, one λ = 6.068, no non-finite
                     // entries): a power-of-two rescale of `E` refuses
                     // identically — so the failure is not a scaling artefact —

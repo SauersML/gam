@@ -38,7 +38,7 @@
 //!     through the location-scale materializer -> `FitResult::GaussianLocationScale`.
 //!     The location block carries role `BlockRole::Location`, the log-sigma block
 //!     role `BlockRole::Scale`.
-//!   * `te(x1, x2, bs=c('tp','tp'))` parses to a `SmoothKind::Te` tensor smooth.
+//!   * `te(x1, x2, bs=c('tps','tps'))` parses to a `SmoothKind::Te` tensor smooth.
 //!     `linkwiggle(...)` is a binomial-only link correction and is rejected for a
 //!     Gaussian response, so it is intentionally absent from the gam formula.
 //!   * LINK CONVENTION (the one subtlety that makes this comparison fair). gam's
@@ -143,11 +143,11 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     // ---- fit with gam: mu ~ te(x1,x2), log-sigma ~ 1 + te(x1,x2) -----------
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + te(x1, x2, bs=c('tp','tp'), k=c(5,5))".to_string()),
+        noise_formula: Some("1 + te(x1, x2, bs=c('tps','tps'), k=c(5,5))".to_string()),
         ..FitConfig::default()
     };
     let fit_started = Instant::now();
-    let result = fit_from_formula("y ~ te(x1, x2, bs=c('tp','tp'), k=c(5,5))", &ds, &cfg)
+    let result = fit_from_formula("y ~ te(x1, x2, bs=c('tps','tps'), k=c(5,5))", &ds, &cfg)
         .expect("gam gaulss tensor-product fit");
     let fit_elapsed = fit_started.elapsed();
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result

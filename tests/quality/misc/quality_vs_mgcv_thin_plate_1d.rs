@@ -1,4 +1,4 @@
-//! End-to-end quality: gam's 1-D thin-plate regression spline (`bs="tp"`) must
+//! End-to-end quality: gam's 1-D thin-plate regression spline (`bs="tps"`) must
 //! generalize — it has to PREDICT held-out data well, not merely reproduce
 //! mgcv's in-sample fit. Matching another smoother's fitted curve proves
 //! nothing about quality (both could overfit the lidar noise identically); the
@@ -11,7 +11,7 @@
 //!     and average the held-out metric. gam and mgcv are scored on the SAME K
 //!     partitions (identical 0/1 fold masks are shipped into the R body), so the
 //!     paired comparison stays honest; only the split noise is averaged away.
-//!   * gam fits `s(range, bs="tp", k=20)` by REML on each partition's *train* rows
+//!   * gam fits `s(range, bs="tps", k=20)` by REML on each partition's *train* rows
 //!     only, then predicts the *test* rows it never saw.
 //!   * PRIMARY claim: held-out predictive accuracy. We assert the AVERAGED test-set
 //!     coefficient of determination `R^2 >= 0.55` (the lidar signal-to-noise is
@@ -43,7 +43,7 @@ use ndarray::Array2;
 use std::io::Write;
 use std::path::Path;
 
-/// #1271 regression: on PURELY LINEAR data, `s(x, bs="tp")` must not over-fit.
+/// #1271 regression: on PURELY LINEAR data, `s(x, bs="tps")` must not over-fit.
 /// mgcv reaches EDF ~= 2.10 (intercept + linear trend); gam was landing at
 /// ~4.87 because the tp REML under-penalized wiggle. The objective claim is
 /// EDF-level: a thin-plate smooth on linear data should spend ~2 effective DOF,
@@ -129,7 +129,7 @@ fn tp_single_penalty_does_not_overfit_linear_data_1271() {
 
     let mut tp_edfs = Vec::new();
     for seed in [1u64, 2, 3, 4, 5] {
-        let (edf, by_block) = fit_edf("y ~ s(x, bs=\"tp\", k=20)", seed);
+        let (edf, by_block) = fit_edf("y ~ s(x, bs=\"tps\", k=20)", seed);
         eprintln!("[#1271] tp seed={seed} edf_total={edf:.4} by_block={by_block:?}");
         tp_edfs.push(edf);
     }
@@ -217,7 +217,7 @@ fn tp_kfold_lidar(seed_base: usize) -> (PairedFoldComparison, f64) {
             }
         }
         train_ds.values = train_values;
-        let result = fit_from_formula("logratio ~ s(range, bs=\"tp\", k=20)", &train_ds, &cfg)
+        let result = fit_from_formula("logratio ~ s(range, bs=\"tps\", k=20)", &train_ds, &cfg)
             .expect("gam fit on train");
         let FitResult::Standard(fit) = result else {
             panic!("expected a standard GAM fit for a gaussian thin-plate smooth");
@@ -282,7 +282,7 @@ fn gam_thin_plate_1d_predicts_heldout_lidar_at_least_as_well_as_mgcv() {
 
     let (panel, gam_r2) = tp_kfold_lidar(0);
     eprintln!(
-        "lidar s(range, bs=tp, k=20) #2395 K={K_SPLITS_TP}-split paired (seed base 0): \
+        "lidar s(range, bs=tps, k=20) #2395 K={K_SPLITS_TP}-split paired (seed base 0): \
          gam_test_R2_avg={gam_r2:.4}"
     );
     eprintln!("{}", panel.report("thin_plate_1d::seeded_split"));
@@ -326,7 +326,7 @@ fn gam_thin_plate_1d_predicts_heldout_lidar_at_least_as_well_as_mgcv_on_real_dat
 
     let (panel, gam_r2) = tp_kfold_lidar(1000);
     eprintln!(
-        "lidar s(range, bs=tp, k=20) #2395 K={K_SPLITS_TP}-split paired (seed base 1000): \
+        "lidar s(range, bs=tps, k=20) #2395 K={K_SPLITS_TP}-split paired (seed base 1000): \
          gam_test_R2_avg={gam_r2:.4}"
     );
     eprintln!("{}", panel.report("thin_plate_1d::i_mod_4_split"));

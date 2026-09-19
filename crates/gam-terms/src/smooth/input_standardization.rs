@@ -32,7 +32,7 @@ impl CompensatedSum {
 /// the `ψ = log κ = −log ℓ` REML length-scale optimizer that refines it —
 /// operate in scale-free coordinates, so the fit is invariant to a covariate
 /// rescale `x → a·x + b`. This matters in **one dimension too** (issue #1215): a
-/// 1-D `s(x, bs="tp")` whose kernel ran in raw covariate units seeded and bounded
+/// 1-D `s(x, bs="tps")` whose kernel ran in raw covariate units seeded and bounded
 /// its `ψ`-optimizer off the raw magnitude, landing in a scale-dependent basin (a
 /// clean bimodal step across `|a| ⋛ 1`). Standardizing removes that magnitude
 /// from the optimizer's view, so the selected `ψ̂` (hence the fitted curve) is

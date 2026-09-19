@@ -1548,7 +1548,7 @@ fn double_penalty_suppressed_on_non_free_boundary_is_single_penalty() {
 }
 
 /// #1476/#1477/#874: in the CENTERED cyclic chart — the one every `cyclic(...)`
-/// / `bs="cc"` term the formula DSL builds actually ships — the harmonic cyclic
+/// / `bs="cyclic"` term the formula DSL builds actually ships — the harmonic cyclic
 /// roughness leaves the constant and the fundamental harmonic unpenalized. The
 /// centering removes the constant and the fundamental survives, so with
 /// `double_penalty: true` the rebuild ships the primary roughness plus a rank-2
