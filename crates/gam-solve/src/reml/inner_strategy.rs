@@ -197,6 +197,79 @@ mod tests {
         assert!(decision.nnz_h_upper_est.is_some());
     }
 
+    /// A many-level factor beside a smooth that carries two penalties on one
+    /// coefficient range (`s(x)`'s wiggliness penalty and null-space ridge) is
+    /// structurally sparse: its penalized Hessian is an arrow of a few dense
+    /// rows over a diagonal. Shared penalty ranges change nothing about that
+    /// structure, so the model must take the sparse exact route.
+    #[test]
+    fn shared_penalty_ranges_beside_a_many_level_factor_route_sparse_exact() {
+        const LEVELS: usize = 160;
+        let smooth = 1..3;
+        let p = smooth.end + LEVELS;
+        let n = 2 * LEVELS;
+        let triplets: Vec<_> = (0..n)
+            .flat_map(|row| {
+                let t = (row as f64 + 0.5) / n as f64;
+                [
+                    Triplet::new(row, 0, 1.0),
+                    Triplet::new(row, 1, t),
+                    Triplet::new(row, 2, t * t),
+                    Triplet::new(row, 3 + row % LEVELS, 1.0),
+                ]
+            })
+            .collect();
+        let x = SparseColMat::try_new_from_triplets(n, p, &triplets)
+            .expect("sparse design should build");
+        let y = Array1::<f64>::zeros(n);
+        let weights = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let config = RemlConfig::external(gaussian_identity_glm_spec(), 1e-8, false);
+        use crate::estimate::PenaltySpec;
+        use gam_terms::smooth::BlockwisePenalty;
+        let specs = vec![
+            PenaltySpec::from_blockwise(BlockwisePenalty::new(
+                smooth.clone(),
+                array![[1.0, -1.0], [-1.0, 1.0]],
+            )),
+            PenaltySpec::from_blockwise(BlockwisePenalty::new(
+                smooth.clone(),
+                array![[0.5, 0.5], [0.5, 0.5]],
+            )),
+            PenaltySpec::from_blockwise(BlockwisePenalty::new(
+                smooth.end..p,
+                Array2::eye(LEVELS),
+            )),
+        ];
+        let (canonical, _) =
+            gam_terms::construction::canonicalize_penalty_specs(&specs, &[1, 1, 0], p, "test")
+                .expect("canonicalize");
+        let state = RemlState::newwith_offset(
+            y.view(),
+            x,
+            weights.view(),
+            offset.view(),
+            canonical,
+            p,
+            &config,
+            Some(vec![1, 1, 0]),
+            None,
+            None,
+        )
+        .expect("REML state should build");
+
+        let decision = state
+            .select_reml_geometry(&array![0.0, 0.0, 0.0])
+            .expect("geometry decision should succeed");
+
+        assert!(
+            matches!(decision.geometry, RemlGeometry::SparseExactSpd),
+            "shared penalty ranges must not force the dense route: {}",
+            decision.basis()
+        );
+        assert_eq!(decision.reason, "sparse_exact_spd");
+    }
+
     /// #2465 instance 4: the routing verdict rides on the bundle, so every
     /// emitter of the `backend=` label can print the quantities the label was
     /// decided from — and a route that decided BEFORE measuring any structure
