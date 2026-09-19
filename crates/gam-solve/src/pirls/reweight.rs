@@ -764,14 +764,10 @@ where
         .unwrap_or(MADSEN_DAMPING_FLOOR);
     let lm_max_attempts = options.max_step_halving.max(1);
     // Convergence is decided by `WorkingState::certifies_kkt` /
-    // `WorkingState::near_stationary_kkt`, which combine a dimension-based
-    // bound  ‖g‖ < τ · √n · max(1, √p)  with a data-driven natural-scale
-    // bound  ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ  and accept under either.
-    // Both certificates are scale-invariant under F → c·F (the additive 1
-    // is a NaN-safe floor; for non-trivial fits the natural scale dominates
-    // it within one PIRLS iteration). The absolute test ‖g‖ < τ that this
-    // replaces was systematically too tight at large-scale n because ‖g‖₂ grows
-    // as O(√n) for standardized columns.
+    // `WorkingState::near_stationary_kkt` on the dimensionless residual
+    // ‖g‖ / (‖score‖ + ‖S·β‖) < τ, or by the exact Newton decrement. Neither
+    // carries the gradient's units, so both read the same at every n and in
+    // every response unit.
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
@@ -1639,13 +1635,12 @@ where
                             .is_some_and(|decrement_sq| decrement_sq <= exact_nd_threshold);
                         if should_check_exact_nd {
                             log::debug!(
-                                "[PIRLS exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
+                                "[PIRLS exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
                                 exact_decrement_sq.unwrap_or(f64::NAN),
                                 exact_nd_threshold,
                                 exact_nd_pass,
                                 convergence_grad_norm,
                                 final_state_ref.relative_gradient_norm(convergence_grad_norm),
-                                final_state_ref.kkt_dimension_scale(),
                                 final_state_ref.gradient_natural_scale,
                                 final_state_ref.penalized_objective(),
                                 actual_reduction,
@@ -1658,10 +1653,8 @@ where
                             );
                         }
 
-                        // Strict KKT: scale-invariant under EITHER the
-                        // dimension-based bound ‖g‖ < τ·√n·max(1,√p) OR the
-                        // data-driven natural-scale bound
-                        //     ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ.
+                        // Strict KKT: the dimensionless residual
+                        //     ‖g‖ / (‖score‖ + ‖S·β‖) < τ.
                         // Newton decrement is an independent additional
                         // acceptance for ill-conditioned problems where ‖g‖
                         // is intrinsically large but H⁻¹g is already tiny.

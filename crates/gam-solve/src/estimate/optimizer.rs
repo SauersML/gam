@@ -997,6 +997,8 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
 
     // The anchors are clamped into the envelope of the design's own #2812
     // resolvability domain, the domain the λ search then runs on (#2902 row 9).
+    // Past the ρ = 0 anchor they are tried only when its inner solve refused,
+    // and the search domain is then read at these same prior weights.
     let (domain_lower, domain_upper) =
         crate::estimate::rho_domain::resolvability_domain_from_design(
             reml_state.weights,
@@ -1202,20 +1204,6 @@ where
         .as_ref()
         .map_or_else(|| y_o.view(), |conditioned| conditioned.view());
 
-    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
-    // from the conditioned design's Gram on that penalty's columns and the
-    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20).
-    let crate::estimate::rho_domain::ResolvabilityDomain {
-        lower: rho_domain_lower,
-        upper: rho_domain_upper,
-        lower_is_limit: rho_lower_is_limit,
-        upper_is_limit: rho_upper_is_limit,
-    } = crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
-        w_o.view(),
-        &x_fit,
-        canonical_shared.as_slice(),
-    )
-    .map_err(EstimationError::LayoutError)?;
     let mut reml_state = RemlState::newwith_offset_shared(
         reml_y_view,
         x_fit,
@@ -1276,6 +1264,42 @@ where
         heuristic_log_lambdas,
         &reml_seed_config,
     )?;
+    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
+    // from the conditioned design's Gram on that penalty's columns and the
+    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20). The
+    // Gram is the data curvature `XᵀWX` of the penalized Hessian, so `W` is the
+    // Fisher working weight of the canonical anchor's inner solve at ρ = 0 (the
+    // solve the nuisance freeze above ran, before any warm start): its scale
+    // follows the response's units (`μ³/4` for the inverse-Gaussian `1/μ²`
+    // link), and a prior-weight Gram leaves the domain fixed while `λ̂` moves
+    // with those units, off the domain's lower face in small units. When that
+    // solve refuses there is no fitted working weight, and the Gram is read at
+    // the prior weights.
+    let domain_weights = if k == 0 {
+        w_o.to_owned()
+    } else {
+        match reml_state.data_curvature_weights(&Array1::zeros(k)) {
+            Ok(weights) => weights,
+            Err(error) => {
+                log::debug!(
+                    "[OUTER] ρ-domain Gram read at the prior weights: the canonical anchor's \
+                     inner solve at ρ = 0 refused ({error})"
+                );
+                w_o.to_owned()
+            }
+        }
+    };
+    let crate::estimate::rho_domain::ResolvabilityDomain {
+        lower: rho_domain_lower,
+        upper: rho_domain_upper,
+        lower_is_limit: rho_lower_is_limit,
+        upper_is_limit: rho_upper_is_limit,
+    } = crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
+        domain_weights.view(),
+        &reml_state.x,
+        canonical_shared.as_slice(),
+    )
+    .map_err(EstimationError::LayoutError)?;
     if let Some(store) = opts.persistent_warm_start_store.clone() {
         // Attach only after the canonical nuisance anchor so cache history
         // cannot influence the criterion frame.

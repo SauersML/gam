@@ -104,7 +104,7 @@ pub use reweight::{
     ExactNewtonDecrementEvidence, exact_newton_decrement_evidence, runworking_model_pirls,
 };
 
-pub use state::array1_l2_norm;
+pub use state::{array1_l2_norm, relative_gradient_residual};
 
 // Surface the `WorkingModel` trait (defined in the private `working_model_trait`
 // module) at the `pirls` root so out-of-crate engine implementors (gam-models
