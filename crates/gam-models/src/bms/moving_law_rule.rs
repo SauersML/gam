@@ -1425,6 +1425,8 @@ mod tests {
     /// reason, never taking the reason in place of the certificate.
     #[test]
     fn an_uncertified_moving_law_round_trips_and_certification_refuses_it_2926() {
+        // Any stated reason: the record, not the reason, is under test.
+        const REASON: &str = "the certificate was not taken for this fit";
         let evidence = ConditionalLawEvidence {
             mean_p_value: Some(1e-9),
             variance_p_value: Some(0.4),
@@ -1436,7 +1438,7 @@ mod tests {
             arm: MovingLawArm::LocationScaleGaussian,
             contexts: 7,
             certificate: None,
-            uncertified: Some(RESIDUAL_REPAIR_UNCERTIFIED.to_string()),
+            uncertified: Some(REASON.to_string()),
         };
         let text = serde_json::to_string(&uncertified).expect("serialize");
         let loaded: LatentLawConsumed = serde_json::from_str(&text).expect("deserialize");
@@ -1446,7 +1448,7 @@ mod tests {
             .require_certified("certified fit")
             .expect_err("no certificate, so no certified fit");
         assert!(
-            refusal.contains(RESIDUAL_REPAIR_UNCERTIFIED),
+            refusal.contains(REASON),
             "the refusal must name the reason: {refusal}"
         );
 

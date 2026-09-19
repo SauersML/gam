@@ -272,6 +272,7 @@ impl PredictableModel for TransformationNormalPredictor {
             observation_upper: None,
             point_covariance_source: InferenceCovarianceMode::Conditional,
             uncertainty_covariance_source: None,
+            point_covariance_provenance: None,
         };
         if options.include_observation_interval
             && let Some(level) = options.confidence_level

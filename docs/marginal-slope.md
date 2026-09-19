@@ -620,6 +620,15 @@ Fisher-orthogonal under the declared law
 (`Descent.Portability.MarginalAnchor.crossInformation_baseline_shape_zero`),
 which is what makes `β` estimable without corrupting `q`.
 
+The default latent-law certificates read this joint anchor through the score
+(gam#2985). Given the score, the fit models `βᵀr | z ~ N(u z, v − u²)` with
+`u = βᵀγ(a)`, `v = βᵀΣ_rr(a)β`, so at the row's index intercept `α` the
+residual integrates out: `E_{r|z}[Φ(α + s(g z + βᵀr))] = Φ(ã + B z)` with
+`B = s(g + u)/τ`, `ã = α/τ`, `τ = √(1 + s²(v − u²))`. Under any law of the
+score the joint anchor is the score-only anchor at the row's `(ã, B)`, so the
+closed form's excess anchoring loss and the moving-law certificate run on it
+unchanged, and a fit with the block is certified like one without it.
+
 ### What the fit checks and refuses
 
 - Every residual column is tested for `E_w[r | marginal-index span] = 0`
@@ -633,6 +642,14 @@ which is what makes `β` estimable without corrupting `q`.
   absorbed CTN influence block. Each of those is a typed refusal, not a
   silent reinterpretation. Spatial length scales are held at their seeded
   values in the presence of the block; pass `length_scale=` to choose them.
+- When the score's conditional law moves and the conditional location-scale
+  calibration fires, the calibrated score is a generated regressor, and the
+  block has no Murphy–Topel channel: it reads the score through each row's
+  `ζ_i` and through the joint covariance, which is fitted on the calibrated
+  score. The fit publishes its point estimates and certificate and withholds
+  the coefficient covariance, recording why
+  (`CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable`,
+  gam#2985). An uncorrected covariance would be too narrow.
 
 ### On a declared finite law of the score
 

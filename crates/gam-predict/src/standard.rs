@@ -415,6 +415,7 @@ impl PredictableModel for StandardPredictor {
                 &strategy,
                 "standard posterior mean",
             )?;
+            result.point_covariance_provenance = PointCovarianceProvenance::of_fit(fit);
             if let Some(level) = options.confidence_level {
                 // UNCERTAINTY: the reported SE, credible bounds and observation
                 // band honour `covariance_mode`. We borrow the SE / TransformEta

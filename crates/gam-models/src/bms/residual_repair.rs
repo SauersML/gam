@@ -74,6 +74,18 @@ pub const RESIDUAL_BLOCK_NAME: &str = "residual_repair";
 /// marginal or slope surface), above the flex deviations.
 pub(super) const GAUGE_PRIORITY_RESIDUAL: u8 = 110;
 
+/// The channel a fit with this block and a fired conditional latent-z
+/// calibration has no Murphy–Topel correction for, so its covariance is
+/// withheld (gam#2985,
+/// `CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable`).
+pub(super) const RESIDUAL_REPAIR_GENERATED_REGRESSOR_CHANNEL: &str =
+    "the block reads the calibrated score through each row's own ζ_i and through the joint \
+     (z, r) covariance Σ(a), whose regression of r on the score and innovation variances are \
+     fitted on the calibrated score itself, so every ζ_j moves every row's anchor. Neither the \
+     row channel ∂score_i/∂ζ_i for the block's coordinates nor the covariance fit's cross-row \
+     channel ∂Σ̂/∂ζ_j is implemented, and the rigid channels cover only the marginal and slope \
+     blocks";
+
 /// Why a residual block was refused. Each reason names the contract that was
 /// not met; none is a solver failure.
 #[derive(Clone, Debug, PartialEq)]
@@ -884,6 +896,140 @@ pub(crate) fn residual_row_index(
     Ok((eta, d_q, d_g, d_beta))
 }
 
+/// A row's joint `(z, r)` anchor read through the score alone (gam#2985).
+///
+/// Under the fit's model of the residual given the score, with `Σ₀₀ = 1`,
+/// `βᵀr | z ~ N(u z, v − u²)` for `u = βᵀγ(a)` and `v = βᵀΣ_rr(a)β`. At the row's
+/// index intercept `α` (its index at `z = 0`, `r = 0`), the residual integrates out
+/// in closed form:
+///
+/// ```text
+///   E_{r|z}[Φ(α + s(g z + βᵀr))] = Φ(ã + B z),   ã = α/τ,   B = m/τ,
+///   m = s(g + u),   τ = √(1 + s²(v − u²)).
+/// ```
+///
+/// So the joint anchor under any candidate law of the score is the score-only
+/// anchor with this row's intercept `ã` and slope `B`, and a latent-law
+/// certificate that reads `Φ(ã + B u)` over a law's nodes evaluates the joint
+/// anchor unchanged. `m` and `τ` are formed exactly as [`residual_row_index`]
+/// forms them on a finite law.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct JointAnchorOnScore {
+    /// `B = m/τ`.
+    pub(crate) slope: f64,
+    /// `τ = √(1 + s²(v − u²))`.
+    pub(crate) scale: f64,
+}
+
+impl JointAnchorOnScore {
+    pub(crate) fn at(
+        g: f64,
+        beta: &[f64],
+        covariance: &MarginalSlopeCovariance,
+        probit_scale: f64,
+    ) -> Result<Self, String> {
+        let k = beta.len();
+        if covariance.dim() != k + 1 {
+            return Err(format!(
+                "joint anchor on the score: covariance dimension {} for {k} residual coefficients",
+                covariance.dim()
+            ));
+        }
+        let s = probit_scale;
+        let mut drive = Vec::with_capacity(k + 1);
+        drive.push(s * g);
+        drive.extend(beta.iter().map(|&b| s * b));
+        let mut sigma_drive = vec![0.0; k + 1];
+        covariance.multiply(&drive, &mut sigma_drive);
+        let quad: f64 = drive.iter().zip(sigma_drive.iter()).map(|(a, b)| a * b).sum();
+        let m = sigma_drive[0];
+        let v = quad - m * m;
+        if !(v.is_finite() && v >= -f64::EPSILON * (1.0 + quad.abs())) {
+            return Err(format!(
+                "joint anchor on the score: the residual drive variance βᵀΣ_{{r·z}}β = {v} is not \
+                 admissible"
+            ));
+        }
+        let scale = (1.0 + v.max(0.0)).sqrt();
+        Ok(Self {
+            slope: m / scale,
+            scale,
+        })
+    }
+
+    /// `ã = α/τ` for the row's index intercept `α`.
+    pub(crate) fn score_intercept(&self, alpha: f64) -> f64 {
+        alpha / self.scale
+    }
+
+    /// Under the candidate law `law` of the score, `(Σ_k w_k Φ(ã + B u_k) − μ, the
+    /// standard deviation of Φ(ã + B U), μ)`: the anchoring residual the
+    /// closed-form certificate reads, on the joint anchor.
+    pub(crate) fn anchoring_residual(
+        &self,
+        alpha: f64,
+        mu: f64,
+        law: &EmpiricalZGrid,
+    ) -> Result<(f64, f64, f64), String> {
+        let intercept = self.score_intercept(alpha);
+        let probabilities: Vec<(f64, f64)> = law
+            .pairs()
+            .map(|(node, weight)| (weight, normal_cdf(intercept + self.slope * node)))
+            .collect();
+        let mean: f64 = probabilities.iter().map(|&(w, p)| w * p).sum();
+        let variance: f64 = probabilities
+            .iter()
+            .map(|&(w, p)| w * (p - mean) * (p - mean))
+            .sum();
+        if !(mean.is_finite() && variance.is_finite()) {
+            return Err(format!(
+                "joint anchor on the score: the anchoring residual is not finite: mean={mean}, \
+                 variance={variance} at α={alpha}"
+            ));
+        }
+        Ok((mean - mu, variance.sqrt(), mu))
+    }
+}
+
+/// One training row of a fit with a residual block, as the latent-law
+/// certificates read it (gam#2985): the row's index intercept `α` under the law it
+/// was fitted on (its index at `z = 0`, `r = 0`), its index at the observed
+/// `(z, r_i)`, `μ = Φ(q)`, and its joint anchor read on the score. `z` is the row's
+/// score on the axis the certificate scores it on.
+pub(super) struct ResidualCertificateRow {
+    pub(super) alpha: f64,
+    pub(super) observed_index: f64,
+    pub(super) mu: f64,
+    pub(super) anchor: JointAnchorOnScore,
+}
+
+pub(super) fn residual_certificate_row(
+    family: &BernoulliMarginalSlopeFamily,
+    runtime: &ResidualBlockRuntime,
+    block_states: &[ParameterBlockState],
+    row: usize,
+    z: f64,
+) -> Result<ResidualCertificateRow, String> {
+    let marginal = family.marginal_link_map(block_states[0].eta[row])?;
+    let g = block_states[1].eta[row];
+    let beta = block_states[2].beta.as_slice().ok_or("residual beta not contiguous")?;
+    let r = runtime.features.row(row);
+    let r = r.as_slice().ok_or("residual feature row not contiguous")?;
+    let grid = family.latent_measure.empirical_grid_for_training_row(row)?;
+    let covariance = runtime.field.at_row(row);
+    let s = family.probit_frailty_scale();
+    let origin = vec![0.0; beta.len()];
+    let (alpha, _, _, _) = residual_row_index(&marginal, g, beta, 0.0, &origin, covariance, grid.as_deref(), s)?;
+    let (observed_index, _, _, _) =
+        residual_row_index(&marginal, g, beta, z, r, covariance, grid.as_deref(), s)?;
+    Ok(ResidualCertificateRow {
+        alpha,
+        observed_index,
+        mu: marginal.mu,
+        anchor: JointAnchorOnScore::at(g, beta, covariance, s)?,
+    })
+}
+
 /// Value-only row negative log-likelihood, bit-equivalent to the jet program's
 /// value channel at the same row state.
 pub(super) fn residual_row_neglog_only(
@@ -1167,6 +1313,68 @@ mod residual_repair_kernel_tests {
                 marginal.mu
             );
         }
+    }
+
+    /// gam#2985: the joint anchor read through the score alone is the joint
+    /// anchor. Its residual under the law the row was anchored on is zero, and
+    /// under any law it is the integral over that law of the score and the
+    /// residual's conditional Gaussian, computed here directly on a second
+    /// quadrature.
+    #[test]
+    fn joint_anchor_on_the_score_integrates_the_residual_given_the_score() {
+        let link = InverseLink::Standard(StandardLink::Probit);
+        let declared = declare_unit_score_variance(&covariance(2, 47).to_dense()).unwrap();
+        let cov = MarginalSlopeCovariance::full(declared.clone()).unwrap();
+        let (g, beta, s) = (0.7, [0.45, -0.3], 0.9);
+        let gamma = [declared[[1, 0]], declared[[2, 0]]];
+        let m = s * (g + beta[0] * gamma[0] + beta[1] * gamma[1]);
+        let mut v = 0.0;
+        for i in 0..2 {
+            for j in 0..2 {
+                v += s * s * beta[i] * (declared[[i + 1, j + 1]] - gamma[i] * gamma[j]) * beta[j];
+            }
+        }
+        let anchor = JointAnchorOnScore::at(g, &beta, &cov, s).unwrap();
+        assert!((anchor.scale - (1.0 + v).sqrt()).abs() < 1.0e-14, "τ = {}", anchor.scale);
+        assert!((anchor.slope - m / anchor.scale).abs() < 1.0e-14, "B = {}", anchor.slope);
+        let skewed = skewed_grid();
+        let normal = hermite_grid(64);
+        let inner = hermite_grid(64);
+        for eta_m in [-1.8, 0.4] {
+            let marginal = bernoulli_marginal_link_map(&link, eta_m).unwrap();
+            for (anchored_on, anchored_law, scored_on) in [
+                (Some(&skewed), &skewed, &skewed),
+                (Some(&skewed), &skewed, &normal),
+                (None, &normal, &normal),
+                (None, &normal, &skewed),
+            ] {
+                let (alpha, _, _, _) =
+                    residual_row_index(&marginal, g, &beta, 0.0, &[0.0, 0.0], &cov, anchored_on, s)
+                        .unwrap();
+                let (residual, _, mu) = anchor.anchoring_residual(alpha, marginal.mu, scored_on).unwrap();
+                let mut direct = 0.0;
+                for (z, w) in scored_on.pairs() {
+                    for (e, we) in inner.pairs() {
+                        direct += w * we * normal_cdf(alpha + m * z + v.sqrt() * e);
+                    }
+                }
+                assert!(
+                    (residual - (direct - mu)).abs() < 1.0e-10,
+                    "η_m = {eta_m}: residual {residual} against the direct integral {}",
+                    direct - mu
+                );
+                if std::ptr::eq(anchored_law, scored_on) {
+                    assert!(
+                        residual.abs() < 1.0e-10,
+                        "η_m = {eta_m}: the anchor does not hold on its own law: {residual}"
+                    );
+                }
+            }
+        }
+        // With β = 0 the joint anchor is the score-only anchor: B = s·g, τ = 1.
+        let score_only = JointAnchorOnScore::at(g, &[0.0, 0.0], &cov, s).unwrap();
+        assert_eq!(score_only.scale, 1.0);
+        assert!((score_only.slope - s * g).abs() < 1.0e-15, "B = {}", score_only.slope);
     }
 
     /// A standalone row program over the kernel's own [`residual_row_nll`],

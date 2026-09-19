@@ -3292,60 +3292,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
             law.counts()
         );
     }
-    // gam#2926 with a gam#2924 residual repair block: the fit anchors on the joint
-    // (z, r) law, and both certificates below read a row's anchor through the
-    // score alone, so neither can be taken. The fit is what the gate chose — the
-    // closed form, the provisional arm of a moving law, a declared Gaussian — and
-    // the record names why it carries no certificate.
-    let latent_moving_law = if residual_runtime.is_some() {
-        let reason = RESIDUAL_REPAIR_UNCERTIFIED.to_string();
-        latent_law_consumed = match latent_law_consumed {
-            LatentLawConsumed::EstimatedGaussianAdequate {
-                evidence,
-                adequacy,
-                residual: None,
-            } => LatentLawConsumed::GaussianUncertified {
-                evidence,
-                adequacy: Some(adequacy),
-                certificate: None,
-                missing: reason.clone(),
-            },
-            LatentLawConsumed::DeclaredGaussian {
-                evidence,
-                adequacy: Some(adequacy),
-                residual: None,
-                uncertified: None,
-            } => LatentLawConsumed::DeclaredGaussian {
-                evidence,
-                adequacy: Some(adequacy),
-                residual: None,
-                uncertified: Some(reason.clone()),
-            },
-            LatentLawConsumed::EstimatedMovingLaw {
-                evidence,
-                arm,
-                contexts,
-                certificate: None,
-                uncertified: None,
-            } => LatentLawConsumed::EstimatedMovingLaw {
-                evidence,
-                arm,
-                contexts,
-                certificate: None,
-                uncertified: Some(reason.clone()),
-            },
-            other => other,
-        };
-        if let Some(reason) = latent_law_consumed.uncertified_reason() {
-            log::warn!(
-                "[{gate_context} latent-z] the {} law is fitted uncertified: {reason} (gam#2926)",
-                latent_law_consumed.label()
-            );
-        }
-        None
-    } else {
-        latent_moving_law
-    };
     // gam#2926: certify a closed form the adequacy screen chose, by the error it
     // controls. One pass over the rows of the converged fit: each row's
     // intercept under the closed form, and its anchoring residual
@@ -3390,23 +3336,36 @@ fn fit_bernoulli_marginal_slope_terms_under(
             .map(|row| -> Result<(f64, f64, f64, f64), String> {
                 let marginal_eta = block_states[0].eta[row];
                 let slope = block_states[1].eta[row];
-                let (intercept, _, _) = certificate_family.solve_row_intercept_base(
-                    row,
-                    marginal_eta,
-                    slope,
-                    beta_h,
-                    beta_w,
-                    None,
-                )?;
-                let (anchoring_residual, law_sd, mu) = certificate_family
-                    .evaluate_empirical_grid_anchoring_residual(
+                // gam#2985: with a residual block the row anchors on the joint
+                // (z, r) law; under the estimated law of the score it is the
+                // score-only anchor at the row's (ã, B).
+                let (anchoring_residual, law_sd, mu) = if let Some(runtime) = residual_runtime.as_ref() {
+                    let joint = super::residual_repair::residual_certificate_row(
+                        &certificate_family,
+                        runtime,
+                        block_states,
+                        row,
+                        certificate_family.z[row],
+                    )?;
+                    joint.anchor.anchoring_residual(joint.alpha, joint.mu, law)?
+                } else {
+                    let (intercept, _, _) = certificate_family.solve_row_intercept_base(
+                        row,
+                        marginal_eta,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        None,
+                    )?;
+                    certificate_family.evaluate_empirical_grid_anchoring_residual(
                         intercept,
                         marginal_eta,
                         slope,
                         beta_h,
                         beta_w,
                         law,
-                    )?;
+                    )?
+                };
                 Ok((
                     anchoring_residual,
                     law_sd / sqrt_effective_n,
@@ -3489,7 +3448,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     hints: ThetaHints {
                         marginal_beta: Some(block_states[0].beta.clone()),
                         slope_beta: Some(block_states[1].beta.clone()),
-                        residual_beta: None,
+                        residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
                         score_warp_beta: beta_h.cloned(),
                         link_dev_beta: beta_w.cloned(),
                     },
@@ -3522,29 +3481,59 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 }
                 let marginal_eta = block_states[0].eta[row];
                 let slope = block_states[1].eta[row];
-                let (intercept, _, _) = certificate_family
-                    .solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, None)
-                    .map_err(|reason| moving_law_rule::MovingLawError::AnchorProgram { reason })?;
-                let anchor = |law: &EmpiricalZGrid| {
-                    certificate_family.empirical_grid_anchor_log_probabilities(
-                        intercept,
-                        slope,
-                        beta_h,
-                        beta_w,
-                        law,
-                    )
-                };
-                // The row's own score as a one-point law: the observed row's event
-                // probability, which each arm's is scored against.
-                let own = anchor(&EmpiricalZGrid {
+                let own_point = EmpiricalZGrid {
                     nodes: vec![candidates.own_score(row)],
                     weights: vec![1.0],
-                })?;
-                let arms = candidates
-                    .row_laws(row)?
-                    .iter()
-                    .map(anchor)
-                    .collect::<Result<Vec<_>, _>>()?;
+                };
+                let (arms, own) = if let Some(runtime) = residual_runtime.as_ref() {
+                    // gam#2985: the joint (z, r) anchor read on the score. Each arm's
+                    // event probability is Σ_k w_k Φ(ã + B u_k) on its held-out law,
+                    // and the row's own is Φ at its observed index, residual included.
+                    let joint = super::residual_repair::residual_certificate_row(
+                        &certificate_family,
+                        runtime,
+                        block_states,
+                        row,
+                        candidates.own_score(row),
+                    )
+                    .map_err(|reason| moving_law_rule::MovingLawError::AnchorProgram { reason })?;
+                    let (intercept, slope) = (joint.anchor.score_intercept(joint.alpha), joint.anchor.slope);
+                    let arms = candidates
+                        .row_laws(row)?
+                        .iter()
+                        .map(|law| {
+                            moving_law_rule::log_grid_anchor_probabilities(law, |node| {
+                                Ok::<f64, moving_law_rule::MovingLawError>(intercept + slope * node)
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let own = moving_law_rule::log_grid_anchor_probabilities(&own_point, |_| {
+                        Ok::<f64, moving_law_rule::MovingLawError>(joint.observed_index)
+                    })?;
+                    (arms, own)
+                } else {
+                    let (intercept, _, _) = certificate_family
+                        .solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, None)
+                        .map_err(|reason| moving_law_rule::MovingLawError::AnchorProgram { reason })?;
+                    let anchor = |law: &EmpiricalZGrid| {
+                        certificate_family.empirical_grid_anchor_log_probabilities(
+                            intercept,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            law,
+                        )
+                    };
+                    // The row's own score as a one-point law: the observed row's event
+                    // probability, which each arm's is scored against.
+                    let own = anchor(&own_point)?;
+                    let arms = candidates
+                        .row_laws(row)?
+                        .iter()
+                        .map(anchor)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (arms, own)
+                };
                 moving_law_rule::moving_law_row_losses(&[moving_law_rule::MovingLawAnchor {
                     arms,
                     own,
@@ -3588,7 +3577,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 hints: ThetaHints {
                     marginal_beta: Some(block_states[0].beta.clone()),
                     slope_beta: same_axis.then(|| block_states[1].beta.clone()),
-                    residual_beta: None,
+                    residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
                     score_warp_beta: if same_axis { beta_h.cloned() } else { None },
                     link_dev_beta: if same_axis { beta_w.cloned() } else { None },
                 },
@@ -3691,41 +3680,57 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // gam#2943: the decision is logged from the classification itself, so the
     // log cannot claim a refusal the classifier did not make. A withheld
     // covariance says why through `CovarianceDeclined::explain` below.
-    if solved_fit.covariance_conditional.is_some() && latent_z_conditional_calibration.is_some() {
-        let corrected_through = match &empirical_channel {
-            EmpiricalGeneratedRegressorChannel::ClosedForm => {
-                Some("the closed-form standard-normal channel".to_string())
-            }
-            EmpiricalGeneratedRegressorChannel::Empirical(build) => Some(format!(
-                "the global-empirical measure's direct and cross-row channels ({} nodes)",
-                build.grid.nodes.len()
-            )),
-            EmpiricalGeneratedRegressorChannel::Unavailable { .. } => None,
-        };
-        if let Some(channel) = corrected_through {
-            log::info!(
-                "[BMS latent-z] Murphy–Topel generated-regressor covariance: corrected through \
-                 {channel}"
-            );
-        }
-    }
-    if solved_fit.covariance_conditional.is_some()
-        && latent_z_conditional_calibration.is_some()
-        && let EmpiricalGeneratedRegressorChannel::Unavailable {
-            latent_measure: latent_measure_label,
-            unavailable_channel,
-        } = &empirical_channel
+    // gam#2985: a residual repair block has no channel under any measure, so it
+    // is withheld before the measure's own channel is consulted.
+    let declined = if !(solved_fit.covariance_conditional.is_some()
+        && latent_z_conditional_calibration.is_some())
     {
+        None
+    } else if residual_runtime.is_some() {
+        Some(
+            gam_solve::estimate::CovarianceDeclined::
+                BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                    unavailable_channel:
+                        super::residual_repair::RESIDUAL_REPAIR_GENERATED_REGRESSOR_CHANNEL
+                            .to_string(),
+                },
+        )
+    } else {
+        match &empirical_channel {
+            EmpiricalGeneratedRegressorChannel::ClosedForm => {
+                log::info!(
+                    "[BMS latent-z] Murphy–Topel generated-regressor covariance: corrected \
+                     through the closed-form standard-normal channel"
+                );
+                None
+            }
+            EmpiricalGeneratedRegressorChannel::Empirical(build) => {
+                log::info!(
+                    "[BMS latent-z] Murphy–Topel generated-regressor covariance: corrected \
+                     through the global-empirical measure's direct and cross-row channels ({} \
+                     nodes)",
+                    build.grid.nodes.len()
+                );
+                None
+            }
+            EmpiricalGeneratedRegressorChannel::Unavailable {
+                latent_measure: latent_measure_label,
+                unavailable_channel,
+            } => Some(
+                gam_solve::estimate::CovarianceDeclined::
+                    BmsGeneratedRegressorLatentMeasureNotStandardNormal {
+                        latent_measure: latent_measure_label.clone(),
+                        unavailable_channel: unavailable_channel.clone(),
+                    },
+            ),
+        }
+    };
+    if let Some(declined) = declined {
         solved_fit.covariance_conditional = None;
         solved_fit.covariance_corrected = None;
         if let Some(inference) = solved_fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
         }
-        let declined = gam_solve::estimate::CovarianceDeclined::
-            BmsGeneratedRegressorLatentMeasureNotStandardNormal {
-                latent_measure: latent_measure_label.clone(),
-                unavailable_channel: unavailable_channel.clone(),
-            };
         log::warn!("[BMS latent-z] {}", declined.explain());
         solved_fit.artifacts.covariance_declined = Some(declined);
     }

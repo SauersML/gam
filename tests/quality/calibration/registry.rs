@@ -380,6 +380,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         observation_upper,
         point_covariance_source,
         uncertainty_covariance_source,
+        point_covariance_provenance,
     } = payload;
     std::hint::black_box((
         eta,
@@ -392,6 +393,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         observation_upper,
         point_covariance_source,
         uncertainty_covariance_source,
+        point_covariance_provenance,
     ));
     vec![
         FieldAudit::point("eta"),
@@ -404,6 +406,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         FieldAudit::audited("observation_upper", "predictive_interval_gaussian"),
         FieldAudit::point("point_covariance_source"),
         FieldAudit::point("uncertainty_covariance_source"),
+        FieldAudit::point("point_covariance_provenance"),
     ]
 }
 
@@ -597,6 +600,7 @@ fn posterior_mean_probe() -> PredictPosteriorMeanResult {
         observation_upper: None,
         point_covariance_source: InferenceCovarianceMode::Conditional,
         uncertainty_covariance_source: None,
+        point_covariance_provenance: None,
     }
 }
 

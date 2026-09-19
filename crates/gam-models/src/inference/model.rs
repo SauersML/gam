@@ -96,10 +96,18 @@ use std::path::Path;
 // The field carries a serde default, so a v22, v21, v20, v19 or v18 payload, which predates it,
 // loads with no record, which reads as the law the pre-gam#2926 automatic gate chose; a v22
 // binary refuses a v23 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 23;
+// v24 adds a `CovarianceDeclined` variant (gam#2985): a marginal-slope fit with a residual
+// repair block and a fired latent-z calibration withholds its covariance and records why.
+// No v23 payload carries the variant, so a v23 payload loads unchanged; a v23 binary
+// refuses a v24 payload by version instead of failing on an unknown variant.
+pub const MODEL_PAYLOAD_VERSION: u32 = 24;
 
-/// The schema before the latent-law record (gam#2926), whose only difference is that
-/// field's absence.
+/// The schema before the residual repair block's covariance declination (gam#2985),
+/// whose only difference is that variant's absence.
+const RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION: u32 = 23;
+
+/// The schema before the latent-law record (gam#2926), whose only difference from
+/// [`RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 22;
 
 /// The schema before the certificate's Newton polish and face kinds (#2954), whose only
@@ -124,8 +132,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 6] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 7] = [
     MODEL_PAYLOAD_VERSION,
+    RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
     LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
     NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
     RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
@@ -7405,6 +7414,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
             LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
             NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
             RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
@@ -7416,7 +7426,11 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
+            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);

@@ -646,12 +646,6 @@ impl LatentLawConsumed {
     }
 }
 
-/// The reason a default recorded with a gam#2924 residual repair block carries no
-/// latent-law certificate (gam#2926): its anchor integrates the joint `(z, r)` law,
-/// and the certificates read the anchor through the score alone.
-pub(crate) const RESIDUAL_REPAIR_UNCERTIFIED: &str = "the residual repair block anchors on the joint \
-     (z, r) law, which the certificate does not evaluate";
-
 /// Why a marginal-slope fit refused the latent law it was asked for, or could
 /// not reach the default one (gam#2926). Rendered into the fit's error; the
 /// variants are what a caller can act on.

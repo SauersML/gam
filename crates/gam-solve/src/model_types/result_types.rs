@@ -2334,6 +2334,22 @@ pub enum CovarianceDeclined {
         /// Not named `reason`: that is this enum's serde tag.
         unavailable_channel: String,
     },
+    /// Bernoulli marginal-slope, conditional latent-z calibration active, and a
+    /// gam#2924 residual repair block (gam#2985).
+    ///
+    /// Whatever the latent measure: the block's coordinates read the calibrated
+    /// score through each row's own `zeta_i` and through the joint `(z, r)`
+    /// covariance, which is fitted on the calibrated score, so every `zeta_j`
+    /// moves every row's anchor. No channel supplies either derivative for the
+    /// block's coordinates, and the rigid channels cover only the marginal and
+    /// slope blocks.
+    ///
+    /// Point estimation is unaffected and IS published.
+    BmsGeneratedRegressorResidualRepairChannelUnavailable {
+        /// Which channel is missing. Not named `reason`: that is this enum's
+        /// serde tag.
+        unavailable_channel: String,
+    },
 }
 
 impl CovarianceDeclined {
@@ -2377,6 +2393,23 @@ impl CovarianceDeclined {
                      the correction exists to add, so the intervals would be too narrow and, on \
                      the wire, indistinguishable from corrected ones. The point estimates are \
                      unaffected and are published. See gam#2768."
+                )
+            }
+            Self::BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                unavailable_channel,
+            } => {
+                format!(
+                    "no coefficient covariance was published for this bernoulli marginal-slope \
+                     fit: the conditional latent-z location-scale calibration fired, so the \
+                     fitted score is a GENERATED regressor whose first stage was estimated from \
+                     the same data, and the fit carries a gam#2924 residual repair block. The \
+                     Murphy-Topel correction needs the total derivative of every coefficient's \
+                     score in the latent coordinate, and for the residual block's coefficients \
+                     it has none: {unavailable_channel}. Publishing the UNCORRECTED covariance \
+                     instead is not admissible: it omits the first-stage uncertainty the \
+                     correction exists to add, so the intervals would be too narrow and, on the \
+                     wire, indistinguishable from corrected ones. The point estimates are \
+                     unaffected and are published. See gam#2985."
                 )
             }
         }
