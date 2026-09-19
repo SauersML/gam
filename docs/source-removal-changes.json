@@ -1244,5 +1244,17 @@
     ],
     "reason": "#2899 P4: moved, body unchanged, to gam_terms::basis::position_basis::validate_position_period, the one owner of a position basis's period rule (gam#580), which resolve_position_basis calls. The pyffi call sites reach it through the ffi_prelude re-export.",
     "evidence": "Gate dy7 run spec2-p4b-eded at eded626399 (tree d4c24d0b09): the source-removal guard reports exactly this item (fn, private, 1 declaration removed, 7 production occurrences), and those occurrences are the reml_latent_fit_ffi.rs call sites, which now resolve through ffi_prelude's re-export of the gam-terms owner. The same gate: workspace --all-targets check RC 0, gam-pyffi check RC 0, public_api_census 0, gam-terms position_basis 3/3."
+  },
+  {
+    "base": "03aefe022f0eebd215b1349c65b7715011c95abf",
+    "items": [
+      "crates/gam-sae/src/attention_kernel.rs:fn:fill_separable_basis",
+      "crates/gam-sae/src/attention_kernel.rs:fn:harmonic_basis_values",
+      "crates/gam-sae/src/attention_kernel.rs:fn:separable_sums_of_squares",
+      "crates/gam-sae/src/attention_kernel.rs:fn:stationary_basis",
+      "crates/gam-sae/src/attention_kernel.rs:fn:stationary_sums_of_squares"
+    ],
+    "reason": "#2946: attention_kernel.rs's two QK fits become Gaussian REML smooths through gam_solve::gaussian_reml (TorusHarmonicEvaluator(2, K) with anisotropic_flat_product_torus_penalty, and the stationary kernel as its exact +-1 embedding). The unpenalized least-squares route and its BIC comparison are deleted with the private helpers only they used: the per-row harmonic and separable basis fillers (harmonic_basis_values, stationary_basis, fill_separable_basis) and the two sums-of-squares accumulators (stationary_sums_of_squares, separable_sums_of_squares).",
+    "evidence": "Direct lane dy5 run landsae-S2a-2922 (base 29221e56b1, tree a9473765, patch md5 40c83ac5) ran scripts/source_removal_guard.py, which reported exactly these five private fns of crates/gam-sae/src/attention_kernel.rs as removed. git grep -c -w at 29221e56b1 finds each only in that file (fill_separable_basis 4, harmonic_basis_values 7, separable_sums_of_squares 2, stationary_basis 3, stationary_sums_of_squares 2 occurrences), and at the landing tree in no file under crates, src or tests."
   }
 ]
