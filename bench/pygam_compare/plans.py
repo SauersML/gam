@@ -18,7 +18,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from .fuzz_families import FAMILY_LABELS, REGIMES, fuzz_design
+from .fuzz_families import FAMILY_LABELS, REGIMES
+from .fuzz_families import fuzz_design as family_fuzz_design
+from .fuzz_terms import fuzz_design as term_fuzz_design
 from .worker import (
     BINOMIAL_FAMILIES,
     COUNT_FAMILIES,
@@ -45,6 +47,15 @@ FAMILY_FUZZ_REPS = 3
 # (test_fuzz_families_quick.py).
 FAMILY_FUZZ_QUICK_REGIMES: tuple[str, ...] = ("base", "edge", "zeros", "lowdisp")
 FAMILY_FUZZ_QUICK_NS: tuple[int, ...] = (50, 500)
+
+# Convergence fuzz over term structure (fuzz_terms.py): FUZZ_CASES cases, each
+# at n in FUZZ_NS for every family, one rep -> 1080 gamfit fits.
+FUZZ_CASES = 120
+FUZZ_NS: tuple[int, ...] = (50, 500, 5_000)
+# The quick mode: fixed cases that together cover every term kind, at the two
+# smaller n. It is a 0-failure regression test (test_fuzz_terms_quick.py).
+FUZZ_QUICK_CASES: tuple[int, ...] = (0, 1, 2, 3, 7, 15, 20, 34)
+FUZZ_QUICK_NS: tuple[int, ...] = (50, 500)
 
 
 @dataclass(frozen=True)
@@ -104,7 +115,7 @@ def _grid(
 def _family_fuzz_grid(ns: tuple[int, ...], regimes: tuple[str, ...]) -> tuple[Cell, ...]:
     # Ordered by n ascending for the same not-run-after-timeout rule as _grid.
     return tuple(
-        Cell(f, n, fuzz_design(r)) for n in ns for f in FAMILY_LABELS for r in regimes
+        Cell(f, n, family_fuzz_design(r)) for n in ns for f in FAMILY_LABELS for r in regimes
     )
 
 
@@ -139,6 +150,13 @@ def _oversubscription_grid() -> tuple[Cell, ...]:
         for n, d in ((20_000, "te"), (100_000, "p5"))
         for t in (1, None)
         for k in (1, HOST_WORKERS)
+    )
+
+
+def _fuzz_grid(ns: tuple[int, ...], cases: tuple[int, ...]) -> tuple[Cell, ...]:
+    # Ordered by n ascending for the same not-run-after-timeout rule as _grid.
+    return tuple(
+        Cell(f, n, term_fuzz_design(c)) for n in ns for f in FAMILIES for c in cases
     )
 
 
@@ -356,6 +374,25 @@ PLANS: dict[str, Plan] = {
             cells=_oversubscription_grid(),
             reps=2,
             timeout_s=3_600.0,
+            libs=("gamfit",),
+        ),
+        Plan(
+            name="fuzz_terms",
+            description=(
+                f"convergence fuzz over term structure: {FUZZ_CASES} cases x "
+                "n in {50, 500, 5000} x every family, gamfit only, 1 rep"
+            ),
+            cells=_fuzz_grid(FUZZ_NS, tuple(range(FUZZ_CASES))),
+            reps=1,
+            timeout_s=1_800.0,
+            libs=("gamfit",),
+        ),
+        Plan(
+            name="fuzz_terms_quick",
+            description="fuzz quick mode: fixed cases covering every term kind, n in {50, 500}",
+            cells=_fuzz_grid(FUZZ_QUICK_NS, FUZZ_QUICK_CASES),
+            reps=1,
+            timeout_s=600.0,
             libs=("gamfit",),
         ),
     )
