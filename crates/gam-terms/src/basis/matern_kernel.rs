@@ -97,14 +97,15 @@ fn ensure_thin_plate_bulk_resolvable(
         };
         let bulk_width = quantile(0.75) - quantile(0.25);
         if bulk_width > 0.0 && bulk_width <= resolvable {
-            return Err(BasisError::InvalidInput(format!(
-                "thin-plate basis is not representable in double precision: axis {axis}'s \
-                 middle half is {:.3e} of the covariate span, below the finest scale \
-                 {:.3e} that clears the numerical-rank floor at that span, so only \
-                 {retained} of {available} bending directions survive",
-                bulk_width / diameter,
-                resolvable / diameter,
-            )));
+            return Err(BasisError::ThinPlateBulkUnresolvable {
+                term: None,
+                axis,
+                bulk_fraction: bulk_width / diameter,
+                resolvable_fraction: resolvable / diameter,
+                retained,
+                available,
+                spans: Vec::new(),
+            });
         }
     }
     Ok(())

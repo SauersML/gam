@@ -1003,12 +1003,11 @@ fn tensor_k_accepts_square_bracket_per_margin_list() {
 
 #[test]
 fn tensor_margin_sizes_split_the_budget_and_respect_each_margin_support() {
-    // Two continuous margins: the mgcv-like 7 x 7 pilot, then a doubled budget
-    // split as evenly as integers allow.
+    // Two continuous margins split the budget as evenly as integers allow.
     assert_eq!(tensor_margin_sizes(&[200, 200], 49), vec![7, 7]);
-    let doubled = tensor_margin_sizes(&[200, 200], 98);
-    assert_eq!(doubled.iter().product::<usize>(), 90);
-    assert!(doubled.iter().all(|&k| k == 9 || k == 10), "{doubled:?}");
+    let split = tensor_margin_sizes(&[200, 200], 98);
+    assert_eq!(split.iter().product::<usize>(), 90);
+    assert!(split.iter().all(|&k| k == 9 || k == 10), "{split:?}");
     // `te(season, hour)`: the 4-level margin cannot take its geometric share,
     // so the headroom goes to `hour` until it too reaches its 24 values.
     assert_eq!(tensor_margin_sizes(&[4, 24], 49), vec![4, 12]);
@@ -1016,51 +1015,54 @@ fn tensor_margin_sizes_split_the_budget_and_respect_each_margin_support() {
     assert_eq!(tensor_margin_sizes(&[4, 24], 10_000), vec![4, 24]);
 }
 
-fn tensor_spec_for(ds: &Dataset, formula: &str) -> (Vec<usize>, TensorBSplineSpec) {
+fn default_te_margin_dims(ds: &Dataset, formula: &str) -> Vec<usize> {
     let parsed = parse_formula(formula).expect("parse tensor formula");
     let mut notes = Vec::new();
     let terms = build_termspec(&parsed.terms, ds, &ds.column_map(), &mut notes)
         .expect("build tensor termspec");
-    let SmoothBasisSpec::TensorBSpline { feature_cols, spec } = &terms.smooth_terms[0].basis else {
+    let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!("{formula} must lower to TensorBSpline");
     };
-    (feature_cols.clone(), spec.clone())
+    spec.marginalspecs
+        .iter()
+        .map(|margin| match &margin.knotspec {
+            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
+            other => panic!("default te margins are cr, got {other:?}"),
+        })
+        .collect()
 }
 
+/// The default `te` is a 2-D smooth and takes the same total basis dimension
+/// as any other 2-covariate default smooth on these rows, not a fixed per-margin
+/// table: at n = 3200 a `te(x, z)` of two continuous covariates resolves more
+/// than a fixed `7 x 7` could (the bump2d audit case).
 #[test]
-fn only_the_unsized_default_te_is_owned_by_the_adaptive_workflow() {
+fn default_te_takes_the_engine_default_basis_dimension_for_its_rows() {
+    let n = 3200;
     let ds = continuous_dataset(
         &["y", "x", "z"],
-        (0..400)
+        (0..n)
             .map(|i| {
-                let x = i as f64 / 399.0;
-                let z = ((i * 7) % 400) as f64 / 399.0;
+                let x = i as f64 / (n - 1) as f64;
+                let z = ((i * 7919) % n) as f64 / (n - 1) as f64;
                 vec![x.sin() + z.cos(), x, z]
             })
             .collect(),
     );
-    let (_, default_te) = tensor_spec_for(&ds, "y ~ te(x, z)");
-    assert!(default_te.adaptive);
-    assert_eq!(adaptive_tensor_basis_dim(&default_te), Some(49));
-    for pinned in [
-        "y ~ te(x, z, k=7)",
-        "y ~ te(x, z, k=[7, 7])",
-        "y ~ te(x, z, bs=c('cr','cr'))",
-        "y ~ te(x, z, degree=[3, 3])",
-        "y ~ ti(x, z)",
-        "y ~ t2(x, z)",
-    ] {
-        let (_, spec) = tensor_spec_for(&ds, pinned);
-        assert!(
-            !spec.adaptive,
-            "{pinned} pins its basis and must not be regrown"
-        );
-        assert_eq!(adaptive_tensor_basis_dim(&spec), None, "{pinned}");
-    }
+    let dims = default_te_margin_dims(&ds, "y ~ te(x, z)");
+    assert_eq!(
+        dims,
+        tensor_margin_sizes(&[n, n], default_num_centers(n, 2)),
+        "default te margins must split the engine's 2-D default budget"
+    );
+    assert!(dims.iter().product::<usize>() > 49, "{dims:?}");
 }
 
+/// A low-cardinality margin is capped at its distinct values and hands the
+/// remaining budget to the other margin: `te(season, hour)` resolves all 24
+/// hours instead of a 12-knot hour margin (the bike audit case).
 #[test]
-fn resizing_an_adaptive_te_rebuilds_its_quantile_cr_margins() {
+fn default_te_gives_a_low_cardinality_margins_share_to_the_other_margin() {
     let ds = continuous_dataset(
         &["y", "season", "hour"],
         (0..960)
@@ -1071,28 +1073,9 @@ fn resizing_an_adaptive_te_rebuilds_its_quantile_cr_margins() {
             })
             .collect(),
     );
-    let (cols, mut spec) = tensor_spec_for(&ds, "y ~ te(season, hour)");
-    let (total, caps) =
-        adaptive_tensor_resolution(&cols, &spec, ds.values.view()).expect("adaptive te");
-    assert_eq!((total, caps.clone()), (48, vec![4, 24]));
-    resize_adaptive_tensor_margins(&cols, &mut spec, ds.values.view(), 96).expect("resize");
-    assert!(spec.adaptive, "a regrown te keeps its adaptive provenance");
-    let dims: Vec<usize> = spec
-        .marginalspecs
-        .iter()
-        .map(|margin| match &margin.knotspec {
-            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
-            other => panic!("default te margins are cr, got {other:?}"),
-        })
-        .collect();
-    assert_eq!(dims, vec![4, 24]);
-    let BSplineKnotSpec::NaturalCubicRegression { knots } = &spec.marginalspecs[1].knotspec else {
-        unreachable!()
-    };
-    let expected = crate::basis::select_cr_knots(ds.values.column(2), 24).expect("cr knots");
     assert_eq!(
-        knots, &expected,
-        "regrown margin re-places its value-knots at data quantiles"
+        default_te_margin_dims(&ds, "y ~ te(season, hour)"),
+        vec![4, 24]
     );
 }
 
@@ -3803,10 +3786,34 @@ fn inferred_tensor_basis_cap_uses_coordinate_support_not_duplicate_rows() {
     let unique_basis = inferred_tensor_basis_product(&unique);
     let repeated_basis = inferred_tensor_basis_product(&repeated);
 
-    assert_eq!(
-        unique_basis, repeated_basis,
-        "duplicating existing tensor coordinates must not inflate inferred basis width"
+    // Replicates sharpen the surface at the occupied locations, so the
+    // row-driven default may use more of the coordinate support, but never
+    // more than the 50 x 16 = 800 distinct locations the rows occupy.
+    assert!(
+        unique_basis <= repeated_basis,
+        "{unique_basis} > {repeated_basis}"
     );
+    assert!(
+        repeated_basis <= 800,
+        "duplicating existing tensor coordinates must not inflate the basis past its coordinate support: {repeated_basis}"
+    );
+
+    // On a coarse crossed grid the replicated default reaches that support
+    // exactly and stops there, however many replicates are added.
+    let grid_rows = |reps: usize| {
+        let mut rows = Vec::new();
+        for _ in 0..reps {
+            for i in 0..6 {
+                for j in 0..5 {
+                    let (theta, h) = (i as f64, j as f64);
+                    rows.push(vec![theta.sin() + h, theta, h]);
+                }
+            }
+        }
+        continuous_dataset(&["y", "theta", "h"], rows)
+    };
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(40)), 30);
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(400)), 30);
 }
 
 #[test]

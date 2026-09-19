@@ -3,21 +3,22 @@ adequate for the data, and no silently-flat thin-plate smooth on outlying x.
 
 Each case is one the audit measured gamfit losing at the formula defaults:
 
-* ``te(x0, x1)`` on a two-bump surface (n = 4000). The default tensor started
-  at the mgcv-like 7 x 7 and stayed there although its own basis-adequacy test
-  rejected it (p ~ 1e-17), so the truth-MSE sat at ~0.008. A formula-default
-  ``te`` now grows its per-margin sizes through the same converged-REML
-  adaptive loop that grows ``s(x)`` and ``duchon(...)``: every accepted size is
-  a converged fit, and the loop stops once the fit is certified or the margins
-  run out of distinct values / the design runs out of rank.
+* ``te(x0, x1)`` on a two-bump surface (n = 4000). The default tensor was a
+  fixed 7 x 7 whatever the row count, and its own basis-adequacy test rejected
+  it (p ~ 1e-17), so the truth-MSE sat at ~0.008. A formula-default ``te`` of
+  ``d`` covariates now takes the same total basis dimension as every other
+  ``d``-covariate default smooth on those rows, split across its margins and
+  capped per margin by the covariate's distinct values; the REML penalty, not
+  the basis size, sets the smoothness.
 * ``te(season, hour)`` on the bike-sharing torus data. ``hour`` has 24 distinct
-  values but the default margin used 6 of them (held-out MSE ~0.17).
+  values but the default margin used 6 of them (held-out MSE ~0.17); the
+  4-level ``season`` margin now hands its unused share to ``hour``.
 * ``s(x, bs='tp')`` with one x = 1e6 among 300 rows on [0, 1). The isotropic
   standardization put the whole bulk inside ~2e-5 of standardized space, where
   the r^3 kernel differences are ~1e-15 of the outlier's: every bulk bending
   direction fell under the numerical-rank floor and the fit came back as a flat
-  line with edf 1 and no warning. That basis is now refused with an error that
-  names the outlying span.
+  line with edf 1 and no warning. That basis is now refused with a typed error
+  that names the outlying span and the remedies.
 * ``s(x)`` on sin(12 pi x) (n = 500) already clears its bar at HEAD since the
   adaptive 1-D B-spline default landed; it is pinned here so it stays cleared.
 """
@@ -58,7 +59,7 @@ def test_default_1d_smooth_resolves_a_six_cycle_sine() -> None:
     assert float(np.mean((pred - mu[test]) ** 2)) < 0.02
 
 
-def test_default_te_grows_past_its_starting_budget_on_a_two_bump_surface() -> None:
+def test_default_te_resolves_a_two_bump_surface() -> None:
     n = 4000
     rng = np.random.default_rng(n + 1)
     X = rng.uniform(0.0, 1.0, (n, 2))
@@ -95,6 +96,7 @@ def test_thin_plate_smooth_refuses_a_bulk_flattened_by_an_outlier() -> None:
     assert "cannot resolve the bulk of its data" in message
     assert "1.000000e6" in message
     assert "middle half spans" in message
+    assert "bs='cr'" in message
 
 
 def test_thin_plate_smooth_on_the_same_bulk_without_the_outlier_still_bends() -> None:

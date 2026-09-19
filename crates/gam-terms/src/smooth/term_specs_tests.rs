@@ -330,7 +330,6 @@ mod tensor_function_space_runtime_tests {
             double_penalty: true,
             identifiability: TensorBSplineIdentifiability::None,
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
-            adaptive: false,
         };
         let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
             .expect("double-penalty tensor basis");
@@ -431,7 +430,6 @@ mod tensor_function_space_runtime_tests {
                 double_penalty: true,
                 identifiability,
                 penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
-                adaptive: false,
             };
             let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
                 .expect("double-penalty tensor basis");
@@ -476,7 +474,6 @@ mod tensor_function_space_runtime_tests {
             double_penalty: false,
             identifiability: TensorBSplineIdentifiability::None,
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
-            adaptive: false,
         };
 
         let error = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)

@@ -365,7 +365,6 @@ fn te_xh_design_spec(
                     double_penalty: false,
                     identifiability,
                     penalty_decomposition: Default::default(),
-                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),

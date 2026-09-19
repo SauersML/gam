@@ -280,27 +280,8 @@ pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool>
 
     spec.smooth_terms
         .iter()
-        .map(|term| {
-            auto_spatial(&term.basis)
-                || adaptive_bspline_knots(&term.basis).is_some()
-                || adaptive_tensor_basis_dim(&term.basis).is_some()
-        })
+        .map(|term| auto_spatial(&term.basis) || adaptive_bspline_knots(&term.basis).is_some())
         .collect()
-}
-
-/// Total basis dimension `∏ k_d` of an ungated formula-default `te(...)` whose
-/// per-margin resolution the standard workflow owns
-/// ([`gam_terms::smooth::TensorBSplineSpec::adaptive`]). Like the default
-/// `s(x)`, a row-gated tensor keeps its starting resolution.
-pub(crate) fn adaptive_tensor_basis_dim(
-    basis: &gam_terms::smooth::SmoothBasisSpec,
-) -> Option<usize> {
-    match basis {
-        gam_terms::smooth::SmoothBasisSpec::TensorBSpline { spec, .. } => {
-            gam_terms::term_builder::adaptive_tensor_basis_dim(spec)
-        }
-        _ => None,
-    }
 }
 
 /// Internal-knot count of an ungated formula-default `s(x)` B-spline whose
@@ -360,11 +341,7 @@ pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<O
 
     spec.smooth_terms
         .iter()
-        .map(|term| {
-            center_count(&term.basis)
-                .or_else(|| adaptive_bspline_knots(&term.basis))
-                .or_else(|| adaptive_tensor_basis_dim(&term.basis))
-        })
+        .map(|term| center_count(&term.basis).or_else(|| adaptive_bspline_knots(&term.basis)))
         .collect()
 }
 

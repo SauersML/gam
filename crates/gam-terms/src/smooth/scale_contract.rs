@@ -980,7 +980,6 @@ mod tests {
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::None,
                     penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
-                    adaptive: false,
                 },
             },
         ]
@@ -1227,7 +1226,6 @@ mod tests {
                 double_penalty: false,
                 identifiability: TensorBSplineIdentifiability::None,
                 penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
-                adaptive: false,
             };
             build_tensor_bspline_basis(scaled.view(), &[0, 1], &spec)
                 .expect("rescaled tensor basis")

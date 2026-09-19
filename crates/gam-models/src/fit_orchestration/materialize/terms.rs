@@ -54,8 +54,6 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 /// * the formula-default 1-D `s(x)` B-spline, whose knot count nobody chose
 ///   (`BSplineKnotSpec::Automatic { adaptive: true, .. }`); an explicit `k=` /
 ///   `knots=` is a fixed spec and is untouched;
-/// * the formula-default `te(...)` whose per-margin sizes nobody chose
-///   (`TensorBSplineSpec::adaptive`); its proposed count is the total `∏ k_d`;
 /// * the current strategy must retain [`CenterStrategy::Auto`] provenance;
 ///   every explicit formula/programmatic strategy is therefore left alone;
 /// Python `smooths={...}` overrides are applied by the caller AFTER this, so they
@@ -92,28 +90,6 @@ fn apply_adaptive_spatial_center_counts(
             // owned (and measured) by the same loop.
             if let Some(proposed) = requested_counts.get(term_index).copied().flatten() {
                 *num_internal_knots = proposed;
-            }
-            continue;
-        }
-        if let gam_terms::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, spec } =
-            &mut term.basis
-            && spec.adaptive
-        {
-            // The formula-default `te(...)` keeps its `adaptive` provenance and
-            // re-sizes its margins to the total basis this loop proposed.
-            if let Some(proposed) = requested_counts.get(term_index).copied().flatten() {
-                gam_terms::term_builder::resize_adaptive_tensor_margins(
-                    feature_cols,
-                    spec,
-                    data.values.view(),
-                    proposed,
-                )
-                .map_err(|reason| WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "failed to resize adaptive tensor smooth '{}': {reason}",
-                        term.name
-                    ),
-                })?;
             }
             continue;
         }

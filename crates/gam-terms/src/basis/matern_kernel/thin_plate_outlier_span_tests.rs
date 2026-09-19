@@ -31,14 +31,22 @@ fn a_far_outlier_that_flattens_the_bulk_is_refused_not_fit_linear() {
     let err = super::build_thin_plate_basis(data.view(), &spec(10))
         .err()
         .expect("an outlier-dominated thin-plate basis must be refused");
-    let BasisError::InvalidInput(msg) = &err else {
-        panic!("expected InvalidInput, got {err:?}");
+    let BasisError::ThinPlateBulkUnresolvable {
+        term,
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        spans,
+    } = &err
+    else {
+        panic!("expected the typed thin-plate bulk refusal, got {err:?}");
     };
-    assert!(
-        msg.starts_with("thin-plate basis is not representable"),
-        "{msg}"
-    );
-    assert!(msg.contains("bending directions survive"), "{msg}");
+    assert_eq!((term, *axis, spans.len()), (&None, 0, 0));
+    assert!(bulk_fraction <= resolvable_fraction, "{err}");
+    assert!(retained < available, "{err}");
+    assert!(err.advice().is_some_and(|a| a.contains("bs='cr'")));
 }
 
 #[test]
@@ -59,21 +67,39 @@ fn the_term_level_refusal_names_the_outlying_span_in_original_units() {
         raw[[i, 1]] = i as f64 / n as f64;
     }
     raw[[0, 1]] = 1.0e6;
-    let err = name_thin_plate_outlier_span(
-        BasisError::InvalidInput("thin-plate basis is not representable: detail".to_string()),
-        "s(x)",
-        raw.view(),
-        &[1],
-    );
-    let BasisError::InvalidInput(msg) = err else {
-        panic!("expected InvalidInput");
+    let basis_level = BasisError::ThinPlateBulkUnresolvable {
+        term: None,
+        axis: 0,
+        bulk_fraction: 1.0e-7,
+        resolvable_fraction: 1.0e-4,
+        retained: 1,
+        available: 8,
+        spans: Vec::new(),
     };
+    let err = name_thin_plate_outlier_span(basis_level, "s(x)", raw.view(), &[1]);
+    let BasisError::ThinPlateBulkUnresolvable {
+        term,
+        spans,
+        retained,
+        available,
+        ..
+    } = &err
+    else {
+        panic!("expected the typed refusal, got {err:?}");
+    };
+    assert_eq!(term.as_deref(), Some("s(x)"));
+    assert_eq!((*retained, *available), (1, 8));
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].column, 1);
+    assert_eq!(spans[0].max, 1.0e6);
+    let msg = err.to_string();
     assert!(msg.contains("thin-plate smooth 's(x)'"), "{msg}");
     assert!(msg.contains("spans [1.111111e-1, 1.000000e6]"), "{msg}");
     assert!(
         msg.contains("middle half spans [3.333333e-1, 7.777778e-1]"),
         "{msg}"
     );
+    assert!(msg.contains("only 1 of 8 bending directions"), "{msg}");
     assert!(msg.contains("bs='cr'"), "{msg}");
 
     let other = name_thin_plate_outlier_span(

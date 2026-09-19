@@ -66,26 +66,30 @@ pub(crate) fn rewrite_thin_plate_knots_error(
     }
 }
 
-/// Put the unrepresentable-thin-plate refusal in the term's own units: for
-/// each covariate, the full range the centres had to span next to the
-/// interquartile range where the bulk of the rows sit, so the outlying span is
-/// visible and the remedy (transform the covariate, or use a local basis) is
-/// actionable.
+/// Put the unresolvable-bulk thin-plate refusal in the term's own units: name
+/// the smooth and, for each covariate, the full range the centres had to span
+/// next to the interquartile range where the bulk of the rows sit, so the
+/// outlying span is visible and the remedy is actionable.
 pub(crate) fn name_thin_plate_outlier_span(
     err: BasisError,
     termname: &str,
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
 ) -> BasisError {
-    let BasisError::InvalidInput(msg) = err else {
+    let BasisError::ThinPlateBulkUnresolvable {
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        ..
+    } = err
+    else {
         return err;
     };
-    if !msg.starts_with("thin-plate basis is not representable") {
-        return BasisError::InvalidInput(msg);
-    }
     let spans = feature_cols
         .iter()
-        .filter(|&&col| col < data.ncols())
+        .filter(|&&col| col < data.ncols() && data.nrows() > 0)
         .map(|&col| {
             let mut values: Vec<f64> = data.column(col).iter().copied().collect();
             values.sort_by(f64::total_cmp);
@@ -94,23 +98,24 @@ pub(crate) fn name_thin_plate_outlier_span(
                 let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
                 values[lo] + (pos - lo as f64) * (values[hi] - values[lo])
             };
-            format!(
-                "column {col} spans [{:.6e}, {:.6e}] but its middle half spans [{:.6e}, {:.6e}]",
-                values[0],
-                values[values.len() - 1],
-                quantile(0.25),
-                quantile(0.75),
-            )
+            crate::basis::CovariateSpan {
+                column: col,
+                min: values[0],
+                lower_quartile: quantile(0.25),
+                upper_quartile: quantile(0.75),
+                max: values[values.len() - 1],
+            }
         })
-        .collect::<Vec<_>>()
-        .join("; ");
-    BasisError::InvalidInput(format!(
-        "thin-plate smooth '{termname}' cannot resolve the bulk of its data: {spans}. \
-         The outlying span dominates the global r-power kernel ({msg}), so the bending \
-         directions across the bulk are numerically zero and the fit would be silently linear. \
-         Transform the covariate (e.g. log or rank), remove the outlying rows, or use a \
-         local basis such as bs='cr' or bs='ps'"
-    ))
+        .collect();
+    BasisError::ThinPlateBulkUnresolvable {
+        term: Some(termname.to_string()),
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        spans,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,16 +621,6 @@ pub struct TensorBSplineSpec {
     pub identifiability: TensorBSplineIdentifiability,
     #[serde(default)]
     pub penalty_decomposition: TensorBSplinePenaltyDecomposition,
-    /// The formula-default `te(...)` whose per-margin sizes nobody chose: every
-    /// margin is a data-quantile natural cubic regression spline (or a fixed
-    /// low-cardinality margin) sized from the pilot tensor budget. The
-    /// standard formula workflow owns its resolution and regrows the margins
-    /// from a larger total budget when the converged fit's own adequacy
-    /// evidence rejects the pilot (see `resize_adaptive_tensor_margins`). An
-    /// explicit `k=`, basis family, degree, penalty order, knot placement,
-    /// period or domain pins the spec, which then stays `false`.
-    #[serde(default)]
-    pub adaptive: bool,
 }
 
 pub(crate) const fn default_tensor_double_penalty() -> bool {
@@ -640,7 +635,6 @@ impl Default for TensorBSplineSpec {
             double_penalty: default_tensor_double_penalty(),
             identifiability: TensorBSplineIdentifiability::default(),
             penalty_decomposition: TensorBSplinePenaltyDecomposition::default(),
-            adaptive: false,
         }
     }
 }

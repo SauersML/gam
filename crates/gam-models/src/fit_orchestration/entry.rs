@@ -1947,26 +1947,6 @@ fn adaptive_bspline_knot_ceiling(
     support_knots.min(rank_knots).max(current_knots)
 }
 
-/// The largest total basis `∏ k_d` the adaptive loop may give a formula-default
-/// `te(...)` whose margins identify at most `margin_caps` functions each (their
-/// covariates' distinct values), starting from `current_dim` in a model that
-/// already realizes `model_coefficients` columns on `n_rows` rows. The same two
-/// identifiability bounds as [`adaptive_bspline_knot_ceiling`]: the full tensor
-/// of every margin's support, and at least one residual degree of freedom for
-/// the whole model. Never below `current_dim`.
-fn adaptive_tensor_basis_ceiling(
-    margin_caps: &[usize],
-    current_dim: usize,
-    model_coefficients: usize,
-    n_rows: usize,
-) -> usize {
-    let support = margin_caps.iter().fold(1usize, |p, &c| p.saturating_mul(c));
-    let spare_rank = n_rows.saturating_sub(1).saturating_sub(model_coefficients);
-    support
-        .min(current_dim.saturating_add(spare_rank))
-        .max(current_dim)
-}
-
 fn adaptive_spatial_candidates(
     result: &StandardFitResult,
     data: &Dataset,
@@ -2048,34 +2028,15 @@ fn adaptive_spatial_candidates(
             // request is already the smallest admissible basis in that case, so
             // it is also the ceiling; never report a nonsensical attempted
             // center count below the basis that just converged.
-            // The formula-default `te(...)` is bounded by its margins' distinct
-            // values and the design rank.
-            let tensor_caps = match &result.resolvedspec.smooth_terms[term_index].basis {
-                gam_terms::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-                    gam_terms::term_builder::adaptive_tensor_resolution(
-                        feature_cols,
-                        spec,
-                        data.values.view(),
-                    )
-                    .map(|(_, caps)| caps)
-                }
-                _ => None,
-            };
-            let ceiling_centers = match (bspline, &tensor_caps) {
-                (Some((feature_col, degree)), _) => adaptive_bspline_knot_ceiling(
+            let ceiling_centers = match bspline {
+                Some((feature_col, degree)) => adaptive_bspline_knot_ceiling(
                     data.values.column(feature_col),
                     degree,
                     current_centers,
                     result.design.design.ncols(),
                     n_rows,
                 ),
-                (None, Some(caps)) => adaptive_tensor_basis_ceiling(
-                    caps,
-                    current_centers,
-                    result.design.design.ncols(),
-                    n_rows,
-                ),
-                (None, None) => gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
+                None => gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
                     .max(current_centers),
             };
             let global_range = (smooth_offset + realized.coeff_range.start)
@@ -2099,18 +2060,7 @@ fn adaptive_spatial_candidates(
                 // direction its covariate and the design rank allow; there is no
                 // larger default basis to certify against, so the converged fit
                 // stands with its fit-time adequacy advisory.
-                AdaptiveCenterDecision::Exhausted if bspline.is_some() || tensor_caps.is_some() => {
-                }
-                // Margin sizes are integers whose product must stay within the
-                // proposed total, so a budget the margins cannot use leaves the
-                // tensor where it is, i.e. at its ceiling.
-                AdaptiveCenterDecision::Expand(proposed_centers)
-                    if tensor_caps.as_ref().is_some_and(|caps| {
-                        gam_terms::term_builder::tensor_margin_sizes(caps, proposed_centers)
-                            .iter()
-                            .product::<usize>()
-                            <= current_centers
-                    }) => {}
+                AdaptiveCenterDecision::Exhausted if bspline.is_some() => {}
                 AdaptiveCenterDecision::Expand(proposed_centers) => {
                     candidates.push(AdaptiveSpatialCandidate {
                         term_index,
@@ -2222,30 +2172,6 @@ mod adaptive_spatial_resolution_tests {
         assert_eq!(
             super::adaptive_bspline_knot_ceiling(column.view(), 3, 4, 6, 6),
             4
-        );
-    }
-
-    #[test]
-    fn tensor_basis_ceiling_is_the_joint_margin_support_when_rank_is_ample() {
-        // `te(season, hour)`: 4 x 24 distinct values identify at most 96
-        // tensor functions however many rows there are.
-        assert_eq!(
-            super::adaptive_tensor_basis_ceiling(&[4, 24], 48, 49, 17_000),
-            96
-        );
-    }
-
-    #[test]
-    fn tensor_basis_ceiling_keeps_a_residual_degree_of_freedom() {
-        // 200 rows, 60 coefficients realized: the tensor may add 139.
-        assert_eq!(
-            super::adaptive_tensor_basis_ceiling(&[200, 200], 49, 60, 200),
-            188
-        );
-        // Never below the basis that just converged.
-        assert_eq!(
-            super::adaptive_tensor_basis_ceiling(&[200, 200], 49, 60, 40),
-            49
         );
     }
 }
