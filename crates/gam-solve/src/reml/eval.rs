@@ -1026,32 +1026,33 @@ impl<'a> RemlState<'a> {
     /// criterion is infeasible at `ρ̂` — the diagnostic is simply absent, never
     /// an error.
     ///
-    /// The Tier-0 diagnostic itself is CHEAP — a handful (`M`) of outer-criterion
-    /// evaluations near `ρ̂` — so it is always produced when available. The
-    /// ESCALATION tiers are the expensive part and are gated by `allow_escalation`:
-    /// when the diagnostic grades the plug-in [`Escalate`] AND `allow_escalation` is set, the
-    /// tiers (#938) run HERE, against the same live objective — Tier 1 quadrature
-    /// for `K ≤ 4`, Tier 2 NUTS with the exact LAML `ρ`-gradient
+    /// It runs only when the caller requested `ρ`-posterior inference
+    /// (`skip_rho_posterior_inference = false`, #3010): a default fit publishes
+    /// `NotComputed(InferenceNotRequested)` and never evaluates the criterion
+    /// here. When the diagnostic grades the plug-in [`Escalate`], the tiers
+    /// (#938) run HERE, against the same live objective — Tier 1 quadrature for
+    /// `K ≤ 4`, Tier 2 NUTS with the exact LAML `ρ`-gradient
     /// (`Self::compute_gradient`) for `K ≤ 16`, honest `Unavailable` beyond.
     /// Post-hoc escalation after the `RemlState` is gone would need an owned
-    /// rebuild recipe; running at the live seam avoids that entirely. When
-    /// `allow_escalation` is `false` the returned escalation is always `None`, so
-    /// ordinary interactive formula/CLI fits emit the cheap diagnostic WITHOUT
-    /// ever turning into a NUTS-over-ρ sampler benchmark.
+    /// rebuild recipe; running at the live seam avoids that entirely.
     ///
     /// [`Escalate`]: gam_problem::rho_posterior::RhoProposalAdequacy::Escalate
     ///
     /// `rho_domain` is the box the outer arm searched and certified against
     /// (the #2812 resolvability domain). It is the support of `π(ρ|y)`: a
-    /// proposal outside it is not a model, so it carries zero importance weight
-    /// and is never handed to the inner solve. A railed coordinate's Laplace
-    /// proposal is near-flat, so without this its draws land hundreds of
-    /// log-units past the face, where P-IRLS has no valid minimum to report.
+    /// proposal outside it is not a model and is never handed to the inner
+    /// solve. `railed_rho` names the coordinates the certificate railed. The
+    /// Tier-0 proposal holds them, and every coordinate with `ρ̂` on a face of
+    /// the box, at `ρ̂`, and draws the rest from the Laplace approximation
+    /// conditioned on them and truncated to the box (#3010). A railed
+    /// coordinate's Laplace proposal is near-flat, so drawing it put the
+    /// proposal hundreds of log-units past the face, where P-IRLS has no valid
+    /// minimum to report.
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
         rho_domain: &(Array1<f64>, Array1<f64>),
-        allow_escalation: bool,
+        railed_rho: &[usize],
         n_samples: Option<usize>,
     ) -> (
         gam_problem::rho_posterior::RhoPosteriorOutcome,
@@ -1100,11 +1101,9 @@ impl<'a> RemlState<'a> {
         let outcome = match escalator.rho_posterior_adequacy(
             final_rho,
             &outer_hessian,
-            &|rho| {
-                in_domain(rho)
-                    .then(|| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()))
-                    .flatten()
-            },
+            rho_domain,
+            railed_rho,
+            &|rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
             n_samples,
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
@@ -1118,13 +1117,8 @@ impl<'a> RemlState<'a> {
             }
         };
         let escalation = match &outcome {
-            // The diagnostic grades the plug-in `Escalate`, but escalation
-            // (Tier-1 quadrature / Tier-2 NUTS over ρ) is the expensive tier;
-            // only run it when the caller opts in. Interactive formula/CLI fits
-            // pass `allow_escalation = false`, so they surface the cheap Tier-0
-            // diagnostic while never launching the sampler.
             RhoPosteriorOutcome::Assessed(adequacy)
-                if adequacy.adequacy == RhoProposalAdequacy::Escalate && allow_escalation =>
+                if adequacy.adequacy == RhoProposalAdequacy::Escalate =>
             {
                 // #2450 — THE SAMPLER TARGETS A DISTRIBUTION; THE CRITERION DOES NOT.
                 //
