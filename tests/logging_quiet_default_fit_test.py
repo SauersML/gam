@@ -7,9 +7,10 @@ DOC-15) found two kinds of noise on every default ``gamfit.fit``:
   solver logs its routine progress (``[OUTER]``, ``[HGB]``, ``[INDEF-HESS]``
   lines) at that level, so every fit printed solver internals to stderr with
   only a private level setter to stop it;
-* every inference note became a ``GamInferenceWarning``, including the
-  informational "Automatically set N internal knots" note a default ``s(x)``
-  always records, so every default fit warned about nothing the user did.
+* every inference note became a ``GamInferenceWarning``, including purely
+  informational notes (then including a per-fit knot note a default ``s(x)``
+  always recorded, since removed), so every default fit warned about nothing
+  the user did.
 
 Now the engine's records go to the ``gamfit`` Python logger at debug/trace
 level (silent unless the caller lowers that logger's level), and only
@@ -61,9 +62,20 @@ def test_default_fit_raises_no_warning_when_warnings_are_errors() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         model = gamfit.fit(data, "y ~ s(x)")
-    # The default knot choice is still recorded — as a note, not a warning.
-    assert any("internal knots" in note for note in model.notes), model.notes
-    assert any("internal knots" in note for note in model.summary().notes)
+    # The default basis is sized from the data; nothing about it is announced.
+    assert not any("internal knots" in note for note in model.notes), model.notes
+
+
+def test_informational_notes_are_recorded_not_warned() -> None:
+    rng = np.random.default_rng(7)
+    data = _default_data()
+    data["z"] = rng.uniform(0.0, 1.0, len(data["x"])).tolist()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        model = gamfit.fit(data, "y ~ te(x, z)")
+    # An inferred tensor budget is recorded — as a note, not a warning.
+    assert any("per-margin basis sizes" in note for note in model.notes), model.notes
+    assert any("per-margin basis sizes" in note for note in model.summary().notes)
     assert "Notes:" in str(model.summary())
 
 
