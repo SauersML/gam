@@ -4376,3 +4376,26 @@ fn survival_marginal_slope_and_latent_refusals_raise_their_category_2937() {
         assert_eq!(err.variant_name(), "FitFailure::Input", "{mode}: {err}");
     }
 }
+
+/// PKG-10: one predicate names the multinomial-logit family for the CLI, the
+/// Python `fit_table` entry and the latent fitters, and the scalar resolver
+/// refuses exactly those names.
+#[test]
+fn multinomial_family_names_are_one_predicate() {
+    for name in [
+        "multinomial",
+        "Multinomial_Logit",
+        "categorical",
+        "categorical-logit",
+        "SOFTMAX",
+    ] {
+        assert!(is_multinomial_family_name(name), "{name}");
+        assert!(
+            scalar_family_from_name(name, FamilyNuisanceOverrides::default()).is_err(),
+            "{name}"
+        );
+    }
+    for name in ["binomial", "gaussian", "poisson", "ordinal", "auto"] {
+        assert!(!is_multinomial_family_name(name), "{name}");
+    }
+}

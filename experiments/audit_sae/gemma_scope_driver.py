@@ -5,7 +5,7 @@ Gemma Scope JumpReLU checkpoints store an encoder ``W_enc, b_enc, threshold``
 and a decoder ``W_dec, b_dec``. This driver treats ``W_dec`` as the frozen GAM
 decoder with shape ``K x P``: rows are dictionary atoms and columns are residual
 activation dimensions. Dense external codes are computed as
-``pre * (pre > threshold)`` and passed directly to ``gamfit.audit_sae``.
+``pre * (pre > threshold)`` and passed directly to ``gamfit.sae.audit_sae``.
 
 The required null-battery donor is an architecture-matched random-weight
 encoder: it keeps the real encoder bias and thresholds, replaces ``W_enc`` by
@@ -30,7 +30,7 @@ SAE_KEYS = ("W_enc", "b_enc", "W_dec", "b_dec", "threshold")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Audit Gemma Scope 2 JumpReLU SAE codes with gamfit.audit_sae.",
+        description="Audit Gemma Scope 2 JumpReLU SAE codes with gamfit.sae.audit_sae.",
     )
     parser.add_argument("--sae", required=True, type=Path, help="Gemma Scope .safetensors or .npz")
     parser.add_argument("--activations", required=True, type=Path, help="Residual activations .npy")
@@ -246,7 +246,7 @@ def main() -> None:
     random_w_enc = random_weight_encoder(w_enc, rng)
     random_weight_codes, _ = jumprelu_codes(activations, random_w_enc, b_enc, threshold)
 
-    report = gamfit.audit_sae(
+    report = gamfit.sae.audit_sae(
         w_dec,
         activations,
         codes=codes,

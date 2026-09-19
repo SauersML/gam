@@ -25,15 +25,15 @@ an exact function of the design.
 `gamfit.validate_formula(...)` validates a formula and data against the
 parser and schema without fitting.
 
-The top-level package also exposes research/inference instruments used by
-the SAE and structure-discovery workflows: `split_likelihood_log_e`,
+Research/inference instruments used by the SAE and structure-discovery
+workflows live in submodules: `gamfit.sae` has `split_likelihood_log_e`,
 `e_bh_dictionary_certificate`, `log_e_from_p_value`,
-`select_probe_by_expected_evidence`, `expected_resolution_budget`,
-`plan_probe_for_contested_claim`, `lawley_bartlett_factor`, and
-`glm_full_conformal`. These are low-level building blocks rather than
-`Model` methods; see the [API reference](api-reference.md) for signatures.
-(`debiased_functional`, by contrast, is a `Model` method, not a
-top-level export.)
+`select_probe_by_expected_evidence`, `expected_resolution_budget`, and
+`plan_probe_for_contested_claim`; `gamfit.inference` has
+`lawley_bartlett_factor` and `glm_full_conformal`. These are low-level
+building blocks rather than `Model` methods; see the
+[API reference](api-reference.md) for signatures. (`debiased_functional`, by
+contrast, is a `Model` method.)
 
 ## summary()
 
@@ -237,11 +237,10 @@ Returns a `FormulaValidation` dataclass that wraps the parsed payload.
 Accepts these parser/materialization keyword arguments from `gamfit.fit`,
 with the same semantics, and does no fitting:
 `family`, `negative_binomial_theta`, `expectile_tau`, `offset`, `weights`,
-`persistent_warm_start_root`,
 `transformation_normal`, `transformation_normal_stage1`,
 `survival_likelihood`, `survival_time_anchor`, `baseline_target`,
 `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`,
-`z_column`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
+`z_column`, `residual_columns`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
 `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
 `noise_offset`, `flexible_link`, `config`.
 

@@ -1118,7 +1118,7 @@ class Model:
         regression marginal is capped to the data support, or a basis-
         degradation note when a low-cardinality covariate cannot support the
         requested smooth. :func:`gamfit.fit` also emits these as
-        :class:`gamfit.GamInferenceWarning` at fit time; this property lets a
+        :class:`gamfit.errors.GamInferenceWarning` at fit time; this property lets a
         caller inspect them after the fact (or after loading a saved model).
         Empty when the fit used exactly the requested configuration.
         """

@@ -80,7 +80,7 @@ def main():
 
     import gamfit
     with open(os.path.join(args.fits, f"manifold_k{args.k}.pkl"), "rb") as f:
-        sae = gamfit.model_from_dict(pickle.load(f))  # K > P carries the support tag (#2567)
+        sae = gamfit.sae.model_from_dict(pickle.load(f))  # K > P carries the support tag (#2567)
     lift = np.load(f"{args.prep}/lift.npy")
     c0 = np.load(f"{args.prep}/c0.npy")
     scale_path = f"{args.prep}/scale.npy"

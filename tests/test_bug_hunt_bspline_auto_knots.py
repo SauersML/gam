@@ -1,6 +1,6 @@
 """Regression: the auto-knot B-spline primitive paths must be usable (#459).
 
-`gamfit.bspline_basis` / `bspline_basis_derivative` accept ``knots=None``
+`gamfit.basis.bspline_basis` / `bspline_basis_derivative` accept ``knots=None``
 (auto-derive a clamped knot vector) and integer ``knots=K`` (auto-derive with
 ``K`` interior knots). #340 changed the Rust ``auto_knots_1d`` FFI export to
 return a 4-tuple ``(knots, effective_degree, num_internal_knots, shrunk)`` but
@@ -31,7 +31,7 @@ from gamfit._api import _resolve_knots
 @pytest.mark.parametrize("degree", [1, 2, 3, 4])
 def test_auto_knot_none_is_partition_of_unity(degree: int) -> None:
     t = np.linspace(0.0, 1.0, 50)
-    basis = gamfit.bspline_basis(t, degree=degree)
+    basis = gamfit.basis.bspline_basis(t, degree=degree)
     assert basis.shape[0] == t.shape[0]
     assert np.all(np.isfinite(basis))
     np.testing.assert_allclose(basis.sum(axis=1), 1.0, atol=1e-12)
@@ -41,7 +41,7 @@ def test_auto_knot_none_is_partition_of_unity(degree: int) -> None:
 @pytest.mark.parametrize("k", [0, 1, 6, 12])
 def test_auto_knot_int_is_partition_of_unity(degree: int, k: int) -> None:
     t = np.linspace(0.0, 1.0, 50)
-    basis = gamfit.bspline_basis(t, knots=k, degree=degree)
+    basis = gamfit.basis.bspline_basis(t, knots=k, degree=degree)
     assert basis.shape[0] == t.shape[0]
     np.testing.assert_allclose(basis.sum(axis=1), 1.0, atol=1e-12)
 
@@ -51,8 +51,8 @@ def test_auto_knot_matches_explicit_knot_path() -> None:
     t = np.linspace(0.0, 1.0, 50)
     knots, eff_degree, shrunk = _resolve_knots(6, t, degree=3)
     assert not shrunk and eff_degree == 3  # plenty of data: nothing to shrink
-    auto = gamfit.bspline_basis(t, knots=6, degree=3)
-    explicit = gamfit.bspline_basis(t, knots, degree=eff_degree)
+    auto = gamfit.basis.bspline_basis(t, knots=6, degree=3)
+    explicit = gamfit.basis.bspline_basis(t, knots, degree=eff_degree)
     np.testing.assert_allclose(auto, explicit, atol=0.0)
 
 
@@ -67,11 +67,11 @@ def test_auto_knot_derivative_matches_finite_difference() -> None:
     knots, eff_degree, _ = _resolve_knots(10, t, degree=3)
 
     h = 1e-6
-    base = gamfit.bspline_basis(t, knots, degree=eff_degree)
-    plus = gamfit.bspline_basis(t + h, knots, degree=eff_degree)
-    minus = gamfit.bspline_basis(t - h, knots, degree=eff_degree)
+    base = gamfit.basis.bspline_basis(t, knots, degree=eff_degree)
+    plus = gamfit.basis.bspline_basis(t + h, knots, degree=eff_degree)
+    minus = gamfit.basis.bspline_basis(t - h, knots, degree=eff_degree)
 
-    d1 = gamfit.bspline_basis_derivative(t, knots, degree=eff_degree, order=1)
+    d1 = gamfit.basis.bspline_basis_derivative(t, knots, degree=eff_degree, order=1)
     fd1 = (plus - minus) / (2.0 * h)
 
     interior = (t > 0.05) & (t < 0.95)
@@ -85,8 +85,8 @@ def test_auto_knot_derivative_paths_do_not_crash() -> None:
     """The derivative primitive's auto paths must also be usable (#459)."""
     t = np.linspace(0.0, 1.0, 40)
     for order in (1, 2):
-        d_none = gamfit.bspline_basis_derivative(t, degree=3, order=order)
-        d_int = gamfit.bspline_basis_derivative(t, knots=7, degree=3, order=order)
+        d_none = gamfit.basis.bspline_basis_derivative(t, degree=3, order=order)
+        d_int = gamfit.basis.bspline_basis_derivative(t, knots=7, degree=3, order=order)
         assert np.all(np.isfinite(d_none))
         assert np.all(np.isfinite(d_int))
         np.testing.assert_allclose(d_none.sum(axis=1), 0.0, atol=1e-9)
@@ -115,17 +115,17 @@ def test_small_n_degree_shrink_produces_valid_basis(n: int, expected_degree: int
 
     # Public API: both auto paths produce a finite partition-of-unity basis
     # instead of crashing.
-    for basis in (gamfit.bspline_basis(t, degree=3), gamfit.bspline_basis(t, knots=6, degree=3)):
+    for basis in (gamfit.basis.bspline_basis(t, degree=3), gamfit.basis.bspline_basis(t, knots=6, degree=3)):
         assert np.all(np.isfinite(basis))
         np.testing.assert_allclose(basis.sum(axis=1), 1.0, atol=1e-12)
 
-    deriv = gamfit.bspline_basis_derivative(t, degree=3, order=1)
+    deriv = gamfit.basis.bspline_basis_derivative(t, degree=3, order=1)
     np.testing.assert_allclose(deriv.sum(axis=1), 0.0, atol=1e-9)
 
 
 def test_periodic_auto_knot_is_partition_of_unity() -> None:
     t = np.linspace(0.0, 1.0, 50)
-    basis = gamfit.bspline_basis(t, knots=8, degree=3, periodic=True)
+    basis = gamfit.basis.bspline_basis(t, knots=8, degree=3, periodic=True)
     assert np.all(np.isfinite(basis))
     np.testing.assert_allclose(basis.sum(axis=1), 1.0, atol=1e-12)
 
@@ -135,7 +135,7 @@ def test_reml_positions_auto_knot_path_runs() -> None:
     rng = np.random.default_rng(0)
     t = np.sort(rng.uniform(0.0, 1.0, 80))
     y = np.sin(2.0 * np.pi * t) + 0.05 * rng.standard_normal(80)
-    out = gamfit.gaussian_reml_fit_positions(t, y.reshape(-1, 1))
+    out = gamfit.reml.gaussian_reml_fit_positions(t, y.reshape(-1, 1))
     assert "coefficients" in out or "fitted" in out or "basis_kind" in out
 
 
@@ -165,7 +165,7 @@ def test_torch_bspline_basis_auto_knot_paths() -> None:
 
 def test_torch_bspline_descriptor_evaluate_and_basis_size() -> None:
     torch = pytest.importorskip("torch")
-    spec = gamfit.BSpline(knots=None, degree=3)
+    spec = gamfit.smooth.BSpline(knots=None, degree=3)
     phi = spec.evaluate(torch.linspace(0.05, 0.95, 17, dtype=torch.float64))
     # basis_size must match the resolved design width (the #235 contract).
     assert phi.shape == (17, spec.basis_size)
@@ -178,7 +178,7 @@ def test_torch_fit_design_penalty_consistent_for_auto_knots(knots: object) -> No
     from gamfit.torch.fit import _build_design_penalty
 
     pts = torch.linspace(0.0, 1.0, 60, dtype=torch.float64).reshape(-1, 1)
-    design, penalty = _build_design_penalty(gamfit.BSpline(knots=knots, degree=3), pts)
+    design, penalty = _build_design_penalty(gamfit.smooth.BSpline(knots=knots, degree=3), pts)
     # The penalty must live in the design's coefficient space (same width).
     assert design.shape[1] == penalty.shape[0] == penalty.shape[1]
     assert torch.allclose(design.sum(dim=1), torch.ones(60, dtype=torch.float64))

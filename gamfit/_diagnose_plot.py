@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING
 
 from ._diagnostics import Diagnostics
+from ._matplotlib import pyplot
 from ._tables import coerce_numeric_vector, table_columns
 
 if TYPE_CHECKING:
@@ -81,7 +82,7 @@ def plot(
     ax: Any | None = None,
 ) -> Any:
     """Plot the model's behaviour on ``data`` with matplotlib."""
-    import matplotlib.pyplot as plt
+    plt = pyplot()
 
     columns, _table_kind = table_columns(data)
     diagnostics = diagnose(

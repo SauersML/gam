@@ -30,7 +30,7 @@ Input is one ``.npz`` with these required keys:
     the complete route directly.
 
 The block candidate is trained with
-``gamfit.fixed_budget_block_sparse_dictionary_fit``.  For the production
+``gamfit.sae.fixed_budget_block_sparse_dictionary_fit``.  For the production
 DeepSeek comparison, ``n_atoms=114688, active=64, block_size=4`` means 28,672
 orthonormal blocks and exactly 16 selected blocks/token: identical scalar
 capacity and identical 64-coordinate activity to the baseline, with correlated

@@ -250,7 +250,7 @@ pp.summary(level=0.95)   # same dict as posterior.predict
 large prediction sets prefer `posterior.predict(...)`.
 
 The response-scale inverse link supports `identity`, `logit`, `probit`,
-`cloglog`, and `log`; other tags raise a `gamfit.GamError`.
+`cloglog`, and `log`; other tags raise a `gamfit.errors.GamError`.
 
 ### Trace plots
 

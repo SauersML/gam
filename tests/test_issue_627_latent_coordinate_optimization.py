@@ -3,7 +3,7 @@
 `gaussian_reml_fit_latent` is a single ``β | t`` solve — it never moves ``t``,
 so its fit quality is whatever the *input* ``t`` already encodes. Issue #627
 asks for a latent-optimizing entry point that actually recovers ``t`` from a
-poor init. `gamfit.gaussian_reml_optimize_latent` provides it: a spectral
+poor init. `gamfit.reml.gaussian_reml_optimize_latent` provides it: a spectral
 (Laplacian-eigenmaps) warm start plus Riemannian refinement.
 
 These tests pin the contract on the canonical oracle from the issue (a shuffled
@@ -40,9 +40,9 @@ N = 180
 def _fit_at_achieved_precision(*args, max_iter, **kwargs):
     """Return the recovered checkpoint under its observed stationarity level."""
     try:
-        out = gamfit.gaussian_reml_optimize_latent(*args, max_iter=max_iter, **kwargs)
+        out = gamfit.reml.gaussian_reml_optimize_latent(*args, max_iter=max_iter, **kwargs)
         return out, str(out["init"])
-    except gamfit.RemlConvergenceError as exc:
+    except gamfit.errors.RemlConvergenceError as exc:
         achieved = float(exc.grad_t_norm_scaled)
         assert np.isfinite(achieved)
         accepted = np.nextafter(achieved, np.inf)
@@ -54,7 +54,7 @@ def _fit_at_achieved_precision(*args, max_iter, **kwargs):
             grad_tol=accepted,
             stationarity_reference=float(exc.checkpoint_stationarity_reference),
         )
-        resumed = gamfit.gaussian_reml_optimize_latent(
+        resumed = gamfit.reml.gaussian_reml_optimize_latent(
             *args,
             **resume_kwargs,
         )
@@ -81,13 +81,13 @@ def _shuffled_parabola(seed, n=N):
 
 
 def _centers_and_penalty():
-    # #1512: gamfit.duchon_function_norm_penalty now requires 2D centers with
+    # #1512: gamfit.basis.duchon_function_norm_penalty now requires 2D centers with
     # shape (K, d) and raises "centers must be 2D ... got 1D" on the bare
     # np.linspace 1D vector this orphaned test used to pass. Build the (K, 1)
     # column up front and feed the same 2D array to both the penalty and the
     # latent fit below.
     centers = np.linspace(0.0, 1.0, M).reshape(-1, 1)
-    penalty = np.asarray(gamfit.duchon_function_norm_penalty(centers, m=2))
+    penalty = np.asarray(gamfit.basis.duchon_function_norm_penalty(centers, m=2))
     return centers, penalty
 
 
@@ -123,9 +123,9 @@ def test_recovery_is_initialization_independent():
     centers, penalty = _centers_and_penalty()
 
     # The bug, pinned: the forward primitive does not move t.
-    fixed_true = gamfit.gaussian_reml_fit_latent(true_t, y, N, 1, centers, penalty, m=2)
+    fixed_true = gamfit.reml.gaussian_reml_fit_latent(true_t, y, N, 1, centers, penalty, m=2)
     rng = np.random.default_rng(7)
-    fixed_rand = gamfit.gaussian_reml_fit_latent(rng.random(N), y, N, 1, centers, penalty, m=2)
+    fixed_rand = gamfit.reml.gaussian_reml_fit_latent(rng.random(N), y, N, 1, centers, penalty, m=2)
     assert _r2(y, fixed_true["fitted"]) >= 0.99
     assert _r2(y, fixed_rand["fitted"]) <= 0.5  # random order is not fit
 

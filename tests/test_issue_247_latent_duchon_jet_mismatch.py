@@ -31,7 +31,7 @@ def test_gaussian_reml_fit_latent_duchon_default_runs(latent_dim: int) -> None:
     n_centers = 6
     t, y, centers, penalty = _make_inputs(n_obs, latent_dim, n_centers)
 
-    result = gamfit.gaussian_reml_fit_latent(
+    result = gamfit.reml.gaussian_reml_fit_latent(
         t.ravel(),
         y,
         n_obs,
@@ -54,7 +54,7 @@ def test_gaussian_reml_fit_latent_duchon_d1_default_repro() -> None:
     centers = np.linspace(0, 1, 4).reshape(4, latent_dim)
     penalty = np.eye(4)
 
-    result = gamfit.gaussian_reml_fit_latent(
+    result = gamfit.reml.gaussian_reml_fit_latent(
         t.ravel(),
         y,
         n_obs,

@@ -14,7 +14,7 @@ support payload handed to the dense parser fails on a *dense* field name
 misrouted one. The splice, interpretation, and steering benchmarks could not read
 the very dictionaries they exist to measure.
 
-The dispatch is now ``gamfit.model_from_dict``, and these tests pin the routing
+The dispatch is now ``gamfit.sae.model_from_dict``, and these tests pin the routing
 itself: which parser claims the payload, identified by the parser that reports
 the failure. Deliberately fit-free -- minting a real overcomplete fit costs a
 support-lane solve that does not converge on small synthetic data, and the defect
@@ -50,7 +50,7 @@ def _claiming_parser(fn: Any, payload: Any) -> str:
 
 
 def test_support_tag_routes_to_the_support_parser() -> None:
-    message = _claiming_parser(gamfit.model_from_dict, SUPPORT_PAYLOAD)
+    message = _claiming_parser(gamfit.sae.model_from_dict, SUPPORT_PAYLOAD)
     assert SUPPORT_PARSER in message, (
         "an overcomplete payload must be claimed by the support parser; "
         f"instead it was claimed by: {message}"
@@ -59,7 +59,7 @@ def test_support_tag_routes_to_the_support_parser() -> None:
 
 
 def test_dense_tag_still_routes_to_the_dense_parser() -> None:
-    message = _claiming_parser(gamfit.model_from_dict, DENSE_PAYLOAD)
+    message = _claiming_parser(gamfit.sae.model_from_dict, DENSE_PAYLOAD)
     assert DENSE_PARSER in message, (
         f"a dense payload must still reach the dense parser; got: {message}"
     )
@@ -67,7 +67,7 @@ def test_dense_tag_still_routes_to_the_dense_parser() -> None:
 
 def test_unknown_tag_falls_back_to_the_dense_parser() -> None:
     """Only the exact support tag diverts; anything else keeps its old destination."""
-    message = _claiming_parser(gamfit.model_from_dict, {"schema": "unknown/v0"})
+    message = _claiming_parser(gamfit.sae.model_from_dict, {"schema": "unknown/v0"})
     assert DENSE_PARSER in message
 
 
@@ -79,7 +79,7 @@ def test_the_old_direct_call_still_misroutes_the_support_payload() -> None:
     the readers were re-pointed. This pins the two destinations as distinct, and
     documents the exact symptom #2567 filed.
     """
-    message = _claiming_parser(gamfit.ManifoldSAE.from_dict, SUPPORT_PAYLOAD)
+    message = _claiming_parser(gamfit.sae.ManifoldSAE.from_dict, SUPPORT_PAYLOAD)
     assert DENSE_PARSER in message
     assert SUPPORT_PARSER not in message
 
@@ -87,18 +87,18 @@ def test_the_old_direct_call_still_misroutes_the_support_payload() -> None:
 def test_pickle_round_trip_preserves_the_tag() -> None:
     """The readers carry the payload through pickle; the tag must survive it."""
     restored = pickle.loads(pickle.dumps(SUPPORT_PAYLOAD, protocol=4))
-    assert restored["schema"] == gamfit.SUPPORT_SAE_SCHEMA
-    message = _claiming_parser(gamfit.model_from_dict, restored)
+    assert restored["schema"] == "gamfit.ManifoldSAE/support-v2"
+    message = _claiming_parser(gamfit.sae.model_from_dict, restored)
     assert SUPPORT_PARSER in message
 
 
 def test_load_and_model_from_dict_route_identically(tmp_path: Any) -> None:
-    """``gamfit.load`` and ``gamfit.model_from_dict`` are one dispatch, not two."""
+    """``gamfit.load`` and ``gamfit.sae.model_from_dict`` are one dispatch, not two."""
     path = tmp_path / "overcomplete.json"
     path.write_text(json.dumps(SUPPORT_PAYLOAD), encoding="utf-8")
 
     from_disk = _claiming_parser(gamfit.load, str(path))
-    from_payload = _claiming_parser(gamfit.model_from_dict, SUPPORT_PAYLOAD)
+    from_payload = _claiming_parser(gamfit.sae.model_from_dict, SUPPORT_PAYLOAD)
 
     assert SUPPORT_PARSER in from_disk
     assert from_disk == from_payload, (
