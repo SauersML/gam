@@ -172,6 +172,20 @@ a penalized fit is biased, and its shrinkage bias lives entirely inside the span
 of the fitted design, so projecting it out makes the test blind to "λ is large"
 and sensitive only to structure the design *cannot represent at all*.
 
+For a Gaussian response the score is exactly normal and the `χ²`/`F` reference
+is exact. For a canonical binomial (logit) or Poisson (log) fit it is only first
+order, and at small `n` it is visibly off (on `n = 200` binomial rows it was
+conservative: size `0.032` at `0.05`, which is as much a miscalibration as an
+anti-conservative test). There the score is evaluated at the unpenalized null
+MLE and referred to its law **conditional on the sufficient statistic**
+`Xᵀ(w∘y)`, which does not depend on the nuisance coefficients at all; its mean,
+covariance and fourth cumulant are corrected to `O(1/n)`. Where that expansion
+leaves its range of validity — high-leverage rows at an extreme fitted mean —
+the row reports `provenance = "conditional_reference_unavailable"` and no
+`p_value` (about 7% of null replicates of a default `s(x)` binomial fit at
+`n = 200`; none at `n = 2000`). `"null_fit_unavailable"` means the null MLE
+itself could not be certified.
+
 Asking whether a direction the basis HAS is being over-smoothed is a
 smoothing-parameter question, and this report declines to answer it. It is also
 conditional on the fitted `λ̂` and on the alternative, exactly as the `summary()`
