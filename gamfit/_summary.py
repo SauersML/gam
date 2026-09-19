@@ -251,12 +251,26 @@ class Summary:
     smooth_terms : list of dict
         The mgcv-style per-smooth significance table: one record per
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
-        and — for penalized smooths — ``chi_sq`` (Wood 2013 rank-truncated
-        Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
-        only. A shape-constrained smooth (``shape=...``) has no ``chi_sq`` or
-        ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
-        instead, because its null ``f = 0`` is the apex of the constraint cone
-        and no calibrated reference exists for the truncated posterior mean.
+        and — for penalized smooths — ``chi_sq`` and ``p_value`` from the
+        variance-component score test of ``f = 0`` (Lin 1997; Zhang & Lin 2003).
+        The score fits the other terms only and weights the term's directions by
+        its fixed structural penalties, one variance component per penalty on
+        its own null scale, so it never reads the term's own fitted
+        smoothing parameter, and its reference law (a weighted
+        :math:`\chi^2_1` sum, over :math:`\chi^2_\rho/\rho` when the scale is
+        estimated) is the null law at the fitted smoothing parameters of the
+        other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
+        Random-effect blocks carry the score test of their variance component
+        against its exact boundary null law, or a ``"random_effect_*"``
+        reason when it could not be scored. A smooth with no valid
+        p-value has no ``chi_sq`` or ``p_value`` and carries a
+        ``p_value_unavailable`` reason instead: ``"shape_constrained"`` (the
+        null is the apex of the constraint cone), ``"unpenalized_direction"``
+        (a direction no penalty shrinks is a fixed effect the variance-component
+        null does not remove), ``"fit_curvature_unavailable"`` (the model kept no
+        exact penalized Hessian and weighted Gram), ``"dispersion_unavailable"``
+        (the coefficient covariance scale cannot be resolved),
+        ``"not_identified"``, or ``"residual_df_unavailable"``.
         Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
@@ -266,8 +280,7 @@ class Summary:
         reason, so an absence is never reported without its reason — the same
         contract as :attr:`reml_score_unavailable`.
 
-        This ``p_value`` is the *first-order* Wald reference; computing it needs
-        only the saved model. For the **second-order-accurate**, Bartlett-corrected
+        This ``p_value`` needs only the saved model. For the **second-order-accurate**, Bartlett-corrected
         likelihood-ratio p-value (the exact Lawley factor auto-applied whenever the
         family carries closed-form cumulant jets, #939/#1063) call
         :meth:`Model.smooth_significance(data) <gamfit.Model.smooth_significance>`,

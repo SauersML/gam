@@ -60,7 +60,7 @@ fn reml_profile_1266_probe() {
         let FitResult::Standard(std_fit) = &fit else {
             panic!("expected a standard Gaussian fit");
         };
-        let rows = smooth_term_summary_rows(&std_fit.design, &std_fit.resolvedspec, &std_fit.fit, None);
+        let rows = smooth_term_summary_rows(&std_fit.design, &std_fit.resolvedspec, &std_fit.fit);
         let edfs: Vec<(String, f64)> = rows.iter().map(|row| (row.name.clone(), row.edf)).collect();
         let n = response.len();
         let y = Array1::from(response);
