@@ -1,6 +1,6 @@
 //! Standing type-I size gate (issue #1891): the multinomial per-class smooth
 //! significance p-value (`MultinomialSavedModel::smooth_significance` /
-//! `MultinomialSmoothSignificance::p_value`).
+//! `MultinomialSmoothSignificance::test`).
 //!
 //! A completeness sweep of the library's public payload structs (the #1891
 //! follow-up) found `MultinomialSmoothSignificance` unregistered and ungated.
@@ -73,21 +73,23 @@ fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
         .unwrap_or_else(|e| panic!("multinomial null smooth fit failed (rep {rep}): {e:?}"));
 
         let significance = model.smooth_significance();
-        let Some(row) = significance.first() else {
-            // A degenerate replication (e.g. the smooth term collapsed to the
-            // nullspace) declines to report a p-value rather than fabricate
-            // one; skip it rather than treat "no row" as either a hit or miss.
+        let row = significance
+            .first()
+            .unwrap_or_else(|| panic!("rep {rep}: the smooth term has no significance row"));
+        let Ok(test) = &row.test else {
+            // A replication whose fit shrank the term to nothing carries its
+            // typed reason instead of a p-value; it is neither a hit nor a miss.
             continue;
         };
         assert!(
-            row.p_value.is_finite() && (0.0..=1.0).contains(&row.p_value),
+            test.p_value.is_finite() && (0.0..=1.0).contains(&test.p_value),
             "rep {rep}: multinomial smooth-significance p-value out of range: {}",
-            row.p_value
+            test.p_value
         );
         replications_used += 1;
 
         for (alpha_idx, &alpha) in ALPHAS.iter().enumerate() {
-            if row.p_value > alpha {
+            if test.p_value > alpha {
                 non_rejections[alpha_idx] += 1;
             }
         }

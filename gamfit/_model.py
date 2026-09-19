@@ -1756,13 +1756,41 @@ class MultinomialModel:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 
         One row per ``(active class, smooth term)`` with keys ``class``,
-        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` — the same
-        kernel the scalar :meth:`Model.summary` smooth-term p-values use. Empty
-        when the model has no smooth terms or no stored covariance.
+        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value``,
+        ``unavailable`` — the same kernel the scalar :meth:`Model.summary`
+        smooth-term p-values use. Each row tests whether the term moves that
+        class's log-odds against the reference class, so it depends on which
+        class is the reference; :meth:`joint_smooth_significance` asks whether
+        the term moves any class. A row whose test could not be formed has
+        ``None`` in the numeric keys and the reason in ``unavailable``.
+
+        With three or more classes every row is unavailable with
+        ``"penalty_couples_outside_tested_set"``: the reference-symmetric
+        penalty shrinks each class toward the all-class mean, so one class's
+        estimate borrows the others' fit and is biased under its own null. Use
+        :meth:`joint_smooth_significance` there.
         """
         try:
             return list(
                 rust_module().multinomial_smooth_significance_pyfunc(self._model_bytes)
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+
+    def joint_smooth_significance(self) -> list[dict]:
+        """Joint Wood smooth-term test across every class, one row per term.
+
+        Tests that the term's coefficients are zero in every class at once —
+        the covariate moves no class probability. The answer does not depend
+        on the reference class. Keys are ``term``, ``edf``, ``ref_df``,
+        ``statistic``, ``p_value``, ``unavailable``, as in
+        :meth:`smooth_significance`.
+        """
+        try:
+            return list(
+                rust_module().multinomial_joint_smooth_significance_pyfunc(
+                    self._model_bytes
+                )
             )
         except Exception as exc:
             raise map_exception(exc) from exc

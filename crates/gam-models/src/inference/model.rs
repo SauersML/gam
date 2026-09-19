@@ -6238,37 +6238,51 @@ fn validate_frozen_term_collectionspec(
 /// terms when the spec has any.
 ///
 /// `spec` is the mean predictor's spec, so the saved count is the λ of the
-/// block that spec builds: the Mean block of a single-predictor fit, or the
-/// Location block of a location-scale fit, whose trailing Scale block carries
-/// the noise predictor's own λ. Counting every λ of a location-scale fit against
-/// the location spec refused every such summary as a stale layout. The walk
-/// reads λ from global index 0, so that block must lead the fit; a fit with
-/// neither role counts all of its λ.
+/// block that spec builds: the fit's primary predictor block (Mean, Location
+/// or Threshold; see `UnifiedFitResult::primary_predictor_block`) when the fit
+/// records blocks, and the fit's λ otherwise. A location-scale fit's trailing
+/// Scale block carries the noise predictor's own λ, so counting every λ of the
+/// fit against the location spec would refuse every such summary as a stale
+/// layout. This check reads λ from global index 0, so that block must lead the
+/// fit; a walk that shifts by the preceding blocks' widths uses
+/// [`saved_block_lambdas_index_rebuilt_layout`] instead.
 pub fn saved_lambdas_index_rebuilt_layout(
     spec: &TermCollectionSpec,
     rebuilt_penalties: usize,
     fit: &UnifiedFitResult,
     context: &str,
 ) -> Result<(), FittedModelError> {
-    let spec_block = fit
-        .block_by_role(BlockRole::Mean)
-        .or_else(|| fit.block_by_role(BlockRole::Location));
-    if let Some(block) = spec_block {
-        if !fit
+    let primary = primary_predictor_block_or_refuse(fit, context)?;
+    if let Some(block) = primary.block
+        && !fit
             .blocks
             .first()
             .is_some_and(|first| std::ptr::eq(first, block))
-        {
-            return Err(FittedModelError::SchemaMismatch {
-                reason: format!(
-                    "{context}: the {} block the saved spec builds is not the fit's leading block, \
-                     so its smoothing parameters do not start at global index 0",
-                    block.role.name()
-                ),
-            });
-        }
+    {
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "{context}: the {} block the saved spec builds is not the fit's leading block, \
+                 so its smoothing parameters do not start at global index 0",
+                block.role.name()
+            ),
+        });
     }
-    let saved_lambdas = spec_block.map_or(fit.lambdas.len(), |block| block.lambdas.len());
+    saved_block_lambdas_index_rebuilt_layout(spec, rebuilt_penalties, fit, context)
+}
+
+/// [`saved_lambdas_index_rebuilt_layout`] for a walk that reads the primary
+/// block's λ at its own offset in the flat layout, so the block need not lead
+/// the fit (a latent survival fit opens with its time-transform block).
+pub fn saved_block_lambdas_index_rebuilt_layout(
+    spec: &TermCollectionSpec,
+    rebuilt_penalties: usize,
+    fit: &UnifiedFitResult,
+    context: &str,
+) -> Result<(), FittedModelError> {
+    let primary = primary_predictor_block_or_refuse(fit, context)?;
+    let saved_lambdas = primary
+        .block
+        .map_or(fit.lambdas.len(), |block| block.lambdas.len());
     if rebuilt_penalties == saved_lambdas {
         return Ok(());
     }
@@ -6298,6 +6312,21 @@ pub fn saved_lambdas_index_rebuilt_layout(
             "{context}: the rebuilt design has {rebuilt_penalties} penalty blocks but the saved \
              fit has {saved_lambdas} smoothing parameters; {cause}. Refit the model."
         ),
+    })
+}
+
+fn primary_predictor_block_or_refuse<'a>(
+    fit: &'a UnifiedFitResult,
+    context: &str,
+) -> Result<gam_solve::estimate::PrimaryPredictorBlock<'a>, FittedModelError> {
+    fit.primary_predictor_block().ok_or_else(|| {
+        let roles: Vec<&str> = fit.blocks.iter().map(|block| block.role.name()).collect();
+        FittedModelError::SchemaMismatch {
+            reason: format!(
+                "{context}: the saved spec describes the mean predictor, and this fit's blocks \
+                 {roles:?} include no mean, location or threshold block"
+            ),
+        }
     })
 }
 

@@ -181,7 +181,7 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
         &fit.resolvedspec,
         &fit.fit,
         fit.fit.weighted_gram(),
-    );
+    )?;
     let row = rows
         .iter()
         .find(|row| row.name.contains(NULL_TERM))

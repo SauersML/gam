@@ -40,6 +40,7 @@ mod smooth_fit_term_collection_bug_hunt_2_3;
 mod smooth_not_covariate_scale_invariant;
 mod smooth_term_predict_flat_clamped_outside_training_range;
 mod summary_penalty_cursor_skips_unpenalized_re;
+mod summary_smooth_test_without_published_influence;
 mod sz_factor_smooth_fits_and_predicts;
 mod tensor_null_blocks_keep_a_supported_trend_1561;
 mod tensor_periodic_margin_predict_offbyone;

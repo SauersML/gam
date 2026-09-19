@@ -22,7 +22,10 @@
 //! the registry is the single index of what is audited and by which gate, not a
 //! second copy of those gates.
 
-use gam::families::multinomial::{MultinomialPredictionIntervals, MultinomialSmoothSignificance};
+use gam::families::multinomial::{
+    MultinomialJointSmoothSignificance, MultinomialPredictionIntervals,
+    MultinomialSmoothSignificance, MultinomialSmoothTestUnavailable, MultinomialWaldTest,
+};
 use gam::families::survival::predict::SurvivalPredictResult;
 use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
@@ -261,6 +264,17 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             guards: &[1891],
             audited_by: "sbc_multinomial_smooth_significance_size_curve \
                          (multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null)",
+        },
+        // Multinomial joint (all-classes) Wood smooth test: the same kernel on
+        // the union of the term's class blocks, so a covariate with no effect
+        // on any class is tested once, independent of the reference class.
+        CalibrationTarget {
+            name: "multinomial_joint_smooth_test_pvalue",
+            kind: SurfaceKind::TestPValue,
+            mode: AuditMode::TestSizeCurve,
+            guards: &[1891],
+            audited_by: "sbc_multinomial_joint_smooth_significance_size_curve \
+                         (multinomial_three_class_null_term_tests_hold_their_size)",
         },
         // ---- Posterior surfaces ------------------------------------------
         // The ρ-posterior (smoothing-hyperparameter) adequacy diagnostic is a posterior
@@ -527,20 +541,63 @@ fn multinomial_smooth_significance_field_audits(
     let MultinomialSmoothSignificance {
         class_label,
         term_label,
+        test,
+    } = payload;
+    std::hint::black_box((class_label, term_label));
+    let mut audits = vec![
+        FieldAudit::point("class_label"),
+        FieldAudit::point("term_label"),
+    ];
+    audits.extend(multinomial_wald_test_field_audits(
+        test,
+        "multinomial_smooth_test_pvalue",
+    ));
+    audits
+}
+
+/// Exhaustive classification of every field of
+/// [`MultinomialJointSmoothSignificance`].
+fn multinomial_joint_smooth_significance_field_audits(
+    payload: &MultinomialJointSmoothSignificance,
+) -> Vec<FieldAudit> {
+    let MultinomialJointSmoothSignificance { term_label, test } = payload;
+    std::hint::black_box(term_label);
+    let mut audits = vec![FieldAudit::point("term_label")];
+    audits.extend(multinomial_wald_test_field_audits(
+        test,
+        "multinomial_joint_smooth_test_pvalue",
+    ));
+    audits
+}
+
+/// The fields of a formed [`MultinomialWaldTest`]; the typed unavailable
+/// reason is not a number and carries no calibration claim.
+fn multinomial_wald_test_field_audits(
+    test: &Result<MultinomialWaldTest, MultinomialSmoothTestUnavailable>,
+    p_value_target: &'static str,
+) -> Vec<FieldAudit> {
+    let MultinomialWaldTest {
         edf,
         ref_df,
         statistic,
         p_value,
-    } = payload;
-    std::hint::black_box((class_label, term_label, edf, ref_df, statistic, p_value));
+    } = test.as_ref().expect("probe carries a formed test");
+    std::hint::black_box((edf, ref_df, statistic, p_value));
     vec![
-        FieldAudit::point("class_label"),
-        FieldAudit::point("term_label"),
-        FieldAudit::point("edf"),
-        FieldAudit::point("ref_df"),
-        FieldAudit::point("statistic"),
-        FieldAudit::audited("p_value", "multinomial_smooth_test_pvalue"),
+        FieldAudit::point("test.edf"),
+        FieldAudit::point("test.ref_df"),
+        FieldAudit::point("test.statistic"),
+        FieldAudit::audited("test.p_value", p_value_target),
     ]
+}
+
+fn multinomial_wald_test_probe() -> MultinomialWaldTest {
+    MultinomialWaldTest {
+        edf: 3.0,
+        ref_df: 3.0,
+        statistic: 1.0,
+        p_value: 0.5,
+    }
 }
 
 /// A minimal well-formed `MultinomialSmoothSignificance` probe.
@@ -548,10 +605,15 @@ fn multinomial_smooth_significance_probe() -> MultinomialSmoothSignificance {
     MultinomialSmoothSignificance {
         class_label: "class0".to_string(),
         term_label: "s(x)".to_string(),
-        edf: 3.0,
-        ref_df: 3.0,
-        statistic: 1.0,
-        p_value: 0.5,
+        test: Ok(multinomial_wald_test_probe()),
+    }
+}
+
+/// A minimal well-formed `MultinomialJointSmoothSignificance` probe.
+fn multinomial_joint_smooth_significance_probe() -> MultinomialJointSmoothSignificance {
+    MultinomialJointSmoothSignificance {
+        term_label: "s(x)".to_string(),
+        test: Ok(multinomial_wald_test_probe()),
     }
 }
 
@@ -645,6 +707,15 @@ fn multinomial_smooth_significance_fields_are_all_registered() {
     let registry = uq_surface_registry();
     let audits =
         multinomial_smooth_significance_field_audits(&multinomial_smooth_significance_probe());
+    assert_registry_covers_fields(&audits, &registry);
+}
+
+#[test]
+fn multinomial_joint_smooth_significance_fields_are_all_registered() {
+    let registry = uq_surface_registry();
+    let audits = multinomial_joint_smooth_significance_field_audits(
+        &multinomial_joint_smooth_significance_probe(),
+    );
     assert_registry_covers_fields(&audits, &registry);
 }
 

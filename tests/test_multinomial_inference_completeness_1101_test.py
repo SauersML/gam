@@ -75,6 +75,14 @@ def test_smooth_significance_table_is_populated() -> None:
     for row in sig:
         for key in ("class", "term", "edf", "ref_df", "statistic", "p_value"):
             assert key in row
+        # Three classes: the coupled penalty makes a one-class test invalid,
+        # so each per-class row carries the reason instead of a p-value.
+        assert row["unavailable"] == "penalty_couples_outside_tested_set"
+        assert row["p_value"] is None
+    joint = model.joint_smooth_significance()
+    assert {row["term"] for row in joint} == {row["term"] for row in sig}
+    for row in joint:
+        assert row["unavailable"] is None
         assert np.isfinite(row["edf"]) and row["edf"] > 0.0
         assert np.isfinite(row["statistic"]) and row["statistic"] >= 0.0
         assert 0.0 <= row["p_value"] <= 1.0

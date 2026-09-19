@@ -2534,85 +2534,132 @@ impl MultinomialSavedModel {
     }
 
     /// Wood (2013) rank-truncated Wald smooth-significance test per
-    /// `(active class, smooth term)` (#1101), reusing the exact scalar-summary
-    /// kernel [`gam_terms::inference::smooth_test::wood_smooth_test`]. For active
-    /// class `a` and term span `[c0, c1)` within the class block, the global
-    /// coefficient range is `a·P + c0 .. a·P + c1`; the joint covariance and
-    /// influence are sliced there. The term EDF is the influence-block trace
-    /// `tr(F_jj)` (when present) and the reference d.f. uses `tr(F_jj)²/tr(F_jj²)`,
-    /// exactly as the scalar path. The multinomial softmax is a known-dispersion
-    /// family, so the χ²_{ref_df} branch applies. Returns one row per
-    /// `(class label, term label, edf, ref_df, statistic, p_value)`; empty when
-    /// no covariance/smooth terms are available.
+    /// `(active class, smooth term)` (#1101), on the exact scalar-summary kernel
+    /// [`gam_terms::inference::smooth_test::wood_smooth_test`].
+    ///
+    /// For active class `a` and term span `[c0, c1)` the tested block is the
+    /// coefficient range `a·P + c0 .. a·P + c1` of the stacked vector: the null
+    /// is that the term does not move the log-odds of class `a` against the
+    /// reference class. That is a statement about one contrast, so its answer
+    /// depends on which class is the reference; the reference-free question —
+    /// does the term move any class probability at all — is
+    /// [`Self::joint_smooth_significance`].
+    ///
+    /// Every input is the one the scalar `summary()` path hands the same kernel
+    /// (`gam_solve::estimate::smooth_term_summary_rows`): the conditional joint
+    /// covariance `H⁻¹`, the joint influence `F`, the term EDF `tr(F_jj)`, and
+    /// the likelihood curvature `XᵀW(β̂)X` as the Wood whitening Gram. Without
+    /// that Gram the kernel truncates the raw coefficient covariance, which ranks
+    /// directions by coefficient variance in whatever basis the smooth happens
+    /// to be written in; the whitened test ranks them by fitted-value variance,
+    /// the frame Wood's rank-`r` truncation is defined in. The softmax has no
+    /// dispersion, so the χ²_{ref_df} branch applies.
+    ///
+    /// A row whose test cannot be formed carries the typed reason instead of
+    /// being dropped, so the table always has one row per `(class, term)`.
+    ///
+    /// With `K ≥ 3` classes every row carries
+    /// [`MultinomialSmoothTestUnavailable::PenaltyCouplesOutsideTestedSet`]:
+    /// the reference-symmetric penalty shrinks each class's term toward the
+    /// all-class mean, so the class-`a` estimate borrows the other classes'
+    /// fit and is biased under its own null. Measured at `n = 2000`
+    /// (`bench/pvalue_calibration/pv-multi-predictor`), a class whose null held
+    /// while another class carried the effect rejected at 0.088 at `α = 0.01`.
+    /// A two-class fit has one class block and no such coupling.
     pub fn smooth_significance(&self) -> Vec<MultinomialSmoothSignificance> {
-        let mut out = Vec::new();
         let p = self.p_per_class;
-        let m = self.n_active_classes;
-        let Ok(cov) = self.coefficient_covariance() else {
-            return out;
-        };
-        if self.smooth_term_spans.is_empty() {
-            return out;
-        }
-        let Ok(beta) = self.coefficients_active() else {
-            return out;
-        };
-        // Block-ordered θ = [β_0; …; β_{M-1}], θ[a·P + i] = β[i, a].
-        let d = p * m;
-        let mut theta = Array1::<f64>::zeros(d);
-        for a in 0..m {
-            for i in 0..p {
-                theta[a * p + i] = beta[[i, a]];
-            }
-        }
-        let influence = self.coefficient_influence();
-        for a in 0..m {
-            let class_label = self
-                .class_levels
-                .get(a)
-                .cloned()
-                .unwrap_or_else(|| format!("class{a}"));
-            let base = a * p;
+        let inputs = self.smooth_test_inputs();
+        let mut out = Vec::new();
+        for a in 0..self.n_active_classes {
+            let class_label = self.class_levels[a].clone();
             for span in &self.smooth_term_spans {
-                if span.col_end > p {
-                    continue;
-                }
-                let start = base + span.col_start;
-                let end = base + span.col_end;
-                // Term EDF = tr(F_jj); without an influence matrix fall back to
-                // the block coefficient count (full-rank Wald on the span).
-                let block_len = (span.col_end - span.col_start) as f64;
-                let edf = influence
+                let indices: Vec<usize> = (span.col_start..span.col_end)
+                    .map(|column| a * p + column)
+                    .collect();
+                let test = inputs
                     .as_ref()
-                    .map(|f| (start..end).map(|i| f[[i, i]]).sum::<f64>())
-                    .filter(|v| v.is_finite() && *v > 0.0)
-                    .unwrap_or(block_len);
-                let result = gam_terms::inference::smooth_test::wood_smooth_test(
-                    gam_terms::inference::smooth_test::SmoothTestInput {
-                        beta: theta.view(),
-                        covariance: &cov,
-                        influence_matrix: influence.as_ref(),
-                        whitening_gram: None,
-                        coeff_range: start..end,
-                        edf,
-                        nullspace_dim: span.nullspace_dim,
-                        residual_df: None,
-                        scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
-                    },
-                );
-                if let Some(res) = result {
-                    out.push(MultinomialSmoothSignificance {
-                        class_label: class_label.clone(),
-                        term_label: span.label.clone(),
-                        edf,
-                        ref_df: res.ref_df,
-                        statistic: res.statistic,
-                        p_value: res.p_value,
-                    });
-                }
+                    .map_err(Clone::clone)
+                    .and_then(|inputs| inputs.test(&indices, span.col_end, span.nullspace_dim));
+                out.push(MultinomialSmoothSignificance {
+                    class_label: class_label.clone(),
+                    term_label: span.label.clone(),
+                    test,
+                });
             }
         }
         out
+    }
+
+    /// Joint Wood (2013) test of one smooth term across every class: the null
+    /// is that the term's coefficients are zero in every active class block at
+    /// once, i.e. that the covariate moves no class probability. Unlike the
+    /// per-class rows of [`Self::smooth_significance`] this null does not
+    /// mention the reference class, and neither does the statistic: the tested
+    /// set `J = ∪_a {a·P + span}` maps onto itself under any change of reference
+    /// class (a block-triangular `A` with identity-per-block entries), and the
+    /// whitened statistic `f̂ᵀ(R_J V_JJ R_Jᵀ)⁻_r f̂` with `R_JᵀR_J = G_JJ` is
+    /// invariant under `V ↦ AVAᵀ`, `G ↦ A⁻ᵀGA⁻¹` because the whitened covariance
+    /// only rotates. It is also one test rather than `M`, so it holds its level
+    /// where rejecting when any per-class row rejects does not.
+    ///
+    /// The kernel inputs are the principal `J×J` submatrices of the same
+    /// covariance, influence and likelihood curvature the per-class rows use —
+    /// the off-diagonal class blocks of each are where the softmax couples the
+    /// classes, and they are kept. The EDF is `tr(F_JJ)`, the sum of the
+    /// per-class term EDFs, and the unpenalized floor is `M` times the term's.
+    pub fn joint_smooth_significance(&self) -> Vec<MultinomialJointSmoothSignificance> {
+        let p = self.p_per_class;
+        let m = self.n_active_classes;
+        let inputs = self.smooth_test_inputs();
+        self.smooth_term_spans
+            .iter()
+            .map(|span| {
+                let indices: Vec<usize> = (0..m)
+                    .flat_map(|a| (span.col_start..span.col_end).map(move |column| a * p + column))
+                    .collect();
+                let test = inputs.as_ref().map_err(Clone::clone).and_then(|inputs| {
+                    inputs.test(&indices, span.col_end, m * span.nullspace_dim)
+                });
+                MultinomialJointSmoothSignificance {
+                    term_label: span.label.clone(),
+                    test,
+                }
+            })
+            .collect()
+    }
+
+    /// The joint objects every smooth test slices: the stacked mode, the
+    /// conditional covariance, the influence `F`, and the likelihood curvature
+    /// `XᵀW(β̂)X`, all in the stacked order `θ[a·P + i] = β[i, a]`.
+    fn smooth_test_inputs(&self) -> Result<SmoothTestInputs, MultinomialSmoothTestUnavailable> {
+        let covariance = self
+            .coefficient_covariance()
+            .map_err(|_| MultinomialSmoothTestUnavailable::CovarianceUnreadable)?;
+        let influence = self
+            .coefficient_influence()
+            .ok_or(MultinomialSmoothTestUnavailable::InfluenceUnavailable)?;
+        let mode = self
+            .stacked_mode()
+            .map_err(|_| MultinomialSmoothTestUnavailable::CoefficientsUnreadable)?;
+        let design = self
+            .training_design()
+            .map_err(|_| MultinomialSmoothTestUnavailable::CurvatureUnavailable)?;
+        let penalty = self
+            .joint_penalty()
+            .map_err(|_| MultinomialSmoothTestUnavailable::CurvatureUnavailable)?;
+        let weights = Array1::from(self.training_weights.clone());
+        let curvature = self
+            .predictive_model(design.view(), weights.view(), penalty.view(), None)
+            .likelihood_curvature(mode.view())
+            .map_err(|_| MultinomialSmoothTestUnavailable::CurvatureUnavailable)?;
+        Ok(SmoothTestInputs {
+            p_per_class: self.p_per_class,
+            mode,
+            covariance,
+            influence,
+            curvature,
+            penalty,
+        })
     }
 
     /// Draw `n_draws` posterior-predictive replicate class assignments at fresh
@@ -2723,7 +2770,7 @@ impl MultinomialSavedModel {
         }
         let significance = self.smooth_significance();
         if !significance.is_empty() {
-            lines.push("  smooth terms (Wood rank-truncated Wald):".to_string());
+            lines.push("  smooth terms, per class vs ref (Wood rank-truncated Wald):".to_string());
             lines.push(
                 "    class                 term            edf   ref.df    chi.sq   p-value"
                     .to_string(),
@@ -2732,15 +2779,36 @@ impl MultinomialSavedModel {
                 let class: String = row.class_label.chars().take(20).collect();
                 let term: String = row.term_label.chars().take(14).collect();
                 lines.push(format!(
-                    "    {class:<20} {term:<14} {:>6} {:>7} {:>9} {:>9}",
-                    format_g(row.edf, 3),
-                    format_g(row.ref_df, 3),
-                    format_g(row.statistic, 4),
-                    format_g(row.p_value, 3),
+                    "    {class:<20} {term:<14} {}",
+                    wald_test_cells(&row.test)
                 ));
             }
         }
+        let joint = self.joint_smooth_significance();
+        if !joint.is_empty() {
+            lines.push("  smooth terms, all classes jointly (Wood rank-truncated Wald):".to_string());
+            lines.push("    term            edf   ref.df    chi.sq   p-value".to_string());
+            for row in joint {
+                let term: String = row.term_label.chars().take(14).collect();
+                lines.push(format!("    {term:<14} {}", wald_test_cells(&row.test)));
+            }
+        }
         Ok(lines.join("\n"))
+    }
+}
+
+/// The `edf ref.df chi.sq p-value` cells of one smooth-test row, or the
+/// reason the row has no test.
+fn wald_test_cells(test: &Result<MultinomialWaldTest, MultinomialSmoothTestUnavailable>) -> String {
+    match test {
+        Ok(test) => format!(
+            "{:>6} {:>7} {:>9} {:>9}",
+            format_g(test.edf, 3),
+            format_g(test.ref_df, 3),
+            format_g(test.statistic, 4),
+            format_g(test.p_value, 3),
+        ),
+        Err(reason) => format!("unavailable: {reason}"),
     }
 }
 
@@ -2903,15 +2971,191 @@ mod multinomial_persistence_contract_tests {
 }
 
 /// One row of the multinomial smooth-significance table (#1101): the Wood
-/// rank-truncated Wald test for one `(active class, smooth term)` pair.
+/// rank-truncated Wald test for one `(active class, smooth term)` pair, or the
+/// reason that pair has none.
 #[derive(Debug, Clone)]
 pub struct MultinomialSmoothSignificance {
     pub class_label: String,
     pub term_label: String,
+    pub test: Result<MultinomialWaldTest, MultinomialSmoothTestUnavailable>,
+}
+
+/// One row of the joint multinomial smooth-significance table: the Wood test
+/// of one smooth term across every class at once (see
+/// [`MultinomialSavedModel::joint_smooth_significance`]), or the reason it has
+/// none.
+#[derive(Debug, Clone)]
+pub struct MultinomialJointSmoothSignificance {
+    pub term_label: String,
+    pub test: Result<MultinomialWaldTest, MultinomialSmoothTestUnavailable>,
+}
+
+/// A formed Wood rank-truncated Wald test: the tested block's EDF `tr(F_JJ)`,
+/// the χ² reference degrees of freedom, the statistic, and its upper-tail
+/// probability.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MultinomialWaldTest {
     pub edf: f64,
     pub ref_df: f64,
     pub statistic: f64,
     pub p_value: f64,
+}
+
+/// Why a multinomial smooth test could not be formed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MultinomialSmoothTestUnavailable {
+    /// The saved joint covariance does not reshape to `(P·M)²`.
+    CovarianceUnreadable,
+    /// The saved coefficients do not reshape to `P×M`.
+    CoefficientsUnreadable,
+    /// The fit retained no joint influence matrix, so neither the term EDF
+    /// (the truncation rank) nor the reference d.f. exists.
+    InfluenceUnavailable,
+    /// The likelihood curvature `XᵀWX` the test whitens by could not be
+    /// rebuilt from the saved training frame.
+    CurvatureUnavailable,
+    /// The term's column span lies outside the per-class block.
+    SpanOutOfRange,
+    /// The fit shrank the term to nothing: its EDF `tr(F_JJ)` is not positive,
+    /// so the rank-`round(edf)` truncation has no direction to test.
+    NoEffectiveDegreesOfFreedom { edf: f64 },
+    /// Every direction of the whitened block covariance is numerically null,
+    /// or the statistic or its tail probability is not finite.
+    NoEstimableDirection { edf: f64 },
+    /// The fitted penalty couples the tested coefficients to coefficients
+    /// outside the tested set, so the penalized estimate of `β_J` does not
+    /// shrink toward the null `β_J = 0`. With `K ≥ 3` classes the
+    /// reference-symmetric carrier `Σ λ (M ⊗ S_t)` penalizes each class's
+    /// deviation from the all-class mean, which pulls one class's term
+    /// coefficients toward the others' fit; under the per-class null
+    /// `β_{a,J} = 0` the estimate is then biased by whatever the other classes
+    /// carry, and no reference distribution sizes the test. The all-classes
+    /// set is closed under that coupling, so the joint test stays available.
+    PenaltyCouplesOutsideTestedSet,
+}
+
+impl std::fmt::Display for MultinomialSmoothTestUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CovarianceUnreadable => f.write_str("saved joint covariance is unreadable"),
+            Self::CoefficientsUnreadable => f.write_str("saved coefficients are unreadable"),
+            Self::InfluenceUnavailable => f.write_str("fit retained no influence matrix"),
+            Self::CurvatureUnavailable => {
+                f.write_str("likelihood curvature could not be rebuilt from the training frame")
+            }
+            Self::SpanOutOfRange => f.write_str("term span lies outside the class block"),
+            Self::NoEffectiveDegreesOfFreedom { edf } => {
+                write!(f, "term shrunk to edf {edf}; no direction to test")
+            }
+            Self::NoEstimableDirection { edf } => {
+                write!(f, "no estimable direction in the term block (edf {edf})")
+            }
+            Self::PenaltyCouplesOutsideTestedSet => {
+                f.write_str("penalty couples this block to other classes; use the all-classes test")
+            }
+        }
+    }
+}
+
+impl MultinomialSmoothTestUnavailable {
+    /// Stable machine-readable name for the FFI.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::CovarianceUnreadable => "covariance_unreadable",
+            Self::CoefficientsUnreadable => "coefficients_unreadable",
+            Self::InfluenceUnavailable => "influence_unavailable",
+            Self::CurvatureUnavailable => "curvature_unavailable",
+            Self::SpanOutOfRange => "span_out_of_range",
+            Self::NoEffectiveDegreesOfFreedom { .. } => "no_effective_degrees_of_freedom",
+            Self::NoEstimableDirection { .. } => "no_estimable_direction",
+            Self::PenaltyCouplesOutsideTestedSet => "penalty_couples_outside_tested_set",
+        }
+    }
+}
+
+/// The joint objects the multinomial smooth tests slice, in the stacked order.
+struct SmoothTestInputs {
+    p_per_class: usize,
+    mode: Array1<f64>,
+    covariance: Array2<f64>,
+    influence: Array2<f64>,
+    curvature: Array2<f64>,
+    penalty: Array2<f64>,
+}
+
+impl SmoothTestInputs {
+    /// The Wood test of the coefficient set `indices`, from the principal
+    /// submatrices of the joint covariance, influence and curvature on it.
+    /// `span_end` is the term's last column within a class block, checked
+    /// against `P`; `nullspace_dim` is the unpenalized dimension of the set.
+    fn test(
+        &self,
+        indices: &[usize],
+        span_end: usize,
+        nullspace_dim: usize,
+    ) -> Result<MultinomialWaldTest, MultinomialSmoothTestUnavailable> {
+        use gam_terms::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
+        let d = self.mode.len();
+        if span_end > self.p_per_class || indices.iter().any(|&index| index >= d) {
+            return Err(MultinomialSmoothTestUnavailable::SpanOutOfRange);
+        }
+        // Wood's test reads the tested block's principal submatrices, which
+        // describes a penalized estimate shrinking toward `β_J = 0` only when
+        // the penalty on `J` does not reach outside `J`. Entries at round-off
+        // of the rows' own scale are assembly noise, not coupling.
+        let mut in_set = vec![false; d];
+        for &index in indices {
+            in_set[index] = true;
+        }
+        let row_scale = indices
+            .iter()
+            .flat_map(|&i| self.penalty.row(i).to_vec())
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let coupling = indices
+            .iter()
+            .flat_map(|&i| {
+                let row = self.penalty.row(i);
+                (0..d)
+                    .filter(|&k| !in_set[k])
+                    .map(move |k| row[k].abs())
+                    .collect::<Vec<f64>>()
+            })
+            .fold(0.0_f64, f64::max);
+        if coupling > f64::EPSILON * row_scale * d as f64 {
+            return Err(MultinomialSmoothTestUnavailable::PenaltyCouplesOutsideTestedSet);
+        }
+        let principal = |matrix: &Array2<f64>| {
+            Array2::from_shape_fn((indices.len(), indices.len()), |(i, j)| {
+                matrix[[indices[i], indices[j]]]
+            })
+        };
+        let beta = Array1::from_iter(indices.iter().map(|&index| self.mode[index]));
+        let covariance = principal(&self.covariance);
+        let influence = principal(&self.influence);
+        let curvature = principal(&self.curvature);
+        let edf = influence.diag().sum();
+        if !(edf.is_finite() && edf > 0.0) {
+            return Err(MultinomialSmoothTestUnavailable::NoEffectiveDegreesOfFreedom { edf });
+        }
+        let result = wood_smooth_test(SmoothTestInput {
+            beta: beta.view(),
+            covariance: &covariance,
+            influence_matrix: Some(&influence),
+            whitening_gram: Some(&curvature),
+            coeff_range: 0..indices.len(),
+            edf,
+            nullspace_dim,
+            residual_df: None,
+            scale: SmoothTestScale::Known,
+        })
+        .ok_or(MultinomialSmoothTestUnavailable::NoEstimableDirection { edf })?;
+        Ok(MultinomialWaldTest {
+            edf,
+            ref_df: result.ref_df,
+            statistic: result.statistic,
+            p_value: result.p_value,
+        })
+    }
 }
 
 /// One-hot-encode the categorical response column and return both the
@@ -6074,6 +6318,144 @@ mod reference_class_invariance_tests {
             drift < 1e-3,
             "predicted probabilities must be invariant to the reference class; \
              cross-labeling drift = {drift:.3e} (refit noise = {refit_noise:.3e})"
+        );
+    }
+
+    /// The all-classes term test asks whether the term moves ANY class
+    /// probability, a question that does not mention the reference class. Its
+    /// statistic `β̂_Jᵀ (R V_JJ Rᵀ)⁺ β̂_J` is a congruence invariant of the
+    /// joint block (a change of reference is an invertible linear map of the
+    /// stacked class coefficients, which carries `β̂_J`, `V_JJ` and the
+    /// whitening curvature along together), so relabeling the classes so that a
+    /// different original class becomes the reference must leave the
+    /// statistic, edf and p-value unchanged up to the fit's own
+    /// reference-invariance tolerance.
+    #[test]
+    fn multinomial_joint_term_test_is_invariant_to_reference_class() {
+        let td = tempdir().expect("tempdir");
+        let dir = td.path();
+        // A weak effect keeps the p-value off 0 so the comparison is informative.
+        let mut rng = SplitMix64(0x7E57_0001);
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut cls = Vec::with_capacity(n);
+        for _ in 0..n {
+            let xi = -2.0 + 4.0 * rng.unit();
+            let eta = [0.12 * xi, -0.08 * xi, 0.0];
+            let weights = [eta[0].exp(), eta[1].exp(), eta[2].exp()];
+            let total: f64 = weights.iter().sum();
+            let u = rng.unit() * total;
+            let c = if u < weights[0] {
+                0
+            } else if u < weights[0] + weights[1] {
+                1
+            } else {
+                2
+            };
+            x.push(xi);
+            cls.push(c);
+        }
+
+        let joint_test = |tag: &str, name_map: [&str; 3]| -> MultinomialWaldTest {
+            let labels: Vec<String> = cls.iter().map(|&c| name_map[c].to_string()).collect();
+            let train = dataset_xy(dir, tag, &x, &labels);
+            let config = FitConfig::default();
+            let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+                init_lambda: 1.0,
+                max_iter: 60,
+                tol: 1e-6,
+                ..MultinomialFitRequest::new(&train, "y ~ s(x)", &config)
+            })
+            .expect("multinomial formula fit must succeed");
+            let joint = model.joint_smooth_significance();
+            assert_eq!(joint.len(), 1, "[{tag}] one smooth term, one joint row");
+            joint[0]
+                .test
+                .clone()
+                .unwrap_or_else(|reason| panic!("[{tag}] joint term test unavailable: {reason}"))
+        };
+
+        // The class whose label sorts last is the reference.
+        let a = joint_test("abc", ["A", "B", "C"]);
+        let b = joint_test("bca", ["B", "C", "A"]);
+        let c = joint_test("cab", ["C", "A", "B"]);
+        for (other, tag) in [(&b, "bca"), (&c, "cab")] {
+            let rel = |u: f64, v: f64| (u - v).abs() / u.abs().max(v.abs()).max(1e-12);
+            assert!(
+                rel(a.statistic, other.statistic) < 1e-3
+                    && rel(a.edf, other.edf) < 1e-3
+                    && (a.p_value - other.p_value).abs() < 1e-3,
+                "joint term test must not depend on the reference class: \
+                 abc={a:?} vs {tag}={other:?}"
+            );
+        }
+        assert!(
+            a.p_value > 1e-6,
+            "fixture must keep the joint p-value off zero, got {}",
+            a.p_value
+        );
+    }
+    /// With three classes the per-class null `β_{a,x} = 0` is not the
+    /// penalty's shrinkage target: the reference-symmetric carrier penalizes
+    /// each class's deviation from the all-class mean, so the class-`a` estimate
+    /// is pulled toward class `b`'s effect and the per-class Wood test rejects a
+    /// true null far above its level (0.088 at `α = 0.01`, n = 2000, in
+    /// `bench/pvalue_calibration/pv-multi-predictor`). The per-class rows must
+    /// carry the typed reason instead of that p-value, while the all-classes
+    /// row, whose coefficient set the penalty does not reach outside of, stays
+    /// a test.
+    #[test]
+    fn three_class_per_class_rows_refuse_the_coupled_penalty() {
+        let td = tempdir().expect("tempdir");
+        let mut rng = SplitMix64(0x7E57_0002);
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut labels = Vec::with_capacity(n);
+        for _ in 0..n {
+            let xi = rng.unit();
+            // x moves class B only; A against the reference C has no x effect.
+            let eta = [0.0, (std::f64::consts::PI * xi).sin(), 0.0];
+            let weights = eta.map(f64::exp);
+            let u = rng.unit() * weights.iter().sum::<f64>();
+            let label = if u < weights[0] {
+                "A"
+            } else if u < weights[0] + weights[1] {
+                "B"
+            } else {
+                "C"
+            };
+            x.push(xi);
+            labels.push(label.to_string());
+        }
+        let train = dataset_xy(td.path(), "coupled", &x, &labels);
+        let config = FitConfig::default();
+        let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            init_lambda: 1.0,
+            max_iter: 60,
+            tol: 1e-6,
+            ..MultinomialFitRequest::new(&train, "y ~ s(x)", &config)
+        })
+        .expect("multinomial formula fit must succeed");
+
+        let rows = model.smooth_significance();
+        assert_eq!(rows.len(), 2, "one row per active class");
+        for row in &rows {
+            assert_eq!(
+                row.test,
+                Err(MultinomialSmoothTestUnavailable::PenaltyCouplesOutsideTestedSet),
+                "class {} row must refuse the class-coupled penalty",
+                row.class_label
+            );
+        }
+        let joint = model.joint_smooth_significance();
+        assert_eq!(joint.len(), 1, "one smooth term, one joint row");
+        let test = joint[0]
+            .test
+            .unwrap_or_else(|reason| panic!("joint term test unavailable: {reason}"));
+        assert!(
+            test.p_value.is_finite() && (0.0..=1.0).contains(&test.p_value),
+            "joint p-value out of range: {}",
+            test.p_value
         );
     }
 }

@@ -162,7 +162,7 @@ pub use result_types::{
     FittedLinkState, IdentifiedCoefficientSubspace, IdentifiedRankConstancy,
     InferenceCovarianceMode, NO_CRITERION_AT_EXACT_FIT,
     NewtonPolishRail, NewtonPolishRecord,
-    OuterCriterionCertificate,
+    OuterCriterionCertificate, PrimaryPredictorBlock,
     RailFaceKind,
     OuterHessianAbsence, OuterStationarityCertificate, OuterWarmStartRecord, RailCoordinate,
     RailTailEvidence,
