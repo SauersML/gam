@@ -283,8 +283,8 @@ fn fitted_formula_criterion(
         "[{label}] the smoothing-corrected covariance is not finite"
     );
     let criterion = Criterion {
-        y: request.y.to_owned(),
-        weights: request.weights.to_owned(),
+        y: (*request.y).clone(),
+        weights: (*request.weights).clone(),
         design: design.design.clone(),
         offset,
         penalties: design.penalties.clone(),
