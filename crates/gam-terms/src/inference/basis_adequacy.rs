@@ -217,7 +217,10 @@
 //! means `0.14–0.82` at `n = 200` and 24 null-plus-enrichment directions, 19%
 //! of null replicates are refused and the measured ones read KS `p ≈ 0.01`
 //! over 8000 — resolving that regime needs the next order of the expansion,
-//! not a tolerance.
+//! not a tolerance. Rarer events are further out of range: with 28–34
+//! expected events in 200 rows (`sin(2πx) − 2` on the log or logit scale)
+//! two-thirds of null replicates are refused, and the measured Poisson ones
+//! are conservative (size `0.030` at `0.05`, KS `p = 2e-4`).
 //!
 //! # What it does not claim
 //!

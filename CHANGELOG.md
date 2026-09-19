@@ -22,8 +22,24 @@
   adequate basis it rejected 2.3% of the time at 0.05 and 0.1% at 0.01 (1000 seeded
   replicates). It now refers `(T/r)·(ν − r)/(ν − T)` to `F(r, ν − r)`, the classical test of
   the enrichment columns added to the fit, and reports no p-value when `ν ≤ r` or `T ≥ ν`.
-  Estimated-scale `basis_checks` p-values are smaller than before. Known-scale families
-  (binomial, Poisson) are unchanged. Calibration is in `bench/pvalue_calibration/pv-model-comparison/`.
+  Estimated-scale `basis_checks` p-values are smaller than before. Calibration is in
+  `bench/pvalue_calibration/pv-model-comparison/`.
+- **`basis_check` on a canonical binomial or Poisson fit uses the score's conditional law**
+  (pyGAM audit, lane pv-model-comparison). The χ²_r reference for the score at the
+  penalized fit is only first order, and at small n it was miscalibrated in both
+  directions: at n = 200 with a default `s(x)` it was conservative (binomial size 0.032 at
+  0.05; with success probabilities 0.05–0.27 size 0.024 at 0.05, KS p ≈ 0), and with
+  Poisson means 0.14–1.0 its p-values failed a KS test against U(0, 1) (p ≈ 0). The score
+  is now taken at the unpenalized null MLE and referred to its law conditional on the
+  sufficient statistic `Xᵀ(w∘y)`, with its mean, covariance and fourth cumulant corrected
+  to O(1/n) (`c·χ²_{r/c}`, `c = 1 + K₄/(2r)`). Binomial and Poisson `basis_checks` p-values
+  change. Where the expansion leaves its range of validity (Σ not positive definite, or
+  `c ≤ 0`) the row reports provenance `conditional_reference_unavailable` and no p-value;
+  `null_fit_unavailable` means the null MLE could not be certified. A row that is not
+  measured omits the `p_value` key. **Open limit:** with rare events (28–34 expected
+  events in 200 rows) two-thirds of rows are refused and the Poisson p-values that are
+  reported are conservative (size 0.030 at 0.05, KS p = 2e-4); that regime needs the next
+  order of the expansion.
 - **The top-level `gamfit` namespace is 19 names** (PKG-06). `import gamfit` exposed about
   340 names: the core API next to every research helper, basis primitive, result class and
   error type, several under two names. The top level now holds the fit and load entry

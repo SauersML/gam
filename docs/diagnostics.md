@@ -184,7 +184,12 @@ leaves its range of validity — high-leverage rows at an extreme fitted mean �
 the row reports `provenance = "conditional_reference_unavailable"` and no
 `p_value` (about 7% of null replicates of a default `s(x)` binomial fit at
 `n = 200`; none at `n = 2000`). `"null_fit_unavailable"` means the null MLE
-itself could not be certified.
+itself could not be certified. The refused share grows as events get rarer:
+15–19% of `n = 200` rows at Poisson means or success probabilities around
+`0.1–1`, and two-thirds with 28–34 expected events in 200 rows. In that
+last regime the p-values that are reported are **not calibrated** (Poisson:
+size `0.030` at `0.05`, KS `p = 2e-4` against uniformity); treat them as
+unmeasured.
 
 Asking whether a direction the basis HAS is being over-smoothed is a
 smoothing-parameter question, and this report declines to answer it. It is also

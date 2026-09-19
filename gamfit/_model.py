@@ -828,8 +828,9 @@ class Model:
         in the fit's own IRLS weight metric. The statistic is
         :math:`T = U^{\top} V^{-} U / \hat\varphi` with
         :math:`U = \tilde Z^{\top} s` and :math:`V = \tilde Z^{\top} W \tilde Z`,
-        referred to :math:`\chi^2_r` (known dispersion) or :math:`F(r, \nu)`
-        (estimated).
+        referred to :math:`\chi^2_r` (known dispersion) or, with the scale
+        estimated on :math:`\nu` residual degrees of freedom, as the
+        added-variable :math:`(T/r)(\nu - r)/(\nu - T)` to :math:`F(r, \nu - r)`.
 
         For a canonical binomial (logit) or Poisson (log) fit that reference is
         only first order, and at small ``n`` its error is not small (a
