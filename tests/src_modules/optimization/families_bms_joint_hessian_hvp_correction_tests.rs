@@ -3498,6 +3498,22 @@ impl SplitMix64 {
     }
 }
 
+/// Shifts component `k` of `θ₁ = (mean_coeffs, variance stage)` by `delta`, in
+/// the order of [`LatentZConditionalCalibration::zeta_theta1_jacobian_row`]: the
+/// variance stage is `var_coeffs` when the Breusch-Pagan stage fired and the
+/// estimated constant `homoskedastic_var` when it did not (gam#3030).
+fn shift_theta1_component(cal: &mut LatentZConditionalCalibration, k: usize, delta: f64) {
+    let dm = cal.mean_coeffs.len();
+    if k < dm {
+        cal.mean_coeffs[k] += delta;
+    } else if cal.var_coeffs.is_empty() {
+        assert_eq!(k, dm, "constant variance stage has one component");
+        cal.homoskedastic_var += delta;
+    } else {
+        cal.var_coeffs[k - dm] += delta;
+    }
+}
+
 /// #1028 acceptance — Murphy–Topel generated-regressor SE correction oracle.
 ///
 /// Murphy–Topel (1985) propagates the FIRST-STAGE PARAMETER uncertainty
@@ -3602,17 +3618,9 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
     let h = 1e-5_f64;
     for k in 0..dim_theta1 {
         let mut cal_p = cal.clone();
-        if k < cal_p.mean_coeffs.len() {
-            cal_p.mean_coeffs[k] += h;
-        } else {
-            cal_p.var_coeffs[k - cal.mean_coeffs.len()] += h;
-        }
+        shift_theta1_component(&mut cal_p, k, h);
         let mut cal_m = cal.clone();
-        if k < cal_m.mean_coeffs.len() {
-            cal_m.mean_coeffs[k] -= h;
-        } else {
-            cal_m.var_coeffs[k - cal.mean_coeffs.len()] -= h;
-        }
+        shift_theta1_component(&mut cal_m, k, -h);
         let fd = (refit_beta(&cal_p) - refit_beta(&cal_m)) / (2.0 * h);
         let analytic = vbg[k];
         // SIGNED tolerance check: fd and analytic must agree including sign.
@@ -3667,17 +3675,9 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
         assert_eq!(vbg_prod.dim(), (1, dim_theta1));
         for k in 0..dim_theta1 {
             let mut cal_p = cal.clone();
-            if k < cal_p.mean_coeffs.len() {
-                cal_p.mean_coeffs[k] += h;
-            } else {
-                cal_p.var_coeffs[k - cal.mean_coeffs.len()] += h;
-            }
+            shift_theta1_component(&mut cal_p, k, h);
             let mut cal_m = cal.clone();
-            if k < cal_m.mean_coeffs.len() {
-                cal_m.mean_coeffs[k] -= h;
-            } else {
-                cal_m.var_coeffs[k - cal.mean_coeffs.len()] -= h;
-            }
+            shift_theta1_component(&mut cal_m, k, -h);
             let fd = (refit_beta(&cal_p) - refit_beta(&cal_m)) / (2.0 * h);
             let analytic = vbg_prod[[0, k]];
             assert!(
@@ -3716,7 +3716,7 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
     // first-order propagation variance it targets — strictly the right oracle.
     let pert_scale = 0.25_f64;
     let mt_first_order_scaled = pert_scale * pert_scale * mt_correction;
-    // Lower Cholesky V₁ = L Lᵀ (small dim_theta1; V₁ is block-diagonal PSD).
+    // Lower Cholesky V₁ = L Lᵀ (small dim_theta1; V₁ is the PSD stacked sandwich).
     let chol = {
         let p = dim_theta1;
         let mut l = Array2::<f64>::zeros((p, p));
@@ -3737,7 +3737,6 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
         l
     };
     let boot = 20000usize;
-    let dm = cal.mean_coeffs.len();
     let mut boot_mean = 0.0_f64;
     let mut boot_m2 = 0.0_f64;
     for b in 0..boot {
@@ -3750,11 +3749,7 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
                 delta += chol[[r, col]] * stdn[col];
             }
             delta *= pert_scale;
-            if r < dm {
-                cal_star.mean_coeffs[r] += delta;
-            } else {
-                cal_star.var_coeffs[r - dm] += delta;
-            }
+            shift_theta1_component(&mut cal_star, r, delta);
         }
         // Reject draws that floor the variance (out of the linear regime); rare.
         let beta_star = refit_beta(&cal_star);

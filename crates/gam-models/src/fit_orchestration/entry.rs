@@ -58,14 +58,12 @@ pub fn canonical_standard_fit_options(
         // works for every family (the `COV_MAX_P` diagonal fallback caps cost).
         compute_inference: true,
         // Formula/CLI fits are the interactive/default path: keep coefficient
-        // covariance and the smoothing correction, and emit the CHEAP Tier-0
-        // live-rho posterior adequacy diagnostic (a handful of outer-criterion
-        // evaluations), which the optimizer surfaces regardless of this flag
-        // whenever it is cheaply available (#1810). This flag only suppresses the
-        // EXPENSIVE escalation tiers (Tier-1 quadrature / Tier-2 NUTS over rho),
-        // which could otherwise launch NUTS and turn ordinary fits into sampler
-        // benchmarks. Lower-level callers that explicitly need the escalation opt
-        // in elsewhere (`skip_rho_posterior_inference: false`).
+        // covariance and the smoothing correction, and request no rho-posterior
+        // inference. The Tier-0 adequacy diagnostic and the escalation tiers it
+        // selects (Tier-1 quadrature / Tier-2 NUTS over rho) have no reader on
+        // this path, so the fit publishes `NotComputed(InferenceNotRequested)`
+        // and spends no criterion evaluation on them (#3010). Callers that read
+        // them opt in (`skip_rho_posterior_inference: false`).
         skip_rho_posterior_inference: true,
         // The count for the loops that still take one: the negative-binomial
         // alternation, the expectile LAWS iterations, the bounded-effect

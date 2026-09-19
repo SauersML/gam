@@ -7,13 +7,17 @@
 //! surface it on the fit artifact, so the tiers that consume it (1-2) have a
 //! real entry point. It asserts the diagnostic is present and structurally
 //! sound, and that it is deterministic across identical fits.
+//!
+//! The seam runs only on request (#3010): a default formula fit has no reader
+//! for the diagnostic, so it publishes `NotComputed(InferenceNotRequested)`.
+//! These tests request it explicitly on the materialized request, and check
+//! that requesting it leaves the fitted model unchanged.
 
 use csv::StringRecord;
 use gam::inference::data::EncodedDataset;
-use gam::inference::rho_posterior::RhoPosteriorOutcome;
-use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
+use gam::inference::rho_posterior::{RhoPosteriorNotComputed, RhoPosteriorOutcome};
+use gam::solver::fit_orchestration::{FitRequest, FitResult, fit_model, materialize};
+use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -45,18 +49,29 @@ fn build_dataset(seed: u64) -> EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
 }
 
-fn fit_and_take_adequacy(
-    seed: u64,
-) -> (f64, gam::inference::rho_posterior::RhoPosteriorAdequacy) {
+/// Fit `y ~ s(x) + z` through the materialized standard request, with
+/// `ρ`-posterior inference requested or not.
+fn fit(seed: u64, request_rho_posterior: bool) -> gam::solver::fit_orchestration::StandardFitResult {
     let ds = build_dataset(seed);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x) + z", &ds, &cfg).expect("gam fit");
-    let FitResult::Standard(fit) = result else {
+    let mut materialized = materialize("y ~ s(x) + z", &ds, &cfg).expect("materialize");
+    let FitRequest::Standard(request) = &mut materialized.request else {
+        panic!("a gaussian `s(x) + z` fit materializes a standard request");
+    };
+    request.options.skip_rho_posterior_inference = !request_rho_posterior;
+    let FitResult::Standard(fit) = fit_model(materialized.request).expect("gam fit") else {
         panic!("expected a standard GAM fit");
     };
+    fit
+}
+
+fn fit_and_take_adequacy(
+    seed: u64,
+) -> (f64, gam::inference::rho_posterior::RhoPosteriorAdequacy) {
+    let fit = fit(seed, true);
     let reml_score = fit
         .fit
         .reml_score()
@@ -65,10 +80,42 @@ fn fit_and_take_adequacy(
         RhoPosteriorOutcome::Assessed(adequacy) => adequacy.clone(),
         other => panic!(
             "a smooth-term Gaussian GAM has ρ parameters and an SPD outer Hessian, so the \
-             Tier-0 ρ-posterior seam must grade the real fit artifact, got {other:?}"
+             requested Tier-0 ρ-posterior seam must grade the real fit artifact, got {other:?}"
         ),
     };
     (reml_score, adequacy)
+}
+
+/// #3010: a default fit does not run the seam, and requesting it changes
+/// nothing about the fitted model. With the `ρ`-posterior fields cleared, the
+/// two fits serialize to the same bytes (`float_roundtrip` JSON writes each
+/// float's exact value).
+#[test]
+fn a_default_fit_does_not_run_the_seam_and_requesting_it_leaves_the_model_unchanged_3010() {
+    init_parallelism();
+    let default_fit = fit(938_003, false);
+    let requested = fit(938_003, true);
+    assert_eq!(
+        default_fit.fit.artifacts.rho_posterior,
+        RhoPosteriorOutcome::NotComputed(RhoPosteriorNotComputed::InferenceNotRequested),
+        "a default fit has no reader for the diagnostic"
+    );
+    assert!(default_fit.fit.artifacts.rho_posterior_escalation.is_none());
+    assert!(
+        matches!(requested.fit.artifacts.rho_posterior, RhoPosteriorOutcome::Assessed(_)),
+        "the requested seam grades the fit, got {:?}",
+        requested.fit.artifacts.rho_posterior
+    );
+    let model_bytes = |fit: &gam::solver::fit_orchestration::StandardFitResult| {
+        let mut model = fit.fit.clone();
+        model.artifacts.rho_posterior = RhoPosteriorOutcome::default();
+        model.artifacts.rho_posterior_escalation = None;
+        serde_json::to_string(&model).expect("serialize the fitted model")
+    };
+    assert!(
+        model_bytes(&default_fit) == model_bytes(&requested),
+        "requesting the rho-posterior seam changed the fitted model"
+    );
 }
 
 /// The seam delivers: a real fit carries an Assessed Tier-0 outcome with a finite

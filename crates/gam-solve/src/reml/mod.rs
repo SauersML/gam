@@ -5478,6 +5478,33 @@ impl RemlArena {
             lastgradient_used_stochastic_fallback: AtomicBool::new(false),
         }
     }
+
+    /// Run post-convergence work without charging it to the search.
+    ///
+    /// `outer_cost_evals` and `inner_pirls_solves` report the work the
+    /// smoothing-parameter search did (#1575), and work guards read them as
+    /// such. Inference run at the converged `ρ̂` afterwards (the #938 Tier-0
+    /// diagnostic and the tiers it selects) evaluates the same criterion, so
+    /// both counters are put back to their values at entry once it returns: a
+    /// fit that requests that inference reports the same search as one that
+    /// does not.
+    pub(crate) fn without_charging_the_search<T>(&self, work: impl FnOnce() -> T) -> T {
+        let cost_evals = *self
+            .cost_eval_count
+            .read()
+            .expect("cost-eval counter lock is never held across a panic");
+        let inner_solves = self
+            .inner_pirls_solve_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let result = work();
+        *self
+            .cost_eval_count
+            .write()
+            .expect("cost-eval counter lock is never held across a panic") = cost_evals;
+        self.inner_pirls_solve_count
+            .store(inner_solves, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
 }
 
 /// The ρ at which a fit decides the #784 block-local correction's admission,

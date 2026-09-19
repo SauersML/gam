@@ -2393,8 +2393,9 @@ where
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<InferenceHessianFactor> = None;
-    // The Tier-0 seam runs only inside the inference pass below; a fit run without
-    // inference keeps this typed reason instead of an unexplained absence (#2627).
+    // The Tier-0 seam runs only inside the inference pass below, and only when the
+    // caller requested rho-posterior inference (#3010); any other fit keeps this
+    // typed reason instead of an unexplained absence (#2627).
     let mut rho_posterior = gam_problem::rho_posterior::RhoPosteriorOutcome::NotComputed(
         gam_problem::rho_posterior::RhoPosteriorNotComputed::InferenceNotRequested,
     );
@@ -3381,6 +3382,22 @@ where
         // correction lands on the same c² variance scale as `Vb = cov_scale·H_opt⁻¹`
         // (#582); the var_beta = Cov_ρ[β̂] block is already on that scale and
         // stays unscaled.
+        // The ρ-block rails, not the theta-wide `railed_facts`: the Hessians
+        // judged and sampled below are ρ-Hessians, and a railed link-shape
+        // coordinate is not one of their axes.
+        let certified_railed_rho: Vec<usize> = outer_result
+            .criterion_certificate
+            .as_ref()
+            .map(|certificate| {
+                certificate
+                    .lambdas_railed
+                    .iter()
+                    .copied()
+                    .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
+                    .filter(|&index| index < final_rho.len())
+                    .collect()
+            })
+            .unwrap_or_default();
         if beta_covariance_unscaled.is_some() {
             let no_outer_gradient = Array1::<f64>::zeros(0);
             // #2748 -- THE RESOLUTION THE CERTIFICATE'S VERDICT WAS TAKEN AT.
@@ -3462,22 +3479,6 @@ where
                 )
             }))
             .collect();
-            // The ρ-block rails, not the theta-wide `railed_facts`: the Hessian
-            // judged below is the ρ-Hessian, and a railed link-shape
-            // coordinate is not one of its axes.
-            let certified_railed_rho: Vec<usize> = outer_result
-                .criterion_certificate
-                .as_ref()
-                .map(|certificate| {
-                    certificate
-                        .lambdas_railed
-                        .iter()
-                        .copied()
-                        .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
-                        .filter(|&index| index < final_rho.len())
-                        .collect()
-                })
-                .unwrap_or_default();
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
                 // The box the outer arm searched and the shipped-point
@@ -3601,30 +3602,31 @@ where
         // read the PSIS k̂ that says whether the plug-in + first-order V_ρ
         // correction is adequate. This is the objective-lifecycle seam — the
         // diagnostic runs against the SAME objective the fit converged on, so
-        // its criterion is the fit's own bit-for-bit (no retain/rebuild). Absent
-        // when there are no smoothing parameters or the outer Hessian is
-        // unavailable; never fatal.
+        // its criterion is the fit's own bit-for-bit (no retain/rebuild).
         //
-        // The Tier-0 diagnostic is CHEAP (a handful of outer-criterion
-        // evaluations) so it is emitted regardless of `skip_rho_posterior_inference`
-        // whenever it is available (#1810) — the standard formula/CLI fit surfaces
-        // its ρ-posterior adequacy grade by default. Only the EXPENSIVE escalation
-        // tiers (Tier-1 quadrature / Tier-2 NUTS over ρ) are gated by the flag:
-        // interactive formula/CLI fits keep `skip_rho_posterior_inference = true`
-        // so a fit whose plug-in grades `Escalate` never turns into a sampler
-        // benchmark, while lower-level callers that opt in (`skip = false`) get
-        // the auto-selected escalation tier (quadrature for K≤4, NUTS over ρ for
-        // K≤16, honest Unavailable beyond) at this same live seam.
-        (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-            &final_rho,
-            // The box is where λ is numerically resolvable, not the
-            // posterior's support: a draw past a saturated face is valued by
-            // the criterion's exact affine limit from that face, so no
-            // posterior mass is dropped when the box edge moves.
-            &rho_continuation,
-            !opts.skip_rho_posterior_inference,
-            None,
-        );
+        // It runs only on request (#3010): the diagnostic and the escalation
+        // tiers it selects (Tier-1 quadrature / Tier-2 NUTS over ρ) are inference
+        // a caller asks for with `skip_rho_posterior_inference = false`. A
+        // default fit has no reader for them, so it publishes the
+        // `NotComputed(InferenceNotRequested)` initialized above and spends no
+        // criterion evaluation here; the fitted model, its search-work counters
+        // included, is the same either way.
+        if !opts.skip_rho_posterior_inference {
+            (rho_posterior, rho_posterior_escalation) =
+                reml_state.arena.without_charging_the_search(|| {
+                    reml_state.rho_posterior_inference(
+                        &final_rho,
+                        // The box is where λ is numerically resolvable, not the
+                        // posterior's support: a draw past a saturated face is
+                        // valued by the criterion's exact affine limit from that
+                        // face, so no posterior mass is dropped when the box
+                        // edge moves.
+                        &rho_continuation,
+                        &certified_railed_rho,
+                        None,
+                    )
+                });
+        }
 
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass

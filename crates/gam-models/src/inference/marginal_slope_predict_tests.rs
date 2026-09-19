@@ -396,7 +396,7 @@ fn conditional_latent_calibration_conditions_on_the_named_design_block() {
         homoskedastic_var: 0.64,
         post_mean: 0.0,
         post_sd: 1.0,
-        theta1_cov: Array2::<f64>::zeros((2, 2)),
+        theta1_cov: Array2::<f64>::zeros((3, 3)),
     };
     let x = array![-1.0, 0.0, 2.0];
     let z = array![0.75, 0.25, 1.25];
