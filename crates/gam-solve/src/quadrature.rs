@@ -2107,7 +2107,70 @@ pub fn integrated_inverse_link_mean_and_derivative(
             dmean_dmu: 1.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+            let jet = reciprocal_link_posterior_jet(link, mu, sigma)?;
+            Ok(IntegratedMeanDerivative {
+                mean: jet.mean,
+                dmean_dmu: jet.d1,
+                mode: jet.mode,
+            })
+        }
     }
+}
+
+/// Posterior mean of a reciprocal-power inverse link, `μ = η^{-1}` or
+/// `μ = η^{-1/2}`, under `η ~ N(mu, sigma²)`, with its `mu`-derivatives.
+///
+/// The Gaussian has mass on `η ≤ 0`, where `1/η` is not integrable and
+/// `η^{-1/2}` is not real, so the mean is the real part of `E[g⁻¹(η + i0)]`:
+/// the Cauchy principal value (via Dawson's integral) for `1/η` and the
+/// positive-half integral for `η^{-1/2}`. Both reduce to the plug-in at
+/// `sigma = 0` and match the moment expansion of `g⁻¹` about `mu` to every
+/// order (see `gam_math::gaussian_reciprocal`).
+///
+/// The linear predictor itself must lie in the link's domain `η > 0`: a
+/// posterior centred on or below zero describes no positive mean.
+fn reciprocal_link_posterior_jet(
+    link: LinkFunction,
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    if !(mu.is_finite() && mu > 0.0 && sigma.is_finite() && sigma >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior mean requires a finite linear predictor inside its domain eta > 0 \
+             and a finite nonnegative standard error; got eta = {mu}, se = {sigma}",
+            link.name()
+        )));
+    }
+    let [mean, d1, d2, d3] = match link {
+        LinkFunction::Inverse => gam_math::gaussian_reciprocal::principal_value_inverse_normal_jet(mu, sigma),
+        LinkFunction::InverseSquared => {
+            // `η^{-1/2}` is the inverse of the `1/μ²` link.
+            gam_math::gaussian_reciprocal::positive_part_inverse_sqrt_normal_jet(mu, sigma)
+        }
+        other => {
+            return Err(EstimationError::InvalidInput(format!(
+                "reciprocal-link posterior mean reached non-reciprocal link {other:?}"
+            )));
+        }
+    };
+    if ![mean, d1, d2, d3].iter().all(|value| value.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior mean is not representable at eta = {mu}, se = {sigma}",
+            link.name()
+        )));
+    }
+    Ok(IntegratedInverseLinkJet {
+        mean,
+        d1,
+        d2,
+        d3,
+        mode: if sigma == 0.0 {
+            IntegratedExpectationMode::ExactClosedForm
+        } else {
+            IntegratedExpectationMode::ExactSpecialFunction
+        },
+    })
 }
 
 #[inline]
@@ -2207,6 +2270,9 @@ pub(crate) fn integrated_inverse_link_jet(
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+            reciprocal_link_posterior_jet(link, mu, sigma)
+        }
     }
 }
 
@@ -2614,13 +2680,50 @@ pub fn integrated_family_moments_jet(
             let variance = resolved_scale
                 .gaussian_phi()
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            // Identity or the reciprocal link; the legality table admits no other.
+            let jet = integrated_inverse_link_jet(quadctx, spec.link.link_function(), e, se)?;
             Ok(IntegratedMomentsJet {
-                mean: e,
+                mean: jet.mean,
                 variance,
-                d1: 1.0,
-                d2: 0.0,
-                d3: 0.0,
-                mode: IntegratedExpectationMode::ExactClosedForm,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        ResponseFamily::Gamma | ResponseFamily::InverseGaussian
+            if !matches!(spec.link, InverseLink::Standard(StandardLink::Log)) =>
+        {
+            // Reciprocal links: `1/μ` (Gamma) or `1/μ²` (inverse Gaussian).
+            let jet = integrated_inverse_link_jet(quadctx, spec.link.link_function(), e, se)?;
+            let mean = jet.mean;
+            let variance = if matches!(spec.response, ResponseFamily::Gamma) {
+                resolved_scale
+                    .gamma_phi()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+                    * mean
+                    * mean
+            } else {
+                resolved_scale
+                    .dispersion_phi()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+                    * mean
+                    * mean
+                    * mean
+            };
+            if !(variance.is_finite() && variance >= 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "integrated {} variance is not representable: {variance:?}",
+                    spec.response.name()
+                )));
+            }
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
             })
         }
         ResponseFamily::RoystonParmar => {
@@ -2660,8 +2763,9 @@ pub fn integrated_family_moments_jet(
         ResponseFamily::Poisson
         | ResponseFamily::Tweedie { .. }
         | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Gamma => {
-            // Log-normal MGF: E[exp(η)] = exp(e + s²/2)
+        | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian => {
+            // Log link. Log-normal MGF: E[exp(η)] = exp(e + s²/2)
             // d/de = exp(e + s²/2)   (same as the mean)
             // d²/de² = exp(e + s²/2)
             // d³/de³ = exp(e + s²/2)
@@ -2672,6 +2776,7 @@ pub fn integrated_family_moments_jet(
             //   Tweedie(p):        Var = φ · m^p           (φ from `scale`)
             //   NegativeBinomial:  Var = m + m² / theta    (φ ≡ 1, overdispersion in theta)
             //   Gamma (shape k):   Var = m² / k = φ · m²   (k from `scale`, φ = 1/k)
+            //   InverseGaussian:   Var = φ · m³            (φ from `scale`)
             // The Tweedie φ and Gamma shape are genuine free dispersion parameters
             // (see `LikelihoodScaleMetadata`), so they are read from `scale` rather
             // than assumed unit. A Gamma/Tweedie response whose `scale` does not
@@ -2697,9 +2802,15 @@ pub fn integrated_family_moments_jet(
                         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                     phi * mean * mean
                 }
-                // Unreachable: this match arm is only entered for the four families
-                // in the enclosing `Poisson | Tweedie | NegativeBinomial | Gamma`
-                // pattern, all handled above.
+                ResponseFamily::InverseGaussian => {
+                    let phi = resolved_scale
+                        .dispersion_phi()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                    phi * mean * mean * mean
+                }
+                // Unreachable: this match arm is only entered for the five families
+                // in the enclosing `Poisson | Tweedie | NegativeBinomial | Gamma |
+                // InverseGaussian` pattern, all handled above.
                 other => {
                     return Err(EstimationError::InvalidInput(format!(
                         "integrated log-normal moments reached unexpected family {other:?}"
