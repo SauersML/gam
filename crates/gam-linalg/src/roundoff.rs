@@ -100,6 +100,22 @@ pub fn compensated_band(formation_roundings: usize, absolute_sum: f64) -> f64 {
     (2.0 + formation_roundings as f64) * UNIT_ROUNDOFF * absolute_sum
 }
 
+/// The absolute summands behind a gradient summed from terms (#2976, #2822).
+///
+/// A gradient summed from rows carries the rounding of that sum, which scales with
+/// the summands' magnitudes and not with the assembled result: near a mode each
+/// row's term is `O(1)` while their sum is small. Coordinate `j` of the computed sum
+/// is within `accumulation_growth(accumulation_depth) · absolute_sums[j]` of the exact
+/// sum of the same computed terms.
+pub struct GradientAccumulation {
+    /// The sequential depth of the floating-point reduction that sums the terms:
+    /// the `m` of the `γ_m` that bands the sum.
+    pub accumulation_depth: usize,
+    /// `Σ |terms|` per coordinate: every product the reduction adds into that
+    /// coordinate, in absolute value.
+    pub absolute_sums: ndarray::Array1<f64>,
+}
+
 /// Backward-error band on the singular values of an `m × n` factor with largest
 /// singular value `sigma_max`.
 ///

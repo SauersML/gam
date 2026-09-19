@@ -25,7 +25,9 @@ _BaseT = TypeVar("_BaseT", bound="_BaseGAMEstimator")
 # the SurvivalPrediction object returned by Model.predict.
 
 
-def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str]]:
+def _prepare_fit_input(
+    X: Any, y: Any, formula: str | None
+) -> tuple[Any, str, list[str]]:
     rust = rust_module()
     if isinstance(y, str):
         columns, _kind = table_columns(X)
@@ -57,7 +59,7 @@ def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str
 
 @dataclass
 class _BaseGAMEstimator(BaseEstimator):
-    formula: str
+    formula: str | None = None
     family: str = "auto"
     offset: str | None = None
     weights: str | None = None
@@ -73,7 +75,8 @@ class _BaseGAMEstimator(BaseEstimator):
             weights=self.weights,
             config=self.config,
         )
-        self.formula_ = fit_formula
+        # The fitted formula, with an automatic `.` expanded by the engine.
+        self.formula_ = getattr(self.model_, "formula", fit_formula)
         self.feature_names_in_ = np.asarray(feature_names, dtype=object)
         self.n_features_in_ = len(feature_names)
         return self
@@ -104,7 +107,7 @@ class _BaseGAMEstimator(BaseEstimator):
 class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
     """scikit-learn-compatible regressor wrapping :func:`gamfit.fit`.
 
-    Construct with a formula string and (optionally) pipeline kwargs such as
+    Construct with an optional formula string and pipeline kwargs such as
     ``family``, ``offset``, ``weights``, or a free-form ``config`` dict, then
     call :meth:`fit` with either a fully-formed table (``X``) or a feature
     table plus a target column / vector (``y``). After fitting, the estimator
@@ -114,9 +117,16 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
 
     Parameters
     ----------
-    formula : str
+    formula : str or None, default ``None``
         Wilkinson-style formula. May or may not include the response on the
         left-hand side; the response is resolved from ``y`` if missing.
+        ``None`` fits the automatic formula ``y ~ .``: the engine builds one
+        term per feature column from its schema (``s(x)`` for numeric
+        columns with at least three distinct values, a linear term for
+        two-valued numeric and boolean columns, ``factor(g)`` for
+        categorical and string columns, constant columns dropped with a
+        warning). Every such term is penalized and can shrink to zero; the
+        formula actually fitted is ``formula_`` after :meth:`fit`.
     family : str, default ``"auto"``
         Likelihood family forwarded to :func:`gamfit.fit`.
     offset : str or None, optional
@@ -130,6 +140,8 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
     --------
     >>> from gamfit.sklearn import GAMRegressor
     >>> reg = GAMRegressor(formula="y ~ s(x1) + s(x2)").fit(X_train, y_train)
+    >>> GAMRegressor().fit(X_train, y_train).formula_
+    'y ~ s(x1) + s(x2)'
     >>> preds = reg.predict(X_test)
     >>> reg.score(X_test, y_test)
     0.87
@@ -148,7 +160,7 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
             Target. ``str`` names a column already in ``X``; an array-like is
             bound to ``X`` under the response name implied by ``formula``;
             ``None`` means ``X`` already contains the response named by
-            ``formula``.
+            ``formula`` (which then must be given).
 
         Returns
         -------

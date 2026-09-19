@@ -3094,6 +3094,13 @@ pub(crate) enum StationarityBoundSource {
     /// there, so the point is refused by this type instead of railed. The bound
     /// is the decrement verdict's.
     RepresentabilityFace,
+    /// A mint whose polish backtracked along its Newton step, down to where the
+    /// quadratic model's own decrease reaches `band_f`, and found no step that
+    /// lowers the criterion by more than `band_f`, with no limit face lowering it
+    /// either (#3012). The decrement promises a decrease the criterion does not
+    /// deliver along the Newton direction, so the point is refused by this type.
+    /// The bound is the decrement verdict's.
+    NewtonBacktrackUnresolved,
 }
 
 impl StationarityBoundSource {
@@ -3108,6 +3115,7 @@ impl StationarityBoundSource {
             Self::NewtonDecrement => "newton-decrement",
             Self::NewtonDecrementUndecided => "newton-decrement-undecided",
             Self::RepresentabilityFace => "representability-face",
+            Self::NewtonBacktrackUnresolved => "newton-backtrack-unresolved",
         }
     }
 

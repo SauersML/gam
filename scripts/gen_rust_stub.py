@@ -243,6 +243,9 @@ class Crate:
         dataclasses.field(default_factory=list)
     )
     constants: dict[str, list[Token]] = dataclasses.field(default_factory=dict)
+    # `#[derive(FromPyObject)]` enums: Rust name -> the field types of each
+    # tuple variant, tried in order by PyO3's extraction.
+    extractions: dict[str, list[list[list[Token]]]] = dataclasses.field(default_factory=dict)
 
 
 def parse_attribute(tokens: Sequence[Token], index: int) -> tuple[Attribute, int]:
@@ -438,6 +441,40 @@ def parse_struct(
     return end
 
 
+def derives_from_py_object(attrs: Sequence[Attribute]) -> bool:
+    return any(
+        attribute.name == "derive"
+        and any(arg and arg[-1].text == "FromPyObject" for arg in attribute_args(attribute))
+        for attribute in attrs
+    )
+
+
+def parse_extraction_enum(tokens: Sequence[Token], index: int, crate: Crate) -> int:
+    """Parse a ``#[derive(FromPyObject)] enum`` with ``tokens[index] == 'enum'``.
+
+    PyO3 extracts such an enum by trying each variant in order: a one-field
+    tuple variant accepts what its field accepts, a wider one a tuple of its
+    fields. Struct variants extract by attribute name, which no annotation
+    here expresses, so they are refused.
+    """
+    rust_name = tokens[index + 1].text
+    index = skip_generics(tokens, index + 2)
+    close = matching(tokens, index)
+    variants: list[list[list[Token]]] = []
+    for part in split_top_level(tokens[index + 1 : close]):
+        position = 0
+        while position < len(part) and part[position].text == "#":
+            _, position = parse_attribute(part, position)
+        if position + 1 >= len(part) or part[position + 1].text != "(":
+            raise ValueError(
+                f"{part[position].origin}: FromPyObject enum {rust_name} needs tuple variants"
+            )
+        fields = matching(part, position + 1)
+        variants.append(split_top_level(part[position + 2 : fields]))
+    crate.extractions[rust_name] = variants
+    return close + 1
+
+
 def parse_impl(tokens: Sequence[Token], index: int, crate: Crate) -> int:
     """Parse a ``#[pymethods] impl Type { ... }`` block."""
     index = skip_generics(tokens, index + 1)
@@ -531,6 +568,10 @@ def parse_file(path: Path, crate: Crate) -> None:
             continue
         if keyword in ("struct", "enum") and has_attr(attrs, "pyclass"):
             index = parse_struct(tokens, position, attrs, crate)
+            attrs = []
+            continue
+        if keyword == "enum" and derives_from_py_object(attrs):
+            index = parse_extraction_enum(tokens, position, crate)
             attrs = []
             continue
         if keyword == "impl" and has_attr(attrs, "pymethods"):
@@ -663,6 +704,7 @@ class TypeMapper:
 
     def __init__(self, crate: Crate, qualifier: str = "") -> None:
         self.classes = {rust: qualifier + cls.python_name for rust, cls in crate.classes.items()}
+        self.extractions = crate.extractions
 
     def annotate(self, ty: Ty, *, argument: bool, owner: str | None) -> str:
         name, args = ty.name, ty.args
@@ -672,6 +714,12 @@ class TypeMapper:
             return owner
         if name in self.classes:
             return self.classes[name]
+        if name in self.extractions:
+            if not argument:
+                raise ValueError(f"{ty.origin}: FromPyObject enum {name} is never returned")
+            return " | ".join(
+                self._extracted_variant(fields, owner) for fields in self.extractions[name]
+            )
         if name in _TRANSPARENT:
             (wrapped,) = args
             return self.annotate(wrapped, argument=argument, owner=owner)
@@ -716,6 +764,10 @@ class TypeMapper:
                 self.annotate(a, argument=argument, owner=owner) for a in args
             ) + "]"
         raise ValueError(f"{ty.origin}: no Python type for Rust type `{name}`")
+
+    def _extracted_variant(self, fields: Sequence[Sequence[Token]], owner: str | None) -> str:
+        types = [self.annotate(parse_type(field), argument=True, owner=owner) for field in fields]
+        return types[0] if len(types) == 1 else "tuple[" + ", ".join(types) + "]"
 
 
 # --------------------------------------------------------------------------
