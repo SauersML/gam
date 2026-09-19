@@ -26,6 +26,13 @@
   bindings `model_conditional_aic` and `compare_reml_fits` and the helper
   `ranking_score_from_summary_payload` are deleted.
 
+- **Fitted models pickle, copy and cross process boundaries** (pyGAM audit api F1 / PKG-02).
+  `pickle.dumps`, `copy.deepcopy`, `joblib.dump` and `joblib.Parallel` refused a fitted
+  `Model`, `MultinomialModel` or sklearn `GAMRegressor`/`GAMClassifier` with
+  `cannot pickle '_FittedModel'`. They now serialize the saved-model bytes `dumps()` returns
+  and rebuild through `gamfit.loads`, so a round trip is byte-identical and every accessor
+  returns bit-identical values. The compiled prediction handle is never pickled; it is
+  rebuilt from the bytes.
 - **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
   accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
   `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`
