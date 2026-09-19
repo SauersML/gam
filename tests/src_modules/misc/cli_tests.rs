@@ -620,6 +620,7 @@ fn empty_termspec() -> TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     }
 }
 
@@ -4134,6 +4135,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4174,6 +4176,7 @@ fn does_notwarn_for_singlemultivariate_matern_spatial_term() {
             shape: gam::smooth::ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4225,6 +4228,7 @@ fn warns_for_repeated_univariate_thinplate_spatial_terms() {
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string()];
 
@@ -4273,6 +4277,7 @@ fn warns_for_linear_terms_overlappingwith_smoothvariables() {
             shape: gam::smooth::ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4336,6 +4341,7 @@ fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string()];
 

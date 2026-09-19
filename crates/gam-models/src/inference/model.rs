@@ -1164,6 +1164,7 @@ impl FittedModelPayload {
                 linear_terms: Vec::new(),
                 smooth_terms: Vec::new(),
                 random_effect_terms: Vec::new(),
+                level: Default::default(),
             });
     }
 
@@ -6401,6 +6402,7 @@ mod tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     }
 
@@ -8033,6 +8035,7 @@ mod tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 

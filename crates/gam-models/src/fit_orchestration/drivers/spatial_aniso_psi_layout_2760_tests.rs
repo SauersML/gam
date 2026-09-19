@@ -71,6 +71,7 @@ mod spatial_aniso_psi_layout_2760_tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 
