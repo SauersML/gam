@@ -77,7 +77,7 @@ def test_competing_risks_predict_has_unit_survival_at_origin() -> None:
         }
     )
     pred = model.predict(pred_rows)
-    assert isinstance(pred, gamfit.CompetingRisksPrediction)
+    assert isinstance(pred, gamfit.results.CompetingRisksPrediction)
 
     times = np.asarray(pred.times, dtype=float)
     # The default grid for an entry==0 design starts exactly at the origin; that

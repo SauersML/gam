@@ -125,7 +125,7 @@ def test_numpy_scalars_in_a_categorical_column_carry_no_numpy_repr() -> None:
 
 
 def test_normalize_table_rejects_zero_row_mapping() -> None:
-    from gamfit import DataError
+    from gamfit.errors import DataError
 
     with pytest.raises(DataError, match="has no observations"):
         normalize_table({"x": [], "y": []})

@@ -96,7 +96,6 @@ pub(crate) use gam::terms::basis::{
     DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternLengthScale, MaternNu,
     OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
-    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
     bspline_derivative_penalty_matrix, bspline_tensor_first_derivative, build_duchon_basis,
     build_duchon_basis_mixed_periodicity_auto, build_duchon_basis_spec_chart,
     build_duchon_operator_penalty_matrices,
@@ -115,7 +114,8 @@ pub(crate) use gam::terms::basis::{
 pub(crate) use gam::terms::basis::input_loc_derivatives::contract_input_loc_gradient;
 
 pub(crate) use gam::terms::basis::position_basis::{
-    PositionBasisLocations, PositionPenaltyRequest, ResolvedPositionBasis, resolve_position_basis,
+    PositionBasisKind, PositionBasisLocations, PositionPenaltyRequest, ResolvedPositionBasis,
+    resolve_position_basis,
     validate_position_period,
 };
 

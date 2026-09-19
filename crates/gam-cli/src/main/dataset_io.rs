@@ -46,7 +46,8 @@ fn collect_categorical_role_columns(terms: &[ParsedTerm], out: &mut BTreeSet<Str
             | ParsedTerm::LinkWiggle { .. }
             | ParsedTerm::TimeWiggle { .. }
             | ParsedTerm::LinkConfig { .. }
-            | ParsedTerm::SurvivalConfig { .. } => {}
+            | ParsedTerm::SurvivalConfig { .. }
+            | ParsedTerm::NoIntercept => {}
         }
     }
 }

@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 import gamfit
-from gamfit import (
+from gamfit.penalties import (
     ARDPenalty,
     BlockOrthogonalityPenalty,
     MechanismSparsityPenalty,

@@ -45,13 +45,13 @@ string, object or plain-Python column as its raw values. Polars and pyarrow
 tables are decoded from Arrow memory directly. The engine then applies one rule
 to every untyped column: it is a factor if any cell is a string, otherwise
 numeric. A cell that is neither a number, a string nor missing (a date, a
-timestamp, a complex number, an arbitrary object) raises `gamfit.DataError`
+timestamp, a complex number, an arbitrary object) raises `gamfit.errors.DataError`
 naming its type, row and column, whichever library it came from. A column
 whose declared dtype is neither numbers nor labels (NumPy or pandas
 `datetime64`, `timedelta64`, `complex`; an Arrow date or timestamp) raises
-`gamfit.DataError` naming the column; encode such values as numbers first.
+`gamfit.errors.DataError` naming the column; encode such values as numbers first.
 Labels are trimmed on every path, and a label of only whitespace raises
-`gamfit.DataError` naming its row and column.
+`gamfit.errors.DataError` naming its row and column.
 Table normalization itself enforces only shape rules, because it runs before
 any formula is known:
 

@@ -245,9 +245,6 @@ pub(crate) fn resolve_fit_request_config(
     if let Some(flag) = json_config.firth {
         fit_config.firth = flag;
     }
-    if let Some(root) = json_config.persistent_warm_start_root {
-        fit_config = fit_config.with_persistent_warm_start_root(root);
-    }
     if let Some(raw_gpu) = json_config.gpu {
         fit_config.gpu_policy = parse_gpu_policy(&raw_gpu)?;
     }
@@ -473,30 +470,20 @@ mod tests {
         assert_eq!(on.precompute_conformal, Some(true));
     }
 
+    /// The on-disk warm-start root is not a request field: a cache directory
+    /// does not change the fitted model. The request document is
+    /// `deny_unknown_fields`, so a document naming it is refused by name rather
+    /// than silently ignored, and no request enables on-disk persistence.
     #[test]
-    fn persistent_warm_start_is_disabled_by_default_and_preserves_explicit_root_2639() {
+    fn persistent_warm_start_root_is_not_a_request_field() {
+        let error = resolved_json(json!({"persistent_warm_start_root": "warm-root"}))
+            .expect_err("the removed cache key is refused");
+        assert!(error.contains("persistent_warm_start_root"), "{error}");
         let defaulted = resolved_json(json!({})).expect("empty config resolves");
         assert!(
             defaulted.persistent_warm_start_store.is_none(),
-            "omitting the root must leave persistence disabled"
+            "a request cannot enable on-disk warm-start persistence"
         );
-
-        let exact_root = std::path::PathBuf::from("caller-owned/../warm-root");
-        let configured = resolved_json(json!({
-            "persistent_warm_start_root": exact_root
-        }))
-        .expect("an explicit persistence root resolves")
-        .persistent_warm_start_store
-        .expect("the root must become a store capability");
-        assert_eq!(
-            configured.root(),
-            exact_root,
-            "configuration must not canonicalize or relocate the caller's root"
-        );
-
-        let empty = resolved_json(json!({"persistent_warm_start_root": ""}))
-            .expect_err("an empty persistence root is not an explicit location");
-        assert!(empty.contains("persistent_warm_start_root must not be empty"));
     }
 
     #[test]
