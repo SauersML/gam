@@ -54,14 +54,14 @@ def _assert_block_curve(levels):
     assert term in names, f"expected block {term!r}; available: {names}"
 
     result = model.partial_dependence(term, n_points=25)
-    assert result["held"] == {"g": levels[0]}
-    assert result["quantity"] == "term_contribution"
-    assert result["scale"] == "linear_predictor"
+    assert result.held == {"g": levels[0]}
+    assert result.quantity == "term_contribution"
+    assert result.scale == "linear_predictor"
 
-    predicted = np.asarray(result["predicted"], dtype=float)
-    se = np.asarray(result["standard_error"], dtype=float)
+    predicted = result.fit
+    se = result.se
     expected, expected_se = _block_oracle(
-        model, term, np.asarray(result["grid"], dtype=float), levels[0]
+        model, term, result.x, levels[0]
     )
     np.testing.assert_allclose(predicted, expected, atol=1e-10)
     np.testing.assert_allclose(se, expected_se, atol=1e-10)

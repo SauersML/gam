@@ -161,6 +161,17 @@ topical guides for narrative explanations.
       heading_level: 3
       members_order: source
 
+::: gamfit.PartialEffect
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
+::: gamfit.AxisLevels
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.MultinomialModel
     options:
       show_root_heading: true

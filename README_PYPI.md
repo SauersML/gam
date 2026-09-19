@@ -123,7 +123,8 @@ est.fit(X, y)
 
 # Diagnose, plot, report
 model.diagnose(train).metrics
-model.plot(train, x="x", kind="prediction")
+model.plot_terms()                        # each term's partial effect with bands
+model.partial_dependence("s(x)").simultaneous_upper
 model.report("report.html")
 ```
 

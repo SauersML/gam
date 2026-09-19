@@ -4,11 +4,13 @@
 //! for a `by=` smooth, its by column. This module resolves a term block to its
 //! saved spec entry, sweeps its axes over the training range or a caller grid,
 //! pins a by column at the value the spec records, and fills every other schema
-//! column with a valid default. The result is an encoded table over the saved
+//! column with a valid default. A factor the block reads for every level (a
+//! bare factor term, or a factor smooth's grouping column) is an axis that
+//! takes the block's saved levels. The result is an encoded table over the saved
 //! schema that front ends hand to the model's design builder unchanged, so no
 //! term label is parsed and no cell is encoded a second time.
 
-use gam_data::{ColumnKindTag, DataSchema, EncodedDataset};
+use gam_data::{ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn};
 use gam_terms::smooth::{
     ByVarKind, ByVariableSpec, SmoothBasisSpec, TermCollectionSpec, smooth_term_feature_cols,
 };
@@ -26,15 +28,41 @@ pub struct PartialDependenceInputs<'a> {
 
 /// Where a term's axes are evaluated.
 pub enum PartialDependenceGrid {
-    /// `n_points` evenly spaced values over the one axis's training range.
+    /// The Cartesian product of `n_points` evenly spaced values over each
+    /// numeric axis's training range and every level of each factor axis, with
+    /// the last axis varying fastest.
     TrainingRange { n_points: usize },
-    /// One row per evaluation point and one column per axis, in the term's axis order.
+    /// One row per evaluation point and one column per axis, in the term's axis
+    /// order. A factor axis takes its levels' codes, as [`AxisLevels::values`] lists them.
     Explicit(Array2<f64>),
+}
+
+/// The values a factor axis can take, and their labels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AxisLevels {
+    /// The encoded value of each level, as a grid column holds it.
+    pub values: Vec<f64>,
+    pub labels: Vec<String>,
+}
+
+impl AxisLevels {
+    /// The label of the level encoded as `value`, if `value` is one of the levels.
+    pub fn label_of(&self, value: f64) -> Option<&str> {
+        self.values
+            .iter()
+            .position(|&level| level == value)
+            .map(|index| self.labels[index].as_str())
+    }
 }
 
 pub struct PartialDependenceTable {
     /// The term's axis columns, in the order the grid's columns follow.
     pub axes: Vec<String>,
+    /// For each axis, its levels when it is a factor axis and `None` when it is numeric.
+    pub axis_levels: Vec<Option<AxisLevels>>,
+    /// For the default grid, the values each axis sweeps; the grid is their
+    /// Cartesian product with the last axis varying fastest. `None` for a caller grid.
+    pub axis_values: Option<Vec<Vec<f64>>>,
     /// The evaluation points, `(n, axes.len())`.
     pub grid: Array2<f64>,
     /// One encoded row per grid point over the saved schema.
@@ -92,6 +120,8 @@ pub enum HeldValue {
 /// linear interaction's categorical gates). Indices are training columns.
 struct ResolvedTerm {
     axis_cols: Vec<usize>,
+    /// Axes the block reads at a level set it records, as encoded values.
+    axis_level_sets: Vec<(usize, Vec<f64>)>,
     pins: Vec<(usize, f64)>,
     /// The training column of a numeric by, whose smooth is reported as its coefficient function.
     numeric_by: Option<usize>,
@@ -170,7 +200,20 @@ pub fn partial_dependence_table(
         });
     }
 
-    let grid = match grid {
+    let axis_levels = axes
+        .iter()
+        .zip(&resolved.axis_cols)
+        .map(|(&column, training_col)| {
+            let recorded = resolved
+                .axis_level_sets
+                .iter()
+                .find(|(col, _)| col == training_col)
+                .map(|(_, values)| values.clone());
+            axis_levels_of(&schema.columns[column], recorded, term)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (grid, axis_values) = match grid {
         PartialDependenceGrid::Explicit(points) => {
             if points.ncols() != axes.len() {
                 return Err(format!(
@@ -186,44 +229,56 @@ pub fn partial_dependence_table(
                     "partial_dependence: grid values must be finite; got {value}"
                 ));
             }
-            points
+            for (index, levels) in axis_levels.iter().enumerate() {
+                let Some(levels) = levels else { continue };
+                if let Some(value) = points
+                    .column(index)
+                    .iter()
+                    .find(|value| levels.label_of(**value).is_none())
+                {
+                    return Err(format!(
+                        "partial_dependence: factor axis {:?} takes the level codes {:?} ({:?}); \
+                         the grid holds {value}",
+                        axis_names[index], levels.values, levels.labels
+                    ));
+                }
+            }
+            (points, None)
         }
         PartialDependenceGrid::TrainingRange { n_points } => {
-            let &[axis] = axes.as_slice() else {
-                return Err(format!(
-                    "partial_dependence: term {term:?} has axes {axis_names:?}, and a default grid \
-                     sweeps exactly one axis; pass a grid with one column per axis"
-                ));
-            };
             if n_points < 2 {
                 return Err(format!(
                     "partial_dependence: n_points must be at least 2; got {n_points}"
                 ));
             }
-            let column = &schema.columns[axis];
-            if column.kind != ColumnKindTag::Continuous {
-                return Err(format!(
-                    "partial_dependence: axis {:?} is not continuous, so it has no training range \
-                     to sweep; pass a grid",
-                    column.name
-                ));
-            }
-            let (lo, hi) = inputs.training_feature_ranges[axis];
-            if !(lo.is_finite() && hi.is_finite() && lo < hi) {
-                return Err(format!(
-                    "partial_dependence: training range for {:?} must be finite and increasing; \
-                     got ({lo:?}, {hi:?})",
-                    column.name
-                ));
-            }
-            let step = (hi - lo) / (n_points - 1) as f64;
-            Array2::from_shape_fn((n_points, 1), |(row, _)| {
-                if row + 1 == n_points {
-                    hi
-                } else {
-                    lo + step * row as f64
-                }
-            })
+            let values = axes
+                .iter()
+                .zip(&axis_levels)
+                .map(|(&axis, levels)| match levels {
+                    Some(levels) => Ok(levels.values.clone()),
+                    None => {
+                        let (lo, hi) = inputs.training_feature_ranges[axis];
+                        if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+                            return Err(format!(
+                                "partial_dependence: training range for {:?} must be finite and \
+                                 increasing; got ({lo:?}, {hi:?})",
+                                schema.columns[axis].name
+                            ));
+                        }
+                        let step = (hi - lo) / (n_points - 1) as f64;
+                        Ok((0..n_points)
+                            .map(|index| {
+                                if index + 1 == n_points {
+                                    hi
+                                } else {
+                                    lo + step * index as f64
+                                }
+                            })
+                            .collect())
+                    }
+                })
+                .collect::<Result<Vec<Vec<f64>>, String>>()?;
+            (cartesian_product(&values), Some(values))
         }
     };
 
@@ -272,11 +327,68 @@ pub fn partial_dependence_table(
     };
     Ok(PartialDependenceTable {
         axes: axis_names,
+        axis_levels,
+        axis_values,
         grid,
         table,
         held,
         quantity,
     })
+}
+
+/// The levels a factor axis takes: the level set the block records when it
+/// records one, else every saved level of a categorical column, and `{0, 1}`
+/// for a binary column. A continuous column the block does not level is numeric.
+fn axis_levels_of(
+    column: &SchemaColumn,
+    recorded: Option<Vec<f64>>,
+    term: &str,
+) -> Result<Option<AxisLevels>, String> {
+    let values = match (recorded, column.kind) {
+        (Some(values), _) => values,
+        (None, ColumnKindTag::Categorical) => (0..column.levels.len()).map(|code| code as f64).collect(),
+        (None, ColumnKindTag::Binary) => vec![0.0, 1.0],
+        (None, ColumnKindTag::Continuous) => return Ok(None),
+    };
+    if values.is_empty() {
+        return Err(format!(
+            "partial_dependence: term {term:?} reads factor {:?} at no levels",
+            column.name
+        ));
+    }
+    let labels = values
+        .iter()
+        .map(|&value| match column.kind {
+            ColumnKindTag::Categorical => column
+                .levels
+                .get(value as usize)
+                .filter(|_| value >= 0.0 && value.fract() == 0.0)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "partial_dependence: term {term:?} records level code {value} of factor \
+                         {:?}, which is not one of its {} saved levels",
+                        column.name,
+                        column.levels.len()
+                    )
+                }),
+            ColumnKindTag::Binary | ColumnKindTag::Continuous => Ok(format!("{value}")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(AxisLevels { values, labels }))
+}
+
+/// Rows of the Cartesian product of `values`, with the last axis varying fastest.
+fn cartesian_product(values: &[Vec<f64>]) -> Array2<f64> {
+    let rows: usize = values.iter().map(Vec::len).product();
+    Array2::from_shape_fn((rows, values.len()), |(row, axis)| {
+        let stride: usize = values[axis + 1..].iter().map(Vec::len).product();
+        values[axis][(row / stride) % values[axis].len()]
+    })
+}
+
+fn levels_from_bits(bits: &[u64]) -> Vec<f64> {
+    bits.iter().map(|&bits| f64::from_bits(bits)).collect()
 }
 
 fn resolve_term(spec: &TermCollectionSpec, term: &str) -> Result<ResolvedTerm, String> {
@@ -288,6 +400,7 @@ fn resolve_term(spec: &TermCollectionSpec, term: &str) -> Result<ResolvedTerm, S
         };
         return Ok(ResolvedTerm {
             axis_cols,
+            axis_level_sets: Vec::new(),
             pins: linear
                 .categorical_levels
                 .iter()
@@ -296,10 +409,28 @@ fn resolve_term(spec: &TermCollectionSpec, term: &str) -> Result<ResolvedTerm, S
             numeric_by: None,
         });
     }
+    if let Some(effect) = spec
+        .random_effect_terms
+        .iter()
+        .find(|effect| effect.name == term)
+    {
+        // One coefficient per level: the effect is a function of the level alone.
+        let levels = effect.frozen_levels.as_deref().ok_or_else(|| {
+            format!("partial_dependence: factor term {term:?} has no saved level set")
+        })?;
+        return Ok(ResolvedTerm {
+            axis_cols: vec![effect.feature_col],
+            axis_level_sets: vec![(effect.feature_col, levels_from_bits(levels))],
+            pins: Vec::new(),
+            numeric_by: None,
+        });
+    }
     if let Some(smooth) = spec.smooth_terms.iter().find(|smooth| smooth.name == term) {
         // A factor by-smooth is one block per level, and the block's spec records its
         // level, so the by column is held there. A numeric by multiplies the inner
         // smooth, and holding it at one reports the coefficient function itself.
+        // A block that carries every level of its factor reads the factor as an
+        // axis over the levels it records.
         let pin = match &smooth.basis {
             SmoothBasisSpec::ByVariable { by_col, by, .. } => Some((
                 *by_col,
@@ -312,16 +443,23 @@ fn resolve_term(spec: &TermCollectionSpec, term: &str) -> Result<ResolvedTerm, S
                 by_kind: ByVarKind::Numeric { feature_col },
                 ..
             } => Some((*feature_col, 1.0)),
+            _ => None,
+        };
+        let factor_axis = match &smooth.basis {
             SmoothBasisSpec::BySmooth {
-                by_kind: ByVarKind::Factor { .. },
+                by_kind:
+                    ByVarKind::Factor {
+                        feature_col,
+                        frozen_levels,
+                        ..
+                    },
                 ..
+            } => Some((*feature_col, frozen_levels.as_deref())),
+            SmoothBasisSpec::FactorSumToZero { by_col, levels, .. } => {
+                Some((*by_col, Some(levels.as_slice())))
             }
-            | SmoothBasisSpec::FactorSumToZero { .. }
-            | SmoothBasisSpec::FactorSmooth { .. } => {
-                return Err(format!(
-                    "partial_dependence: term {term:?} carries every level of its factor in one \
-                     block, so its partial effect depends on a level the block does not record"
-                ));
+            SmoothBasisSpec::FactorSmooth { spec } => {
+                Some((spec.group_col, spec.group_frozen_levels.as_deref()))
             }
             _ => None,
         };
@@ -341,8 +479,18 @@ fn resolve_term(spec: &TermCollectionSpec, term: &str) -> Result<ResolvedTerm, S
         if let Some((by_col, _)) = pin {
             axis_cols.retain(|&column| column != by_col);
         }
+        let mut axis_level_sets = Vec::new();
+        if let Some((factor_col, levels)) = factor_axis {
+            if !axis_cols.contains(&factor_col) {
+                axis_cols.push(factor_col);
+            }
+            if let Some(levels) = levels {
+                axis_level_sets.push((factor_col, levels_from_bits(levels)));
+            }
+        }
         return Ok(ResolvedTerm {
             axis_cols,
+            axis_level_sets,
             pins: pin.into_iter().collect(),
             numeric_by,
         });
@@ -351,24 +499,24 @@ fn resolve_term(spec: &TermCollectionSpec, term: &str) -> Result<ResolvedTerm, S
         .linear_terms
         .iter()
         .map(|linear| linear.name.as_str())
+        .chain(spec.random_effect_terms.iter().map(|effect| effect.name.as_str()))
         .chain(spec.smooth_terms.iter().map(|smooth| smooth.name.as_str()))
         .collect();
     Err(format!(
-        "partial_dependence: {term:?} is not a linear or smooth term of this model; available: \
-         {available:?}"
+        "partial_dependence: {term:?} is not a term of this model; available: {available:?}"
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_data::SchemaColumn;
     use gam_terms::basis::{
         BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
         OneDimensionalBoundary,
     };
     use gam_terms::smooth::{
-        BySmoothKind, LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothTermSpec,
+        BySmoothKind, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
+        ShapeConstraint, SmoothTermSpec,
     };
     use ndarray::array;
 
@@ -528,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn a_linear_interaction_holds_its_gate_and_a_two_axis_term_needs_a_grid() {
+    fn a_linear_interaction_holds_its_gate_and_a_two_axis_term_sweeps_a_product_grid() {
         let spec = TermCollectionSpec {
             linear_terms: vec![
                 linear("x:g[b]", vec![0], vec![(1, 1.0_f64.to_bits())]),
@@ -541,10 +689,21 @@ mod tests {
             .expect("gated linear table");
         assert!(gated.table.values.column(1).iter().all(|code| *code == 1.0));
 
-        let refusal = table(&spec, "x:z", PartialDependenceGrid::TrainingRange { n_points: 4 })
-            .err()
-            .expect("a two-axis term refuses a default grid");
-        assert!(refusal.contains("sweeps exactly one axis"), "got: {refusal}");
+        let product = table(&spec, "x:z", PartialDependenceGrid::TrainingRange { n_points: 3 })
+            .expect("a two-axis term sweeps the product of its training ranges");
+        assert_eq!(product.axes, vec!["x".to_string(), "z".to_string()]);
+        assert_eq!(product.axis_levels, vec![None, None]);
+        assert_eq!(
+            product.axis_values,
+            Some(vec![vec![0.0, 1.0, 2.0], vec![1.0, 2.0, 3.0]])
+        );
+        assert_eq!(product.grid.nrows(), 9);
+        assert_eq!(product.grid.row(0).to_vec(), vec![0.0, 1.0]);
+        assert_eq!(product.grid.row(1).to_vec(), vec![0.0, 2.0], "the last axis varies fastest");
+        assert_eq!(product.grid.row(3).to_vec(), vec![1.0, 1.0]);
+        assert_eq!(product.grid.row(8).to_vec(), vec![2.0, 3.0]);
+        assert_eq!(product.table.values.column(0).to_vec(), product.grid.column(0).to_vec());
+        assert_eq!(product.table.values.column(2).to_vec(), product.grid.column(1).to_vec());
 
         let explicit = table(
             &spec,
@@ -553,12 +712,70 @@ mod tests {
         )
         .expect("explicit two-axis grid");
         assert_eq!(explicit.axes, vec!["x".to_string(), "z".to_string()]);
+        assert_eq!(explicit.axis_values, None);
         assert_eq!(explicit.table.values.column(0).to_vec(), vec![0.25, 1.75]);
         assert_eq!(explicit.table.values.column(2).to_vec(), vec![1.5, 2.5]);
     }
 
+    fn factor_term(name: &str, feature_col: usize, levels: &[f64]) -> RandomEffectTermSpec {
+        RandomEffectTermSpec {
+            name: name.to_string(),
+            feature_col,
+            drop_first_level: false,
+            penalized: true,
+            frozen_levels: Some(levels.iter().map(|level| level.to_bits()).collect()),
+            lenient_unseen: false,
+        }
+    }
+
     #[test]
-    fn a_block_spanning_every_level_and_an_unknown_term_are_refused_by_name() {
+    fn a_factor_term_sweeps_its_saved_levels() {
+        let spec = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: vec![factor_term("g", 1, &[0.0, 1.0])],
+            smooth_terms: Vec::new(),
+        };
+        let pd = table(&spec, "g", PartialDependenceGrid::TrainingRange { n_points: 50 })
+            .expect("a bare factor term");
+        assert_eq!(pd.axes, vec!["g".to_string()]);
+        assert_eq!(
+            pd.axis_levels,
+            vec![Some(AxisLevels {
+                values: vec![0.0, 1.0],
+                labels: vec!["a".to_string(), "b".to_string()],
+            })]
+        );
+        assert_eq!(pd.grid.column(0).to_vec(), vec![0.0, 1.0], "one row per level, not n_points");
+        assert_eq!(pd.table.values.column(1).to_vec(), vec![0.0, 1.0]);
+        assert_eq!(pd.contribution(), "f(g)");
+
+        let explicit = table(&spec, "g", PartialDependenceGrid::Explicit(array![[1.0]]))
+            .expect("an explicit level code");
+        assert_eq!(explicit.table.values.column(1).to_vec(), vec![1.0]);
+        let refusal = table(&spec, "g", PartialDependenceGrid::Explicit(array![[0.5]]))
+            .err()
+            .expect("a non-level code is refused");
+        assert!(refusal.contains("level codes"), "got: {refusal}");
+    }
+
+    #[test]
+    fn a_numeric_coded_factor_term_labels_its_levels_by_value() {
+        let spec = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: vec![factor_term("factor(z)", 2, &[1.0, 2.0, 3.0])],
+            smooth_terms: Vec::new(),
+        };
+        let pd = table(&spec, "factor(z)", PartialDependenceGrid::TrainingRange { n_points: 4 })
+            .expect("a numeric-coded factor term");
+        assert_eq!(pd.grid.column(0).to_vec(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(
+            pd.axis_levels[0].as_ref().map(|levels| levels.labels.clone()),
+            Some(vec!["1".to_string(), "2".to_string(), "3".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_block_spanning_every_level_sweeps_the_factor_as_an_axis() {
         let spec = TermCollectionSpec {
             linear_terms: vec![linear("z", vec![2], Vec::new())],
             random_effect_terms: Vec::new(),
@@ -572,10 +789,17 @@ mod tests {
                 },
             )],
         };
-        let spanning = table(&spec, "s(x, g, bs=sz)", PartialDependenceGrid::TrainingRange { n_points: 3 })
-            .err()
-            .expect("a level-spanning block is refused");
-        assert!(spanning.contains("carries every level"), "got: {spanning}");
+        let pd = table(&spec, "s(x, g, bs=sz)", PartialDependenceGrid::TrainingRange { n_points: 3 })
+            .expect("a level-spanning block reads its factor as an axis");
+        assert_eq!(pd.axes, vec!["x".to_string(), "g".to_string()]);
+        assert_eq!(pd.axis_levels[0], None);
+        assert_eq!(
+            pd.axis_levels[1].as_ref().map(|levels| levels.labels.clone()),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_eq!(pd.grid.nrows(), 6);
+        assert_eq!(pd.table.values.column(1).to_vec(), vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        assert!(pd.held.is_empty());
 
         let unknown = table(&spec, "s(w)", PartialDependenceGrid::TrainingRange { n_points: 3 })
             .err()

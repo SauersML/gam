@@ -4,6 +4,11 @@
 shape depends on the fitted model class and on the keyword arguments
 `interval`, `id_column`, and `return_type`.
 
+A prediction is the whole model at given rows. For one term's own curve,
+surface or per-level effect, with pointwise intervals and a simultaneous
+band, use `Model.partial_dependence(term)`; see
+[partial-effects.md](partial-effects.md).
+
 ## Signature
 
 ```text

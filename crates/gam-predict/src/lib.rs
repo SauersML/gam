@@ -6,6 +6,7 @@ pub mod generative;
 pub mod input;
 pub mod interval_policy;
 pub mod linalg;
+pub mod partial_effect;
 pub mod posterior_bands;
 pub mod posterior_predict;
 pub mod term_diagnostics;

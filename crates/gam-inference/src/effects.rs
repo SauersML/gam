@@ -18,10 +18,43 @@ use std::fmt;
 
 /// Default confidence level for effect bands.
 pub(crate) const DEFAULT_BAND_LEVEL: f64 = 0.95;
-/// Default Monte Carlo draw count for simultaneous bands.
-pub(crate) const DEFAULT_SIMULATIONS: usize = 10_000;
 /// Default deterministic random seed for simultaneous bands.
-pub(crate) const DEFAULT_SIMULATION_SEED: u64 = 12_345;
+pub const DEFAULT_SIMULATION_SEED: u64 = 12_345;
+
+/// Target Monte Carlo error of a simultaneous band's attained miss rate,
+/// relative to the nominal miss rate `alpha = 1 - level`.
+///
+/// A simulated band's critical value is the `ceil(level * N)`-th order statistic
+/// of `N` simulated suprema, so its attained coverage `F(c_hat)` is exactly
+/// `Beta(k, N + 1 - k)` for the supremum's continuous CDF `F`, whatever the grid
+/// or covariance: mean `level` and standard deviation `sqrt(level * alpha / N)`
+/// to first order. Asking that standard deviation to be this fraction of
+/// `alpha` fixes `N` (see [`simultaneous_band_simulations`]); at 5%, two Monte
+/// Carlo standard deviations keep the attained miss rate within a tenth of
+/// nominal.
+pub const SIMULTANEOUS_BAND_RELATIVE_MC_ERROR: f64 = 0.05;
+
+/// Monte Carlo draw count whose attained-coverage standard deviation is
+/// [`SIMULTANEOUS_BAND_RELATIVE_MC_ERROR`] times the nominal miss rate:
+/// `N = ceil(level / (alpha * delta^2))`, which is 7,600 draws at 95% and
+/// 39,600 at 99%.
+pub fn simultaneous_band_simulations(level: f64) -> Result<usize, EffectError> {
+    validate_level(level)?;
+    let miss_rate = 1.0 - level;
+    let delta = SIMULTANEOUS_BAND_RELATIVE_MC_ERROR;
+    let draws = (level / (miss_rate * delta * delta)).ceil();
+    if !draws.is_finite() || draws > usize::MAX as f64 {
+        return Err(EffectError::InvalidLevel { level });
+    }
+    Ok(draws as usize)
+}
+
+fn validate_level(level: f64) -> Result<(), EffectError> {
+    if !level.is_finite() || !(0.0..1.0).contains(&level) || level == 0.0 {
+        return Err(EffectError::InvalidLevel { level });
+    }
+    Ok(())
+}
 
 /// The coefficient covariance definition used by an effect report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,13 +132,14 @@ pub(crate) struct SimultaneousBandOptions {
     pub seed: u64,
 }
 
-impl Default for SimultaneousBandOptions {
-    fn default() -> Self {
-        Self {
-            level: DEFAULT_BAND_LEVEL,
-            simulations: DEFAULT_SIMULATIONS,
+impl SimultaneousBandOptions {
+    /// A band at `level` with the Monte Carlo size its target error implies.
+    pub fn at_level(level: f64) -> Result<Self, EffectError> {
+        Ok(Self {
+            level,
+            simulations: simultaneous_band_simulations(level)?,
             seed: DEFAULT_SIMULATION_SEED,
-        }
+        })
     }
 }
 
@@ -301,6 +335,80 @@ pub(crate) fn effect_report(
     })
 }
 
+/// Pointwise and simultaneous bands for one linear effect curve at one level.
+///
+/// Both bands share the center `C beta` and the standard errors of `C V C'`;
+/// they differ only in the critical value. The pointwise one is the two-sided
+/// normal quantile. The simultaneous one is the `level` quantile of
+/// `max_i |Z_i|` for the standardized Gaussian curve `Z`, simulated with
+/// [`simultaneous_band_simulations`] draws, so the band covers the whole curve
+/// over the rows of `C` jointly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectBands {
+    pub fit: Array1<f64>,
+    pub se: Array1<f64>,
+    pub lower: Array1<f64>,
+    pub upper: Array1<f64>,
+    pub simultaneous_lower: Array1<f64>,
+    pub simultaneous_upper: Array1<f64>,
+    pub level: f64,
+    pub pointwise_critical: f64,
+    pub simultaneous_critical: f64,
+    /// The Monte Carlo draws behind `simultaneous_critical`.
+    pub simulations: usize,
+    /// The random seed behind `simultaneous_critical`.
+    pub seed: u64,
+}
+
+/// Compute [`EffectBands`] for contrast design `C`, coefficients `beta`, and
+/// covariance `V` at `level`.
+pub fn effect_bands(
+    beta: ArrayView1<'_, f64>,
+    covariance: ArrayView2<'_, f64>,
+    contrast_design: ArrayView2<'_, f64>,
+    level: f64,
+) -> Result<EffectBands, EffectError> {
+    let options = SimultaneousBandOptions::at_level(level)?;
+    validate_inputs(
+        beta,
+        covariance,
+        contrast_design,
+        BandOptions::Simultaneous(options),
+    )?;
+    let covariance = validated_symmetric_matrix(covariance)?;
+    let fit = contrast_design.dot(&beta);
+    let curve_factor = simultaneous_curve_factor(contrast_design, covariance.view())?;
+    let se = factor_standard_errors(&curve_factor);
+    let pointwise_critical = standard_normal_quantile(0.5 * (1.0 + level))
+        .map_err(|detail| EffectError::NormalQuantile { detail })?;
+    let simultaneous_critical = simultaneous_critical(
+        &curve_factor,
+        se.view(),
+        level,
+        options.simulations,
+        options.seed,
+    );
+    let band = |critical: f64| {
+        let half_width = se.mapv(|value| critical * value);
+        (&fit - &half_width, &fit + &half_width)
+    };
+    let (lower, upper) = band(pointwise_critical);
+    let (simultaneous_lower, simultaneous_upper) = band(simultaneous_critical);
+    Ok(EffectBands {
+        fit,
+        se,
+        lower,
+        upper,
+        simultaneous_lower,
+        simultaneous_upper,
+        level,
+        pointwise_critical,
+        simultaneous_critical,
+        simulations: options.simulations,
+        seed: options.seed,
+    })
+}
+
 fn pointwise_standard_errors(
     contrast_design: ArrayView2<'_, f64>,
     covariance: ArrayView2<'_, f64>,
@@ -412,9 +520,7 @@ fn validate_inputs(
             (simultaneous.level, Some(simultaneous.simulations))
         }
     };
-    if !level.is_finite() || !(0.0..1.0).contains(&level) || level == 0.0 {
-        return Err(EffectError::InvalidLevel { level });
-    }
+    validate_level(level)?;
     if simulations == Some(0) {
         return Err(EffectError::InvalidSimulationCount);
     }
@@ -537,23 +643,34 @@ fn simultaneous_critical(
         }
     }
 
+    // Draws are generated one at a time, so the stream (and hence the result)
+    // does not depend on the block size; each block of draws is pushed through
+    // the factor as one matrix product.
+    let rank = curve_factor.ncols();
+    let block = gam_runtime::resource::byte_balanced_row_chunk(
+        standardized_factor.nrows(),
+        simulations,
+    );
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut normal_coordinates = vec![0.0; curve_factor.ncols()];
+    let mut draws = Array2::<f64>::zeros((block, rank));
     let mut maxima = Vec::with_capacity(simulations);
-    for _ in 0..simulations {
-        fill_standard_normals(&mut rng, &mut normal_coordinates);
-        let maximum = standardized_factor
-            .rows()
-            .into_iter()
-            .map(|row| {
-                row.iter()
-                    .zip(&normal_coordinates)
-                    .map(|(&loading, &coordinate)| loading * coordinate)
-                    .sum::<f64>()
-                    .abs()
-            })
-            .fold(0.0_f64, f64::max);
-        maxima.push(maximum);
+    while maxima.len() < simulations {
+        let rows = block.min(simulations - maxima.len());
+        for mut draw in draws.rows_mut().into_iter().take(rows) {
+            let coordinates = draw
+                .as_slice_mut()
+                .expect("a row of a standard-layout array is contiguous");
+            fill_standard_normals(&mut rng, coordinates);
+        }
+        let curves = draws
+            .slice(ndarray::s![..rows, ..])
+            .dot(&standardized_factor.t());
+        maxima.extend(
+            curves
+                .rows()
+                .into_iter()
+                .map(|curve| curve.iter().fold(0.0_f64, |maximum, value| maximum.max(value.abs()))),
+        );
     }
     maxima.sort_by(f64::total_cmp);
     quantile_from_sorted(&maxima, level)
@@ -606,7 +723,7 @@ mod tests {
         let contrast = array![[1.0, 0.0], [0.0, 1.0], [1.0, -1.0]];
         let options = BandOptions::Simultaneous(SimultaneousBandOptions {
             simulations: 2_000,
-            ..SimultaneousBandOptions::default()
+            ..SimultaneousBandOptions::at_level(DEFAULT_BAND_LEVEL).unwrap()
         });
 
         let first =
@@ -665,7 +782,7 @@ mod tests {
         let contrast = array![[1.0, 0.5], [-0.25, 1.0]];
         let options = BandOptions::Simultaneous(SimultaneousBandOptions {
             simulations: 1_000,
-            ..SimultaneousBandOptions::default()
+            ..SimultaneousBandOptions::at_level(DEFAULT_BAND_LEVEL).unwrap()
         });
         let first = effect_report(
             array![1.0, -2.0].view(),
@@ -708,7 +825,7 @@ mod tests {
             array![[1.0], [1e-9]].view(),
             BandOptions::Simultaneous(SimultaneousBandOptions {
                 simulations: 64,
-                ..SimultaneousBandOptions::default()
+                ..SimultaneousBandOptions::at_level(DEFAULT_BAND_LEVEL).unwrap()
             }),
         )
         .expect("scaled contrasts of the same Gaussian coefficient");
@@ -716,6 +833,80 @@ mod tests {
         assert_eq!(report.se[1], 1e-9);
         assert!(report.upper[1] > 0.0);
         assert_abs_diff_eq!(report.upper[1] / report.upper[0], 1e-9, epsilon = 1e-24);
+    }
+
+    #[test]
+    fn simulation_count_meets_the_relative_mc_error_target() {
+        assert_eq!(simultaneous_band_simulations(0.95).unwrap(), 7_600);
+        assert_eq!(simultaneous_band_simulations(0.99).unwrap(), 39_600);
+        for level in [0.8, 0.9, 0.95, 0.99, 0.999] {
+            let n = simultaneous_band_simulations(level).unwrap() as f64;
+            // Attained coverage is Beta(k, N + 1 - k) with k ~ level * N, so
+            // its standard deviation relative to the miss rate is at most the target.
+            let relative = (level * (1.0 - level) / n).sqrt() / (1.0 - level);
+            assert!(relative <= SIMULTANEOUS_BAND_RELATIVE_MC_ERROR + 1e-12);
+        }
+        for level in [0.0, 1.0, -0.5, f64::NAN] {
+            assert!(simultaneous_band_simulations(level).is_err());
+        }
+    }
+
+    #[test]
+    fn simultaneous_band_attains_its_exact_coverage_on_independent_rows() {
+        // For m independent standard normal rows, P(max |Z_i| <= c) = (2 Phi(c) - 1)^m
+        // exactly, so the attained coverage of the simulated critical value is
+        // checkable against the level within the Monte Carlo error the draw count targets.
+        let m = 12;
+        let level = 0.95;
+        let bands = effect_bands(
+            Array1::zeros(m).view(),
+            Array2::eye(m).view(),
+            Array2::eye(m).view(),
+            level,
+        )
+        .unwrap();
+        let attained =
+            (2.0 * gam_math::probability::normal_cdf(bands.simultaneous_critical) - 1.0)
+                .powi(m as i32);
+        let mc_sd = (level * (1.0 - level) / bands.simulations as f64).sqrt();
+        assert!(
+            (attained - level).abs() <= 4.0 * mc_sd,
+            "attained {attained} at critical {}",
+            bands.simultaneous_critical
+        );
+        assert_eq!(bands.simulations, simultaneous_band_simulations(level).unwrap());
+        assert_abs_diff_eq!(bands.pointwise_critical, 1.959_963_984_540_054, epsilon = 1e-9);
+        assert!(bands.simultaneous_critical > bands.pointwise_critical);
+        for row in 0..m {
+            assert!(bands.simultaneous_lower[row] < bands.lower[row]);
+            assert!(bands.simultaneous_upper[row] > bands.upper[row]);
+        }
+    }
+
+    #[test]
+    fn a_perfectly_correlated_curve_needs_only_the_pointwise_critical_value() {
+        // Every row is a positive multiple of one coefficient, so the maximum
+        // of the standardized curve is a single |Z| and the simultaneous and
+        // pointwise critical values agree up to Monte Carlo error.
+        let level = 0.95;
+        let bands = effect_bands(
+            array![0.3].view(),
+            array![[2.0]].view(),
+            array![[1.0], [2.0], [0.5]].view(),
+            level,
+        )
+        .unwrap();
+        let attained = 2.0 * gam_math::probability::normal_cdf(bands.simultaneous_critical) - 1.0;
+        let mc_sd = (level * (1.0 - level) / bands.simulations as f64).sqrt();
+        assert!((attained - level).abs() <= 4.0 * mc_sd);
+        let again = effect_bands(
+            array![0.3].view(),
+            array![[2.0]].view(),
+            array![[1.0], [2.0], [0.5]].view(),
+            level,
+        )
+        .unwrap();
+        assert_eq!(bands, again);
     }
 
     #[test]

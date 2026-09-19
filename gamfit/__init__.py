@@ -335,6 +335,7 @@ from ._model import (
     TermBlock,
     competing_risks_cif,
 )
+from ._partial_effect import AxisLevels, PartialEffect
 from ._response_geometry import (
     ResponseGeometryModel,
     alr,

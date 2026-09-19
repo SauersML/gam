@@ -15,6 +15,7 @@ gam --help
 | `gam fit DATA FORMULA --out MODEL` | Fit and save a model. |
 | `gam predict MODEL NEW_DATA --out PREDICTIONS.csv` | Predict from a saved model. |
 | `gam diagnose MODEL DATA` | Compute approximate leave-one-out diagnostics. |
+| `gam partial-effect MODEL --term TERM [--out effect.csv]` | One term's partial effect with pointwise and simultaneous bands; see [partial-effects.md](partial-effects.md#cli). |
 | `gam sample MODEL DATA [--out posterior.csv]` | Draw posterior coefficients. |
 | `gam generate MODEL DATA [--out generated.csv]` | Draw synthetic responses from a fitted model. |
 | `gam report MODEL [DATA] [OUT]` | Write a self-contained HTML report. |
