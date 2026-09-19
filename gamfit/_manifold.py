@@ -106,7 +106,8 @@ class _ExpMapFn:
     def get(cls) -> Any:
         if cls._impl is not None:
             return cls._impl
-        torch = _require_torch()
+        _require_torch()  # clean ImportError when torch is missing
+        import torch
 
         class _Impl(torch.autograd.Function):
             @staticmethod

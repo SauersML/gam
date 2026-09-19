@@ -2809,7 +2809,7 @@ pub(crate) fn build_smooth_basis(
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
             let degree = option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE);
             let default_internal = heuristic_knots_for_column(ds.values.column(c));
-            let (mut n_knots, inferred, effective_degree) =
+            let (mut n_knots, inferred, mut effective_degree) =
                 parse_ps_internal_knots(options, degree, default_internal)?;
             let periodic_axes = parse_periodic_axes(options, 1).map_err(|e| e.to_string())?;
             // Every period/origin declaration this arm accepts is read only
@@ -2833,8 +2833,15 @@ pub(crate) fn build_smooth_basis(
             if inferred && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 n_knots = n_knots.min(1);
             }
+            let unique = unique_count_column(ds.values.column(c));
+            let knots_before_support_cap = n_knots;
+            if inferred && !periodic_axes[0] && unique >= 2 {
+                let (capped_knots, capped_degree) =
+                    support_capped_bspline_dimension(n_knots, effective_degree, unique);
+                n_knots = capped_knots;
+                effective_degree = capped_degree;
+            }
             if inferred {
-                let unique = unique_count_column(ds.values.column(c));
                 // State the rule the engine actually applied
                 // (`heuristic_knots_for_column`: `clamp(unique/4, 4..8)`), and
                 // the small-data reduction when it fired. The note used to
@@ -2850,12 +2857,21 @@ pub(crate) fn build_smooth_basis(
                     MAX_DEFAULT_INTERNAL_KNOTS,
                     heuristic_knots,
                 );
-                if n_knots != heuristic_knots {
+                if knots_before_support_cap != heuristic_knots {
                     note.push_str(&format!(
                         " Reduced to {} because the fit has only {} rows and {} smooth coordinates.",
-                        n_knots,
+                        knots_before_support_cap,
                         ds.values.nrows(),
                         smooth_coordinate_count,
+                    ));
+                }
+                if n_knots != knots_before_support_cap || effective_degree != degree {
+                    note.push_str(&format!(
+                        " Capped to {} internal knots at degree {} (basis dimension {}) because the covariate has only {} unique values.",
+                        n_knots,
+                        effective_degree,
+                        n_knots + effective_degree + 1,
+                        unique,
                     ));
                 }
                 note.push_str(" Override with knots=... or k=....");
@@ -4509,6 +4525,32 @@ pub(crate) const MAX_DEFAULT_INTERNAL_KNOTS: usize = 8;
 pub(crate) fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     let unique = unique_count_column(col);
     (unique / 4).clamp(4, MAX_DEFAULT_INTERNAL_KNOTS)
+}
+
+/// Cap a default open B-spline `(internal_knots, degree)` so its basis
+/// dimension `internal_knots + degree + 1` does not exceed the covariate's
+/// `unique` distinct values (`unique >= 2`).
+///
+/// [`heuristic_knots_for_column`] floors at four internal knots, so a covariate
+/// with two or three distinct values was given eight basis functions. Only
+/// `unique` combinations of them are seen by the data; the rest are identified
+/// by the penalty alone, and the smooth's null space and effective degrees of
+/// freedom are then decided by the knot heuristic instead of the data. A basis
+/// of exactly `unique` functions already interpolates any value per distinct
+/// covariate level, so the cap never costs representable signal. When `unique`
+/// is at most the degree, the degree is lowered to `unique − 1` (a linear basis
+/// on a binary covariate) with no internal knots, the same reduction an
+/// explicit `k = unique` makes in [`parse_ps_internal_knots`].
+pub(crate) fn support_capped_bspline_dimension(
+    internal_knots: usize,
+    degree: usize,
+    unique: usize,
+) -> (usize, usize) {
+    if internal_knots + degree + 1 <= unique {
+        return (internal_knots, degree);
+    }
+    let degree = degree.min(unique.saturating_sub(1)).max(1);
+    (unique.saturating_sub(degree + 1), degree)
 }
 
 /// #1867: the basis dimension the default open cubic `s(x)` gets on `col`, the
