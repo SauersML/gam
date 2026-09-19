@@ -22,13 +22,13 @@ pub struct ParametricTermSummary {
 /// The joint Wald test of one parametric term: every coefficient the term owns
 /// tested against zero together, as one anova-style row.
 ///
-/// A factor with `L` levels owns `L - 1` treatment contrasts, and each contrast's
-/// own p-value answers a question about the reference level. The term row asks
+/// A factor with `L` levels is tested on its `L - 1` contrasts: the term row asks
 /// whether the factor matters at all, which does not depend on the coding.
 #[derive(Clone, Debug)]
 pub struct ParametricTermTest {
     pub name: String,
-    /// The number of coefficients tested, the numerator degrees of freedom.
+    /// The number of coefficient directions tested, the numerator degrees of
+    /// freedom: `L - 1` for a factor with `L` levels.
     pub df: usize,
     /// `W / df` referred to `F(df, residual_df)` when the fit's scale is
     /// estimated; the Wald `W` referred to `χ²_df` when it is known, where

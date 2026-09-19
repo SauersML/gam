@@ -19,8 +19,23 @@
 //! `λ_J`, `λ_J`'s uncertainty is not charged to it: the covariance is the
 //! conditional `φ[H⁻¹AH⁻¹]_JJ = (V_c)_JJ − φ(H⁻¹S_JH⁻¹)_JJ`, not the
 //! smoothing-corrected one, whose first-order `λ_J` term made the test
-//! conservative again. An unpenalized term (a fixed factor) has `S_J = 0` and
-//! keeps the display covariance.
+//! conservative again. An unpenalized term (the factor that carries the level
+//! of a model without an intercept) has `S_J = 0` and keeps the display
+//! covariance.
+//!
+//! A fixed factor (`+ g`, `factor(g)`, `C(g)`) is a full one-hot block of its
+//! `L` levels under its own REML ridge `λI`, beside a level carrier (the
+//! intercept, or the factor carrying the level of a no-intercept model). The
+//! block's constant direction `1` is aliased with that carrier: with `M` the
+//! Schur complement of `A` on the block, `M1 = 0`, so the data say nothing about
+//! the mean of the level effects and the ridge sets it to zero. The factor's
+//! null — all levels equal — is a hypothesis on the `L − 1` contrasts `Q'β_J`,
+//! `Q` an orthonormal basis of `1⊥`. Because `1` is an eigenvector of `M`, `Q`
+//! spans an invariant subspace of `M` and of `(M + λI)⁻¹`, so the contrasts'
+//! Wald statistic under the covariance above is again the unpenalized one,
+//! whatever `λ` is, on `L − 1` degrees of freedom. The level deviations
+//! themselves are a variance-component block, reported with the smooth terms;
+//! only the factor's joint test is parametric.
 
 use crate::estimate::summary::{
     ParametricPValueUnavailable, ParametricTermSummary, ParametricTermTest,
@@ -44,10 +59,11 @@ use std::ops::Range;
 /// joint test per term.
 #[derive(Clone, Debug)]
 pub struct ParametricTermTables {
-    /// Intercept, linear-term and fixed-factor contrast coefficients.
+    /// Intercept and linear-term coefficients, and the level coefficients of a
+    /// factor left unpenalized to carry the level of a no-intercept model.
     pub coefficients: Vec<ParametricTermSummary>,
-    /// One Wald test per parametric term on its own number of columns: a
-    /// factor with `L` levels is tested once on `L − 1` degrees of freedom.
+    /// One Wald test per parametric term: a factor with `L` levels is tested
+    /// once on `L − 1` degrees of freedom, any other term on its own columns.
     pub term_tests: Vec<ParametricTermTest>,
 }
 
@@ -59,6 +75,19 @@ struct ParametricTerm {
     /// A coefficient on a bound or inside a bounded geometry has no Wald
     /// sampling distribution at the boundary.
     bounded: bool,
+    /// What the term's joint test is on.
+    tested: TestedDirections,
+}
+
+/// The coefficient directions a parametric term's joint Wald test is on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestedDirections {
+    /// Every coefficient of the term, one row each in the coefficient table.
+    Coefficients,
+    /// The `L − 1` contrasts of a ridged fixed factor, whose level mean is
+    /// aliased with the level carrier and set by the ridge (module doc). Its
+    /// level deviations have no coefficient rows here.
+    Contrasts,
 }
 
 /// The reference distribution of every parametric Wald statistic of one fit.
@@ -89,9 +118,10 @@ impl WaldReference {
 /// that prior's variance removed (module doc); its rows report the resulting
 /// null sampling SD with `penalized` set. A multi-column linear term yields one
 /// row per column, suffixed `[i]`; a constrained or bounded coefficient names
-/// its geometry in the row label. An unpenalized factor contributes one row per
-/// contrast column, labelled `name[level]` by `level_label(feature_col, code)`,
-/// and one joint term test.
+/// its geometry in the row label. A ridged fixed factor contributes one joint
+/// test on its `L − 1` contrasts and no coefficient rows; a factor left
+/// unpenalized to carry the level contributes one row per level, labelled
+/// `name[level]` by `level_label(feature_col, code)`, and one joint test.
 pub fn parametric_term_summary_rows(
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -111,7 +141,11 @@ pub fn parametric_term_summary_rows(
         let penalized = own_penalty.is_some();
         let null_covariance = null_sampling_covariance(fit, covariance, &term.range, own_penalty);
         let first = coefficients.len();
-        for (local, (idx, label)) in term.range.clone().zip(&term.column_labels).enumerate() {
+        let columns = match term.tested {
+            TestedDirections::Coefficients => term.range.len(),
+            TestedDirections::Contrasts => 0,
+        };
+        for (local, (idx, label)) in term.range.clone().zip(&term.column_labels).take(columns).enumerate() {
             let estimate = fit.beta.get(idx).copied().unwrap_or(f64::NAN);
             let std_error = if penalized {
                 null_covariance
@@ -162,6 +196,7 @@ fn parametric_terms(
             range: design.intercept_range.clone(),
             column_labels: vec!["Intercept".to_string(); design.intercept_range.len()],
             bounded: false,
+            tested: TestedDirections::Coefficients,
         });
     }
     for (name, range) in &design.linear_ranges {
@@ -189,23 +224,26 @@ fn parametric_terms(
             range: range.clone(),
             column_labels,
             bounded,
+            tested: TestedDirections::Coefficients,
         });
     }
-    // A penalized random-effect block is a variance component, tested (or not)
-    // with the smooth terms; only the unpenalized blocks — fixed factors — are
-    // parametric.
+    // A genuine random effect (`group(g)`, `re(g)`) is a variance component,
+    // tested (or not) with the smooth terms. A fixed factor is parametric: tested
+    // on its contrasts when it carries its own ridge, and on its levels when it
+    // is left unpenalized to carry the level of a no-intercept model.
     for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
         let Some(meta) = spec.random_effect_terms.get(re_idx) else {
             continue;
         };
-        if meta.penalized || range.is_empty() {
+        let fixed_factor = !meta.lenient_unseen;
+        if !(fixed_factor || !meta.penalized) || range.is_empty() {
             continue;
         }
         let codes = design
             .random_effect_levels
             .get(re_idx)
             .map(|(_, codes)| codes.as_slice())
-            .or_else(|| meta.column_levels())
+            .or(meta.frozen_levels.as_deref())
             .unwrap_or(&[]);
         let column_labels = (0..range.len())
             .map(|i| match codes.get(i) {
@@ -218,6 +256,11 @@ fn parametric_terms(
             range: range.clone(),
             column_labels,
             bounded: false,
+            tested: if meta.penalized {
+                TestedDirections::Contrasts
+            } else {
+                TestedDirections::Coefficients
+            },
         });
     }
     terms
@@ -328,7 +371,10 @@ fn term_test(
     null_covariance: Option<&Array2<f64>>,
     reference: WaldReference,
 ) -> ParametricTermTest {
-    let df = term.range.len();
+    let df = match term.tested {
+        TestedDirections::Coefficients => term.range.len(),
+        TestedDirections::Contrasts => term.range.len().saturating_sub(1),
+    };
     if let [row] = rows {
         return ParametricTermTest {
             name: term.name.clone(),
@@ -348,14 +394,25 @@ fn term_test(
     if term.bounded {
         return unavailable(ParametricPValueUnavailable::BoundedCoefficient);
     }
+    // A one-level factor has no contrast to test.
+    if df == 0 {
+        return unavailable(ParametricPValueUnavailable::SingularCovariance);
+    }
     let Some(block) = null_covariance else {
         return unavailable(ParametricPValueUnavailable::NoCovariance);
+    };
+    let beta = fit.beta.slice(s![term.range.clone()]).to_owned();
+    let (beta, block) = match term.tested {
+        TestedDirections::Coefficients => (beta, block.clone()),
+        TestedDirections::Contrasts => {
+            let basis = helmert_contrasts(term.range.len());
+            (basis.t().dot(&beta), basis.t().dot(block).dot(&basis))
+        }
     };
     let Some(factor) = cholesky_factor_in_place(block.view(), CholeskyGuard::FiniteStrict) else {
         return unavailable(ParametricPValueUnavailable::SingularCovariance);
     };
-    let beta = fit.beta.slice(s![term.range.clone()]);
-    let whitened = forward_substitution_lower_vector(&factor, beta);
+    let whitened = forward_substitution_lower_vector(&factor, beta.view());
     let wald = whitened.dot(&whitened);
     if !wald.is_finite() {
         return unavailable(ParametricPValueUnavailable::SingularCovariance);
@@ -384,6 +441,19 @@ fn term_test(
     }
 }
 
+/// An orthonormal basis of the contrasts of `levels` level effects, the
+/// complement of the constant direction: the normalized Helmert columns, whose
+/// `k`-th column compares level `k + 1` with the mean of the levels before it.
+fn helmert_contrasts(levels: usize) -> Array2<f64> {
+    let mut basis = Array2::<f64>::zeros((levels, levels.saturating_sub(1)));
+    for k in 1..levels {
+        let norm = ((k * (k + 1)) as f64).sqrt();
+        basis.slice_mut(s![..k, k - 1]).fill(1.0 / norm);
+        basis[[k, k - 1]] = -(k as f64) / norm;
+    }
+    basis
+}
+
 /// A linear term's row label, naming any coefficient bound or bounded geometry.
 fn linear_term_label(name: &str, meta: Option<&LinearTermSpec>) -> String {
     let Some(meta) = meta else {
@@ -408,6 +478,25 @@ fn linear_term_label(name: &str, meta: Option<&LinearTermSpec>) -> String {
             };
             let bounds = bounds.map(|b| format!(", {b}")).unwrap_or_default();
             format!("{name} [bounded {min:.3}..{max:.3}, {prior}{bounds}]")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::helmert_contrasts;
+    use ndarray::Array2;
+
+    #[test]
+    fn helmert_contrasts_are_an_orthonormal_basis_of_the_non_constant_directions() {
+        for levels in 1..7 {
+            let basis = helmert_contrasts(levels);
+            assert_eq!(basis.dim(), (levels, levels - 1));
+            let gram = basis.t().dot(&basis);
+            let identity = Array2::<f64>::eye(levels - 1);
+            assert!((&gram - &identity).iter().all(|e| e.abs() < 1e-14), "{gram:?}");
+            let column_sums = basis.sum_axis(ndarray::Axis(0));
+            assert!(column_sums.iter().all(|e| e.abs() < 1e-14), "{column_sums:?}");
         }
     }
 }

@@ -285,7 +285,7 @@ class Summary:
         the residual degrees of freedom) when the scale is estimated, ``"z"``
         when it is known.
     parametric_terms : list of dict
-        The intercept, linear-term and factor-contrast coefficients, one record
+        The intercept and linear-term coefficients, one record
         per coefficient with ``name``, ``estimate``, ``std_error``,
         ``penalized``, ``statistic`` and ``p_value``, plus
         ``p_value_unavailable`` (the reason label) when no valid p-value

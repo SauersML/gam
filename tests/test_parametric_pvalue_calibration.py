@@ -13,6 +13,7 @@ true null lies within two Monte Carlo standard errors of the level, and the
 null p-values do not reject U(0, 1) under a Kolmogorov-Smirnov test.
 """
 
+import json
 import math
 import shutil
 import subprocess
@@ -84,13 +85,13 @@ def test_ridged_row_reports_its_null_sd_and_the_factor_is_one_joint_test():
     rows = {r["name"]: r for r in summary.parametric_terms}
     assert rows["x1"]["penalized"] is True
     assert rows["Intercept"]["penalized"] is False
-    contrasts = [name for name in rows if name.startswith("g[")]
-    assert len(contrasts) == len(LEVELS) - 1
-    assert all(rows[name]["penalized"] is False for name in contrasts)
+    # The ridged factor's level deviations are a variance-component block with
+    # the smooth terms; only its joint test is parametric.
+    assert not any(name.startswith("g") for name in rows)
     # The statistic is the estimate over the SE the row reports.
     x1 = rows["x1"]
     assert x1["statistic"] == x1["estimate"] / x1["std_error"]
-    # One joint Wald test for the factor on L - 1 df; a one-column term's test
+    # One joint Wald test for the factor on its L - 1 contrasts; a one-column term's test
     # is its row squared, with the same p-value bit for bit.
     tests = {r["name"]: r for r in summary.parametric_term_tests}
     assert tests["g"]["df"] == len(LEVELS) - 1
@@ -116,3 +117,13 @@ def test_cli_and_python_read_the_same_parametric_pvalues(tmp_path):
     assert cli.returncode == 0, cli.stderr
     assert cli.stdout == str(fresh)
     assert "Parametric terms:" in cli.stdout
+    # The CLI's payload carries the same p-values, bit for bit.
+    cli_json = subprocess.run(
+        [GAM, "summary", "--json", str(path)], capture_output=True, text=True
+    )
+    assert cli_json.returncode == 0, cli_json.stderr
+    payload = json.loads(cli_json.stdout)
+    for table in ("parametric_terms", "parametric_term_tests"):
+        before = [float(r["p_value"]).hex() for r in getattr(fresh, table)]
+        after = [float(r["p_value"]).hex() for r in payload[table]]
+        assert before == after, table
