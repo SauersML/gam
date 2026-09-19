@@ -3972,6 +3972,7 @@ dependencies = [
  "gam-gpu",
  "gam-identifiability",
  "gam-linalg",
+ "gam-linalg-test-support",
  "gam-math",
  "gam-problem",
  "gam-runtime",

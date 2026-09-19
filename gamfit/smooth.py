@@ -102,22 +102,31 @@ class Smooth(_BasisDescriptor):
         One of ``None`` / ``"none"`` (unconstrained, the default),
         ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere on the data range),
         ``"monotone_decreasing"`` (f'(x) ≤ 0), ``"convex"`` (f''(x) ≥ 0),
-        or ``"concave"`` (f''(x) ≤ 0). Shape constraints are enforced by
-        the inner solver as joint linear inequalities ``A·β ≥ b`` on the
-        coefficient vector (the constraint matrix ``A`` is generated from
-        the basis on a dense 1D grid spanning the data range, so the
-        inequality at the grid points implies the constraint on the
-        smooth function under standard B-spline / radial-basis density
-        arguments). The solver is an active-set / interior-point method;
-        when the constraint is active at the cert exit the outer REML
-        score uses the tangent-projected LAML formulation so the smoothing
-        parameter is selected over the working subspace. This mirrors
-        mgcv's ``scop=...`` argument and the ``scam`` R library's shape-
-        constrained smooths. Currently restricted to univariate 1D smooths
-        (B-splines and thin-plate / Duchon with a single feature axis);
-        a multivariate spec on a constrained smooth will be rejected with
-        a clear error from the Rust core. Spherical-harmonic and tensor
-        smooths reject all non-``None`` shape constraints.
+        or ``"concave"`` (f''(x) ≤ 0). The constraint is exact and involves
+        no evaluation grid: it is a cone on the raw B-spline control points
+        ``β``. The derivative of a degree-``d`` spline is a degree-``d-1``
+        spline whose control points are ``d·(β[i+1] - β[i]) / (t[i+d+1] -
+        t[i+1])``, and B-splines are non-negative, so non-negative
+        consecutive control-point differences certify ``f' ≥ 0`` on every
+        knot span. Likewise, non-decreasing control-polygon slopes
+        (divided by the knot-dependent Greville-abscissa gaps, so any knot
+        placement is handled) certify ``f'' ≥ 0``. The engine
+        reparameterizes ``β = C·δ`` so the cone becomes the coordinate
+        bounds ``δ_j ≥ 0`` on the difference coordinates, and the penalized
+        fit solves that bound-constrained problem. The term is centred like
+        an unconstrained smooth (weighted sum-to-zero over the training
+        rows): ``C`` drops the constant level column, which a clamped
+        B-spline basis would duplicate with the intercept, so the model
+        intercept carries the level. When bounds are active at the optimum,
+        the REML/LAML score is evaluated on the tangent subspace of the
+        active face. The certificate is always sufficient. It is also
+        necessary when the constrained derivative is piecewise linear (a
+        monotone quadratic or a convex/concave cubic); for higher degrees
+        it is slightly conservative. Supported only on open
+        (``periodic=False``) :class:`BSpline` smooths. :class:`Duchon`,
+        :class:`Matern`, :class:`Sphere`, :class:`TensorBSpline`, periodic
+        B-splines and every other smooth kind reject a non-``None`` shape
+        constraint with an error from the Rust core.
     """
 
     name: str | None = None

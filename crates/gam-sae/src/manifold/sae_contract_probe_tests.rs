@@ -37,7 +37,7 @@ pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("basis");
     let m = phi.ncols();
     let smooth_penalty =
-        gam_terms::basis::create_difference_penalty_matrix(m, 2, None).expect("penalty");
+        gam_linalg_test_support::coefficient_difference_penalty(m, 2);
     let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "contract-line",
         SaeAtomBasisKind::EuclideanPatch,
