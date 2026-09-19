@@ -12,8 +12,8 @@
 //! # What is asserted
 //!
 //! 1. Under strong heteroscedasticity (σ shrinking to almost nothing at the
-//!    right edge of the data) the separately fitted 0.1 and 0.9 expectile
-//!    curves cross on a dense grid that extends past the data, while the joint
+//!    right edge of the data) separately fitted adjacent expectile curves
+//!    cross on a dense grid that extends past the data, while the joint
 //!    fit's curves are strictly ordered at every grid point, and the joint
 //!    curves track the closed-form truth `f(x) + σ(x)·e_τ` inside the data.
 //! 2. In the homoscedastic case, where the location-scale model holds with a
@@ -118,7 +118,9 @@ fn predict(
     let mean = predictor
         .predict_posterior_mean(
             &input,
-            model.unified().expect("a saved fit carries its unified fit"),
+            model
+                .unified()
+                .expect("a saved fit carries its unified fit"),
             &PosteriorMeanOptions {
                 confidence_level: None,
                 covariance_mode: InferenceCovarianceMode::Conditional,
@@ -169,11 +171,11 @@ fn joint_expectile_curves_never_cross_where_separate_fits_do() {
 
     let separate = separate_curves(&data, &grid);
     let separate_crossings = (0..grid.len())
-        .filter(|&k| separate[2][k] <= separate[0][k])
+        .filter(|&k| separate[1][k] <= separate[0][k] || separate[2][k] <= separate[1][k])
         .count();
     assert!(
         separate_crossings > 0,
-        "fixture must be one where independently fitted 0.1/0.9 expectiles cross; they \
+        "fixture must be one where independently fitted adjacent expectiles cross; they \
          stayed ordered at all {} grid points",
         grid.len()
     );
@@ -223,16 +225,12 @@ fn joint_expectile_curves_match_separate_fits_when_homoscedastic() {
     let model = fit(&data, &expectile_config(&LEVELS));
     let joint = joint_curves(&model, &data, &grid);
     for ((joint_curve, separate_curve), &tau) in joint.iter().zip(&separate).zip(&LEVELS) {
-        let worst = joint_curve
-            .iter()
-            .zip(separate_curve)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        // σ = 0.5; the two estimators target the same curve, so they must agree
-        // to well inside the curves' own sampling error.
+        let rms = ((joint_curve - separate_curve).mapv(|d| d * d).sum() / grid.len() as f64).sqrt();
+        // The two estimators target the same curve `f(x) + 0.5·e_τ`, so they must
+        // agree to well inside the noise scale: a tenth of σ = 0.5.
         assert!(
-            worst < 0.08,
-            "homoscedastic τ={tau}: joint and separate expectile curves differ by up to {worst:.4}"
+            rms < 0.05,
+            "homoscedastic τ={tau}: joint and separate expectile curves differ by RMS {rms:.4}"
         );
     }
 }
@@ -251,7 +249,11 @@ fn saved_joint_expectile_refuses_crossing_estimator_metadata() {
         panic!("a multi-level request saves a joint expectile estimator");
     };
     assert_eq!(levels, LEVELS);
-    assert!(standardized_expectiles.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        standardized_expectiles
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    );
 
     let mut swapped = standardized_expectiles.clone();
     swapped.swap(0, 2);

@@ -382,10 +382,12 @@ where
         One(f64),
         Many(Vec<f64>),
     }
-    Ok(Option::<Levels>::deserialize(deserializer)?.map(|levels| match levels {
-        Levels::One(tau) => vec![tau],
-        Levels::Many(levels) => levels,
-    }))
+    Ok(
+        Option::<Levels>::deserialize(deserializer)?.map(|levels| match levels {
+            Levels::One(tau) => vec![tau],
+            Levels::Many(levels) => levels,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -398,7 +400,10 @@ mod tests {
             let json = format!(
                 r#"{{"schema":"gam.fit-request","schema_version":1,"formula":"y ~ x","config":{{"expectile_tau":{value}}}}}"#
             );
-            FitRequestDocument::from_json(&json).unwrap().config.expectile_tau
+            FitRequestDocument::from_json(&json)
+                .unwrap()
+                .config
+                .expectile_tau
         };
         assert_eq!(parse("0.9"), Some(vec![0.9]));
         assert_eq!(parse("[0.1, 0.5, 0.9]"), Some(vec![0.1, 0.5, 0.9]));
@@ -439,4 +444,3 @@ mod tests {
         );
     }
 }
-

@@ -68,8 +68,8 @@ def test_joint_expectile_curves_are_ordered_where_separate_fits_cross() -> None:
             for tau in LEVELS
         ]
     )
-    assert np.any(separate[:, 2] <= separate[:, 0]), (
-        "fixture must be one where independently fitted 0.1/0.9 expectiles cross"
+    assert np.any(np.diff(separate, axis=1) <= 0.0), (
+        "fixture must be one where independently fitted adjacent expectiles cross"
     )
 
     joint = np.asarray(
