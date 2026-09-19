@@ -1,0 +1,9 @@
+[3m 36s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[3m 36s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 1.634759e110.
+[3m 36s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[3m 36s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[3m 36s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1411e177). This indicates a numerical instability.
+[3m 37s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.6205e185). This indicates a numerical instability.
+[3m 37s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[3m 37s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+2000 y ~ s(balance) + s(income) wall 216.0s cpu 69.9s certified True edf 2.8909802381894814

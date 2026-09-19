@@ -1,0 +1,40 @@
+
+== gaussian (n=600, reps=8)
+  gamfit            RMSE 0.0652 (sd 0.0102)  cover95 0.976  time 0.18s  ok=8
+  pygam_default     RMSE 0.0914 (sd 0.0081)  cover95 0.960  time 0.02s  ok=8
+  pygam_gridsearch  RMSE 0.0695 (sd 0.0102)  cover95 0.911  time 0.16s  ok=8
+
+== binomial (n=1500, reps=8)
+  gamfit            RMSE 0.0329 (sd 0.0104)  cover95 0.962  time 3.78s  ok=8
+  pygam_default     RMSE 0.0552 (sd 0.0052)  cover95 0.941  time 1.33s  ok=8
+  pygam_gridsearch  RMSE 0.0321 (sd 0.0107)  cover95 0.936  time 8.81s  ok=8
+
+== binomial_trials (n=600, reps=8)
+  gamfit            RMSE 0.0177 (sd 0.0045)  cover95 0.973  time 4.70s  ok=8
+  pygam_default     RMSE 0.0310 (sd 0.0066)  cover95 0.941  time 8.73s  ok=8
+  pygam_gridsearch  RMSE 0.0204 (sd 0.0048)  cover95 0.879  time 67.90s  ok=8
+
+== poisson_exposure (n=600, reps=8)
+  gamfit            RMSE 0.0751 (sd 0.0181)  cover95 0.989  time 5.03s  ok=8
+  pygam_default     RMSE 0.1440 (sd 0.0290)  cover95 0.954  time 20.13s  ok=8
+  pygam_gridsearch  RMSE 0.7093 (sd 0.0136)  cover95 0.000  time 116.43s  ok=8
+
+== gamma (n=600, reps=4)
+  gamfit            RMSE 0.2118 (sd 0.0804)  cover95 0.937  time 14.25s  ok=4
+  pygam_default     RMSE 0.3515 (sd 0.0361)  cover95 0.938  time 24.58s  ok=4
+  pygam_gridsearch  RMSE 0.2813 (sd 0.0730)  cover95 0.859  time 228.59s  ok=4
+
+== expectile90 (n=600, reps=4)
+  gamfit            RMSE 0.1158 (sd 0.0306)  cover95 0.892  time 1.43s  ok=4
+  pygam_default     RMSE 0.1484 (sd 0.0228)  cover95 1.000  time 20.00s  ok=4
+  pygam_gridsearch  RMSE 0.1170 (sd 0.0321)  cover95 0.994  time 129.33s  ok=4
+
+== gamma_inverse (n=600, reps=4)
+  gamfit            RMSE 0.1317 (sd 0.0237)  cover95 0.932  time 8.81s  ok=4
+  pygam_default     RMSE 7.9636 (sd 4.5207)  cover95 0.016  time 29.91s  ok=4
+  pygam_gridsearch  ERRORS (4): AttributeError: 'NoneType' object has no attribute 'get_params'
+
+== inv_gauss (n=600, reps=2)
+  gamfit            ERRORS (2): unsupported family
+  pygam_default     RMSE 0.2902 (sd 0.0041)  cover95 0.965  time 20.21s  ok=2
+  pygam_gridsearch  RMSE 0.1821 (sd 0.0020)  cover95 0.955  time 209.04s  ok=2

@@ -1,0 +1,11 @@
+fit wall=76.125 cpu=18.603
+GAM fitted model
+  Formula: y ~ s(x0) + s(x1) + s(x2) + s(x3) + s(x4)
+  Family:  Gaussian Identity
+  Class:   standard
+  Training rows: 100000
+  Deviance: 24947.8
+  REML score: 72640
+  Effective dof: 50.9159
+  Outer iterations: 128
+  Coefficients: 56
