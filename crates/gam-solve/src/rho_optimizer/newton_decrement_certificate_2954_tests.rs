@@ -18,8 +18,15 @@ const EXACT_INNER_MODE_2954: crate::estimate::outer_eval_capture::InnerResidualC
         source: crate::estimate::outer_eval_capture::InnerResidualSource::InnerGradient,
     };
 
+/// The certificate band #2954 removed, `τ·(1 + |V|)` at the judged point: a
+/// criterion summed over `n` rows made it grow with `n`. Stated here so the
+/// controls below can show a point that band admitted.
+fn removed_n_anchored_band_2954(cost: f64) -> f64 {
+    OUTER_TOL_2954 * (1.0 + cost.abs())
+}
+
 /// `V(ρ) = n·(0.6 + ½ρ²)`, a criterion summed over `n` rows with curvature `n`,
-/// certified at `ρ = theta` with the declared scale `n` every REML route sets.
+/// certified at `ρ = theta` with the problem size every REML route declares.
 ///
 /// When `publishes_parts`, each evaluation publishes the gradient parts a REML
 /// evaluator would: a same-sign criterion whose whole entry is the penalty
@@ -36,7 +43,6 @@ fn certify_row_summed_quadratic_2954(
     let n = n_obs as f64;
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        objective_scale: Some(n),
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
@@ -103,7 +109,7 @@ fn certify_row_summed_quadratic_2954(
     (outcome, result.rho)
 }
 
-/// `ρ = 5e-4` sits inside the n-anchored band at every size, `|Pg| = 5e-4·n ≤
+/// `ρ = 5e-4` sits inside the removed n-anchored band at every size, `|Pg| = 5e-4·n ≤
 /// 1e-3·(1 + |V|)`. The decrease a Newton step still buys there is `½·n·(5e-4)²
 /// = 1.25e-7·n`, from 2.5e-4 to 2.5e-2, far above the objective's rounding band,
 /// so the point is not stationary at 2,000, 20,000 or 200,000 rows and is never
@@ -116,13 +122,7 @@ fn a_resolvable_decrement_is_not_published_at_any_size_the_scaled_band_admitted_
     let theta = 5.0e-4;
     for n_obs in ROWS_2954 {
         let n = n_obs as f64;
-        let scaled = OuterConfig {
-            tolerance: OUTER_TOL_2954,
-            objective_scale: Some(n),
-            ..OuterConfig::default()
-        };
-        let band =
-            outer_stationarity_band_and_rung_at(&scaled, n * (0.6 + 0.5 * theta * theta)).bound;
+        let band = removed_n_anchored_band_2954(n * (0.6 + 0.5 * theta * theta));
         assert!(
             n * theta <= band,
             "control: the n-anchored band {band:.3e} must admit |Pg|={:.3e} at n={n_obs}",
@@ -154,7 +154,7 @@ fn a_resolvable_decrement_is_not_published_at_any_size_the_scaled_band_admitted_
     }
 }
 
-/// At 2,000,000 rows the same `ρ = 5e-4` is still admitted by the n-anchored band
+/// At 2,000,000 rows the same `ρ = 5e-4` is still admitted by the removed n-anchored band
 /// (`|Pg| = 1000 ≤ 1e-3·(1 + |V|) ≈ 1200`), and `λ = √n·5e-4 ≈ 0.71` is outside
 /// the quadratic region `λ ≤ 1/4`. The polish no longer predicts a step budget from
 /// that region, which here was zero steps and a refusal by name: it takes the damped
@@ -164,12 +164,7 @@ fn a_mint_outside_the_quadratic_region_takes_its_newton_step_3012() {
     let n_obs = 2_000_000;
     let theta = 5.0e-4;
     let n = n_obs as f64;
-    let scaled = OuterConfig {
-        tolerance: OUTER_TOL_2954,
-        objective_scale: Some(n),
-        ..OuterConfig::default()
-    };
-    let band = outer_stationarity_band_and_rung_at(&scaled, n * (0.6 + 0.5 * theta * theta)).bound;
+    let band = removed_n_anchored_band_2954(n * (0.6 + 0.5 * theta * theta));
     assert!(
         n * theta <= band,
         "control: the n-anchored band {band:.3e} must admit |Pg|={:.3e}",
@@ -336,7 +331,6 @@ fn certify_scripted_2954(
     let n = n_obs as f64;
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        objective_scale: Some(n),
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
@@ -883,7 +877,6 @@ fn a_coupled_tail_is_railed_as_one_face_2954() {
     };
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        objective_scale: Some(n),
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
@@ -1004,7 +997,6 @@ fn projected_newton_path_rails_the_tail_and_leaves_the_interior_free_2954() {
     };
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        objective_scale: Some(n),
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
@@ -1169,7 +1161,6 @@ fn certify_two_route_walk_2954(
     let n = n_obs as f64;
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        objective_scale: Some(n),
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
@@ -1323,7 +1314,6 @@ fn a_polish_step_is_judged_at_the_certificates_own_evaluation_order_2954() {
 fn an_inner_mode_without_a_residual_takes_no_decrement_verdict_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        objective_scale: Some(2_000.0),
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(2_000),
             p_coefficients: Some(COEFFICIENTS_2954),

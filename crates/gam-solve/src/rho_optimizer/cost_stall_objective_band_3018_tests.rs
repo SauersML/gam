@@ -205,7 +205,7 @@ fn the_guard_resolves_a_decrease_against_the_band_sum_3018() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(rel_tol_3018(&config), COST_STALL_WINDOW, &config, exit);
     assert!(
-        guard.stationarity_band(V0_3018) < 1.0,
+        guard.stationarity_band() < 1.0,
         "the fixture's |g| = 1 must be outside the claim band, or every step is a stall"
     );
     let steps = 3 * COST_STALL_WINDOW;
