@@ -223,11 +223,13 @@ fn assert_null_p_value_is_uniform(family: Family) {
             "{family:?} rep {rep}: p-value out of range: {}",
             row.p_value
         );
-        // The reference df is defined, and at least one, for every edf —
-        // including a term shrunk below one effective degree of freedom.
+        // `ref_df` is the null mean `Σ_k 1/(1 + e_k)` of the whitened
+        // statistic at `λ̂`, so a term REML shrank onto its null space
+        // honestly reports about its edf, below one. The p-value does not
+        // read it: its law is the λ̂-selection replay, checked below.
         assert!(
-            row.ref_df.is_finite() && row.ref_df >= 1.0,
-            "{family:?} rep {rep}: ref_df {} undefined or below one at edf {}",
+            row.ref_df.is_finite() && row.ref_df >= 0.0,
+            "{family:?} rep {rep}: ref_df {} undefined or negative at edf {}",
             row.ref_df,
             row.edf
         );

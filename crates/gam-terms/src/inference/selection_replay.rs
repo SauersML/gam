@@ -2389,7 +2389,7 @@ impl SmoothLrSelectionReplay {
 /// The p-value is the exact conditional tail of `W(0)` —
 /// [`gam_math::probability::signed_weighted_chi_square_sf`] over the weights
 /// `1/(1 + e_k)` — plus the paired selection shift of
-/// [`SmoothLrSelectionReplay::tail_shift`], whose standard error is published.
+/// [`SmoothLrSelectionReplay::tail_shift_at`], whose standard error is published.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SmoothWaldSelectionTest {
     /// `W(t̂(u))` at the observation's own selected point.
