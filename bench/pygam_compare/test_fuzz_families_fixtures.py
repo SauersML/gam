@@ -12,15 +12,18 @@ Each cell below failed before its root-cause fix and must now be clean under
   almost-deterministic binomial refused. main now evaluates the continuous
   normalizer ``ln C(w, w y)`` for any finite positive weight; the cells stay
   as its regression fixtures.
-* inverse-gaussian (canonical link): three unit-carrying reads broke
+* inverse-gaussian (canonical link): four unit-carrying reads broke
   equivariance under ``y -> c y``. The P-IRLS KKT certificate compared the
   gradient norm against bounds in the gradient's own units, so in small
   response units (gradients ~1e-12) an iterate two steps from the start
-  certified at edf 1.4 where the mode is at edf ~13; and the smoothing-parameter
+  certified at edf 1.4 where the mode is at edf ~13; the smoothing-parameter
   seed and the resolvability domain of ``rho`` read the prior weights, not the
   Fisher working weights ``mu^3 / 4``, so the optimum lay outside the searched
-  box. The outer optimizer then read the ``lambda -> infinity`` plateau and
-  the intercept-only fit certified.
+  box; and the penalized eigenvalues of ``sum_k lambda_k S_k`` were floored at
+  an absolute ``1e-12``, so where the optimal ``lambda * s`` is ~1e-13 every
+  penalized direction carried the same ridge and the fit was crushed to the
+  near-linear one. The floor is now the spectrum route's own resolution,
+  proportional to the spectrum.
 
 A failing cell reruns in isolation with
 ``python worker.py gamfit FAMILY N DESIGN SEED``.
