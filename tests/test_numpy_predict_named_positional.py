@@ -74,5 +74,5 @@ def test_numpy_predict_with_wrong_width_names_the_expected_columns() -> None:
     model, test = _table_fit()
     wrong = np.column_stack([test["z"], test["a"], test["a"]])
 
-    with pytest.raises(SchemaMismatchError, match=r"\['z', 'a'\]"):
+    with pytest.raises(SchemaMismatchError, match=r'\["z", "a"\]'):
         model.predict(wrong)
