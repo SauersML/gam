@@ -1676,7 +1676,7 @@ pub(crate) fn reml_laml_evaluate(
     if let Some((input, normalizer)) = cone_normalizer.as_ref() {
         let drifts = build_trace_drifts();
         let y = normalizer.solved_gradient();
-        let r = normalizer.normal_solves();
+        let basis = normalizer.covariance_basis();
         let rho_vs = rho_v_ks
             .as_ref()
             .expect("the constrained normalizer requests every rho mode response");
@@ -1696,17 +1696,17 @@ pub(crate) fn reml_laml_evaluate(
             };
             let drift = &drifts[coordinate];
             let precision_rate_on_y = drift.apply(y) / cone_scale;
-            let mut precision_rate_on_r = Array2::<f64>::zeros(r.raw_dim());
-            for column in 0..r.ncols() {
-                precision_rate_on_r
+            let mut precision_rate_on_basis = Array2::<f64>::zeros(basis.raw_dim());
+            for column in 0..basis.ncols() {
+                precision_rate_on_basis
                     .column_mut(column)
-                    .assign(&(drift.apply(&r.column(column).to_owned()) / cone_scale));
+                    .assign(&(drift.apply(&basis.column(column).to_owned()) / cone_scale));
             }
             let motion = crate::constrained_posterior::ConeCoordinateMotion {
                 mode_response,
                 gradient_rate,
                 precision_rate_on_y,
-                precision_rate_on_r,
+                precision_rate_on_basis,
             };
             let first = normalizer.first_order(&motion, &cone_solve);
             grad[coordinate] += first.derivative;
@@ -2179,7 +2179,7 @@ fn cone_normalizer_outer_hessian(
     let k = curvature_lambdas.len();
     let total = mode_responses.len();
     let y = normalizer.solved_gradient();
-    let r = normalizer.normal_solves();
+    let basis = normalizer.covariance_basis();
     let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
     // The family's fixed-β pair objects, fetched across the pool as the dense Hessian fetches its
     // own; the solution memoizes them, so the log-determinant's Hessian reads these same objects.
@@ -2358,17 +2358,17 @@ fn cone_normalizer_outer_hessian(
             }
             ConeGradientMotion::Pinned => -&state.rhs / scale,
         };
-        let mut precision_rate_on_r = Array2::<f64>::zeros(r.raw_dim());
-        for column in 0..r.ncols() {
-            precision_rate_on_r
+        let mut precision_rate_on_basis = Array2::<f64>::zeros(basis.raw_dim());
+        for column in 0..basis.ncols() {
+            precision_rate_on_basis
                 .column_mut(column)
-                .assign(&second_drift(&r.column(column).to_owned()));
+                .assign(&second_drift(&basis.column(column).to_owned()));
         }
         let pair_motion = crate::constrained_posterior::ConePairMotion {
             mode_response: state.second_response.clone(),
             gradient_rate,
             precision_rate_on_y: second_drift(y),
-            precision_rate_on_r,
+            precision_rate_on_basis,
         };
         let value = normalizer
             .second_order(
