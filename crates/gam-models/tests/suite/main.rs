@@ -3,6 +3,7 @@
 //! its dependency tree. One binary, same tests, same names.
 
 mod bms_generated_regressor_covariance_2943;
+mod bms_latent_conditional_residual_3016;
 mod bspline_nonzero_anchor_affine_2297;
 mod duchon_grid_fit_and_rotation_2319;
 mod exact_gaussian_boundary_2663;

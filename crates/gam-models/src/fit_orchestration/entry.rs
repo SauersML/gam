@@ -77,9 +77,8 @@ pub fn canonical_standard_fit_options(
         // projected-gradient threshold ≈ 1e-7) resolves λ̂ to optimiser
         // precision and restores the `w=c ⇔ c-fold replication` invariance in
         // smoothing selection (gam#893). The CLI previously used the stale
-        // `1e-6`, which over-smoothed relative to the formula path. A caller's
-        // `outer_tol` replaces it on both entry points alike.
-        tol: config.outer_tol.unwrap_or(1e-10),
+        // `1e-6`, which over-smoothed relative to the formula path.
+        tol: 1e-10,
         nullspace_dims: vec![],
         linear_constraints: inputs.linear_constraints,
         firth_bias_reduction: inputs.firth_bias_reduction,
@@ -1582,7 +1581,26 @@ pub struct FormulaFitResult {
 /// Resolve, materialize, and fit a formula without making front ends repeat any
 /// model construction. Unlike `fit_from_formula`, this service also returns the
 /// materializer's user-facing advisories for CLI/Python presentation.
+///
+/// An automatic `.` term is expanded against `data` first; its notes (the
+/// first of which spells out the fitted formula) lead the returned notes.
 pub fn fit_from_formula_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
+    let automatic = expand_automatic_fit_formula(formula, data, config)?;
+    if automatic.notes.is_empty() {
+        return fit_expanded_formula_with_notes(formula, data, config);
+    }
+    let mut outcome = fit_expanded_formula_with_notes(&automatic.formula, data, config)?;
+    let mut notes = automatic.notes;
+    notes.append(&mut outcome.inference_notes);
+    outcome.inference_notes = notes;
+    Ok(outcome)
+}
+
+fn fit_expanded_formula_with_notes(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
