@@ -2890,10 +2890,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_initial_rho(rho0.clone())
         .with_screen_initial_rho(options.screen_initial_rho)
-        // n-scaled profiled-criterion calibration: absolute gradient floor =
-        // max(outer_tol, n·1e-9). Mirrors the primary REML outer
-        // (solver/estimate.rs) and the spatial exact-joint path.
-        .with_objective_scale(if n_obs > 0 { Some(n_obs as f64) } else { None })
         .with_problem_size(n_obs, p_total.max(1))
         // Per-coordinate ρ domain (#2812): the interval on which each term's
         // penalty is resolvable against its own design curvature, derived in
