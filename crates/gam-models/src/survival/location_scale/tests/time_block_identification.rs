@@ -1291,3 +1291,60 @@ fn resolve_survival_time_anchor_defaults_to_earliest_entry() {
             .expect("resolve default anchor");
     assert!((anchor - 1.0).abs() <= 1e-12);
 }
+
+/// The #892 log-t collapse needs only a constant scale and no time wiggle, so a
+/// penalized threshold beside a constant scale keeps it: the warp is removed and
+/// `−log t` rides the location channel although the fit is not the fully reduced
+/// parametric AFT. Saved replay dispatches on `time_parameterization`, and
+/// recording such a fit as `MonotoneWarp` dropped `−log t` from its predicted
+/// survival (S = 1 at every age on the age scale, a time-flat curve on the
+/// follow-up scale). A smooth scale keeps the warp and must say so.
+#[test]
+fn time_parameterization_follows_the_log_time_collapse_not_the_smoothing_layout() {
+    let (age_exit, event, _log_t) = reduced_aft_lognormal_sample(400, 1.4, 0.5, 3);
+    let n = age_exit.len();
+    let reduced_aft = SurvivalLocationScaleTimeParameterization::ReducedParametricAft;
+
+    let parametric =
+        prepare_survival_location_scale_model(&reduced_aft_lognormal_spec(&age_exit, &event, 1.0))
+            .expect("prepare the parametric AFT");
+    assert!(parametric.is_reduced_parametric_aft());
+    assert_eq!(parametric.time_parameterization(), reduced_aft);
+
+    // Intercept, x and x²; the curvature penalty leaves {1, x} unpenalized, so it
+    // is a smoothing penalty (null space 2), never a parametric ridge.
+    let x = Array1::from_shape_fn(n, |i| (i as f64 + 0.5) / n as f64 - 0.5);
+    let mut smooth_design = Array2::<f64>::ones((n, 3));
+    smooth_design.column_mut(1).assign(&x);
+    smooth_design.column_mut(2).assign(&x.mapv(|v| v * v));
+    let mut curvature = Array2::<f64>::zeros((3, 3));
+    curvature[[2, 2]] = 1.0;
+    let smooth_block = || {
+        CovariateBlockKind::Static(ParameterBlockInput {
+            design: DesignMatrix::from(smooth_design.clone()),
+            offset: Array1::zeros(n),
+            penalties: vec![gam_terms::penalty_spec::PenaltySpec::Dense(curvature.clone())],
+            nullspace_dims: vec![2],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        })
+    };
+
+    let mut smooth_threshold = reduced_aft_lognormal_spec(&age_exit, &event, 1.0);
+    smooth_threshold.threshold_block = smooth_block();
+    let smooth_threshold = prepare_survival_location_scale_model(&smooth_threshold)
+        .expect("prepare a penalized threshold beside a constant scale");
+    assert!(!smooth_threshold.is_reduced_parametric_aft());
+    assert!(smooth_threshold.family.location_log_time.is_some());
+    assert_eq!(smooth_threshold.time_parameterization(), reduced_aft);
+
+    let mut smooth_scale = reduced_aft_lognormal_spec(&age_exit, &event, 1.0);
+    smooth_scale.log_sigma_block = smooth_block();
+    let smooth_scale = prepare_survival_location_scale_model(&smooth_scale)
+        .expect("prepare a smooth scale");
+    assert!(smooth_scale.family.location_log_time.is_none());
+    assert_eq!(
+        smooth_scale.time_parameterization(),
+        SurvivalLocationScaleTimeParameterization::MonotoneWarp
+    );
+}

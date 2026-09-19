@@ -462,18 +462,6 @@ pub(crate) fn fit_survival_location_scale_terms(
         },
         wiggle_rho0.len(),
     );
-    // This is the same structural predicate consumed by
-    // `PreparedSurvivalLocationScaleModel::is_reduced_parametric_aft`: every
-    // smoothing coordinate is absent, and neither time nor link wiggles exist.
-    // Persist the result while the fit topology is still available; saved
-    // replay must not attempt to recover it from fitted coefficient values.
-    let time_parameterization =
-        if layout.total() == 0 && protected_timewiggle_cols == 0 && spec.linkwiggle_block.is_none()
-        {
-            SurvivalLocationScaleTimeParameterization::ReducedParametricAft
-        } else {
-            SurvivalLocationScaleTimeParameterization::MonotoneWarp
-        };
     let mut rho0 = Array1::<f64>::zeros(layout.total());
     if layout.k_time > 0 {
         if time_rho0.len() != layout.k_time {
@@ -806,7 +794,12 @@ pub(crate) fn fit_survival_location_scale_terms(
     // evaluation runs, under the #2812 law `fit_custom_family` applies to those
     // blocks (#2902 item 15). The threshold and log-sigma term collections alone
     // do not carry the time and wiggle penalties.
-    let (rho_lower, rho_upper) = {
+    //
+    // The same seed preparation fixes the time parameterization saved replay
+    // dispatches on. It is fit topology (the time design, the log-σ penalty
+    // count and the wiggles), identical at every ρ and κ, and is persisted here
+    // because replay must never recover it from fitted coefficient values.
+    let (rho_lower, rho_upper, time_parameterization) = {
         let seed_spec = build_spec(
             &rho0,
             spec.inverse_link.clone(),
@@ -817,11 +810,12 @@ pub(crate) fn fit_survival_location_scale_terms(
         )
         .map_err(|reason| FitFailure::raised(gam_problem::FailureCategory::Invariant, reason))?;
         let prepared = prepare_survival_location_scale_model(&seed_spec)?;
-        crate::fit_orchestration::drivers::realized_blocks_rho_domain(
+        let (rho_lower, rho_upper) = crate::fit_orchestration::drivers::realized_blocks_rho_domain(
             &prepared.blockspecs,
             &survival_blockwise_fit_options(&seed_spec),
             layout.total(),
-        )?
+        )?;
+        (rho_lower, rho_upper, prepared.time_parameterization())
     };
     let joint_setup = build_survival_two_block_exact_joint_setup(
         data.view(),

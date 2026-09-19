@@ -49,6 +49,23 @@ impl PreparedSurvivalLocationScaleModel {
             && self.family.x_link_wiggle.is_none()
             && self.family.time_wiggle_ncols == 0
     }
+
+    /// The time axis this preparation fits, which saved replay must reproduce.
+    ///
+    /// The warp is removed and `−log t` rides the σ-scaled location channel
+    /// exactly when the family carries the #892 location log-time offset. That
+    /// collapse needs only a constant scale and no time wiggle, so it also
+    /// happens beside a penalized threshold (`~ s(x)`, a Duchon smooth), where
+    /// [`Self::is_reduced_parametric_aft`] is false. Reading the smoothing
+    /// layout instead recorded such fits as `MonotoneWarp`, and their predicted
+    /// survival lost its whole time dependence.
+    pub(crate) fn time_parameterization(&self) -> SurvivalLocationScaleTimeParameterization {
+        if self.family.location_log_time.is_some() {
+            SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+        } else {
+            SurvivalLocationScaleTimeParameterization::MonotoneWarp
+        }
+    }
 }
 
 /// Whether the scale block carries no penalties — a single constant `σ`
