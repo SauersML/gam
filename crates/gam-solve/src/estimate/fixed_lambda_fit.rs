@@ -281,7 +281,6 @@ pub fn fit_nested_at_fitted_log_lambdas(
         },
         pirls::PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p: p_null,
             coefficient_lower_bounds: None,
