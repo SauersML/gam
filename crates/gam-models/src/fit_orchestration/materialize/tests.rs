@@ -2794,6 +2794,9 @@ fn reference_gaussian_no_wiggle(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     let fit = fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
         .expect("reference gaussian no-wiggle terms fit");
     let mut result = GaussianLocationScaleFitResult {
@@ -2802,6 +2805,7 @@ fn reference_gaussian_no_wiggle(
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
     rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
     result
@@ -2817,6 +2821,9 @@ fn reference_gaussian_wiggle(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     let ref_pilot = fit_gaussian_location_scale_terms(data, spec.clone(), options, kappa_options)
         .expect("reference gaussian pilot");
     let ref_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
@@ -2851,6 +2858,7 @@ fn reference_gaussian_wiggle(
         wiggle_degree: Some(ref_solved.wiggle_degree),
         beta_link_wiggle,
         response_scale: 1.0,
+        sigma_floor,
     };
     rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
     result
@@ -2902,6 +2910,9 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
     // remap) so the remap under test is applied exactly once, by this test.
     let mut spec = spec;
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     assert!(
         (s - 1.0).abs() > 10.0,
         "fixture response scale must make the remap non-trivial, got s={s}"
@@ -2914,6 +2925,7 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
 
     // Install the #2346-shaped covariance state: the corrected matrix mirrored
@@ -3043,6 +3055,9 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
     } = request;
     let mut spec = spec;
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     assert!(
         (s - 1.0).abs() > 10.0,
         "fixture response scale must make the remap non-trivial, got s={s}"
@@ -3068,6 +3083,7 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
     let mut rescaled = wrap(fit.clone());
     let mut composed = wrap(fit);

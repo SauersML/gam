@@ -1,9 +1,7 @@
 use crate::bms::{
     BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloReplayInput,
     EmpiricalZGrid, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
-    bernoulli_marginal_link_map, empirical_intercept_from_marginal,
-    empirical_intercept_from_marginal_within, empirical_intercept_tail_tolerance,
-    replay_saved_bernoulli_marginal_slope_alo,
+    bernoulli_marginal_link_map, empirical_intercept, replay_saved_bernoulli_marginal_slope_alo,
 };
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use crate::marginal_slope_shared::{
@@ -236,10 +234,9 @@ impl AnchoredRowKernel {
     /// `η = a(q, b) + s·b·z` under an empirical law, `a` being the root of
     /// `Σ wᵢ Φ(a + s·b·zᵢ) = Φ(q)`. The same formulas
     /// [`BernoulliMarginalSlopePredictor::final_eta_from_theta`] evaluates at
-    /// `θ̂`; the only difference is that a posterior node can sit several
-    /// standard deviations into the tail of `q`, where the root is accepted at
-    /// the roundoff floor of its log-space residual
-    /// (`empirical_intercept_tail_tolerance`) rather than refused.
+    /// `θ̂`. A posterior node can sit several standard deviations into the tail
+    /// of `q`; the root is solved from `q` in log space on the smaller tail, so
+    /// it resolves there like anywhere else (gam#2978).
     pub fn eta(&self, q: f64, b: f64) -> Result<f64, EstimationError> {
         let sb = self.probit_scale * b;
         match &self.grid {
@@ -247,15 +244,12 @@ impl AnchoredRowKernel {
             Some(grid) => {
                 let marginal = bernoulli_marginal_link_map(&self.base_link, q)
                     .map_err(EstimationError::InvalidInput)?;
-                let intercept = empirical_intercept_from_marginal_within(
-                    marginal.mu,
+                let intercept = empirical_intercept(
                     marginal.q,
                     b,
                     self.probit_scale,
                     &grid.nodes,
                     &grid.weights,
-                    None,
-                    empirical_intercept_tail_tolerance(marginal.mu),
                 )
                 .map_err(EstimationError::InvalidInput)?;
                 Ok(intercept + sb * self.z)
@@ -285,20 +279,9 @@ impl AnchoredRowKernel {
             Some(grid) => {
                 let marginal = bernoulli_marginal_link_map(&self.base_link, q)
                     .map_err(EstimationError::InvalidInput)?;
-                let intercept = empirical_intercept_from_marginal_within(
-                    marginal.mu,
+                let (intercept, a_q, a_b) = empirical_intercept_and_partials(
                     marginal.q,
-                    b,
-                    scale,
-                    &grid.nodes,
-                    &grid.weights,
-                    None,
-                    empirical_intercept_tail_tolerance(marginal.mu),
-                )
-                .map_err(EstimationError::InvalidInput)?;
-                let (a_q, a_b) = empirical_intercept_partials(
-                    intercept,
-                    marginal.mu1,
+                    marginal.q1,
                     b,
                     scale,
                     &grid.nodes,
@@ -310,32 +293,33 @@ impl AnchoredRowKernel {
     }
 }
 
-/// The implicit-function partials `(∂a/∂q, ∂a/∂b) = (μ′(q)/F_a, −F_b/F_a)` of
-/// the empirical-law intercept `a`, the root of
-/// `F(a) = Σ wᵢ Φ(a + s·b·zᵢ) − μ(q)`, given that root and `μ′(q)`.
-fn empirical_intercept_partials(
-    intercept: f64,
-    marginal_mu1: f64,
+/// The empirical-law intercept `a`, the root of `Σ wᵢ Φ(a + s·b·zᵢ) = Φ(q)`,
+/// with its partials `(∂a/∂η, ∂a/∂b)` in the marginal index `η` (through
+/// `q′(η) = marginal_q1`) and the slope `b`. The root and its derivatives are
+/// the latent anchor's log-space solve and Taylor table at the observed slope
+/// `s·b`, normalized by the grid density, so a tail index keeps its exact
+/// partials (gam#2978).
+fn empirical_intercept_and_partials(
+    q: f64,
+    marginal_q1: f64,
     slope: f64,
     probit_scale: f64,
     nodes: &[f64],
     weights: &[f64],
-) -> Result<(f64, f64), EstimationError> {
+) -> Result<(f64, f64, f64), EstimationError> {
     let observed_slope = probit_scale * slope;
-    let mut f_a = 0.0;
-    let mut f_b = 0.0;
-    for (&node, &weight) in nodes.iter().zip(weights.iter()) {
-        let eta = intercept + observed_slope * node;
-        let pdf = normal_pdf(eta);
-        f_a += weight * pdf;
-        f_b += weight * pdf * probit_scale * node;
-    }
-    if !(f_a.is_finite() && f_a > 0.0 && f_b.is_finite()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "empirical latent prediction calibration derivative is invalid: F_a={f_a}, F_b={f_b}"
-        )));
-    }
-    Ok((marginal_mu1 / f_a, -f_b / f_a))
+    let grid = crate::latent_anchor::AnchorGridOwned::new(nodes.to_vec(), weights.to_vec());
+    let derivatives = crate::latent_anchor::solve_anchor(q, observed_slope, grid.view())
+        .and_then(|alpha| {
+            crate::latent_anchor::AnchorTaylor::at(alpha, q, observed_slope, grid.view())
+        })
+        .map_err(EstimationError::InvalidInput)?
+        .derivatives();
+    Ok((
+        derivatives.alpha,
+        derivatives.a_q * marginal_q1,
+        derivatives.a_b * probit_scale,
+    ))
 }
 
 pub struct BernoulliMarginalSlopePredictor {
@@ -889,19 +873,7 @@ impl BernoulliMarginalSlopePredictor {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
         let scale = self.probit_frailty_scale();
-        let intercept = empirical_intercept_from_marginal(
-            marginal.mu,
-            marginal.q,
-            slope,
-            scale,
-            nodes,
-            weights,
-            None,
-        )
-        .map_err(EstimationError::InvalidInput)?;
-        let (a_marginal_eta, a_slope) =
-            empirical_intercept_partials(intercept, marginal.mu1, slope, scale, nodes, weights)?;
-        Ok((intercept, a_marginal_eta, a_slope))
+        empirical_intercept_and_partials(marginal.q, marginal.q1, slope, scale, nodes, weights)
     }
 
     fn local_empirical_mixture_for_point(

@@ -2815,8 +2815,7 @@ fn joint_expectile_standardized_expectiles(
         .design
         .quadratic_form_diag(&scale_block)
         .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?;
-    let sigma_floor =
-        location_scale.response_scale * gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+    let sigma_floor = location_scale.response_scale * location_scale.sigma_floor;
     let standardized: Vec<f64> = (0..n)
         .map(|i| {
             let sigma = gam_model_kernels::sigma_link::logb_sigma_posterior_mean_with_floor_scalar(
