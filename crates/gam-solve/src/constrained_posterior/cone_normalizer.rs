@@ -274,8 +274,12 @@ impl OrthantLogMass {
         loop {
             state.sweeps += 1;
             let (mut at_fixed_point, mut moved) = (true, false);
+            // `b = m₀ + Wν̃`, so `μ = E b`. A site update moves `b` by one column of `W` and `E` by
+            // a rank-one term, so each site costs O(q²) and a sweep O(q³); the sweep then
+            // refactors `E` at its sites, so rounding does not accumulate across sweeps (gam#2992).
+            let mut shift = &state.m0 + &state.w.dot(&state.nu);
             for j in 0..q {
-                let (tau_c, nu_c) = state.cavity(j);
+                let (tau_c, nu_c) = state.cavity_on(j, &shift);
                 if !(tau_c > 0.0 && tau_c.is_finite()) {
                     return Err(ConeNormalizerRefusal::CavityPrecision {
                         row: j,
@@ -288,10 +292,17 @@ impl OrthantLogMass {
                 let tau = (1.0 - fraction) * state.tau[j] + fraction * update.tau;
                 let nu = (1.0 - fraction) * state.nu[j] + fraction * update.nu;
                 moved |= tau != state.tau[j] || nu != state.nu[j];
+                let (d_tau, d_nu) = (tau - state.tau[j], nu - state.nu[j]);
+                if d_tau != 0.0 {
+                    state.move_site_precision(j, d_tau)?;
+                }
+                if d_nu != 0.0 {
+                    shift.scaled_add(d_nu, &state.w.column(j));
+                }
                 state.tau[j] = tau;
                 state.nu[j] = nu;
-                state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
             }
+            state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
             let (log_mass, magnitude) = state.evaluate_log_mass()?;
             let change = (log_mass - previous).abs();
             // Every term of ln Z_EP is formed in O(q²) rounded operations. A damped sweep moves
@@ -327,9 +338,36 @@ impl OrthantLogMass {
     }
 
     fn cavity(&self, j: usize) -> (f64, f64) {
-        let (sigma, mu) = self.posterior();
-        let s_jj = sigma[[j, j]];
-        (1.0 / s_jj - self.tau[j], mu[j] / s_jj - self.nu[j])
+        self.cavity_on(j, &(&self.m0 + &self.w.dot(&self.nu)))
+    }
+
+    /// Site `j`'s cavity `(1/Σ_jj − τ̃_j, μ_j/Σ_jj − ν̃_j)` from row `j` of `Σ = EW` and of
+    /// `μ = E b`, `b = m₀ + Wν̃`.
+    fn cavity_on(&self, j: usize, shift: &Array1<f64>) -> (f64, f64) {
+        let row = self.e.row(j);
+        let s_jj = row.dot(&self.w.column(j));
+        (1.0 / s_jj - self.tau[j], row.dot(shift) / s_jj - self.nu[j])
+    }
+
+    /// `E ← (I + W(T + δ e_j e_jᵀ))⁻¹` by Sherman–Morrison: with `u = E W e_j`,
+    /// `E' = E − δ u E_{j:} / (1 + δ u_j)`. `u_j = Σ_jj = 1/(τ_c + τ̃_j)`, so the denominator is
+    /// `(τ_c + τ̃_j + δ)/(τ_c + τ̃_j)`, positive whenever the new site precision is admissible.
+    fn move_site_precision(&mut self, j: usize, delta: f64) -> Result<(), ConeNormalizerRefusal> {
+        let u = self.e.dot(&self.w.column(j));
+        let denominator = 1.0 + delta * u[j];
+        if !(denominator > 0.0 && denominator.is_finite()) {
+            return Err(ConeNormalizerRefusal::Singular {
+                reason: format!(
+                    "I + WT lost positive definiteness at site {j} (rank-one denominator {denominator:e})"
+                ),
+            });
+        }
+        let row = self.e.row(j).to_owned();
+        let scale = delta / denominator;
+        for (i, &u_i) in u.iter().enumerate() {
+            self.e.row_mut(i).scaled_add(-scale * u_i, &row);
+        }
+        Ok(())
     }
 
     /// `ln Z_EP` and the summed magnitude of its terms,
@@ -896,6 +934,91 @@ mod tests {
                 gamma[i]
             );
         }
+    }
+
+    /// A sweep moves each site's precision by a rank-one update of `E` instead of refactoring
+    /// `I + WT` per site, and keeps the cavity shift `m₀ + Wν̃` by one column update per site
+    /// (gam#2992). On a correlated 48-row orthant, driving both with the same site sequence, the
+    /// rank-one `E`, the maintained shift and every cavity's linear reads match the per-site
+    /// refactor's to rounding; and the converged sites are the per-site iteration's fixed point:
+    /// one more sweep that refactors `E` after every site moves `ln P` by no more than the band EP
+    /// stops at.
+    #[test]
+    fn rank_one_site_updates_keep_the_per_site_refactor_fixed_point_2992() {
+        let (q, p) = (48, 64);
+        let a = Array2::from_shape_fn((q, p), |(i, k)| {
+            ((i * 7 + k * 3) as f64 * 0.37).sin() + if k == i { 1.5 } else { 0.0 }
+        });
+        let w = symmetrized(&a.dot(&a.t()).mapv(|value| value / p as f64));
+        let m0 = Array1::from_shape_fn(q, |i| ((i as f64) * 0.61).cos() - 0.4);
+        let max_abs = |values: &mut dyn Iterator<Item = f64>| values.fold(0.0_f64, |m, v| m.max(v.abs()));
+
+        let mut refactored = OrthantLogMass::converge(&m0, &w).expect("the orthant converges");
+        let mut rank_one = refactored.clone();
+        let mut shift = &rank_one.m0 + &rank_one.w.dot(&rank_one.nu);
+        let w_scale = max_abs(&mut w.iter().copied());
+        let (mut e_scale, mut shift_scale) = (0.0_f64, 0.0_f64);
+        let (mut e_gap, mut shift_gap, mut read_gap, mut read_scale) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+        for j in 0..q {
+            // Both states read the cavity's two linear functionals of `E`: the diagonal
+            // `s_jj = (EW)_jj` and the mean read `E_j·(m₀ + Wν̃)`.
+            let exact_shift = &refactored.m0 + &refactored.w.dot(&refactored.nu);
+            let reads = |state: &OrthantLogMass, shift: &Array1<f64>| {
+                let row = state.e.row(j);
+                (row.dot(&state.w.column(j)), row.dot(shift))
+            };
+            let (s_f, mean_f) = reads(&refactored, &exact_shift);
+            let (s_r, mean_r) = reads(&rank_one, &shift);
+            shift_scale = shift_scale.max(max_abs(&mut exact_shift.iter().copied()));
+            e_scale = e_scale.max(max_abs(&mut refactored.e.iter().copied()));
+            read_scale = read_scale.max(q as f64 * e_scale * w_scale.max(shift_scale));
+            read_gap = read_gap.max((s_r - s_f).abs()).max((mean_r - mean_f).abs());
+            shift_gap = shift_gap.max(max_abs(&mut (&shift - &exact_shift).iter().copied()));
+
+            // Perturb each site off the fixed point so every rank-one update is nontrivial;
+            // both states take the same site values.
+            let (tau_c, nu_c) = refactored.cavity(j);
+            let update = site_update(tau_c, nu_c);
+            let (tau, nu) = (1.1 * update.tau + 0.05, update.nu - 0.02);
+            refactored.tau[j] = tau;
+            refactored.nu[j] = nu;
+            refactored.e = inverse_i_plus_wt(&refactored.w, &refactored.tau).expect("admissible");
+
+            rank_one.move_site_precision(j, tau - rank_one.tau[j]).expect("admissible");
+            shift.scaled_add(nu - rank_one.nu[j], &rank_one.w.column(j));
+            rank_one.tau[j] = tau;
+            rank_one.nu[j] = nu;
+            e_gap = e_gap.max(max_abs(&mut (&rank_one.e - &refactored.e).iter().copied()));
+        }
+        assert!(
+            e_gap <= band(4 * q * q * q, e_scale),
+            "rank-one E differs from the refactored E by {e_gap:e} (scale {e_scale:e})"
+        );
+        assert!(
+            shift_gap <= band(4 * q * q, shift_scale.max(w_scale * max_abs(&mut rank_one.nu.iter().copied()))),
+            "the maintained shift differs from m₀ + Wν̃ by {shift_gap:e}"
+        );
+        assert!(
+            read_gap <= band(4 * q * q * q, read_scale),
+            "a rank-one cavity read differs from the refactored read by {read_gap:e} (scale {read_scale:e})"
+        );
+
+        let mass = OrthantLogMass::converge(&m0, &w).expect("the orthant converges");
+        let mut checked = mass.clone();
+        for j in 0..q {
+            let (tau_c, nu_c) = checked.cavity(j);
+            let update = site_update(tau_c, nu_c);
+            checked.tau[j] = update.tau;
+            checked.nu[j] = update.nu;
+            checked.e = inverse_i_plus_wt(&checked.w, &checked.tau).expect("admissible sites");
+        }
+        let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
+        let stop_band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
+        assert!(
+            (after - mass.log_mass()).abs() <= stop_band,
+            "a refactoring sweep from the rank-one fixed point moves ln P by {:e}, above {stop_band:e}",
+            (after - mass.log_mass()).abs()
+        );
     }
 
     #[test]
