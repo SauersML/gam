@@ -32,6 +32,8 @@ def _two_groups(family: str, n: int, seed: int, difference: bool) -> dict[str, A
         eta = eta + np.where(g == "B", 0.6 * np.cos(np.pi * x), 0.0)
     if family == "gaussian":
         y = eta + 0.5 * rng.standard_normal(n)
+    elif family == "poisson":
+        y = rng.poisson(np.exp(eta)).astype(float)
     else:
         y = rng.binomial(1, 0.5 * (1.0 + np.tanh(0.5 * eta))).astype(float)
     return {"x": x, "g": g, "y": y}
@@ -53,22 +55,35 @@ def _column(rows: list[dict[str, Any]], key: str) -> np.ndarray:
     return np.array([row[key] for row in rows], dtype=float)
 
 
-def test_band_uses_the_published_covariance_when_the_correction_is_unavailable() -> None:
-    # This binomial fit certifies a smoothing parameter at its rail, so its
-    # smoothing correction is typed unavailable and it publishes the
-    # conditional covariance. The band used to refuse the fit outright.
-    model = gamfit.fit(_two_groups("binomial", 400, 304_001, False), FORMULA, family="binomial")
-    grid = np.linspace(0.0, 1.0, GRID)
+@pytest.mark.parametrize(
+    ("family", "seed", "publishes_corrected"),
+    [
+        ("binomial", 304_001, True),
+        # This fit types its smoothing correction unavailable, so it publishes
+        # the conditional covariance; the band used to refuse it outright.
+        ("poisson", 204_000, False),
+    ],
+)
+def test_band_is_priced_from_the_published_covariance(
+    family: str, seed: int, publishes_corrected: bool
+) -> None:
+    # The band's standard errors and row correlation come from the covariance
+    # the fit publishes: smoothing-corrected when the fit carries it,
+    # conditional when the correction is typed unavailable.
+    model = gamfit.fit(_two_groups(family, 400, seed, True), FORMULA, family=family)
+    rows = _rows(model)
+    grid = _column(rows, "x")
     design_a = model.design_matrix({"x": grid, "g": np.array(["A"] * GRID)})
     design_b = model.design_matrix({"x": grid, "g": np.array(["B"] * GRID)})
-    assert design_b.covariance_smoothing_corrected is None
+    corrected = design_b.covariance_smoothing_corrected
+    assert (corrected is not None) == publishes_corrected
+    published = np.asarray(design_b.covariance_conditional if corrected is None else corrected)
 
-    rows = _rows(model)
-    assert {row["covariance_kind"] for row in rows} == {"conditional"}
-    assert not any(row["covariance_corrected"] for row in rows)
+    expected_kind = "conditional" if corrected is None else "smoothing-corrected"
+    assert {row["covariance_kind"] for row in rows} == {expected_kind}
+    assert {row["covariance_corrected"] for row in rows} == {corrected is not None}
     contrast = np.asarray(design_b.matrix) - np.asarray(design_a.matrix)
-    conditional = np.asarray(design_b.covariance_conditional)
-    expected_se = np.sqrt(np.einsum("ij,jk,ik->i", contrast, conditional, contrast))
+    expected_se = np.sqrt(np.einsum("ij,jk,ik->i", contrast, published, contrast))
     np.testing.assert_allclose(_column(rows, "se"), expected_se, rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(_column(rows, "diff"), contrast @ np.asarray(design_b.coefficients), atol=1e-10)
 

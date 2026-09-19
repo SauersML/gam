@@ -834,7 +834,9 @@ mod tests {
             BandOptions::Pointwise(PointwiseBandOptions { level }),
         )
         .unwrap();
-        assert_eq!(simultaneous.se, pointwise.se);
+        for (&factor_se, &quadratic_se) in simultaneous.se.iter().zip(&pointwise.se) {
+            assert_abs_diff_eq!(factor_se, quadratic_se, epsilon = 1e-12);
+        }
 
         let replicates = 20_000;
         let maxima = independent_standardized_maxima(
