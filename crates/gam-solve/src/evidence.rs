@@ -2831,8 +2831,9 @@ pub struct RankedRow {
     pub delta_aic: f64,
     /// Akaike evidence ratio of the winner over this row, `exp(½·delta_aic)`
     /// (Burnham & Anderson; #2124). A relative likelihood, not a Bayes factor:
-    /// it integrates over no prior.
-    pub evidence_ratio: f64,
+    /// it integrates over no prior. `None` when it exceeds `f64` range; the
+    /// gap itself is `delta_aic`.
+    pub evidence_ratio: Option<f64>,
     pub aic_conditional: f64,
     pub edf_corrected: f64,
     pub edf_conditional: f64,
@@ -2856,7 +2857,8 @@ pub struct ScoreRow {
     pub delta_reml: Option<f64>,
     /// `exp(delta_reml)`: the restricted-evidence ratio of the best-scoring fit
     /// over this one, at plug-in `λ̂`, under the shared fixed-effect condition
-    /// above.
+    /// above. `None` without a `delta_reml` or when the ratio exceeds `f64`
+    /// range.
     pub reml_criterion_ratio_best_over_model: Option<f64>,
     pub effective_dof: f64,
 }
@@ -2908,6 +2910,13 @@ fn check_comparable(candidates: &[&ComparisonCandidate]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `exp(log_ratio)` when it is a finite `f64`. A ratio past `f64::MAX` is
+/// reported as absent rather than `inf`, which JSON cannot carry; the finite
+/// log-scale gap beside it remains the exact comparison.
+fn representable_exp(log_ratio: f64) -> Option<f64> {
+    Some(log_ratio.exp()).filter(|ratio| ratio.is_finite())
 }
 
 /// Log Akaike evidence ratio of `a` over `b`, `½·(AIC_c(b) − AIC_c(a))`, on
@@ -2962,7 +2971,7 @@ pub fn compare_models(
                 name: row.name.clone(),
                 aic_corrected: row.aic_corrected,
                 delta_aic,
-                evidence_ratio: (0.5 * delta_aic).exp(),
+                evidence_ratio: representable_exp(0.5 * delta_aic),
                 aic_conditional: row.aic_conditional,
                 edf_corrected: row.edf_corrected,
                 edf_conditional: row.edf_conditional,
@@ -2979,7 +2988,7 @@ pub fn compare_models(
                 name: row.name.clone(),
                 reml_score: row.reml_score,
                 delta_reml,
-                reml_criterion_ratio_best_over_model: delta_reml.map(f64::exp),
+                reml_criterion_ratio_best_over_model: delta_reml.and_then(representable_exp),
                 effective_dof: row.edf_conditional,
             }
         })
@@ -3662,8 +3671,8 @@ mod tests {
                 row.delta_aic
             );
             assert!(
-                row.evidence_ratio >= 1.0 - 1e-12,
-                "ranking evidence_ratio for {} must be >= 1, got {}",
+                row.evidence_ratio.is_some_and(|ratio| ratio >= 1.0 - 1e-12),
+                "ranking evidence_ratio for {} must be >= 1, got {:?}",
                 row.name,
                 row.evidence_ratio
             );
@@ -3671,7 +3680,7 @@ mod tests {
         let winner_row = cmp.ranking.iter().find(|r| r.name == "m1").unwrap();
         assert!(winner_row.delta_aic.abs() < 1e-12, "winner delta == 0");
         assert!(
-            (winner_row.evidence_ratio - 1.0).abs() < 1e-9,
+            winner_row.evidence_ratio == Some(1.0),
             "winner evidence_ratio == 1"
         );
 
@@ -4593,7 +4602,9 @@ mod tests {
         let loser_row = cmp.ranking.iter().find(|r| r.name == "loser").unwrap();
         assert!((loser_row.delta_aic - delta_aic).abs() < 1e-9);
         let expected = (0.5 * delta_aic).exp();
-        assert!((loser_row.evidence_ratio / expected - 1.0).abs() < 1e-9);
+        assert!(loser_row
+            .evidence_ratio
+            .is_some_and(|ratio| (ratio / expected - 1.0).abs() < 1e-9));
         let loser_score_row = cmp.score_table.iter().find(|r| r.name == "loser").unwrap();
         assert!(
             loser_score_row
@@ -4629,7 +4640,12 @@ mod tests {
         assert_eq!(cmp.winner, "m1");
         for row in &cmp.ranking {
             assert!(row.delta_aic >= 0.0, "row {} delta {}", row.name, row.delta_aic);
-            assert!(row.evidence_ratio >= 1.0, "row {} ratio {}", row.name, row.evidence_ratio);
+            assert!(
+                row.evidence_ratio.is_some_and(|ratio| ratio >= 1.0),
+                "row {} ratio {:?}",
+                row.name,
+                row.evidence_ratio
+            );
         }
         let names: Vec<_> = cmp.ranking.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["m1", "m2", "m3"]);

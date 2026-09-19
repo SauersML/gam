@@ -36,7 +36,8 @@ def compare_models(
     * ``ranking`` -- one dict per fit, best first, with ``name``,
       ``aic_corrected``, ``delta_aic`` (gap to the winner),
       ``evidence_ratio`` (``exp(delta_aic / 2)``, the Akaike evidence ratio of
-      the winner over the row; not a Bayes factor), ``aic_conditional``,
+      the winner over the row; not a Bayes factor; ``None`` past float
+      range), ``aic_conditional``,
       ``edf_corrected`` and ``edf_conditional``;
     * ``winner`` and ``evidence_summary``;
     * ``score_table`` -- each fit's REML/LAML score. Differences in that score

@@ -23,7 +23,9 @@ def test_compare_models_refuses_a_fit_without_its_criterion_2670() -> None:
     x = rng.uniform(0.0, 1.0, n)
     data = {"x": x, "y": np.cos(3.0 * x) + rng.normal(0.0, 0.2, n)}
     # The O(n) spline scan keeps no smoothing-parameter covariance correction.
-    scan = gamfit.fit(data, "y ~ s(x)", double_penalty=False)
+    scan = gamfit.fit(
+        data, 'y ~ s(x, bs="ps", degree=3, penalty_order=2, double_penalty=False)'
+    )
     summary = scan.summary()
     assert summary.aic_corrected is None
     assert summary.aic_conditional is not None

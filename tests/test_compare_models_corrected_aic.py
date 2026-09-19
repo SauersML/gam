@@ -49,8 +49,12 @@ def test_d11_corrected_aic_prefers_the_true_model() -> None:
         comparison = gamfit.compare_models([truth, noise], names=["truth", "noise"])
         assert comparison["criterion"] == "aic_corrected"
         true_wins += comparison["winner"] == "truth"
-    # Measured: the true model wins 17 of 20 replicates on this seed (the
-    # uncorrected ranking it replaces managed 11 of 20).
+    # Measured: the true model wins 18 of 20 replicates on this seed. The
+    # uncorrected -2*loglik + 2*edf it replaces managed 11 of 20: in the 11
+    # replicates where REML shrinks s(z) away both criteria prefer the truth
+    # by the shrunk smooth's residual edf, and in the 9 where s(z) keeps
+    # weight the uncorrected score picked the noise model every time, while
+    # the corrected score picks the truth in 7 of them.
     assert true_wins >= 15, (
         f"compare_models preferred y ~ s(x) over y ~ s(x) + s(z) (z pure noise) "
         f"in only {true_wins}/{D11_REPS} fixed-seed replicates"
@@ -147,7 +151,9 @@ def test_compare_models_refuses_a_fit_without_corrected_aic() -> None:
     x = rng.uniform(0.0, 1.0, n)
     data = {"x": x, "y": np.sin(2.0 * np.pi * x) + rng.normal(0.0, 0.3, n)}
     dense = gamfit.fit(data, "y ~ s(x)")
-    scan = gamfit.fit(data, "y ~ s(x)", double_penalty=False)
+    scan = gamfit.fit(
+        data, 'y ~ s(x, bs="ps", degree=3, penalty_order=2, double_penalty=False)'
+    )
     reason = scan.summary().aic_corrected_unavailable
     assert reason is not None and scan.summary().aic_corrected is None
     # Never a fallback to the conditional AIC: the refusal carries the reason.
