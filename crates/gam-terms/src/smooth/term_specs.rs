@@ -1268,36 +1268,27 @@ pub struct TermCollectionSpec {
 /// Where a model's constant level lives.
 ///
 /// The constant is carried at most once, and always in an unpenalized
-/// direction, so a shift of the response shifts the fit and nothing else. With
-/// the default global intercept it is the unpenalized all-ones column and
-/// every other term is centred against it. A formula that removes the
-/// intercept (`0 + …`, `… - 1`) hands the level to one term, in this order:
+/// direction, so a shift of the response shifts the fit and nothing else: it
+/// is the unpenalized all-ones column, and every other term is centred against
+/// it. A formula that removes the intercept (`0 + …`, `… - 1`) still keeps it
+/// when some term spans the constant: a fixed factor block (`+ g`,
+/// `factor(g)`, `C(g)`, or the main effect of a factor `by=`), a
+/// pure-indicator interaction over the full level cross (`g:h`), or a
+/// B-spline / tensor smooth whose gauge would keep the constant (the default
+/// sum-to-zero centring, or `identifiability=none`). Such a model has the
+/// column space the formula asked for, with only the constant free; every
+/// other direction keeps its default penalty (a full-level ridge beside the
+/// intercept is the ridge on the level contrasts).
 ///
-/// 1. the first fixed factor block (`+ g`, `factor(g)`, `C(g)`, or the main
-///    effect of a factor `by=`), which already spans the constant with its
-///    full dummy coding and is made unpenalized, giving the cell-means model;
-/// 2. else the first pure-indicator interaction (`g:h`), which keeps every
-///    cell, its reference cell included;
-/// 3. else the first B-spline / tensor smooth whose explicit
-///    `identifiability=none` already keeps the constant, or failing that the
-///    first one with the default gauge, whose sum-to-zero centring is
-///    released. Either way it becomes `level_smooth`, and its null-space
-///    ridge is dropped unless `double_penalty=true` was written.
-///
-/// A genuine random effect (`group(g)`, `re(g)`) never carries the level: its
-/// levels are mean-zero deviations. When no term can carry it the model has
-/// no level: every surviving effect passes through the origin, as a
-/// parametric no-intercept fit does.
+/// Only when no term spans the constant is it removed (`NoIntercept`): every
+/// effect then passes through the origin, as a parametric no-intercept fit
+/// does. A genuine random effect (`group(g)`, `re(g)`) never spans it: its
+/// levels are mean-zero deviations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ModelLevel {
     #[default]
     Intercept,
-    NoIntercept {
-        /// Index into `smooth_terms` of the smooth whose centring was released
-        /// to carry the level. Its parametric constraint block omits the
-        /// constant column so the identifiability pass does not re-centre it.
-        level_smooth: Option<usize>,
-    },
+    NoIntercept,
 }
 
 pub(crate) fn validate_smooth_basis_frozen(
@@ -7010,7 +7001,7 @@ pub(crate) fn defer_inner_model_centering_to_factor_level_wrapper(basis: &mut Sm
 /// Whether a B-spline smooth (1-D or tensor) carries its default model-space
 /// centring, the gauge that removes the constant so the smooth cannot compete
 /// with a global intercept. Other bases report `false`: they keep their own
-/// gauge and never take part in the level-carrier rule (see [`ModelLevel`]).
+/// gauge and never count as spanning the constant (see [`ModelLevel`]).
 pub(crate) fn bspline_smooth_is_default_centred(basis: &SmoothBasisSpec) -> bool {
     match basis {
         SmoothBasisSpec::BSpline1D { spec, .. } => matches!(
@@ -7035,43 +7026,6 @@ pub(crate) fn bspline_smooth_spans_constant(basis: &SmoothBasisSpec) -> bool {
             matches!(spec.identifiability, TensorBSplineIdentifiability::None)
         }
         _ => false,
-    }
-}
-
-/// Hand the model's constant level to this smooth when the formula removed
-/// the intercept (the level-carrier rule of [`ModelLevel`]): release the
-/// default model-space centring so the constant stays in the smooth's span.
-///
-/// The level must sit in an unpenalized direction, or the fit would shrink the
-/// whole curve toward zero and change under a shift of the response. The
-/// wiggliness penalty already leaves the constant free (it lies in its null
-/// space); the double-penalty null-space ridge would not, so when
-/// `keep_null_ridge` is false the ridge is dropped and the smooth's null space
-/// (the constant and the polynomials the penalty annihilates) is left
-/// unpenalized, as for a smooth fitted alongside an intercept without a
-/// null-space penalty. An explicit `double_penalty=true` keeps it: the user
-/// asked for the whole null space, level included, to be shrunk. Only a basis
-/// for which [`bspline_smooth_is_default_centred`] or
-/// [`bspline_smooth_spans_constant`] holds is ever handed the level; any other
-/// basis is left untouched.
-pub(crate) fn release_model_centring_for_level(basis: &mut SmoothBasisSpec, keep_null_ridge: bool) {
-    if let SmoothBasisSpec::TensorBSpline { spec, .. } = basis {
-        if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) {
-            spec.identifiability = TensorBSplineIdentifiability::None;
-        }
-        if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
-            spec.double_penalty &= keep_null_ridge;
-        }
-    } else if let SmoothBasisSpec::BSpline1D { spec, .. } = basis {
-        if matches!(
-            spec.identifiability,
-            BSplineIdentifiability::WeightedSumToZero { .. }
-        ) {
-            spec.identifiability = BSplineIdentifiability::None;
-        }
-        if matches!(spec.identifiability, BSplineIdentifiability::None) {
-            spec.double_penalty &= keep_null_ridge;
-        }
     }
 }
 
