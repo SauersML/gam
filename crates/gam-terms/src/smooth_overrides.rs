@@ -39,7 +39,7 @@ use crate::basis::{
 use crate::fit_notes::FitNoteSink;
 use crate::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
-    TermCollectionSpec, parse_shape_constraint,
+    TermCollectionSpec,
 };
 use gam_data::{ColumnKindTag, EncodedDataset as Dataset};
 
@@ -279,15 +279,26 @@ fn apply_one_override(
     // Universal shape constraint (`Smooth.shape_constraint`). Stamped onto the
     // term, not the basis: the constraint solver (box-reparam / tangent-LAML)
     // keys off `SmoothTermSpec.shape`. A basis-incompatible request fails
-    // loudly downstream via `shape_supports_basis`.
-    if let Some(shape_val) = descriptor.get("shape_constraint") {
-        let raw = shape_val
-            .as_str()
-            .ok_or_else(|| format!("smooths[{symbol:?}].shape_constraint must be a string"))?;
-        term.shape = parse_shape_constraint(raw).map_err(|e| format!("smooths[{symbol:?}].{e}"))?;
-    }
+    // loudly downstream via `validate_shape_request`. The value is a DSL
+    // string or a (nested) JSON list, resolved against the final basis so a
+    // `te()` list addresses the tensor's margins.
+    let shape_expr = descriptor
+        .get("shape_constraint")
+        .map(|value| {
+            crate::smooth::shape_expr_from_json(value)
+                .map_err(|e| format!("smooths[{symbol:?}].shape_constraint: {e}"))
+        })
+        .transpose()?;
 
     apply_kind_specific(&mut term.basis, kind, descriptor, symbol)?;
+
+    if let Some(expr) = shape_expr {
+        term.shape = crate::smooth::resolve_shape_spec(
+            &expr,
+            crate::smooth::shape_tensor_margin_count(&term.basis),
+        )
+        .map_err(|e| format!("smooths[{symbol:?}].shape_constraint: {e}"))?;
+    }
 
     inference_notes.inform(format!(
         "smooths[{symbol:?}] descriptor (kind={kind}) merged onto formula-built term",
@@ -1176,7 +1187,7 @@ mod tests {
                 feature_col: 0,
                 spec: open_bspline_spec(),
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }

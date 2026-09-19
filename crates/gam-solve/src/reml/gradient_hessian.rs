@@ -172,7 +172,9 @@ impl<'a> RemlState<'a> {
         {
             return false;
         }
-        true
+        // A latched #784 block correction splices `Δ_b` with its exact
+        // gradient but no ρ-Hessian, so the criterion it defines has none.
+        !self.block_correction_latched()
     }
 
     /// Whether the exact analytic outer Hessian of the Tierney-Kadane

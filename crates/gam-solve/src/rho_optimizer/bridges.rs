@@ -301,7 +301,8 @@ pub(crate) const COST_STALL_WINDOW: usize = 6;
 pub(crate) const ARC_COST_STALL_WINDOW: usize = 3;
 pub(crate) const COST_STALL_REL_TOL_FLOOR: f64 = 1.0e-7;
 
-/// The incumbent state a stall escape was granted from, compared by raw bits.
+/// The search state a stall escape was granted from, compared by raw bits: the
+/// incumbent, and the trial points the window that filled had evaluated.
 ///
 /// Bit identity is the only comparison that supports the claim the escape cut
 /// makes. The cut asserts that reopening the no-improvement window CANNOT
@@ -314,6 +315,17 @@ pub(crate) const COST_STALL_REL_TOL_FLOOR: f64 = 1.0e-7;
 /// threshold, because one window improved the best by less than roundoff while
 /// the search was still moving.
 ///
+/// The incumbent alone is not the search's state. A window of REJECTED trials
+/// leaves it bit-identical while the solver's own state moves: every ARC
+/// rejection raises the cubic regularization, so the next window proposes
+/// shorter steps from the same incumbent. Twenty double-penalized smooths on
+/// 100 rows of pure noise stopped that way at a strict saddle with
+/// `|g| = 2.0e-1`: the window after the escape evaluated three new trials
+/// whose costs fell 105 → 40 → 22.3 against an incumbent of 21.85, and the cut
+/// called it a replay. The trials the window evaluated are the part of the
+/// state the guard can see, so a replay is a window that evaluated the same
+/// points, in the same order, from the same incumbent.
+///
 /// Raw bits also keep the comparison total where a float comparison is not:
 /// two non-finite incumbents match only when their payloads match, and `-0.0`
 /// is not `0.0` — both errors, when made, are made on the safe side (grant the
@@ -323,16 +335,22 @@ pub(crate) struct EscapeIncumbent {
     rho: Vec<u64>,
     value: u64,
     grad_norm: u64,
+    window_trials: Vec<Vec<u64>>,
 }
 
 impl EscapeIncumbent {
-    fn new(rho: &Array1<f64>, value: f64, grad_norm: f64) -> Self {
+    fn new(rho: &Array1<f64>, value: f64, grad_norm: f64, window_trials: &[Vec<u64>]) -> Self {
         Self {
-            rho: rho.iter().map(|value| value.to_bits()).collect(),
+            rho: point_bits(rho),
             value: value.to_bits(),
             grad_norm: grad_norm.to_bits(),
+            window_trials: window_trials.to_vec(),
         }
     }
+}
+
+fn point_bits(rho: &Array1<f64>) -> Vec<u64> {
+    rho.iter().map(|value| value.to_bits()).collect()
 }
 
 /// Best iterate captured by a cost-stall convergence, handed from the bridge
@@ -461,6 +479,12 @@ pub(crate) struct CostStallGuard {
     /// next escape is not a replay of it. `None` before the first escape of a
     /// streak, and cleared wherever [`Self::stuck_escapes`] is replenished.
     incumbent_at_last_escape: Option<EscapeIncumbent>,
+    /// Every trial point observed without improving the incumbent since the
+    /// window last opened: at the latest improvement, or at the latest escape
+    /// grant, which moves them into [`Self::incumbent_at_last_escape`]. The
+    /// half of the replay identity the incumbent cannot carry (see
+    /// [`EscapeIncumbent`]).
+    window_trials: Vec<Vec<u64>>,
     /// `(best value, best projected-gradient norm)` when the previous filled
     /// window was licensed to continue a non-stationary stall on the ARC route;
     /// `None` before the first. What the next licence is judged against (see
@@ -503,6 +527,7 @@ impl CostStallGuard {
             accepted_iters: 0,
             stuck_escapes: 0,
             incumbent_at_last_escape: None,
+            window_trials: Vec::new(),
             continuation_incumbent: None,
             recent: std::collections::VecDeque::new(),
             exit,
@@ -553,8 +578,20 @@ impl CostStallGuard {
         }
         self.stuck_escapes = self.stuck_escapes.saturating_add(1);
         self.incumbent_at_last_escape = Some(incumbent);
+        self.window_trials.clear();
         self.no_improve_streak = 0;
         true
+    }
+
+    /// The replay identity of the search as it stands (see [`EscapeIncumbent`]).
+    fn escape_state(&self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> EscapeIncumbent {
+        EscapeIncumbent::new(rho, value, grad_norm, &self.window_trials)
+    }
+
+    /// Record a trial that did not improve the incumbent as part of the open
+    /// window's replay identity.
+    fn record_window_trial(&mut self, rho: &Array1<f64>) {
+        self.window_trials.push(point_bits(rho));
     }
 
     /// Whether a filled window at a non-stationary stall may be followed by
@@ -780,6 +817,7 @@ impl CostStallGuard {
         self.best_curvature = staged_curvature;
         self.no_improve_streak = 0;
         self.infeasible_streak = 0;
+        self.window_trials.clear();
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         self.record_recent(rho, value);
         // Seed the shared exit cell so the budget-exhaustion path always has a
@@ -848,6 +886,7 @@ impl CostStallGuard {
             // bookkeeping lives in `observe_infeasible`; this finite-path entry
             // is left untouched for non-finite values.
             self.no_improve_streak = 0;
+            self.record_window_trial(rho);
             return CostStallVerdict::Continue;
         }
         if !inner_converged {
@@ -862,6 +901,7 @@ impl CostStallGuard {
             // do converge and the best-so-far tracks an honest iterate.
             self.infeasible_streak = 0;
             self.no_improve_streak = 0;
+            self.record_window_trial(rho);
             return CostStallVerdict::Continue;
         }
         // A finite trial means the inner solve produced a real cost: the
@@ -906,8 +946,10 @@ impl CostStallGuard {
         // stops.
         if floor.is_finite() && (improvement <= floor || kkt_stationary_at_bound) {
             self.no_improve_streak = self.no_improve_streak.saturating_add(1);
+            self.record_window_trial(rho);
         } else {
             self.no_improve_streak = 0;
+            self.window_trials.clear();
             // A genuine super-floor improvement means the last stuck-stall
             // escape (if any) restored real descent, so the escape streak is
             // over: clear both the diagnostic count and the recorded incumbent
@@ -939,7 +981,7 @@ impl CostStallGuard {
         if self.best_hessian_psd == Some(false) {
             let (best_rho, best_value, best_grad_norm) =
                 self.best_iterate_or(rho, value, grad_norm);
-            let incumbent = EscapeIncumbent::new(&best_rho, best_value, best_grad_norm);
+            let incumbent = self.escape_state(&best_rho, best_value, best_grad_norm);
             if self.grant_escape_unless_replay(incumbent) {
                 log::debug!(
                     "[OUTER] ARC cost-stall window filled at a strict-saddle incumbent \
@@ -958,9 +1000,9 @@ impl CostStallGuard {
             self.replay_proven = true;
             log::debug!(
                 "[OUTER] ARC strict-saddle stall refusal cut at escape {}: the previous \
-                 refusal reopened a full {}-step window and left the incumbent \
-                 bit-identical (best={:.9e}, |g|={:.3e}), so refusing again replays the \
-                 same window from the same state; halting.",
+                 refusal reopened a full {}-step window that evaluated the same trials \
+                 from a bit-identical incumbent (best={:.9e}, |g|={:.3e}), so refusing \
+                 again replays the same window from the same state; halting.",
                 self.stuck_escapes,
                 self.window,
                 best_value,
@@ -991,6 +1033,7 @@ impl CostStallGuard {
         }
         self.infeasible_streak = self.infeasible_streak.saturating_add(1);
         self.off_stratum_streak = 0;
+        self.record_window_trial(rho);
         if self.infeasible_streak < self.window {
             return CostStallVerdict::Continue;
         }
@@ -1037,6 +1080,7 @@ impl CostStallGuard {
             return CostStallVerdict::Continue;
         }
         self.infeasible_streak = self.infeasible_streak.saturating_add(1);
+        self.record_window_trial(rho);
         self.off_stratum_streak = match self.infeasible_streak {
             1 => 1,
             _ => self.off_stratum_streak.saturating_add(1),
@@ -1206,8 +1250,9 @@ impl CostStallGuard {
         // and the seven repeats cost about half the seed's wall clock before
         // the guard halted with the verdict escape 1 would have produced.
         //
-        // The test is BIT-IDENTITY of the whole incumbent, not a tolerance on
-        // the objective: the budget of eight was sized for a multi-shelf
+        // The test is BIT-IDENTITY of the whole incumbent and of the trials its
+        // window evaluated ([`EscapeIncumbent`]), not a tolerance on the
+        // objective: the budget of eight was sized for a multi-shelf
         // descent whose 7th escape bought a 36-point objective drop (#2253),
         // and only an escape that left the search in the state it started from
         // is provably unrepeatable — reopening the window then replays a
@@ -1216,7 +1261,7 @@ impl CostStallGuard {
         // incumbent did not improve, and #2392 is what keying this on the
         // value alone cost: a still-descending run halted at escape 1 of 8
         // carrying |g| = 2.479e2 against a keep-descending threshold of 1.5.
-        let escape_incumbent = EscapeIncumbent::new(&best_rho, best_value, best_grad_norm);
+        let escape_incumbent = self.escape_state(&best_rho, best_value, best_grad_norm);
         if non_stationary_stall && self.grant_escape_unless_replay(escape_incumbent.clone()) {
             // The grant already reopened the no-improvement window. Reset the
             // infeasible streak too: the optimizer should be allowed a fresh
@@ -1236,7 +1281,10 @@ impl CostStallGuard {
             // The replay is proven, so nothing continues past this stall (#2817).
             self.replay_proven = true;
             log::debug!(
-                "[OUTER] cost-stall escape streak cut at {}: escape {} reopened a full                  {}-step window and left the incumbent bit-identical (best={:.9e}, |g|={:.3e}),                  so reopening it again replays the same window from the same state; halting.",
+                "[OUTER] cost-stall escape streak cut at {}: escape {} reopened a full \
+                 {}-step window that evaluated the same trials from a bit-identical \
+                 incumbent (best={:.9e}, |g|={:.3e}), so reopening it again replays the \
+                 same window from the same state; halting.",
                 self.stuck_escapes,
                 self.stuck_escapes,
                 self.window,

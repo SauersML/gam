@@ -472,6 +472,21 @@ pub(crate) fn eligible_transferred_outer_hessian<'a>(
     })
 }
 
+/// The continuation's exact start curvature, only at the start it was measured
+/// at and only in this layout's dimension; see [`OuterConfig::initial_curvature`].
+pub(crate) fn bound_initial_curvature<'a>(
+    bound: Option<&'a BoundOuterCurvature>,
+    start: &Array1<f64>,
+    n_params: usize,
+) -> Option<&'a Array2<f64>> {
+    bound
+        .filter(|bound| outer_theta_bitwise_eq(&bound.theta, start))
+        .map(|bound| &bound.hessian)
+        .filter(|h| {
+            h.nrows() == n_params && h.ncols() == n_params && h.iter().all(|v| v.is_finite())
+        })
+}
+
 /// A multistart candidate that has cleared the analytic outer certificate.
 ///
 /// Keeping the winner slot typed this way prevents a solver status bit from
@@ -2578,6 +2593,13 @@ pub(crate) fn run_outer_with_plan(
                                 cap.hessian,
                                 layout.n_params,
                             )
+                                .or_else(|| {
+                                    bound_initial_curvature(
+                                        config.initial_curvature.as_ref(),
+                                        &stratum_start,
+                                        layout.n_params,
+                                    )
+                                })
                                 .and_then(|h| {
                                     match gam_linalg::utils::certified_spd_inverse(
                                         h,

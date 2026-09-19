@@ -123,7 +123,7 @@ fn spec_1d(aniso: bool) -> TermCollectionSpec {
                 // pin would be a gamed gate masking the open geometry gap.
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
         level: Default::default(),

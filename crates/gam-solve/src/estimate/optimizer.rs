@@ -7,7 +7,8 @@ use crate::estimate::evaluation::{
 use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
 use crate::estimate::penalty::{REML_SEED_SCREENING_RHO_CAP, scaled_covariance};
 use crate::estimate::prefit::{
-    reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
+    reject_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
+    reject_prefit_unpenalized_rank_deficiency,
 };
 use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
@@ -587,22 +588,6 @@ pub(crate) fn external_reml_seed_config(k: usize, gaussian_identity: bool) -> Se
     }
 }
 
-pub(crate) fn standard_reml_search_prefers_gradient_only(gaussian_identity: bool) -> bool {
-    // The optimize-3 / certify-4 split exists to keep the generic
-    // non-Gaussian family derivative tower through order four out of the
-    // smoothing-parameter search (#2359).  A profiled Gaussian identity
-    // likelihood is quadratic in eta: its family derivatives above order two
-    // vanish, so reserving the already-available exact outer Hessian for mint
-    // buys nothing.  Worse, it routes a small exact-curvature problem through
-    // first-order BFGS: the saturated wine_gamair fold took 86 accepted
-    // iterations, then failed the first analytic stationarity audit.
-    //
-    // Let the capability planner choose analytic-Hessian ARC for that exact
-    // quadratic objective.  Every non-identity family retains the order-three
-    // search ceiling and pays order four only at mint.
-    !gaussian_identity
-}
-
 /// The resolution the outer certificate's curvature verdict was decided at,
 /// when that verdict admitted the point (#2748, #1561).
 ///
@@ -1115,6 +1100,7 @@ where
         );
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
+    reject_prefit_unidentifiable_unpenalized_space(w, p, &canonical)?;
     // Student-t `(σ, ν)` are outer LAML hyperparameters searched jointly with
     // ρ in the coordinates `(ln(σ/s₀), ln ν)` (see `student_t_outer_point`).
     // Install the zero seed before any evaluation reads the family.
@@ -1352,6 +1338,9 @@ where
     // later run of the standard arm is the corrected search continued from that
     // optimum, alone (#1082).
     let mut corrected_continuation = false;
+    // The Laplace optimum's exact analytic outer Hessian, bound to that
+    // optimum: the corrected continuation's BFGS starts from its inverse.
+    let mut continuation_curvature: Option<Array2<f64>> = None;
     let mut negbin_best_checkpoint: Option<NegbinJointCheckpoint> = None;
     // The box every outer arm searches the ρ block in, and so the box its
     // certificate judges rails against: the #2812 resolvability domain (#2902
@@ -1380,12 +1369,13 @@ where
                 .and_then(|rho| rho.as_slice())
                 .or(heuristic_log_lambdas);
             let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
-            // #2359: non-Gaussian search consumes the analytic outer gradient
-            // (the family derivative ladder through order three), reserving
-            // exact curvature for the terminal mint audit.  Profiled Gaussian
-            // identity is quadratic in eta and has no expensive order-four
-            // family tower, so it uses the declared exact outer Hessian during
-            // search instead of approximating it with first-order BFGS.
+            // Every family's search consumes the declared exact outer Hessian
+            // (ARC), as profiled Gaussian identity always has. The #2359 split
+            // that held non-Gaussian links to gradient-only BFGS, paying the
+            // order-four family tower only at the mint audit, made binomial and
+            // Poisson fits 6-10x slower than the Gaussian path: BFGS rebuilds
+            // from secant pairs the curvature the evaluator already has exactly
+            // (48-61 outer iterations on a one-smooth n=1000 logistic fit).
             let n_obs = y_o.len();
             let problem = OuterProblem::new(k)
                 .with_gradient(Derivative::Analytic)
@@ -1394,9 +1384,6 @@ where
                 } else {
                     DeclaredHessianForm::Unavailable
                 })
-                .with_prefer_gradient_only(standard_reml_search_prefers_gradient_only(
-                    cfg.likelihood.spec.is_gaussian_identity(),
-                ))
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                         fit_linear_constraints.as_ref(),
@@ -1461,6 +1448,12 @@ where
                 problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
             } else {
                 problem
+            };
+            let problem = match (corrected_continuation, negbin_rho_seed.as_ref(), continuation_curvature.as_ref()) {
+                (true, Some(seed), Some(hessian)) => {
+                    problem.with_initial_curvature(seed.clone(), hessian.clone())
+                }
+                _ => problem,
             };
 
             // Geometric-mean log prior-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ`
@@ -1768,7 +1761,13 @@ where
                 Some(|state: &mut &mut crate::estimate::reml::RemlState<'_>| {
                     state.reset_outer_seed_state()
                 }),
-                Some(
+                // The EFS map is the fixed point of the Laplace trace identity
+                // alone. Once the #784 block correction is latched the criterion
+                // also carries Delta_b(rho), whose rho-gradient that map never
+                // sees, so its fixed point is not a stationary point of the
+                // corrected criterion: the corrected continuation has no
+                // fixed-point map and walks on the criterion's own derivatives.
+                (!corrected_continuation).then_some(
                     |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                         state.compute_efs_steps(rho)
                     },
@@ -2379,6 +2378,7 @@ where
                 {
                     negbin_rho_seed = Some(final_rho.clone());
                     corrected_continuation = true;
+                    continuation_curvature = outer_result.final_hessian.clone();
                     continue;
                 }
                 break;
@@ -2442,6 +2442,7 @@ where
         {
             negbin_rho_seed = Some(final_rho.clone());
             corrected_continuation = true;
+            continuation_curvature = outer_result.final_hessian.clone();
             continue;
         }
 

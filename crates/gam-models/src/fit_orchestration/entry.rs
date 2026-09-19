@@ -958,7 +958,8 @@ fn deterministic_gaussian_standard_fit(
             // the data pin every direction the face leaves free. When they do
             // not -- `free_dim > n` makes `A` singular by construction, since
             // `rank(X Z) <= n`, and a double-penalized smooth deliberately
-            // admits `p > n` (`bspline_basis_min_rows`) -- the unpenalized
+            // admits `p > n` (only `n > M_p` is required, see
+            // `reject_prefit_unidentifiable_unpenalized_space`) -- the unpenalized
             // interpolant the boundary was built from is not the optimum at
             // all: with a penalty on those directions the criterion's
             // `log|X'WX + S_λ| - log|S_λ|₊` terms move the optimum off the
@@ -2964,7 +2965,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;
@@ -3139,7 +3140,7 @@ pub fn residual_cascade_fast_path(
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;

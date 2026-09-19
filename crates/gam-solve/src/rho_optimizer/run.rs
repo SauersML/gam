@@ -25,6 +25,16 @@ pub(crate) struct BoundInnerSeed {
     pub(crate) beta: Array1<f64>,
 }
 
+/// Exact outer curvature bound to the one outer coordinate it was measured at.
+///
+/// It seeds the BFGS iter-0 metric only at a start bitwise equal to `theta`,
+/// so a reseed or a resumed checkpoint elsewhere never inherits it.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundOuterCurvature {
+    pub(crate) theta: Array1<f64>,
+    pub(crate) hessian: Array2<f64>,
+}
+
 pub(crate) fn outer_theta_bitwise_eq(left: &Array1<f64>, right: &Array1<f64>) -> bool {
     left.len() == right.len()
         && left
@@ -197,6 +207,16 @@ pub(crate) struct OuterConfig {
     /// the canonical frame. `None` on the first attempt and on every path outside the plan loop.
     pub(crate) carried_checkpoint: Option<OuterResult>,
     pub(crate) initial_inner_seed: Option<BoundInnerSeed>,
+    /// The exact analytic Hessian of the criterion a continuation search
+    /// resumes, at the start it resumes from. The #784 corrected continuation
+    /// starts at the certified Laplace optimum, where the Laplace criterion's
+    /// analytic Hessian is exact and the correction's own curvature is a small
+    /// perturbation of it; BFGS takes its inverse as the iter-0 metric, so the
+    /// first step is a Newton step instead of a unit-length gradient step that
+    /// the line search halves back down one full corrected evaluation at a time.
+    /// The metric shapes the path only: BFGS reaches the same stationary point
+    /// under any SPD initial metric.
+    pub(crate) initial_curvature: Option<BoundOuterCurvature>,
     pub(crate) fallback_policy: FallbackPolicy,
     pub(crate) screening_cap: Option<Arc<AtomicUsize>>,
     pub(crate) screen_initial_rho: bool,
@@ -422,6 +442,7 @@ impl Default for OuterConfig {
             rho_uncertainty_problem_size:
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             warm_start_outer_hessian: None,
+            initial_curvature: None,
             rho_canonical_keys: None,
             native_coordinate_order: None,
             curvature_search_latched: false,
@@ -462,6 +483,7 @@ pub struct OuterProblem {
     heuristic_log_lambdas: Option<Vec<f64>>,
     initial_rho: Option<Array1<f64>>,
     initial_rho_candidates: Vec<Array1<f64>>,
+    initial_curvature: Option<BoundOuterCurvature>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
     screen_initial_rho: bool,
@@ -512,6 +534,7 @@ impl OuterProblem {
             heuristic_log_lambdas: None,
             initial_rho: None,
             initial_rho_candidates: Vec::new(),
+            initial_curvature: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             screen_initial_rho: false,
@@ -625,6 +648,12 @@ impl OuterProblem {
     }
     pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self {
         self.initial_rho = Some(rho);
+        self
+    }
+    /// Bind the exact outer Hessian measured at `theta` to this search; see
+    /// [`OuterConfig::initial_curvature`].
+    pub(crate) fn with_initial_curvature(mut self, theta: Array1<f64>, hessian: Array2<f64>) -> Self {
+        self.initial_curvature = Some(BoundOuterCurvature { theta, hessian });
         self
     }
     pub(crate) fn with_initial_rho_candidates(mut self, candidates: Vec<Array1<f64>>) -> Self {
@@ -945,6 +974,7 @@ impl OuterProblem {
             // Populated only by the persistent-cache resume path in `run` after
             // a warm-start hit decodes a converged outer Hessian.
             warm_start_outer_hessian: None,
+            initial_curvature: self.initial_curvature.clone(),
             rho_canonical_keys: self.rho_canonical_keys.clone(),
             // Set only on the recursive canonical run's config (#2817).
             native_coordinate_order: None,
@@ -8038,6 +8068,17 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
         }
         canonical.warm_start_outer_hessian = Some(hc);
     }
+    if let Some(bound) = config.initial_curvature.as_ref()
+        && bound.hessian.nrows() == perm.len()
+        && bound.hessian.ncols() == perm.len()
+    {
+        canonical.initial_curvature = Some(BoundOuterCurvature {
+            theta: permute_arr(&bound.theta),
+            hessian: Array2::from_shape_fn((perm.len(), perm.len()), |(a, b)| {
+                bound.hessian[[perm[a], perm[b]]]
+            }),
+        });
+    }
     canonical
 }
 
@@ -9217,6 +9258,35 @@ pub(crate) fn run_fixed_point_outer_solver(
     label: &str,
     failure_prefix: &str,
 ) -> Result<OuterResult, FixedPointOuterRunError> {
+    // Judge the seed before walking from it. The walk's own stop is a step-norm
+    // test, never stationarity (see the certificate after the walk), so a seed
+    // that is already stationary is walked anyway: a smoothing parameter on its
+    // rail keeps proposing an outward EFS step, and nothing short of the
+    // unprogressing-walk window ends it. On the ISLR `Default` logistic fit the
+    // #784 corrected continuation starts from the certified Laplace optimum, which
+    // is stationary under the correction too (the BFGS continuation later
+    // certified it at zero iterations, |g| = 5.9e-6), yet the walk spent ~60
+    // corrected evaluations there. The screening certificate is the one the walk's
+    // stop is judged by, so passing it here is the same claim with zero steps.
+    // A refusal is no verdict on the walk; it proceeds from the same seed.
+    if obj.capability().gradient == Derivative::Analytic {
+        let mut seed_result = OuterResult::new(seed.clone(), f64::NAN, 0, true, the_plan);
+        if let Ok(certificate) = certify_outer_optimality_with_fidelity(
+            obj,
+            config,
+            context,
+            &mut seed_result,
+            CertificationFidelity::Screening,
+        ) {
+            log::info!(
+                "[OUTER] {context}: {label} seed is already stationary at cost={:.6e}; \
+                 no fixed-point step taken",
+                seed_result.final_value,
+            );
+            seed_result.criterion_certificate = Some(certificate);
+            return Ok(seed_result);
+        }
+    }
     // Shared publication slot for the recurrent-restored-incumbent stop
     // (#2235 verdict 2): the bridge is moved into the driver, so the streak
     // count comes back through this cell and is stamped onto the returned

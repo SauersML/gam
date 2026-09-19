@@ -94,12 +94,6 @@ pub(crate) fn materialize_standard<'a>(
     // untouched and keeps the full scale.
     gate_duchon_operator_penalties_for_family(&mut spec, &family);
 
-    // Sample size vs basis-rank gate (#309). Each smooth basis answers
-    // `min_sample_rows()` for itself; this helper just sums and compares.
-    // Runs *after* `build_termspec_with_geometry_and_overrides` so the lower bound is
-    // computed on the fully resolved basis spec (e.g. tensor-product columns,
-    // knot counts inferred at materialization time).
-    check_smooth_capacity(&spec, y.len(), &parsed.response)?;
     if let Some(coord) = latent_coord.as_mut() {
         let resolved_idx = spec
             .smooth_terms

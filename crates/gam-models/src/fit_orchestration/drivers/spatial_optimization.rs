@@ -2824,7 +2824,7 @@ fn wrap_local_build_as_realization(
         collection_gauge: None,
         name: termspec.name.clone(),
         coeff_range: 0..p_local,
-        shape: termspec.shape,
+        shape: termspec.shape.clone(),
         active_penalties: local.active_penalties.clone(),
         dropped_penalties: local.dropped_penalties.clone(),
         metadata: local.metadata.clone(),
