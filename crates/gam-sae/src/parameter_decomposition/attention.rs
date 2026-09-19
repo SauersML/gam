@@ -61,12 +61,20 @@
 //!
 //! With every mask at one the program executes the original tensors on the
 //! original path ([`NativeAttention::execute`]), bit for bit. Every other result
-//! carries a forward-error radius against the exact value of its own program at
-//! the given inputs, propagated entry by entry to first order. It collects:
-//! - Higham's `γ_k · Σ|monomials|` over the rounded operations (`gam_linalg::roundoff`);
-//! - each input's own radius;
-//! - the trigonometric input error `u·|φ| + ulp` of each angle;
-//! - the log-softmax evaluation radius from `gam_math::categorical`.
+//! carries a forward-error radius against the exact value of its own program for
+//! inputs anywhere within their own radii. It collects:
+//! - Higham's `γ_k · Σ|monomials|` over the rounded operations at the computed
+//!   inputs (`gam_linalg::roundoff`);
+//! - each input's own radius, through every product of two inexact factors as the
+//!   box bound `|â| r_b + r_a |b̂| + r_a r_b`, whose last term a first-order
+//!   propagation drops;
+//! - the trigonometric input error `u·|φ| + ulp` of each angle, as one of those
+//!   inexact factors;
+//! - the log-softmax evaluation radius from `gam_math::categorical`, which holds
+//!   over the whole logit box;
+//! - through the per-head query/key RMS norm
+//!   ([`NativeAttention::with_query_key_norm`]), a mean value bound. It takes the
+//!   normalizer and its slope at the smallest mean square the input box admits.
 //!
 //! Two programs with the same exact value agree within the sum of their radii.
 //!
@@ -84,7 +92,7 @@ use gam_math::categorical::{CategoricalError, log_softmax_with_error};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder};
 use serde::{Deserialize, Serialize};
 
-use crate::parameter_decomposition::gated_rewrite::{GatedRewriteError, MaskedNorm, rms_normalizers};
+use crate::parameter_decomposition::gated_rewrite::{GatedRewriteError, MaskedNorm};
 
 /// Largest position magnitude whose differences stay exact in `f64`:
 /// `|p_s − p_t| ≤ 2^53` is representable, so `Δ as f64` rounds nothing.
@@ -222,6 +230,13 @@ fn plane_trig(multiplier: f64, frequency: f64) -> (f64, f64, f64) {
     let (sin, cos) = angle.sin_cos();
     let eta = accumulation_growth(1) * angle.abs() + f64::EPSILON * cos.abs().max(sin.abs());
     (cos, sin, eta)
+}
+
+/// The largest `|a b − â b̂|` over `|a − â| ≤ r_a` and `|b − b̂| ≤ r_b`:
+/// `|â| r_b + r_a |b̂| + r_a r_b`. Every term is nonnegative, so the sum rounds
+/// without cancellation.
+fn box_product(a: f64, radius_a: f64, b: f64, radius_b: f64) -> f64 {
+    a.abs() * radius_b + radius_a * b.abs() + radius_a * radius_b
 }
 
 /// One sequential inner product and the absolute sum of its terms.
@@ -424,11 +439,23 @@ fn project_affine(projection: &AffineProjection, x: ArrayView2<f64>) -> (Array2<
 /// `tokens × heads·head_dim` rows, evaluated by the gated-rewrite owner on the
 /// current summed rows.
 ///
-/// For one head row `x` with radius `r`, `y = w ⊙ x ν` with
-/// `ν = (mean x² + ε)^{-1/2}`. Since `∂ν/∂x_d = −ν³ x_d / d`, to first order
-/// `|δy_c| ≤ |w_c| ν (r_c + ν² |x_c| Σ_d |x_d| r_d / d)`. Evaluating `ν` from the
-/// stored row costs `γ_{d+4}` relative (the owner's bound) and the two products
-/// `γ_2`, so the radius adds `γ_{d+6} |y_c|`.
+/// For one head row `x̂` with radius `r`, `y(x) = w ⊙ x ν(x)` with
+/// `ν = s^{-1/2}`, `s(x) = mean x² + ε`. The radius bounds `|y_c(x) − fl(y_c(x̂))|` for
+/// every `x` in the box, by the identity
+/// `y_c(x) − y_c(x̂) = w_c [(x_c − x̂_c) ν(x) + x̂_c (ν(x) − ν(x̂))]`:
+/// - each square's box bound gives `|s(x) − s(x̂)| ≤ Δs = mean(2|x̂_d| r_d + r_d²)`;
+/// - so `s ≥ s_lo = max(ŝ (1 − γ_{d+2}) − Δs / (1 − γ_{d+4}) − γ_7 (ŝ + Δs), ε)`,
+///   covering the rounding of `ŝ`, of `Δs` (a box product per coordinate, `d − 1`
+///   sums and the mean, so `γ_{d+4}`; it is rounded up where it is subtracted) and
+///   the expression's own seven: the two constants `1 − γ`, the product, the
+///   division, the two subtractions, and the allowance's own sum;
+/// - `ν` and `|ν'| = ½ s^{-3/2}` both decrease in `s`, so `ν(x) ≤ s_lo^{-1/2}` and, by
+///   the mean value inequality, `|ν(x) − ν(x̂)| ≤ ½ s_lo^{-3/2} Δs`.
+///
+/// The radius is `|w_c| (r_c s_lo^{-1/2} + |x̂_c| ½ s_lo^{-3/2} Δs)`, plus the
+/// evaluation's own rounding `γ_{d+6} |fl(y_c)|` (`ν` from the stored row is `γ_{d+4}`
+/// relative, the two products `γ_2`). The total is divided by `1 − γ_{d+12}` for the
+/// radius's own arithmetic.
 fn normalize_heads(
     (values, radius): (Array2<f64>, Array2<f64>),
     heads: usize,
@@ -451,22 +478,29 @@ fn normalize_heads(
         .ok()
         .ok_or(mismatch.clone())?;
     let normalized = MaskedNorm::Rms { epsilon, gain }.apply(per_head.view())?;
-    let normalizers = rms_normalizers(per_head.view(), epsilon)?;
     let evaluation = accumulation_growth(head_dim + 6);
+    let square_growth = accumulation_growth(head_dim + 2);
+    let spread_growth = accumulation_growth(head_dim + 4);
+    let floor_growth = accumulation_growth(7);
+    let dominance = 1.0 - accumulation_growth(head_dim + 12);
+    let head_width = head_dim as f64;
     let mut normalized_radius = Array2::zeros(normalized.dim());
-    for (row, &nu) in normalizers.iter().enumerate() {
-        let weighted = per_head
-            .row(row)
+    for (row, (x, r)) in per_head.rows().into_iter().zip(per_head_radius.rows()).enumerate() {
+        let computed = x.iter().map(|value| value * value).sum::<f64>() / head_width + epsilon;
+        let spread = x
             .iter()
-            .zip(per_head_radius.row(row).iter())
-            .map(|(x, r)| x.abs() * r)
+            .zip(r.iter())
+            .map(|(&value, &radius)| box_product(value, radius, value, radius))
             .sum::<f64>()
-            / head_dim as f64;
+            / head_width;
+        let floor = (computed * (1.0 - square_growth) - spread / (1.0 - spread_growth) - floor_growth * (computed + spread))
+            .max(epsilon);
+        let inverse_root = floor.sqrt().recip();
+        let slope = 0.5 * inverse_root * inverse_root * inverse_root;
         for c in 0..head_dim {
-            normalized_radius[[row, c]] = gain[c].abs()
-                * nu
-                * (per_head_radius[[row, c]] + nu * nu * per_head[[row, c]].abs() * weighted)
-                + evaluation * normalized[[row, c]].abs();
+            normalized_radius[[row, c]] = (gain[c].abs() * (r[c] * inverse_root + x[c].abs() * slope * spread)
+                + evaluation * normalized[[row, c]].abs())
+                / dominance;
         }
     }
     let values = normalized
@@ -532,7 +566,7 @@ impl RotaryCausalAttention {
     /// The source's attention on already-projected rows: rotate queries and keys
     /// at their absolute positions, score, mask causally, softmax jointly and read
     /// the values. Queries are `tokens × n_heads·head_dim`; keys and values are
-    /// `tokens × n_kv_heads·head_dim`. Each input radius enters to first order.
+    /// `tokens × n_kv_heads·head_dim`. Each input radius enters as a box bound (see the module docs).
     pub fn attend_projected(
         &self,
         queries: ProjectedRows<'_>,
@@ -568,8 +602,7 @@ impl RotaryCausalAttention {
                         let (q, k) = ((t, qo + c), (s, ko + c));
                         value += queries.value[q] * keys.value[k];
                         abs += (queries.value[q] * keys.value[k]).abs();
-                        propagated +=
-                            queries.radius[q] * keys.value[k].abs() + queries.value[q].abs() * keys.radius[k];
+                        propagated += box_product(queries.value[q], queries.radius[q], keys.value[k], keys.radius[k]);
                     }
                     scores[[head, t, s]] = self.score_scale * value;
                     radius[[head, t, s]] = self.score_scale.abs() * (propagated + growth * abs);
@@ -580,8 +613,9 @@ impl RotaryCausalAttention {
     }
 
     /// The source's rotation of every head of `rows` at each token's absolute
-    /// position. The radius carries the rows' own radius, the trigonometric input
-    /// error and the rotation's rounding (`α·cos`, the product and the in-plane sum).
+    /// position. The radius carries the rows' own radius and the trigonometric
+    /// input error `|α| η` of `α·cos` and `α·sin` as the box bound of each product,
+    /// and the rotation's rounding (`α·cos`, the product and the in-plane sum).
     fn rotate(&self, rows: ProjectedRows<'_>, positions: &[i64], heads: usize) -> HeadRows {
         let alpha = self.rotary.attention_scaling;
         let growth = accumulation_growth(3);
@@ -598,14 +632,12 @@ impl RotaryCausalAttention {
                     let (xa, xb, ra, rb) = (value[a], value[b], radius[a], radius[b]);
                     value[a] = xa * cos - xb * sin;
                     value[b] = xb * cos + xa * sin;
-                    let trig = alpha.abs() * eta * (xa.abs() + xb.abs());
-                    radius[a] = ra * cos.abs()
-                        + rb * sin.abs()
-                        + trig
+                    let trig = alpha.abs() * eta;
+                    radius[a] = box_product(xa, ra, cos, trig)
+                        + box_product(xb, rb, sin, trig)
                         + growth * (xa.abs() * cos.abs() + xb.abs() * sin.abs());
-                    radius[b] = rb * cos.abs()
-                        + ra * sin.abs()
-                        + trig
+                    radius[b] = box_product(xb, rb, cos, trig)
+                        + box_product(xa, ra, sin, trig)
                         + growth * (xb.abs() * cos.abs() + xa.abs() * sin.abs());
                 }
             }
@@ -647,7 +679,8 @@ impl RotaryCausalAttention {
     /// Each head's read of the values at given causal weights,
     /// `mixed[t, h] = Σ_{s ≤ t} w_{hts} v_{s, g(h)}`, `tokens × n_heads·head_dim`,
     /// with the radius [`RotaryCausalAttention::attend_projected`] carries:
-    /// `Σ_s (r^w_{hts} |v_s| + w_{hts} r^v_s) + γ_{t+1} Σ_s |w_{hts} v_s|`.
+    /// `Σ_s (r^w_{hts} |v_s| + w_{hts} r^v_s + r^w_{hts} r^v_s) + γ_{t+1} Σ_s |w_{hts} v_s|`,
+    /// which bounds the exact read for weights and values anywhere within their radii.
     /// Weights and their radii are `n_heads × tokens × tokens`, values
     /// `tokens × n_kv_heads·head_dim`. Entries with `s > t` are never read.
     pub fn mix_at_weights(
@@ -675,7 +708,7 @@ impl RotaryCausalAttention {
                         let (w, v) = (weights[[head, t, s]], values.values[[s, vo + c]]);
                         value += w * v;
                         abs += (w * v).abs();
-                        propagated += weight_radius[[head, t, s]] * v.abs() + w * values.radius[[s, vo + c]];
+                        propagated += box_product(w, weight_radius[[head, t, s]], v, values.radius[[s, vo + c]]);
                     }
                     mixed[[t, qo + c]] = value;
                     mixed_radius[[t, qo + c]] = propagated + mix_growth * abs;
@@ -1076,9 +1109,13 @@ impl ComponentAttention {
                         planes += cos * (qa * ka + qb * kb) + sin * (qb * ka - qa * kb);
                         planes_abs += cos.abs() * ((qa * ka).abs() + (qb * kb).abs())
                             + sin.abs() * ((qb * ka).abs() + (qa * kb).abs());
-                        let direct = rqa * ka.abs() + qa.abs() * rka + rqb * kb.abs() + qb.abs() * rkb;
-                        let crossed = rqb * ka.abs() + qb.abs() * rka + rqa * kb.abs() + qa.abs() * rkb;
-                        planes_propagated += cos.abs() * direct + sin.abs() * crossed;
+                        // Each term is a product of three inexact factors, `q·k·cos` or
+                        // `q·k·sin`. Its box bound `(|q̂|+r_q)(|k̂|+r_k)(|ĉ|+η) − |q̂||k̂||ĉ|` is
+                        // `(|ĉ|+η)·box(q, k) + η|q̂||k̂|`: the first part is below, the second is
+                        // `planes_trig`.
+                        let direct = box_product(qa, rqa, ka, rka) + box_product(qb, rqb, kb, rkb);
+                        let crossed = box_product(qb, rqb, ka, rka) + box_product(qa, rqa, kb, rkb);
+                        planes_propagated += (cos.abs() + eta) * direct + (sin.abs() + eta) * crossed;
                         planes_trig += eta * (qa.abs() + qb.abs()) * (ka.abs() + kb.abs());
                     }
                     let (mut pass, mut pass_abs, mut pass_propagated) = (0.0, 0.0, 0.0);
@@ -1086,8 +1123,7 @@ impl ComponentAttention {
                         let (q, k) = ((t, qo + c), (s, ko + c));
                         pass += queries.value[q] * keys.value[k];
                         pass_abs += (queries.value[q] * keys.value[k]).abs();
-                        pass_propagated +=
-                            queries.radius[q] * keys.value[k].abs() + queries.value[q].abs() * keys.radius[k];
+                        pass_propagated += box_product(queries.value[q], queries.radius[q], keys.value[k], keys.radius[k]);
                     }
                     scores[[head, t, s]] = self.native.attention.score_scale * (alpha2 * planes + pass);
                     radius[[head, t, s]] = self.native.attention.score_scale.abs()
@@ -1178,6 +1214,7 @@ impl ComponentAttention {
 mod tests {
     use super::*;
     use ndarray::array;
+    use crate::parameter_decomposition::gated_rewrite::rms_normalizers;
     use qd::Quad;
 
     /// Small dyadic rationals. Every product and sum the fixture forms stays exact
@@ -2097,6 +2134,202 @@ mod tests {
             native.query().weight,
             edited_query,
             "the accessor must return the source query tensor, not an edited one"
+        );
+    }
+
+    /// Offsets sampled across a radius-`r` box, `−r … r` in quarters of `r`. With a
+    /// dyadic `r` every sampled point stays dyadic.
+    fn box_offsets(radius: f64) -> [f64; 5] {
+        [-radius, -0.5 * radius, 0.0, 0.5 * radius, radius]
+    }
+
+    /// The score radius encloses the exact score's deviation for queries and keys
+    /// sampled across their radius boxes, including the far corner, where the
+    /// `r_q r_k` term that a first-order propagation drops is the margin.
+    /// - The block is rotary-free (`rotary_dim` 0) with `σ = 1/2`.
+    /// - Rows and radius are positive dyadics, so every sampled score
+    ///   `σ Σ (q + δ_q)(k + δ_k)` is exact in `f64`. With `q, k > 0` the deviation is
+    ///   largest at the all-`+r` corner, so the sampled diagonal contains the worst case.
+    /// - Control: the far corner `δ_q = δ_k = r` lies outside the radius less its
+    ///   `σ Σ r_q r_k`.
+    #[test]
+    fn score_radius_encloses_the_exact_score_across_the_input_boxes() {
+        let geometry = AttentionGeometry {
+            model_dim: 4,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 6,
+        };
+        let rotary = RotaryEmbedding {
+            pairing: RotaryPairing::HalfSplit,
+            inverse_frequencies: vec![],
+            attention_scaling: 1.0,
+        };
+        let attention = RotaryCausalAttention::new(geometry, rotary, 0.5).expect("rotary-free geometry");
+        let positions = [0_i64, 1, 2];
+        let radius = 0.125;
+        let queries = dyadic(3, geometry.query_dim(), 1, 8.0).mapv(|v| v.abs() + radius);
+        let keys = dyadic(3, geometry.key_value_dim(), 2, 8.0).mapv(|v| v.abs() + radius);
+        let values = dyadic(3, geometry.key_value_dim(), 3, 8.0);
+        let (query_radius, key_radius) = (
+            Array2::from_elem(queries.dim(), radius),
+            Array2::from_elem(keys.dim(), radius),
+        );
+        let projected = attention
+            .attend_projected(
+                ProjectedRows {
+                    values: queries.view(),
+                    radius: query_radius.view(),
+                },
+                ProjectedRows {
+                    values: keys.view(),
+                    radius: key_radius.view(),
+                },
+                ProjectedRows::exact(values.view()),
+                &positions,
+            )
+            .expect("rotary-free attention");
+        let hd = geometry.head_dim;
+        for head in 0..geometry.n_heads {
+            let (qo, ko) = (head * hd, geometry.key_value_head(head) * hd);
+            for t in 0..positions.len() {
+                for s in 0..=t {
+                    let bound = projected.score_radius[[head, t, s]];
+                    let reach_at = |dq: f64, dk: f64| {
+                        let exact = 0.5
+                            * (0..hd)
+                                .map(|c| (queries[[t, qo + c]] + dq) * (keys[[s, ko + c]] + dk))
+                                .sum::<f64>();
+                        (exact - projected.scores[[head, t, s]]).abs()
+                    };
+                    for dq in box_offsets(radius) {
+                        for dk in box_offsets(radius) {
+                            let reach = reach_at(dq, dk);
+                            assert!(
+                                reach <= bound,
+                                "score ({head}, {t}, {s}) at offsets ({dq}, {dk}): {reach} beyond the radius {bound}"
+                            );
+                        }
+                    }
+                    let first_order = bound - 0.5 * hd as f64 * radius * radius;
+                    assert!(
+                        reach_at(radius, radius) > first_order,
+                        "score ({head}, {t}, {s}): the radius without r_q r_k, {first_order}, still covers the corner"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The mixed-row radius encloses the exact value read's deviation for weights and
+    /// values sampled across their radius boxes, including the far corner, where the
+    /// `r_w r_v` term is the margin. Weights, values and radius are positive
+    /// dyadics, so every sampled read `Σ_s (w + δ_w)(v + δ_v)` is exact in `f64`, and with
+    /// `w, v > 0` the all-`+r` corner, which is sampled, is the worst case.
+    /// Control: the far corner lies outside the radius less its `Σ_s r_w r_v`.
+    #[test]
+    fn mixed_radius_encloses_the_exact_read_across_the_input_boxes() {
+        let fixture = Fixture::new(RotaryPairing::HalfSplit);
+        let g = fixture.geometry;
+        let attention =
+            RotaryCausalAttention::new(g, fixture.rotary.clone(), fixture.score_scale).expect("fixture geometry");
+        let tokens = 4;
+        let radius = 0.125;
+        let weights = Array3::from_shape_fn((g.n_heads, tokens, tokens), |(h, t, s)| {
+            if s <= t {
+                ((h + 2 * t + 3 * s) % 4 + 1) as f64 / 8.0
+            } else {
+                0.0
+            }
+        });
+        let values = dyadic(tokens, g.key_value_dim(), 5, 8.0).mapv(|v| v.abs() + radius);
+        let weight_radius = Array3::from_elem(weights.dim(), radius);
+        let value_radius = Array2::from_elem(values.dim(), radius);
+        let (mixed, mixed_radius) = attention
+            .mix_at_weights(
+                weights.view(),
+                weight_radius.view(),
+                ProjectedRows {
+                    values: values.view(),
+                    radius: value_radius.view(),
+                },
+            )
+            .expect("value read");
+        let hd = g.head_dim;
+        for head in 0..g.n_heads {
+            let (qo, vo) = (head * hd, g.key_value_head(head) * hd);
+            for t in 0..tokens {
+                for c in 0..hd {
+                    let bound = mixed_radius[[t, qo + c]];
+                    let reach_at = |dw: f64, dv: f64| {
+                        let exact = (0..=t)
+                            .map(|s| (weights[[head, t, s]] + dw) * (values[[s, vo + c]] + dv))
+                            .sum::<f64>();
+                        (exact - mixed[[t, qo + c]]).abs()
+                    };
+                    for dw in box_offsets(radius) {
+                        for dv in box_offsets(radius) {
+                            let reach = reach_at(dw, dv);
+                            assert!(
+                                reach <= bound,
+                                "mixed ({t}, {head}, {c}) at offsets ({dw}, {dv}): {reach} beyond the radius {bound}"
+                            );
+                        }
+                    }
+                    let first_order = bound - (t + 1) as f64 * radius * radius;
+                    assert!(
+                        reach_at(radius, radius) > first_order,
+                        "mixed ({t}, {head}, {c}): the radius without r_w r_v, {first_order}, still covers the corner"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The per-head RMS norm's radius encloses the exact norm for rows sampled across
+    /// their radius box, where a first-order propagation does not.
+    /// - Setup: one head of `head_dim` 2, rows `x̂ = (1/8, 1/2)` with radius
+    ///   `(0, 1/4)`, unit gains and `ε = 1/64`.
+    /// - Why first order fails: moving `x_2` down by its radius raises `ν` convexly,
+    ///   so `y_1` moves by more than the linearization's bound.
+    /// - How it is compared: the exact norm at each dyadic sample is checked in
+    ///   double-double without a square root. For `y = x_c / √s > 0`,
+    ///   `y ∈ [ŷ − ρ, ŷ + ρ]` holds exactly when `max(ŷ − ρ, 0)² s ≤ x_c² ≤ (ŷ + ρ)² s`.
+    /// - Control: the first-order radius misses the sample `x_2 = 1/4`.
+    #[test]
+    fn query_key_norm_radius_encloses_the_exact_norm_across_the_input_box() {
+        let epsilon = 0.015625;
+        let rows = array![[0.125, 0.5]];
+        let radius = array![[0.0, 0.25]];
+        let gain = array![1.0, 1.0];
+        let (normalized, bound) =
+            normalize_heads((rows.clone(), radius.clone()), 1, 2, epsilon, gain.view()).expect("finite head row");
+        let quad = Quad::from_f64;
+        let encloses = |x: [f64; 2], c: usize, center: f64, reach: f64| {
+            let s = (quad(x[0]) * quad(x[0]) + quad(x[1]) * quad(x[1])) / quad(2.0) + quad(epsilon);
+            let square = quad(x[c]) * quad(x[c]);
+            let low = quad(center) - quad(reach);
+            let low = if low.0 < 0.0 { quad(0.0) } else { low };
+            let high = quad(center) + quad(reach);
+            (low * low * s - square).0 <= 0.0 && (square - high * high * s).0 <= 0.0
+        };
+        for x2 in [0.25, 0.375, 0.5, 0.625, 0.75] {
+            for c in 0..2 {
+                assert!(
+                    encloses([0.125, x2], c, normalized[[0, c]], bound[[0, c]]),
+                    "coordinate {c} at x_2 = {x2}: the exact norm lies outside {} ± {}",
+                    normalized[[0, c]],
+                    bound[[0, c]]
+                );
+            }
+        }
+        let nu = rms_normalizers(rows.view(), epsilon).expect("finite head row")[0];
+        let weighted = (rows[[0, 0]] * radius[[0, 0]] + rows[[0, 1]] * radius[[0, 1]]) / 2.0;
+        let first_order = nu * (radius[[0, 0]] + nu * nu * rows[[0, 0]] * weighted)
+            + accumulation_growth(8) * normalized[[0, 0]].abs();
+        assert!(
+            !encloses([0.125, 0.25], 0, normalized[[0, 0]], first_order),
+            "the first-order radius {first_order} must miss the exact norm at x_2 = 1/4"
         );
     }
 }
