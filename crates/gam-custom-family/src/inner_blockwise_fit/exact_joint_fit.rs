@@ -682,6 +682,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         options,
         mut states,
         s_lambdas,
+        penalty_roots,
         joint_bundle,
         mut lastobjective,
         mut converged,
@@ -892,16 +893,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // [`ObjectiveResolutionWitness`].
     let mut objective_resolution_witness = ObjectiveResolutionWitness::default();
     // The penalty's own ACCUMULATION, which is not its value (gam#2612's central
-    // observation, gam#2748's ceiling): `½β·(S_λβ)` with signed `S_ij` sums
-    // `½Σ|β_i S_ij β_j|` while returning something that can be many orders
-    // smaller. Each endpoint's magnitude comes from one explicit pass over its
-    // own `β` (gam#2959); this counts the summands that pass charges, every
-    // entry of each block `S_λ` and of each full-width penalty. `S_λ` is a
-    // function of ρ alone and ρ is fixed for this solve, so the count is too.
-    let penalty_entries = s_lambdas.iter().map(|s_lambda| s_lambda.len()).sum::<usize>()
-        + joint_bundle.map_or(0, |bundle| {
-            bundle.specs().iter().map(|spec| spec.matrix.len()).sum::<usize>()
-        });
+    // observation, gam#2748's ceiling). The penalty is formed on its structural
+    // roots (#2954, `BlockPenaltyRoots::value`), whose rounding is
+    // `γ_depth·magnitude` with a depth fixed by the roots' shapes: a function of
+    // ρ alone, and ρ is fixed for this solve, so the depth is too. Each
+    // endpoint's magnitude comes from its own `β`.
+    let penalty_entries = penalty_roots.accumulation_depth();
     let mut cycles_since_residual_improved: usize = 0;
     // Number of consecutive non-improving cycles after which the
     // conditioning-based self-vanishing Levenberg–Marquardt damping is
@@ -1376,12 +1373,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     cached_eval = eval;
                     cached_joint_workspace = workspace;
                     cached_joint_hessian_source = None;
-                    current_penalty = total_quadratic_penalty(
-                        &states,
-                        &s_lambdas,
-                        joint_bundle,
-                        Some(specs),
-                    );
+                    current_penalty = penalty_roots.value_of_states(&states).value;
                     lastobjective = -current_log_likelihood + current_penalty;
                     saddle_escapes_used += 1;
                     previous_escape_lambda_min = Some(lambda_min);
@@ -2842,13 +2834,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
         // What the incumbent's penalty accumulates, for the objective-resolution
         // ceiling (gam#2748, gam#2959).
-        let old_penalty_accumulation =
-            crate::blockwise_solve::total_quadratic_penalty_with_accumulation(
-                &old_beta,
-                &s_lambdas,
-                joint_bundle,
-            )
-            .1;
+        let old_penalty_accumulation = penalty_roots.value(&old_beta).magnitude;
         // Firth value Φ at the OLD (start-of-cycle) β, folded under the SAME
         // skippable gate the trial uses below — so `actual_reduction =
         // old_objective − trialobjective` compares two points on one objective
@@ -4251,12 +4237,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 states[b].beta.assign(&projected);
             }
             refresh_all_block_etas(family, specs, &mut states)?;
-            let mut trial_penalty = total_quadratic_penalty(
-                &states,
-                &s_lambdas,
-                joint_bundle,
-                Some(specs),
-            );
+            let mut trial_penalty = penalty_roots.value_of_states(&states).value;
             // Jeffreys objective contribution at the trial point keeps the
             // accept/reject objective consistent with the Jeffreys-modified
             // Newton step. `states` already holds the trial coefficients
@@ -4322,19 +4303,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // TWO decisions read it: the early exit below and the resolution
             // witness after the trial objective is known. The objective
             // magnitudes cover the likelihood accumulation; the penalty's is
-            // carried separately because it is precisely the term whose
-            // accumulation exceeds its value, and each endpoint is charged what
-            // its own `½βᵀS_λβ` summed; the log-determinant is not a sum at all
-            // and carries its own certified bound.
+            // carried separately, as each endpoint's own root-form accumulation
+            // (#2954, `BlockPenaltyRoots::value`); the log-determinant is not a sum
+            // at all and carries its own certified bound.
             let trial_betas: Vec<Array1<f64>> =
                 states.iter().map(|state| state.beta.clone()).collect();
-            let trial_penalty_accumulation =
-                crate::blockwise_solve::total_quadratic_penalty_with_accumulation(
-                    &trial_betas,
-                    &s_lambdas,
-                    joint_bundle,
-                )
-                .1;
+            let trial_penalty_accumulation = penalty_roots.value(&trial_betas).magnitude;
             // The trial's objective is not known yet, so the incumbent's stands in.
             let pre_trial_accumulation = ObjectiveAccumulation::between_endpoints(
                 total_joint_n,
@@ -5402,12 +5376,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         cached_joint_gradient = gradient;
         cached_eval = eval;
         cached_joint_workspace = workspace;
-        current_penalty = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        current_penalty = penalty_roots.value_of_states(&states).value;
         // `current_penalty` / `lastobjective` stay the pure quadratic-penalized
         // objective (NO Φ folded in) — the Firth value is applied per cycle at
         // each β (see `old_objective` above and `trialobjective` below). The
@@ -6365,22 +6334,16 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // CTN order-0 power-9 fixture's fixed point at |Δobjective| = 3.382e-12
                 // against 2.445e-12 (gam#2959).
                 //
-                // The penalty half is what each endpoint's `½βᵀS_λβ` really summed,
-                // `½Σ|β_i S_ij β_j|` from one explicit pass, the same charge the trust
-                // loop's early exit and resolution witness read. The data half is
+                // The penalty half is each endpoint's root-form accumulation (#2954,
+                // `BlockPenaltyRoots::value`), the same charge the trust loop's early
+                // exit and resolution witness read. The data half is
                 // `|f_old| + |f_new|`: per-row log-likelihood terms can cancel, so it is
                 // at most `Σ|ℓ_i|` and the floor errs small, which only declines more.
                 // Where the floor is still loose, the step and exact-model arms carry
                 // the guarantee (`constrained_numerical_fixed_point_failures`).
                 let accepted_beta: Vec<Array1<f64>> =
                     states.iter().map(|state| state.beta.clone()).collect();
-                let accepted_penalty_accumulation =
-                    crate::blockwise_solve::total_quadratic_penalty_with_accumulation(
-                        &accepted_beta,
-                        &s_lambdas,
-                        joint_bundle,
-                    )
-                    .1;
+                let accepted_penalty_accumulation = penalty_roots.value(&accepted_beta).magnitude;
                 let objective_floor = ObjectiveAccumulation::between_endpoints(
                     total_joint_n,
                     penalty_entries,
@@ -7471,12 +7434,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let final_jeffreys_cache = jeffreys_triple_cache
             .as_ref()
             .filter(|(beta_key, _, _)| beta_cache_keys_match_bitwise(beta_key, &final_beta_key));
-        let penalty_value = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        let penalty_value = penalty_roots.value_of_states(&states).value;
         let active_constraints = {
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
             // The LAML logdet must project onto the tangent of the FULL
@@ -7754,12 +7712,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
             }
         }
-        let penalty_value = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        let penalty_value = penalty_roots.value_of_states(&states).value;
         let active_constraints = {
             let local_ranges = block_param_ranges(specs);
             let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
@@ -7850,12 +7803,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         log::debug!(
             "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
         );
-        let penalty_value = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        let penalty_value = penalty_roots.value_of_states(&states).value;
         let active_constraints = {
             let local_ranges = block_param_ranges(specs);
             let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
