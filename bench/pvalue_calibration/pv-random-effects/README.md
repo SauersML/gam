@@ -68,10 +68,11 @@ mixture of the components, and on that replicate it read a linear score of
 `z = −2.98` as `p = .33`. Null calibration was fine, but power collapsed (the
 "S⁺ direction" row below). With `K_j` the same replicate gives `p = .0018`.
 
-A block with a direction no penalty touches is refused with the typed reason
-`variance_component_test_unpenalized_directions`, and the smooth keeps its
-Wald row. A block with no penalty at all (a factor `by=` main effect) gets the
-classical fixed-effect score `F` under its own hypothesis label.
+A block with a direction no penalty touches, or with no penalty at all, is
+refused with the typed reason `variance_component_unpenalized_directions`, and
+the smooth keeps its Wald row. Since the factor contract every `group()`/`re()`
+block is a penalized full one-hot block, so no unpenalized random-effect block
+reaches the test.
 
 ## Design
 

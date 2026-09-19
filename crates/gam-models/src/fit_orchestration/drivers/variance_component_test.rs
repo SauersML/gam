@@ -11,8 +11,7 @@
 // realized penalties and hands them over; every tested term gets a record, and
 // a term the test cannot score carries the typed reason instead of a p-value.
 
-/// The variance-component test of every random-effect block (or, for an
-/// unpenalized factor block, the fixed-effect test) and of every smooth whose
+/// The variance-component test of every random-effect block and of every smooth whose
 /// active penalties jointly penalize every direction
 /// ([`gam_terms::smooth::TermCollectionDesign::smooth_variance_component_penalties`]).
 ///
@@ -192,7 +191,7 @@ fn variance_component_test_records_from_rows(
 /// coefficient ranges and null.
 ///
 /// A random-effect block is tested against the penalties the design realized
-/// on exactly its range (none: an unpenalized factor block, a fixed effect).
+/// on exactly its range; a range no penalty covers is refused.
 /// A smooth is tested when
 /// [`gam_terms::smooth::TermCollectionDesign::smooth_variance_component_penalties`]
 /// admits it; every other smooth keeps the Wald test.
@@ -202,9 +201,7 @@ fn variance_component_test_terms(
     String,
     gam_terms::inference::variance_component_test::VarianceComponentTermRequest,
 )> {
-    use gam_terms::inference::variance_component_test::{
-        TestedBlock, VarianceComponentTermRequest,
-    };
+    use gam_terms::inference::variance_component_test::VarianceComponentTermRequest;
 
     let mut terms = Vec::new();
     for (name, range) in &design.random_effect_ranges {
@@ -214,16 +211,11 @@ fn variance_component_test_terms(
             .filter(|penalty| penalty.col_range == *range)
             .map(|penalty| penalty.local.clone())
             .collect();
-        let block = if penalties.is_empty() {
-            TestedBlock::Unpenalized
-        } else {
-            TestedBlock::Penalized { penalties }
-        };
         terms.push((
             name.clone(),
             VarianceComponentTermRequest {
                 range: range.clone(),
-                block,
+                penalties,
             },
         ));
     }
@@ -233,7 +225,7 @@ fn variance_component_test_terms(
                 term.name.clone(),
                 VarianceComponentTermRequest {
                     range: design.smooth_global_range(term),
-                    block: TestedBlock::Penalized { penalties },
+                    penalties,
                 },
             ));
         }

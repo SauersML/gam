@@ -339,18 +339,18 @@ fn terminal_certification_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline = run_outer_uncertified(&mut uncertified, &config, "terminal-baseline")
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "certification-baseline")
         .expect("baseline outer run");
-    let diagnosed =
-        run_outer(&mut certified, &config, "terminal-certified").expect("certified outer run");
+    let certified_result =
+        run_outer(&mut certified, &config, "certification-run").expect("certified outer run");
 
-    assert_eq!(baseline.rho, diagnosed.rho);
+    assert_eq!(baseline.rho, certified_result.rho);
     assert_eq!(
         baseline.final_value.to_bits(),
-        diagnosed.final_value.to_bits()
+        certified_result.final_value.to_bits()
     );
-    assert_eq!(baseline.iterations, diagnosed.iterations);
-    assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
+    assert_eq!(baseline.iterations, certified_result.iterations);
+    assert_eq!(baseline.final_grad_norm, certified_result.final_grad_norm);
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a

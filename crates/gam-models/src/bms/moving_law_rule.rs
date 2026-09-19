@@ -764,8 +764,8 @@ impl MovingLawCandidates {
             .unwrap_or_default();
         let residual = match &calibration {
             Some(cal) => {
-                let zeta = cal
-                    .apply(z.view(), conditioning)
+                let zeta = FittedLatentScoreMap::conditional_only(cal)
+                    .calibrate(z.view(), Some(conditioning))
                     .map_err(law("location-scale score"))?;
                 Some(
                     build_global_empirical_latent_measure(&zeta, weights, grid_size)
@@ -830,8 +830,8 @@ impl MovingLawCandidates {
                     for &row in rows {
                         fold_location[row] = location_at(&cal, conditioning, row);
                     }
-                    let zeta = cal
-                        .apply(z.view(), conditioning)
+                    let zeta = FittedLatentScoreMap::conditional_only(&cal)
+                        .calibrate(z.view(), Some(conditioning))
                         .map_err(|reason| refusal(held_out, arm, reason))?;
                     let (kind, _) =
                         build_global_empirical_latent_measure(&zeta, &fold_weights, grid_size)

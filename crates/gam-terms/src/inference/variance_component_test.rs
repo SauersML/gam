@@ -133,26 +133,16 @@
 //! The test needs the penalties to cover the whole block: a direction no
 //! penalty touches is a fixed effect, `b = 0` along it is an interior null,
 //! and a zero variance component would not mean a zero effect. Such a block is
-//! refused ([`VarianceComponentTestUnavailable::UnpenalizedDirections`]); the
-//! smooth summary keeps its Wald test for those terms.
-//!
-//! # An unpenalized block
-//!
-//! A block that carries no penalty at all (the treatment-coded factor main
-//! effect a factor `by=` smooth injects) is a FIXED effect: its null `b = 0` is
-//! interior, and the classical score test `uᵀV⁺u/φ ~ χ²_rank` — the nested
-//! `F(rank, ν)` when the scale is estimated — applies. It is reported under its
-//! own hypothesis label rather than silently sharing the variance-component
-//! one.
+//! refused ([`VarianceComponentTestUnavailable::UnpenalizedDirections`]), as
+//! is a block that carries no penalty at all; the smooth summary keeps its
+//! Wald test for those terms.
 
 use std::ops::Range;
 
 use faer::Side;
 use gam_linalg::faer_ndarray::strict_symmetric_eigh;
 use gam_linalg::matrix::DesignMatrix;
-use gam_math::probability::{
-    WeightedChiSquareTerm, chi_square_sf, fisher_snedecor_sf, signed_weighted_chi_square_sf,
-};
+use gam_math::probability::{WeightedChiSquareTerm, signed_weighted_chi_square_sf};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use serde::{Deserialize, Serialize};
 
@@ -170,17 +160,7 @@ pub enum VarianceComponentTestScale {
     Estimated,
 }
 
-/// Which null the reported p-value tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VarianceComponentHypothesis {
-    /// Every variance of a penalized block is zero — the boundary null.
-    VarianceComponent,
-    /// `b = 0` for an unpenalized (fixed) block — an interior null.
-    FixedEffect,
-}
-
-/// Why a penalized or fixed block has no p-value.
+/// Why a block has no p-value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VarianceComponentTestUnavailable {
@@ -240,18 +220,15 @@ impl VarianceComponentTestUnavailable {
     }
 }
 
-/// A computed variance-component (or fixed-effect) test.
+/// A computed variance-component test.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VarianceComponentTest {
-    pub hypothesis: VarianceComponentHypothesis,
-    /// Reported on a chi-square-like scale with mean `reference_df` under `H₀`.
-    ///
-    /// Variance component: `(T/φ̂)·reference_df/Σμ`, with `φ̂ = φ` for a known
-    /// scale and `D'/ν` for an estimated one. Fixed effect: `uᵀV⁺u/φ̂`.
+    /// Reported on a chi-square-like scale with mean `reference_df` under `H₀`:
+    /// `(T/φ̂)·reference_df/Σμ`, with `φ̂ = φ` for a known scale and `D'/ν` for
+    /// an estimated one.
     pub statistic: f64,
-    /// Variance component: the effective degrees of freedom `(Σμ)²/Σμ²` of the
-    /// spectral reference — `rank` exactly when the design is balanced.
-    /// Fixed effect: `rank`.
+    /// The effective degrees of freedom `(Σμ)²/Σμ²` of the spectral reference
+    /// — `rank` exactly when the design is balanced.
     pub reference_df: f64,
     /// Number of estimable directions of the term (reference weights above
     /// their rounding floor).
@@ -296,18 +273,10 @@ pub struct VarianceComponentTestRecord {
 pub struct VarianceComponentTermRequest {
     /// GLOBAL coefficient range of the term's block.
     pub range: Range<usize>,
-    pub block: TestedBlock,
-}
-
-/// What the block's null is.
-#[derive(Clone, Debug)]
-pub enum TestedBlock {
-    /// No penalty: a fixed effect, tested at the interior null `b = 0`.
-    Unpenalized,
     /// The block's LOCAL penalties `S_j` (each `q × q`, `q = range.len()`, in
     /// the block's coefficient basis), which must jointly penalize every
     /// direction. Tested at the boundary null "every variance is zero".
-    Penalized { penalties: Vec<Array2<f64>> },
+    pub penalties: Vec<Array2<f64>>,
 }
 
 /// The fit's row state, in the fit's own row and coefficient layout.
@@ -465,10 +434,7 @@ impl<'a> VarianceComponentTestBasis<'a> {
             return Err(VarianceComponentTestUnavailable::NoEstimableDirection);
         }
         let q = range.len();
-        let penalties = match &request.block {
-            TestedBlock::Unpenalized => None,
-            TestedBlock::Penalized { penalties } => Some(covering_penalties(penalties, q)?),
-        };
+        let penalties = covering_penalties(&request.penalties, q)?;
         let tested: Vec<usize> = range.clone().collect();
         let other: Vec<usize> = (0..p).filter(|j| !range.contains(j)).collect();
         let projection = if other.is_empty() {
@@ -565,23 +531,14 @@ impl<'a> VarianceComponentTestBasis<'a> {
         // difference: `p·ε` relative to the same form in the unprojected Gram,
         // `aᵀG_u a`, which bounds it.
         let rounding = (p as f64) * f64::EPSILON;
-        match term.penalties {
-            Some(penalties) => self.variance_component(
-                &penalties,
-                &term.fisher_projected,
-                &term.fisher_unprojected,
-                &term.score,
-                rounding,
-                residual_df,
-            ),
-            None => self.fixed_effect(
-                &term.fisher_projected,
-                &term.fisher_unprojected,
-                &term.score,
-                rounding,
-                residual_df,
-            ),
-        }
+        self.variance_component(
+            &term.penalties,
+            &term.fisher_projected,
+            &term.fisher_unprojected,
+            &term.score,
+            rounding,
+            residual_df,
+        )
     }
 
     fn variance_component(
@@ -666,7 +623,6 @@ impl<'a> VarianceComponentTestBasis<'a> {
         let (p_value, p_value_relative_error) =
             resolved_tail(tail.probability, tail.relative_error)?;
         Ok(VarianceComponentTest {
-            hypothesis: VarianceComponentHypothesis::VarianceComponent,
             statistic: statistic / dispersion * effective_df / weight_sum,
             reference_df: effective_df,
             rank: weights.len(),
@@ -675,67 +631,11 @@ impl<'a> VarianceComponentTestBasis<'a> {
             p_value_relative_error,
         })
     }
-
-    fn fixed_effect(
-        &self,
-        fisher_projected: &Array2<f64>,
-        fisher_unprojected: &Array2<f64>,
-        score: &Array1<f64>,
-        rounding: f64,
-        residual_df: Option<f64>,
-    ) -> Result<VarianceComponentTest, VarianceComponentTestUnavailable> {
-        let (eigenvalues, eigenvectors) = symmetric_eigh(fisher_projected)?;
-        let floor = rounding * fisher_unprojected.diag().sum();
-        let kept: Vec<usize> = (0..eigenvalues.len())
-            .filter(|&j| eigenvalues[j] > floor)
-            .collect();
-        if kept.is_empty() {
-            return Err(VarianceComponentTestUnavailable::NoEstimableDirection);
-        }
-        let rank = kept.len();
-        let quadratic: f64 = kept
-            .iter()
-            .map(|&j| {
-                let projection = eigenvectors.column(j).dot(score);
-                projection * projection / eigenvalues[j]
-            })
-            .sum();
-        let rank_df = rank as f64;
-        let (statistic, p_value) = match self.scale {
-            ResolvedScale::Known(dispersion) => {
-                let statistic = quadratic / dispersion;
-                (statistic, chi_square_sf(statistic, rank_df))
-            }
-            ResolvedScale::Estimated {
-                residual_sum_of_squares,
-                residual_df,
-            } => {
-                let statistic = quadratic / (residual_sum_of_squares / residual_df);
-                (
-                    statistic,
-                    fisher_snedecor_sf(statistic / rank_df, rank_df, residual_df),
-                )
-            }
-        };
-        if !p_value.is_finite() {
-            return Err(VarianceComponentTestUnavailable::TailUnresolved);
-        }
-        Ok(VarianceComponentTest {
-            hypothesis: VarianceComponentHypothesis::FixedEffect,
-            statistic,
-            reference_df: rank_df,
-            rank,
-            residual_df,
-            p_value,
-            p_value_relative_error: 0.0,
-        })
-    }
 }
 
 struct PreparedTerm {
-    /// The covering penalties `S_j` of a penalized block; `None` for a fixed
-    /// block.
-    penalties: Option<Vec<Array2<f64>>>,
+    /// The covering penalties `S_j`.
+    penalties: Vec<Array2<f64>>,
     tested: Vec<usize>,
     other: Vec<usize>,
     beta_tested: Array1<f64>,
@@ -941,6 +841,7 @@ fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
 mod tests {
     use super::*;
     use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_math::probability::fisher_snedecor_sf;
 
     struct Lcg(u64);
 
@@ -985,7 +886,7 @@ mod tests {
         y: &Array1<f64>,
         beta: &Array1<f64>,
         range: Range<usize>,
-        block: TestedBlock,
+        penalties: Vec<Array2<f64>>,
         scale: VarianceComponentTestScale,
     ) -> Result<VarianceComponentTest, VarianceComponentTestUnavailable> {
         let n = design.nrows();
@@ -1001,7 +902,7 @@ mod tests {
             scale,
         })?;
         basis
-            .test_terms(&[VarianceComponentTermRequest { range, block }])
+            .test_terms(&[VarianceComponentTermRequest { range, penalties }])
             .pop()
             .expect("one term requested")
     }
@@ -1036,10 +937,8 @@ mod tests {
         design
     }
 
-    fn ridge(levels: usize) -> TestedBlock {
-        TestedBlock::Penalized {
-            penalties: vec![Array2::eye(levels)],
-        }
+    fn ridge(levels: usize) -> Vec<Array2<f64>> {
+        vec![Array2::eye(levels)]
     }
 
     /// A null p-value sample is U(0, 1) in BOTH tails: size within 3 MCSE of
@@ -1084,7 +983,7 @@ mod tests {
     /// Double penalty on a six-coefficient block: the second-difference
     /// penalty `DᵀD` (rank 4) and the orthogonal projector onto its null space
     /// (rank 2), scaled by `wiggle` and `null`.
-    fn double_penalty(wiggle: f64, null: f64) -> TestedBlock {
+    fn double_penalty(wiggle: f64, null: f64) -> Vec<Array2<f64>> {
         let k = 6;
         let mut difference = Array2::<f64>::zeros((k - 2, k));
         for r in 0..k - 2 {
@@ -1103,9 +1002,7 @@ mod tests {
                 null_projector[[a, b]] = constant[a] * constant[b] + slope[a] * slope[b];
             }
         }
-        TestedBlock::Penalized {
-            penalties: vec![wiggle * bending, null * null_projector],
-        }
+        vec![wiggle * bending, null * null_projector]
     }
 
     /// `[1 | z | bump_basis(x)]`, the smooth block at `2..8`.
@@ -1151,33 +1048,6 @@ mod tests {
             "{} vs {expected}",
             test.p_value
         );
-    }
-
-    #[test]
-    fn unbalanced_fixed_effect_branch_is_the_nested_f_test() {
-        let levels = 5;
-        let mut rng = Lcg(11);
-        let groups: Vec<usize> = (0..83)
-            .map(|i| if i < levels { i } else { (rng.next_uniform() * rng.next_uniform() * levels as f64) as usize })
-            .collect();
-        let y: Array1<f64> = groups.iter().map(|_| rng.next_normal()).collect();
-        let design = intercept_and_groups(&groups, levels);
-        let beta = Array1::<f64>::zeros(design.ncols());
-        let test = gaussian_test(
-            &design,
-            &y,
-            &beta,
-            1..1 + levels,
-            TestedBlock::Unpenalized,
-            VarianceComponentTestScale::Estimated,
-        )
-        .expect("test runs");
-        let (f, df1, df2) = anova_f(&groups, levels, &y);
-        assert_eq!(test.hypothesis, VarianceComponentHypothesis::FixedEffect);
-        assert_eq!(test.rank, levels - 1);
-        assert!((test.statistic - f * df1).abs() < 1e-8 * f * df1, "{test:?} vs F={f}");
-        let expected = fisher_snedecor_sf(f, df1, df2);
-        assert!((test.p_value - expected).abs() <= 1e-9 * expected + 1e-14);
     }
 
     #[test]
@@ -1378,15 +1248,10 @@ mod tests {
         let mut reparametrized = design.clone();
         let block = design.slice(s![.., 2..8]).dot(&chart);
         reparametrized.slice_mut(s![.., 2..8]).assign(&block);
-        let TestedBlock::Penalized { penalties } = double_penalty(1.0, 1.0) else {
-            unreachable!()
-        };
-        let moved = TestedBlock::Penalized {
-            penalties: penalties
-                .iter()
-                .map(|penalty| chart.t().dot(&penalty.dot(&chart)))
-                .collect(),
-        };
+        let moved: Vec<Array2<f64>> = double_penalty(1.0, 1.0)
+            .iter()
+            .map(|penalty| chart.t().dot(&penalty.dot(&chart)))
+            .collect();
         for scale in [
             VarianceComponentTestScale::Known { dispersion: 1.0 },
             VarianceComponentTestScale::Estimated,
@@ -1442,22 +1307,25 @@ mod tests {
         let z: Vec<f64> = (0..n).map(|_| rng.next_normal()).collect();
         let design = smooth_design(&x, &z);
         let y: Array1<f64> = (0..n).map(|_| rng.next_normal()).collect();
-        let TestedBlock::Penalized { penalties } = double_penalty(1.0, 1.0) else {
-            unreachable!()
-        };
-        // The bending penalty alone leaves the linear part unpenalized.
-        let reason = gaussian_test(
-            &design,
-            &y,
-            &Array1::zeros(design.ncols()),
-            2..8,
-            TestedBlock::Penalized {
-                penalties: vec![penalties[0].clone()],
-            },
-            VarianceComponentTestScale::Known { dispersion: 1.0 },
-        )
-        .expect_err("linear part is unpenalized");
-        assert_eq!(reason, VarianceComponentTestUnavailable::UnpenalizedDirections);
+        let bending = double_penalty(1.0, 1.0).swap_remove(0);
+        // The bending penalty alone leaves the linear part unpenalized, and a
+        // block with no penalty at all leaves every direction unpenalized.
+        for (label, penalties) in [("bending only", vec![bending]), ("no penalty", Vec::new())] {
+            let reason = gaussian_test(
+                &design,
+                &y,
+                &Array1::zeros(design.ncols()),
+                2..8,
+                penalties,
+                VarianceComponentTestScale::Known { dispersion: 1.0 },
+            )
+            .expect_err(label);
+            assert_eq!(
+                reason,
+                VarianceComponentTestUnavailable::UnpenalizedDirections,
+                "{label}"
+            );
+        }
     }
 
     #[test]

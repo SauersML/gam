@@ -206,7 +206,6 @@ fn tested_row(family: Family, rep: u64, effect: f64) -> Result<SmoothRow, String
     };
     let rows = smooth_term_summary_rows(
         &fit.design,
-        &fit.resolvedspec,
         &fit.fit,
         fit.fit.weighted_gram(),
     );
@@ -340,7 +339,7 @@ fn location_scale_tested_row(rep: u64, effect: f64) -> Result<SmoothRow, String>
         panic!("location-scale rep {rep}: expected a Gaussian location-scale fit");
     };
     let fit = &location_scale.fit;
-    let rows = smooth_term_summary_rows(&fit.mean_design, &fit.meanspec_resolved, &fit.fit, None);
+    let rows = smooth_term_summary_rows(&fit.mean_design, &fit.fit, None);
     let row = rows
         .iter()
         .find(|row| row.name.contains(NULL_TERM))

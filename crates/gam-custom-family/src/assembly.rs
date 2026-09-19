@@ -2895,7 +2895,10 @@ pub(crate) struct CachedInnerMode {
     pub(crate) converged: bool,
     pub(crate) block_logdet_h: Option<f64>,
     pub(crate) block_logdet_s: Option<f64>,
-    pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    // No joint Hessian workspace (#2996): a warm start keeps only arrays. The
+    // reuse path re-certifies the cached mode and takes the certificate's
+    // fresh workspace, so a filed workspace was never read, but it pinned an
+    // n-row cache per warm-start carrier past the exact-cache store's bound.
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
     pub(crate) terminal_working_sets: Option<Vec<BlockWorkingSet>>,
