@@ -1,4 +1,4 @@
-//! Minimum-code head supports of mpd-induction's trained network at declared tolerances (#2951 S2a).
+//! Minimum-code head supports of mpd-induction's trained network at declared tolerances (#2951 S2a, S3).
 //!
 //! `mpd_induction_supports --export REGISTRY_EXPORT --settings SETTINGS_JSON --out REPORT_JSON`
 //!
@@ -67,6 +67,25 @@
 //! * the do-nothing baseline, every head off;
 //! * the artifact's distortion with every head on;
 //! * the teacher's native logits measured against torch's exported native logits.
+//!
+//! # Stage S3: position-scoped supports at one occurrence
+//! Declared by `"positions": {"rows": [[sequence, position], …], "baseline_fractions": [f, …], "null_seed": s}`,
+//! each row one occurrence of the mechanism. A component is one head read at one position alone: its `d_head`
+//! columns of `W_O` at that row of `block::ComponentMasks` (one center row per position). A row `t`'s components
+//! are every head of a layer below the last at every position `s ≤ t`, and every head of the last layer at `t`
+//! alone: the last layer's write at another position reaches only that position's logits, and no position after
+//! `t` reaches it. Every other head and position stays on.
+//! * **Divergence:** `KL(teacher ‖ artifact under the mask)` at row `t` alone, over both logit boxes. The
+//!   tolerances are fractions of the row's own all-off divergence.
+//! * **Search:** `BoxSeparationOracle` and `minimum_code_support` with the padded head code over the row's
+//!   components, a function of the size alone, so the minimum-code support keeps the fewest instances. The report
+//!   also gives the code that sends each distinct kept head once, and how many instances the same heads keep
+//!   when each is kept at every position.
+//! * **The mechanism's prediction, from the tokens alone:** the earlier occurrence of the row's token is at
+//!   `t − n`, so an induction head at `t` reads its key at the source `t − n + 1`. The report counts the
+//!   support's lower-layer instances at the source and elsewhere.
+//! * **Null at equal count:** the support's lower-layer instances each moved to a uniformly drawn other position
+//!   (declared seed), with every other instance off, must miss the tolerance; the support alone must meet it.
 
 use gam_sae::parameter_decomposition::attention::AttentionGeometry;
 use gam_sae::parameter_decomposition::block::{
@@ -83,6 +102,8 @@ use gam_sae::parameter_decomposition::supports::{
     SupportSearchError, minimum_code_support, sufficient_union,
 };
 use ndarray::{Array2, s};
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -95,7 +116,8 @@ mod induction_export;
 mod induction_network;
 use induction_export::{LoadedExport, float64_array, load_export};
 use induction_network::{
-    InductionRows, Largest, Network, PROJECTIONS, RowDivergence, Rows, factored_layer, flag, layout, stored_layer,
+    InductionRows, Largest, Logged, Network, PROJECTIONS, RowDivergence, Rows, factored_layer, flag, layout,
+    row_divergence, stored_layer,
 };
 
 const USAGE: &str = "usage: mpd_induction_supports --export REGISTRY_EXPORT --settings SETTINGS_JSON --out REPORT_JSON";
@@ -108,6 +130,17 @@ struct Settings {
     absolute_tolerances: Vec<f64>,
     fraction_bits: i32,
     transplant: Option<TransplantSettings>,
+    /// Stage S3, when declared: position-scoped supports at declared induction rows.
+    positions: Option<PositionSettings>,
+}
+
+/// The induction rows `(sequence, position)` S3 scores, its tolerances as fractions of each row's own all-off
+/// divergence, and the seed of its moved-position null.
+#[derive(Deserialize)]
+struct PositionSettings {
+    rows: Vec<(usize, usize)>,
+    baseline_fractions: Vec<f64>,
+    null_seed: u64,
 }
 
 /// The trained network's report whose certified supports this control receives, the declared top share `q`,
@@ -320,6 +353,152 @@ impl HeadNetwork {
         }
         Ok((logits, spreads))
     }
+
+    /// The logits of one sequence, `T × vocab`, with their radius, under a box of position-scoped head masks:
+    /// `instances[i]` is head `head` of layer `layer` at `position` alone, under the box's control `i`, and every
+    /// head at every other position stays on. A free instance's columns read `1/2 ± 1/2` at its position. Also
+    /// each free instance's spread `Σ |W_O[:, head]| (|z_s| + r_s)` over its position's mixed row, and zero for
+    /// the others.
+    fn scoped_logits(&self, tokens: &[i64], instances: &[Instance], mask: &MaskBox) -> Result<(Rows, Vec<f64>), String> {
+        let network = &self.network;
+        let (count, head_dim) = (network.heads, network.head_dim);
+        let layers = network.layers.len();
+        let mut centers = vec![Array2::<f64>::ones((tokens.len(), count * head_dim)); layers];
+        let mut half_widths = vec![Array2::<f64>::zeros((tokens.len(), count * head_dim)); layers];
+        let mut free = vec![false; layers];
+        for (instance, side) in instances.iter().zip(mask.sides()) {
+            let (center, half_width) = match side {
+                MaskSide::On => (1.0, 0.0),
+                MaskSide::Off => (0.0, 0.0),
+                MaskSide::Free => (0.5, 0.5),
+            };
+            let columns = instance.head * head_dim..(instance.head + 1) * head_dim;
+            centers[instance.layer].slice_mut(s![instance.position, columns.clone()]).fill(center);
+            half_widths[instance.layer].slice_mut(s![instance.position, columns]).fill(half_width);
+            free[instance.layer] |= *side == MaskSide::Free;
+        }
+        let reads: Vec<AttentionLayerReads<'_>> = centers
+            .iter()
+            .zip(&half_widths)
+            .zip(&free)
+            .map(|((center, half_width), &free)| AttentionLayerReads {
+                output: ProjectionRead::Components(ComponentMasks {
+                    center: center.view(),
+                    half_width: free.then(|| half_width.view()),
+                }),
+                ..AttentionLayerReads::native()
+            })
+            .collect();
+        let (logits, executions) = network.run(tokens, &reads)?;
+        let mut spreads = vec![0.0_f64; instances.len()];
+        for ((spread, instance), side) in spreads.iter_mut().zip(instances).zip(mask.sides()) {
+            if *side != MaskSide::Free {
+                continue;
+            }
+            let output = network.layers[instance.layer].native().weight(AttentionProjection::Output);
+            let attention = &executions[instance.layer].attention;
+            *spread = (instance.head * head_dim..(instance.head + 1) * head_dim)
+                .map(|column| {
+                    let column_mass: f64 = output.column(column).iter().map(|entry| entry.abs()).sum();
+                    column_mass
+                        * (attention.mixed[[instance.position, column]].abs()
+                            + attention.mixed_radius[[instance.position, column]])
+                })
+                .sum();
+        }
+        Ok((logits, spreads))
+    }
+}
+
+/// One S3 component: head `head` of layer `layer` read at `position` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Instance {
+    layer: usize,
+    head: usize,
+    position: usize,
+}
+
+impl Instance {
+    fn name(&self) -> String {
+        format!("L{}H{}@{}", self.layer, self.head, self.position)
+    }
+}
+
+/// The components of the induction row at `position`: every head of a layer below the last at every position up
+/// to it, and every head of the last layer at it alone. The last layer's write at another position reaches only
+/// that position's logits, and a position after the row reaches no earlier one, so neither can move the row.
+fn row_instances(layers: usize, heads: usize, position: usize) -> Vec<Instance> {
+    let mut instances = Vec::new();
+    for layer in 0..layers {
+        let positions = if layer + 1 < layers { 0..position + 1 } else { position..position + 1 };
+        for at in positions {
+            instances.extend((0..heads).map(|head| Instance { layer, head, position: at }));
+        }
+    }
+    instances
+}
+
+/// The finite family an S3 status is exhaustive over: one row's binary masks over its instances.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+struct ScopedFamily {
+    sequence: usize,
+    position: usize,
+    instances: usize,
+}
+
+/// One induction row's decoded artifact under position-scoped head masks, as a box program: its divergence from
+/// the teacher at that row, bounded over both logit boxes. A box runs once at its center with every free
+/// instance at `1/2 ± 1/2`; free instances split widest first, by spread.
+struct ScopedBoxes<'a, 'b> {
+    artifact: &'a HeadNetwork,
+    tokens: &'a [i64],
+    reference: &'a Rows,
+    family: ScopedFamily,
+    instances: &'a [Instance],
+    enclosed: &'b mut BTreeMap<MaskBox, BoxEnclosure<ScopedFamily>>,
+}
+
+impl BoxDivergence for ScopedBoxes<'_, '_> {
+    type Domain = ScopedFamily;
+    type Error = String;
+
+    fn components(&self) -> usize {
+        self.instances.len()
+    }
+
+    fn domain(&self) -> ScopedFamily {
+        self.family
+    }
+
+    fn enclose(&mut self, mask: &MaskBox) -> Result<BoxEnclosure<ScopedFamily>, String> {
+        if let Some(found) = self.enclosed.get(mask) {
+            return Ok(found.clone());
+        }
+        let (moved, spreads) = self.artifact.scoped_logits(self.tokens, self.instances, mask)?;
+        let row = row_divergence(self.reference, &moved, self.family.position)?;
+        let domain = self.family;
+        let evidence = match (mask.is_vertex(), row.resolved, row.upper) {
+            (true, Some((value, error)), _) => {
+                EvidenceStatus::exact(value, error, ExactBasis::Exhaustive { cardinality: 1 }, Some(mask.clone()), domain)
+            }
+            (false, resolved, Some(upper)) => {
+                EvidenceStatus::uniform_bound(upper, resolved.map_or(0.0, |(_, error)| error), domain)
+            }
+            (vertex, _, _) => EvidenceStatus::unresolved(
+                row.lower.unwrap_or(0.0),
+                f64::INFINITY,
+                Extremum::Supremum,
+                vertex.then(|| mask.clone()),
+                domain,
+            ),
+        }
+        .map_err(|error| format!("{error:?}"))?;
+        let mut split_order = mask.free();
+        split_order.sort_by(|left, right| spreads[*right].total_cmp(&spreads[*left]));
+        let enclosure = BoxEnclosure { evidence, split_order };
+        self.enclosed.insert(mask.clone(), enclosure.clone());
+        Ok(enclosure)
+    }
 }
 
 /// Per-row divergences of the decoded artifact from the teacher, memoized per head mask.
@@ -355,14 +534,13 @@ impl<'a> Divergences<'a> {
     /// the box's center, and each head's largest spread over the sequences.
     fn box_rows(&mut self, heads: &MaskBox) -> Result<(Vec<RowDivergence>, Vec<f64>), String> {
         let (artifact, tokens) = (self.artifact, self.tokens);
+        let (rows, by_sequence) = self.induction.evaluate_with(|sequence| artifact.logits(&tokens[sequence], Some(heads)))?;
         let mut spreads = vec![0.0_f64; artifact.components()];
-        let rows = self.induction.at(heads, |sequence| {
-            let (logits, spread) = artifact.logits(&tokens[sequence], Some(heads))?;
-            for (widest, own) in spreads.iter_mut().zip(spread) {
+        for spread in by_sequence.values() {
+            for (widest, &own) in spreads.iter_mut().zip(spread) {
                 *widest = widest.max(own);
             }
-            Ok(logits)
-        })?;
+        }
         Ok((rows, spreads))
     }
 }
@@ -893,6 +1071,8 @@ struct Report {
     /// not, `undiscriminating` when none can discriminate, and `none` without a transplant.
     transplant_verdict: String,
     tolerances: Vec<ToleranceReport>,
+    /// Stage S3, when declared.
+    positions: Option<Vec<PositionRowReport>>,
 }
 
 fn names(heads: usize, members: &[usize]) -> Vec<String> {
@@ -962,6 +1142,13 @@ fn main() -> Result<(), String> {
              must be finite and non-negative"
                 .to_string(),
         );
+    }
+    if let Some(positions) = &settings.positions
+        && (positions.rows.is_empty()
+            || positions.baseline_fractions.is_empty()
+            || positions.baseline_fractions.iter().any(|value| !(value.is_finite() && *value >= 0.0)))
+    {
+        return Err("S3's positions must declare rows and finite non-negative baseline fractions".to_string());
     }
     if let Some(transplant) = &settings.transplant
         && !(transplant.top_share > 0.0 && transplant.top_share <= 1.0)
@@ -1231,6 +1418,53 @@ fn main() -> Result<(), String> {
         });
     }
 
+    // Stage S3: position-scoped supports at the declared induction rows.
+    let positions = match &settings.positions {
+        Some(declared) => {
+            let mut rng = StdRng::seed_from_u64(declared.null_seed);
+            let mut scored = Vec::with_capacity(declared.rows.len());
+            for &(sequence, position) in &declared.rows {
+                if !divergences.induction.rows.contains(&(sequence, position)) {
+                    return Err(format!("({sequence}, {position}) is not an induction row"));
+                }
+                // The rows of a sequence are `T − n … T − 2`, so there are `n − 1` of them.
+                let segment = divergences.induction.rows.iter().filter(|(row_sequence, _)| *row_sequence == sequence).count() + 1;
+                let row = position_row(
+                    &artifact,
+                    &export.tokens[sequence],
+                    &divergences.induction.reference[sequence],
+                    (sequence, position),
+                    segment,
+                    &declared.baseline_fractions,
+                    padded_head_bits,
+                    &mut rng,
+                )?;
+                for tolerance in &row.tolerances {
+                    println!(
+                        "[positions] row=({sequence}, {position}) n={segment} source={} instances={} fraction={:.3e} tolerance={:.3e} code={} support={:?} at_source={} elsewhere={} heads={} scoped_bits={} global_instances={} alone={} moved={:?} moved_verdict={}",
+                        row.source,
+                        row.instances,
+                        tolerance.fraction,
+                        tolerance.tolerance,
+                        tolerance.code_status,
+                        tolerance.support,
+                        tolerance.at_source,
+                        tolerance.elsewhere,
+                        tolerance.distinct_heads,
+                        tolerance.scoped_code_bits,
+                        tolerance.global_instances,
+                        tolerance.alone_verdict,
+                        tolerance.moved,
+                        tolerance.moved_verdict
+                    );
+                }
+                scored.push(row);
+            }
+            Some(scored)
+        }
+        None => None,
+    };
+
     let report = Report {
         checkpoint: export.checkpoint,
         teacher_fingerprint: format!("{:#018x}", loaded.registry.teacher_fingerprint().0),
@@ -1247,6 +1481,7 @@ fn main() -> Result<(), String> {
         box_enclosures: box_enclosures.len(),
         transplant_verdict: transplant_verdict(settings.transplant.is_some(), &reports),
         tolerances: reports,
+        positions,
     };
     let text = serde_json::to_string_pretty(&report).map_err(|error| format!("report: {error}"))?;
     std::fs::write(&report_path, text).map_err(|error| format!("write {}: {error}", report_path.display()))?;
@@ -1262,4 +1497,192 @@ fn main() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// A status's proven sides.
+#[derive(Serialize)]
+struct Bounds {
+    lower: Option<f64>,
+    upper: Option<f64>,
+}
+
+impl Bounds {
+    fn of<W, D>(status: &EvidenceStatus<W, D>) -> Self {
+        Self {
+            lower: status.lower_bound(),
+            upper: status.upper_bound(),
+        }
+    }
+
+    /// `meets` when the upper side is at most `tolerance`, `violates` when the lower side exceeds it.
+    fn verdict(&self, tolerance: f64) -> &'static str {
+        match (self.lower, self.upper) {
+            (_, Some(upper)) if upper <= tolerance => "meets",
+            (Some(lower), _) if lower > tolerance => "violates",
+            _ => "unresolved",
+        }
+    }
+}
+
+/// S3 at one row and one tolerance.
+#[derive(Serialize)]
+struct PositionTolerance {
+    fraction: f64,
+    tolerance: f64,
+    vacuous: bool,
+    /// `exact`, `unresolved`, or `all_on_violation` when the artifact misses the tolerance with every instance on.
+    code_status: String,
+    code_bits_lower: f64,
+    code_bits_upper: f64,
+    support: Vec<String>,
+    separations: usize,
+    edges: usize,
+    /// The support's lower-layer instances at the source position `t − n + 1` the mechanism reads, and elsewhere.
+    at_source: usize,
+    elsewhere: usize,
+    /// The support's distinct heads, its code with each distinct head's codeword sent once, and the instances
+    /// the same heads keep when each is kept at every position of the row.
+    distinct_heads: usize,
+    scoped_code_bits: u64,
+    global_instances: usize,
+    /// The support alone (every other instance off), and the same heads with every lower-layer instance moved
+    /// to another position (declared seed), at equal or smaller count.
+    alone: Option<Bounds>,
+    alone_verdict: String,
+    moved: Vec<String>,
+    moved_risk: Option<Bounds>,
+    moved_verdict: String,
+}
+
+#[derive(Serialize)]
+struct PositionRowReport {
+    sequence: usize,
+    position: usize,
+    segment: usize,
+    source: usize,
+    instances: usize,
+    baseline: Bounds,
+    all_on: Bounds,
+    enclosures: usize,
+    tolerances: Vec<PositionTolerance>,
+}
+
+/// Stage S3 at one declared induction row `(sequence, position)` of a sequence whose segment has length
+/// `segment`: at each declared fraction `f` of the row's own all-off divergence, the minimum-code support over
+/// the row's instances (`row_instances`) by `BoxSeparationOracle`. The code is the padded head code over the
+/// instances, `L(C, k) + L_int(H) + k·H`, a function of the size alone, so the minimum-code support is a
+/// minimum-count one; the report also gives the code that sends each distinct kept head once.
+fn position_row(
+    artifact: &HeadNetwork,
+    tokens: &[i64],
+    reference: &Rows,
+    (sequence, position): (usize, usize),
+    segment: usize,
+    fractions: &[f64],
+    head_bits: u64,
+    rng: &mut StdRng,
+) -> Result<PositionRowReport, String> {
+    let layers = artifact.network.layers.len();
+    let instances = row_instances(layers, artifact.heads(), position);
+    let count = instances.len();
+    let family = ScopedFamily { sequence, position, instances: count };
+    let source = position + 1 - segment;
+    let vertex = |on: Vec<usize>| {
+        ComponentSet::new(count, on).map(|on| MaskBox::vertex(&on)).map_err(|error| error.to_string())
+    };
+    let mut enclosed = BTreeMap::new();
+    let (baseline, all_on) = {
+        let mut program = ScopedBoxes { artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
+        (program.enclose(&vertex(Vec::new())?)?.evidence, program.enclose(&vertex((0..count).collect())?)?.evidence)
+    };
+    let &EvidenceStatus::Exact { value: do_nothing, .. } = &baseline else {
+        return Err(format!("row ({sequence}, {position}): the all-off divergence is unresolved"));
+    };
+    let code = HeadCode { head_bits };
+    let mut tolerances = Vec::with_capacity(fractions.len());
+    for &fraction in fractions {
+        let tolerance = fraction * do_nothing;
+        let program = ScopedBoxes { artifact, tokens, reference, family, instances: &instances, enclosed: &mut enclosed };
+        let oracle = BoxSeparationOracle::new(program, tolerance).map_err(|error| format!("{error:?}"))?;
+        let mut oracle = Logged::new(oracle, format!("row=({sequence}, {position}) fraction={fraction:.3e}"));
+        let found = minimum_code_support(&mut oracle, &code, tolerance, FailureHypergraph::new(count));
+        let (code_status, code_bits_lower, code_bits_upper) = code_bits(&found)?;
+        let (members, separations, edges) = match &found {
+            Ok(search) => (
+                search.certified.as_ref().map(|found| found.support.members().to_vec()),
+                search.separations,
+                search.hypergraph.edges().len(),
+            ),
+            Err(_) => (None, 0, 0),
+        };
+        let support = members.clone().unwrap_or_default();
+        let lower: Vec<&Instance> =
+            support.iter().map(|&member| &instances[member]).filter(|instance| instance.layer + 1 < layers).collect();
+        let at_source = lower.iter().filter(|instance| instance.position == source).count();
+        let mut heads: Vec<(usize, usize)> = support.iter().map(|&member| (instances[member].layer, instances[member].head)).collect();
+        heads.sort_unstable();
+        heads.dedup();
+        let scoped_code_bits = subset_code_len_bits(count, support.len()).map_err(|error| format!("{error:?}"))?
+            + prefix_integer_len_bits(head_bits).map_err(|error| format!("{error:?}"))?
+            + heads.len() as u64 * head_bits;
+        let global_instances = heads.iter().map(|&(layer, _)| if layer + 1 < layers { position + 1 } else { 1 }).sum();
+        let (alone, moved, moved_risk) = match &members {
+            Some(members) => {
+                let alone = oracle.evaluate(&vertex(members.clone())?).map_err(|error| format!("{error:?}"))?;
+                let mut moved: Vec<usize> = Vec::with_capacity(members.len());
+                for &member in members {
+                    let instance = instances[member];
+                    let target = if instance.layer + 1 < layers && position > 0 {
+                        let drawn = rng.random_range(0..position);
+                        let at = if drawn >= instance.position { drawn + 1 } else { drawn };
+                        instances
+                            .iter()
+                            .position(|other| *other == Instance { position: at, ..instance })
+                            .ok_or_else(|| format!("no instance {} at {at}", instance.name()))?
+                    } else {
+                        member
+                    };
+                    moved.push(target);
+                }
+                moved.sort_unstable();
+                moved.dedup();
+                let moved_status = oracle.evaluate(&vertex(moved.clone())?).map_err(|error| format!("{error:?}"))?;
+                (Some(Bounds::of(&alone)), moved, Some(Bounds::of(&moved_status)))
+            }
+            None => (None, Vec::new(), None),
+        };
+        let verdict = |bounds: &Option<Bounds>| bounds.as_ref().map_or("none", |bounds| bounds.verdict(tolerance)).to_string();
+        tolerances.push(PositionTolerance {
+            fraction,
+            tolerance,
+            vacuous: code_status == "exact" && members.as_ref().is_some_and(Vec::is_empty),
+            code_status,
+            code_bits_lower,
+            code_bits_upper,
+            support: support.iter().map(|&member| instances[member].name()).collect(),
+            separations,
+            edges,
+            at_source,
+            elsewhere: lower.len() - at_source,
+            distinct_heads: heads.len(),
+            scoped_code_bits,
+            global_instances,
+            alone_verdict: verdict(&alone),
+            alone,
+            moved: moved.iter().map(|&member| instances[member].name()).collect(),
+            moved_verdict: verdict(&moved_risk),
+            moved_risk,
+        });
+    }
+    Ok(PositionRowReport {
+        sequence,
+        position,
+        segment,
+        source,
+        instances: count,
+        baseline: Bounds::of(&baseline),
+        all_on: Bounds::of(&all_on),
+        enclosures: enclosed.len(),
+        tolerances,
+    })
 }

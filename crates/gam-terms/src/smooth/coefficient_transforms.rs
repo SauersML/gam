@@ -31,9 +31,8 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
 
 /// Knot-span-scaled second-order cumulative transform for the convex/concave
 /// box reparameterization on a B-spline coefficient vector `θ` (raw control
-/// points; the shape-constrained B-spline arm forces
-/// `BSplineIdentifiability::None`, so the design columns are the raw basis
-/// functions and `θ` carries the control-polygon geometry).
+/// points, so `θ` carries the control-polygon geometry; the shape cone chart in
+/// `shape_constraints::bspline_shape_cone_chart` builds on this `T`).
 ///
 /// The plain integer second-difference cone `θ_{i+2} − 2θ_{i+1} + θ_i ≥ 0`
 /// only certifies convexity of the *function* when the Greville abscissae are
@@ -44,9 +43,7 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
 /// still). The geometrically-correct convexity cone is that the control-polygon
 /// *slopes* `m_i = (θ_{i+1} − θ_i)/(ξ_{i+1} − ξ_i)` are non-decreasing, i.e. the
 /// second *divided* differences `[D²θ]_i = (m_{i+1} − m_i)/(ξ_{i+2} − ξ_i) ≥ 0`.
-/// This is the exact same divided-difference correction the difference-penalty
-/// path applies (see `create_difference_penalty_matrix` /
-/// `penalty_greville_abscissae_for_knots`): a coefficient sequence linear in
+/// This is a constraint cone, not a penalty: a coefficient sequence linear in
 /// `x` (`θ_j = a + b·ξ_j`, the unpenalized affine null space, which must be a
 /// boundary of both the convex and concave cones) has zero second divided
 /// difference but a *non-zero* plain second difference under non-uniform ξ, so
@@ -56,7 +53,7 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
 /// common rescaling of `sign · [D²θ]_{i−2}`; the common scale comes from
 /// normalizing the supplied spans by their maximum so the coefficient chart is
 /// invariant to physical covariate units. Pairing this `T` with the lower bounds
-/// `γ_i ≥ 0` (`i ≥ 2`) from [`shape_lower_bounds_local`] therefore enforces
+/// `γ_i ≥ 0` (`i ≥ 2`) from `shape_lower_bounds_local` therefore enforces
 /// convexity (`sign = +1`) or concavity (`sign = −1`) exactly for arbitrary
 /// (clamped / quantile) knot geometry. `γ_0` is the level and `γ_1` the initial
 /// slope, both unconstrained. When ξ is uniform this reduces (column-scaled) to

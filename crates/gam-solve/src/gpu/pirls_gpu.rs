@@ -2821,6 +2821,7 @@ extern "C" __global__ void status_first_ladder(
                     crate::pirls::computeworkingweight_derivatives_from_eta(
                         ext.likelihood,
                         ext.inverse_link,
+                        ext.y,
                         &final_eta,
                         ext.priorweights,
                     )
