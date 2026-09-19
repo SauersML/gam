@@ -83,13 +83,21 @@
 //! build targets. The tests measure that bound against a double-double reference at
 //! every point the fixtures evaluate. That checks the platform the tests run on; it
 //! does not certify production inputs.
+//!
+//! # Memory
+//!
+//! The `heads × tokens × tokens` scores, weights and their radii are reserved on
+//! gam-runtime's process memory governor before they are allocated. Each result
+//! holds its reservation for as long as its arrays live, so none is `Clone`. A
+//! footprint beyond the budget is a typed refusal, [`AttentionProgramError::Memory`].
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::categorical::{CategoricalError, log_softmax_with_error};
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder};
+use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, CowArray, Ix2, ShapeBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::parameter_decomposition::gated_rewrite::{GatedRewriteError, MaskedNorm};
@@ -127,6 +135,9 @@ pub enum AttentionProgramError {
     Categorical(CategoricalError),
     /// The source's per-head query/key norm refused its rows.
     Norm(GatedRewriteError),
+    /// The `heads × tokens × tokens` scores and weights do not fit the process
+    /// memory budget. Nothing of that size was allocated.
+    Memory(MemoryReservationError),
 }
 
 impl fmt::Display for AttentionProgramError {
@@ -162,6 +173,7 @@ impl fmt::Display for AttentionProgramError {
             }
             Self::Categorical(error) => write!(f, "attention score row: {error}"),
             Self::Norm(error) => write!(f, "attention query/key norm: {error}"),
+            Self::Memory(error) => write!(f, "attention scores and weights: {error}"),
         }
     }
 }
@@ -355,6 +367,17 @@ fn expect_heads(
     }
 }
 
+/// Reserve `copies` `heads × tokens × tokens` `f64` arrays on the process
+/// memory governor before any of them is allocated. The caller holds the
+/// reservation beside the arrays for as long as they live. A shape whose cell
+/// count overflows `usize` is refused by the governor as a size overflow.
+fn reserve_heads(shape: (usize, usize, usize), copies: usize) -> Result<MemoryReservation, AttentionProgramError> {
+    let (heads, tokens, keys) = shape;
+    MemoryGovernor::global()
+        .try_reserve_dense_f64_copies(heads.saturating_mul(tokens), keys, copies, "attention scores and weights")
+        .map_err(AttentionProgramError::Memory)
+}
+
 /// A pre-softmax score matrix per head with its radius; causally masked entries
 /// are `−∞` with radius zero.
 struct ScoredHeads {
@@ -363,8 +386,10 @@ struct ScoredHeads {
 }
 
 /// One program's executed attention block, each quantity with its forward-error
-/// radius against the program's exact value.
-#[derive(Clone, Debug)]
+/// radius against the program's exact value. It holds the memory reservation of
+/// its four `heads × tokens × tokens` arrays for as long as they live, so it is
+/// not `Clone`: a copy would be memory the governor never admitted.
+#[derive(Debug)]
 pub struct AttentionExecution {
     /// `heads × tokens × tokens` scores; `s > t` is causally masked to `−∞`.
     pub scores: Array3<f64>,
@@ -374,6 +399,14 @@ pub struct AttentionExecution {
     /// `tokens × model_dim`, after the source's output projection.
     pub output: Array2<f64>,
     pub output_radius: Array2<f64>,
+    footprint: MemoryReservation,
+}
+
+impl AttentionExecution {
+    /// Bytes this execution holds on the process memory governor.
+    pub fn reserved_bytes(&self) -> usize {
+        self.footprint.bytes()
+    }
 }
 
 /// Already-projected rows, `tokens × width`, with a per-entry forward-error
@@ -398,8 +431,9 @@ impl<'a> ProjectedRows<'a> {
 }
 
 /// The attention block before the output projection, each quantity with its
-/// forward-error radius.
-#[derive(Clone, Debug)]
+/// forward-error radius. Like [`AttentionExecution`], it holds the reservation of
+/// its four `heads × tokens × tokens` arrays for as long as they live.
+#[derive(Debug)]
 pub struct ProjectedAttention {
     /// `heads × tokens × tokens` scores; `s > t` is causally masked to `−∞`.
     pub scores: Array3<f64>,
@@ -410,6 +444,31 @@ pub struct ProjectedAttention {
     /// output projection.
     pub mixed: Array2<f64>,
     pub mixed_radius: Array2<f64>,
+    footprint: MemoryReservation,
+}
+
+impl ProjectedAttention {
+    /// Bytes this result holds on the process memory governor.
+    pub fn reserved_bytes(&self) -> usize {
+        self.footprint.bytes()
+    }
+}
+
+/// The causal attention weights at given scores, each with its radius, holding
+/// the reservation of both `heads × tokens × tokens` arrays for as long as they
+/// live.
+#[derive(Debug)]
+pub struct AttentionWeights {
+    pub weights: Array3<f64>,
+    pub weight_radius: Array3<f64>,
+    footprint: MemoryReservation,
+}
+
+impl AttentionWeights {
+    /// Bytes these weights hold on the process memory governor.
+    pub fn reserved_bytes(&self) -> usize {
+        self.footprint.bytes()
+    }
 }
 
 /// Per-token head-space rows with a per-entry forward-error radius.
@@ -435,9 +494,47 @@ fn project_affine(projection: &AffineProjection, x: ArrayView2<f64>) -> (Array2<
     (value, radius)
 }
 
-/// The source's per-head RMS norm (Qwen3 `q_norm`, `k_norm`) on every head of
-/// `tokens × heads·head_dim` rows, evaluated by the gated-rewrite owner on the
-/// current summed rows.
+/// `tokens × width` rows as `tokens·heads × head_dim` head rows, one per contiguous
+/// `head_dim` block. A width that is not a whole, nonzero number of heads is refused.
+/// A contiguous view is reshaped in place; any other view (e.g. a zero-stride exact radius) is copied.
+fn head_rows<'a>(rows: &'a ArrayView2<'_, f64>, head_dim: usize) -> Result<CowArray<'a, f64, Ix2>, GatedRewriteError> {
+    let (tokens, width) = rows.dim();
+    let heads = width.checked_div(head_dim).unwrap_or(0);
+    let mismatch = GatedRewriteError::ShapeMismatch {
+        what: "per-head query/key rows",
+        expected: (tokens * heads, head_dim),
+        found: (tokens, width),
+    };
+    if heads == 0 || heads * head_dim != width {
+        return Err(mismatch);
+    }
+    rows.to_shape((tokens * heads, head_dim)).map_err(|_| mismatch)
+}
+
+/// The source's per-head RMS norm (Qwen3 `q_norm`, `k_norm`) of `tokens × heads·head_dim`
+/// rows: `w ⊙ x (mean x² + ε)^{-1/2}` on each contiguous `head_dim` block of a row, with one
+/// gain `w` of length `head_dim` shared by every head, evaluated by the gated-rewrite owner.
+/// [`NativeAttention::with_query_key_norm`] and the mechanism program's `HeadRmsNorm` node
+/// both run it, so their rows agree bit for bit.
+pub fn head_rms_norm(
+    rows: ArrayView2<'_, f64>,
+    head_dim: usize,
+    epsilon: f64,
+    gain: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, GatedRewriteError> {
+    let (tokens, width) = rows.dim();
+    let per_head = head_rows(&rows, head_dim)?;
+    let normalized = MaskedNorm::Rms { epsilon, gain }.apply(per_head.view())?;
+    normalized
+        .into_shape_with_order((tokens, width))
+        .map_err(|_| GatedRewriteError::ShapeMismatch {
+            what: "per-head query/key rows",
+            expected: (tokens, width),
+            found: (tokens * width / head_dim, head_dim),
+        })
+}
+
+/// [`head_rms_norm`] of rows given with a per-entry radius, and the radius of the result.
 ///
 /// For one head row `x̂` with radius `r`, `y(x) = w ⊙ x ν(x)` with
 /// `ν = s^{-1/2}`, `s(x) = mean x² + ε`. The radius bounds `|y_c(x) − fl(y_c(x̂))|` for
@@ -456,34 +553,31 @@ fn project_affine(projection: &AffineProjection, x: ArrayView2<f64>) -> (Array2<
 /// evaluation's own rounding `γ_{d+6} |fl(y_c)|` (`ν` from the stored row is `γ_{d+4}`
 /// relative, the two products `γ_2`). The total is divided by `1 − γ_{d+12}` for the
 /// radius's own arithmetic.
-fn normalize_heads(
-    (values, radius): (Array2<f64>, Array2<f64>),
-    heads: usize,
+pub fn head_rms_norm_with_radius(
+    rows: ProjectedRows<'_>,
     head_dim: usize,
     epsilon: f64,
     gain: ArrayView1<'_, f64>,
 ) -> Result<(Array2<f64>, Array2<f64>), GatedRewriteError> {
-    let (tokens, width) = values.dim();
-    let mismatch = GatedRewriteError::ShapeMismatch {
-        what: "per-head query/key rows",
-        expected: (tokens * heads, head_dim),
-        found: (tokens, width),
-    };
-    let per_head = values
-        .into_shape_with_order((tokens * heads, head_dim))
-        .ok()
-        .ok_or(mismatch.clone())?;
-    let per_head_radius = radius
-        .into_shape_with_order((tokens * heads, head_dim))
-        .ok()
-        .ok_or(mismatch.clone())?;
-    let normalized = MaskedNorm::Rms { epsilon, gain }.apply(per_head.view())?;
+    let (tokens, width) = rows.values.dim();
+    if rows.radius.dim() != (tokens, width) {
+        return Err(GatedRewriteError::ShapeMismatch {
+            what: "per-head query/key radius",
+            expected: (tokens, width),
+            found: rows.radius.dim(),
+        });
+    }
+    let values = head_rms_norm(rows.values, head_dim, epsilon, gain)?;
+    let per_head = head_rows(&rows.values, head_dim)?;
+    let per_head_radius = head_rows(&rows.radius, head_dim)?;
     let evaluation = accumulation_growth(head_dim + 6);
     let square_growth = accumulation_growth(head_dim + 2);
     let spread_growth = accumulation_growth(head_dim + 4);
     let floor_growth = accumulation_growth(7);
     let dominance = 1.0 - accumulation_growth(head_dim + 12);
     let head_width = head_dim as f64;
+    let values_view = values.view();
+    let normalized = head_rows(&values_view, head_dim)?;
     let mut normalized_radius = Array2::zeros(normalized.dim());
     for (row, (x, r)) in per_head.rows().into_iter().zip(per_head_radius.rows()).enumerate() {
         let computed = x.iter().map(|value| value * value).sum::<f64>() / head_width + epsilon;
@@ -503,14 +597,13 @@ fn normalize_heads(
                 / dominance;
         }
     }
-    let values = normalized
-        .into_shape_with_order((tokens, width))
-        .ok()
-        .ok_or(mismatch.clone())?;
     let radius = normalized_radius
         .into_shape_with_order((tokens, width))
-        .ok()
-        .ok_or(mismatch)?;
+        .map_err(|_| GatedRewriteError::ShapeMismatch {
+            what: "per-head query/key radius",
+            expected: (tokens, width),
+            found: (tokens * width / head_dim, head_dim),
+        })?;
     Ok((values, radius))
 }
 
@@ -587,6 +680,8 @@ impl RotaryCausalAttention {
             expect_shape(name, values_dim, (tokens, width))?;
             expect_shape(name, radius_dim, (tokens, width))?;
         }
+        // Scores, score radius, weights and weight radius, before anything is allocated.
+        let footprint = reserve_heads((heads, tokens, tokens), 4)?;
         let queries = self.rotate(queries, positions, heads);
         let keys = self.rotate(keys, positions, g.n_kv_heads);
         // The `head_dim` products and their additions, then σ.
@@ -609,7 +704,7 @@ impl RotaryCausalAttention {
                 }
             }
         }
-        self.mix(ScoredHeads { scores, radius }, values)
+        self.mix(ScoredHeads { scores, radius }, values, footprint)
     }
 
     /// The source's rotation of every head of `rows` at each token's absolute
@@ -649,16 +744,35 @@ impl RotaryCausalAttention {
     /// and query token `t`, one categorical distribution over the keys `s ≤ t`,
     /// with the radius [`RotaryCausalAttention::attend_projected`] carries. Scores
     /// and their radii are `n_heads × tokens × tokens`. Entries with `s > t` are
-    /// never read; their weights are zero with radius zero.
+    /// never read; their weights are zero with radius zero. Both weight arrays are
+    /// reserved on the process memory governor before they are allocated.
     pub fn weights_at_scores(
         &self,
         scores: ArrayView3<'_, f64>,
         score_radius: ArrayView3<'_, f64>,
-    ) -> Result<(Array3<f64>, Array3<f64>), AttentionProgramError> {
+    ) -> Result<AttentionWeights, AttentionProgramError> {
         let tokens = scores.dim().1;
         let shape = (self.geometry.n_heads, tokens, tokens);
         expect_heads("scores", scores.dim(), shape)?;
         expect_heads("score radius", score_radius.dim(), shape)?;
+        let footprint = reserve_heads(shape, 2)?;
+        let (weights, weight_radius) = self.causal_softmax(scores, score_radius)?;
+        Ok(AttentionWeights {
+            weights,
+            weight_radius,
+            footprint,
+        })
+    }
+
+    /// The per-row causal softmax behind [`RotaryCausalAttention::weights_at_scores`],
+    /// on `n_heads × tokens × tokens` scores whose shape the caller has checked and
+    /// whose weights it has reserved.
+    fn causal_softmax(
+        &self,
+        scores: ArrayView3<'_, f64>,
+        score_radius: ArrayView3<'_, f64>,
+    ) -> Result<(Array3<f64>, Array3<f64>), AttentionProgramError> {
+        let (shape, tokens) = (scores.dim(), scores.dim().1);
         let mut weights = Array3::zeros(shape);
         let mut weight_radius = Array3::zeros(shape);
         for head in 0..self.geometry.n_heads {
@@ -719,9 +833,15 @@ impl RotaryCausalAttention {
     }
 
     /// Causal mask, joint softmax per query row and the value read, propagating
-    /// the score and value radii.
-    fn mix(&self, scored: ScoredHeads, values: ProjectedRows<'_>) -> Result<ProjectedAttention, AttentionProgramError> {
-        let (weights, weight_radius) = self.weights_at_scores(scored.scores.view(), scored.radius.view())?;
+    /// the score and value radii. `footprint` is the reservation the caller took
+    /// for the scores, the weights and their radii.
+    fn mix(
+        &self,
+        scored: ScoredHeads,
+        values: ProjectedRows<'_>,
+        footprint: MemoryReservation,
+    ) -> Result<ProjectedAttention, AttentionProgramError> {
+        let (weights, weight_radius) = self.causal_softmax(scored.scores.view(), scored.radius.view())?;
         let (mixed, mixed_radius) = self.mix_at_weights(weights.view(), weight_radius.view(), values)?;
         Ok(ProjectedAttention {
             scores: scored.scores,
@@ -730,6 +850,7 @@ impl RotaryCausalAttention {
             weight_radius,
             mixed,
             mixed_radius,
+            footprint,
         })
     }
 
@@ -847,9 +968,11 @@ impl NativeAttention {
     ) -> Result<(Array2<f64>, Array2<f64>), AttentionProgramError> {
         match &self.query_key_norm {
             None => Ok(rows),
-            Some(norm) => normalize_heads(
-                rows,
-                self.attention.geometry.n_heads,
+            Some(norm) => head_rms_norm_with_radius(
+                ProjectedRows {
+                    values: rows.0.view(),
+                    radius: rows.1.view(),
+                },
                 self.attention.geometry.head_dim,
                 norm.epsilon,
                 norm.query_gain.view(),
@@ -865,9 +988,11 @@ impl NativeAttention {
     ) -> Result<(Array2<f64>, Array2<f64>), AttentionProgramError> {
         match &self.query_key_norm {
             None => Ok(rows),
-            Some(norm) => normalize_heads(
-                rows,
-                self.attention.geometry.n_kv_heads,
+            Some(norm) => head_rms_norm_with_radius(
+                ProjectedRows {
+                    values: rows.0.view(),
+                    radius: rows.1.view(),
+                },
                 self.attention.geometry.head_dim,
                 norm.epsilon,
                 norm.key_gain.view(),
@@ -942,6 +1067,7 @@ impl NativeAttention {
             weight_radius: projected.weight_radius,
             output,
             output_radius,
+            footprint: projected.footprint,
         }
     }
 }
@@ -1068,6 +1194,10 @@ impl ComponentAttention {
             return self.native.execute(x, positions);
         }
         self.native.check_input(x, positions)?;
+        let g = self.native.attention.geometry;
+        let (heads, tokens, hd) = (g.n_heads, x.nrows(), g.head_dim);
+        // Scores, score radius, weights and weight radius, before anything is allocated.
+        let footprint = reserve_heads((heads, tokens, tokens), 4)?;
         let HeadRows { value, radius } = masked_head_rows(&self.query, &self.native.query.bias, masks.query.view(), x);
         let (value, radius) = self.native.normalize_queries((value, radius))?;
         let queries = HeadRows { value, radius };
@@ -1075,14 +1205,12 @@ impl ComponentAttention {
         let (value, radius) = self.native.normalize_keys((value, radius))?;
         let keys = HeadRows { value, radius };
         let (values, value_radius) = project_affine(&self.native.value, x);
-        let g = self.native.attention.geometry;
         let rotary = &self.native.attention.rotary;
         let alpha2 = rotary.attention_scaling * rotary.attention_scaling;
         // Per plane: the coordinate product, the in-plane sum, the `cos`/`sin`
         // product and the plane's sum (4), then at most `head_dim` plane additions,
         // `α·α` and its product (2), the pass-through addition (1) and σ (1).
         let growth = accumulation_growth(g.head_dim + 8);
-        let (heads, tokens, hd) = (g.n_heads, x.nrows(), g.head_dim);
         let rotated = rotary.rotary_dim();
         let mut trig_by_displacement: BTreeMap<i64, Vec<(f64, f64, f64)>> = BTreeMap::new();
         let mut scores = Array3::from_elem((heads, tokens, tokens), f64::NEG_INFINITY);
@@ -1139,6 +1267,7 @@ impl ComponentAttention {
                 values: values.view(),
                 radius: value_radius.view(),
             },
+            footprint,
         )?;
         Ok(self.native.project_output(projected))
     }
@@ -1778,16 +1907,16 @@ mod tests {
         fn bits<D: ndarray::Dimension>(arrays: &[&ndarray::Array<f64, D>]) -> Vec<u64> {
             arrays.iter().flat_map(|a| a.iter().map(|v| v.to_bits())).collect()
         }
-        let (weights, weight_radius) = attention
+        let stage = attention
             .weights_at_scores(projected.scores.view(), projected.score_radius.view())
             .expect("weights at attend_projected's scores");
         assert_eq!(
-            bits(&[&weights, &weight_radius]),
+            bits(&[&stage.weights, &stage.weight_radius]),
             bits(&[&projected.weights, &projected.weight_radius]),
             "the softmax stage must reproduce attend_projected's weights and radii"
         );
         let (mixed, mixed_radius) = attention
-            .mix_at_weights(weights.view(), weight_radius.view(), value_rows)
+            .mix_at_weights(stage.weights.view(), stage.weight_radius.view(), value_rows)
             .expect("value read at those weights");
         assert_eq!(
             bits(&[&mixed, &mixed_radius]),
@@ -1803,26 +1932,26 @@ mod tests {
         let moved_weights = attention
             .weights_at_scores(moved.view(), projected.score_radius.view())
             .expect("moved scores")
-            .0;
-        assert_ne!(row(&moved_weights, 0, 3), row(&weights, 0, 3), "a moved score must move its row");
-        assert_eq!(row(&moved_weights, 1, 3), row(&weights, 1, 3), "a moved score must leave other heads alone");
-        assert_eq!(row(&moved_weights, 0, 4), row(&weights, 0, 4), "a moved score must leave other rows alone");
+            .weights;
+        assert_ne!(row(&moved_weights, 0, 3), row(&stage.weights, 0, 3), "a moved score must move its row");
+        assert_eq!(row(&moved_weights, 1, 3), row(&stage.weights, 1, 3), "a moved score must leave other heads alone");
+        assert_eq!(row(&moved_weights, 0, 4), row(&stage.weights, 0, 4), "a moved score must leave other rows alone");
 
         let mut masked = projected.scores.clone();
         masked[[0, 1, 3]] = f64::NAN;
         let masked_weights = attention
             .weights_at_scores(masked.view(), projected.score_radius.view())
             .expect("a NaN past the causal mask is never read")
-            .0;
+            .weights;
         assert_eq!(
             bits(&[&masked_weights]),
-            bits(&[&weights]),
+            bits(&[&stage.weights]),
             "entries with s > t must not be read"
         );
-        let mut masked_mix = weights.clone();
+        let mut masked_mix = stage.weights.clone();
         masked_mix[[1, 2, 4]] = f64::NAN;
         let masked_mixed = attention
-            .mix_at_weights(masked_mix.view(), weight_radius.view(), value_rows)
+            .mix_at_weights(masked_mix.view(), stage.weight_radius.view(), value_rows)
             .expect("a NaN weight past the causal mask is never read")
             .0;
         assert_eq!(
@@ -1844,7 +1973,7 @@ mod tests {
         );
         assert_eq!(
             attention
-                .mix_at_weights(weights.slice(ndarray::s![..1, .., ..]), weight_radius.view(), value_rows)
+                .mix_at_weights(stage.weights.slice(ndarray::s![..1, .., ..]), stage.weight_radius.view(), value_rows)
                 .expect_err("one head of weights for a two-head geometry"),
             AttentionProgramError::HeadShape {
                 tensor: "weights",
@@ -1852,6 +1981,95 @@ mod tests {
                 found: (1, 5, 5),
             }
         );
+    }
+
+    /// A score footprint beyond the process memory budget is refused, typed, before
+    /// anything of that size is allocated. `2^20` tokens on two heads ask for four
+    /// `2 × 2^20 × 2^20` arrays, 64 TiB. Every input is a zero-stride view of one
+    /// zero, so the only large allocation left is the one the reservation guards, and
+    /// making it would abort the test process instead of returning.
+    #[test]
+    fn a_score_footprint_beyond_the_memory_budget_is_refused_before_allocating() {
+        let fixture = Fixture::new(RotaryPairing::HalfSplit);
+        let native = fixture.edited(&all_on());
+        let g = fixture.geometry;
+        let tokens = 1_usize << 20;
+        let positions: Vec<i64> = (0..tokens as i64).collect();
+        let zeros = |width: usize| {
+            ArrayView2::from_shape((tokens, width).strides((0, 0)), &EXACT_RADIUS[..])
+                .expect("a zero-stride view reads only its one entry")
+        };
+        let requested = |copies: usize| {
+            gam_runtime::resource::dense_f64_bytes(g.n_heads * tokens, tokens).expect("fits in usize") * copies
+        };
+        fn refused<T>(result: &Result<T, AttentionProgramError>, bytes: usize) -> bool {
+            matches!(
+                result,
+                Err(AttentionProgramError::Memory(MemoryReservationError::BudgetExceeded { requested_bytes, .. }))
+                    if *requested_bytes == bytes
+            )
+        }
+        let projected = native.attention.attend_projected(
+            ProjectedRows::exact(zeros(g.query_dim())),
+            ProjectedRows::exact(zeros(g.key_value_dim())),
+            ProjectedRows::exact(zeros(g.key_value_dim())),
+            &positions,
+        );
+        assert!(
+            refused(&projected, requested(4)),
+            "attend_projected must refuse its four score arrays, got {projected:?}"
+        );
+        let component = fixture
+            .program()
+            .execute(&continuous_masks(), zeros(g.model_dim), &positions);
+        assert!(
+            refused(&component, requested(4)),
+            "the component program must refuse its four score arrays, got {component:?}"
+        );
+        let scores = ArrayView3::from_shape((g.n_heads, tokens, tokens).strides((0, 0, 0)), &EXACT_RADIUS[..])
+            .expect("a zero-stride view reads only its one entry");
+        let weights = native.attention.weights_at_scores(scores, scores);
+        assert!(
+            refused(&weights, requested(2)),
+            "the softmax stage must refuse its two weight arrays, got {weights:?}"
+        );
+    }
+
+    /// While a result lives, the process ledger holds exactly its
+    /// `heads × tokens × tokens` footprint, and dropping it releases the charge.
+    /// nextest runs each test in its own process, so the process-wide ledger sees
+    /// only this test's reservations (as in program.rs's executor ledger tests).
+    #[test]
+    fn the_score_footprint_is_held_while_a_result_lives_and_released_on_drop() {
+        let fixture = Fixture::new(RotaryPairing::HalfSplit).biased();
+        let native = fixture.edited(&all_on());
+        let g = fixture.geometry;
+        let tokens = fixture.positions.len();
+        let array = gam_runtime::resource::dense_f64_bytes(g.n_heads * tokens, tokens).expect("fits in usize");
+        let governor = MemoryGovernor::global();
+        let idle = governor.remaining_bytes();
+        let execution = native
+            .execute(fixture.x.view(), &fixture.positions)
+            .expect("native execution");
+        assert_eq!(execution.reserved_bytes(), 4 * array, "an execution reserves its four arrays");
+        assert_eq!(idle - governor.remaining_bytes(), 4 * array, "the ledger holds them while it lives");
+        let component = fixture
+            .program()
+            .execute(&continuous_masks(), fixture.x.view(), &fixture.positions)
+            .expect("component execution");
+        assert_eq!(component.reserved_bytes(), 4 * array, "a component execution reserves its four arrays");
+        assert_eq!(idle - governor.remaining_bytes(), 8 * array, "two executions hold both footprints");
+        let stage = native
+            .attention
+            .weights_at_scores(execution.scores.view(), execution.score_radius.view())
+            .expect("weights at the execution's scores");
+        assert_eq!(stage.reserved_bytes(), 2 * array, "the softmax stage reserves its two arrays");
+        assert_eq!(idle - governor.remaining_bytes(), 10 * array, "the ledger holds all three results");
+        drop(execution);
+        assert_eq!(idle - governor.remaining_bytes(), 6 * array, "dropping an execution releases its four arrays");
+        drop(component);
+        drop(stage);
+        assert_eq!(governor.remaining_bytes(), idle, "nothing stays reserved once every result is dropped");
     }
 
     /// Double-double unit roundoff: the low word's last place relative to the high
@@ -2303,7 +2521,8 @@ mod tests {
         let radius = array![[0.0, 0.25]];
         let gain = array![1.0, 1.0];
         let (normalized, bound) =
-            normalize_heads((rows.clone(), radius.clone()), 1, 2, epsilon, gain.view()).expect("finite head row");
+            head_rms_norm_with_radius(ProjectedRows { values: rows.view(), radius: radius.view() }, 2, epsilon, gain.view())
+                .expect("finite head row");
         let quad = Quad::from_f64;
         let encloses = |x: [f64; 2], c: usize, center: f64, reach: f64| {
             let s = (quad(x[0]) * quad(x[0]) + quad(x[1]) * quad(x[1])) / quad(2.0) + quad(epsilon);
