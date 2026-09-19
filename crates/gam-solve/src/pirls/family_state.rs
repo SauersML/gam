@@ -525,7 +525,7 @@ fn certify_dispersion(phi: f64) -> Result<(), EstimationError> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ReciprocalLinkRow {
     mu: f64,
     weight: f64,
@@ -619,23 +619,19 @@ pub(crate) fn write_reciprocal_link_working_state(
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
     certify_dispersion(phi)?;
-    let rows: Vec<Result<(ReciprocalLinkRow, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let geometry =
-                reciprocal_link_row(family, link, exponent, phi, i, eta[i], priorweights[i])?;
-            let z = if geometry.weight == 0.0 {
-                eta[i]
-            } else {
-                family.certify_response(i, eta[i], y[i])?;
-                // (y − μ)/μ′ = −η (y/μ − 1)/a.
-                let z = eta[i] * (1.0 - (y[i] / geometry.mu - 1.0) / exponent);
-                finite_row_value(i, "working response", eta[i], z)?
-            };
-            Ok((geometry, z))
-        })
-        .collect();
-    let rows: Vec<(ReciprocalLinkRow, f64)> = rows.into_iter().collect::<Result<_, _>>()?;
+    let rows: Vec<(ReciprocalLinkRow, f64)> = super::par_certified_rows(eta.len(), |i| {
+        let geometry =
+            reciprocal_link_row(family, link, exponent, phi, i, eta[i], priorweights[i])?;
+        let z = if geometry.weight == 0.0 {
+            eta[i]
+        } else {
+            family.certify_response(i, eta[i], y[i])?;
+            // (y − μ)/μ′ = −η (y/μ − 1)/a.
+            let z = eta[i] * (1.0 - (y[i] / geometry.mu - 1.0) / exponent);
+            finite_row_value(i, "working response", eta[i], z)?
+        };
+        Ok((geometry, z))
+    })?;
     for (i, (row, z_row)) in rows.iter().enumerate() {
         mu[i] = row.mu;
         weights[i] = row.weight;
@@ -665,11 +661,9 @@ pub(crate) fn write_reciprocal_link_eta_curvature(
     buffers: WorkingDerivativeBuffersMut<'_>,
 ) -> Result<(), EstimationError> {
     certify_dispersion(phi)?;
-    let rows: Vec<Result<ReciprocalLinkRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| reciprocal_link_row(family, link, exponent, phi, i, eta[i], priorweights[i]))
-        .collect();
-    let rows: Vec<ReciprocalLinkRow> = rows.into_iter().collect::<Result<_, _>>()?;
+    let rows: Vec<ReciprocalLinkRow> = super::par_certified_rows(eta.len(), |i| {
+        reciprocal_link_row(family, link, exponent, phi, i, eta[i], priorweights[i])
+    })?;
     for (i, row) in rows.iter().enumerate() {
         buffers.c[i] = row.c;
         buffers.d[i] = row.d;
@@ -861,7 +855,7 @@ pub(crate) fn beta_logit_working_curvature_eta_derivatives(
     (c, d)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ExactBetaLogitRow {
     pub(crate) mu: f64,
     pub(crate) weight: f64,
@@ -1103,11 +1097,9 @@ pub(crate) fn write_beta_logit_working_state(
         crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
     }
     validate_beta_responses(&y, &priorweights)?;
-    let certified: Vec<Result<ExactBetaLogitRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| exact_beta_logit_row(i, eta[i], Some(y[i]), priorweights[i], phi))
-        .collect();
-    let certified: Vec<ExactBetaLogitRow> = certified.into_iter().collect::<Result<_, _>>()?;
+    let certified: Vec<ExactBetaLogitRow> = super::par_certified_rows(eta.len(), |i| {
+        exact_beta_logit_row(i, eta[i], Some(y[i]), priorweights[i], phi)
+    })?;
     if let Some(mut derivs) = derivatives {
         let WorkingSlices {
             mu: mu_s,

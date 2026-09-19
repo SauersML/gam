@@ -254,7 +254,7 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
 }
 
 #[test]
-fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
+fn terminal_certification_does_not_change_outer_solution() {
     let center = array![0.25];
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
@@ -263,7 +263,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         .with_problem_size(8, 3);
     let config = problem.config();
 
-    let mut without_diagnostic = problem.build_objective(
+    let mut uncertified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -287,7 +287,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let mut with_diagnostic = problem.build_objective(
+    let mut certified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -312,11 +312,10 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline =
-        run_outer_uncertified(&mut without_diagnostic, &config, "rho-diagnostic-baseline")
-            .expect("baseline outer run");
-    let diagnosed = run_outer(&mut with_diagnostic, &config, "rho-diagnostic-run")
-        .expect("diagnostic outer run");
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "terminal-baseline")
+        .expect("baseline outer run");
+    let diagnosed =
+        run_outer(&mut certified, &config, "terminal-certified").expect("certified outer run");
 
     assert_eq!(baseline.rho, diagnosed.rho);
     assert_eq!(
@@ -325,7 +324,6 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
     );
     assert_eq!(baseline.iterations, diagnosed.iterations);
     assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
-    assert!(diagnosed.rho_uncertainty_diagnostic.is_some());
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
@@ -2762,6 +2760,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let grad_sample = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
     assert_eq!(grad_sample.value, 1.0);
@@ -2825,6 +2824,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a candidate whose row geometry refuses must not produce a cost");
@@ -2897,6 +2897,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a structural refusal must not produce a cost");
@@ -2953,6 +2954,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
         .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
@@ -3203,6 +3205,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
     // Every finite sample, including the one that fills the stall window, must
@@ -3269,6 +3272,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
 
     for _ in 0..5 {
@@ -3346,6 +3350,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     for _ in 0..(COST_STALL_WINDOW + 2) {
         let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
@@ -3426,6 +3431,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
     // evals fill the infeasible-streak window and trip the sentinel.
@@ -3528,6 +3534,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        decrement_verdict_config: None,
     };
     SecondOrderObjective::eval_hessian(&mut bridge, &feasible_rho)
         .expect("feasible iterate must evaluate cleanly");

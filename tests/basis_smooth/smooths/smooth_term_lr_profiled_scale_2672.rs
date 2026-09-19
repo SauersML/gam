@@ -112,6 +112,8 @@ fn lr_report_with(
     .into_iter()
     .find(|report| report.name.contains('z'))
     .expect("a report for the s(z) term")
+    .outcome
+    .unwrap_or_else(|reason| panic!("s(z) has no LR inference: {reason}"))
 }
 
 /// `(deviance, ν = D/σ̂², edf_total, design columns)` for one formula, through

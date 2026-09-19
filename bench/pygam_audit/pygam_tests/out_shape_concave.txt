@@ -1,0 +1,4 @@
+concave fit wall 5.2s cpu 0.6s True
+concave predict wall 404.4s cpu 62.5s
+concave pdep 0.0s plugin 5.10e-05 post_mean 5.10e-05 lower 5.98e-05 upper 2.86e-05 pdep 5.10e-05 cov_src smoothing-corrected
+concave sample 0.0s draws (80, 60) frac_violating 0.0

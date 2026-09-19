@@ -183,7 +183,7 @@ def cross_fit_shared_precision_groups(
     model_payloads: list[dict[str, Any]] = []
     for key, model in model_items:
         try:
-            state_json = rust.coefficient_state_json(model._model_bytes)
+            state_json = rust.coefficient_state_json(model._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
         model_payloads.append({"key": key, "state_json": state_json})
@@ -839,6 +839,7 @@ def fit(
     expectile_tau:
         Optional expectile level in the open interval ``(0, 1)`` for
         ``family="expectile"``, or a strictly increasing sequence of levels.
+        Passing it with any other family raises.
         A sequence is fitted jointly as one location-scale model whose level
         curves ``mu(x) + c_tau * E[sigma(x)]`` never cross; ``predict`` then
         returns an ``(n, K)`` array with one column per level. This is the
@@ -1014,7 +1015,7 @@ def fit(
                        constraints={"s(x)": "monotone_increasing"})
     config:
         Request fields that have no dedicated keyword, such as
-        ``group_metadata`` or ``precompute_conformal``. A key that
+        ``group_metadata``. A key that
         duplicates a dedicated keyword is refused.
     latents:
         Mapping from formula symbol to :class:`gamfit.smooth.LatentCoord`. This is
@@ -1438,13 +1439,7 @@ def loads(model_bytes: bytes) -> LoadedModel:
             _model_bytes=model_bytes,
             _training_table_kind=str(metadata["training_table_kind"]),
         )
-    try:
-        training_table_kind = rust_module().required_saved_model_payload_string(
-            model_bytes, "training_table_kind"
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes, _training_table_kind=training_table_kind)
+    return Model(_model_bytes=model_bytes)
 
 
 def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeometryModel:

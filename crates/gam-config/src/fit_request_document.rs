@@ -133,24 +133,6 @@ pub struct FitRequestConfigDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precision_hyperpriors: Option<BTreeMap<String, PrecisionHyperpriorDocument>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Whether to precompute the distribution-free conformal substrates (#942
-    /// jackknife+, #1098 exact full-conformal) at fit time and persist them on
-    /// the saved model. Omit to keep the default of precomputing whenever the
-    /// fit is eligible; `false` skips both.
-    ///
-    /// Measured on `y ~ s(x1,k=6) + s(x2,k=6)` (#2633): the two substrates are
-    /// 94% of a saved Gaussian model at n=20,000 (10.2 MB of 10.85 MB) and grow
-    /// linearly with the training rows. Rebuilding both costs ~5.6 ms, 0.3% of
-    /// the fit, and stays under half a second out to p=253. So turning this off
-    /// yields a ~16x smaller model (10.85 MB -> ~0.65 MB at n=20,000).
-    ///
-    /// It is opt-OUT because rebuilding needs the training design AND response
-    /// back, which a saved model deliberately does not carry: a model shipped to
-    /// a host that never sees the training data must keep them or it cannot
-    /// produce a conformal interval at all. Turn it off when the caller retains
-    /// its training data, fits in batch, or never asks for conformal intervals.
-    pub precompute_conformal: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub scale_dimensions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slope_time_degree: Option<usize>,

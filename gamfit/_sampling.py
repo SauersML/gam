@@ -110,9 +110,6 @@ class PosteriorPredictive:
         )
 
 
-_NO_MODEL: bytes = b""
-
-
 def _call(name: str, *args: Any) -> Any:
     from ._binding import rust_module
     from ._exceptions import map_exception
@@ -178,7 +175,8 @@ class PosteriorSamples:
     config: SamplingConfig
     # Serialized exact inverse-link identity (JSON); see PosteriorPredictive.
     link_spec: str
-    _model_bytes: bytes = field(repr=False, compare=False, default=_NO_MODEL)
+    # Compiled fitted model (the ``Model``'s Rust handle) that drew these samples.
+    _model: Any = field(repr=False, compare=False, default=None)
     _name_index: Mapping[str, int] = field(repr=False, compare=False, default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -190,7 +188,7 @@ class PosteriorSamples:
         )
 
     @classmethod
-    def from_ffi_payload(cls, payload: Mapping[str, Any], *, model_bytes: bytes = _NO_MODEL) -> "PosteriorSamples":
+    def from_ffi_payload(cls, payload: Mapping[str, Any], *, model: Any = None) -> "PosteriorSamples":
         import numpy as np
         p = payload
         samples = np.asarray(p["samples"], dtype=np.float64)
@@ -214,7 +212,7 @@ class PosteriorSamples:
                    model_class=str(p.get("model_class", "standard")),
                    family_kind=str(p.get("family_kind", "identity")),
                    link_spec=_required_link_spec(p, source="FFI sample payload"),
-                   config=_config_from_payload(p.get("config", {})), _model_bytes=model_bytes)
+                   config=_config_from_payload(p.get("config", {})), _model=model)
 
     @property
     def n_draws(self) -> int: return int(self.samples.shape[0])
@@ -288,7 +286,7 @@ class PosteriorSamples:
 
     def _need_model(self) -> None:
         # allow-list (a): FFI input validation
-        if not self._model_bytes:
+        if self._model is None:
             raise RuntimeError("PosteriorSamples has no model context; predict requires the original Model. "
                                "Re-sample via Model.sample(...) or use Model.predict(...) directly.")
 
@@ -315,7 +313,7 @@ class PosteriorSamples:
         samples = np.ascontiguousarray(np.asarray(self.samples, dtype=np.float64))
         parsed = _call(
             "posterior_predict_bands_table",
-            self._model_bytes,
+            self._model,
             h,
             r,
             samples,
@@ -347,7 +345,7 @@ class PosteriorSamples:
         self._need_model()
         h, r = self._normalize(new_data)
         samples = np.ascontiguousarray(np.asarray(self.samples, dtype=np.float64))
-        p = _call("posterior_predict_table", self._model_bytes, h, r, samples)
+        p = _call("posterior_predict_table", self._model, h, r, samples)
         eta = np.asarray(p["eta"], dtype=float)
         mean = np.asarray(p["mean"], dtype=float)
         # allow-list (a): FFI input validation

@@ -2,10 +2,10 @@ use super::*;
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     // GUARD (#2030): the geometry carrier's optional owned row evidence MUST
-    // survive compaction. Saved ALO explicitly requires `geometry.working`;
-    // `None` correctly means unavailable, while truncating a present vector
-    // would corrupt a valid single-diagonal fit. `FitInference` deliberately
-    // has no duplicate copy, so only this one source of truth is retained.
+    // survive compaction of the in-memory fit: `None` correctly means
+    // unavailable, while truncating a present vector would corrupt a valid
+    // single-diagonal fit. It is never serialized (a saved model carries no
+    // per-row training data), so compaction has nothing to gain from it.
     if let Some(inf) = fit.inference.as_mut() {
         inf.reparam_qs = None;
     }
@@ -57,7 +57,6 @@ fn fit_request_document_from_fit_args(
         noise_formula: args.predict_noise.clone(),
         noise_offset: args.noise_offset_column.clone(),
         offset: args.offset_column.clone(),
-        precompute_conformal: Some(args.precompute_conformal),
         scale_dimensions: args.scale_dimensions.then_some(true),
         sigma_time_k: args.sigma_time_k,
         slope_time_k: args.slope_time_k,
@@ -197,15 +196,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
     }
-    // `--expectile-tau` only has meaning under `--family expectile`; reject the
-    // combination upfront rather than silently ignoring the asymmetry.
-    if fit_config.expectile_tau.is_some() && fit_config.family.as_deref() != Some("expectile") {
-        return Err(
-            "--expectile-tau requires --family expectile (the asymmetry is only used by the \
-             expectile estimator)"
-                .to_string(),
-        );
-    }
     // Several expectile levels are one joint location-scale fit, which the
     // library's formula-to-payload service assembles like any location-scale model.
     let joint_expectile = gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)
@@ -227,6 +217,9 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // integer covariate is untouched.
     let ds = load_fit_dataset_with_roles(&args.data, &requested_columns, &parsed, false)?;
     require_dataset_rows("fit", &args.data, ds.values.nrows())?;
+    // The saved payload below is assembled from this table, so it is the one
+    // the fit sees: zero-weight rows are deleted, not merely down-weighted.
+    let ds = drop_zero_weight_rows(&ds, &fit_config).map_err(|error| error.to_string())?;
     // Every single-parameter formula fit, the expectile estimator included, is
     // owned end-to-end by gam-models; this route adds the CLI's summary lines and
     // its compact saved fit.
