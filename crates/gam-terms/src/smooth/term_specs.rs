@@ -7950,11 +7950,12 @@ fn build_shape_cone_bspline_basis_1d(
     spec: &BSplineBasisSpec,
     term: &SmoothTermSpec,
     atom: ShapeConstraint,
+    realize_penalties: bool,
 ) -> Result<BasisBuildResult, BasisError> {
     let centring_weights = match &spec.identifiability {
         // A frozen spec already carries the realized cone chart.
         BSplineIdentifiability::FrozenTransform { .. } => {
-            return build_bspline_basis_1d(x, spec);
+            return build_bspline_basis_1d_realizing(x, spec, realize_penalties);
         }
         BSplineIdentifiability::None => None,
         BSplineIdentifiability::WeightedSumToZero { weights } => Some(weights.clone()),
@@ -8348,14 +8349,24 @@ pub(crate) fn build_single_local_smooth_term_for(
                 );
             }
             if let Some(atom) = term.shape.single_atom() {
-                build_shape_cone_bspline_basis_1d(data.column(*feature_col), spec, term, atom)?
+                build_shape_cone_bspline_basis_1d(
+                    data.column(*feature_col),
+                    spec,
+                    term,
+                    atom,
+                    realize_penalties,
+                )?
             } else {
                 // A conjunction keeps the spec's own identifiability chart; its
                 // cone rows are mapped through that chart after the build.
                 // Endpoint boundary conditions are structural for B-splines: the
                 // basis builder bakes their homogeneous nullspace transform into
                 // the design, penalties, and stored raw-basis transform.
-                build_bspline_basis_1d(data.column(*feature_col), spec)?
+                build_bspline_basis_1d_realizing(
+                    data.column(*feature_col),
+                    spec,
+                    realize_penalties,
+                )?
             }
         }
         SmoothBasisSpec::ThinPlate {

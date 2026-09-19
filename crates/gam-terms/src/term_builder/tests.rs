@@ -5315,3 +5315,63 @@ fn frozen_tensor_design_is_built_without_its_penalties() {
         );
     }
 }
+
+#[test]
+fn frozen_bspline_1d_design_is_built_without_its_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((31, 4), |(i, j)| match j {
+        1 | 2 => ((i * (j + 7)) % 31) as f64 / 30.0,
+        _ => 0.0,
+    });
+    for formula in [
+        "y ~ s(x)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ s(x, bs=\"cr\")",
+        "y ~ s(x, bs=\"cr\", double_penalty=true)",
+        "y ~ s(x, bs=\"cc\")",
+        "y ~ s(x, shape=monotone_increasing)",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let (feature_col, basis_spec) = frozen
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                crate::smooth::SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+                    Some((*feature_col, spec))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{formula}` has no 1-D spline term"));
+        let build = |realize_penalties: bool| {
+            crate::basis::build_bspline_basis_1d_realizing(
+                new_rows.column(feature_col),
+                basis_spec,
+                realize_penalties,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` 1-D spline build: {err}"))
+        };
+        let full = build(true);
+        let design_only = build(false);
+        assert!(
+            !full.active_penalties.is_empty(),
+            "`{formula}`: the full build realizes penalties"
+        );
+        assert!(
+            design_only.active_penalties.is_empty() && design_only.dropped_penalties.is_empty(),
+            "`{formula}`: a design-only 1-D spline build must not assemble penalties"
+        );
+        assert_eq!(
+            design_only.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the 1-D spline design must not depend on its penalties"
+        );
+        assert_eq!(
+            design_only.affine_offset, full.affine_offset,
+            "`{formula}`: the 1-D spline offset must not depend on its penalties"
+        );
+    }
+}
