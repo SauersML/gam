@@ -81,7 +81,7 @@ fn cli_fit_reports_family_support_weight_and_row_errors_at_the_shared_boundary()
     let cases: [(&str, &str, bool, &[&str]); 4] = [
         (
             counts,
-            "poisson",
+            "poisson-log",
             false,
             &["column 'y'", "Poisson family", "first offending row 3 has value 2.5"],
         ),
