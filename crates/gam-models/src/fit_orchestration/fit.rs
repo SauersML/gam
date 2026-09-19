@@ -2163,6 +2163,7 @@ fn optimize_survival_transformation_smoothing(
     // non-convergence, not an invitation to rebuild BFGS with an arbitrary
     // caller-owned retry budget.
     let problem = OuterProblem::new(num_smoothing)
+        .with_problem_size(model.n_observations(), beta0.len())
         .with_gradient(Derivative::Analytic)
         // The analytic LAML ρ-Hessian is declared under #2359's
         // optimize-3/certify-4 lifecycle: the search stays on BFGS over the

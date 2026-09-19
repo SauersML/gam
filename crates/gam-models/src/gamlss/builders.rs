@@ -4807,6 +4807,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // they rebuild the spatial basis and penalties at each outer proposal.
     let analytic_outer_hessian_available = true;
     let problem = gam_solve::rho_optimizer::OuterProblem::new(theta_dim)
+        .with_problem_size(
+            y.len(),
+            baseline_design.design.ncols() + frozen_warp_basis.ncols(),
+        )
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
             DeclaredHessianForm::Either
