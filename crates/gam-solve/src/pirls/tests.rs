@@ -4348,6 +4348,144 @@ mod root_cause_tests {
         }
     }
 
+    pub(crate) fn capture_pirls_lm_attempts<F, R>(run: F) -> (R, usize)
+    where
+        F: FnOnce() -> R,
+    {
+        super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT.with(|count| count.set(Some(0)));
+        let result = run();
+        let attempts = super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT
+            .with(|count| count.take())
+            .unwrap();
+        (result, attempts)
+    }
+
+    /// Rare-event logistic cold start (pyGAM audit F18). A ~3%-prevalence
+    /// response whose log-odds rise steeply with a skewed covariate (the
+    /// credit-default shape: logit p = −10.65 + 0.0055·balance) makes the
+    /// undamped Newton step from the prevalence-intercept seed overshoot by
+    /// orders of magnitude: it drives η to ≈ +11 on the high-balance rows.
+    /// The Levenberg–Marquardt damping must climb from `u ≈ 1e-16` to O(1)
+    /// before a trial is accepted. The geometric reject schedule alone
+    /// (×2, ×4, ×8, …) needs ~11 trials to cross those 16 decades, each
+    /// re-solving a step the tiny damping leaves unchanged. Moré's
+    /// interpolated rejection update takes the damping to the radius the
+    /// rejected trial indicates in one or two trials. This pins the cost in
+    /// LM attempts (damped solves plus trial evaluations), not wall clock.
+    #[test]
+    pub(crate) fn rare_event_logistic_cold_start_reaches_damping_in_few_trials() {
+        let n = 4000;
+        let n_basis = 10;
+        let mut rng_state: u64 = 0x5EED_F18_0000_0001;
+        let mut uniform = || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((rng_state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
+        };
+        let mut balance = Vec::with_capacity(n);
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            // Box–Muller N(835, 480), truncated at zero like a card balance.
+            let (u1, u2) = (uniform(), uniform());
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let b = (835.0 + 480.0 * z).max(0.0);
+            let p = 1.0 / (1.0 + (10.65 - 0.0055 * b).exp());
+            y[i] = if uniform() < p { 1.0 } else { 0.0 };
+            balance.push(b);
+        }
+        let positives: f64 = y.sum();
+        assert!(
+            positives > 0.01 * n as f64 && positives < 0.08 * n as f64,
+            "fixture must be rare-event, got {positives} positives of {n}"
+        );
+        // Intercept plus a hat-function (linear B-spline) basis on the
+        // covariate range, with a second-difference penalty on the hats.
+        let (lo, hi) = balance
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &b| {
+                (lo.min(b), hi.max(b))
+            });
+        let h = (hi - lo) / (n_basis - 1) as f64;
+        let p = n_basis + 1;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for (i, &b) in balance.iter().enumerate() {
+            x[[i, 0]] = 1.0;
+            for k in 0..n_basis {
+                let knot = lo + k as f64 * h;
+                x[[i, k + 1]] = (1.0 - ((b - knot) / h).abs()).max(0.0);
+            }
+        }
+        let mut root = Array2::<f64>::zeros((n_basis - 2, p));
+        for r in 0..n_basis - 2 {
+            root[[r, r + 1]] = 1.0;
+            root[[r, r + 2]] = -2.0;
+            root[[r, r + 3]] = 1.0;
+        }
+        let canonical = vec![gam_terms::construction::CanonicalPenalty {
+            local: root.t().dot(&root),
+            root,
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 0,
+            prior_mean: Array1::zeros(p),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }];
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+        };
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0];
+        let (result, attempts) = capture_pirls_lm_attempts(|| {
+            fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(rho.view())
+                    .expect("test rho lies in exact strength domain"),
+                PirlsProblem {
+                    x: x.view(),
+                    offset: offset.view(),
+                    y: y.view(),
+                    priorweights: w.view(),
+                    covariate_se: None,
+                    gaussian_fixed_cache: None,
+                    glm_first_step_gram: None,
+                },
+                PenaltyConfig {
+                    canonical_penalties: &canonical,
+                    balanced_penalty_root: None,
+                    reparam_invariant: None,
+                    p,
+                    coefficient_lower_bounds: None,
+                    linear_constraints_original: None,
+                },
+                &config,
+                None,
+            )
+        });
+        let (_, working) = result.expect("rare-event logistic P-IRLS fit should succeed");
+        assert_eq!(working.status, PirlsStatus::Converged);
+        // Every attempt beyond one per iteration is a rejected trial. The
+        // geometric schedule alone spent 10 rejections (21 attempts over 11
+        // iterations) climbing from `u` to the accepted damping; the
+        // interpolated update needs 2.
+        let rejected = attempts.saturating_sub(working.iterations);
+        assert!(
+            rejected <= 3,
+            "rare-event cold start spent {rejected} rejected LM trials \
+             ({attempts} attempts over {} iterations)",
+            working.iterations
+        );
+    }
+
     #[test]
     pub(crate) fn solve_newton_direction_implicit_matches_dense_at_k500() {
         // Phase 2C equivalence test: PCG-against-implicit-H must produce the
