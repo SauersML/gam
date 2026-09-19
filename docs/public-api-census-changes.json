@@ -4483,5 +4483,41 @@
     },
     "reason": "gam#2999: the pub(super) marginal-slope base-link resolver read only the formula's link(...). It is replaced, in the same file, by resolve_marginal_slope_link, which also reads the request's link and flexible_link arguments, so no link spelling goes unread. Its two callers, the bernoulli marginal-slope and the survival marginal-slope materializers, call the replacement.",
     "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
+  },
+  {
+    "base": "cd44a3daa99ff51185ff556d7b9478f5cb6a6aa7",
+    "removed": {
+      "crates/gam-solve/src/estimate/smoothing_correction.rs::active_directions": 1,
+      "crates/gam-solve/src/estimate/smoothing_correction.rs::first_order_variance": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::certified_sigma_point_covariance": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::curvature_kind_to_row": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::family_kind_to_row": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::stream_pool_eval": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::try_gpu_sigma_stream_pool_eval": 1,
+      "crates/gam-solve/src/reml/eval.rs::accumulate_sigma_cubature_total_covariance": 1,
+      "crates/gam-solve/src/reml/eval.rs::branch_label": 1,
+      "crates/gam-solve/src/reml/eval.rs::calibrate_sigma_node": 1,
+      "crates/gam-solve/src/reml/eval.rs::classification_reason_strings_are_nonempty_and_distinct": 1,
+      "crates/gam-solve/src/reml/eval.rs::compute_smoothing_correction_auto": 1,
+      "crates/gam-solve/src/reml/eval.rs::cubature_branch_label_and_extraction": 1,
+      "crates/gam-solve/src/reml/eval.rs::cubature_counter_is_observable": 1,
+      "crates/gam-solve/src/reml/eval.rs::cubature_smoothing_correction_is_response_scale_equivariant": 1,
+      "crates/gam-solve/src/reml/eval.rs::device_pirls_stage3_ready": 1,
+      "crates/gam-solve/src/reml/eval.rs::finalize_smoothing_outcome": 1,
+      "crates/gam-solve/src/reml/eval.rs::first_order_numerical_branch_label_and_extraction": 1,
+      "crates/gam-solve/src/reml/eval.rs::first_order_routine_branch_label_and_extraction": 1,
+      "crates/gam-solve/src/reml/eval.rs::make_first_order": 1,
+      "crates/gam-solve/src/reml/eval.rs::sigma_cubature_dispatch": 1,
+      "crates/gam-solve/src/reml/eval.rs::sigma_cubature_evaluate_cpu_rayon": 1,
+      "crates/gam-solve/src/reml/eval.rs::sigma_cubature_evaluate_gpu_stream_pool": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::execute_pirls_stateless_for_cubature": 1,
+      "crates/gam-solve/src/reml/objective.rs::compute_cost_uncharged": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::compute_rho_uncertainty_diagnostic": 1,
+      "crates/gam-solve/src/rho_uncertainty.rs::cost_gate_allows": 1,
+      "crates/gam-solve/src/rho_uncertainty.rs::rho_uncertainty_diagnostic": 1,
+      "crates/gam-solve/src/rho_uncertainty.rs::skipped": 1
+    },
+    "reason": "pyGAM audit F4/G6: the sigma-point cubature smoothing correction, its GPU stream-pool lane, the cost-gated rho_uncertainty sampler and the post-fit rho-posterior normality diagnostic are deleted (see docs/source-removal-changes.json). The analytic first-order Vp = Vb + J V_rho J^T, already the correction for every fit the cubature gates refused, is now the only one.",
+    "evidence": "git grep -w at the head finds no call of any listed function. Remaining occurrences of the names are unrelated locals and fields (active_directions, first_order_variance, skipped) and make_first_order, now a private helper of the eval.rs test module. The callers were the deleted cubature dispatch in reml/eval.rs, the deleted run.rs diagnostic and tests of those paths. tests/test_smoothing_correction_first_order.py pins the replacement: the first-order correction on 6-smooth GLMs and nominal coverage for Gaussian, Poisson and binomial."
   }
 ]
