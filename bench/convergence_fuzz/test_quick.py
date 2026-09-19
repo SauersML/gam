@@ -110,3 +110,37 @@ def test_triage_labels() -> None:
         "pred_finite": False,
     }
     assert failure_causes(nonfinite) == ["nonfinite:predict"]
+    unresolved = {**nonfinite, "pred_nonfinite_exact": False}
+    assert failure_causes(unresolved) == ["nonfinite:predict"]
+    overflow = {**nonfinite, "pred_nonfinite_exact": True}
+    assert failure_causes(overflow) == []
+
+
+def test_log_link_posterior_mean_overflow_is_exact() -> None:
+    """case12/poisson/n30 draws a held-out x1 13 training ranges below the
+    data, so the posterior mean exp(eta + Var(eta)/2) there is ~exp(2600):
+    +inf is its correctly rounded value, and every finite row of the same
+    prediction matches the exact formula."""
+    import numpy as np
+
+    import gamfit
+
+    from .worker import LOG_DBL_MAX, _overflows_exactly
+
+    data = draw(12, "poisson", 30)
+    model = gamfit.fit(data.train, data.spec.formula, family="poisson")
+    pred = np.asarray(model.predict(data.test), dtype=float).reshape(-1)
+    bad = ~np.isfinite(pred)
+    assert bad.sum() == 1
+    assert _overflows_exactly(model, data.test, pred)
+    ok = {k: v[~bad] for k, v in data.test.items()}
+    design = model.design_matrix(ok)
+    eta = design.offset + design.matrix @ design.coefficients
+    var = np.einsum(
+        "ij,jk,ik->i",
+        design.eta_gradient,
+        design.covariance_conditional,
+        design.eta_gradient,
+    )
+    assert np.all(eta + 0.5 * var < LOG_DBL_MAX)
+    np.testing.assert_allclose(pred[~bad], np.exp(eta + 0.5 * var), rtol=1e-10)
