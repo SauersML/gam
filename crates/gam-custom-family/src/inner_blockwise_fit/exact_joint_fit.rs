@@ -1945,6 +1945,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             min_certified_residual = min_certified_residual.min(current_kkt_norm);
         }
         let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
+        // The forcing ratio compares the residuals of successive iterates, so
+        // the next head divides by this head's residual. The previous cycle's
+        // post-step residual is measured at the very β this head re-measures:
+        // dividing by it made the ratio 1 at every cycle, pinned the forcing at
+        // `PCG_ETA_MAX`, and left the inexact Newton iteration contracting only
+        // by that constant factor per cycle.
+        prev_kkt_norm = Some(current_kkt_norm);
 
         {
             let grad_phi_inf = head_jeffreys_term
@@ -5551,7 +5558,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             joint_lower_bounds.as_ref(),
             joint_penalty_stationarity_score(options, specs, &states).as_ref(),
         )?;
-        prev_kkt_norm = Some(residual);
         // Record this cycle's KKT residual for the steady-geometric-descent
         // test at the certificate-refusal gate below (gam#787 centers≥20).
         if residual.is_finite() {
