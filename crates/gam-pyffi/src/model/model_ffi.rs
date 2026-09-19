@@ -1947,6 +1947,30 @@ fn transformation_score_table<'py>(
     Ok(scores.into_pyarray(py).unbind())
 }
 
+/// Per-row residuals of type `kind` (`response`, `working`, `deviance`,
+/// `pearson`) of a saved standard model on labeled rows; the rows must carry
+/// the response (and the weight/offset columns the model was fit with).
+#[pyfunction]
+fn residuals_table<'py>(
+    py: Python<'py>,
+    model: PyRef<'_, PyFittedModel>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+    kind: String,
+) -> PyResult<Py<PyArray1<f64>>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let kind = kind
+        .parse::<gam::solver::pirls::ResidualKind>()
+        .map_err(py_value_error)?;
+    let source = rows.dataset.clone();
+    let model = Arc::clone(&model.model);
+    let residuals = detach_py_result(py, "residuals_table", move || {
+        let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
+        gam::families::inference::saved_residuals::saved_model_residuals(&model, &dataset, kind)
+    })?;
+    Ok(residuals.into_pyarray(py).unbind())
+}
+
 /// Distribution-free conformal prediction intervals (issue #310 family path).
 ///
 /// Runs the standard model-based predictor on `(headers, rows)`, then replaces

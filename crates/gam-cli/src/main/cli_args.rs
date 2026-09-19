@@ -98,6 +98,8 @@ pub(crate) enum Command {
     TransformationScore(TransformationScoreArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Print a fitted model's per-row residuals on a labeled dataset as JSON.
+    Residuals(ResidualsArgs),
     /// Rank fitted models on their smoothing-corrected AIC and print the
     /// comparison as JSON.
     Compare(CompareArgs),
@@ -513,6 +515,23 @@ pub(crate) struct DiagnoseArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct ResidualsArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Labeled dataset (CSV or parquet) carrying the response; the training data for in-sample residuals"
+    )]
+    pub(crate) data: PathBuf,
+    #[arg(
+        long = "type",
+        value_name = "TYPE",
+        help = "Residual type: response, working, deviance or pearson"
+    )]
+    pub(crate) kind: gam::solver::pirls::ResidualKind,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct CompareArgs {
     #[arg(
         value_name = "MODEL",
@@ -589,6 +608,11 @@ pub(crate) struct GenerateArgs {
 pub(crate) struct SummaryArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     pub(crate) model: PathBuf,
+    #[arg(
+        long = "json",
+        help = "Print the summary payload (coefficients, EDF, smoothing parameters, scale, log-likelihood, deviance, convergence) as JSON, the document gamfit's `Model.summary()` reads"
+    )]
+    pub(crate) json: bool,
 }
 
 #[derive(Args, Debug)]

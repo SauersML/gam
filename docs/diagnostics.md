@@ -45,7 +45,8 @@ s["family_name"]
 s["model_class"]
 s["deviance"]
 s["reml_score"]
-s["iterations"]
+s["scale"]                     # dispersion phi-hat (Gaussian sigma^2)
+s["convergence"]               # certificate incl. outer/inner iteration counts
 s["coefficients"]              # list of dicts (per-term records)
 s.coefficients                 # same list via property
 s.to_dict()                    # full payload as a dict
