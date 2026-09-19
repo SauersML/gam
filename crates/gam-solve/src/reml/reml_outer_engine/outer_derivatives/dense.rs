@@ -173,13 +173,12 @@ pub(crate) fn compute_outer_hessian(
     //
     // A block-local coordinate with no correction keeps `Ḣₖ = Aₖ` as its root
     // (`h_k_matrices[idx] = None`) when every consumer below can take it that
-    // way: the backend contracts roots in the cross trace, there is no
-    // projected kernel or dense spectral batch to feed, and no ext coordinate
-    // pairs with it. A many-level random effect's `Aₖ` is `p × p` and
-    // diagonal; its root costs `O(levels)`.
+    // way: the backend contracts roots in the cross trace (the dense spectral
+    // batch takes them as roots too), there is no projected kernel to feed,
+    // and no ext coordinate pairs with it. A many-level random effect's `Aₖ`
+    // is `p × p` and diagonal; its root costs `O(levels)`.
     let keep_block_roots = hop.contracts_block_root_drifts()
         && solution.penalty_subspace_trace.is_none()
-        && hop.as_exact_dense_spectral().is_none()
         && ext_dim == 0;
     let mut a_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
     let mut h_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
@@ -412,10 +411,15 @@ pub(crate) fn compute_outer_hessian(
             }
             Some(out)
         } else if let Some(dense_hop) = hop.as_exact_dense_spectral() {
-            let dense_drifts: Vec<&Array2<f64>> = (0..k).map(dense_h_k).collect();
+            let rho_drifts: Vec<EigenbasisDrift<'_>> = (0..k)
+                .map(|idx| match &h_k_matrices[idx] {
+                    Some(h_k) => EigenbasisDrift::Rotated(dense_hop.rotate_to_eigenbasis(h_k)),
+                    None => EigenbasisDrift::Root(root_drift(idx)),
+                })
+                .collect();
             Some(trace_logdet_hessian_crosses_dense_spectral_drifts(
                 dense_hop,
-                &dense_drifts,
+                rho_drifts,
                 &ext_h_drifts,
             ))
         } else {
