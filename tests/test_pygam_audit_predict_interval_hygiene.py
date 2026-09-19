@@ -12,7 +12,8 @@ normal quantile is too narrow. The audit's ``gauss_small`` cell (mc.py:
 fixed 60-row test design) measured 95% coverage of 0.934 (corrected), 0.921
 (conditional) and 0.937 (observation). On the tree this lane was cut from,
 the same 500 replicates measured 0.955 corrected and 0.940 observation with
-the multiplier still exactly 1.95996. Families with known scale (Poisson,
+the multiplier still exactly 1.95996. With the t_{n - edf} reference they
+measure 0.959 corrected and 0.945 observation. Families with known scale (Poisson,
 binomial, fixed dispersion) keep z, because their pivot really is Gaussian.
 
 L3: ``PredictOptions.multi_point_joint`` was always false in every caller.
