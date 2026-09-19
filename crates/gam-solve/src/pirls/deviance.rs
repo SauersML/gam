@@ -870,6 +870,13 @@ pub fn deviance_eta_row_on_measure(
     // name its half-deviance as a plain product of finite factors, take the
     // product — one rounding instead of three. `weight` is `log_weight`'s
     // exponentiated twin, the first of those factors.
+    if let Some(cell) = GenericEdmCell::classify(&likelihood.spec.response, inverse_link) {
+        let (half_deviance, eta_score) = generic_edm_deviance_row(cell, row, y, eta, weight)?;
+        return Ok(DevianceEtaRow {
+            half_deviance,
+            eta_score,
+        });
+    }
     let reciprocal_link = reciprocal_power_link(inverse_link);
     let (half_deviance, eta_score) = match &likelihood.spec.response {
         ResponseFamily::Gaussian if reciprocal_link.is_some() => {
@@ -2064,6 +2071,7 @@ fn omitted_log_likelihood_row(
     eta: f64,
     prior_weight: f64,
     response: &ResponseFamily,
+    inverse_link: &InverseLink,
     deviance: DevianceEtaRow,
 ) -> Result<f64, EstimationError> {
     if prior_weight == 0.0 {
@@ -2088,6 +2096,19 @@ fn omitted_log_likelihood_row(
         | ResponseFamily::Gamma
         | ResponseFamily::InverseGaussian
         | ResponseFamily::Tweedie { .. } => Ok(-deviance.half_deviance),
+        // Off the log link `η` is not `ln μ`: `w (y ln μ − μ)` is the negated
+        // half-deviance plus the response-only `w (y ln y − y)`.
+        ResponseFamily::Poisson
+            if !matches!(inverse_link, InverseLink::Standard(StandardLink::Log)) =>
+        {
+            stable_finite_signed_sum(
+                &[
+                    weighted_unit("Poisson saturated log-likelihood", xlogy(y, y) - y)?,
+                    -deviance.half_deviance,
+                ],
+                "Poisson log-likelihood row",
+            )
+        }
         ResponseFamily::Poisson => {
             if y == 0.0 {
                 finite_signed_from_log(row, "Poisson log-likelihood", eta, -1.0, log_weight + eta)
@@ -2199,6 +2220,7 @@ fn eta_log_likelihood_geometry_omitting_constants(
             eta[i],
             priorweights[i],
             &likelihood.spec.response,
+            inverse_link,
             deviance_rows[i],
         )
     })?;
@@ -2273,6 +2295,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
             eta[i],
             priorweights[i],
             &likelihood.spec.response,
+            inverse_link,
             deviance_row,
         )
     })?;
@@ -2371,6 +2394,7 @@ pub(crate) fn unit_measure_deviance_and_log_kernel_from_eta(
             eta[i],
             priorweights[i],
             &likelihood.spec.response,
+            inverse_link,
             deviance_row,
         )?;
         Ok((deviance_row.half_deviance, log_likelihood))
@@ -2629,7 +2653,15 @@ fn full_log_likelihood_row(
         return tweedie_exact_series_loglik_from_eta(row, y, eta, weight, *p, -log_measure_scale);
     }
     let omitted =
-        omitted_log_likelihood_row(row, y, eta, weight, &likelihood.spec.response, deviance)?;
+        omitted_log_likelihood_row(
+            row,
+            y,
+            eta,
+            weight,
+            &likelihood.spec.response,
+            &likelihood.spec.link,
+            deviance,
+        )?;
     let normalizer = match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
             let log_phi = likelihood.resolved_gaussian_log_phi().map_err(|error| {

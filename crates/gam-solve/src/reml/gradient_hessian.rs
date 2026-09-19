@@ -7102,6 +7102,7 @@ impl<'a> RemlState<'a> {
             // requires. It only makes the captured ν the ML shape at a
             // converged mean instead of at a half-converged one.
             let shape = pirls::estimate_gamma_shape_from_eta(
+                &pirls_result.likelihood.spec.link,
                 self.y,
                 &pirls_result.final_eta.to_owned(),
                 self.weights,
