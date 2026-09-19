@@ -37,9 +37,34 @@ const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/
 
 #[test]
 fn prostate_binomial_logit_outer_optimum_certifies() {
+    assert_prostate_binomial_logit_outer_optimum_certifies(4);
+}
+
+/// The same fit on the 4-of-5 training rows that the pyGAM binomial-logit
+/// comparison makes (fold 0 of its `i % 5` split, and its single real-data
+/// split). After the per-coordinate Theorem 9 band (#2954) this fit refused on
+/// the reference-quality run with coordinate 2 railed and the search
+/// cost-stalled on BFGS curvature:
+///
+/// ```text
+/// |Pg|=2.421e-8 bound=2.536e-10 (rung=coordinate-band) curvature_source=unavailable
+/// railed=[2] origin=BfgsCostStallExit search_hessian_source=BfgsApprox
+/// rho_checkpoint=[20.97, -2.378, 22.62, -3.060]
+/// ```
+#[test]
+fn prostate_binomial_logit_outer_optimum_certifies_on_the_five_fold_split() {
+    assert_prostate_binomial_logit_outer_optimum_certifies(5);
+}
+
+/// Fit `y ~ s(pc1, k=5) + s(pc2, k=5)` (binomial logit) on the prostate rows
+/// with `i % holdout_modulus != 0` and assert the returned outer optimum carries
+/// a certificate that certifies.
+fn assert_prostate_binomial_logit_outer_optimum_certifies(holdout_modulus: usize) {
     init_parallelism();
     let ds = load_csvwith_inferred_schema(Path::new(PROSTATE_CSV)).expect("load prostate.csv");
-    let train_rows: Vec<usize> = (0..ds.values.nrows()).filter(|i| i % 4 != 0).collect();
+    let train_rows: Vec<usize> = (0..ds.values.nrows())
+        .filter(|i| i % holdout_modulus != 0)
+        .collect();
     let mut values = Array2::<f64>::zeros((train_rows.len(), ds.headers.len()));
     for (r, &i) in train_rows.iter().enumerate() {
         values.row_mut(r).assign(&ds.values.row(i));
