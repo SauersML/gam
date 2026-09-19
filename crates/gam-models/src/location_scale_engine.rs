@@ -107,6 +107,7 @@ mod tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 

@@ -205,6 +205,7 @@ fn duchon_aniso_pc_spec() -> TermCollectionSpec {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

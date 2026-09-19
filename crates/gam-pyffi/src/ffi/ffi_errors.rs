@@ -1022,6 +1022,7 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
             )
         }
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
+        WorkflowError::TermBuilder { .. } => TermBuilderError::new_err(err.to_string()),
         WorkflowError::MarginalSlopeLink { .. } => InvalidConfigurationError::new_err(err.to_string()),
         WorkflowError::TransformationNormalConflict { .. } => {
             InvalidConfigurationError::new_err(err.to_string())

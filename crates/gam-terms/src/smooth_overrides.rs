@@ -1246,6 +1246,7 @@ mod tests {
             linear_terms: Vec::new(),
             random_effect_terms: Vec::new(),
             smooth_terms: vec![term],
+            level: Default::default(),
         }
     }
 
