@@ -947,7 +947,6 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
                 edgeworth_one_sided: false,
                 boundary_correction: false,
                 ood_inflation: false,
-                multi_point_joint: false,
                 ..PredictUncertaintyOptions::default()
             },
         )
