@@ -1257,7 +1257,7 @@ mod shape_spec_tests {
 
     #[test]
     fn dsl_lists_parse_in_every_spelling_and_round_trip() {
-        use ShapeConstraint::*;
+        use ShapeConstraint::{Concave, Convex, MonotoneIncreasing};
         let expected = ShapeExpr::List(vec![
             ShapeExpr::Atom(MonotoneIncreasing),
             ShapeExpr::Atom(Concave),
@@ -1295,7 +1295,7 @@ mod shape_spec_tests {
 
     #[test]
     fn one_dimensional_conjunctions_resolve_and_contradictions_explain_themselves() {
-        use ShapeConstraint::*;
+        use ShapeConstraint::{Concave, Convex, MonotoneIncreasing};
         let spec = parse_shape_spec("[monotone_increasing, concave]", None).unwrap();
         assert_eq!(spec, ShapeSpec::Joint(set(&[MonotoneIncreasing, Concave])));
         assert_eq!(spec.single_atom(), None);
@@ -1325,7 +1325,7 @@ mod shape_spec_tests {
 
     #[test]
     fn tensor_shapes_need_one_entry_per_margin() {
-        use ShapeConstraint::*;
+        use ShapeConstraint::{Convex, MonotoneDecreasing, MonotoneIncreasing};
         let spec =
             parse_shape_spec("[monotone_increasing, [decreasing, convex]]", Some(2)).unwrap();
         assert_eq!(
@@ -1349,7 +1349,7 @@ mod shape_spec_tests {
 
     #[test]
     fn persisted_shape_keeps_the_legacy_atom_encoding() {
-        use ShapeConstraint::*;
+        use ShapeConstraint::{Concave, Convex, MonotoneDecreasing, MonotoneIncreasing};
         let legacy: ShapeSpec = serde_json::from_str("\"MonotoneIncreasing\"").unwrap();
         assert_eq!(legacy, MonotoneIncreasing);
         assert_eq!(
@@ -1381,7 +1381,7 @@ mod shape_spec_tests {
 
     #[test]
     fn monotone_curvature_cone_keeps_only_the_binding_monotone_row() {
-        use ShapeConstraint::*;
+        use ShapeConstraint::{Concave, Convex, MonotoneDecreasing, MonotoneIncreasing};
         let knots = irregular_cubic_knots();
         let p = knots.len() - 4;
         let spans = bspline_first_derivative_control_spans(knots.view(), 3).unwrap();
@@ -1456,7 +1456,7 @@ mod shape_spec_tests {
 
     #[test]
     fn tensor_cone_is_the_margin_cone_kroneckered_with_identities() {
-        use ShapeConstraint::*;
+        use ShapeConstraint::{Concave, MonotoneIncreasing};
         let kx = irregular_cubic_knots();
         let kz = array![0.0, 0.0, 0.0, 0.3, 0.55, 1.0, 1.0, 1.0];
         let (qx, qz) = (kx.len() - 4, kz.len() - 3);
