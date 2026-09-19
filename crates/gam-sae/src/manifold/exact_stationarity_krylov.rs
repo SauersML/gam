@@ -348,7 +348,16 @@ where
                 + norm(&(&flat_rhs - &projected_rhs))
                 + norm(&projected_rhs);
             let dual_norm = norm(&vectors.t().dot(&residual));
-            let dual_scale = curvature_norm * solution_metric_norm + norm(&coefficients);
+            // The dual residual is `Vᵀ` applied to the physical residual, so it also carries the
+            // physical residual's rounding through `‖Vᵀ‖₂ ≤ ‖V‖_F`. The Ritz vectors are
+            // `Φ`-orthonormal, not orthonormal, so a small metric eigenvalue makes `‖V‖` large.
+            // At #2828 item 2's null-only state the physical residual was 2.8e-14 against its
+            // 9.7e-13 bar, while `Vᵀr` was 1.9e-13 against a 1.3e-13 bar that counted rounding
+            // in the whitened coordinates only (#2822).
+            let vectors_frobenius = vectors.iter().map(|value| value * value).sum::<f64>().sqrt();
+            let dual_scale = curvature_norm * solution_metric_norm
+                + norm(&coefficients)
+                + vectors_frobenius * physical_scale;
             // The Ritz vectors are `Φ`-orthonormal only to the Rayleigh--Ritz arithmetic,
             // `VᵀΦV = I + E` with `‖E‖` of order `κ(VᵀΦV)·ε`. On a basis that spans the space,
             // `ΦV(VᵀΦV)⁻¹Vᵀ = I`, so even the exact pseudoinverse on this basis leaves the dual
