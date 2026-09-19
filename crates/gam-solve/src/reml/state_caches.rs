@@ -225,7 +225,10 @@ pub(crate) fn hash_array_view(hasher: &mut Fingerprinter, values: ndarray::Array
     }
 }
 
-pub(crate) fn hash_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
+pub(crate) fn hash_array2<S: ndarray::Data<Elem = f64>>(
+    hasher: &mut Fingerprinter,
+    values: &ndarray::ArrayBase<S, ndarray::Ix2>,
+) {
     hasher.write_usize(values.nrows());
     hasher.write_usize(values.ncols());
     for &value in values {

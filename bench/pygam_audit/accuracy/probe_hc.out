@@ -1,0 +1,112 @@
+[0s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.092629e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[0s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.092629e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[1s] [HGB] target_mse below mandatory floors; target_mse=8.629e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=5.415e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=3.583e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=4.746e-17 floors=3.000e-12
+[1s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.161782e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[1s] [HGB] target_mse below mandatory floors; target_mse=4.583e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=4.475e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=3.080e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=4.090e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=4.320e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=4.296e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=4.279e-17 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=6.521e-15 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=7.650e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.976e-18 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.491e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.592e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.588e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.644e-16 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.932e-16 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.931e-16 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.929e-16 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=9.001e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=6.677e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.145e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.414e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=2.739e-15 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.663e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=6.014e-15 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.522e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=2.226e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.304e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=2.338e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.374e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.991e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=7.205e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=8.212e-14 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.442e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.177e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=3.761e-13 floors=3.000e-12
+[1s] [HGB] target_mse below mandatory floors; target_mse=1.020e-13 floors=3.000e-12
+[4s] [HGB] target_mse below mandatory floors; target_mse=2.861e-16 floors=3.000e-12
+[4s] [HGB] target_mse below mandatory floors; target_mse=5.350e-17 floors=3.000e-12
+[4s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.148618e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[4s] [HGB] target_mse below mandatory floors; target_mse=6.023e-17 floors=3.000e-12
+[4s] [HGB] target_mse below mandatory floors; target_mse=4.397e-16 floors=3.000e-12
+[4s] [HGB] target_mse below mandatory floors; target_mse=4.236e-16 floors=3.000e-12
+[4s] [HGB] target_mse below mandatory floors; target_mse=3.881e-16 floors=3.000e-12
+[8s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.185364e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[8s] [HGB] target_mse below mandatory floors; target_mse=2.390e-12 floors=3.000e-12
+[8s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.093813e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[8s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.356e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.093813e4).
+[8s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.356e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.093813e4).
+[8s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.356e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.093813e4).
+[8s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.356e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.093813e4).
+[8s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.356e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.093813e4).
+[8s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.356e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.093813e4).
+[8s] [HGB] target_mse below mandatory floors; target_mse=3.207e-13 floors=3.000e-12
+[8s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.089280e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[8s] [HGB] target_mse below mandatory floors; target_mse=8.581e-13 floors=3.000e-12
+[8s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.089280e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 2).
+[10s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.097448e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[10s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.188e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.097448e4).
+[10s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.188e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.097448e4).
+[10s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.188e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.097448e4).
+[10s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.188e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.097448e4).
+[12s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.099659e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[12s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.136e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.099659e4).
+[12s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.136e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.099659e4).
+[12s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.136e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.099659e4).
+[12s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.136e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.099659e4).
+[14s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=1.092837e4): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[14s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.246e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.092837e4).
+[14s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.246e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.092837e4).
+[14s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.246e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.092837e4).
+[14s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.246e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.092837e4).
+[15s] [OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 3 outer steps but the projected gradient is FAR above the certified-stationary band (|g|=1.163e1 > escape threshold 1.500e0); refusing to halt-and-ship and continuing the descent (escape 1, value=1.091356e4).
+[15s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.163e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.091356e4).
+[15s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.163e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.091356e4).
+[16s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.163e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.091356e4).
+[16s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.163e1 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=1.091356e4).
+head_circumference     dev       | default: 2.8339 (edf 11.9) | k20: 2.7708 (edf 19.3) | k30: 2.7759 (edf 27.3) | pygam_default: 2.8282 | pygam_grid: 2.7707 | k20-default d=-0.0631+-0.0095 | k30-default d=-0.058+-0.0098
+[17s] [HGB] target_mse below mandatory floors; target_mse=2.789e-12 floors=3.000e-12
+[18s] [HGB] target_mse below mandatory floors; target_mse=4.114e-14 floors=3.000e-12
+[19s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.143211e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[19s] [HGB] target_mse below mandatory floors; target_mse=3.493e-13 floors=3.000e-12
+[19s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.145023e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[19s] [HGB] target_mse below mandatory floors; target_mse=9.791e-14 floors=3.000e-12
+[20s] [HGB] target_mse below mandatory floors; target_mse=5.230e-13 floors=3.000e-12
+[20s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.113167e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[20s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.106089e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[20s] [HGB] target_mse below mandatory floors; target_mse=1.310e-13 floors=3.000e-12
+[20s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.170190e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[21s] [OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 3 outer steps but the projected gradient is FAR above the certified-stationary band (|g|=8.836e-1 > escape threshold 3.212e-1); refusing to halt-and-ship and continuing the descent (escape 1, value=2.131165e2).
+[22s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.101506e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[22s] [HGB] target_mse below mandatory floors; target_mse=5.357e-14 floors=3.000e-12
+[22s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.101453e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[23s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.259102e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[23s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.702e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=2.259102e2).
+[23s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.152198e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[23s] [HGB] target_mse below mandatory floors; target_mse=3.083e-14 floors=3.000e-12
+   city_temp k30 fail: IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain
+[23s] [HGB] target_mse below mandatory floors; target_mse=5.288e-14 floors=3.000e-12
+   city_temp k30 fail: IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain
+[24s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=2.174007e2): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[24s] [HGB] target_mse below mandatory floors; target_mse=1.145e-12 floors=3.000e-12
+[25s] [OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 3 outer steps but the projected gradient is FAR above the certified-stationary band (|g|=3.466e-1 > escape threshold 3.209e-1); refusing to halt-and-ship and continuing the descent (escape 1, value=2.129285e2).
+[26s] [HGB] target_mse below mandatory floors; target_mse=2.103e-13 floors=3.000e-12
+[26s] [HGB] target_mse below mandatory floors; target_mse=1.577e-12 floors=3.000e-12
+city_temp              dev       | default: 11.009 (edf 11.1) | k20: 11.126 (edf 11.7) | k30: 10.613 (edf 11.9) | pygam_default: 11.702 | pygam_grid: 10.52 | k20-default d=+0.117+-0.11 | k30-default d=+0.102+-0.17

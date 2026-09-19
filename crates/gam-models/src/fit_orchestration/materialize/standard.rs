@@ -117,7 +117,7 @@ pub(crate) fn materialize_standard<'a>(
         }
     }
 
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let latent_cloglog = if family.is_latent_cloglog() {
         let sigma = match config.frailty.clone() {
