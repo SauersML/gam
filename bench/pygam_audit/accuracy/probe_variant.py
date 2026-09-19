@@ -3,7 +3,7 @@
 
   python probe_variant.py CASE_REGEX VARIANT [VARIANT ...]
 VARIANT: 'dp0' (double_penalty=false on every s()/te()), 'kNN' (k=NN on every s()),
-         'default' (the unmodified formula).
+         'default' (the unmodified formula), 'f:<formula>' (an explicit formula).
 Prints the per-case mean primary metric (truth_mse for synthetic cases, else held-out dev /
 logloss) for each variant plus the stored pyGAM numbers from results/<case>.json when the
 data are identical (non-g1d cases; g1d data seeds changed from hash() to crc32).
@@ -20,6 +20,8 @@ from sklearn.model_selection import KFold, StratifiedKFold
 def transform(formula, variant):
     if variant == "default":
         return formula
+    if variant.startswith("f:"):
+        return variant[2:]
     if variant == "dp0":
         opt = "double_penalty=false"
     elif variant.startswith("k"):

@@ -1,0 +1,17 @@
+[run] lidar n=221 gaussian :: y ~ s(range)
+   pygam_default  ok=5/5 dev=0.0068316
+   pygam_grid     ok=5/5 dev=0.0068149
+   gamfit         ok=5/5 dev=0.006779
+[run] gagurine n=314 gaussian :: y ~ s(age)
+   pygam_default  ok=5/5 dev=0.1026
+   pygam_grid     ok=5/5 dev=0.10298
+   gamfit         ok=5/5 dev=0.097923
+[run] prostate_pc n=654 binomial :: y ~ s(pc1) + s(pc2)
+   pygam_default  ok=5/5 dev=1.2381
+   pygam_grid     ok=5/5 dev=1.2277
+   gamfit         ok=5/5 dev=1.2292
+[run] haberman n=306 binomial :: y ~ s(age) + s(year) + s(nodes)
+   pygam_default  ok=5/5 dev=1.1385
+   pygam_grid     ok=5/5 dev=1.0699
+   gamfit         ok=3/5 dev=1.0767  ERR=['IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=7.516e-6 |Pg|=7.516e-6 bound=3.651e-6 (rung=solver-band derived_standard=false) hessian_psd=NO (cleared=true λ_min(H)=-1.675372e-6 λ_min(H+diag|g|)=1.285158e-7 max_k|g_k|=6.978655e-6 measured_resolution=0.000000e0 decided_at=1.490116e-8) curvature_source=terminal-analytic railed=[] → NOT STATI']
+[run] heart_failure n=299 binomial :: y ~ s(age) + s(ejection_fraction) + s(serum_creatinine) + s(serum_sodium) + s(platelets) + s(creatinine_phosphokinase)

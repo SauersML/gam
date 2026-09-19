@@ -1,0 +1,1 @@
+[run] chicago_docs n=4863 poisson :: y ~ s(time, k=200) + te(o3, tmpd) + s(pm10)
