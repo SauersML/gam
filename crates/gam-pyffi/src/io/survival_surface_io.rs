@@ -37,10 +37,9 @@ pub(crate) fn interpolate_rows<'py>(
     kind: &str,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let kind = SurvivalSurfaceKind::parse(kind).map_err(py_value_error)?;
-    let surface =
-        SurvivalSurface::new(kind, grid.as_array(), surface.as_array()).map_err(py_value_error)?;
-    let out = surface
-        .interpolate(query.as_array())
+    let (grid, surface, query) = (grid.as_array(), surface.as_array(), query.as_array());
+    let out = py
+        .detach_on_pool(move || SurvivalSurface::new(kind, grid, surface)?.interpolate(query))
         .map_err(py_value_error)?;
     Ok(out.into_pyarray(py))
 }

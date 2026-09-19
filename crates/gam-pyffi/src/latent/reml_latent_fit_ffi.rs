@@ -4230,9 +4230,12 @@ fn coefficient_state_json(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> Py
 }
 
 #[pyfunction]
-fn term_blocks_for_model(model: PyRef<'_, PyFittedModel>) -> PyResult<Vec<(String, String, usize, usize)>> {
+fn term_blocks_for_model(
+    py: Python<'_>,
+    model: PyRef<'_, PyFittedModel>,
+) -> PyResult<Vec<(String, String, usize, usize)>> {
     let model = Arc::clone(&model.model);
-    term_blocks_for_model_impl(&model).map_err(PyValueError::new_err)
+    detach_py_result(py, "term_blocks_for_model", move || term_blocks_for_model_impl(&model))
 }
 
 #[pyfunction]
