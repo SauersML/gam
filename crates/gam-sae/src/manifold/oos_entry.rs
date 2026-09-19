@@ -238,11 +238,12 @@ fn build_rho(
     }
     let mut ard = Vec::with_capacity(k_atoms);
     for (atom_index, (values, &dim)) in log_ard.iter().zip(latent_dims).enumerate() {
-        if !(values.is_empty() || values.len() == dim)
-            || !values.iter().all(|value| value.is_finite())
-        {
+        // #2822 — the ARD prior is the proper coordinate prior, so every atom
+        // carries a full block; an empty block is not a prior switched off.
+        if values.len() != dim || !values.iter().all(|value| value.is_finite()) {
             return Err(format!(
-                "run_sae_manifold_oos: trained log_ard[{atom_index}] must be empty or contain {dim} finite values"
+                "run_sae_manifold_oos: trained log_ard[{atom_index}] must contain {dim} finite values; got {}",
+                values.len()
             ));
         }
         ard.push(Array1::from(values.clone()));
@@ -1084,7 +1085,7 @@ mod tests {
             regularization: SaeOosRegularization {
                 log_lambda_sparse: 0.01_f64.ln(),
                 log_lambda_smooth: vec![0.01_f64.ln()],
-                log_ard: vec![Vec::new()],
+                log_ard: vec![vec![0.01_f64.ln()]],
             },
             max_iter: 1,
             learning_rate: 1.0,

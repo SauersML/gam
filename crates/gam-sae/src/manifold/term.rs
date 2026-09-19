@@ -826,9 +826,6 @@ pub struct SaeFitConfig {
     /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses the #1610
     /// evidence-derived per-pair strengths (`0.0` = conditioner off).
     pub separation_barrier_strength_override: Option<f64>,
-    /// Per-fit truncated-ordered Beta--Bernoulli concentration `α`. `Some` bypasses the mode's own
-    /// `α` / learnable schedule.
-    pub ordered_beta_bernoulli_alpha_override: Option<f64>,
     /// Backend selection for this fit and every nested arrow-Schur solve.
     pub gpu_policy: gam_gpu::GpuPolicy,
 }

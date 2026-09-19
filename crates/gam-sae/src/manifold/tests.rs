@@ -2188,30 +2188,29 @@ pub(crate) fn collapse_rescue_projection_matches_train_and_oos_and_refuses_targe
 }
 
 /// #1777 GOAL 2 — the PER-FIT [`SaeFitConfig`] is the source of truth for the
-/// ordered Beta--Bernoulli-α and separation-barrier overrides: two terms carrying DIFFERENT configs
-/// produce correspondingly-different α / barrier strength, and the two terms do
-/// not leak into each other.
+/// separation-barrier override and the backend policy: two terms carrying DIFFERENT configs
+/// produce correspondingly-different barrier strengths, and the two terms do not leak into
+/// each other.
 #[test]
-pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha() {
-    let (mut term_a, _t_a, rho_a) = small_two_atom_ordered_beta_bernoulli_term();
-    let (mut term_b, _t_b, rho_b) = small_two_atom_ordered_beta_bernoulli_term();
+pub(crate) fn per_fit_config_isolates_barrier_and_gpu_policy() {
+    let (mut term_a, _t_a, _rho_a) = small_two_atom_ordered_beta_bernoulli_term();
+    let (mut term_b, _t_b, _rho_b) = small_two_atom_ordered_beta_bernoulli_term();
+    let canonical = term_a.separation_barrier_strength();
 
     // Distinct per-fit configs, applied to each term independently.
     term_a.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(0.1),
-        ordered_beta_bernoulli_alpha_override: Some(0.2),
         gpu_policy: gam_gpu::GpuPolicy::Off,
     });
     term_b.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(3.0),
-        ordered_beta_bernoulli_alpha_override: Some(5.0),
         gpu_policy: gam_gpu::GpuPolicy::Required,
     });
 
     // Round-trips through the config accessor.
     assert_eq!(
-        term_a.fit_config().ordered_beta_bernoulli_alpha_override,
-        Some(0.2)
+        term_a.fit_config().separation_barrier_strength_override,
+        Some(0.1)
     );
     assert_eq!(
         term_b.fit_config().separation_barrier_strength_override,
@@ -2220,29 +2219,16 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
     assert_eq!(term_a.fit_config().gpu_policy, gam_gpu::GpuPolicy::Off);
     assert_eq!(term_b.fit_config().gpu_policy, gam_gpu::GpuPolicy::Required);
 
-    // ordered Beta--Bernoulli-α: the per-fit override is the resolved concentration
-    // (bypassing the mode schedule), and the two terms resolve different values.
-    // α parameterizes the prior used by the fit; it does not rewrite an
-    // already-materialized assignment matrix.
-    let concentration = |term: &SaeManifoldTerm, rho: &SaeManifoldRho| {
-        term.assignment
-            .ordered_beta_bernoulli_prior_parameters(rho)
-            .expect("fixture rho is inside the prior domain")
-            .map(|parameters| parameters.concentration)
-    };
-    assert_eq!(concentration(&term_a, &rho_a), Some(0.2));
-    assert_eq!(concentration(&term_b, &rho_b), Some(5.0));
-
     // Barrier strength (K=2, so the barrier is live): the per-fit override is the
     // source of truth, distinct per term.
     assert_eq!(term_a.separation_barrier_strength(), 0.1);
     assert_eq!(term_b.separation_barrier_strength(), 3.0);
 
-    // Isolation: clearing term_a's config leaves term_b untouched, and term_a
-    // uses the mode's canonical α.
+    // Isolation: clearing term_a's config restores its canonical strength and leaves
+    // term_b untouched.
     term_a.set_fit_config(SaeFitConfig::default());
-    assert_eq!(concentration(&term_a, &rho_a), Some(1.0)); // the mode's compiled α
-    assert_eq!(concentration(&term_b, &rho_b), Some(5.0));
+    assert_eq!(term_a.separation_barrier_strength(), canonical);
+    assert_eq!(term_b.separation_barrier_strength(), 3.0);
 }
 
 /// F5 — the per-fit separation-barrier override (#1777) must isolate two
@@ -2267,7 +2253,6 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
                     let (mut term, _t, _rho) = small_two_atom_ordered_beta_bernoulli_term();
                     term.set_fit_config(SaeFitConfig {
                         separation_barrier_strength_override: Some(mu),
-                        ordered_beta_bernoulli_alpha_override: None,
                         gpu_policy: gam_gpu::GpuPolicy::Off,
                     });
                     // Hammer the barrier-strength read while the sibling thread
