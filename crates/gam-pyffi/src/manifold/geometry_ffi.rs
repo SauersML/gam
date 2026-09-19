@@ -7581,6 +7581,14 @@ fn predict_encoded_table_conformal_impl(
     })
 }
 
+/// A full-conformal predict failure: a schema or input rejection of either
+/// table, or a conformal-route refusal or numerical failure, each kept typed
+/// until it is mapped to its Python class.
+enum FullConformalPredictError {
+    Predict(PredictError),
+    Conformal(gam_predict::conformal_routes::FullConformalError),
+}
+
 /// #1098 full-conformal prediction set at the frozen penalty — no calibration
 /// fold.
 ///
@@ -7592,17 +7600,19 @@ fn predict_encoded_table_full_conformal_impl(
     source: EncodedDataset,
     training_source: EncodedDataset,
     conformal_level: f64,
-) -> Result<PredictionPayload, gam_predict::conformal_routes::FullConformalError> {
-    let dataset = dataset_with_model_schema_from_encoded(model, &source)?;
-    let training = dataset_with_model_schema_from_encoded(model, &training_source)?;
+) -> Result<PredictionPayload, FullConformalPredictError> {
+    let dataset = dataset_with_model_schema_from_encoded(model, &source)
+        .map_err(FullConformalPredictError::Predict)?;
+    let training = dataset_with_model_schema_from_encoded(model, &training_source)
+        .map_err(FullConformalPredictError::Predict)?;
     let test_col_map = dataset.column_map();
     let training_col_map = training.column_map();
     let test_offset =
         resolve_offset_column(&dataset, &test_col_map, model.offset_column.as_deref())
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| FullConformalPredictError::Predict(PredictError::Other(err.to_string())))?;
     let training_offset =
         resolve_offset_column(&training, &training_col_map, model.offset_column.as_deref())
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| FullConformalPredictError::Predict(PredictError::Other(err.to_string())))?;
     let columns = gam_predict::conformal_routes::full_conformal_prediction_columns(
         model,
         &gam_predict::conformal_routes::DesignRows {
@@ -7616,7 +7626,8 @@ fn predict_encoded_table_full_conformal_impl(
             offset: &training_offset,
         },
         conformal_level,
-    )?;
+    )
+    .map_err(FullConformalPredictError::Conformal)?;
     let likelihood = model_likelihood_spec(&model);
     let interval_method = if likelihood.is_gaussian_identity() {
         format!(
@@ -7693,10 +7704,13 @@ fn predict_table_full_conformal(
         "predict_table_full_conformal",
         move || predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level),
         |_, err| match err {
-            FullConformalError::PriorWeights { .. } | FullConformalError::Unsupported(_) => {
-                InvalidConfigurationError::new_err(err.to_string())
+            FullConformalPredictError::Predict(err) => predict_error_to_pyerr(err),
+            FullConformalPredictError::Conformal(
+                err @ (FullConformalError::PriorWeights { .. } | FullConformalError::Unsupported(_)),
+            ) => InvalidConfigurationError::new_err(err.to_string()),
+            FullConformalPredictError::Conformal(FullConformalError::Failed(msg)) => {
+                py_value_error(msg)
             }
-            FullConformalError::Failed(msg) => py_value_error(msg),
         },
     )?;
     prediction_payload_into_py(py, payload)
