@@ -1,0 +1,1 @@
+predict sig: (data: 'Any', *, interval: 'float | str | None' = None, conformal_level: 'float' = 0.9, covariance_mode: 'str | None' = None, observation_interval: 'bool' = False, return_type: 'str | None' = None, id_column: 'str | None' = None) -> 'Any'

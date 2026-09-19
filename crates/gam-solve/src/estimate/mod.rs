@@ -62,6 +62,7 @@ mod edf_accounting;
 mod evaluation;
 mod external_options;
 mod fit;
+mod fixed_lambda_fit;
 mod identified_hessian;
 mod joint_hyper;
 mod null_space_normalizer;
@@ -96,6 +97,10 @@ pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
 };
 pub use fit::{fit_gam_with_penalty_specs, fit_gamwith_heuristic_log_lambdas};
+pub use fixed_lambda_fit::{
+    NestedFixedLambdaFit, NestedFixedLambdaInputs, NestedFixedLambdaOutcome,
+    fit_nested_at_fitted_log_lambdas,
+};
 pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub use joint_hyper::{
     ExternalJointHyperEvaluator, gaussian_identity_outer_response_conditioning,
