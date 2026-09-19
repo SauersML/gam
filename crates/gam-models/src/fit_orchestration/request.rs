@@ -519,7 +519,7 @@ impl CtnStage1Recipe {
 #[derive(Clone, Debug)]
 pub struct FitConfig {
     /// Family: "gaussian", "binomial", "poisson", "negative-binomial",
-    /// "gamma", "tweedie" (alias "tw"; variance power fixed at p = 1.5), or
+    /// "gamma", "tweedie" (variance power written as `tweedie(p)`), or
     /// None for auto-detect.
     pub family: Option<String>,
     /// Fixed size/overdispersion parameter for `family="negative-binomial"`.

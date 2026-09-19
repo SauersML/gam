@@ -62,11 +62,11 @@ fn fit_sinusoidal_location_scale(x: &[f64], y: &[f64]) -> GaussianLocationScaleF
         encode_recordswith_inferred_schema(headers, rows).expect("encode location-scale fixture");
     let config = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(x, bs='tps')".to_string()),
         ..FitConfig::default()
     };
 
-    let result = fit_from_formula("y ~ s(x, bs='tp')", &data, &config)
+    let result = fit_from_formula("y ~ s(x, bs='tps')", &data, &config)
         .expect("fit Gaussian location-scale model");
     let FitResult::GaussianLocationScale(result) = result else {
         panic!("expected GaussianLocationScale fit result");

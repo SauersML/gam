@@ -4,6 +4,7 @@ use pest::Parser;
 use pest::iterators::Pair;
 use pest_derive::Parser;
 
+use crate::removed_spellings;
 use crate::smooth::BoundedCoefficientPriorSpec;
 use crate::term_builder::{MARGINAL_SLOPE_Z_ALIAS, marginal_slope_z_alias_is_live};
 use gam_problem::types::{
@@ -936,14 +937,124 @@ mod tests {
         assert_eq!(parsed.rhs_terms[2], "te(x3, x4)");
     }
 
+    /// Parse `y ~ {term}` and return the error text.
+    fn term_error(term: &str) -> String {
+        match parse_formula(&format!("y ~ {term}")) {
+            Ok(parsed) => panic!("`{term}` parsed but must be refused: {:?}", parsed.terms),
+            Err(err) => err.to_string(),
+        }
+    }
+
     #[test]
-    fn parses_cyclic_formula_aliases() {
+    fn removed_formula_spellings_error_and_name_the_canonical_one() {
+        // One spelling per behavior (SPEC R25): each removed spelling is a
+        // parse error that names the single supported spelling.
+        let cases = [
+            ("s(x, bs=tp)", "unknown smooth type `tp`; use `tps`"),
+            ("s(x, bs='gp')", "unknown smooth type `gp`; use `matern`"),
+            ("s(x, bs=cs)", "unknown smooth type `cs`; use `cr`"),
+            ("s(x, bs=cc)", "unknown smooth type `cc`; use `cyclic`"),
+            ("s(x, bs=cp)", "unknown smooth type `cp`; use `cyclic`"),
+            ("s(x, bs=periodic)", "unknown smooth type `periodic`; use `cyclic`"),
+            ("s(x, bs='cyclic-ps')", "unknown smooth type `cyclic-ps`; use `cyclic`"),
+            ("s(x, bs=mkappa)", "unknown smooth type `mkappa`; use `curv`"),
+            ("s(x, bs=web)", "unknown smooth type `web`; use `mjs`"),
+            ("te(x, z, bs=c('cc','ps'))", "unknown smooth type `cc`; use `cyclic`"),
+            ("te(x, z, bs=['tp','cr'])", "unknown smooth type `tp`; use `tps`"),
+            ("s(x, type=ps)", "unknown option `type` in s(); use `bs`"),
+            ("s(x, basis_dim=8)", "unknown option `basis_dim` in s(); use `k`"),
+            ("s(x, basisdim=8)", "unknown option `basisdim` in s(); use `k`"),
+            ("te(x, z, m=2)", "unknown option `m` in te(); use `penalty_order`"),
+            ("sphere(lat, lon, kernel=sobolev)", "unknown option `kernel` in sphere(); use `method`"),
+            ("sphere(lat, lon, method=wahba)", "unknown sphere method `wahba` in sphere(); use `sobolev`"),
+            ("sphere(lat, lon, method='wahba-sobolev')", "unknown sphere method `wahba-sobolev` in sphere(); use `sobolev`"),
+            ("s(x, bc=cyclic)", "unknown boundary token `cyclic` in s(bc=...); use `periodic`"),
+            ("constrain(x, min=0)", "unknown term function `constrain`; use `linear()`"),
+            ("constraint(x, min=0)", "unknown term function `constraint`; use `linear()`"),
+            ("box(x, min=0, max=1)", "unknown term function `box`; use `linear()`"),
+            ("nonnegative_coef(x)", "unknown term function `nonnegative_coef`; use `nonnegative()`"),
+            ("nonpositive_coef(x)", "unknown term function `nonpositive_coef`; use `nonpositive()`"),
+            ("re(g)", "unknown term function `re`; use `group()`"),
+            ("tensor(x, z)", "unknown term function `tensor`; use `te()`"),
+            ("interaction(x, z)", "unknown term function `interaction`; use `te()`"),
+            ("periodic(x)", "unknown term function `periodic`; use `cyclic()`"),
+            ("cc(x)", "unknown term function `cc`; use `cyclic()`"),
+            ("measurejet(x, z)", "unknown term function `measurejet`; use `mjs()`"),
+            ("web(x, z)", "unknown term function `web`; use `mjs()`"),
+            ("curvature(x, z)", "unknown term function `curvature`; use `curv()`"),
+            ("mkappa(x, z)", "unknown term function `mkappa`; use `curv()`"),
+            ("linear(x, lower=0)", "unknown option `lower` in linear(); use `min`"),
+            ("linear(x, upper=1)", "unknown option `upper` in linear(); use `max`"),
+            ("bounded(x, min=0, max=1, pull=uniform)", "unknown option `pull` in bounded(); use `prior`"),
+            ("bounded(x, min=0, max=1, prior=log-jacobian)", "unknown bounded() prior `log-jacobian`; use `uniform`"),
+            ("bounded(x, min=0, max=1, prior=jacobian)", "unknown bounded() prior `jacobian`; use `uniform`"),
+        ];
+        for (term, expected) in cases {
+            let err = term_error(term);
+            assert!(err.contains(expected), "`{term}` error `{err}` must contain `{expected}`");
+        }
+    }
+
+    #[test]
+    fn canonical_formula_spellings_parse() {
+        for term in [
+            "s(x, bs=tps, k=8)",
+            "s(x, bs=matern)",
+            "s(x, bs=cr, penalty_order=2)",
+            "s(x, bs=cyclic)",
+            "te(x, z, bs=c('cyclic','ps'))",
+            "sphere(lat, lon, method=sobolev)",
+            "sphere(lat, lon, method=pseudo)",
+            "s(x, bc=periodic)",
+            "linear(x, min=0, max=1)",
+            "nonnegative(x)",
+            "nonpositive(x)",
+            "group(g)",
+            "te(x, z)",
+            "cyclic(x)",
+            "mjs(x, z)",
+            "curv(x, z)",
+            "bounded(x, min=0, max=1, prior=uniform)",
+        ] {
+            parse_formula(&format!("y ~ {term}"))
+                .unwrap_or_else(|err| panic!("canonical `{term}` must parse: {err}"));
+        }
+    }
+
+    #[test]
+    fn function_form_sets_its_basis_and_refuses_a_different_one() {
+        for (term, basis) in [
+            ("tps(x, z)", "tps"),
+            ("cyclic(x)", "cyclic"),
+            ("mjs(x, z)", "mjs"),
+            ("curv(x, z)", "curv"),
+            ("matern(x)", "matern"),
+            ("duchon(x)", "duchon"),
+        ] {
+            let parsed = parse_formula(&format!("y ~ {term}")).expect("parse");
+            match &parsed.terms[0] {
+                ParsedTerm::Smooth { options, .. } => {
+                    assert_eq!(options.get("bs").map(String::as_str), Some(basis), "{term}");
+                    assert!(!options.contains_key("type"), "{term}");
+                }
+                other => panic!("expected a smooth for {term}, got {other:?}"),
+            }
+        }
+        let err = term_error("cyclic(x, bs=ps)");
+        assert!(
+            err.contains("cyclic() is the `cyclic` smooth and cannot take bs=`ps`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parses_cyclic_formula_function() {
         let parsed = parse_formula("y ~ cyclic(theta, period_start=0, period_end=6.283)")
             .expect("parse cyclic formula");
         match &parsed.terms[0] {
             super::ParsedTerm::Smooth { vars, options, .. } => {
                 assert_eq!(vars, &vec!["theta".to_string()]);
-                assert_eq!(options.get("type").map(String::as_str), Some("cyclic"));
+                assert_eq!(options.get("bs").map(String::as_str), Some("cyclic"));
                 assert_eq!(options.get("period_start").map(String::as_str), Some("0"));
             }
             other => panic!("expected cyclic smooth term, got {other:?}"),
@@ -954,10 +1065,10 @@ mod tests {
     fn sphere_aliases_all_dispatch_to_intrinsic_s2_basis() {
         // Regression for #383: `s2(lat, lon)` must build the same intrinsic
         // S² (sphere) basis as `sphere()`/`sos()`/`spherical()`. Previously the
-        // `s2` arm returned a Smooth without `type=sphere`, so it silently fell
+        // `s2` arm returned a Smooth without `bs=sphere`, so it silently fell
         // back to a generic Euclidean 2-D smooth and diverged in the
-        // spatial-kappa optimizer. All four aliases must be byte-for-byte
-        // equivalent in their dispatch (vars + `type=sphere`).
+        // spatial-kappa optimizer. All four must be byte-for-byte
+        // equivalent in their dispatch (vars + `bs=sphere`).
         for alias in ["sphere", "sos", "spherical", "s2"] {
             let parsed = parse_formula(&format!("y ~ {alias}(lat, lon)"))
                 .unwrap_or_else(|e| panic!("parse {alias}: {e}"));
@@ -969,9 +1080,9 @@ mod tests {
                         "{alias} should keep (lat, lon) as its variables"
                     );
                     assert_eq!(
-                        options.get("type").map(String::as_str),
+                        options.get("bs").map(String::as_str),
                         Some("sphere"),
-                        "{alias} must dispatch to the intrinsic sphere basis (type=sphere)"
+                        "{alias} must dispatch to the intrinsic sphere basis (bs=sphere)"
                     );
                 }
                 other => panic!("expected sphere smooth term for {alias}, got {other:?}"),
@@ -981,7 +1092,7 @@ mod tests {
 
     #[test]
     fn parses_function_callwithnamed_and_positional_args() {
-        let call = parse_function_call("s(log(x + 1), type=\"duchon\", centers=12)").expect("call");
+        let call = parse_function_call("s(log(x + 1), bs=\"duchon\", centers=12)").expect("call");
         assert_eq!(call.name, "s");
         assert_eq!(call.args.len(), 3);
         assert_eq!(
@@ -991,7 +1102,7 @@ mod tests {
         assert_eq!(
             call.args[1],
             CallArgSpec::Named {
-                key: "type".to_string(),
+                key: "bs".to_string(),
                 value: "\"duchon\"".to_string()
             }
         );
@@ -1249,7 +1360,7 @@ mod tests {
     #[test]
     fn marginal_slope_z_column_validator_detects_linear_and_smooth_reuse() {
         let main = parse_formula("y ~ x + z").expect("parse main");
-        let slope = parse_formula("y ~ s(z, type=duchon, centers=6)").expect("parse slope");
+        let slope = parse_formula("y ~ s(z, bs=duchon, centers=6)").expect("parse slope");
 
         assert!(parsed_terms_reference_column(&main.terms, "z"));
         assert!(parsed_terms_reference_column(&slope.terms, "z"));
@@ -1411,7 +1522,7 @@ mod tests {
         // Regression for #2137 (sibling of #2102): `factor(g)` names the
         // categorical level effect of a column seen in training, so an out-of-vocabulary
         // level at predict is a schema mismatch that must raise — NOT be shrunk to
-        // the centering point. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine
+        // the centering point. `group(g)`/`s(g, bs="re")` are genuine
         // random effects that tolerate a held-out group (→ population mean). The
         // parse arm once hardcoded `lenient_unseen: true` for all four wrappers,
         // so `factor(g)` silently averaged an unseen level. Pin the per-wrapper
@@ -1420,7 +1531,7 @@ mod tests {
             !random_effect_lenient_unseen("y ~ factor(g)"),
             "factor(g) is strict (lenient_unseen=false) on unseen levels"
         );
-        for lenient in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=re)"] {
+        for lenient in ["y ~ group(g)", "y ~ s(g, bs=re)"] {
             assert!(
                 random_effect_lenient_unseen(lenient),
                 "{lenient} is a genuine random effect: lenient (lenient_unseen=true) on unseen levels"
@@ -1430,13 +1541,13 @@ mod tests {
 
     #[test]
     fn categorical_wrappers_reject_unknown_options() {
-        // pyGAM audit F3: `factor()`/`group()`/`re()` accept no options, so a
+        // pyGAM audit F3: `factor()`/`group()` accept no options, so a
         // stray keyword must be a typed parse error instead of being dropped.
         for formula in [
             "y ~ factor(g, foo=1)",
             "y ~ factor(g, double_penalty=false)",
             "y ~ group(g, bogus=3)",
-            "y ~ re(g, k=4)",
+            "y ~ group(g, k=4)",
         ] {
             let err = match parse_formula(formula) {
                 Ok(_) => panic!("{formula} must reject its unknown option"),
@@ -1742,7 +1853,7 @@ pub enum ParsedTerm {
     RandomEffect {
         name: String,
         /// Unseen-level policy, fixed at parse time by the wrapper the user
-        /// wrote. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine **random
+        /// wrote. `group(g)`/`s(g, bs="re")` are genuine **random
         /// effects**: a held-out group is shrunk to the population mean, so an
         /// unseen level at predict is tolerated (`true`). `factor(g)` (and
         /// patsy's `C(g)` spelling) names a categorical level effect: like a
@@ -2119,11 +2230,44 @@ pub fn joint_wiggle_unsupported_link_message(context: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Local sibling of `term_builder::validate_known_options` used by the
-/// parser-side `linear / bounded / constrain / nonnegative / nonpositive`
+/// parser-side `linear / bounded / nonnegative / nonpositive`
 /// branches (which build their `ParsedTerm` here and never enter
 /// `term_builder::build_smooth_basis`). Without this, typos like
 /// `bounded(x, min=0, max=1, foo=bar)` silently succeed because the
 /// `foo` key was just never read.
+/// The term functions that build a smooth; their option maps are checked
+/// for removed option keys and values before dispatch.
+const SMOOTH_TERM_FUNCTIONS: &[&str] = &[
+    "smooth", "s", "cyclic", "thinplate", "thin_plate", "tps", "te", "t2", "ti", "fs", "sz",
+    "sphere", "sos", "spherical", "s2", "mjs", "curv", "matern", "duchon", "pca",
+];
+
+/// A function form (`tps()`, `cyclic()`, `matern()`, ...) fixes its smooth
+/// type through `bs=`. A `bs=` the user wrote on it may only repeat that type;
+/// any other value names a different smooth and is refused instead of being
+/// silently replaced.
+fn fix_function_basis(
+    options: &mut BTreeMap<String, String>,
+    name: &str,
+    basis: &str,
+    raw: &str,
+) -> Result<(), String> {
+    if let Some(given) = options.get("bs") {
+        let given = given
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_ascii_lowercase();
+        if given != basis {
+            return Err(format!(
+                "{name}() is the `{basis}` smooth and cannot take bs=`{given}`; \
+                 write s(..., bs=\"{given}\") for that basis: {raw}"
+            ));
+        }
+    }
+    options.insert("bs".to_string(), basis.to_string());
+    Ok(())
+}
+
 fn validate_known_term_options(
     term_name: &str,
     options: &BTreeMap<String, String>,
@@ -2133,6 +2277,17 @@ fn validate_known_term_options(
     let known_set: std::collections::BTreeSet<&&str> = known.iter().collect();
     for key in options.keys() {
         if !known_set.contains(&key.as_str()) {
+            if let Some(canonical) =
+                removed_spellings::canonical_for(removed_spellings::TERM_OPTION_KEYS, key)
+                && known_set.contains(&canonical)
+            {
+                return Err(FormulaDslError::InvalidArgument {
+                    reason: format!(
+                        "unknown option `{key}` in {term_name}(); use `{canonical}`: {raw}"
+                    ),
+                }
+                .into());
+            }
             let known_sorted = {
                 let mut v = known.to_vec();
                 v.sort_unstable();
@@ -2255,8 +2410,8 @@ fn parse_linear_constraint_bounds(
     options: &BTreeMap<String, String>,
     raw: &str,
 ) -> Result<(Option<f64>, Option<f64>), String> {
-    let min = parse_optional_f64_option_alias(options, &["min", "lower"], raw, "linear")?;
-    let max = parse_optional_f64_option_alias(options, &["max", "upper"], raw, "linear")?;
+    let min = parse_optional_labeled_f64_option(options, "min", raw, "linear")?;
+    let max = parse_optional_labeled_f64_option(options, "max", raw, "linear")?;
     if let (Some(min), Some(max)) = (min, max)
         && (!min.is_finite() || !max.is_finite() || min > max)
     {
@@ -2310,37 +2465,23 @@ fn parse_optional_f64_option(
     }
 }
 
-fn parse_optional_f64_option_alias(
+fn parse_optional_labeled_f64_option(
     options: &BTreeMap<String, String>,
-    keys: &[&str],
+    key: &str,
     raw: &str,
     fn_label: &str,
 ) -> Result<Option<f64>, String> {
-    let mut found: Option<(&str, f64)> = None;
-    for key in keys {
-        if let Some(value) = options.get(*key) {
-            let parsed = value
-                .parse::<f64>()
-                .map_err(|err| FormulaDslError::InvalidArgument {
-                    reason: format!(
-                        "{fn_label}() argument '{key}' must be a finite number, got '{}': {err}: {raw}",
-                        value
-                    ),
-                })?;
-            if found.is_some() {
-                return Err(FormulaDslError::IncompatibleTerm {
-                    reason: format!(
-                        "{fn_label}() cannot specify both '{}' and '{}': {raw}",
-                        found.expect("present").0,
-                        key
-                    ),
-                }
-                .into());
+    match options.get(key) {
+        Some(value) => value.parse::<f64>().map(Some).map_err(|err| {
+            FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "{fn_label}() argument '{key}' must be a finite number, got '{value}': {err}: {raw}"
+                ),
             }
-            found = Some((key, parsed));
-        }
+            .into()
+        }),
+        None => Ok(None),
     }
-    Ok(found.map(|(_, v)| v))
 }
 
 fn parse_linkwiggle_penalty_orders(raw: Option<&str>) -> Result<Vec<usize>, String> {
@@ -2542,26 +2683,13 @@ fn parse_bounded_priorspec(
     raw: &str,
 ) -> Result<BoundedCoefficientPriorSpec, String> {
     let prior_mode = options.get("prior").map(|s| s.to_ascii_lowercase());
-    let pull = options.get("pull").map(|s| s.to_ascii_lowercase());
     let target = parse_optional_f64_option(options, "target", raw)?;
     let strength = parse_optional_f64_option(options, "strength", raw)?;
 
     let target_mode = target.is_some() || strength.is_some();
-    if prior_mode.is_some() && pull.is_some() {
-        return Err(FormulaDslError::IncompatibleTerm {
-            reason: format!("bounded() cannot combine prior=... with pull=...: {raw}"),
-        }
-        .into());
-    }
     if prior_mode.is_some() && target_mode {
         return Err(FormulaDslError::IncompatibleTerm {
             reason: format!("bounded() cannot combine prior=... with target/strength: {raw}"),
-        }
-        .into());
-    }
-    if pull.is_some() && target_mode {
-        return Err(FormulaDslError::IncompatibleTerm {
-            reason: format!("bounded() cannot combine pull=... with target/strength: {raw}"),
         }
         .into());
     }
@@ -2569,31 +2697,20 @@ fn parse_bounded_priorspec(
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
             "none" => Ok(BoundedCoefficientPriorSpec::None),
-            "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
-                Ok(BoundedCoefficientPriorSpec::Uniform)
-            }
+            "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
-            _ => Err(FormulaDslError::InvalidArgument {
-                reason: format!(
-                    "bounded() prior must currently be one of none|uniform|log-jacobian|center, got '{}': {raw}",
-                    priorname
-                ),
-            }
-            .into()),
-        };
-    }
-
-    if let Some(pull_mode) = pull {
-        return match pull_mode.as_str() {
-            "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
-                Ok(BoundedCoefficientPriorSpec::Uniform)
-            }
-            "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
-            _ => Err(FormulaDslError::InvalidArgument {
-                reason: format!(
-                    "bounded() pull must currently be 'uniform'/'log-jacobian' or 'center', got '{}': {raw}",
-                    pull_mode
-                ),
+            other => Err(FormulaDslError::InvalidArgument {
+                reason: match removed_spellings::canonical_for(
+                    removed_spellings::BOUNDED_PRIORS,
+                    other,
+                ) {
+                    Some(canonical) => format!(
+                        "unknown bounded() prior `{other}`; use `{canonical}`: {raw}"
+                    ),
+                    None => format!(
+                        "bounded() prior must be one of none|uniform|center, got '{other}': {raw}"
+                    ),
+                },
             }
             .into()),
         };
@@ -3256,46 +3373,18 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
             call.name.to_ascii_lowercase()
         };
         let (vars, mut options) = split_call_args(&call);
+        if let Some(canonical) = removed_spellings::canonical_for(removed_spellings::TERM_FUNCTIONS, &name)
+        {
+            return Err(format!(
+                "unknown term function `{name}`; use `{canonical}()`: {raw}"
+            ));
+        }
+        if SMOOTH_TERM_FUNCTIONS.contains(&name.as_str()) {
+            removed_spellings::reject_removed_smooth_spellings(&name, &options)
+                .map_err(|reason| format!("{reason}: {raw}"))?;
+        }
         match name.as_str() {
-            "constrain" | "constraint" | "box" => {
-                if vars.len() != 1 {
-                    return Err(FormulaDslError::InvalidArgument {
-                        reason: format!(
-                            "constrain()/constraint()/box() expects exactly one variable: {raw}"
-                        ),
-                    }
-                    .into());
-                }
-                validate_known_term_options(
-                    "constrain",
-                    &options,
-                    &["min", "lower", "max", "upper", "double_penalty"],
-                    raw,
-                )?;
-                let (coefficient_min, coefficient_max) =
-                    parse_linear_constraint_bounds(&options, raw)?;
-                if coefficient_min.is_none() && coefficient_max.is_none() {
-                    return Err(FormulaDslError::MalformedConfig {
-                        reason: format!(
-                            "constrain()/constraint()/box() requires at least one of min/lower/max/upper: {raw}"
-                        ),
-                    }
-                    .into());
-                }
-                // A constrained linear effect keeps the null-recovery ridge by
-                // default like every other non-intercept effect (SPEC rules 12, 14):
-                // zero lies in the feasible set of every sign or box constraint REML
-                // can shrink toward, and `double_penalty=false` opts out.
-                return Ok(ParsedTerm::Linear {
-                    name: vars[0].clone(),
-                    explicit: true,
-                    double_penalty: option_bool(&options, "double_penalty")?
-                        .unwrap_or(true),
-                    coefficient_min,
-                    coefficient_max,
-                });
-            }
-            "nonnegative" | "nonnegative_coef" => {
+            "nonnegative" => {
                 if vars.len() != 1 {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!("nonnegative() expects exactly one variable: {raw}"),
@@ -3312,7 +3401,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     coefficient_max: None,
                 });
             }
-            "nonpositive" | "nonpositive_coef" => {
+            "nonpositive" => {
                 if vars.len() != 1 {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!("nonpositive() expects exactly one variable: {raw}"),
@@ -3343,7 +3432,6 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                         "min",
                         "max",
                         "prior",
-                        "pull",
                         "target",
                         "strength",
                         "double_penalty",
@@ -3377,7 +3465,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                         .unwrap_or(false),
                 });
             }
-            "group" | "re" | "factor" => {
+            "group" | "factor" => {
                 if vars.len() != 1 {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!(
@@ -3394,8 +3482,8 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options(&name, &options, &[], raw)?;
                 // `factor(g)` forces categorical encoding of the column and,
                 // like a bare `+ g` main effect, is strict on unseen levels.
-                // `group(g)`/`re(g)` are genuine random effects that shrink a
-                // held-out group to the population mean, so they tolerate
+                // `group(g)` is a genuine random effect that shrinks a
+                // held-out group to the population mean, so it tolerates
                 // unseen levels. Both share the penalized-categorical block;
                 // only the unseen policy differs (#2137/#2102).
                 let lenient_unseen = name != "factor";
@@ -3404,12 +3492,10 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     lenient_unseen,
                 });
             }
-            "tensor" | "interaction" | "te" => {
+            "te" => {
                 if vars.len() < 2 {
                     return Err(FormulaDslError::InvalidArgument {
-                        reason: format!(
-                            "tensor()/interaction()/te() requires at least two variables: {raw}"
-                        ),
+                        reason: format!("te() requires at least two variables: {raw}"),
                     }
                     .into());
                 }
@@ -3475,7 +3561,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                options.insert("type".to_string(), "tps".to_string());
+                fix_function_basis(&mut options, &name, "tps", raw)?;
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -3483,21 +3569,20 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" => {
+            "smooth" | "s" | "cyclic" => {
                 if vars.is_empty() {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!("smooth()/s() requires at least one variable: {raw}"),
                     }
                     .into());
                 }
-                // mgcv idiom: `s(g, bs='re')` with a single variable is a
-                // random intercept on the factor `g`. Route it to the
+                // `s(g, bs='re')` with a single variable is a random
+                // intercept on the factor `g`. Route it to the
                 // dedicated random-effect machinery (which expects a single
                 // categorical column) rather than to the factor-smooth path
                 // (which requires a numeric companion).
                 let bs_is_re = options
                     .get("bs")
-                    .or_else(|| options.get("type"))
                     .map(|v| {
                         v.trim()
                             .trim_matches(|c| c == '\'' || c == '"')
@@ -3513,8 +3598,8 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                         lenient_unseen: true,
                     });
                 }
-                if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {
-                    options.insert("type".to_string(), "cyclic".to_string());
+                if name == "cyclic" {
+                    fix_function_basis(&mut options, &name, "cyclic", raw)?;
                 }
                 if matches!(name.as_str(), "fs" | "sz") {
                     options.insert("bs".to_string(), name.clone());
@@ -3530,7 +3615,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                 // `s2()` is an alias for the intrinsic S² (sphere) smooth, just
                 // like `sphere()`/`sos()`/`spherical()`. All four share the
                 // Wahba/harmonic sphere basis, so they must dispatch through
-                // the identical `type=sphere` route; otherwise `s2()` would
+                // the identical `bs=sphere` route; otherwise `s2()` would
                 // silently fall back to a generic Euclidean 2-D smooth over
                 // (lat, lon) and diverge in the spatial-kappa optimizer.
                 if vars.len() != 2 {
@@ -3542,7 +3627,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                options.insert("type".to_string(), "sphere".to_string());
+                fix_function_basis(&mut options, &name, "sphere", raw)?;
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -3550,19 +3635,17 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "mjs" | "measurejet" | "measure_jet" | "web" => {
+            "mjs" => {
                 // Measure-jet spline smooth (`basis::measure_jet_smooth` docs)
                 // for responses varying along an unknown low-dimensional set
-                // inside a higher-dimensional ambient space. All aliases
-                // dispatch through the identical `type=measurejet` route,
-                // mirroring the sphere/curvature alias rule.
+                // inside a higher-dimensional ambient space.
                 if vars.is_empty() {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!("{name}() requires at least one variable: {raw}"),
                     }
                     .into());
                 }
-                options.insert("type".to_string(), "measurejet".to_string());
+                fix_function_basis(&mut options, &name, "mjs", raw)?;
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -3570,19 +3653,17 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "curv" | "curvature" | "constant_curvature" | "mkappa" => {
+            "curv" => {
                 // Constant-curvature (M_κ) geodesic-kernel smooth (#944): the
                 // κ-generic sibling of sphere()/s2(), interpolating
-                // S^d → ℝ^d → H^d through `kappa=` (default 0 = flat). All
-                // four aliases must dispatch through the identical
-                // `type=curvature` route, mirroring the sphere alias rule.
+                // S^d → ℝ^d → H^d through `kappa=` (default 0 = flat).
                 if vars.is_empty() {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!("{name}() requires at least one variable: {raw}"),
                     }
                     .into());
                 }
-                options.insert("type".to_string(), "curvature".to_string());
+                fix_function_basis(&mut options, &name, "curv", raw)?;
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -3597,7 +3678,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                options.insert("type".to_string(), "matern".to_string());
+                fix_function_basis(&mut options, &name, "matern", raw)?;
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -3617,7 +3698,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                 {
                     options.insert("cyclic".to_string(), "true".to_string());
                 }
-                options.insert("type".to_string(), "duchon".to_string());
+                fix_function_basis(&mut options, &name, "duchon", raw)?;
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -3632,7 +3713,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                options.insert("type".to_string(), "pca".to_string());
+                fix_function_basis(&mut options, &name, "pca", raw)?;
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -3729,7 +3810,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options(
                     "linear",
                     &options,
-                    &["min", "lower", "max", "upper", "double_penalty"],
+                    &["min", "max", "double_penalty"],
                     raw,
                 )?;
                 let (coefficient_min, coefficient_max) =
@@ -3786,7 +3867,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/periodic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), t2(), ti(), fs(), sz(), group()/re()/factor()/C(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), slope(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), nonnegative(), nonpositive(), smooth()/s(), cyclic(), thinplate()/thin_plate()/tps(), te(), t2(), ti(), fs(), sz(), group(), factor()/C(), sphere()/sos()/spherical(), s2(), matern(), duchon(), mjs(), curv(), pca(), slope(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }
@@ -3904,13 +3985,19 @@ pub fn parse_link_choice(
 /// Parse a link name through the canonical vocabulary in
 /// [`LinkFunction::from_name`]; the error lists [`LinkFunction::ALL`].
 pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
-    LinkFunction::from_name(v).ok_or_else(|| FormulaDslError::UnknownIdentifier {
-        reason: format!(
-            "{}, blended(...)/mixture(...) or flexible(...). \
-             The formula term `link(type=<type>)`, the mgcv-style `family(<type>)` and \
-             Python's `link=` accept the same set.",
-            gam_problem::types::UnknownLinkName(v.trim().to_string())
-        ),
+    LinkFunction::from_name(v).ok_or_else(|| {
+        let unknown = gam_problem::types::UnknownLinkName(v.trim().to_string());
+        FormulaDslError::UnknownIdentifier {
+            reason: if LinkFunction::canonical_for_unknown(v).is_some() {
+                unknown.to_string()
+            } else {
+                format!(
+                    "{unknown}, blended(...)/mixture(...) or flexible(...). \
+                     The formula term `link(type=<type>)`, the parenthesized \
+                     `family(<type>)` and Python's `link=` accept the same set."
+                )
+            },
+        }
     })
 }
 

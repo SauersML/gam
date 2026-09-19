@@ -1186,7 +1186,7 @@ pub(crate) fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
 // ── #1606: NB location-scale (GAMLSS-style joint mean/dispersion) inner solve ──
 //
 // Regression for gam#1606: a negative-binomial location-scale fit
-// (`family="nb"` + a dispersion smooth) ABORTED at fit time with an
+// (`family="negative-binomial"` + a dispersion smooth) ABORTED at fit time with an
 // `IntegrationError` on well-posed heteroscedastic count data, while every
 // sibling path (plain NB, Gaussian-LS, Gamma-LS) fit the same design. Root
 // cause: the NB dispersion (log-θ) block assembled its IRLS curvature from the

@@ -6,7 +6,7 @@
 //! the predictive-accuracy case). We make a deterministic train/test split of
 //! the canonical `lidar` benchmark — every 5th row (by ascending `range`) is
 //! held out as the test set, the remainder is training — fit gam's smooth
-//! `logratio ~ s(range, bs='tp')` on the training rows only, predict at the
+//! `logratio ~ s(range, bs='tps')` on the training rows only, predict at the
 //! held-out `range` values, and assert:
 //!
 //!   1. ABSOLUTE held-out accuracy: test R^2 >= 0.55. The lidar signal is a
@@ -121,7 +121,7 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla() {
         ..FitConfig::default()
     };
     let result =
-        fit_from_formula("logratio ~ s(range, bs='tp')", &train_ds, &cfg).expect("gam fit");
+        fit_from_formula("logratio ~ s(range, bs='tps')", &train_ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit");
     };
@@ -341,7 +341,7 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla_on_real_data() {
         ..FitConfig::default()
     };
     let result =
-        fit_from_formula("logratio ~ s(range, bs='tp')", &train_ds, &cfg).expect("gam fit");
+        fit_from_formula("logratio ~ s(range, bs='tps')", &train_ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit");
     };

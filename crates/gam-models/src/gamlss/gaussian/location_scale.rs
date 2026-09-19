@@ -945,7 +945,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// (Matérn/GP) location-scale path already classifies the family as
     /// `GaussianLocationScale`; this override extends that same correct
     /// classification to the NON-spatial (thin-plate / P-spline) rho-only path,
-    /// which is the one a `s(x, bs='tp')` location-scale fit actually takes. The
+    /// which is the one a `s(x, bs='tps')` location-scale fit actually takes. The
     /// `GaussianLocationScale` profile reuses Gaussian's flexible seed grid (which
     /// reaches the low-λ scale basin) and Gaussian's lowest-cost keep-best (no
     /// smoothing-biased tie-break), while still taking the interior-extreme seed
