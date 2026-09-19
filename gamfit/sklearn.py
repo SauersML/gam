@@ -139,6 +139,16 @@ class _BaseGAMEstimator(BaseEstimator):
                 del self.feature_names_in_
         else:
             self.feature_names_in_ = np.asarray(feature_names, dtype=object)
+        if isinstance(self.model_, Model):
+            # sklearn fitted attributes: the fitted Model's Rust summary fields.
+            self.coef_ = self.model_.coefficients
+            self.edf_ = self.model_.edf_total
+            self.n_iter_ = self.model_.outer_iterations
+        else:
+            # A refit to a multinomial model must not keep a previous fit's.
+            for attribute in ("coef_", "edf_", "n_iter_"):
+                if hasattr(self, attribute):
+                    delattr(self, attribute)
         return self
 
     def _serving_table(self, X: Any) -> Any:

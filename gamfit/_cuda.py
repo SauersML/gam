@@ -253,12 +253,15 @@ def assert_no_cuda_library_conflicts(context: str) -> None:
     cause discoverable; if it doesn't (the typical case), gamfit just works.
     """
 
-    diag = CudaDiagnostics.from_mapping(cuda_diagnostics())
-    if not diag.conflicts:
+    # A conflict is read off ``/proc/self/maps`` alone. The rest of the
+    # diagnostics snapshot (packaged and system stacks on disk) is only
+    # rendered into the warning, so it is built only when there is one.
+    mapped = _mapped_cuda_libraries()
+    conflicts = {family: paths for family, paths in mapped.items() if len(paths) > 1}
+    if not conflicts:
         return
     key = "|".join(
-        f"{name}:{','.join(sorted(paths))}"
-        for name, paths in sorted(diag.conflicts.items())
+        f"{name}:{','.join(sorted(paths))}" for name, paths in sorted(conflicts.items())
     )
     if key in _CUDA_CONFLICT_WARNED:
         return

@@ -76,7 +76,7 @@ def _sweep() -> list[dict[str, float]]:
                 # conservative full basis dimension rather than the tight edf1.
                 # The tight-band assertion below therefore only applies to
                 # CONVERGED fits; the pure-noise flat fits routinely stall.
-                "converged": int(summary.iterations) < 200,
+                "converged": int(model.outer_iterations) < 200,
             }
         )
     return out
@@ -169,7 +169,7 @@ def test_nonconverged_flat_fit_is_not_flagged_significant() -> None:
         summary = model.summary()
         rec = model.smooth_significance({"x": list(x), "y": list(y)})[0]
         p = float(rec["p_value_corrected"])
-        if int(summary.iterations) >= 200:  # the stall signature
+        if int(model.outer_iterations) >= 200:  # the stall signature
             stalls += 1
             if worst is None or p < worst[1]:
                 worst = (seed, p, float(rec["statistic_lr"]), float(rec["ref_df"]))

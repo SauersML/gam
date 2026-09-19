@@ -470,81 +470,77 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
     // arrays.  Parallel evaluation stays O(n), while the ordered scan below
     // deterministically reports the smallest bad row and guarantees atomic
     // output on error.
-    let certified: Vec<Result<(f64, f64, f64), EstimationError>> = (0..n)
-        .into_par_iter()
-        .map(|i| -> Result<(f64, f64, f64), EstimationError> {
-            let eta_used = eta[i];
-            if !(priorweights[i].is_finite() && priorweights[i] >= 0.0) {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "prior weight",
-                    eta: eta_used,
-                    value: priorweights[i],
-                });
-            }
-            if priorweights[i] == 0.0 {
-                return Ok((0.0, 0.0, 0.0));
-            }
-            // Every jet and every variance carrier is evaluated at this exact
-            // eta.  A non-representable tail is refused below rather than
-            // projected onto a different Hessian surface.
-            let jet =
-                crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
-            let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                inverse_link,
-                eta_used,
-            )?;
-            let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-                inverse_link,
-                eta_used,
-                jet.mu,
-            );
-            let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
-                weight_family,
-                weight_link,
-                y[i],
-                jet.mu,
-                one_minus_mu,
-                phi,
-                priorweights[i],
-                jet,
-                h4,
-            );
-            // A *finite* but non-positive observed weight is NOT a failure: the
-            // observed information `W_obs = W_Fisher - (y-μ)·B` legitimately goes
-            // indefinite on individual rows for a non-canonical link (probit,
-            // cloglog, SAS, and — critically for #1598 — a blended/mixture link)
-            // whenever a residual flips the correction's sign.  Signed row
-            // weights are assembled exactly; the matrix-level ridge handles a
-            // non-PD aggregate without modifying these statistical carriers.
-            if !w_obs.is_finite() {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "observed Hessian weight",
-                    eta: eta_used,
-                    value: w_obs,
-                });
-            }
-            if !c_obs.is_finite() {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "observed Hessian dW/deta",
-                    eta: eta_used,
-                    value: c_obs,
-                });
-            }
-            if !d_obs.is_finite() {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "observed Hessian d2W/deta2",
-                    eta: eta_used,
-                    value: d_obs,
-                });
-            }
-            Ok((w_obs, c_obs, d_obs))
-        })
-        .collect();
-    let certified: Vec<(f64, f64, f64)> = certified.into_iter().collect::<Result<_, _>>()?;
+    let certified: Vec<(f64, f64, f64)> = super::par_certified_rows(n, |i| -> Result<(f64, f64, f64), EstimationError> {
+        let eta_used = eta[i];
+        if !(priorweights[i].is_finite() && priorweights[i] >= 0.0) {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "prior weight",
+                eta: eta_used,
+                value: priorweights[i],
+            });
+        }
+        if priorweights[i] == 0.0 {
+            return Ok((0.0, 0.0, 0.0));
+        }
+        // Every jet and every variance carrier is evaluated at this exact
+        // eta.  A non-representable tail is refused below rather than
+        // projected onto a different Hessian surface.
+        let jet =
+            crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
+        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+            inverse_link,
+            eta_used,
+        )?;
+        let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+            inverse_link,
+            eta_used,
+            jet.mu,
+        );
+        let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
+            weight_family,
+            weight_link,
+            y[i],
+            jet.mu,
+            one_minus_mu,
+            phi,
+            priorweights[i],
+            jet,
+            h4,
+        );
+        // A *finite* but non-positive observed weight is NOT a failure: the
+        // observed information `W_obs = W_Fisher - (y-μ)·B` legitimately goes
+        // indefinite on individual rows for a non-canonical link (probit,
+        // cloglog, SAS, and — critically for #1598 — a blended/mixture link)
+        // whenever a residual flips the correction's sign.  Signed row
+        // weights are assembled exactly; the matrix-level ridge handles a
+        // non-PD aggregate without modifying these statistical carriers.
+        if !w_obs.is_finite() {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "observed Hessian weight",
+                eta: eta_used,
+                value: w_obs,
+            });
+        }
+        if !c_obs.is_finite() {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "observed Hessian dW/deta",
+                eta: eta_used,
+                value: c_obs,
+            });
+        }
+        if !d_obs.is_finite() {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "observed Hessian d2W/deta2",
+                eta: eta_used,
+                value: d_obs,
+            });
+        }
+        Ok((w_obs, c_obs, d_obs))
+    })?;
     for (i, &(w, c, d)) in certified.iter().enumerate() {
         hessian_weights[i] = w;
         hessian_c[i] = c;
