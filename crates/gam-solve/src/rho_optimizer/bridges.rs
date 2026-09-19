@@ -2955,12 +2955,22 @@ impl OuterSecondOrderBridge<'_> {
         // curvature-resolvability rung becomes the deciding test (#2817). The
         // deferral above is unchanged; what follows is the adjudication it was
         // always waiting for and never had.
-        if adjudicate_second_order {
-            let verdict =
-                self.curvature_stationary_exit(x, cost, gradient, hessian.as_ref(), hessian_psd, evidence.as_ref());
-            if verdict.is_some() {
-                return verdict;
-            }
+        //
+        // The Newton-decrement verdict (#2954) needs no such wait: it is the
+        // certificate's own stationarity decision, so it is taken at every
+        // evaluated point and stops the run the first time it certifies. Only
+        // the curvature-resolvability rung is held for a filled window.
+        let verdict = self.curvature_stationary_exit(
+            x,
+            cost,
+            gradient,
+            hessian.as_ref(),
+            hessian_psd,
+            evidence.as_ref(),
+            adjudicate_second_order,
+        );
+        if verdict.is_some() {
+            return verdict;
         }
         // Neither test accepted the point, so continuing needs evidence that
         // continuing buys something. Without it the run stops at its incumbent
@@ -3034,6 +3044,19 @@ impl OuterSecondOrderBridge<'_> {
     /// descent — inflates `gᵀH⁻¹g` and is rejected, and only a residual that is
     /// small along the well-curved directions and nearly orthogonal to the flat
     /// ones passes.
+    ///
+    /// The two rungs are taken at different times. The verdict is the
+    /// certificate's stationarity decision itself, so it is taken at every
+    /// point the guard folds in: a search that has reached a point its
+    /// certificate accepts gains nothing by walking on. On a smoothing
+    /// parameter penalized out of the fit the REML gradient decays as `e^{−ρ}`
+    /// and ARC's Newton step is exactly one e-fold, so each step buys only
+    /// `(1 − e^{−1})` of the decrease left; waiting for a filled stall window
+    /// walked about five e-folds past the first certified point (Gaussian `s(x)`
+    /// at n = 10⁴: certified at ρ ≈ 19.6, stopped at ρ ≈ 22.7). The
+    /// curvature-resolvability rung is not the certificate's decision where a
+    /// verdict is taken, only its fallback, and it decides only once the
+    /// criterion has stopped moving (`criterion_stalled`, a filled window).
     fn curvature_stationary_exit(
         &mut self,
         x: &Array1<f64>,
@@ -3042,6 +3065,7 @@ impl OuterSecondOrderBridge<'_> {
         hessian: Option<&Array2<f64>>,
         hessian_psd: Option<bool>,
         evidence: Option<&crate::estimate::outer_eval_capture::CertificateEvidence>,
+        criterion_stalled: bool,
     ) -> Option<ObjectiveEvalError> {
         let floor = self.curvature_stationary_floor?;
         if hessian_psd != Some(true) || !cost.is_finite() || !floor.is_finite() || floor <= 0.0 {
@@ -3094,6 +3118,9 @@ impl OuterSecondOrderBridge<'_> {
                 format!("Newton-decrement verdict {verdict:?} (bound {bound:.3e})")
             }
             None => {
+                if !criterion_stalled {
+                    return None;
+                }
                 // The decrement travels with the verdict (#2817, #1082).
                 // `hessian_psd` was judged at the criterion's curvature
                 // resolution, so a negative eigenvalue below that resolution is

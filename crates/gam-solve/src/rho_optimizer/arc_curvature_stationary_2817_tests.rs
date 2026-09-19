@@ -769,17 +769,17 @@ fn the_online_stop_declines_a_point_the_certificates_verdict_refuses_2954() {
     );
 }
 
-/// POSITIVE CONTROL: the verdict stops the loop where it certifies.
-///
-/// The criterion's `½·log|H_β|` channel comes from a factor whose forward error
-/// is `1e-4`, which charges `5e-5` to the objective band, leaving the decrement
-/// `τ_stat − 5e-5 ≈ 4.5e-4` of the statistical resolution `τ_stat = 5e-4` at
-/// `1e3` rows. `|g| = 5e-3` is a decrement of `2.5e-5`, inside that tolerance, so
-/// the certificate accepts the point and the loop halts there, above the claim
-/// band the guard reads as KKT-stationary.
-#[test]
-fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
-    const GRADIENT: f64 = 5.0e-3;
+/// The residual of the certifying fixture: above the claim band, inside the
+/// verdict's tolerance.
+const CERTIFIED_GRADIENT_2954: f64 = 5.0e-3;
+
+/// A `1e3`-row route and the evidence of a point its verdict certifies at
+/// [`CERTIFIED_GRADIENT_2954`] against unit curvature, with both preconditions
+/// checked.
+fn certifying_verdict_2954() -> (
+    OuterConfig,
+    crate::estimate::outer_eval_capture::CertificateEvidence,
+) {
     let config = sized_claim_band_config_2954(VERDICT_ROWS_2954);
     let criterion = crate::estimate::outer_eval_capture::CertificateCriterion {
         cost: COST_2817,
@@ -792,11 +792,11 @@ fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
     let factor = crate::estimate::outer_eval_capture::InnerFactorCondition {
         logdet_forward_error: 1.0e-4,
     };
-    let evidence = published_evidence_2954(GRADIENT, Some((criterion, factor)));
+    let evidence = published_evidence_2954(CERTIFIED_GRADIENT_2954, Some((criterion, factor)));
     let decision = crate::rho_optimizer::decrement_bands::outer_decrement_verdict(
         &config,
         &array![[1.0]],
-        &array![GRADIENT],
+        &array![CERTIFIED_GRADIENT_2954],
         &[],
         COST_2817,
         &evidence,
@@ -807,9 +807,26 @@ fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
         "fixture precondition: the certificate accepts this point on its verdict: {:?}",
         decision.verdict
     );
-    assert!(GRADIENT > CLAIM_BAND_2817, "the stop must not come from the claim band");
+    assert!(
+        CERTIFIED_GRADIENT_2954 > CLAIM_BAND_2817,
+        "the stop must not come from the claim band"
+    );
+    (config, evidence)
+}
 
-    let (outcomes, published) = drive_flat_stall_with_verdict_2954(GRADIENT, &config, evidence);
+/// POSITIVE CONTROL: the verdict stops the loop where it certifies.
+///
+/// The criterion's `½·log|H_β|` channel comes from a factor whose forward error
+/// is `1e-4`, which charges `5e-5` to the objective band, leaving the decrement
+/// `τ_stat − 5e-5 ≈ 4.5e-4` of the statistical resolution `τ_stat = 5e-4` at
+/// `1e3` rows. `|g| = 5e-3` is a decrement of `2.5e-5`, inside that tolerance, so
+/// the certificate accepts the point and the loop halts there, above the claim
+/// band the guard reads as KKT-stationary.
+#[test]
+fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
+    let (config, evidence) = certifying_verdict_2954();
+    let (outcomes, published) =
+        drive_flat_stall_with_verdict_2954(CERTIFIED_GRADIENT_2954, &config, evidence);
     assert_eq!(
         outcomes.last().expect("ran").clone().err().as_deref(),
         Some(ARC_CURVATURE_STATIONARY_SENTINEL),
@@ -818,6 +835,63 @@ fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
     let published = published.expect("the halt publishes its point");
     assert!(published.converged);
     assert_eq!(published.value, COST_2817);
+}
+
+/// The verdict is taken at every evaluated point, not only once a stall window
+/// has filled.
+///
+/// A criterion still falling by a unit each step never fills the window, yet the
+/// first point it reaches is one its certificate accepts on the verdict. Walking
+/// on buys nothing the certificate can resolve, and on a smoothing parameter
+/// penalized out of the fit that walk is linear: the REML gradient decays as
+/// `e^{−ρ}` and each ARC step is one e-fold. Gated behind the window, the
+/// Gaussian `s(x)` fit at n = 10⁴ certified at ρ ≈ 19.6 and stopped at ρ ≈ 22.7,
+/// about five evaluations per seed for nothing.
+#[test]
+fn a_descending_search_stops_at_the_first_point_its_verdict_certifies_2954() {
+    let (config, evidence) = certifying_verdict_2954();
+    let samples = descending_2817(array![CERTIFIED_GRADIENT_2954], ARC_COST_STALL_WINDOW + 3);
+    let (outcomes, published) = drive_arc_oracle_publishing_2817(
+        vec![array![0.5]; samples.len()],
+        samples,
+        array![[1.0]],
+        wide_box_2817(1),
+        Some(FLOOR_2817),
+        |_| COST_2817,
+        Some((&config, evidence)),
+    );
+    assert_eq!(
+        outcomes,
+        vec![Err(ARC_CURVATURE_STATIONARY_SENTINEL.to_string())],
+        "the first evaluated point the verdict certifies must halt ARC, with no window filled"
+    );
+    let published = published.expect("the halt publishes its point");
+    assert!(published.converged);
+    assert_eq!(published.value, COST_2817);
+}
+
+/// CONTROL: the curvature-resolvability rung still waits for a stalled
+/// criterion. The same descending search on a route that takes no verdict, whose
+/// every point is inside the rung's tolerance, is never halted on it.
+#[test]
+fn where_no_verdict_is_taken_a_descending_search_is_not_halted_2954() {
+    let config = claim_band_config_2817(CLAIM_BAND_2817);
+    let evidence = published_evidence_2954(STOP_GRAD_2817, None);
+    let samples = descending_2817(array![STOP_GRAD_2817], ARC_COST_STALL_WINDOW + 3);
+    let (outcomes, published) = drive_arc_oracle_publishing_2817(
+        vec![array![0.5]; samples.len()],
+        samples,
+        array![[1.0]],
+        wide_box_2817(1),
+        Some(FLOOR_2817),
+        |_| COST_2817,
+        Some((&config, evidence)),
+    );
+    assert!(
+        outcomes.iter().all(|o| o.is_ok()),
+        "a descending search the verdict does not decide must never be halted: {outcomes:?}"
+    );
+    assert!(published.is_none_or(|exit| !exit.converged));
 }
 
 /// Where no verdict is taken the certificate's `else` branch, the
