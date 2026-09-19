@@ -174,6 +174,14 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
         nuts.converged,
         nuts.warmup_transitions
     );
+    match nuts.sampler.acceptance_rate() {
+        Some(rate) => cli_out!(
+            "  sampler: {}  acceptance rate={:.4}",
+            nuts.sampler.label(),
+            rate
+        ),
+        None => cli_out!("  sampler: {}", nuts.sampler.label()),
+    }
 
     // Write per-coefficient posterior summary (mean, std, 95% CI) to CSV.
     let summary_path = out.with_extension("summary.csv");

@@ -36,6 +36,10 @@ pub fn render_summary_text(summary: &SummaryPayload) -> String {
     line("Link function", summary.link.clone());
     line("Formula", summary.formula.clone());
     line("Model class", summary.model_class.clone());
+    // The spline scan certifies no optimizer and so names no estimator.
+    if let Some(convergence) = &summary.convergence {
+        line("Estimator", convergence.estimator.text.clone());
+    }
     if let Some(n) = summary.n_obs {
         line("n", n.to_string());
     }
@@ -202,6 +206,12 @@ fn smooth_table(summary: &SummaryPayload, out: &mut String) {
         .collect::<Vec<_>>();
     out.push_str("Approximate significance of smooth terms:\n");
     write_table(out, &header, &rows);
+    for row in &summary.smooth_terms {
+        if let Some(reason) = row.p_value_unavailable {
+            writeln!(out, "  {}: {}", row.name, reason.explanation())
+                .expect("writing to a String cannot fail");
+        }
+    }
     // #2901: a term spending an uncertified penalty block publishes its EDF
     // unclamped, and says so here rather than in a number that looks clamped.
     for row in &summary.smooth_terms {
@@ -317,9 +327,10 @@ fn convergence_text(convergence: &SummaryConvergence) -> String {
 mod tests {
     use super::*;
     use crate::inference::saved_summary::{
-        SummaryInformationCriteria, SummaryOuterCertificate, SummaryParametricTermRow,
-        SummarySmoothTermRow,
+        SummaryEstimator, SummaryInformationCriteria, SummaryOuterCertificate,
+        SummaryParametricTermRow, SummarySmoothTermRow,
     };
+    use gam_solve::estimate::SmoothPValueUnavailable;
 
     fn smooth_row(name: &str, edf: f64, label: Option<&str>) -> SummarySmoothTermRow {
         SummarySmoothTermRow {
@@ -331,6 +342,7 @@ mod tests {
             p_value: Some(3.1e-7),
             lambdas: vec![0.0125],
             edf_rank_bound: label.map(str::to_string),
+            p_value_unavailable: None,
         }
     }
 
@@ -407,6 +419,11 @@ mod tests {
                     hessian_psd: Some(true),
                     lambdas_railed: Vec::new(),
                 }),
+                estimator: SummaryEstimator {
+                    name: "penalized likelihood".to_string(),
+                    reason: None,
+                    text: "penalized likelihood".to_string(),
+                },
             }),
         }
     }
@@ -418,6 +435,7 @@ Family: Gaussian Identity
 Link function: identity
 Formula: y ~ x1 + s(x2)
 Model class: standard
+Estimator: penalized likelihood
 n: 100
 
 Parametric coefficients:
@@ -466,6 +484,26 @@ Convergence: certified; inner P-IRLS: Converged; 7 outer iterations; analytic_gr
             "{text}"
         );
         assert!(!text.contains("s(x1): rank bound"), "{text}");
+    }
+
+    /// The printed summary names why a shape-constrained smooth has no p-value
+    /// beside the table, so a blank p-value column is never read as "not
+    /// significant".
+    #[test]
+    fn the_summary_names_a_withheld_shape_pvalue() {
+        let mut summary = fixed_small_model();
+        let mut constrained = smooth_row("s(x2)", 2.5, None);
+        constrained.chi_sq = None;
+        constrained.statistic = None;
+        constrained.p_value = None;
+        constrained.p_value_unavailable = Some(SmoothPValueUnavailable::ShapeConstrained);
+        summary.smooth_terms = vec![smooth_row("s(x1)", 3.2, None), constrained];
+        let text = render_summary_text(&summary);
+        assert!(
+            text.contains("s(x2): shape-constrained: the null f = 0 is the apex"),
+            "{text}"
+        );
+        assert!(!text.contains("s(x1): shape-constrained"), "{text}");
     }
 
     /// Every absent quantity prints the reason the payload gives, never a number.

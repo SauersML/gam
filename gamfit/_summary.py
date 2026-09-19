@@ -299,7 +299,11 @@ class Summary:
         smooths — ``chi_sq`` (Wood 2013 rank-truncated Wald statistic),
         ``statistic`` (``chi_sq`` on the :attr:`smooth_statistic` scale) and
         ``p_value``. Random-effect smooths report ``edf``
-        only. Empty when the model has no smooth or random-effect terms; every
+        only. A shape-constrained smooth (``shape=...``) has no ``chi_sq`` or
+        ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
+        instead, because its null ``f = 0`` is the apex of the constraint cone
+        and no calibrated reference exists for the truncated posterior mean.
+        Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
         Why :attr:`smooth_terms` could not be built (a model saved without its
@@ -453,7 +457,14 @@ class Summary:
     #: ``None`` when no smoothing coordinate was optimized, else a mapping with
     #: ``kind``, ``gradient_norm``, ``projected_gradient_norm``,
     #: ``stationarity_bound``, ``hessian_psd`` and ``lambdas_railed``.
+    #: ``estimator`` names the objective the coefficients are the mode of:
+    #: ``name`` (``"penalized likelihood"`` or ``"penalized likelihood with
+    #: Jeffreys prior"``), ``reason`` (why the Jeffreys prior is in it, else
+    #: ``None``) and ``text`` (the line every surface prints).
     convergence: dict[str, Any] | None = None
+    #: The rendered report ``print(summary)`` shows: the same string
+    #: ``gam summary MODEL`` prints, rendered in Rust from these fields.
+    #: ``None`` for summaries that are not of a fitted model.
     text: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -542,7 +553,8 @@ class Summary:
         ``statistic``, ``p_value``, ``lambdas`` (``chi_sq`` / ``statistic`` /
         ``p_value`` are absent for random-effect smooths and any
         shape-constrained term, matching the engine, which only computes the
-        Wood Wald test for ordinary penalized smooths).
+        Wood Wald test for ordinary penalized smooths). A shape-constrained row
+        adds a ``p_value_unavailable`` column naming the reason.
         """
         import pandas as pd
 

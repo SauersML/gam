@@ -621,6 +621,7 @@ fn empty_termspec() -> TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     }
 }
 
@@ -4135,6 +4136,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4175,6 +4177,7 @@ fn does_notwarn_for_singlemultivariate_matern_spatial_term() {
             shape: gam::smooth::ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4226,6 +4229,7 @@ fn warns_for_repeated_univariate_thinplate_spatial_terms() {
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string()];
 
@@ -4274,6 +4278,7 @@ fn warns_for_linear_terms_overlappingwith_smoothvariables() {
             shape: gam::smooth::ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4337,6 +4342,7 @@ fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string()];
 
@@ -5712,6 +5718,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         mean.view(),
         Some(mean.view()),
         Some(sigma.view()),
+        &[],
         None,
         None,
         None,
@@ -5752,6 +5759,7 @@ fn location_scale_map_prediction_omits_the_posterior_estimand() {
         mean.view(),
         None,
         Some(sigma.view()),
+        &[],
         None,
         None,
         None,
@@ -5795,6 +5803,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
         mean.view(),
         Some(mean.view()),
         Some(sigma.view()),
+        &[],
         Some(std_error.view()),
         Some(mean_lower.view()),
         Some(mean_upper.view()),

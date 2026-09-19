@@ -43,7 +43,9 @@
 //! for them, so Python drops them. Surfacing them there is now a field mapping
 //! rather than a second implementation.
 
-use crate::estimate::summary::{SmoothTermSummary, compute_continuous_smoothness_order};
+use crate::estimate::summary::{
+    SmoothPValueUnavailable, SmoothTermSummary, compute_continuous_smoothness_order,
+};
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_terms::basis::{BasisMetadata, PenaltySource};
 use gam_terms::inference::smooth_test::{
@@ -159,6 +161,7 @@ pub fn smooth_term_summary_rows(
             basis_note: None,
             edf_rank_bound,
             lambdas,
+            pvalue_unavailable: None,
         });
     }
 
@@ -188,7 +191,8 @@ pub fn smooth_term_summary_rows(
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k);
         let lambdas = term_lambdas(fit, penalty_cursor, k);
         penalty_cursor += k;
-        let smooth_test = if term.shape == ShapeConstraint::None {
+        let pvalue_unavailable = smooth_pvalue_unavailable(term.shape);
+        let smooth_test = if pvalue_unavailable.is_none() {
             cov_forwald.and_then(|cov| {
                 wood_smooth_test(SmoothTestInput {
                     beta: fit.beta.view(),
@@ -228,6 +232,7 @@ pub fn smooth_term_summary_rows(
             },
             edf_rank_bound,
             lambdas,
+            pvalue_unavailable,
         });
     }
 
@@ -242,6 +247,20 @@ fn term_lambdas(fit: &UnifiedFitResult, start: usize, count: usize) -> Vec<f64> 
         .and_then(|all| all.get(start..start + count))
         .map(<[f64]>::to_vec)
         .unwrap_or_default()
+}
+
+/// The reason a smooth of this shape has no valid significance reference, if
+/// any. One predicate for every p-value surface (the Wald summary table and the
+/// likelihood-ratio `smooth_significance`), so they cannot disagree about which
+/// terms are testable.
+pub fn smooth_pvalue_unavailable(shape: ShapeConstraint) -> Option<SmoothPValueUnavailable> {
+    match shape {
+        ShapeConstraint::None => None,
+        ShapeConstraint::MonotoneIncreasing
+        | ShapeConstraint::MonotoneDecreasing
+        | ShapeConstraint::Convex
+        | ShapeConstraint::Concave => Some(SmoothPValueUnavailable::ShapeConstrained),
+    }
 }
 
 /// The label a term's EDF carries when a penalty block among its `count` blocks from

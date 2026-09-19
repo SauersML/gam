@@ -153,9 +153,14 @@ struct PredictionPayload {
     model_class: String,
     /// Response-scale point column of this class (`PredictModelClass::point_column`).
     point_column: &'static str,
-    /// Point-payload shape of this class (`PredictModelClass::point_shape`); the
-    /// Python shaper branches on it instead of the class label.
+    /// Point-payload shape of this model (`FittedModel::prediction_point_shape`);
+    /// the Python shaper branches on it instead of the class label.
     point_shape: &'static str,
+    /// Ordered point columns of a multi-curve point (`expectile_curves`: one
+    /// column per expectile level, in increasing level order). Omitted for
+    /// single-column points, which `point_column` names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_columns: Option<Vec<String>>,
     /// Inverse-link family kind tag (`identity`, `logit`, `probit`, `log`, ...).
     family: String,
     /// Provenance of the returned prediction interval (#942). Present only on
@@ -211,11 +216,14 @@ struct SamplePayload {
     /// response-scale transforms (issue #1133).
     link_spec: String,
     /// The sampler that produced the draws, stamped by that sampler itself
-    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`, `"laplace"`,
-    /// `"truncated-laplace"`, or `"conjugate-gaussian"`. Callers use it to badge
-    /// the posterior or to warn when a class has fallen back to the approximate
-    /// path.
+    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`,
+    /// `"polya-gamma-jeffreys"`, `"laplace"`, `"truncated-laplace"`, or
+    /// `"conjugate-gaussian"`. Callers use it to badge the posterior or to warn
+    /// when a class has fallen back to the approximate path.
     method: String,
+    /// Metropolis acceptance rate of the draws (`PosteriorSampler::acceptance_rate`),
+    /// present only for a sampler with an accept/reject step.
+    acceptance_rate: Option<f64>,
     /// Whether `method` targets the model's exact posterior (the MCMC routes and
     /// the closed-form conjugate Gaussian route) rather than a Gaussian
     /// approximation of it (every Laplace form).
@@ -2075,6 +2083,7 @@ fn sample_table(
     out.set_item("family_kind", payload.family_kind)?;
     out.set_item("link_spec", payload.link_spec)?;
     out.set_item("method", payload.method)?;
+    out.set_item("acceptance_rate", payload.acceptance_rate)?;
     out.set_item("exact", payload.exact)?;
     out.set_item("covariance_source", payload.covariance_source)?;
     Ok(out.unbind())
@@ -6213,6 +6222,7 @@ mod prediction_payload_tests {
             model_class: "standard".to_string(),
             point_column: "posterior_mean",
             point_shape: "estimand_explicit",
+            point_columns: None,
             family: "identity".to_string(),
             interval_method: None,
             covariance_source: Some("smoothing-corrected".to_string()),
@@ -6248,6 +6258,7 @@ mod prediction_payload_tests {
             model_class: "bernoulli marginal-slope".to_string(),
             point_column: "posterior_mean",
             point_shape: "estimand_explicit",
+            point_columns: None,
             family: "probit".to_string(),
             interval_method: None,
             covariance_source: None,

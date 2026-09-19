@@ -1547,7 +1547,7 @@
     "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call (duchon_thinplate.rs compute_geometric_constraint_transform) whose penalty result both bspline_build.rs callers bind to `_`; every other occurrence is a test or a comment. In the landing tree the name has 0 occurrences outside this ledger. cargo check --workspace --all-targets RC 0; gam-terms basis::tests::test_geometric_constraint_transform_{orthogonality,dimensions} and knot_scale_invariance_tests pass; gam-linalg-test-support 13/13 including coefficient_difference_penalty_matches_closed_form_second_difference_gram."
   },
   {
-    "base": "e110c67a94b801ddc9cc3756a3d0c61dada87550",
+    "base": "9af3c66f1b41be4a15471901d1b46e1b4e590fff",
     "items": [
       "crates/gam-cli/src/main/model_summary.rs:fn:build_model_summary",
       "crates/gam-pyffi/src/io/summary_render.rs:fn:summary_format_float",
@@ -1561,6 +1561,6 @@
       "crates/gam-solve/src/estimate/summary.rs:struct:ModelSummary"
     ],
     "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary text has exactly one renderer, gam_models::inference::summary_text::render_summary_text over the typed SummaryPayload, shared by `gam summary` and gamfit's Model.summary()/__str__. Removed as second implementations: the CLI's build_model_summary and gam_solve's ModelSummary with its Display fmt, format_pvalue and significance_stars (the renderer owns the p-value format and stars); pyffi's summary_criterion_row (the REML-score line is rendered in Rust now) and its three %g float helpers (gam_report::format_significant). the_summary_names_an_uncertified_terms_edf_label_2901 moved under the same name to summary_text.rs's tests against the new renderer.",
-    "evidence": "source_removal_guard.py with base e110c67a94 and head the merge commit refused exactly these ten items. crates/gam-models/src/inference/summary_text.rs defines significance_stars, format_p_value and the_summary_names_an_uncertified_terms_edf_label_2901. git grep -w finds no remaining reference to ModelSummary, build_model_summary (other than one historical doc sentence), summary_criterion_row or the three float helpers. The fmt removed is ModelSummary's own Display impl (the 1278 production occurrences are other fmt fns)."
+    "evidence": "source_removal_guard.py with base 9af3c66f1b and head the merge commit refused exactly these ten items. crates/gam-models/src/inference/summary_text.rs defines significance_stars, format_p_value and the_summary_names_an_uncertified_terms_edf_label_2901. git grep -w finds no remaining reference to ModelSummary, build_model_summary (other than one historical doc sentence), summary_criterion_row or the three float helpers. The fmt removed is ModelSummary's own Display impl (the 1278 production occurrences are other fmt fns)."
   }
 ]

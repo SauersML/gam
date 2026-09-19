@@ -4163,7 +4163,24 @@ fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
             fields.push(format!("{key}={repr}"));
         }
     }
+    if let Some(estimator) = summary_estimator_text(payload)? {
+        fields.push(format!("estimator={}", estimator.repr()?.extract::<String>()?));
+    }
     Ok(format!("Summary({})", fields.join(", ")))
+}
+
+/// `convergence.estimator.text`: the words `SummaryEstimator` renders for the
+/// objective the fit optimized. `None` for a route that certifies no optimizer.
+fn summary_estimator_text<'py>(
+    payload: &Bound<'py, PyDict>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(convergence) = payload.get_item("convergence")? else {
+        return Ok(None);
+    };
+    if convergence.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(convergence.get_item("estimator")?.get_item("text")?))
 }
 
 #[pyfunction]

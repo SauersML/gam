@@ -34,6 +34,55 @@ pub struct SmoothTermSummary {
     /// The fitted smoothing parameters of the penalty blocks this term owns, in
     /// the fit's flat layout order. Empty for an unpenalized term.
     pub lambdas: Vec<f64>,
+    /// Why `pvalue` is absent, when the absence is a refusal rather than a
+    /// missing input. `None` whenever `pvalue` is present.
+    pub pvalue_unavailable: Option<SmoothPValueUnavailable>,
+}
+
+/// Why a smooth term reports no significance p-value.
+///
+/// A reason, not a status: each variant names the property of the term that
+/// leaves no valid reference distribution, so an absent p-value is never
+/// confusable with a missing input or a term that was never tested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothPValueUnavailable {
+    /// The term is shape-constrained (`shape=` monotone, convex, concave).
+    ///
+    /// Its coefficients live in a cone `δ ≥ 0`, and the null `f ≡ 0` is the
+    /// cone's apex, so every coordinate of the null sits on the boundary.
+    /// A `χ²` or spectral reference assumes the estimate can fall on either
+    /// side of the null, which it cannot. The boundary-aware references do not
+    /// apply either:
+    ///
+    /// - The chi-bar-square law (Silvapulle & Sen 2005; Meyer 2003) is the
+    ///   null law of the cone-*projected* estimate, whose face is the active
+    ///   set. The term's estimate is the truncated posterior mean, which lies
+    ///   strictly inside the cone and has no active set.
+    /// - Conditioning on the active set is unavailable for the same reason.
+    /// - Both laws hold for a fixed, unpenalized cone. Here the penalty and its
+    ///   REML-selected λ shrink every face together, and the mixture weights
+    ///   move with them.
+    ShapeConstrained,
+}
+
+impl SmoothPValueUnavailable {
+    /// Serialized label carried into the model payload and the Python surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ShapeConstrained => "shape_constrained",
+        }
+    }
+
+    /// One-line explanation printed beside the summary table.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::ShapeConstrained => {
+                "shape-constrained: the null f = 0 is the apex of the constraint cone, so no \
+                 chi-square, spectral or chi-bar-square reference is valid for the truncated \
+                 posterior mean; no p-value is reported"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,5 +369,35 @@ pub(crate) fn compute_continuous_smoothness_order(
         nu: Some(nu),
         kappa2: Some(kappa2),
         status,
+    }
+}
+
+#[cfg(test)]
+mod pvalue_unavailable_tests {
+    use super::*;
+    use crate::estimate::smooth_pvalue_unavailable;
+    use gam_terms::smooth::ShapeConstraint;
+
+    /// Every shape constraint withholds the p-value with the typed reason, and
+    /// only the unconstrained smooth is testable.
+    #[test]
+    fn every_shape_constraint_withholds_the_smooth_pvalue() {
+        assert_eq!(smooth_pvalue_unavailable(ShapeConstraint::None), None);
+        for shape in [
+            ShapeConstraint::MonotoneIncreasing,
+            ShapeConstraint::MonotoneDecreasing,
+            ShapeConstraint::Convex,
+            ShapeConstraint::Concave,
+        ] {
+            assert_eq!(
+                smooth_pvalue_unavailable(shape),
+                Some(SmoothPValueUnavailable::ShapeConstrained),
+                "{shape:?}"
+            );
+        }
+        assert_eq!(
+            SmoothPValueUnavailable::ShapeConstrained.label(),
+            "shape_constrained"
+        );
     }
 }

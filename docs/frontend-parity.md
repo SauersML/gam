@@ -16,6 +16,7 @@ APIs such as a matrix kernel.
 | Families: auto, Gaussian, binomial (logit/probit/cloglog), Poisson, Gamma, beta, Tweedie, negative binomial, expectile | `FitConfig` / family resolver | `--family`; NB and expectile controls below | `family=` | Parity |
 | Fixed negative-binomial size | `FitConfig::negative_binomial_theta` | `--negative-binomial-theta` | `negative_binomial_theta=` | **Closed by this audit** |
 | Expectile target | `FitConfig::expectile_tau` | `--expectile-tau` | `expectile_tau=` or `expectile(tau)` family spelling | **Closed by this audit** |
+| Joint non-crossing expectile levels (location-scale `μ(x) + c_τ·σ(x)`) | `FitConfig::expectile_tau` list, `FitResult::ExpectileLocationScale`, `gam_predict::joint_expectile_curves` | `--expectile-tau 0.1,0.5,0.9`; predict writes one `expectile_{τ}` column per level | `expectile_tau=[0.1, 0.5, 0.9]`; `predict` returns `(n, K)` curves | Parity |
 | Offset, weights, persistent warm starts | shared request fields | `--offset-column`, `--weights-column`, `--persistent-warm-start-root` | `offset=`, `weights=`, `persistent_warm_start_root=` | Parity |
 | Links and flexible link | family/link resolver | binomial family variants; complete request for `link` / `flexible_link` | `link=`, `flexible_link=` | Parity through shared request |
 | Firth binomial correction | `FitConfig::firth` | `--firth` | `firth=` | Parity |
