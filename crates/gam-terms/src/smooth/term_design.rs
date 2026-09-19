@@ -1174,6 +1174,10 @@ pub struct LocalTermRealization<'a> {
     /// A Duchon term's operator-penalty request, which its penalty set is
     /// re-derived from in the collection chart; `None` for every other kind.
     pub duchon_operator_penalties: Option<&'a crate::basis::DuchonOperatorPenaltySpec>,
+    /// A B-spline term's spec, whose double-penalty ridge is charged in the
+    /// collection chart as its frozen replay charges it; `None` for every other
+    /// kind.
+    pub bspline_null_ridge: Option<&'a crate::basis::BSplineBasisSpec>,
     pub termname: &'a str,
 }
 
@@ -1218,6 +1222,7 @@ pub fn place_term_in_collection_gauge(
         linear_constraints_local,
         joint_null_rotation,
         duchon_operator_penalties,
+        bspline_null_ridge,
         termname,
     } = local;
     let realized = realize_smooth_collection_gauge(design, gauge, termname)?;
@@ -1236,6 +1241,7 @@ pub fn place_term_in_collection_gauge(
         Some(&coefficient_gauge),
         &metadata,
         duchon_operator_penalties,
+        bspline_null_ridge,
         termname,
     )?;
     let linear_constraints_local = linear_constraints_local.map(|lin| {
@@ -1270,6 +1276,21 @@ pub fn duchon_operator_penalty_request(
     }
 }
 
+/// The B-spline spec of a 1-D B-spline term, bare or under a `by=` wrapper,
+/// which [`penalties_in_collection_chart`] charges the null ridge from.
+pub fn bspline_null_ridge_request(
+    termspec: &SmoothTermSpec,
+) -> Option<&crate::basis::BSplineBasisSpec> {
+    let basis = match &termspec.basis {
+        SmoothBasisSpec::ByVariable { inner, .. } => inner.as_ref(),
+        basis => basis,
+    };
+    match basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => Some(spec),
+        _ => None,
+    }
+}
+
 /// A smooth term's penalty set in its collection's coefficient chart: the active
 /// blocks, and the dropped ones following `local_dropped`.
 ///
@@ -1298,6 +1319,7 @@ fn penalties_in_collection_chart(
     coefficient_gauge: Option<&gam_problem::Gauge>,
     placed_metadata: &BasisMetadata,
     duchon_operator_penalties: Option<&crate::basis::DuchonOperatorPenaltySpec>,
+    bspline_null_ridge: Option<&crate::basis::BSplineBasisSpec>,
     term_name: &str,
 ) -> Result<(Vec<ActivePenalty>, Vec<DroppedPenaltyInfo>), BasisError> {
     if coefficient_gauge.is_some() && matches!(placed_metadata, BasisMetadata::Matern { .. }) {
@@ -1345,6 +1367,18 @@ fn penalties_in_collection_chart(
     }
     let candidates =
         penalty_candidates_under_collection_gauge(active_penalties, coefficient_gauge, term_name)?;
+    // A gauge rebuilt a B-spline ridge in the collection chart; charge it as the
+    // frozen replay of this chart does, so fit and rebuild agree.
+    let candidates = match bspline_null_ridge {
+        Some(spec) if coefficient_gauge.is_some() => {
+            crate::basis::charge_placed_bspline_null_ridge_along_mean_slope(
+                candidates,
+                spec,
+                placed_metadata,
+            )?
+        }
+        _ => candidates,
+    };
     // `filter_penalty_candidates` numbers its input from zero, but that input is
     // the term-local build's ACTIVE penalties, one candidate each and in order,
     // so it hands back the local build's numbering, whose dropped blocks travel
@@ -1938,6 +1972,7 @@ fn apply_global_smooth_identifiability(
             coefficient_gauge.as_ref(),
             &placed_metadata,
             duchon_operator_penalty_request(termspec),
+            bspline_null_ridge_request(termspec),
             &term.name,
         )?;
         let linear_constraints_constrained =

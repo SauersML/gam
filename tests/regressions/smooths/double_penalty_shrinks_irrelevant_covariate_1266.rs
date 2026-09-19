@@ -109,7 +109,7 @@ fn standard(fit: &FitResult) -> &gam::StandardFitResult {
 /// `smooth_start` offset; a block-local `coeff_range` is not a column index).
 fn smooth_term_edf(fit: &FitResult, needle: &str) -> f64 {
     let std_fit = standard(fit);
-    let rows = smooth_term_summary_rows(&std_fit.design, &std_fit.resolvedspec, &std_fit.fit, None);
+    let rows = smooth_term_summary_rows(&std_fit.design, &std_fit.resolvedspec, &std_fit.fit);
     rows.iter()
         .find(|row| row.name.contains(needle))
         .map(|row| row.edf)

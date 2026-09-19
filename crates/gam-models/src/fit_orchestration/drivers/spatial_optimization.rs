@@ -4270,6 +4270,11 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                             .smooth_terms
                             .get(term_idx)
                             .and_then(gam_terms::smooth::duchon_operator_penalty_request),
+                        bspline_null_ridge: self
+                            .spec
+                            .smooth_terms
+                            .get(term_idx)
+                            .and_then(gam_terms::smooth::bspline_null_ridge_request),
                         termname: &name,
                     },
                 )

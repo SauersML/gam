@@ -946,14 +946,68 @@ fn bspline_endpoint_derivative_row(
 /// and for its frozen replay: the constrained null space is the single centered
 /// linear function, on which the mean slope is nondegenerate.
 fn uses_mean_slope_ridge(spec: &BSplineBasisSpec) -> bool {
-    spec.double_penalty
-        && spec.penalty_order == 2
-        && spec.boundary_conditions.is_free()
+    frozen_replay_uses_mean_slope_ridge(spec)
         && matches!(
             spec.identifiability,
             BSplineIdentifiability::WeightedSumToZero { .. }
                 | BSplineIdentifiability::FrozenTransform { .. }
         )
+}
+
+/// Whether the frozen replay of `spec` charges its ridge along the mean slope.
+/// A freeze turns every applied chart into `FrozenTransform`, so the replay's
+/// predicate is the smooth's own shape.
+fn frozen_replay_uses_mean_slope_ridge(spec: &BSplineBasisSpec) -> bool {
+    spec.double_penalty && spec.penalty_order == 2 && spec.boundary_conditions.is_free()
+}
+
+/// Charge the double-penalty ridge of a B-spline term along the mean slope in
+/// the chart a collection gauge placed it in.
+///
+/// A gauge (the level centering of a factor `by=` smooth, a residualization
+/// against owner terms) restricts the term's penalties and rebuilds the ridge on
+/// the null space of the restricted wiggliness penalty, as `m n̂n̂ᵀ`. The freeze
+/// stores the composed raw-to-collection chart as `FrozenTransform`, and the
+/// frozen replay charges that same null function along the mean slope
+/// (`charge_null_ridge_along_mean_slope`). Without the same charge here the fit
+/// and every rebuild of the saved model (prediction, summary) carry different
+/// penalties: on `s(x, by=g)` the replayed ridge direction makes cosine 0.11 to
+/// 0.40 with the fitted one. Charging here makes the fit use the ridge the
+/// replay rebuilds, which is the one `s(x)` already uses.
+///
+/// `metadata` is the placed metadata, whose transform maps the raw basis into
+/// the collection chart the candidates live in. The charged ridge is
+/// renormalized as the local build normalizes its own.
+pub(crate) fn charge_placed_bspline_null_ridge_along_mean_slope(
+    candidates: Vec<PenaltyCandidate>,
+    spec: &BSplineBasisSpec,
+    metadata: &BasisMetadata,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let BasisMetadata::BSpline1D {
+        knots,
+        identifiability_transform: Some(transform),
+        periodic: None,
+        degree,
+        ..
+    } = metadata
+    else {
+        return Ok(candidates);
+    };
+    if !frozen_replay_uses_mean_slope_ridge(spec) {
+        return Ok(candidates);
+    }
+    let raw_mean_slope = bspline_mean_slope_row(knots, degree.unwrap_or(spec.degree))?;
+    let mut charged = Vec::with_capacity(candidates.len());
+    for candidate in
+        charge_null_ridge_along_mean_slope(candidates, Some(transform), Some(&raw_mean_slope))?
+    {
+        if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+            charged.extend(renormalize_constrained_penalty_candidates(vec![candidate])?);
+        } else {
+            charged.push(candidate);
+        }
+    }
+    Ok(charged)
 }
 
 /// Mean slope `(f(b) − f(a))/(b − a)`, the interval mean of `f'`, of
