@@ -224,7 +224,7 @@ pub fn residual_block_energies(
     frame: ArrayView2<'_, f64>,
 ) -> Result<ResidualEnergies, ResponseError> {
     require_length("residual block output dimension", block.input_dim(), block.output_dim())?;
-    let explained_mlp = block.explained_variance(frame)?;
+    let explained_mlp = block.explained_variance(frame)?.value;
     let readers = block.readers();
     let metric = block.metric();
     let metric_writers = block.metric_writers();
@@ -273,7 +273,7 @@ pub fn residual_block_energies(
     let discarded_cross_term = 2.0 * discarded_cross;
     Ok(ResidualEnergies {
         explained_variance: retained_skip + 2.0 * retained_cross + explained_mlp,
-        discarded_error: (total_skip - retained_skip) + discarded_cross_term + (block.total_variance() - explained_mlp),
+        discarded_error: (total_skip - retained_skip) + discarded_cross_term + (block.total_variance().value - explained_mlp),
         discarded_cross_term,
     })
 }

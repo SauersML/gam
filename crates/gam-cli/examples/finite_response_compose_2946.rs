@@ -1094,10 +1094,11 @@ fn compose(
             Array2::<f64>::eye(units).view(),
         )
         .map_err(|error| format!("affine stage: {error}"))?;
-        let exact_total = composed.total_variance();
+        let exact_total = composed.total_variance().value;
         let exact_discarded = composed
             .discarded_error(frame.basis.view())
-            .map_err(|error| format!("affine stage discarded error: {error}"))?;
+            .map_err(|error| format!("affine stage discarded error: {error}"))?
+            .value;
         let affine_seconds = affine_started.elapsed().as_secs_f64();
         let coupled_started = Instant::now();
         let base = standard_normal_rows(sizes.pairs, latent_dim, &mut state)?;
@@ -1330,10 +1331,12 @@ fn a3(pair_dir: &Path, law: &Path, draw_dir: &Path, executed_path: &Path, out: &
         let analytic_started = Instant::now();
         let discarded = known
             .discarded_error(frame.basis.view())
-            .map_err(|error| format!("E(P) at {spec}: {error}"))?;
+            .map_err(|error| format!("E(P) at {spec}: {error}"))?
+            .value;
         let explained = known
             .explained_variance(frame.basis.view())
-            .map_err(|error| format!("V(P) at {spec}: {error}"))?;
+            .map_err(|error| format!("V(P) at {spec}: {error}"))?
+            .value;
         let analytic_seconds = analytic_started.elapsed().as_secs_f64();
         // R2 over the whole law: `D = |F(Z) − g(P Z)|² − |F(Z) − F(Z')|²/2` has `E D = E|F̄_P − g|²`, which is 0 for
         // `g = F̄_P` and positive for the plug-in `g₀ = F(P Z)` (the positive control).
@@ -1424,10 +1427,10 @@ fn a3(pair_dir: &Path, law: &Path, draw_dir: &Path, executed_path: &Path, out: &
         "draw": layout,
         "block": block_name,
         "forward_check_float64": forward,
-        "analytic_total_variance": known.total_variance(),
+        "analytic_total_variance": known.total_variance().value,
         "mc_total_variance": total_mc,
         "mc_total_variance_se": total_se,
-        "total_z": (known.total_variance() - total_mc).abs() / total_se,
+        "total_z": (known.total_variance().value - total_mc).abs() / total_se,
         "gate_multiple": multiple,
         "comparisons": comparisons,
         "frames": frame_reports,
@@ -1444,7 +1447,7 @@ fn a3(pair_dir: &Path, law: &Path, draw_dir: &Path, executed_path: &Path, out: &
     write_json(out, &report)?;
     println!(
         "[a3] V(I) analytic {:.6e} mc {total_mc:.6e} +- {total_se:.2e}",
-        known.total_variance()
+        known.total_variance().value
     );
     Ok(())
 }

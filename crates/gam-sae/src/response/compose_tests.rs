@@ -224,10 +224,12 @@ fn affine_last_stage_composes_into_one_block_exactly() {
     .expect("the pulled-back metric of a full-column-rank stage is positive definite");
     let composed_variance = composition
         .explained_variance(frame.view())
-        .expect("V(P) of the composition");
+        .expect("V(P) of the composition")
+        .value;
     let pulled_variance = pulled
         .explained_variance(frame.view())
-        .expect("V(P) under the pulled-back metric");
+        .expect("V(P) under the pulled-back metric")
+        .value;
     // Both evaluate the same kernels at the same arguments, so only `D = Uᵀ Aᵀ M A U` is rounded differently. For
     // ReLU every bracket obeys `|K − m m| ≤ 2 √((b_j² + v_j)(b_k² + v_k))`.
     let absolute_metric = writers
