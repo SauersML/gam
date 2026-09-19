@@ -7637,3 +7637,9 @@ fn the_explicit_psi_terms_are_the_psi_derivatives_of_the_nll_2695() {
 
 /// gam#2695 degree ladder (child module so this file stays under the line gate).
 mod knot_ladder_2695;
+
+/// #3090: the direct parametric-AFT step on an indefinite Hessian.
+mod absolute_newton_3090;
+
+/// #3185: the direct parametric-AFT backtracking floor and stall.
+mod line_search_3185;

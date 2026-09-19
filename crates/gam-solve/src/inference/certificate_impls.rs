@@ -88,7 +88,7 @@ impl Certificate for OuterCriterionCertificate {
         // point that is not where the search stopped says so, and by how much.
         if let Some(polish) = self.newton_polish.as_ref() {
             e.insert("newton_polish_steps", polish.decreases.len().into());
-            e.insert("newton_polish_step_budget", polish.step_budget.into());
+            e.insert("newton_polish_settled", polish.settled.into());
             put_finite(
                 &mut e,
                 "newton_polish_lambda_sq_before",

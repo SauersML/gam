@@ -107,7 +107,6 @@ fn poisson_observation_interval_stays_within_nonnegative_support() {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )

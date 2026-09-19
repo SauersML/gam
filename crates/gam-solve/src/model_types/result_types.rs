@@ -659,6 +659,34 @@ mod per_term_edf_tests {
 /// counts as railed against its box bound.
 pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 
+/// Which exact test proved a rail face's first-order expansion positive.
+///
+/// Off a face `F` the criterion is `V_∞ + f(t) + O(|t|²)` with
+/// `f(t) = ½tr((Σ_{j∈F} A_j/t_j)⁻¹C)`, `t_j = e^{−ρ_j} ≥ 0`. `f` is
+/// homogeneous of degree one, so positivity on the closed orthant is
+/// positivity on the simplex — and two of its cases are decided exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FacePositivityRoute {
+    /// `C ≻ 0`: every compression of `C` is positive definite, so `f > 0` for
+    /// every weighting. Sufficient, not necessary.
+    PositiveForm,
+    /// The released ranges of the face penalties are linearly independent
+    /// (`Σ_j rank A_j = q`). A congruence then block-diagonalizes every `A_j`
+    /// at once, `f(t) = Σ_j c_j t_j` is exactly LINEAR, and `f > 0` on the
+    /// simplex iff every identified `c_j > 0` — the KKT test at the face.
+    IndependentRanges,
+    /// The released ranges OVERLAP, so `f` is genuinely nonlinear and neither
+    /// the per-axis slopes nor `C ≻ 0` decides it (both axis laws can be
+    /// positive while a joint release descends). The weighted parallel sum
+    /// `M(t) = (Σ_j A_j/t_j)⁻¹` is matrix-concave, so on the spectral split
+    /// `C = C₊ − C₋` the expansion is a difference of concave functions; a
+    /// simplicial branch-and-bound bounds it below on every cell (vertex values
+    /// of the concave part, a tangent plane of the subtracted one) and proves
+    /// `f > 0` on the whole simplex, each cell's bound clearing its own
+    /// rounding band.
+    SimplexBound,
+}
+
 /// What established a rail coordinate's tail law, and the standard it cleared
 /// (#2348 Inc 5 build-out).
 ///
@@ -673,9 +701,11 @@ pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RailTailEvidence {
     /// PROVEN at the face. The `λ = ∞` limit was formed exactly and the
-    /// first-order form `C` on the released subspace is positive definite, so
-    /// the criterion strictly increases for every finite smoothing parameter on
-    /// the face, and on every sub-face, at once.
+    /// criterion's first-order expansion off the face,
+    /// `V = V_∞ + ½tr((Σ_j A_j/t_j)⁻¹C) + O(|t|²)` with `t_j = e^{−ρ_j}`, is
+    /// strictly positive for every way of coming off it — every finite
+    /// smoothing parameter on the face and on every sub-face, at once.
+    /// [`FacePositivityRoute`] names which exact positivity test decided it.
     ///
     /// A coordinate whose own penalty releases nothing once the REST of the
     /// face is at `λ = ∞` is unidentified there, and the proof derives
@@ -684,11 +714,17 @@ pub enum RailTailEvidence {
     /// measurement — which is precisely why the two routes cannot share one
     /// well-formedness rule.
     AnalyticFaceProof {
-        /// `λ_min(C)`, the smallest curvature of the face's first-order form.
-        min_curvature: f64,
-        /// The floor it cleared: `q·ε·‖C‖·(1 + cond)`, the eigenvalue backward
-        /// error amplified by the `Z`-block solve that formed `C`.
-        curvature_margin: f64,
+        /// Which exact positivity test proved the face.
+        route: FacePositivityRoute,
+        /// The route's decisive statistic: `λ_min(C)` on
+        /// [`FacePositivityRoute::PositiveForm`], the binding coordinate's
+        /// analytic pencil constant `c_j` on
+        /// [`FacePositivityRoute::IndependentRanges`], the binding simplex
+        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`].
+        statistic: f64,
+        /// The rounding band that statistic had to clear, from the measured
+        /// error of forming `C` in floating point (never a tuned margin).
+        band: f64,
     },
     /// MEASURED by probing back from the rail: the pencil constant
     /// `ĉ = −e^{ρ}·∂V/∂ρ` held across a finite-difference-clean window. The
@@ -719,16 +755,16 @@ impl RailTailEvidence {
         }
         match self {
             Self::AnalyticFaceProof {
-                min_curvature,
-                curvature_margin,
+                statistic, band, ..
             } => {
                 // Re-check the proof's own inequality: `certifies()` may be
                 // asked of a DESERIALIZED certificate, where these are only
                 // numbers someone supplied.
                 tail_constant >= 0.0
-                    && min_curvature.is_finite()
-                    && curvature_margin.is_finite()
-                    && *min_curvature > *curvature_margin
+                    && statistic.is_finite()
+                    && band.is_finite()
+                    && *band >= 0.0
+                    && *statistic > *band
             }
             Self::ProbedTail { noise_floor, .. } => noise_floor.is_finite() && tail_constant > 0.0,
         }
@@ -1142,6 +1178,19 @@ pub enum CurvatureEvidence {
     /// reason: the four are acceptance-identical, and the adjudication is a
     /// statement about a run, not a property of a stored model.
     CriterionContradicted,
+    /// A Hessian was measured and reported a negative direction whose claim
+    /// the criterion **cannot resolve at any step the adjudication may take**
+    /// (#3036): even the largest step predicts a decrease `½|λ_min|·α_max²`
+    /// under the criterion's resolution, so no trial could confirm or falsify
+    /// it and none was evaluated.
+    ///
+    /// Like [`Self::CriterionContradicted`] this withdraws the matrix's verdict
+    /// without inverting it, and it is admissible: a negative direction below
+    /// the instrument's own resolution is exactly what
+    /// [`CurvatureAdmissibility::Admissible`] already admits through the
+    /// gradient-residue floor. Serializes as `null` and reloads as
+    /// [`Self::NotAvailable`], for the reason recorded on that variant.
+    CriterionUnresolvable,
 }
 
 impl CurvatureEvidence {
@@ -1153,7 +1202,20 @@ impl CurvatureEvidence {
             Self::NotSpent
             | Self::NotAvailable
             | Self::NoEstimand
-            | Self::CriterionContradicted => None,
+            | Self::CriterionContradicted
+            | Self::CriterionUnresolvable => None,
+        }
+    }
+
+    /// Whether the criterion's adjudication withdrew a measured negative
+    /// direction: it contradicted the claim over its falsifiable range
+    /// (#2612), or that range is empty (#3036). Either way the matrix is wrong
+    /// along that direction by at least `|λ_min|` at the criterion's
+    /// resolution.
+    pub fn withdrawn_by_criterion(self) -> bool {
+        match self {
+            Self::CriterionContradicted | Self::CriterionUnresolvable => true,
+            Self::Measured { .. } | Self::NotSpent | Self::NotAvailable | Self::NoEstimand => false,
         }
     }
 
@@ -1192,6 +1254,7 @@ impl std::fmt::Display for CurvatureEvidence {
             Self::NotAvailable => "n/a",
             Self::NoEstimand => "no-estimand",
             Self::CriterionContradicted => "criterion-contradicted",
+            Self::CriterionUnresolvable => "criterion-unresolvable",
         })
     }
 }
@@ -1283,21 +1346,26 @@ pub struct OuterCriterionCertificate {
 /// The mint's Newton-decrement verdict is stricter than any search stop, so the
 /// point a search hands over can still buy a decrease the arithmetic resolves.
 /// The mint takes Newton steps on the free coordinates while each lowers the
-/// criterion by more than its band, within the step budget quadratic
-/// convergence allows, and judges the point they reach. A coordinate whose
-/// Newton steps stop short of the box bound they head to is railed there when
-/// that lowers the criterion by more than its band (projected Newton), and the
-/// coordinates left free are polished on a budget of their own.
+/// criterion by more than its band and the decrement contracts, and judges the
+/// point they reach. Where only the decrease left is resolvable, not a step's,
+/// the last step is a settling step whose point must certify. A coordinate
+/// whose Newton steps contract slower than Newton's quadratic rate toward the
+/// box bound they head to is railed there when that lowers the criterion by
+/// more than its band (projected Newton), and the coordinates left free are
+/// polished on their own face.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NewtonPolishRecord {
     /// `λ̂²` at the point the search handed over.
     pub lambda_sq_before: f64,
     /// `λ̂²` at the point this certificate judged.
     pub lambda_sq_after: f64,
-    /// The criterion decrease each accepted step bought, in order.
+    /// The criterion decrease each accepted step bought, in order. A settling
+    /// step's is within the band and may be negative.
     pub decreases: Vec<f64>,
-    /// The step budget quadratic convergence allowed on the current face.
-    pub step_budget: usize,
+    /// Whether the last step was a settling step (#3012): the decrease left to
+    /// the minimum was resolvable, the full step's own model decrease was not.
+    #[serde(default)]
+    pub settled: bool,
     /// The coordinates the polish railed, in order. `#[serde(default)]` so a
     /// record stored before this field existed still deserializes.
     #[serde(default)]
@@ -1379,6 +1447,7 @@ impl OuterCriterionCertificate {
             CurvatureEvidence::CriterionContradicted => {
                 CurvatureAdmissibility::CriterionContradicted
             }
+            CurvatureEvidence::CriterionUnresolvable => CurvatureAdmissibility::Admissible,
             evidence @ (CurvatureEvidence::NotSpent
             | CurvatureEvidence::NotAvailable
             | CurvatureEvidence::NoEstimand) => CurvatureAdmissibility::Unevaluated { evidence },
@@ -1586,6 +1655,7 @@ impl OuterCriterionCertificate {
             // keeps the source honest while `hessian_psd=criterion-contradicted`
             // beside it carries what happened to it.
             CurvatureEvidence::CriterionContradicted => "terminal-analytic-contradicted",
+            CurvatureEvidence::CriterionUnresolvable => "terminal-analytic-unresolvable",
         };
         let verdict = match self.refusal() {
             None => "stationary".to_string(),
@@ -1911,7 +1981,8 @@ impl Default for FitOptions {
 mod tests_certification_refusal_2550 {
     use super::{
         CertificationRefusal, CurvatureAdmissibility, CurvatureEvidence, OuterCriterionCertificate,
-        OuterStationarityCertificate, RailCoordinate, RailFault, RailTailEvidence,
+        FacePositivityRoute, OuterStationarityCertificate, RailCoordinate, RailFault,
+        RailTailEvidence,
     };
     use crate::rho_optimizer::asymptote_certificate::AsymptoteSide;
 
@@ -1932,8 +2003,9 @@ mod tests_certification_refusal_2550 {
             value_gap: 2.6e-5,
             estimand_travel_bound: 1.0e-9,
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: 3.5,
-                curvature_margin: 1.0e-12,
+                route: FacePositivityRoute::PositiveForm,
+                statistic: 3.5,
+                band: 1.0e-12,
             },
         }
     }
@@ -2127,8 +2199,8 @@ mod tests_certification_refusal_2550 {
 #[cfg(test)]
 mod rail_tail_evidence_tests {
     use super::{
-        CurvatureEvidence, OuterCriterionCertificate, OuterStationarityCertificate, RailCoordinate,
-        RailTailEvidence,
+        CurvatureEvidence, FacePositivityRoute, OuterCriterionCertificate,
+        OuterStationarityCertificate, RailCoordinate, RailTailEvidence,
     };
     use crate::rho_optimizer::asymptote_certificate::AsymptoteSide;
 
@@ -2140,8 +2212,9 @@ mod rail_tail_evidence_tests {
             value_gap: tail_constant * (-12.0_f64).exp(),
             estimand_travel_bound: 1.0e-9,
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: 3.5,
-                curvature_margin: 1.0e-12,
+                route: FacePositivityRoute::PositiveForm,
+                statistic: 3.5,
+                band: 1.0e-12,
             },
         }
     }
@@ -2218,8 +2291,9 @@ mod rail_tail_evidence_tests {
     fn a_claimed_face_proof_below_its_own_margin_does_not_certify_2348() {
         let mut rail = proven_rail(0, 4.25);
         rail.evidence = RailTailEvidence::AnalyticFaceProof {
-            min_curvature: 1.0e-14,
-            curvature_margin: 1.0e-12,
+            route: FacePositivityRoute::PositiveForm,
+            statistic: 1.0e-14,
+            band: 1.0e-12,
         };
         assert!(
             !certificate(vec![rail]).certifies(),
@@ -4025,7 +4099,7 @@ mod assembly_inner_status_gate_tests {
                 lambda_sq_before: 1.0e-4,
                 lambda_sq_after: 0.0,
                 decreases: vec![6.3e-5],
-                step_budget: 2,
+                settled: false,
                 rails: vec![NewtonPolishRail {
                     index: 0,
                     from: 17.0,
@@ -4101,7 +4175,7 @@ mod assembly_inner_status_gate_tests {
             lambda_sq_before: 1.0e-4,
             lambda_sq_after: 0.0,
             decreases: vec![1.0e-6],
-            step_budget: 1,
+            settled: false,
             rails: Vec::new(),
             entry: vec![-17.05, 2.49],
         });
@@ -6241,6 +6315,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
             (CurvatureEvidence::NotSpent, "null"),
             (CurvatureEvidence::NoEstimand, "null"),
             (CurvatureEvidence::CriterionContradicted, "null"),
+            (CurvatureEvidence::CriterionUnresolvable, "null"),
         ] {
             let wire = serde_json::to_string(&evidence).expect("evidence serializes");
             assert_eq!(
@@ -6277,6 +6352,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
             CurvatureEvidence::NotSpent,
             CurvatureEvidence::NoEstimand,
             CurvatureEvidence::CriterionContradicted,
+            CurvatureEvidence::CriterionUnresolvable,
         ] {
             let wire = serde_json::to_string(&lossy).expect("serializes");
             let back: CurvatureEvidence = serde_json::from_str(&wire).expect("reloads");

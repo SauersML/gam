@@ -607,7 +607,9 @@ pub(crate) fn certificate_parts_capture_enabled() -> bool {
 }
 
 /// Publish one evaluation's parts to an armed capture (no-op when disarmed).
-pub(crate) fn record_certificate_parts(parts: &[RhoGradientParts]) {
+/// Public so an outer objective outside this crate publishes the same channels
+/// the REML engine does (#2954).
+pub fn record_certificate_parts(parts: &[RhoGradientParts]) {
     CERTIFICATE_EVIDENCE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.parts = parts.to_vec();
