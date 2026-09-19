@@ -11,7 +11,8 @@ It has no rule for the SPEC bans that live in the SHAPE of production code:
                constant, or a `smooth_bound*` box on a parameter
                                                         SPEC "Hand-supplied search boxes or bounds"
   jitter       ridge escalation, jitter/nugget constants, a diagonal add of a
-               jitter-named value                       SPEC "do not paper over solver issues"
+               jitter-named value or of an exponent literal (`+= 1e-10 * s`)
+                                                        SPEC "do not paper over solver issues"
   unconverged  `Ok(Struct { .., converged: false, .. })` / `Some(..)`: a result
                that reports itself unconverged handed on as a success
                                                         SPEC "A fit object must only ever come
@@ -382,6 +383,9 @@ def rule_box(text: str):
 _ESCALATE_CALL = re.compile(r"(?<!fn )\bescalate_ridge\s*\(")
 _JITTER_CONST = re.compile(r"\b(?:const|static)\s+([A-Z0-9_]*(?:JITTER|NUGGET)[A-Z0-9_]*)\s*:")
 _JITTER_DIAG = re.compile(r"\[\[\s*(\w+)\s*,\s*\1\s*\]\]\s*\+=\s*\*?\s*([\w.]*(?:jitter|nugget)\w*)", re.I)
+# A diagonal add of a small exponent literal, `h[[i, i]] += 1e-10 * scale`: a
+# ridge with a tuned magnitude whatever its variable is called.
+_LITERAL_DIAG = re.compile(r"\[\[\s*(\w+)\s*,\s*\1\s*\]\]\s*\+=\s*\(?\s*(\d+(?:\.\d*)?[eE]-\d+)")
 
 
 def rule_jitter(text: str):
@@ -394,6 +398,8 @@ def rule_jitter(text: str):
     for m in _JITTER_CONST.finditer(text):
         hits.append((m.start(), f"const {m.group(1)}"))
     for m in _JITTER_DIAG.finditer(text):
+        hits.append((m.start(), f"diag += {m.group(2)}"))
+    for m in _LITERAL_DIAG.finditer(text):
         hits.append((m.start(), f"diag += {m.group(2)}"))
     return hits
 

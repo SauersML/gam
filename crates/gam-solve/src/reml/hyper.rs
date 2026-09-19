@@ -2307,8 +2307,12 @@ impl<'a> RemlState<'a> {
         // one eigendecomposition per evaluation point, one ridge/threshold
         // convention for `log|Sλ|₊` across ρ and τ alike.
         let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
-        let pld =
-            bundle.penalty_pseudologdet_original(&self.canonical_penalties, &lambdas, p_dim)?;
+        let pld = bundle.penalty_pseudologdet_original(
+            &self.canonical_penalties,
+            &self.penalty_unit_spectra(),
+            &lambdas,
+            p_dim,
+        )?;
 
         // #1033b: conditioned-frame exact ψ-derivatives `(∂G/∂ψ, ∂b/∂ψ)`. In
         // the original basis `self.x()` IS the conditioned design (the same
@@ -2613,6 +2617,7 @@ impl<'a> RemlState<'a> {
         // they differentiate.
         let pld = bundle.penalty_pseudologdet_original(
             &self.canonical_penalties,
+            &self.penalty_unit_spectra(),
             lambdas.as_slice().unwrap_or(&[]),
             p_dim,
         )?;

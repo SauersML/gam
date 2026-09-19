@@ -56,7 +56,6 @@ grid	crates/gam-solve/src/seeding.rs	let log_kappa_grid	https://github.com/Sauer
 grid	crates/gam-solve/src/seeding.rs	let log_kappa_grid	https://github.com/SauersML/gam/issues/2902
 grid	crates/gam-solve/src/seeding.rs	let nu_grid	https://github.com/SauersML/gam/issues/2902
 jitter	crates/gam-inference/src/hmc_io.rs	const MASS_MATRIX_JITTER	https://github.com/SauersML/gam/issues/3090
-jitter	crates/gam-models/src/survival/location_scale/family_solver.rs	escalate_ridge(	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/fit_drivers.rs	escalate_ridge(	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/minimal_seed.rs	const RANDOM_STATE_LOGIT_JITTER	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	const SAE_RANDOM_STATE_LOGIT_JITTER	https://github.com/SauersML/gam/issues/3090
