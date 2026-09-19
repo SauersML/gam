@@ -50,7 +50,7 @@ use super::codec::{
 use super::gated_rewrite::{GatedRewriteError, MaskedNorm, swiglu_hidden};
 use super::attention::{
     AttentionGeometry, AttentionProgramError, ProjectedRows, RotaryCausalAttention, RotaryEmbedding,
-    RotaryPairing,
+    RotaryPairing, head_rms_norm,
 };
 use super::precision::{DecodableArtifact, DeclaredPrecision, LatticeCode};
 use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
@@ -214,6 +214,16 @@ pub enum NativePrimitive {
     /// `Qwen3RMSNorm`, `gain ⊙ (h (mean(h^2) + epsilon)^(-1/2))` per row, evaluated by
     /// `gated_rewrite::MaskedNorm`. `epsilon` is the source configuration's value.
     RmsNorm { epsilon: f64, gain: ParameterSlot },
+    /// The source's per-head query/key norm (Qwen3 `q_norm`, `k_norm`): the RMS norm of
+    /// [`Self::RmsNorm`] on each contiguous `head_dim` block of a row, with one gain of
+    /// length `head_dim` shared by every head, evaluated by `attention::head_rms_norm`, the
+    /// owner [`super::attention::NativeAttention::with_query_key_norm`] runs. `epsilon` is the
+    /// source configuration's value.
+    HeadRmsNorm {
+        head_dim: usize,
+        epsilon: f64,
+        gain: ParameterSlot,
+    },
     /// `torch.nn.LayerNorm` over the population variance, with gain and bias,
     /// evaluated by `gated_rewrite::MaskedNorm`.
     LayerNorm {
@@ -246,6 +256,7 @@ impl NativePrimitive {
             | Self::Activation { .. }
             | Self::CoordinateMask { .. }
             | Self::RmsNorm { .. }
+            | Self::HeadRmsNorm { .. }
             | Self::LayerNorm { .. } => 1,
         }
     }
@@ -261,9 +272,9 @@ impl NativePrimitive {
     pub fn parameter_maps(&self) -> Vec<(ParameterSlot, UseMap)> {
         match self {
             Self::Linear { weight, orientation } => vec![(*weight, UseMap::Linear(*orientation))],
-            Self::AddBias { bias: parameter } | Self::RmsNorm { gain: parameter, .. } => {
-                vec![(*parameter, UseMap::Stored)]
-            }
+            Self::AddBias { bias: parameter }
+            | Self::RmsNorm { gain: parameter, .. }
+            | Self::HeadRmsNorm { gain: parameter, .. } => vec![(*parameter, UseMap::Stored)],
             Self::LayerNorm { gain, bias, .. } => vec![(*gain, UseMap::Stored), (*bias, UseMap::Stored)],
             Self::Activation { .. }
             | Self::Hadamard
@@ -1432,6 +1443,13 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
                     .map(|rows| (reservation, rows))
                     .map_err(|error| ExecutionError::Program(ProgramError::GatedRewrite { body, node, error }))
             }
+            NativePrimitive::HeadRmsNorm { head_dim, epsilon, gain } => {
+                let gain_vector = self.parameter_vector(*gain, site, path)?;
+                let reservation = admit(x.nrows(), x.ncols())?;
+                head_rms_norm(x.view(), *head_dim, *epsilon, gain_vector.view())
+                    .map(|rows| (reservation, rows))
+                    .map_err(|error| ExecutionError::Program(ProgramError::GatedRewrite { body, node, error }))
+            }
             NativePrimitive::LayerNorm { epsilon, gain, bias } => {
                 let gain_vector = self.parameter_vector(*gain, site, path)?;
                 let bias_vector = self.parameter_vector(*bias, site, path)?;
@@ -1787,7 +1805,7 @@ impl Program {
                                 })
                             }
                         }
-                        NativePrimitive::RmsNorm { gain, .. } => {
+                        NativePrimitive::RmsNorm { gain, .. } | NativePrimitive::HeadRmsNorm { gain, .. } => {
                             if x == MaskDependence::FREE {
                                 self.parameter_mask_dependence(*gain)
                             } else {
@@ -2009,9 +2027,9 @@ impl ParameterSource for DenseParameters {
 
 /// The node-label alphabet of a program codeword: Input, Read, Write, Linear,
 /// AddBias, Relu, ExactGelu, Silu, Hadamard, CoordinateMask, Sum, Compose, Call,
-/// Refine, RmsNorm, LayerNorm, CausalSelfAttention, SwiGlu and transposed Linear. A
-/// Linear node's orientation is its label, as an activation's kind is.
-pub const PROGRAM_LABEL_ALPHABET: usize = 19;
+/// Refine, RmsNorm, LayerNorm, CausalSelfAttention, SwiGlu, transposed Linear and
+/// HeadRmsNorm. A Linear node's orientation is its label, as an activation's kind is.
+pub const PROGRAM_LABEL_ALPHABET: usize = 20;
 
 fn node_label(node: &Node) -> usize {
     match node {
@@ -2033,6 +2051,7 @@ fn node_label(node: &Node) -> usize {
             NativePrimitive::LayerNorm { .. } => 15,
             NativePrimitive::CausalSelfAttention { .. } => 16,
             NativePrimitive::SwiGlu => 17,
+            NativePrimitive::HeadRmsNorm { .. } => 19,
         },
         Node::Sum { .. } => 10,
         Node::Compose { .. } => 11,
@@ -2044,9 +2063,9 @@ fn node_label(node: &Node) -> usize {
 /// A primitive's real constants, in the order the program codeword carries them.
 fn real_constants(primitive: &NativePrimitive) -> Vec<f64> {
     match primitive {
-        NativePrimitive::RmsNorm { epsilon, .. } | NativePrimitive::LayerNorm { epsilon, .. } => {
-            vec![*epsilon]
-        }
+        NativePrimitive::RmsNorm { epsilon, .. }
+        | NativePrimitive::HeadRmsNorm { epsilon, .. }
+        | NativePrimitive::LayerNorm { epsilon, .. } => vec![*epsilon],
         NativePrimitive::CausalSelfAttention { rotary, score_scale, .. } => {
             let mut reals = rotary.inverse_frequencies.clone();
             reals.extend([rotary.attention_scaling, *score_scale]);
@@ -2227,6 +2246,10 @@ impl Program {
                     encode_control_list(out, mask, controls)
                 }
                 NativePrimitive::RmsNorm { gain, .. } => {
+                    encode_fixed_index(out, gain.index(), parts.parameters.len())
+                }
+                NativePrimitive::HeadRmsNorm { head_dim, gain, .. } => {
+                    encode_prefix_integer(out, *head_dim as u64 + 1)?;
                     encode_fixed_index(out, gain.index(), parts.parameters.len())
                 }
                 NativePrimitive::LayerNorm { gain, bias, .. } => {
@@ -2441,6 +2464,14 @@ fn decode_node(
             let gain = ParameterSlot(decode_fixed_index(reader, parameters)? as u32);
             let bias = ParameterSlot(decode_fixed_index(reader, parameters)? as u32);
             native(NativePrimitive::LayerNorm { epsilon, gain, bias }, arguments)
+        }
+        19 => {
+            let head_dim = usize::try_from(decode_prefix_integer(reader)? - 1).map_err(|error| {
+                CodecError::InvalidCodeword(format!("a head dimension does not fit usize: {error}"))
+            })?;
+            let epsilon = next_real(reals)?;
+            let gain = ParameterSlot(decode_fixed_index(reader, parameters)? as u32);
+            native(NativePrimitive::HeadRmsNorm { head_dim, epsilon, gain }, arguments)
         }
         13 => {
             let native_body = BodyId(decode_fixed_index(reader, bodies)? as u32);
@@ -3574,6 +3605,64 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// A `HeadRmsNorm` node is the attention owner's per-head norm, the function a Qwen3 block's
+    /// `q_norm` and `k_norm` run: each contiguous `head_dim` block of a row normalized with the
+    /// one shared gain. Controls: over two heads it differs from the row-wide `RmsNorm` of the
+    /// same rows with the gain tiled; a width that is not a whole number of heads reaches the
+    /// caller as the owner's typed refusal; the codeword carries the head width.
+    #[test]
+    fn head_norm_nodes_evaluate_the_attention_owner_head_by_head() {
+        let x = array![[1.0, -2.0, 0.5, 3.0], [0.25, -1.0, 2.0, 0.125]];
+        let gain = array![0.5, -1.5];
+        // epsilon = 2^-20, a point of the codeword lattice.
+        let epsilon = 9.5367431640625e-7;
+        let parts = |head_dim: usize| ProgramParts {
+            parameters: free_parameters(1),
+            slots: Vec::new(),
+            controls: Vec::new(),
+            mask_groups: Vec::new(),
+            bodies: vec![body(
+                "entry",
+                1,
+                vec![
+                    Node::Input { port: 0 },
+                    native(NativePrimitive::HeadRmsNorm { head_dim, epsilon, gain: ParameterSlot(0) }, &[0]),
+                ],
+            )],
+            entry: BodyId(0),
+        };
+        let program = Program::new(parts(2)).expect("a valid program");
+        let source = DenseParameters::new(vec![DenseTensor::Vector(gain.clone())]);
+        let normed = run(&program, &source, &MaskAssignment::all_on(), &x);
+        assert_eq!(normed, head_rms_norm(x.view(), 2, epsilon, gain.view()).expect("two whole heads"));
+        let second_head = MaskedNorm::Rms { epsilon, gain: gain.view() }
+            .apply(x.slice(ndarray::s![.., 2..]))
+            .expect("finite head rows");
+        assert_eq!(normed.slice(ndarray::s![.., 2..]), second_head, "each head is its own RMS norm");
+        let tiled = array![0.5, -1.5, 0.5, -1.5];
+        let row_wide = MaskedNorm::Rms { epsilon, gain: tiled.view() }.apply(x.view()).expect("finite rows");
+        assert_ne!(normed, row_wide, "the per-head norm is not the row-wide norm");
+        let odd = array![[1.0, 2.0, 3.0]];
+        assert!(matches!(
+            program.execute(&source, &MaskAssignment::all_on(), vec![odd.clone()], Vec::new(), &row_positions(&odd)),
+            Err(ExecutionError::Program(ProgramError::GatedRewrite {
+                error: GatedRewriteError::ShapeMismatch { .. },
+                ..
+            }))
+        ));
+        let encode = |head_dim: usize| {
+            Program::new(parts(head_dim))
+                .expect("a valid program")
+                .encode(lattice())
+                .expect("an encodable program")
+        };
+        let decoded = Program::decode(&encode(2)).expect("the codeword of a valid program");
+        assert_eq!(decoded.parts(), &unnamed(&parts(2)));
+        let other = Program::decode(&encode(4)).expect("the codeword of a valid program");
+        assert_eq!(other.parts(), &unnamed(&parts(4)));
+        assert_ne!(decoded.parts(), other.parts(), "the codeword carries the head width");
     }
 
     #[test]
