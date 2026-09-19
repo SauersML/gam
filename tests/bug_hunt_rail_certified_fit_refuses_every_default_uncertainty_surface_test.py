@@ -20,7 +20,7 @@ finite coefficient standard errors and labels their provenance
 that even reports ``covariance_source='conditional'`` in its own output. But
 every DEFAULT uncertainty surface refuses with the same string:
 
-    predict(interval=0.95)                    GamError: ... does not contain smoothing-corrected covariance
+    predict(interval=0.95)                    GamfitError: ... does not contain smoothing-corrected covariance
     predict(interval=0.95, observation_interval=True)   same
     predict(interval="conformal", calibration=...)      same
     diagnose(data)                                      same

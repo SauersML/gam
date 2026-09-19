@@ -2591,7 +2591,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         scale_dimensions: false,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("main formula should reject z-column reuse");
+    .expect_err("main formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("main formula"), "{err}");
@@ -2635,7 +2636,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         scale_dimensions: false,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("slope formula should reject z-column reuse");
+    .expect_err("slope formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("slope_formula"), "{err}");
@@ -5697,6 +5699,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5738,6 +5741,7 @@ fn location_scale_map_prediction_omits_the_posterior_estimand() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5769,6 +5773,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
     let eta = array![1.0];
     let mean = array![1.0];
     let sigma = array![0.4];
+    let eta_std_error = array![0.25];
     let std_error = array![0.3];
     let mean_lower = array![0.2];
     let mean_upper = array![1.8];
@@ -5779,6 +5784,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
         Some(mean.view()),
         Some(sigma.view()),
         &[],
+        Some(eta_std_error.view()),
         Some(std_error.view()),
         Some(mean_lower.view()),
         Some(mean_upper.view()),
@@ -5796,14 +5802,14 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
     assert_eq!(
         lines.next(),
         Some(
-            "linear_predictor_plugin,mean_plugin,posterior_mean,noise_scale,posterior_mean_standard_error,posterior_mean_lower,posterior_mean_upper"
+            "linear_predictor_plugin,mean_plugin,posterior_mean,noise_scale,linear_predictor_standard_error,posterior_mean_standard_error,posterior_mean_lower,posterior_mean_upper"
         ),
         "location-scale uncertainty output must name the posterior estimand"
     );
     assert_eq!(
         lines.next(),
         Some(
-            "1.000000000000,1.000000000000,1.000000000000,0.400000000000,0.300000000000,0.200000000000,1.800000000000"
+            "1.000000000000,1.000000000000,1.000000000000,0.400000000000,0.250000000000,0.300000000000,0.200000000000,1.800000000000"
         )
     );
 
@@ -7591,7 +7597,7 @@ fn run_fit_request_document(data: PathBuf, out: PathBuf, document: &str) -> Resu
     args.formula_positional = None;
     args.predict_noise = None;
     args.survival_likelihood = None;
-    run_fit(args)
+    run_fit(args).map_err(|error| error.to_string())
 }
 
 /// Integration test: a small survival dataset (6 rows, intercept-only
