@@ -1,12 +1,13 @@
 """pyGAM audit lane ``smoothing-correction-provenance``.
 
 Every fold below is one the audit saw fall back from the smoothing-corrected
-covariance, or raise ``smoothing cubature could not calibrate its nodes`` in
-the released wheel. Each must fit, and ``summary().convergence`` must say which
-covariance the standard errors came from and why it is not the full cubature
-upgrade whenever it is not. The Tier-0 PSIS ``k̂`` of the rho-posterior Laplace
-proposal is published, and a ``K <= 4`` fit it grades ``escalate`` carries its
-Tier-1 Gauss-Hermite record.
+covariance, or raise ``smoothing cubature could not calibrate its nodes``, in
+the released wheel. Each must fit with the full sigma-point cubature upgrade:
+a cubature that cannot integrate its nodes is a typed ``IntegrationError``, never
+a downgraded covariance. The two folds whose criterion latches the #784
+block-local correction have no analytic outer rho-Hessian (#3139) and must say
+so. ``summary().convergence`` publishes the Tier-0 PSIS ``k̂`` of the
+rho-posterior Laplace proposal, or the typed reason it could not be formed.
 
 Folds are ``sklearn.model_selection.KFold(5, shuffle=True, random_state=0)``,
 reproduced exactly so the test does not depend on scikit-learn: the test folds
@@ -28,10 +29,6 @@ REPO = os.path.dirname(HERE)
 DATA = os.path.join(HERE, "data", "pygam_smoothing_provenance")
 OUTER_CERTIFY = os.path.join(HERE, "data", "pygam_outer_certify")
 
-SOURCES = {"conditional", "smoothing-corrected"}
-SEVERITIES = {"routine", "numerical_failure"}
-STATUSES = {"assessed", "refused", "not_computed", "not_applicable"}
-QUADRATURE_MAX_DIM = 4
 
 
 def kfold_train(n, fold):
@@ -138,79 +135,82 @@ def nonempty(text):
     return isinstance(text, str) and text.strip() != ""
 
 
-def finite_matrix(rows):
-    return all(math.isfinite(value) for row in rows for value in row)
+# The criterion latches the #784 block-local correction, whose rho-Hessian is
+# not implemented (#3139): the published covariance is the conditional one and
+# the reason says why.
+BLOCK_CORRECTION_FOLDS = {"haberman_k20_fold0", "nearsep_n200_fold0"}
+# The certified rho covariance identifies no direction, so the first-order
+# correction is exact (and zero): there is nothing for a cubature to integrate.
+NO_IDENTIFIED_DIRECTION = {"hepatitis_monotone_decreasing"}
+CUBATURE_FOLDS = sorted(set(FIXTURES) - BLOCK_CORRECTION_FOLDS - NO_IDENTIFIED_DIRECTION)
+# Folds whose Laplace Gaussian puts under 1/M of its mass inside the rho domain
+# (an identified but nearly flat direction): the truncated proposal cannot
+# supply M draws within M^2 and says so (#3010).
+PROPOSAL_OUTSIDE_SUPPORT = {"mc_pois_rep0", "cake_fold3", "haberman_k20_fold2", "haberman_k20_fold4"}
+OUTSIDE_SUPPORT_REASON = "of its mass inside the rho domain"
 
 
-@pytest.mark.parametrize("name", sorted(FIXTURES))
-def test_covariance_source_names_itself_and_its_reason(name):
+@pytest.mark.parametrize("name", CUBATURE_FOLDS)
+def test_fold_fits_with_the_sigma_point_cubature(name):
     summary, conv = fit_summary(name)
-    source = conv["covariance_source"]
-    assert source in SOURCES
-    assert source == summary.coefficient_se_source
-    fallback = conv["smoothing_correction_fallback"]
-    if source == "smoothing-corrected":
-        assert conv["smoothing_correction_method"] in {
-            "sigma_point_cubature",
-            "first_order_identified_subspace",
-        }
-    else:
-        assert conv["smoothing_correction_method"] is None
-    if conv["smoothing_correction_method"] == "first_order_identified_subspace":
-        assert fallback is not None, conv
-    if fallback is not None:
-        assert nonempty(fallback["reason"])
-        assert fallback["severity"] in SEVERITIES
-    if source != "smoothing-corrected" or fallback is not None:
-        assert nonempty(conv["covariance_source_reason"]), conv
-    if conv["smoothing_correction_method"] == "sigma_point_cubature":
-        assert conv["covariance_source_reason"] is None
+    assert conv["covariance_source"] == "smoothing-corrected", conv
+    assert summary.coefficient_se_source == "smoothing-corrected"
+    assert conv["smoothing_correction_method"] == "sigma_point_cubature", conv
+    assert conv["smoothing_correction_fallback"] is None, conv
+    assert conv["covariance_source_reason"] is None, conv
+
+
+@pytest.mark.parametrize("name", sorted(BLOCK_CORRECTION_FOLDS))
+def test_block_correction_fold_names_its_missing_hessian(name):
+    summary, conv = fit_summary(name)
+    assert conv["covariance_source"] == "conditional", conv
+    assert summary.coefficient_se_source == "conditional"
+    assert conv["smoothing_correction_method"] is None
+    reason = conv["covariance_source_reason"]
+    assert nonempty(reason) and "no analytic" in reason and "#784" in reason, conv
+    assert conv["rho_posterior_status"] == "not_computed", conv
+    assert "#784" in conv["rho_posterior_reason"], conv
 
 
 @pytest.mark.parametrize("name", sorted(FIXTURES))
 def test_rho_posterior_khat_is_published(name):
-    summary, conv = fit_summary(name)
+    _, conv = fit_summary(name)
     status = conv["rho_posterior_status"]
-    assert status in STATUSES
+    # The default fit never runs a heavier tier on its own (no dimension gate).
+    assert conv["rho_posterior_escalation"] is None, conv
+    if name in BLOCK_CORRECTION_FOLDS or name in NO_IDENTIFIED_DIRECTION:
+        assert status == "not_computed", conv
+        assert conv["rho_posterior_khat"] is None
+        assert nonempty(conv["rho_posterior_reason"])
+        return
+    if name in PROPOSAL_OUTSIDE_SUPPORT and status == "refused":
+        assert conv["rho_posterior_khat"] is None
+        assert OUTSIDE_SUPPORT_REASON in conv["rho_posterior_reason"], conv
+        return
     assert status == "assessed", conv
     khat = conv["rho_posterior_khat"]
     assert isinstance(khat, float) and math.isfinite(khat)
-    assert conv["rho_posterior_adequacy"] in {
-        "plug_in_adequate",
-        "importance_correct",
-        "escalate",
-    }
+    expected = (
+        "plug_in_adequate" if khat < 0.5 else "importance_correct" if khat < 0.7 else "escalate"
+    )
+    assert conv["rho_posterior_adequacy"] == expected, conv
     assert conv["rho_posterior_samples"] > 0
+    ess = conv["rho_posterior_effective_sample_size"]
+    assert 0.0 < ess <= conv["rho_posterior_samples"]
     assert conv["rho_posterior_reason"] is None
-    n_rho = len(summary.lambdas)
-    escalation = conv["rho_posterior_escalation"]
-    if khat > 0.7:
-        assert conv["rho_posterior_adequacy"] == "escalate"
-    if conv["rho_posterior_adequacy"] == "escalate" and n_rho <= QUADRATURE_MAX_DIM:
-        assert escalation is not None and escalation["tier"] == "quadrature", conv
-        assert escalation["n_nodes"] > 0
-        assert all(math.isfinite(value) for value in escalation["mean"])
-        assert finite_matrix(escalation["covariance"])
-        assert math.isfinite(escalation["effective_sample_size"])
-    elif conv["rho_posterior_adequacy"] != "escalate":
-        assert escalation is None
 
 
 def test_monotone_decreasing_names_its_source_like_the_other_shapes():
-    reports = {}
-    for shape in ("monotone_decreasing", "convex", "concave"):
-        summary, conv = fit_summary(f"hepatitis_{shape}")
-        reports[shape] = (summary.coefficient_se_source, conv)
-    source, conv = reports["monotone_decreasing"]
-    assert source == conv["covariance_source"]
-    # F16: the shape-constrained fit must not publish a bare "conditional".
-    if source == "conditional":
-        assert nonempty(conv["covariance_source_reason"])
-    else:
-        assert source == "smoothing-corrected"
-        assert conv["smoothing_correction_method"] is not None
-        if conv["smoothing_correction_method"] != "sigma_point_cubature":
-            assert nonempty(conv["covariance_source_reason"])
+    """F16: the shape-constrained fit's source is smoothing-corrected and says why
+    its correction is the first-order one, while convex and concave integrate."""
+    summary, conv = fit_summary("hepatitis_monotone_decreasing")
+    assert summary.coefficient_se_source == conv["covariance_source"] == "smoothing-corrected"
+    assert conv["smoothing_correction_method"] == "first_order_identified_subspace", conv
+    fallback = conv["smoothing_correction_fallback"]
+    assert fallback is not None and "no identified rho direction" in fallback["reason"]
+    assert set(fallback) == {"reason"}
+    assert fallback["reason"] in conv["covariance_source_reason"]
     for other in ("convex", "concave"):
-        other_source, other_conv = reports[other]
-        assert other_source == other_conv["covariance_source"]
+        other_summary, other_conv = fit_summary(f"hepatitis_{other}")
+        assert other_summary.coefficient_se_source == other_conv["covariance_source"]
+        assert other_conv["smoothing_correction_method"] == "sigma_point_cubature", other_conv
