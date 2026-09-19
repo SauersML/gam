@@ -157,3 +157,23 @@ def test_solver_tolerances_reach_the_rust_request() -> None:
         gamfit.fit(data, "y ~ x", family="gaussian", inner_tol=1e-9)
     with pytest.raises(Exception, match=r"outer_tol must be finite and > 0"):
         gamfit.fit(data, "y ~ x", family="gaussian", outer_tol=0.0)
+
+
+def test_warm_start_from_takes_a_fitted_model() -> None:
+    data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
+    with pytest.raises(TypeError, match=r"warm_start_from takes a fitted gamfit.Model"):
+        gamfit.fit(data, "y ~ x", family="gaussian", warm_start_from=object())
+
+
+def test_warm_start_from_a_model_with_no_certified_point_is_refused() -> None:
+    """A standard GAM records no custom-family outer point to resume from.
+
+    The refusal comes from the Rust side, so it proves the model crossed the
+    wire and was read.
+    """
+
+    pytest.importorskip("gamfit._rust")
+    data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
+    model = gamfit.fit(data, "y ~ x", family="gaussian")
+    with pytest.raises(Exception, match=r"warm_start_from"):
+        gamfit.fit(data, "y ~ x", family="gaussian", warm_start_from=model)

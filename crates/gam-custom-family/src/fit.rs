@@ -2885,6 +2885,28 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // A low-level caller-keyed session wins. Otherwise derive the outer stream
     // from the same explicit store and structural key used by the block record
     // and cross-fit artifact owners.
+    // A caller's required warm start (`warm_start_from`) must fit this outer
+    // problem exactly; a point of another width is a model with other terms or
+    // another design, and the fit is refused rather than run cold.
+    if let Some(required) = options.required_warm_start.as_ref() {
+        let beta_dim: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        if options.cache_session.is_none()
+            || required.rho_dim != n_rho
+            || required.beta_dim != beta_dim
+        {
+            return Err(CustomFamilyError::InvalidInput {
+                context: "warm_start_from",
+                reason: format!(
+                    "the model's certified point has {} smoothing coordinates and {} coefficients, \
+                     this fit has {n_rho} and {beta_dim}: it differs in its terms or its design width",
+                    required.rho_dim, required.beta_dim,
+                ),
+            });
+        }
+        required
+            .consumed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let cache_session = options.cache_session.clone().or_else(|| {
         persistent_warm_start_cache.as_ref().and_then(|cache| {
             gam_solve::persistent_warm_start::open_outer_session(&cache.store, &cache.key)
@@ -3754,7 +3776,17 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &inner.block_states,
         "fit_custom_family classical deviance",
     )?;
-    assemble_custom_family_fit_result(
+    // The certified point in the outer objective's own coordinates, for a later
+    // fit that resumes from this model (`warm_start_from`).
+    let outer_warm_start = gam_solve::model_types::OuterWarmStartRecord {
+        rho: rho_star.to_vec(),
+        beta: inner
+            .block_states
+            .iter()
+            .flat_map(|state| state.beta.iter().copied())
+            .collect(),
+    };
+    let mut fit = assemble_custom_family_fit_result(
         inner,
         BlockwiseFitAssembly {
             rho_physical: rho_star_physical,
@@ -3773,7 +3805,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             smoothing_corrected,
             smoothing_correction_absence,
         },
-    )
+    )?;
+    fit.artifacts.outer_warm_start = Some(outer_warm_start);
+    Ok(fit)
 }
 
 enum OwnedModeProvenance<'a> {

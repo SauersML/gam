@@ -742,6 +742,11 @@ pub struct FitConfig {
     /// standard REML route's PIRLS takes no caller tolerance, so a standard fit
     /// with no custom-family refit refuses a set value instead of dropping it.
     pub inner_tol: Option<f64>,
+    /// A saved model's certified outer point to resume from (`warm_start_from`).
+    /// Runtime only: the request document cannot carry a model, so the Python and
+    /// Rust front ends build it with
+    /// [`OuterWarmStart::from_model`](crate::fit_orchestration::OuterWarmStart::from_model).
+    pub outer_warm_start: Option<crate::fit_orchestration::OuterWarmStart>,
 }
 
 impl Default for FitConfig {
@@ -751,6 +756,7 @@ impl Default for FitConfig {
             compute_covariance: None,
             outer_tol: None,
             inner_tol: None,
+            outer_warm_start: None,
             family: None,
             negative_binomial_theta: None,
             link: None,

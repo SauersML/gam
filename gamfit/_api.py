@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import tempfile
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -369,6 +371,28 @@ def _build_fit_payload(
     return payload
 
 
+def _warm_start_model_bytes(warm_start_from: Any) -> bytes | None:
+    """The saved bytes of the fitted model a new fit resumes from, or ``None``."""
+    if warm_start_from is None:
+        return None
+    if not isinstance(warm_start_from, Model):
+        raise TypeError(
+            "warm_start_from takes a fitted gamfit.Model; got "
+            f"{type(warm_start_from).__name__}"
+        )
+    return bytes(warm_start_from._model_bytes)
+
+
+@contextlib.contextmanager
+def _warm_start_scratch(model_bytes: bytes | None) -> Any:
+    """A scratch directory for the warm start's one-entry cache, removed after the fit."""
+    if model_bytes is None:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(prefix="gamfit-warm-start-") as scratch:
+        yield scratch
+
+
 def _jsonable_array(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -603,6 +627,7 @@ def fit(
     flexible_link: bool | None = ...,
     outer_tol: float | None = ...,
     inner_tol: float | None = ...,
+    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: None = ...,
@@ -651,6 +676,7 @@ def fit(
     flexible_link: bool | None = ...,
     outer_tol: float | None = ...,
     inner_tol: float | None = ...,
+    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: str,
@@ -698,6 +724,7 @@ def fit(
     flexible_link: bool | None = None,
     outer_tol: float | None = None,
     inner_tol: float | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     constraints: Mapping[str, Any] | None = None,
     response_geometry: str | None = None,
@@ -902,6 +929,17 @@ def fit(
         solver (default ``1e-6``). A standard GAM without a link-wiggle refit
         has no inner tolerance to set and raises instead of ignoring it.
         Corresponds to the fit-request key ``inner_tol``.
+    warm_start_from:
+        A fitted :class:`Model` of the same formula to resume from. The outer
+        search starts at that model's certified point (its smoothing parameters
+        and coefficient mode) and certifies as usual. If the point is still
+        stationary on this data, the search accepts it with no outer
+        iterations. Otherwise the search runs from it. It is a warm start,
+        never a shortcut past the certificate. Custom-family fits
+        (marginal-slope, survival, transformation-normal, location-scale)
+        accept it. A model of another formula, of other terms or design
+        width, or from a route that records no point is refused by name, as is
+        a fit that searches length-scale or other auxiliary coordinates.
     constraints:
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
@@ -1030,6 +1068,7 @@ def fit(
             ("flexible_link", flexible_link),
             ("outer_tol", outer_tol),
             ("inner_tol", inner_tol),
+            ("warm_start_from", warm_start_from),
         ]:
             if arg_val is not None:
                 raise ValueError(f"{arg_name} is not supported with response_geometry")
@@ -1055,6 +1094,7 @@ def fit(
             config=config,
         )
 
+    warm_start_bytes = _warm_start_model_bytes(warm_start_from)
     rust_config = dict(config or {})
     payload = _build_fit_payload(
         family=family,
@@ -1123,6 +1163,8 @@ def fit(
         "categorical-logit",
         "softmax",
     }:
+        if warm_start_bytes is not None:
+            raise ValueError("warm_start_from is not supported for multinomial fits")
         try:
             model_bytes = bytes(
                 rust_module().fit_multinomial_formula_pyfunc(
@@ -1144,9 +1186,18 @@ def fit(
     if fisher_rao_w is not None:
         fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
     try:
-        model_bytes = bytes(
-            rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
-        )
+        with _warm_start_scratch(warm_start_bytes) as warm_start_dir:
+            model_bytes = bytes(
+                rust_module().fit_table(
+                    headers,
+                    rows,
+                    formula,
+                    json.dumps(payload),
+                    fisher_w,
+                    warm_start_bytes,
+                    warm_start_dir,
+                )
+            )
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
@@ -1191,6 +1242,7 @@ def fit_array(
     flexible_link: bool | None = None,
     outer_tol: float | None = None,
     inner_tol: float | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
@@ -1265,10 +1317,20 @@ def fit_array(
         smooths=smooths,
         config=rust_config or None,
     )
+    warm_start_bytes = _warm_start_model_bytes(warm_start_from)
     try:
-        model_bytes = bytes(
-            rust_module().fit_array(X_arr, Y_arr, formula, json.dumps(payload))
-        )
+        with _warm_start_scratch(warm_start_bytes) as warm_start_dir:
+            model_bytes = bytes(
+                rust_module().fit_array(
+                    X_arr,
+                    Y_arr,
+                    formula,
+                    json.dumps(payload),
+                    None,
+                    warm_start_bytes,
+                    warm_start_dir,
+                )
+            )
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")

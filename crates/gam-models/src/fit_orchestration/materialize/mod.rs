@@ -57,7 +57,7 @@ use validation::*;
 /// from here: their model is incomplete without the joint posterior, so their
 /// fit drivers force covariance at the final fit and keep the pilots cheap.
 fn blockwise_fit_options(config: &FitConfig) -> BlockwiseFitOptions {
-    with_caller_tolerances(
+    with_caller_solver_settings(
         BlockwiseFitOptions {
             compute_covariance: config.compute_covariance.unwrap_or(true),
             persistent_warm_start_store: config.persistent_warm_start_store.clone(),
@@ -67,10 +67,12 @@ fn blockwise_fit_options(config: &FitConfig) -> BlockwiseFitOptions {
     )
 }
 
-/// The caller's `outer_tol` / `inner_tol`, when set, in place of the solver
-/// defaults. Every custom-family request built from a `FitConfig` passes
-/// through here, so a set tolerance reaches the solver on every such route.
-fn with_caller_tolerances(
+/// The caller's solver settings on a custom-family request: `outer_tol` /
+/// `inner_tol` in place of the solver defaults, and a `warm_start_from` point as
+/// the request's required cache session. Every custom-family request built from
+/// a `FitConfig` passes through here, so a set value reaches the solver on every
+/// such route.
+fn with_caller_solver_settings(
     mut options: BlockwiseFitOptions,
     config: &FitConfig,
 ) -> BlockwiseFitOptions {
@@ -80,6 +82,10 @@ fn with_caller_tolerances(
     }
     if let Some(tolerance) = config.inner_tol {
         options.inner_tol = tolerance;
+    }
+    if let Some(warm_start) = config.outer_warm_start.as_ref() {
+        options.cache_session = Some(std::sync::Arc::clone(warm_start.session()));
+        options.required_warm_start = Some(warm_start.required().clone());
     }
     options
 }

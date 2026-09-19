@@ -386,6 +386,7 @@ fn caller_tolerances_reach_the_solver_and_absent_keys_keep_the_defaults() {
     assert_eq!(absent.outer_tol.to_bits(), defaults.outer_tol.to_bits());
     assert_eq!(absent.inner_tol.to_bits(), defaults.inner_tol.to_bits());
     assert!(!absent.outer_tol_is_caller_set);
+    assert!(absent.cache_session.is_none() && absent.required_warm_start.is_none());
     let standard_absent =
         canonical_standard_fit_options(&FitConfig::default(), StandardFitOptionsInputs::default());
     assert_eq!(standard_absent.tol.to_bits(), 1e-10_f64.to_bits());

@@ -3067,6 +3067,23 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // a stalled first attempt that silently falls back.
     let outer_policy = initial_family.outer_derivative_policy(&initial_blocks, options);
     let exact_spatial_outer_tol = kappa_options_ref.rel_tol;
+    // `warm_start_from` resumes the outer search that `fit_custom_family` owns on
+    // the driver's fast path; a fit that also searches length-scale or auxiliary
+    // coordinates runs the driver's own search, which the point does not describe.
+    if options.required_warm_start.is_some()
+        && !(setup.auxiliary_dim() == 0
+            && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
+    {
+        return Err(FitFailure::raised(
+            FailureCategory::Input,
+            format!(
+                "warm_start_from resumes a fit whose only outer coordinates are smoothing \
+                 parameters; this fit also searches {} length-scale and {} auxiliary coordinates",
+                setup.log_kappa_dim(),
+                setup.auxiliary_dim(),
+            ),
+        ));
+    }
     let solved = optimize_spatial_length_scale_exact_joint_typed(
         data_view,
         &[marginalspec_boot.clone(), slopespec_boot.clone()],

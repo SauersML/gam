@@ -100,7 +100,16 @@ use std::path::Path;
 // repair block and a fired latent-z calibration withholds its covariance and records why.
 // No v23 payload carries the variant, so a v23 payload loads unchanged; a v23 binary
 // refuses a v24 payload by version instead of failing on an unknown variant.
-pub const MODEL_PAYLOAD_VERSION: u32 = 24;
+// v25 records the certified outer point of a custom-family fit
+// (`FitArtifacts::outer_warm_start`), in the outer objective's own coordinates, for
+// `warm_start_from`. It carries a serde default, so a v24 or older payload loads with no
+// point, and `warm_start_from` refuses it by name; a v24 binary refuses a v25 payload by
+// version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 25;
+
+/// The schema before the certified outer point (`warm_start_from`), whose only difference
+/// is that record's absence.
+const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
 
 /// The schema before the residual repair block's covariance declination (gam#2985),
 /// whose only difference is that variant's absence.
@@ -132,8 +141,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 7] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 8] = [
     MODEL_PAYLOAD_VERSION,
+    OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
     RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
     LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
     NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
@@ -6578,6 +6588,7 @@ mod tests {
                 firth_bias_reduction: false,
                 covariance_declined: None,
                 jeffreys_arming_evidence: None,
+                outer_warm_start: None,
             },
             inner_cycles: 0,
         })
@@ -7414,6 +7425,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
             RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
             LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
             NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
@@ -7426,7 +7438,14 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
+            MODEL_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
+            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
             RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION - 1

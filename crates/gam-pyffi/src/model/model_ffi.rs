@@ -1330,7 +1330,15 @@ fn default_survival_time_grid_from_model(
     )
 }
 
-#[pyfunction(signature = (headers, rows, formula, config_json = None, fisher_rao_w = None))]
+#[pyfunction(signature = (
+    headers,
+    rows,
+    formula,
+    config_json = None,
+    fisher_rao_w = None,
+    warm_start_model = None,
+    warm_start_dir = None
+))]
 fn fit_table(
     py: Python<'_>,
     headers: Vec<String>,
@@ -1338,6 +1346,8 @@ fn fit_table(
     formula: String,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
+    warm_start_model: Option<Vec<u8>>,
+    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
@@ -1351,12 +1361,21 @@ fn fit_table(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
+            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
 
-#[pyfunction(signature = (x, y, formula, config_json = None, fisher_rao_w = None))]
+#[pyfunction(signature = (
+    x,
+    y,
+    formula,
+    config_json = None,
+    fisher_rao_w = None,
+    warm_start_model = None,
+    warm_start_dir = None
+))]
 fn fit_array(
     py: Python<'_>,
     x: PyReadonlyArray2<'_, f64>,
@@ -1364,6 +1383,8 @@ fn fit_array(
     formula: String,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
+    warm_start_model: Option<Vec<u8>>,
+    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
@@ -1375,6 +1396,7 @@ fn fit_array(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
+            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())

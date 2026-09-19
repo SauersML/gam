@@ -392,6 +392,18 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
 /// magnitude while still bounding pathological probes.
 pub const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP: f64 = 5.0;
 
+/// A caller's required warm start: the widths of the certified point its cache
+/// session carries, and the flag the consuming route sets when it attaches it.
+#[derive(Clone, Debug)]
+pub struct RequiredWarmStart {
+    /// Outer coordinates of the point.
+    pub rho_dim: usize,
+    /// Flat inner coefficients of the point.
+    pub beta_dim: usize,
+    /// Set by the route that attached the point to its outer problem.
+    pub consumed: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Stable public API for installing outer-score subsampling.
 #[derive(Clone)]
 pub struct BlockwiseFitOptions {
@@ -495,6 +507,12 @@ pub struct BlockwiseFitOptions {
     /// explicitly; ordinary workflow fits leave this empty so refit-heavy
     /// loops do not touch the shared on-disk store.
     pub cache_session: Option<Arc<gam_runtime::warm_start::Session>>,
+    /// Set when `cache_session` carries a caller's required warm start
+    /// (`warm_start_from`) rather than an opportunistic cache. The route that
+    /// attaches the session checks the point fits its outer problem and marks it
+    /// consumed, so a mismatched point, or a route that cannot take one, is
+    /// refused by name instead of fitting cold.
+    pub required_warm_start: Option<RequiredWarmStart>,
     /// Explicit fit-owned cross-process store. Unlike `cache_session`, which is
     /// one caller-keyed outer-iterate stream, this capability owns the shared
     /// response-keyed record and descriptor-keyed artifact namespaces too.
@@ -606,6 +624,7 @@ impl Default for BlockwiseFitOptions {
             outer_score_subsample: None,
             auto_outer_subsample: true,
             cache_session: None,
+            required_warm_start: None,
             persistent_warm_start_store: None,
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,

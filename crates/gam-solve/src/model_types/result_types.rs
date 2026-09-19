@@ -2599,6 +2599,22 @@ pub struct FitArtifacts {
     /// so it will not catch a new producer on its own.
     #[serde(default)]
     pub covariance_declined: Option<CovarianceDeclined>,
+    /// The certified outer point in the outer optimizer's own coordinates, when
+    /// the route that fitted the model records one: `gamfit.fit(...,
+    /// warm_start_from=model)` resumes a new fit from it through the outer cache
+    /// seam, which recertifies it rather than trusting it. `None` on a route that
+    /// records none and on a model saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_warm_start: Option<OuterWarmStartRecord>,
+}
+
+/// A certified outer point: `rho` in the outer optimizer's coordinates and
+/// `beta`, the inner coefficient mode flattened across blocks in the order the
+/// outer objective's coefficient seed reads it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OuterWarmStartRecord {
+    pub rho: Vec<f64>,
+    pub beta: Vec<f64>,
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -2631,6 +2647,13 @@ impl std::fmt::Debug for FitArtifacts {
             )
             .field("covariance_declined", &self.covariance_declined)
             .field("jeffreys_arming_evidence", &self.jeffreys_arming_evidence)
+            .field(
+                "outer_warm_start",
+                &self
+                    .outer_warm_start
+                    .as_ref()
+                    .map(|seed| (seed.rho.len(), seed.beta.len())),
+            )
             .finish()
     }
 }

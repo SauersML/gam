@@ -78,7 +78,7 @@ pub(crate) fn materialize_location_scale<'a>(
     let mean_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let noise_offset = resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
     let kappa_options = config.spatial_optimization.clone();
-    let options = with_caller_tolerances(
+    let options = with_caller_solver_settings(
         BlockwiseFitOptions {
             persistent_warm_start_store: config.persistent_warm_start_store.clone(),
             ..BlockwiseFitOptions::default()

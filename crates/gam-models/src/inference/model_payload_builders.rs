@@ -1514,6 +1514,13 @@ pub fn fit_formula_to_payload(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
+    if fit_config.outer_warm_start.is_some()
+        && (fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some())
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "warm_start_from resumes one fit; a CTN chain fits several".to_string(),
+        });
+    }
     if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
         return crate::inference::ctn::fit_chain(formula, dataset, fit_config);
     }
@@ -1527,6 +1534,13 @@ pub fn fit_formula_to_payload(
     // `StandardFitResult`, so the persistence payload is built by the same
     // `assemble_standard_payload` used for every other standard fit.
     if let Some(expectile_result) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
+        if fit_config.outer_warm_start.is_some() {
+            return Err(WorkflowError::InvalidConfig {
+                reason: "warm_start_from resumes custom-family fits; the expectile driver does \
+                         not read it"
+                    .to_string(),
+            });
+        }
         let mut payload = assemble_standard_payload(StandardPayloadInputs {
             formula,
             dataset,
@@ -1875,6 +1889,19 @@ pub fn fit_formula_to_payload(
             payload_for_dispersion_location_scale(formula, dataset, fit_config, kind, ls_result)?
         }
     };
+    // A route that never attached the model's point fitted cold; that is not the
+    // warm start the caller asked for.
+    if fit_config
+        .outer_warm_start
+        .as_ref()
+        .is_some_and(|warm_start| !warm_start.consumed())
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "warm_start_from: this fit's route runs no outer search that the model's \
+                     certified point describes, so it could not resume from it"
+                .to_string(),
+        });
+    }
     payload.unidentified_scalar_terms = unidentified_scalar_terms;
     apply_request_metadata(&mut payload, fit_config, inference_notes);
     Ok(payload)
