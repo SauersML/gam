@@ -556,6 +556,83 @@ fn build_reduced_slope_reparam(
     }
 }
 
+/// Whether a learned Gaussian-shift frailty scale is identified (gam#3059).
+///
+/// The probit row likelihood reads the frailty only through the observed slope
+/// `s(σ)·g(x)`, `s = 1/√(1+σ²)`, on every route: the anchor solves
+/// `Σ_m w_m Φ(a + s·g·u_m) = Φ(q)` and the row evaluates `Φ(a + s·g·z)`. The
+/// slope is `g = o + G·β` with the fixed part `o_i = baseline + slope_offset_i`,
+/// so a move of σ is matched exactly by rescaling `β` whenever `s·o` stays in
+/// `span(G)` — that is, whenever `o ∈ span(G)`. The likelihood is then flat in
+/// σ, and the only σ-dependence left in the criterion is the Laplace Jacobian of
+/// the unpenalized slope directions, `p₀·ln s`, which has no stationary point.
+/// `o` is in the span when the sine of its angle to `span(G)` is inside the
+/// rounding band of the orthonormalization, `max(n, p + 1)·ε` (the same
+/// backward-error band as [`reduced_slope_transform_effective`]).
+pub(crate) fn learned_frailty_scale_is_identified(
+    slope: ArrayView2<'_, f64>,
+    slope_offset: &Array1<f64>,
+    baseline_slope: f64,
+) -> Result<bool, String> {
+    let n = slope.nrows();
+    if slope_offset.len() != n {
+        return Err(format!(
+            "learned frailty identifiability: slope design has {n} rows, slope offset {}",
+            slope_offset.len()
+        ));
+    }
+    let fixed = slope_offset.mapv(|offset| offset + baseline_slope);
+    if fixed.iter().any(|v| !v.is_finite()) {
+        return Err("learned frailty identifiability: the fixed slope part is non-finite".to_string());
+    }
+    let norm = fixed.dot(&fixed).sqrt();
+    if norm == 0.0 {
+        return Ok(false);
+    }
+    let direction = fixed / norm;
+    let p = slope.ncols();
+    let band = (n.max(p + 1) as f64) * f64::EPSILON;
+    let (basis, _) = equilibrated_range_basis(&slope.to_owned(), band)?;
+    let residual = &direction - &basis.dot(&basis.t().dot(&direction));
+    Ok(residual.dot(&residual).sqrt() > band)
+}
+
+#[cfg(test)]
+mod learned_frailty_identifiability_tests {
+    use super::learned_frailty_scale_is_identified;
+    use ndarray::{Array1, Array2};
+
+    fn covariate(n: usize) -> Array1<f64> {
+        Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin() + 0.1 * i as f64))
+    }
+
+    #[test]
+    fn intercept_slope_with_constant_fixed_part_is_unidentified_3059() {
+        let n = 50;
+        let slope = Array2::from_elem((n, 1), 1.0);
+        assert!(!learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+    }
+
+    #[test]
+    fn covariate_only_slope_with_constant_fixed_part_is_identified_3059() {
+        let n = 50;
+        let slope = covariate(n).insert_axis(ndarray::Axis(1));
+        assert!(learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+    }
+
+    #[test]
+    fn slope_offset_inside_the_span_is_unidentified_3059() {
+        let n = 50;
+        let x = covariate(n);
+        let mut slope = Array2::from_elem((n, 2), 1.0);
+        slope.column_mut(1).assign(&x);
+        let offset = x.mapv(|v| 2.5 * v - 0.3);
+        assert!(!learned_frailty_scale_is_identified(slope.view(), &offset, 0.8).unwrap());
+        let outside = x.mapv(|v| v * v);
+        assert!(learned_frailty_scale_is_identified(slope.view(), &outside, 0.8).unwrap());
+    }
+}
+
 /// Distinct outcomes of the effective slope confound audit. `FullRank`
 /// (nothing to reduce, `r == p_g`) and `FullyConfounded` (`r == 0`) must not
 /// share a signal: keeping the raw design is correct for the former, while for
@@ -2413,19 +2490,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
             feature_cols: context_cols.clone(),
         }
     });
-    // A learnable frailty sigma is differentiated only under the closed-form
-    // Gaussian lowering, so that is this kernel's latent-law capability here.
-    let (support, gate_context) = if sigma_learnable {
-        (
-            EmpiricalLatentMeasureSupport::StandardNormalOnly,
-            "bernoulli marginal-slope with a learnable Gaussian-shift frailty sigma",
-        )
-    } else {
-        (
-            EmpiricalLatentMeasureSupport::Available,
-            "bernoulli marginal-slope",
-        )
-    };
+    // The rigid kernel differentiates a learnable frailty sigma on whichever
+    // law the row anchors on (gam#3059), so every latent law is available.
+    let gate_context = "bernoulli marginal-slope";
     // gam#2926: the re-solve of a fit whose certificate preferred another law
     // anchors on that law, and records why.
     let (fallback_hints, fallback_decision) = match fallback {
@@ -2435,16 +2502,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
     let decision = match (fallback_decision, spec.declared_latent_law.as_ref()) {
         (Some(decision), _) => decision,
         (None, Some(grid)) => {
-            if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
-                return Err(FitFailure::raised(
-                    gam_problem::FailureCategory::Input,
-                    LatentLawRefusal::EmpiricalKernelUnavailable {
-                        context: gate_context.to_string(),
-                        requested: "declared_latent_law".to_string(),
-                    }
-                    .to_string(),
-                ));
-            }
             // A declared law is the caller's statement about the score AS GIVEN:
             // nothing is estimated or checked, and the law is what the fit
             // anchors on and persists.
@@ -2468,7 +2525,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             &spec.latent_z_policy,
             conditioning_dense.as_ref().map(|d| d.view()),
             local_context.as_ref(),
-            support,
+            EmpiricalLatentMeasureSupport::Available,
             gate_context,
         )
         .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?,
@@ -2545,15 +2602,34 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // reports its own Newton solve's failure in the same text.
     let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights)
         .map_err(|reason| FitFailure::raised(FailureCategory::Unclassified, reason))?;
-    let baseline = (
-        bernoulli_marginal_slope_eta_from_probability(
-            &spec.base_link,
-            normal_cdf(pilot_baseline.0),
-            "bernoulli marginal-slope baseline link inversion",
+    // The probit marginal index is the pilot's own probit intercept: `q = η`
+    // exactly (gam#2978), with no probability formed and inverted.
+    require_probit_marginal_slope_link(&spec.base_link, "bernoulli marginal-slope baseline")
+        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+    let baseline = (pilot_baseline.0, pilot_baseline.1 / probit_scale);
+    if sigma_learnable {
+        let slope_dense = slope_design
+            .design
+            .try_to_dense_arc("bernoulli marginal-slope learned frailty identifiability")
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        let identified = learned_frailty_scale_is_identified(
+            slope_dense.view(),
+            &spec.slope_offset,
+            baseline.1,
         )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?,
-        pilot_baseline.1 / probit_scale,
-    );
+        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        if !identified {
+            return Err(FitFailure::raised(
+                FailureCategory::Input,
+                "bernoulli marginal-slope: a learned GaussianShift frailty scale is not \
+                 identified: the probit likelihood reads σ only through the observed slope \
+                 s(σ)·g(x), s = 1/√(1+σ²), and the fixed part of g (pilot baseline + slope \
+                 offset) lies in the slope design's span, so any σ is matched exactly by \
+                 rescaling the slope coefficients; fix σ (frailty_sd / FrailtyScale::Fixed \
+                 { sigma }) or give the slope a fixed part outside its span (gam#3059)",
+            ));
+        }
+    }
 
     // Score-warp basis construction is β-independent (identifiability is
     // provided by the smoothness-null-space drop on the basis transform,
@@ -3488,7 +3564,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // their excess-KL estimate prefers that law, the fit is re-solved on it from
     // these coefficients. A declared Gaussian law whose score failed the screen
     // is measured the same way and kept, with the measurement warned about.
-    let mut uncertified: Option<LatentLawConsumed> = None;
     let certificate_pending = matches!(
         &latent_law_consumed,
         LatentLawConsumed::EstimatedGaussianAdequate { residual: None, .. }
@@ -3598,22 +3673,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     certificate.summary()
                 );
                 *residual = Some(certificate);
-            } else if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
-                let missing = format!(
-                    "at the converged closed-form fit the estimated law is expected to be the more \
-                     accurate anchor ({}), and a learnable Gaussian-shift frailty sigma is \
-                     differentiated only under the closed form, so nothing can re-solve on it",
-                    certificate.summary()
-                );
-                log::debug!(
-                    "[{gate_context} latent-z] the closed form stays uncertified: {missing} (gam#2926)"
-                );
-                uncertified = Some(LatentLawConsumed::GaussianUncertified {
-                    evidence: evidence.clone(),
-                    adequacy: Some(adequacy.clone()),
-                    certificate: Some(certificate),
-                    missing,
-                });
             } else {
                 log::debug!(
                     "[{gate_context} latent-z] at the converged closed-form fit the estimated law is \
@@ -3644,9 +3703,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 }));
             }
         }
-    }
-    if let Some(next) = uncertified {
-        latent_law_consumed = next;
     }
     // gam#2926: certify the arm a moving law was fitted on against the other arms,
     // by their cross-fitted cross-entropy at the converged fit. Each row is anchored
