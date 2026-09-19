@@ -23,6 +23,49 @@ pub enum DispersionHandling {
     },
 }
 
+/// What the constrained Laplace normalizer reads at an inner mode (gam#2765).
+#[derive(Clone, Debug)]
+pub struct ConeNormalizerInput {
+    /// Every linear inequality row of the inner problem over the joint coefficients,
+    /// `rows · β ≥ bounds`, at any row scale.
+    pub rows: Array2<f64>,
+    pub bounds: Array1<f64>,
+    /// `∇F(β̂)`, the penalized inner objective's unprojected gradient at the mode (the KKT
+    /// gradient `A_actᵀμ` plus the certified residual), in the objective's own (unscaled) units.
+    pub gradient: Array1<f64>,
+    /// How that gradient moves with the outer coordinates.
+    pub gradient_motion: ConeGradientMotion,
+}
+
+/// How the KKT gradient `g = ∇F(β̂(θ), θ)` moves along an outer coordinate (gam#2765).
+#[derive(Clone, Debug)]
+pub enum ConeGradientMotion {
+    /// No row is active, so the mode is stationary and `ġ = 0`.
+    Stationary,
+    /// An active face `Z`: `ġ = M_true β̂̇ + ∂_θ∇F`, with `M_true` the inner stationarity
+    /// Hessian in the operator's (scaled) units.
+    OnFace(Arc<Array2<f64>>),
+    /// Every direction is pinned, so `β̂̇ = 0` and `ġ = ∂_θ∇F`.
+    Pinned,
+}
+
+/// A pair callback that evaluates each fixed-β pair object once per solution: every object is a
+/// function of the one mode the solution carries, so a second request returns the first result.
+fn memoized_pair_fn(pair_fn: HyperCoordPairFn) -> HyperCoordPairFn {
+    let memo: Arc<std::sync::Mutex<std::collections::HashMap<(usize, usize), gam_problem::HyperCoordPair>>> =
+        Arc::default();
+    Arc::new(move |i: usize, j: usize| {
+        if let Some(pair) = memo.lock().expect("pair memo lock poisoned").get(&(i, j)) {
+            return Ok(pair.clone());
+        }
+        let pair = pair_fn(i, j)?;
+        memo.lock()
+            .expect("pair memo lock poisoned")
+            .insert((i, j), pair.clone());
+        Ok(pair)
+    })
+}
+
 /// The unified inner solution produced by any inner solver.
 ///
 /// Contains everything the outer REML/LAML evaluator needs. Produced by:
@@ -267,6 +310,13 @@ pub struct InnerSolution<'dp> {
     /// `None` is the legacy/unconstrained path (no active inequality
     /// constraints to project against).
     pub active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
+
+    /// The constraint system and KKT gradient the constrained Laplace normalizer reads
+    /// (gam#2765). `Some` prices `C = −½gᵀM⁻¹g − ln P(u ≥ 0)` (see
+    /// [`crate::constrained_posterior::ConeNormalizer`]) on top of the full-space
+    /// `½ log|M|`, which makes the criterion continuous where the active set changes. `None`
+    /// prices no truncation.
+    pub cone_normalizer: Option<Arc<ConeNormalizerInput>>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -299,6 +349,7 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) barrier_config: Option<BarrierConfig>,
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
+    pub(crate) cone_normalizer: Option<Arc<ConeNormalizerInput>>,
     pub(crate) gaussian_weight_log_sum_half: f64,
     pub(crate) dp_floor_scale: f64,
 }
@@ -354,6 +405,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            cone_normalizer: None,
             gaussian_weight_log_sum_half: 0.0,
             dp_floor_scale: 1.0,
         }
@@ -472,6 +524,13 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
+    /// Stash the constraint system and KKT gradient the constrained Laplace normalizer reads
+    /// (gam#2765).
+    pub fn cone_normalizer(mut self, input: Option<Arc<ConeNormalizerInput>>) -> Self {
+        self.cone_normalizer = input;
+        self
+    }
+
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty coordinates.
     pub fn build(self) -> InnerSolution<'dp> {
         let beta_dim = self.beta.len();
@@ -557,6 +616,16 @@ impl<'dp> InnerSolutionBuilder<'dp> {
                 beta_dim
             );
         }
+        // A criterion that prices the constrained normalizer reads each fixed-β pair object twice,
+        // once in its own outer Hessian and once in the log-determinant's (gam#2765).
+        let (ext_coord_pair_fn, rho_ext_pair_fn) = if self.cone_normalizer.is_some() {
+            (
+                self.ext_coord_pair_fn.map(memoized_pair_fn),
+                self.rho_ext_pair_fn.map(memoized_pair_fn),
+            )
+        } else {
+            (self.ext_coord_pair_fn, self.rho_ext_pair_fn)
+        };
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
             let penalty_rank: usize = self
                 .penalty_coords
@@ -586,13 +655,14 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             dp_floor_scale: self.dp_floor_scale,
             dispersion: self.dispersion,
             ext_coords: self.ext_coords,
-            ext_coord_pair_fn: self.ext_coord_pair_fn,
-            rho_ext_pair_fn: self.rho_ext_pair_fn,
+            ext_coord_pair_fn,
+            rho_ext_pair_fn,
             fixed_drift_deriv: self.fixed_drift_deriv,
             contracted_psi_second_order: self.contracted_psi_second_order,
             barrier_config: self.barrier_config,
             kkt_residual: self.kkt_residual,
             active_constraints: self.active_constraints,
+            cone_normalizer: self.cone_normalizer,
         }
     }
 }

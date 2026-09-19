@@ -273,6 +273,12 @@ impl JointLatentLawRuntime {
         self.node_count
     }
 
+    /// The node weights, one per residual node, summing to one.
+    #[inline]
+    pub(crate) fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
     #[inline]
     fn factor(&self, row: usize) -> Result<&[f64], String> {
         let kk = self.score_dim * self.score_dim;
@@ -712,7 +718,7 @@ pub(crate) fn build_joint_latent_law(
         log_weights,
         ..runtime_shell
     };
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope latent-z] the row index is anchored on the joint law of K={k} \
          scores: {} nodes, {} transport (gam#2929)",
         runtime.node_count,
@@ -3350,5 +3356,108 @@ mod joint_latent_law_tests {
                 "K={k}: unexpected refusal {reason}"
             );
         }
+    }
+
+    /// gam#2926: the several-score closed-form certificate is the closed form's
+    /// anchoring residual under the joint law. On a product Gauss–Hermite law
+    /// transported by the family's own `Σ` the closed form solves the anchoring
+    /// equation, so every row's residual vanishes to quadrature tolerance; on a
+    /// skewed, shifted law it is the direct sum `Σ_m w_m Φ(−(q·c + s·rᵀu_m)) − Φ(−q)`
+    /// at exit and entry, and it does not vanish.
+    #[test]
+    fn joint_certificate_residual_is_the_closed_form_residual_under_the_joint_law_2926() {
+        let n = 30;
+        let (family, beta, marginal) = per_score_family(2, n, false);
+        let states = per_score_states(&marginal, &beta);
+        let dense = family.score_covariance.pooled_covariance().to_dense();
+        let covariance = [[dense[[0, 0]], dense[[0, 1]]], [dense[[1, 0]], dense[[1, 1]]]];
+
+        let (axis_nodes, axis_weights) = gauss_hermite_probabilists(41).expect("GH");
+        let mut gh_nodes = Vec::new();
+        let mut gh_weights = Vec::new();
+        for (x, wx) in axis_nodes.iter().zip(axis_weights.iter()) {
+            for (y, wy) in axis_nodes.iter().zip(axis_weights.iter()) {
+                gh_nodes.push(*x);
+                gh_nodes.push(*y);
+                gh_weights.push(wx * wy);
+            }
+        }
+        let total: f64 = gh_weights.iter().sum();
+        for weight in gh_weights.iter_mut() {
+            *weight /= total;
+        }
+        let gaussian = persisted_law(&gh_nodes, &gh_weights, [0.0, 0.0], covariance)
+            .runtime(None, n)
+            .expect("Gaussian runtime");
+        let mut workspace =
+            super::super::calibration::JointCertificateWorkspace::new(&family, &gaussian)
+                .expect("certificate workspace");
+        for row in 0..n {
+            let anchors = family
+                .closed_form_joint_certificate_anchors(row, &states, &gaussian, &mut workspace)
+                .expect("Gaussian certificate anchors");
+            for (residual, sd, scale) in anchors {
+                assert!(
+                    residual.abs() <= 1e-9,
+                    "row {row}: the closed form solves the anchoring equation on a Gaussian law; \
+                     residual {residual:.3e}"
+                );
+                assert!(sd > 0.0 && scale > 0.0 && scale <= 0.25, "row {row}: sd={sd} scale={scale}");
+            }
+        }
+
+        let (nodes, weights) = skewed_joint_law();
+        let mean = [0.1, -0.2];
+        let skewed = persisted_law(&nodes, &weights, mean, covariance)
+            .runtime(None, n)
+            .expect("skewed runtime");
+        let mut workspace =
+            super::super::calibration::JointCertificateWorkspace::new(&family, &skewed)
+                .expect("certificate workspace");
+        let mut slopes = family.slope_row_workspace().expect("slope workspace");
+        let mut buffer = vec![0.0; 2 * skewed.node_count()];
+        let scale = family.probit_frailty_scale();
+        let mut largest = 0.0_f64;
+        for row in 0..n {
+            let anchors = family
+                .closed_form_joint_certificate_anchors(row, &states, &skewed, &mut workspace)
+                .expect("skewed certificate anchors");
+            let values = family.row_dynamic_q_values(row, &states).expect("row q values");
+            family
+                .fill_slope_values_for_row(row, &states, &mut slopes)
+                .expect("row slopes");
+            let r = slopes.values();
+            skewed.row_nodes_into(row, &mut buffer).expect("row nodes");
+            let variance = scale
+                * scale
+                * (r[0] * r[0] * covariance[0][0]
+                    + 2.0 * r[0] * r[1] * covariance[0][1]
+                    + r[1] * r[1] * covariance[1][1]);
+            for (anchor, q) in anchors.iter().zip([values.q1, values.q0]) {
+                let alpha = q * (1.0 + variance).sqrt();
+                let direct = buffer
+                    .chunks_exact(2)
+                    .zip(skewed.weights().iter())
+                    .map(|(u, w)| w * normal_cdf(-(alpha + scale * (r[0] * u[0] + r[1] * u[1]))))
+                    .sum::<f64>()
+                    - normal_cdf(-q);
+                assert!(
+                    (anchor.0 - direct).abs() <= 1e-12,
+                    "row {row}, q={q}: certificate residual {} vs direct {direct}",
+                    anchor.0
+                );
+                assert!(
+                    (anchor.2 - normal_cdf(q) * normal_cdf(-q)).abs() <= 1e-15,
+                    "row {row}: π(1−π) {}",
+                    anchor.2
+                );
+                largest = largest.max(direct.abs());
+            }
+        }
+        assert!(
+            largest > 1e-3,
+            "a skewed, shifted joint law must leave the closed form a visible residual; largest \
+             {largest:.3e}"
+        );
     }
 }

@@ -2,7 +2,7 @@
 """Fit every featurizer on SynthSAEBench-style data and run the downstream battery.
 
 This is the gamfit-consuming driver for ``bench/downstream_battery.py``. It fits
-the manifold SAE (``gamfit.sae_manifold_fit``) and the flat baselines (L1 / TopK
+the manifold SAE (``gamfit.sae.sae_manifold_fit``) and the flat baselines (L1 / TopK
 / BatchTopK, the PyTorch modules already in ``bench/synth_sae_compare.py``) on the
 same SynthSAEBench-style train/test activations, marshals each fit's decoder
 directions + codes + the planted factors into a :class:`FeaturizerCodes`, and runs
@@ -100,14 +100,14 @@ def _manifold_codes(
     learning_rate: float,
     basis: str,
     atom_dim: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, gamfit.ManifoldSAE]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, gamfit.sae.ManifoldSAE]:
     """Fit the manifold SAE; return (decoder_dirs, train_codes, test_codes, fit).
 
     The extraction mirrors ``synth_sae_compare._score_manifold``: each atom's
     non-intercept basis rows with a live (nonzero-norm) decoder direction become a
     latent, whose activation is ``assignment_k * phi[:, row]``.
     """
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=train_x,
         K=atoms,
         atom_topology=basis,
@@ -115,7 +115,6 @@ def _manifold_codes(
         assignment="softmax",
         top_k=top_k,
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=max_iter,

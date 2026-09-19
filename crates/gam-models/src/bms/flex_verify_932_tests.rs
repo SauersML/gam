@@ -86,6 +86,8 @@ fn vfixture(is_score_warp: bool, amplitude: f64) -> VFixture {
     };
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
+        search: None,
         y: Arc::new(Array1::from_vec(vec![1.0])),
         weights: Arc::new(Array1::from_vec(vec![1.0])),
         z: Arc::new(Array1::from_vec(vec![0.45])),
@@ -572,9 +574,7 @@ fn production_flex_grad_hess_matches_independent_fd_link_dev_wide_deviation_932(
 /// independent FD with tail-resident nodes too. The link deviation is only C0
 /// at its support edges (clamped knots, constant tails), so under the
 /// standard-normal measure the moving edge does carry a term:
-/// `standard_normal_flex_crossing_second_partials` adds it, and
-/// `standard_normal_flex_calibration_partials_differentiate_along_intercept_and_slope`
-/// checks it. A missing term here would fail at the ~1e-7 gradient / ~1e-5
+/// `standard_normal_flex_crossing_second_partials` adds it. A missing term here would fail at the ~1e-7 gradient / ~1e-5
 /// Hessian tolerances (the June measurement of the gap was ~4e-7 relative).
 #[test]
 fn production_flex_grad_hess_matches_independent_fd_link_dev_constant_tail_2341() {
@@ -621,6 +621,8 @@ pub(super) fn standard_normal_flex_fixture() -> (BernoulliMarginalSlopeFamily, V
     let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
+        search: None,
         y: Arc::new(Array1::from_vec(vec![1.0])),
         weights: Arc::new(Array1::from_vec(vec![0.9])),
         z: Arc::new(Array1::from_vec(vec![0.35])),
@@ -1059,198 +1061,6 @@ fn standard_normal_flex_beta_hessian_directional_derivatives_match_finite_differ
         "{} entries miss their bar:\n{}",
         failures.len(),
         failures.join("\n")
-    );
-}
-
-/// The standard-normal FLEX fifth slabs are the primary-axis derivatives of the
-/// canonical fourth contraction: `T_c[k][l] = Σ_{d,e} ℓ_{klcde}·u_d·v_e` must
-/// match a Richardson difference of `row_primary_fourth_contracted_ordered(u, v)`
-/// along primary `c`, with the calibrated intercept re-solved at every shifted
-/// state (#2901 rule 4). Both directions mix q, slope, score-warp and
-/// link-deviation components, and the row's partition crosses every interior
-/// link knot, so the moving-boundary fluxes at orders four and five both act.
-#[test]
-fn standard_normal_flex_fifth_slabs_differentiate_the_fourth_contraction_2901() {
-    let row = 0usize;
-    let (family, states) = standard_normal_flex_fixture();
-    let cache = family
-        .build_exact_eval_cache(&states)
-        .expect("base StandardNormal FLEX exact cache");
-    let primary = cache.primary.clone();
-    let h_range = primary.h.clone().expect("active score-warp range");
-    let w_range = primary.w.clone().expect("active link-deviation range");
-    let r = primary.total;
-    let mut dir_u = Array1::<f64>::zeros(r);
-    dir_u[primary.q] = 0.55;
-    dir_u[primary.slope] = -0.35;
-    dir_u[h_range.start] = 0.45;
-    dir_u[w_range.start] = -0.40;
-    let mut dir_v = Array1::<f64>::zeros(r);
-    dir_v[primary.q] = -0.30;
-    dir_v[primary.slope] = 0.50;
-    dir_v[h_range.end - 1] = 0.25;
-    dir_v[w_range.end - 1] = 0.60;
-
-    let point = family
-        .primary_point_from_block_states(row, &states, &primary)
-        .expect("StandardNormal FLEX primary point");
-    let (q, b, beta_h, beta_w) = family.primary_point_components(&point, &primary);
-    let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
-    let classify = |index: usize| -> String {
-        if index == primary.q {
-            "q".to_string()
-        } else if index == primary.slope {
-            "slope".to_string()
-        } else if h_range.contains(&index) {
-            format!("h{}", index - h_range.start)
-        } else {
-            format!("w{}", index - w_range.start)
-        }
-    };
-
-    // The totals the fifth slabs compose from also compose the third and fourth
-    // contractions the canonical lowerings serve. Agreement there confines any gap
-    // in the fifth slabs to its order-five terms.
-    let totals = family
-        .standard_normal_flex_row_totals(
-            row,
-            &primary,
-            q,
-            b,
-            beta_h.as_ref(),
-            beta_w.as_ref(),
-            row_ctx,
-            &dir_u,
-            &dir_v,
-        )
-        .expect("StandardNormal FLEX row totals");
-    let composed_third = totals.contraction(0b01101);
-    let composed_fourth = totals.contraction(0b01111);
-    let canonical_third = family
-        .row_primary_third_contracted_with_moments(row, &states, &cache, row_ctx, &dir_u)
-        .expect("canonical StandardNormal t3 lowering");
-    let canonical_fourth = family
-        .row_primary_fourth_contracted_ordered(row, &states, &cache, row_ctx, &dir_u, &dir_v)
-        .expect("canonical StandardNormal t4 lowering");
-    let mut max_third_gap = 0.0_f64;
-    let mut max_fourth_gap = 0.0_f64;
-    for k in 0..r {
-        for l in 0..r {
-            max_third_gap = max_third_gap.max(derivative_ladder_relative_error(
-                composed_third[k + l * r],
-                canonical_third[[k, l]],
-            ));
-            max_fourth_gap = max_fourth_gap.max(derivative_ladder_relative_error(
-                composed_fourth[k + l * r],
-                canonical_fourth[[k, l]],
-            ));
-        }
-    }
-    eprintln!(
-        "#2901 composed vs canonical: t3 max relative gap {max_third_gap:.3e}, t4 max relative gap {max_fourth_gap:.3e}"
-    );
-
-    let started = std::time::Instant::now();
-    let slabs = family
-        .standard_normal_flex_row_fifth_axis_slabs(
-            row,
-            &primary,
-            q,
-            b,
-            beta_h.as_ref(),
-            beta_w.as_ref(),
-            row_ctx,
-            &dir_u,
-            &dir_v,
-        )
-        .expect("StandardNormal FLEX fifth slabs");
-    eprintln!(
-        "#2901 StandardNormal FLEX fifth slabs for one row, r={r}: {:.3e} s",
-        started.elapsed().as_secs_f64()
-    );
-    assert_eq!(slabs.len(), r);
-
-    let fourth_along = |axis: usize, step: f64| -> Array2<f64> {
-        let mut e_axis = Array1::<f64>::zeros(r);
-        e_axis[axis] = 1.0;
-        let shifted = perturb_standard_normal_flex_states(&states, &primary, row, &e_axis, step);
-        let shifted_cache = family
-            .build_exact_eval_cache(&shifted)
-            .expect("shifted StandardNormal FLEX exact cache");
-        family
-            .row_primary_fourth_contracted_ordered(
-                row,
-                &shifted,
-                &shifted_cache,
-                BernoulliMarginalSlopeFamily::row_ctx(&shifted_cache, row),
-                &dir_u,
-                &dir_v,
-            )
-            .expect("shifted StandardNormal t4 lowering")
-    };
-    let mut rows: Vec<(f64, usize, usize, usize, f64, f64, f64)> = Vec::new();
-    let mut signal = 0.0_f64;
-    for axis in 0..r {
-        let central = |step: f64| (fourth_along(axis, step) - fourth_along(axis, -step)) / (2.0 * step);
-        let coarse = central(4.0e-4);
-        let fine = central(2.0e-4);
-        let richardson = (&fine * 4.0 - &coarse) / 3.0;
-        for k in 0..r {
-            for l in 0..r {
-                let analytic = slabs[axis][[k, l]];
-                assert!(
-                    analytic.is_finite(),
-                    "axis={axis} k={k} l={l}: non-finite fifth slab {analytic}"
-                );
-                signal = signal.max(analytic.abs());
-                let witness = richardson[[k, l]];
-                rows.push((
-                    derivative_ladder_relative_error(analytic, witness),
-                    axis,
-                    k,
-                    l,
-                    analytic,
-                    witness,
-                    coarse[[k, l]],
-                ));
-            }
-        }
-    }
-    // Print the worst entries before asserting, so a red run still names the
-    // blocks that carry the gap.
-    rows.sort_by(|left, right| {
-        right
-            .0
-            .partial_cmp(&left.0)
-            .expect("finite relative errors order totally")
-    });
-    for &(error, axis, k, l, analytic, witness, coarse) in rows.iter().take(16) {
-        eprintln!(
-            "#2901   {error:.3e} | T[{}][{}][{}] | fifth={analytic:+.9e} richardson={witness:+.9e} coarse={coarse:+.9e}",
-            classify(axis),
-            classify(k),
-            classify(l)
-        );
-    }
-    let max_error = rows.first().map_or(0.0, |worst| worst.0);
-    eprintln!(
-        "#2901 StandardNormal FLEX fifth slabs vs Richardson t4: max relative error {max_error:.3e}, max |T|={signal:.3e}"
-    );
-    assert!(
-        max_third_gap <= 1e-9,
-        "composed t3 departs from the canonical lowering: {max_third_gap:.3e}"
-    );
-    assert!(
-        max_fourth_gap <= 1e-9,
-        "composed t4 departs from the canonical lowering: {max_fourth_gap:.3e}"
-    );
-    assert!(
-        signal > 1e-8,
-        "StandardNormal FLEX fifth slabs must carry nonzero signal, max |T|={signal:.3e}"
-    );
-    assert!(
-        max_error <= 1e-5,
-        "StandardNormal FLEX fifth slabs depart from the Richardson t4 witness: {max_error:.3e}"
     );
 }
 

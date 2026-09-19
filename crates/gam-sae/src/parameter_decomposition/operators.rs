@@ -13,7 +13,8 @@
 //!   control per block. Any other mask names an intervention only together with
 //!   the basis it was written in, and is carried as an operator, `M → S⁻¹ M S`.
 //!   Independent diagonal masks on an arbitrary basis of one block are not
-//!   intrinsic interventions.
+//!   intrinsic interventions. [`mask_gauge_evidence`] reports the verdict as an
+//!   [`EvidenceStatus`]: exact at 0, or a counterexample with its witness.
 //! * **Curved versus straight paths (P2).** For a rotation
 //!   `W = I + U (R(α) − I) Uᵀ` in orthonormal planes, the angle path
 //!   `W(t) = I + U (R(tα) − I) Uᵀ` is orthogonal for every `t` and moves the
@@ -35,8 +36,10 @@ use std::ops::Range;
 
 use gam_geometry::manifolds::lie_so::rho_so2;
 use gam_linalg::faer_ndarray::{FaerSvd, fast_ab, fast_abt, fast_atb, fast_atv, fast_av};
-use gam_linalg::roundoff::factor_singular_band;
+use gam_linalg::roundoff::{accumulation_growth, factor_singular_band};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+
+use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis};
 
 /// Why an operator construction or application was declined.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,8 +71,17 @@ pub enum OperatorRefusal {
     /// A plane basis has an odd column count, so its columns do not pair into
     /// planes.
     OddPlaneBasis { columns: usize },
+    /// A plane basis is further from orthonormal than any stably orthogonalized
+    /// basis of its shape: `‖UᵀU − I‖_F` exceeds the floor derived at
+    /// [`PlaneRotation::new`].
+    NonOrthonormalPlaneBasis { defect: f64, floor: f64 },
+    /// A rotary declaration lists a coordinate outside `0..dim`, or lists one twice.
+    InvalidRotaryDeclaration { coordinate: usize },
     /// The linear-algebra backend failed to decompose a matrix.
     DecompositionFailed { what: &'static str, detail: String },
+    /// The evidence constructor refused the status, e.g. a counterexample whose shift overflowed
+    /// to a non-finite value.
+    Evidence(EvidenceStatusError),
 }
 
 /// A declared implementation gauge of an `r`-coordinate internal space: the group
@@ -204,6 +216,400 @@ pub fn classify_internal_mask(
         controls.push(control);
     }
     Ok(MaskGaugeVerdict::Intrinsic { controls })
+}
+
+/// A declared implementation gauge of an `r`-coordinate internal space, named by its
+/// group.
+///
+/// A fixed internal mask is an intrinsic intervention iff it lies in the group's
+/// commutant. [`classify_under`] decides that on the declared entries; otherwise it
+/// returns a witness that lies in the group and moves the fixed mask's intervention.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DeclaredGauge {
+    /// `GL(r₁) ⊕ … ⊕ GL(r_K)`, with commutant `⊕ c_k I_{r_k}`.
+    Blocks(GaugeBlocks),
+    /// The permutations `S_r` of `units` hidden units, acting as `M → P M Pᵀ`. This is
+    /// the gauge of an activation that commutes with permutations and nothing larger
+    /// (GELU, SiLU). Its commutant is `span{I, 11ᵀ}`.
+    UnitPermutations { units: usize },
+    /// Unit permutations with per-unit scalings: `(ℝ_{>0})^r ⋊ S_r` for ReLU, and
+    /// `(ℝ^×)^r ⋊ S_r` for a SwiGLU up/down pair or a norm gain. Both groups have
+    /// commutant `cI`, and every witness [`classify_under`] returns lies in both, so the
+    /// declaration does not name the sign.
+    ScaledPermutations { units: usize },
+    /// The commutant of a rotary map `R_1` on head coordinates,
+    /// `⊕_k GL(m_k, ℂ) ⊕ GL(n_pass)`, whose own commutant is
+    /// `⊕_k (α_k I + β_k J_k) ⊕ γ I`.
+    RotaryCommutant(RotaryGroups),
+}
+
+impl DeclaredGauge {
+    /// The internal dimension `r`.
+    pub fn rank(&self) -> usize {
+        match self {
+            DeclaredGauge::Blocks(blocks) => blocks.rank(),
+            DeclaredGauge::UnitPermutations { units } | DeclaredGauge::ScaledPermutations { units } => *units,
+            DeclaredGauge::RotaryCommutant(groups) => groups.dim(),
+        }
+    }
+}
+
+/// The frequency groups of a rotary map on head coordinates.
+///
+/// Group `k` lists the `(a, b)` coordinate pairs of the planes rotating at one frequency
+/// in `(0, π)`. For each plane, `x_a + i x_b` is the complex coordinate and
+/// `J_k (x_a, x_b) = (−x_b, x_a)`. `pass_through` holds the coordinates the map fixes.
+///
+/// Detecting the frequencies is the caller's job. Since `R_Δ = R_1^Δ`, and frequencies in
+/// `(0, π)` give eigenvalues `e^{±iθ}` that differ between groups and differ from the
+/// pass-through eigenvalue 1, an `S` commuting with every `R_Δ` is block diagonal and
+/// commutes with each `J_k`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RotaryGroups {
+    plane_groups: Vec<Vec<(usize, usize)>>,
+    pass_through: Range<usize>,
+    dim: usize,
+}
+
+impl RotaryGroups {
+    /// `dim = 2 Σ m_k + |pass_through|`.
+    ///
+    /// Refuses an empty group, and any coordinate listed outside `0..dim` or listed twice.
+    /// Exactly `dim` coordinates are listed, so with no duplicate and none out of range they
+    /// cover `0..dim` exactly once.
+    pub fn new(plane_groups: Vec<Vec<(usize, usize)>>, pass_through: Range<usize>) -> Result<Self, OperatorRefusal> {
+        if plane_groups.iter().any(|group| group.is_empty()) {
+            return Err(OperatorRefusal::EmptyGaugeBlock);
+        }
+        let dim = 2 * plane_groups.iter().map(Vec::len).sum::<usize>() + pass_through.len();
+        let mut covered = vec![false; dim];
+        let listed = plane_groups
+            .iter()
+            .flatten()
+            .flat_map(|&(a, b)| [a, b])
+            .chain(pass_through.clone());
+        for coordinate in listed {
+            if coordinate >= dim || covered[coordinate] {
+                return Err(OperatorRefusal::InvalidRotaryDeclaration { coordinate });
+            }
+            covered[coordinate] = true;
+        }
+        Ok(Self {
+            plane_groups,
+            pass_through,
+            dim,
+        })
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn plane_groups(&self) -> &[Vec<(usize, usize)>] {
+        &self.plane_groups
+    }
+
+    pub fn pass_through(&self) -> Range<usize> {
+        self.pass_through.clone()
+    }
+
+    /// The block of each coordinate: `k` for group `k`, and `plane_groups.len()` for the
+    /// pass-through.
+    fn block_ids(&self) -> Vec<usize> {
+        let mut ids = vec![self.plane_groups.len(); self.dim];
+        for (k, group) in self.plane_groups.iter().enumerate() {
+            for &(a, b) in group {
+                ids[a] = k;
+                ids[b] = k;
+            }
+        }
+        ids
+    }
+}
+
+/// Classify a fixed internal mask under a declared gauge (P1).
+///
+/// The checks compare declared entries with `==` and carry no tolerance: an entry that
+/// differs by any amount moves the intervention by that amount along the witness.
+/// Every witness lies in the declared group. Witnesses are built from permutations,
+/// reflections, `J_k` and scalings by 2, so `S M S⁻¹` only permutes, negates or doubles
+/// entries.
+///
+/// Witnesses by variant:
+/// - `Blocks`: as [`classify_internal_mask`].
+/// - `UnitPermutations`:
+///   - unequal diagonal entries: the transposition `(0 i)`;
+///   - an off-diagonal entry unequal to `M_01`: the permutation sending `(i, j)` to `(0, 1)`.
+///     It exists because `S_r` is 2-transitive on ordered pairs.
+/// - `ScaledPermutations`:
+///   - an off-diagonal `M_ij ≠ 0`: scale 2 on coordinate `i`, which doubles the entry and
+///     lies in both scale groups;
+///   - unequal diagonal entries: the transposition.
+/// - `RotaryCommutant`, checked in this order:
+///   - a cross-block entry: scale 2 on the row's block;
+///   - a block that is not complex-linear, `M J_k ≠ J_k M`: `J_k` on group `k`;
+///   - a complex off-diagonal entry: scale 2 on plane `p`;
+///   - unequal complex diagonal entries: the complex transposition of planes `0` and `p`,
+///     moving both coordinates together;
+///   - the pass-through: the GL witnesses.
+///
+/// `Intrinsic { controls }` by variant:
+/// - `Blocks`: one per block.
+/// - `UnitPermutations`: `[diagonal, off_diagonal]`, or `[diagonal]` for one unit.
+/// - `ScaledPermutations`: `[c]`.
+/// - `RotaryCommutant`: `[α_1, β_1, …, α_K, β_K]`, followed by `γ` when the pass-through is
+///   non-empty. `α_k = M[a, a]` and `β_k = M[b, a]` on the group's first plane.
+pub fn classify_under(mask: ArrayView2<'_, f64>, gauge: &DeclaredGauge) -> Result<MaskGaugeVerdict, OperatorRefusal> {
+    match gauge {
+        DeclaredGauge::Blocks(blocks) => classify_internal_mask(mask, blocks),
+        DeclaredGauge::UnitPermutations { units } => {
+            check_declared_mask(mask, *units)?;
+            Ok(classify_unit_permutations(mask))
+        }
+        DeclaredGauge::ScaledPermutations { units } => {
+            check_declared_mask(mask, *units)?;
+            Ok(classify_scaled_permutations(mask))
+        }
+        DeclaredGauge::RotaryCommutant(groups) => {
+            check_declared_mask(mask, groups.dim())?;
+            Ok(classify_rotary(mask, groups))
+        }
+    }
+}
+
+/// A point of the domain of [`mask_gauge_evidence`]: a gauge change in the declared group and
+/// the internal entry whose movement it measures.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskWitness {
+    /// `S`, an element of the declared group.
+    pub gauge_change: Array2<f64>,
+    /// `(i, j)`, the entry of `S M S⁻¹ − M` the value measures.
+    pub moved: (usize, usize),
+}
+
+/// The evidence status of P1's claim for one fixed mask under one declared gauge.
+pub type MaskGaugeEvidence = EvidenceStatus<MaskWitness, DeclaredGauge>;
+
+/// P1 as evidence. The claim is that a fixed internal mask names an intervention that does
+/// not depend on the basis: `sup Q <= 0` with `Q(S, (i, j)) = |(S M S⁻¹ − M)_ij|` over the
+/// gauge changes `S` of the declared group and the internal entries `(i, j)`. With
+/// full-column-rank factors ([`FactoredOperator::new`] refuses others), a moved entry moves
+/// `U M Vᵀ`.
+///
+/// - [`MaskGaugeVerdict::Intrinsic`] is `Exact` with value 0, basis `Algebraic` and the
+///   declared gauge as its domain. A mask in the group's commutant commutes with every
+///   element, and nothing is evaluated.
+/// - [`MaskGaugeVerdict::BasisDependent`] is a `Counterexample` at threshold 0, with the
+///   witness and value `|shift|`. [`classify_under`]'s witnesses only permute, negate or double
+///   entries, so each shift is exact (`−2 M_ij` or `M_ij`) or one rounded subtraction of two
+///   declared entries, `fl(a − b) = (a − b)(1 + δ)` with `|δ| <= u`. Then
+///   `|fl(a − b) − (a − b)| <= γ₁ |fl(a − b)| <= ε |fl(a − b)|`. `ε |shift|` is a power-of-two
+///   scaling, exact unless it underflows, and rounding it up once covers the underflow. A
+///   subnormal difference of two floats is exact, because both are multiples of the smallest
+///   subnormal, so a subnormal shift carries no error. `a ≠ b` gives `fl(a − b) ≠ 0`, so every
+///   finite shift exceeds its error.
+/// - A shift that overflows is refused. That happens when `|M_ij| > f64::MAX / 2` under a
+///   reflection, or when two opposite-sign entries differ by more than `f64::MAX`.
+///   [`EvidenceStatus::counterexample`] refuses the non-finite value, and the refusal returns as
+///   [`OperatorRefusal::Evidence`] although the mask is basis-dependent.
+pub fn mask_gauge_evidence(mask: ArrayView2<'_, f64>, gauge: &DeclaredGauge) -> Result<MaskGaugeEvidence, OperatorRefusal> {
+    let status = match classify_under(mask, gauge)? {
+        MaskGaugeVerdict::Intrinsic { .. } => EvidenceStatus::exact(0.0, 0.0, ExactBasis::Algebraic, None, gauge.clone()),
+        MaskGaugeVerdict::BasisDependent {
+            gauge_change,
+            moved,
+            shift,
+        } => {
+            let value = shift.abs();
+            let numerical_error = if value < f64::MIN_POSITIVE {
+                0.0
+            } else {
+                (f64::EPSILON * value).next_up()
+            };
+            EvidenceStatus::counterexample(value, numerical_error, 0.0, MaskWitness { gauge_change, moved })
+        }
+    };
+    status.map_err(OperatorRefusal::Evidence)
+}
+
+fn check_declared_mask(mask: ArrayView2<'_, f64>, order: usize) -> Result<(), OperatorRefusal> {
+    if order == 0 {
+        return Err(OperatorRefusal::EmptyGaugeBlock);
+    }
+    check_square("internal mask order", order, mask)?;
+    if !mask.iter().all(|entry| entry.is_finite()) {
+        return Err(OperatorRefusal::NonFinite {
+            what: "internal mask",
+        });
+    }
+    Ok(())
+}
+
+fn basis_dependent(gauge_change: Array2<f64>, moved: (usize, usize), shift: f64) -> MaskGaugeVerdict {
+    MaskGaugeVerdict::BasisDependent {
+        gauge_change,
+        moved,
+        shift,
+    }
+}
+
+/// `I − 2 e_i e_iᵀ`.
+fn reflection(r: usize, i: usize) -> Array2<f64> {
+    let mut s = Array2::<f64>::eye(r);
+    s[[i, i]] = -1.0;
+    s
+}
+
+/// The permutation matrix with `P e_k = e_{sigma[k]}`, so `(P M Pᵀ)[σ(k), σ(l)] = M[k, l]`.
+fn permutation_matrix(sigma: &[usize]) -> Array2<f64> {
+    let mut p = Array2::<f64>::zeros((sigma.len(), sigma.len()));
+    for (k, &image) in sigma.iter().enumerate() {
+        p[[image, k]] = 1.0;
+    }
+    p
+}
+
+/// The transpositions of the listed coordinate pairs, applied together.
+fn swap_coordinates(r: usize, pairs: &[(usize, usize)]) -> Array2<f64> {
+    let mut sigma: Vec<usize> = (0..r).collect();
+    for &(i, j) in pairs {
+        sigma.swap(i, j);
+    }
+    permutation_matrix(&sigma)
+}
+
+/// Scale 2 on the listed coordinates and 1 elsewhere. The factor 2 is exact in binary,
+/// so `(S M S⁻¹)_ij = 2 M_ij` for a row `i` in the list and a column `j` outside it.
+fn scale_coordinates(r: usize, coordinates: &[usize]) -> Array2<f64> {
+    let mut s = Array2::<f64>::eye(r);
+    for &i in coordinates {
+        s[[i, i]] = 2.0;
+    }
+    s
+}
+
+fn classify_unit_permutations(mask: ArrayView2<'_, f64>) -> MaskGaugeVerdict {
+    let r = mask.nrows();
+    let diagonal = mask[[0, 0]];
+    for i in 1..r {
+        if mask[[i, i]] != diagonal {
+            return basis_dependent(swap_coordinates(r, &[(0, i)]), (0, 0), mask[[i, i]] - diagonal);
+        }
+    }
+    if r == 1 {
+        return MaskGaugeVerdict::Intrinsic {
+            controls: vec![diagonal],
+        };
+    }
+    let off_diagonal = mask[[0, 1]];
+    for ((i, j), &entry) in mask.indexed_iter() {
+        if i != j && entry != off_diagonal {
+            let mut sigma = vec![0; r];
+            sigma[j] = 1;
+            let mut next = 2;
+            for (k, image) in sigma.iter_mut().enumerate() {
+                if k != i && k != j {
+                    *image = next;
+                    next += 1;
+                }
+            }
+            return basis_dependent(permutation_matrix(&sigma), (0, 1), entry - off_diagonal);
+        }
+    }
+    MaskGaugeVerdict::Intrinsic {
+        controls: vec![diagonal, off_diagonal],
+    }
+}
+
+fn classify_scaled_permutations(mask: ArrayView2<'_, f64>) -> MaskGaugeVerdict {
+    let r = mask.nrows();
+    for ((i, j), &entry) in mask.indexed_iter() {
+        if i != j && entry != 0.0 {
+            return basis_dependent(scale_coordinates(r, &[i]), (i, j), entry);
+        }
+    }
+    let control = mask[[0, 0]];
+    for i in 1..r {
+        if mask[[i, i]] != control {
+            return basis_dependent(swap_coordinates(r, &[(0, i)]), (0, 0), mask[[i, i]] - control);
+        }
+    }
+    MaskGaugeVerdict::Intrinsic {
+        controls: vec![control],
+    }
+}
+
+fn classify_rotary(mask: ArrayView2<'_, f64>, groups: &RotaryGroups) -> MaskGaugeVerdict {
+    let r = groups.dim();
+    let ids = groups.block_ids();
+    for ((u, v), &entry) in mask.indexed_iter() {
+        if ids[u] != ids[v] && entry != 0.0 {
+            let row_block: Vec<usize> = (0..r).filter(|&w| ids[w] == ids[u]).collect();
+            return basis_dependent(scale_coordinates(r, &row_block), (u, v), entry);
+        }
+    }
+    let mut controls = Vec::with_capacity(2 * groups.plane_groups.len() + 1);
+    for group in &groups.plane_groups {
+        for &(a_p, b_p) in group {
+            for &(a_q, b_q) in group {
+                let (upper_left, upper_right) = (mask[[a_p, a_q]], mask[[a_p, b_q]]);
+                let (lower_left, lower_right) = (mask[[b_p, a_q]], mask[[b_p, b_q]]);
+                if lower_right != upper_left || upper_right != -lower_left {
+                    let mut j = Array2::<f64>::eye(r);
+                    for &(a, b) in group {
+                        j[[a, a]] = 0.0;
+                        j[[b, b]] = 0.0;
+                        j[[b, a]] = 1.0;
+                        j[[a, b]] = -1.0;
+                    }
+                    // Conjugating by J sends [[A, B], [C, D]] to [[D, −C], [−B, A]].
+                    return if lower_right != upper_left {
+                        basis_dependent(j, (a_p, a_q), lower_right - upper_left)
+                    } else {
+                        basis_dependent(j, (a_p, b_q), -lower_left - upper_right)
+                    };
+                }
+            }
+        }
+        let (a_0, b_0) = group[0];
+        for &(a_p, b_p) in group {
+            for &(a_q, ..) in group {
+                if a_p != a_q && (mask[[a_p, a_q]] != 0.0 || mask[[b_p, a_q]] != 0.0) {
+                    let s = scale_coordinates(r, &[a_p, b_p]);
+                    return if mask[[a_p, a_q]] != 0.0 {
+                        basis_dependent(s, (a_p, a_q), mask[[a_p, a_q]])
+                    } else {
+                        basis_dependent(s, (b_p, a_q), mask[[b_p, a_q]])
+                    };
+                }
+            }
+            if mask[[a_p, a_p]] != mask[[a_0, a_0]] || mask[[b_p, a_p]] != mask[[b_0, a_0]] {
+                let s = swap_coordinates(r, &[(a_0, a_p), (b_0, b_p)]);
+                return if mask[[a_p, a_p]] != mask[[a_0, a_0]] {
+                    basis_dependent(s, (a_0, a_0), mask[[a_p, a_p]] - mask[[a_0, a_0]])
+                } else {
+                    basis_dependent(s, (b_0, a_0), mask[[b_p, a_p]] - mask[[b_0, a_0]])
+                };
+            }
+        }
+        controls.push(mask[[a_0, a_0]]);
+        controls.push(mask[[b_0, a_0]]);
+    }
+    let pass: Vec<usize> = groups.pass_through().collect();
+    if let Some(&lead) = pass.first() {
+        for &u in &pass {
+            for &v in &pass {
+                if u != v && mask[[u, v]] != 0.0 {
+                    return basis_dependent(reflection(r, u), (u, v), -2.0 * mask[[u, v]]);
+                }
+            }
+            if mask[[u, u]] != mask[[lead, lead]] {
+                return basis_dependent(swap_coordinates(r, &[(lead, u)]), (lead, lead), mask[[u, u]] - mask[[lead, lead]]);
+            }
+        }
+        controls.push(mask[[lead, lead]]);
+    }
+    MaskGaugeVerdict::Intrinsic { controls }
 }
 
 /// A rank-`r` operator `P = U Vᵀ` with full-column-rank factors and a declared
@@ -390,8 +796,13 @@ impl ResidualEdit for MaskedOperator<'_> {
 /// experiments, so a path is never inferred from a bare scalar.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RotationPath {
-    /// `W(t) = I + U (R(tα) − I) Uᵀ`: a structured-edit coordinate. Orthogonal for
-    /// every `t`; it varies the angles.
+    /// `W(t) = I + U (R(tα) − I) Uᵀ`: a structured-edit coordinate that varies the
+    /// angles. It is orthogonal up to the basis defect `δ = ‖UᵀU − I‖_F`, which
+    /// [`PlaneRotation::new`] bounds by its refusal floor.
+    ///
+    /// With `UᵀU = I + F`, the identity terms of `WᵀW` cancel because
+    /// `(Rᵀ − I)(R − I) = 2I − R − Rᵀ`. That leaves `U (Rᵀ − I) F (R − I) Uᵀ`, so
+    /// `‖W(t)ᵀ W(t) − I‖₂ ≤ ‖U‖₂² ‖R − I‖₂² δ ≤ 4δ(1 + δ)`.
     Angle(f64),
     /// `L(t) = I + t U (R(α) − I) Uᵀ`: the residual anchor's mask on `Δ = W − I`.
     /// It removes the contribution and contracts plane `j` by
@@ -407,12 +818,25 @@ pub struct PlaneRotation {
     basis: Array2<f64>,
     angles: Array1<f64>,
     orthonormality_defect: f64,
+    orthonormality_floor: f64,
 }
 
 impl PlaneRotation {
-    /// The basis is not refused for a loss of orthonormality; the defect
-    /// `‖UᵀU − I‖_F` is measured once and reported, and every identity of the
-    /// module holds for this edit only up to it.
+    /// Refuses a basis whose measured defect `δ = ‖UᵀU − I‖_F` exceeds the floor
+    /// `2k·max(d, 2k)·ε + γ_d ‖U‖_F²`. The floor has two parts, and only the second is
+    /// derived.
+    /// - **Orthogonalization, a convention.** `2k·max(d, 2k)·ε` is the `m·n·ε` band of
+    ///   [`factor_singular_band`] at `σ = 1`. It is not derived for this computation.
+    ///   Householder QR's bound `‖Q̂ − Q‖_F ≤ √n·γ̃_{mn}` (Higham, Thm 19.4) carries an
+    ///   unstated constant, so no constant-free floor exists for every stable
+    ///   orthogonalization. The test `householder_qr_bases_stay_under_the_plane_basis_floor`
+    ///   checks FaerQr bases at `d ∈ {8, 64, 512}` and `2k ∈ {2, 8, 32}` from inputs graded
+    ///   down to `1e-12`, and places the refusal at the floor itself.
+    /// - **Forming `UᵀU`.** Each entry is an inner product of `d` terms. By
+    ///   Cauchy–Schwarz the rounding is at most `γ_d ‖U‖_F²` in Frobenius norm.
+    ///
+    /// An accepted basis keeps its measured defect `δ ≤ floor`. Every identity of the
+    /// module holds for this edit up to `δ` (see [`RotationPath::Angle`]).
     pub fn new(basis: Array2<f64>, angles: Array1<f64>) -> Result<Self, OperatorRefusal> {
         if basis.ncols() % 2 != 0 {
             return Err(OperatorRefusal::OddPlaneBasis {
@@ -434,10 +858,18 @@ impl PlaneRotation {
                 deviation * deviation
             })
             .sum();
+        let defect = defect_sq.sqrt();
+        let (dim, internal) = (basis.nrows(), basis.ncols());
+        let basis_sq: f64 = basis.iter().map(|entry| entry * entry).sum();
+        let floor = internal as f64 * dim.max(internal) as f64 * f64::EPSILON + accumulation_growth(dim) * basis_sq;
+        if defect > floor {
+            return Err(OperatorRefusal::NonOrthonormalPlaneBasis { defect, floor });
+        }
         Ok(Self {
             basis,
             angles,
-            orthonormality_defect: defect_sq.sqrt(),
+            orthonormality_defect: defect,
+            orthonormality_floor: floor,
         })
     }
 
@@ -456,6 +888,11 @@ impl PlaneRotation {
     /// `‖UᵀU − I‖_F`, measured at construction.
     pub fn orthonormality_defect(&self) -> f64 {
         self.orthonormality_defect
+    }
+
+    /// The derived floor that [`PlaneRotation::new`] requires the defect not to exceed.
+    pub fn orthonormality_floor(&self) -> f64 {
+        self.orthonormality_floor
     }
 
     /// `Δ x` along `path`.
@@ -621,6 +1058,7 @@ fn check_square(what: &'static str, order: usize, matrix: ArrayView2<'_, f64>) -
 mod tests {
     use super::*;
     use gam_linalg::roundoff::accumulation_growth;
+    use gam_linalg::faer_ndarray::FaerQr;
     use ndarray::s;
     use rand::RngExt;
     use rand::SeedableRng;
@@ -663,13 +1101,12 @@ mod tests {
         }
     }
 
-    /// `columns` orthonormal columns in `ℝ^dim`: two Gram–Schmidt sweeps, so the
-    /// defect is at roundoff, and `PlaneRotation::new` still measures it.
+    /// `columns` orthonormal columns in `ℝ^dim`, from the Householder QR owner that
+    /// spectral.rs's tests use. Taking the first `columns` columns gives the same
+    /// basis whether `qr` returns a thin or a full `Q`.
     fn orthonormal_columns(rng: &mut StdRng, dim: usize, columns: usize) -> Array2<f64> {
-        let mut q = uniform_matrix(rng, dim, columns);
-        orthogonalize_columns(&mut q);
-        orthogonalize_columns(&mut q);
-        q
+        let q = uniform_matrix(rng, dim, columns).qr().expect("Householder QR of a uniform draw").0;
+        q.slice(s![.., 0..columns]).to_owned()
     }
 
     /// `U_j D(φ)`: the unit vector at angle `φ` in plane `j` of `basis`.
@@ -724,9 +1161,16 @@ mod tests {
     /// `Uᵀx` rounds `d` terms per coordinate, the plane map at most three (the
     /// chord's scale included), `U z` `2k`, and the final add one, so each stage
     /// sits inside `γ_{d + 2k + 4}` times its absolute magnitude. Frobenius norms
-    /// majorize those magnitudes: `‖Uᵀx‖ ≤ ‖U‖_F ‖x‖`, `‖|R − I|‖_F ≤ 4` because its
-    /// entries are at most 2, and `‖U z‖ ≤ ‖U‖_F ‖z‖`. Propagating the four stage
-    /// errors and the rounding of `cos` and `sin` gives `γ·(1 + 11 lever ‖U‖_F²)‖x‖`.
+    /// majorize those magnitudes. The five contributions, carried to the output:
+    /// - `Uᵀx`, on `‖Uᵀx‖ ≤ ‖U‖_F ‖x‖`, through `|R − I| ≤ 2` and `U`: `2‖U‖_F²‖x‖`;
+    /// - the plane map, `‖|R − I|‖_F ≤ 4` on `‖z‖ ≤ ‖U‖_F ‖x‖`, through `U`: `4‖U‖_F²‖x‖`;
+    /// - `U z'` on `‖z'‖ ≤ 2‖U‖_F ‖x‖`: `2‖U‖_F²‖x‖`;
+    /// - the final add, on `‖x‖ + ‖U z'‖`: `(1 + 2‖U‖_F²)‖x‖`;
+    /// - the rounding of `cos` and `sin`, within `u` per entry, through `U` on both
+    ///   sides: `‖U‖_F²‖x‖`.
+    ///
+    /// Summed: `γ·(1 + (2 + 4 + 2 + 2 + 1)‖U‖_F²)‖x‖ = γ·(1 + 11‖U‖_F²)‖x‖`. On the chord,
+    /// every stage after `Uᵀx` scales by `|t|`, so `lever = max(1, |t|)` multiplies the 11.
     /// This is rounding only. The basis defect enters through [`plane_vector_defect`]
     /// or [`loop_bar`], wherever an orthonormal-basis map is the reference.
     fn rotation_apply_band(rotation: &PlaneRotation, lever: f64, x_norm: f64) -> f64 {
@@ -1231,6 +1675,659 @@ mod tests {
         assert!(
             remainder > skew_bar + rounding,
             "positive control: non-skew generators must leave the skew bar, {remainder:e} <= {skew_bar:e}"
+        );
+    }
+
+    /// Rounding band, in Frobenius norm, of `gam_geometry::manifold::matrix_exp(a)` for an
+    /// exactly skew `n × n` input `a`, following the owner's algorithm.
+    ///
+    /// The owner halves `s` times until `θ = ‖a‖_F / 2^s ≤ 1/4`, sums the degree-12 Taylor
+    /// series and squares `s` times. The band is assembled phase by phase.
+    /// - **Taylor phase.** `term_k = term_{k−1} · a_s / k` rounds `n` products and one
+    ///   division per entry, and the sum adds one more rounding. With
+    ///   `‖|X||Y|‖_F ≤ ‖X‖_F ‖Y‖_F`, the error `τ_k` of `term_k` obeys
+    ///   `τ_k ≤ θ(τ_{k−1} + γ_{n+1}(‖term_{k−1}‖_F + τ_{k−1}))/k`, with
+    ///   `‖term_k‖_F ≤ √n θ^k/k!`. Each addition adds `γ_1(√n e^θ + ‖term_k‖_F)`.
+    /// - **Truncation.** The owner's tail bound `θ^{13}/13!/(1 − θ)` per unit norm, times `√n`.
+    /// - **Squaring phase.** The exact factors are orthogonal because `a` is skew, so
+    ///   `‖X_j‖₂ = 1`. A computed square `(X + E)(X + E)` therefore carries error at most
+    ///   `2e + e² + γ_n(√n + e)²` from an input error `e`.
+    ///
+    /// Every step is evaluated as its recurrence, not linearized.
+    fn matrix_exp_band(a: &Array2<f64>) -> f64 {
+        let n = a.nrows();
+        let root_n = (n as f64).sqrt();
+        let frob = frobenius(a);
+        let squarings = if frob > 0.25 { (frob / 0.25).log2().ceil() as i32 } else { 0 };
+        let theta = frob / 2.0_f64.powi(squarings);
+        let mut term_norm = root_n;
+        let mut term_error = 0.0_f64;
+        let mut sum_error = 0.0_f64;
+        let mut factorial = 1.0_f64;
+        for k in 1..=12 {
+            let k_f = k as f64;
+            term_error = theta * (term_error + accumulation_growth(n + 1) * (term_norm + term_error)) / k_f;
+            term_norm = term_norm * theta / k_f;
+            sum_error += term_error + accumulation_growth(1) * (root_n * theta.exp() + term_norm);
+            factorial *= k_f;
+        }
+        let tail = root_n * theta.powi(13) / (factorial * 13.0) / (1.0 - theta);
+        let mut error = sum_error + tail;
+        for _ in 0..squarings {
+            error = 2.0 * error + error * error + accumulation_growth(n) * (root_n + error).powi(2);
+        }
+        error
+    }
+
+    /// `U Ω Uᵀ` formed densely for a test, with `Ω = ⊕_j α_j J`, then made exactly skew
+    /// by `½(A − Aᵀ)`: the two entries of each pair are exact negatives of each other.
+    fn dense_generator(rotation: &PlaneRotation) -> Array2<f64> {
+        let internal = rotation.basis.ncols();
+        let mut omega = Array2::<f64>::zeros((internal, internal));
+        for (j, &alpha) in rotation.angles.iter().enumerate() {
+            omega[[2 * j + 1, 2 * j]] = alpha;
+            omega[[2 * j, 2 * j + 1]] = -alpha;
+        }
+        let formed = rotation.basis.dot(&omega).dot(&rotation.basis.t());
+        (&formed - &formed.t()) * 0.5
+    }
+
+    /// The executed angle-path factor of a plane rotation is the matrix exponential of
+    /// its generator: `x + U(R(sα) − I)Uᵀx` equals `matrix_exp(s U Ω Uᵀ) x`.
+    ///
+    /// The band combines:
+    /// - the executed edit's rounding, [`rotation_apply_band`];
+    /// - the basis defect `ε = 2|s|‖Ω‖₂ δ(2 + δ)` (derived at [`loop_bar`]);
+    /// - the dense generator's formation error `|s|‖δA‖_F` with
+    ///   `‖δA‖_F ≤ γ_{4k+4} ‖U‖_F² ‖Ω‖_F`, since both generators are skew and
+    ///   `‖e^X − e^Y‖ ≤ ‖X − Y‖`;
+    /// - [`matrix_exp_band`];
+    /// - the dense matvec `γ_{d+1}(√d + e)‖x‖`.
+    ///
+    /// Positive control: `matrix_exp(−sA) x` misses the executed factor by
+    /// `2|sin(sα_j)|` on each plane.
+    #[test]
+    fn the_executed_plane_rotation_factor_is_the_matrix_exponential_of_its_generator() {
+        let mut rng = StdRng::seed_from_u64(295_108);
+        let dim = 6;
+        let basis = orthonormal_columns(&mut rng, dim, 4);
+        let rotation = PlaneRotation::new(basis, Array1::from(vec![0.9, -2.3])).expect("rotation");
+        let generator = dense_generator(&rotation);
+        let x = uniform_vector(&mut rng, dim);
+        let x_norm = norm(&x);
+        let omega_spectral = rotation.angles.iter().fold(0.0_f64, |largest, angle| largest.max(angle.abs()));
+        let omega_frobenius = 2.0_f64.sqrt() * norm(&rotation.angles.to_owned());
+        let delta = rotation.orthonormality_defect();
+        let formation = accumulation_growth(4 * rotation.basis.ncols() + 4) * frobenius(&rotation.basis).powi(2) * omega_frobenius;
+        for s in [0.4_f64, 1.0, 1.7] {
+            let executed = rotation.apply(RotationPath::Angle(s), x.view()).expect("angle path");
+            let scaled = &generator * s;
+            let exponential = gam_geometry::manifold::matrix_exp(&scaled).expect("matrix_exp");
+            let exp_error = matrix_exp_band(&scaled);
+            let band = rotation_apply_band(&rotation, 1.0, x_norm)
+                + (2.0 * s.abs() * omega_spectral * delta * (2.0 + delta) + s.abs() * formation + exp_error) * x_norm
+                + accumulation_growth(dim + 1) * ((dim as f64).sqrt() + exp_error) * x_norm;
+            let gap = norm(&(&executed - &exponential.dot(&x)));
+            assert!(gap <= band, "executed factor vs matrix_exp(sA) at s={s}: {gap:e} > {band:e}");
+            let reversed = gam_geometry::manifold::matrix_exp(&(&generator * -s)).expect("matrix_exp");
+            let reversed_gap = norm(&(&executed - &reversed.dot(&x)));
+            assert!(
+                reversed_gap > band + matrix_exp_band(&(&generator * -s)) * x_norm,
+                "positive control: matrix_exp(−sA) must miss the executed factor at s={s}, {reversed_gap:e}"
+            );
+        }
+    }
+
+    /// A random exactly skew `n × n` matrix.
+    fn random_skew(rng: &mut StdRng, n: usize) -> Array2<f64> {
+        let raw = uniform_matrix(rng, n, n);
+        (&raw - &raw.t()) * 0.5
+    }
+
+    /// An upper bound on `‖a‖₂`: the computed largest singular value plus its SVD
+    /// rounding band ([`factor_singular_band`]).
+    fn spectral_norm_bound(a: &Array2<f64>) -> f64 {
+        let sigma = a.svd(false, false).expect("svd").1;
+        let sigma_max = sigma.iter().fold(0.0_f64, |largest, &value| largest.max(value));
+        sigma_max + factor_singular_band(a.nrows(), a.ncols(), sigma_max)
+    }
+
+    /// A4 (P4) beyond plane generators: for random dense skew `A`, `B` executed through
+    /// `matrix_exp`, the loop remainder stays inside [`skew_loop_bar`] plus the four
+    /// factors' exponential bands, telescoped against orthogonal exponentials as
+    /// `(Σ e_i)(1 + max e)³‖x‖`. Rounding covers the four dense matvecs,
+    /// `4γ_{n+1}(√n + max e)‖x‖`, and the commutator's formation,
+    /// `st · 2γ_{2n+1} ‖A‖_F ‖B‖_F ‖x‖`.
+    ///
+    /// Positive control: `x` is the column that `[A, B]` moves the most. Dropping `st[A, B]`
+    /// at the smallest step leaves the bar.
+    #[test]
+    fn the_skew_loop_bar_holds_for_dense_skew_generators() {
+        let mut rng = StdRng::seed_from_u64(295_109);
+        let n = 5;
+        let a = random_skew(&mut rng, n);
+        let b = random_skew(&mut rng, n);
+        let (norm_a, norm_b) = (spectral_norm_bound(&a), spectral_norm_bound(&b));
+        let bracket = a.dot(&b) - b.dot(&a);
+        let column = (0..n)
+            .map(|j| (j, norm(&bracket.column(j).to_owned())))
+            .fold((0, 0.0_f64), |best, candidate| if candidate.1 > best.1 { candidate } else { best })
+            .0;
+        let mut aligned_x = Array1::<f64>::zeros(n);
+        aligned_x[column] = 1.0;
+        let random_x = uniform_vector(&mut rng, n);
+        let steps = [0.2, 0.1, 0.05, 0.025, 0.0125];
+        let loop_through_exp = |s: f64, t: f64, x: &Array1<f64>| -> (Array1<f64>, f64) {
+            let factors = [&b * -t, &a * -s, &b * t, &a * s];
+            let mut value = x.clone();
+            let mut errors = Vec::with_capacity(4);
+            for generator in &factors {
+                value = gam_geometry::manifold::matrix_exp(generator).expect("matrix_exp").dot(&value);
+                errors.push(matrix_exp_band(generator));
+            }
+            let largest = errors.iter().fold(0.0_f64, |largest, &e| largest.max(e));
+            let total: f64 = errors.iter().sum();
+            let executed = total * (1.0 + largest).powi(3) + 4.0 * accumulation_growth(n + 1) * ((n as f64).sqrt() + largest);
+            (value, executed)
+        };
+        for x in [&random_x, &aligned_x] {
+            let x_norm = norm(x);
+            let bracket_x = bracket.dot(x);
+            for h in steps {
+                let (s, t) = (h, 0.6 * h);
+                let (looped, executed) = loop_through_exp(s, t, x);
+                let remainder = norm(&(&(&looped - x) - &(&bracket_x * (s * t))));
+                let bar = skew_loop_bar(s, t, norm_a, norm_b, x_norm)
+                    + executed * x_norm
+                    + s * t * 2.0 * accumulation_growth(2 * n + 1) * frobenius(&a) * frobenius(&b) * x_norm;
+                assert!(remainder <= bar, "dense skew loop remainder at h={h}: {remainder:e} > {bar:e}");
+            }
+        }
+        let (s, t) = (steps[steps.len() - 1], 0.6 * steps[steps.len() - 1]);
+        let (looped, executed) = loop_through_exp(s, t, &aligned_x);
+        let bar = skew_loop_bar(s, t, norm_a, norm_b, 1.0)
+            + executed
+            + s * t * 2.0 * accumulation_growth(2 * n + 1) * frobenius(&a) * frobenius(&b);
+        let without_commutator = norm(&(&looped - &aligned_x));
+        assert!(
+            without_commutator > bar,
+            "positive control: without the commutator term the dense loop must leave the bar, {without_commutator:e} <= {bar:e}"
+        );
+    }
+
+    /// mpd-spec NOTE 9: a basis further from orthonormal than a stable
+    /// orthogonalization leaves one is refused, so a non-orthogonal map is never typed
+    /// as an angle path. Positive control: the Householder-QR basis the perturbation
+    /// starts from is accepted, with its defect under the floor production derives.
+    #[test]
+    fn a_non_orthonormal_plane_basis_is_refused() {
+        let mut rng = StdRng::seed_from_u64(295_111);
+        let basis = orthonormal_columns(&mut rng, 8, 4);
+        let angles = Array1::from(vec![0.4, 1.2]);
+        let accepted = PlaneRotation::new(basis.clone(), angles.clone()).expect("a Householder-QR basis is accepted");
+        assert!(
+            accepted.orthonormality_defect() <= accepted.orthonormality_floor(),
+            "accepted defect {:e} above its floor {:e}",
+            accepted.orthonormality_defect(),
+            accepted.orthonormality_floor()
+        );
+        // A second backward-stable orthogonalization, Gram–Schmidt applied twice, is also
+        // accepted: the floor bounds any stable orthogonalization, not one algorithm's output.
+        let mut reorthogonalized = uniform_matrix(&mut rng, 8, 4);
+        orthogonalize_columns(&mut reorthogonalized);
+        orthogonalize_columns(&mut reorthogonalized);
+        let gram_schmidt =
+            PlaneRotation::new(reorthogonalized, angles.clone()).expect("a twice-orthogonalized basis is accepted");
+        assert!(
+            gram_schmidt.orthonormality_defect() <= gram_schmidt.orthonormality_floor(),
+            "Gram–Schmidt defect {:e} above its floor {:e}",
+            gram_schmidt.orthonormality_defect(),
+            gram_schmidt.orthonormality_floor()
+        );
+        let mut stretched = basis;
+        stretched.column_mut(1).mapv_inplace(|entry| entry * (1.0 + 1e-6));
+        assert!(matches!(
+            PlaneRotation::new(stretched, angles),
+            Err(OperatorRefusal::NonOrthonormalPlaneBasis { .. })
+        ));
+    }
+
+    /// The exact inverse of a witness, exact in binary: `Sᵀ` for an orthogonal witness
+    /// (permutations, reflections, `J_k`), and the reciprocal diagonal for a scaling by 2.
+    fn exact_inverse(s: &Array2<f64>) -> Array2<f64> {
+        if s.t().dot(s) == Array2::<f64>::eye(s.nrows()) {
+            s.t().to_owned()
+        } else {
+            s.mapv(|entry| if entry == 0.0 { 0.0 } else { 1.0 / entry })
+        }
+    }
+
+    /// A witness lies in the declared group (`member`). With the exact inverse, `S M S⁻¹`
+    /// moves the reported entry by exactly the reported shift, and that shift is nonzero.
+    fn assert_witness(mask: &Array2<f64>, verdict: &MaskGaugeVerdict, member: &dyn Fn(&Array2<f64>) -> bool) {
+        assert!(
+            matches!(verdict, MaskGaugeVerdict::BasisDependent { .. }),
+            "expected a witness, got {verdict:?}"
+        );
+        if let MaskGaugeVerdict::BasisDependent {
+            gauge_change,
+            moved,
+            shift,
+        } = verdict
+        {
+            assert!(member(gauge_change), "the witness is outside the declared group: {gauge_change:?}");
+            let conjugated = gauge_change.dot(mask).dot(&exact_inverse(gauge_change));
+            assert_eq!(conjugated[*moved] - mask[*moved], *shift);
+            assert!(*shift != 0.0, "a witness must move its entry");
+        }
+    }
+
+    fn is_permutation(s: &Array2<f64>) -> bool {
+        s.iter().all(|&entry| entry == 0.0 || entry == 1.0)
+            && s.rows().into_iter().all(|row| row.iter().filter(|&&entry| entry == 1.0).count() == 1)
+            && s.columns().into_iter().all(|column| column.iter().filter(|&&entry| entry == 1.0).count() == 1)
+    }
+
+    fn is_positive_monomial(s: &Array2<f64>) -> bool {
+        s.iter().all(|&entry| entry >= 0.0)
+            && s.rows().into_iter().all(|row| row.iter().filter(|&&entry| entry > 0.0).count() == 1)
+            && s.columns().into_iter().all(|column| column.iter().filter(|&&entry| entry > 0.0).count() == 1)
+    }
+
+    /// Block diagonal over the rotary blocks, and commuting with `J = ⊕_k J_k ⊕ 0`. `J` is
+    /// zero on the pass-through, so for a block-diagonal `S`, `S J = J S` holds iff each
+    /// group's block commutes with its `J_k`.
+    fn is_rotary_commutant(groups: &RotaryGroups, s: &Array2<f64>) -> bool {
+        let ids = groups.block_ids();
+        let block_diagonal = s.indexed_iter().all(|((u, v), &entry)| ids[u] == ids[v] || entry == 0.0);
+        let mut j = Array2::<f64>::zeros((groups.dim(), groups.dim()));
+        for group in groups.plane_groups() {
+            for &(a, b) in group {
+                j[[b, a]] = 1.0;
+                j[[a, b]] = -1.0;
+            }
+        }
+        block_diagonal && s.dot(&j) == j.dot(s)
+    }
+
+    #[test]
+    fn unit_permutation_masks_are_intrinsic_iff_they_span_identity_and_ones() {
+        let r = 4;
+        let gauge = DeclaredGauge::UnitPermutations { units: r };
+        let mut intrinsic = Array2::<f64>::from_elem((r, r), 0.2);
+        for i in 0..r {
+            intrinsic[[i, i]] = 0.5;
+        }
+        assert_eq!(
+            classify_under(intrinsic.view(), &gauge).expect("classify"),
+            MaskGaugeVerdict::Intrinsic {
+                controls: vec![0.5, 0.2]
+            }
+        );
+        // Positive control: once per-unit scalings join the group, the same mask is not intrinsic.
+        let scaled = classify_under(intrinsic.view(), &DeclaredGauge::ScaledPermutations { units: r }).expect("classify");
+        assert!(matches!(scaled, MaskGaugeVerdict::BasisDependent { .. }));
+        assert_witness(&intrinsic, &scaled, &is_positive_monomial);
+
+        let mut off_diagonal = intrinsic.clone();
+        off_diagonal[[2, 3]] = 0.7;
+        let verdict = classify_under(off_diagonal.view(), &gauge).expect("classify");
+        assert!(matches!(verdict, MaskGaugeVerdict::BasisDependent { moved: (0, 1), .. }));
+        assert_witness(&off_diagonal, &verdict, &is_permutation);
+
+        let mut diagonal = intrinsic.clone();
+        diagonal[[1, 1]] = -0.1;
+        let verdict = classify_under(diagonal.view(), &gauge).expect("classify");
+        assert!(matches!(verdict, MaskGaugeVerdict::BasisDependent { moved: (0, 0), .. }));
+        assert_witness(&diagonal, &verdict, &is_permutation);
+
+        assert_eq!(
+            classify_under(Array2::from_elem((1, 1), 0.4).view(), &DeclaredGauge::UnitPermutations { units: 1 })
+                .expect("classify"),
+            MaskGaugeVerdict::Intrinsic { controls: vec![0.4] }
+        );
+        assert!(matches!(
+            classify_under(Array2::<f64>::zeros((0, 0)).view(), &DeclaredGauge::UnitPermutations { units: 0 }),
+            Err(OperatorRefusal::EmptyGaugeBlock)
+        ));
+    }
+
+    #[test]
+    fn scaled_permutation_masks_are_intrinsic_only_as_scalars() {
+        let r = 4;
+        let gauge = DeclaredGauge::ScaledPermutations { units: r };
+        assert_eq!(
+            classify_under((Array2::<f64>::eye(r) * 0.6).view(), &gauge).expect("classify"),
+            MaskGaugeVerdict::Intrinsic { controls: vec![0.6] }
+        );
+        let diagonal = Array2::from_diag(&Array1::from(vec![1.0, 0.0, 1.0, 0.5]));
+        let verdict = classify_under(diagonal.view(), &gauge).expect("classify");
+        assert!(matches!(verdict, MaskGaugeVerdict::BasisDependent { moved: (0, 0), .. }));
+        assert_witness(&diagonal, &verdict, &is_positive_monomial);
+
+        let mut off_diagonal = Array2::<f64>::eye(r);
+        off_diagonal[[3, 1]] = -0.25;
+        let verdict = classify_under(off_diagonal.view(), &gauge).expect("classify");
+        assert!(matches!(verdict, MaskGaugeVerdict::BasisDependent { moved: (3, 1), .. }));
+        assert_witness(&off_diagonal, &verdict, &is_positive_monomial);
+
+        // Positive control: under the per-component scale gauge alone, with no permutations,
+        // the diagonal mask is intrinsic, through `classify_under` and `classify_internal_mask`.
+        let per_component = GaugeBlocks::new(&[1, 1, 1, 1]).expect("four scale blocks");
+        let expected = MaskGaugeVerdict::Intrinsic {
+            controls: vec![1.0, 0.0, 1.0, 0.5],
+        };
+        assert_eq!(
+            classify_under(diagonal.view(), &DeclaredGauge::Blocks(per_component.clone())).expect("classify"),
+            expected
+        );
+        assert_eq!(classify_internal_mask(diagonal.view(), &per_component).expect("classify"), expected);
+    }
+
+    /// Groups `[(0, 1), (2, 3)]` and `[(4, 5)]`, pass-through `6..8`, and the intrinsic mask
+    /// `(0.7 I − 0.3 J_0) ⊕ (0.2 I + 0.9 J_1) ⊕ 0.4 I`.
+    fn rotary_fixture() -> (RotaryGroups, Array2<f64>) {
+        let groups = RotaryGroups::new(vec![vec![(0, 1), (2, 3)], vec![(4, 5)]], 6..8).expect("rotary groups");
+        let mut mask = Array2::<f64>::zeros((8, 8));
+        for (group, (alpha, beta)) in groups.plane_groups().iter().zip([(0.7, -0.3), (0.2, 0.9)]) {
+            for &(a, b) in group {
+                mask[[a, a]] = alpha;
+                mask[[b, b]] = alpha;
+                mask[[b, a]] = beta;
+                mask[[a, b]] = -beta;
+            }
+        }
+        mask[[6, 6]] = 0.4;
+        mask[[7, 7]] = 0.4;
+        (groups, mask)
+    }
+
+    #[test]
+    fn rotary_masks_are_intrinsic_iff_complex_scalars_per_frequency_group() {
+        let (groups, intrinsic) = rotary_fixture();
+        let gauge = DeclaredGauge::RotaryCommutant(groups.clone());
+        assert_eq!(
+            classify_under(intrinsic.view(), &gauge).expect("classify"),
+            MaskGaugeVerdict::Intrinsic {
+                controls: vec![0.7, -0.3, 0.2, 0.9, 0.4]
+            }
+        );
+        let member = |s: &Array2<f64>| is_rotary_commutant(&groups, s);
+        // One perturbation per witness path, in the classifier's order:
+        // - a cross-block entry;
+        // - a block that is not complex-linear;
+        // - a complex off-diagonal entry, set on both coordinates so complex-linearity holds;
+        // - an unequal complex diagonal on plane (2, 3);
+        // - a pass-through off-diagonal entry;
+        // - an unequal pass-through diagonal.
+        let perturbations: Vec<(Vec<((usize, usize), f64)>, (usize, usize))> = vec![
+            (vec![((0, 4), 0.1)], (0, 4)),
+            (vec![((1, 1), 0.5)], (0, 0)),
+            (vec![((0, 2), 0.3), ((1, 3), 0.3)], (0, 2)),
+            (vec![((2, 2), -0.2), ((3, 3), -0.2)], (0, 0)),
+            (vec![((6, 7), 0.25)], (6, 7)),
+            (vec![((7, 7), -0.4)], (6, 6)),
+        ];
+        for (entries, expected_moved) in perturbations {
+            let mut mask = intrinsic.clone();
+            for (index, value) in entries {
+                mask[index] = value;
+            }
+            let verdict = classify_under(mask.view(), &gauge).expect("classify");
+            assert!(
+                matches!(verdict, MaskGaugeVerdict::BasisDependent { moved, .. } if moved == expected_moved),
+                "expected the witness to move {expected_moved:?}, got {verdict:?}"
+            );
+            assert_witness(&mask, &verdict, &member);
+        }
+    }
+
+    /// A declared-group witness moves a full-rank intervention. Every witness is
+    /// invertible, so it lies in GL(8), which one gauge block declares for `regauge`.
+    /// The fixed mask moves the intervention past the rounding band; the carried mask
+    /// stays inside it.
+    #[test]
+    fn a_declared_group_witness_moves_the_fixed_mask_intervention() {
+        let mut rng = StdRng::seed_from_u64(295_110);
+        let (groups, intrinsic) = rotary_fixture();
+        let operator = FactoredOperator::new(
+            uniform_matrix(&mut rng, 9, 8),
+            uniform_matrix(&mut rng, 10, 8),
+            GaugeBlocks::new(&[8]).expect("one block"),
+        )
+        .expect("random factors have full column rank");
+        let x = uniform_vector(&mut rng, 10);
+        let mut not_complex_linear = intrinsic.clone();
+        not_complex_linear[[1, 1]] = 0.5;
+        let verdict = classify_under(not_complex_linear.view(), &DeclaredGauge::RotaryCommutant(groups)).expect("classify");
+        assert!(matches!(verdict, MaskGaugeVerdict::BasisDependent { .. }));
+        if let MaskGaugeVerdict::BasisDependent { gauge_change, .. } = verdict {
+            let fixed = InternalMask::Operator(not_complex_linear);
+            let before = operator.apply(&fixed, x.view()).expect("apply");
+            let (regauged, carried) = operator.regauge(gauge_change.view(), &fixed).expect("regauge");
+            let band = regauge_band(&operator, &gauge_change, &fixed, &x);
+            let carried_moved = norm(&(&regauged.apply(&carried, x.view()).expect("apply") - &before));
+            let fixed_moved = norm(&(&regauged.apply(&fixed, x.view()).expect("apply") - &before));
+            assert!(carried_moved <= band, "carried mask moved {carried_moved:e} > band {band:e}");
+            assert!(
+                fixed_moved > band,
+                "the J witness must move the fixed mask's intervention, moved {fixed_moved:e} <= band {band:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rotary_declaration_must_cover_every_coordinate_once() {
+        assert!(matches!(
+            RotaryGroups::new(vec![vec![(0, 1), (1, 2)]], 4..4),
+            Err(OperatorRefusal::InvalidRotaryDeclaration { coordinate: 1 })
+        ));
+        assert!(matches!(
+            RotaryGroups::new(vec![vec![(0, 5)]], 2..3),
+            Err(OperatorRefusal::InvalidRotaryDeclaration { coordinate: 5 })
+        ));
+        assert!(matches!(
+            RotaryGroups::new(vec![vec![]], 0..2),
+            Err(OperatorRefusal::EmptyGaugeBlock)
+        ));
+        // Positive control: a declaration covering 0..3 exactly once is accepted.
+        let valid = RotaryGroups::new(vec![vec![(0, 1)]], 2..3).expect("valid declaration");
+        assert_eq!(valid.dim(), 3);
+    }
+
+    /// P1 as evidence: a commutant mask is `Exact` at 0, and any other mask is a
+    /// `Counterexample` whose witness moves its entry by exactly the reported value.
+    ///
+    /// Positive controls:
+    /// - the diagonal mask that GL(4) refutes is exact under the per-component scale gauge;
+    /// - the numerical error covers a shift that rounds. Under unit permutations the shift of
+    ///   `diag(1, x)` with `x = 1e-17` is `fl(x − 1) = −1`, which drops `x`, so a zero error
+    ///   would claim an exactness the subtraction does not have;
+    /// - a subnormal shift is an exact counterexample, which the rounded-up bound alone would refuse;
+    /// - an overflowing shift is refused as non-finite (mpd-verify's review note).
+    #[test]
+    fn mask_gauge_evidence_is_exact_or_a_counterexample() {
+        let diagonal = Array2::from_diag(&Array1::from(vec![1.0, 0.0, 1.0, 0.5]));
+        let full = DeclaredGauge::Blocks(GaugeBlocks::new(&[4]).expect("one block"));
+        let per_component = DeclaredGauge::Blocks(GaugeBlocks::new(&[1, 1, 1, 1]).expect("four scale blocks"));
+        for (mask, gauge) in [(Array2::<f64>::eye(4) * 0.6, &full), (diagonal.clone(), &per_component)] {
+            let status = mask_gauge_evidence(mask.view(), gauge).expect("evidence");
+            assert!(
+                matches!(
+                    &status,
+                    EvidenceStatus::Exact {
+                        value,
+                        numerical_error,
+                        basis: ExactBasis::Algebraic,
+                        witness: None,
+                        domain,
+                        ..
+                    } if *value == 0.0 && *numerical_error == 0.0 && domain == gauge
+                ),
+                "expected exact evidence at 0 under {gauge:?}, got {status:?}"
+            );
+            assert!(status.certifies_at_most(0.0));
+        }
+
+        let (groups, rotary) = rotary_fixture();
+        let mut cross_block = rotary;
+        cross_block[[0, 4]] = 0.1;
+        let mut off_diagonal = Array2::<f64>::from_elem((4, 4), 0.2);
+        off_diagonal[[2, 3]] = 0.7;
+        let cases = [
+            (diagonal, full),
+            (off_diagonal.clone(), DeclaredGauge::UnitPermutations { units: 4 }),
+            (off_diagonal, DeclaredGauge::ScaledPermutations { units: 4 }),
+            (cross_block, DeclaredGauge::RotaryCommutant(groups)),
+        ];
+        for (mask, gauge) in &cases {
+            let status = mask_gauge_evidence(mask.view(), gauge).expect("evidence");
+            assert!(status.refutes_at_most(0.0) && !status.certifies_at_most(0.0));
+            let EvidenceStatus::Counterexample {
+                value,
+                threshold,
+                witness,
+                ..
+            } = &status
+            else {
+                panic!("expected a counterexample under {gauge:?}, got {status:?}");
+            };
+            assert_eq!(*threshold, 0.0);
+            let MaskGaugeVerdict::BasisDependent {
+                gauge_change,
+                moved,
+                shift,
+            } = classify_under(mask.view(), gauge).expect("classify")
+            else {
+                panic!("the classifier and the evidence disagree under {gauge:?}");
+            };
+            assert_eq!((&witness.gauge_change, witness.moved, *value), (&gauge_change, moved, shift.abs()));
+            let conjugated = witness.gauge_change.dot(mask).dot(&exact_inverse(&witness.gauge_change));
+            assert_eq!((conjugated[witness.moved] - mask[witness.moved]).abs(), *value);
+        }
+
+        let x = 1e-17;
+        let rounding = Array2::from_diag(&Array1::from(vec![1.0, x]));
+        let status = mask_gauge_evidence(rounding.view(), &DeclaredGauge::UnitPermutations { units: 2 }).expect("evidence");
+        let EvidenceStatus::Counterexample {
+            value,
+            numerical_error,
+            ..
+        } = &status
+        else {
+            panic!("expected a counterexample, got {status:?}");
+        };
+        assert_eq!(*value, 1.0);
+        assert_eq!((x - 1.0) + 1.0, 0.0, "the control needs a subtraction that drops x");
+        assert!(*numerical_error >= x, "the error bound {numerical_error:e} misses the dropped {x:e}");
+
+        // A subnormal shift is exact and carries no error. The rounded-up power-of-two bound
+        // alone would leave it inside its own error, and the constructor would refuse it.
+        let tiny = f64::from_bits(1);
+        let subnormal = Array2::from_diag(&Array1::from(vec![0.0, tiny]));
+        let status = mask_gauge_evidence(subnormal.view(), &DeclaredGauge::UnitPermutations { units: 2 }).expect("evidence");
+        assert!(
+            matches!(
+                &status,
+                EvidenceStatus::Counterexample {
+                    value,
+                    numerical_error,
+                    ..
+                } if *value == tiny && *numerical_error == 0.0
+            ),
+            "a subnormal shift is an exact counterexample, got {status:?}"
+        );
+        assert!(EvidenceStatus::<(), ()>::counterexample(tiny, (f64::EPSILON * tiny).next_up(), 0.0, ()).is_err());
+
+        // An overflowing shift is a typed refusal, never a status.
+        let mut overflow = Array2::<f64>::zeros((2, 2));
+        overflow[[0, 1]] = f64::MAX;
+        assert!(matches!(
+            mask_gauge_evidence(overflow.view(), &DeclaredGauge::Blocks(GaugeBlocks::new(&[2]).expect("one block"))),
+            Err(OperatorRefusal::Evidence(EvidenceStatusError::NonFinite { .. }))
+        ));
+    }
+
+    /// mpd-verify's review note: the floor's `m·n·ε` term is factor_singular_band's convention,
+    /// not a bound derived for this computation. This is evidence at the swept dimensions.
+    ///
+    /// - Sweep: Householder-QR bases from uniform draws with columns graded from 1 down to `10^e`,
+    ///   `e ∈ {0, −6, −12}`, at `d ∈ {8, 64, 512}` and `2k ∈ {2, 8, 32}` with `2k <= d`. Every
+    ///   one is accepted, and the largest `defect / floor` ratio is printed.
+    /// - Boundary: the refusal sits at the floor. At 512×32, column 0 is stretched by `s`. With
+    ///   `UᵀU = I + F` and `D = diag(s, 1, …)`, the stretched Gram deviation is
+    ///   `(D² − I) + D F D`, whose true norm lies within `s²‖F‖_F` of `s² − 1`. `‖F‖_F` is at most
+    ///   the measured defect plus `γ_d‖U‖_F²`, and the measured stretched defect is within
+    ///   `γ_d‖U_s‖_F²` of its true norm.
+    ///   - Below, `s² − 1 = floor₀/8`: the derived upper side is under production's floor, and it accepts.
+    ///   - Above, `s² − 1 = 2·floor₀`: the derived lower side is over production's floor, and it refuses.
+    #[test]
+    fn householder_qr_bases_stay_under_the_plane_basis_floor() {
+        let mut rng = StdRng::seed_from_u64(295_112);
+        let graded_qr_basis = |rng: &mut StdRng, dim: usize, internal: usize, exponent: f64| -> Array2<f64> {
+            let mut input = uniform_matrix(rng, dim, internal);
+            for (j, mut column) in input.columns_mut().into_iter().enumerate() {
+                let scale = 10f64.powf(exponent * j as f64 / (internal - 1) as f64);
+                column.mapv_inplace(|entry| entry * scale);
+            }
+            let q = input.qr().expect("Householder QR of a graded draw").0;
+            q.slice(s![.., 0..internal]).to_owned()
+        };
+        let mut largest_ratio = 0.0_f64;
+        for dim in [8, 64, 512] {
+            for internal in [2, 8, 32].into_iter().filter(|&internal| internal <= dim) {
+                for exponent in [0.0, -6.0, -12.0] {
+                    let basis = graded_qr_basis(&mut rng, dim, internal, exponent);
+                    let angles = Array1::from(vec![0.9; internal / 2]);
+                    match PlaneRotation::new(basis, angles) {
+                        Ok(rotation) => {
+                            largest_ratio = largest_ratio.max(rotation.orthonormality_defect() / rotation.orthonormality_floor());
+                        }
+                        Err(refusal) => {
+                            panic!("a Householder-QR basis {dim}×{internal} graded to 1e{exponent} was refused: {refusal:?}")
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("QR_FLOOR_RATIO largest defect/floor over the sweep: {largest_ratio:e}");
+        assert!(largest_ratio <= 1.0);
+
+        let (dim, internal) = (512, 32);
+        let basis = graded_qr_basis(&mut rng, dim, internal, 0.0);
+        let angles = Array1::from(vec![0.9; internal / 2]);
+        let unstretched = PlaneRotation::new(basis.clone(), angles.clone()).expect("the QR basis is accepted");
+        let (defect_0, floor_0) = (unstretched.orthonormality_defect(), unstretched.orthonormality_floor());
+        let gamma = accumulation_growth(dim);
+        let formation_0 = gamma * frobenius(&basis).powi(2);
+        // s = √(1 + excess); (s − 1)(s + 1) measures s² − 1 including the rounding of s.
+        let stretch = |excess: f64| {
+            let s = (1.0 + excess).sqrt();
+            let mut stretched = basis.clone();
+            stretched.column_mut(0).mapv_inplace(|entry| entry * s);
+            let s_sq_minus_1 = (s - 1.0) * (s + 1.0);
+            let deviation = s * s * (defect_0 + formation_0) + gamma * frobenius(&stretched).powi(2);
+            (PlaneRotation::new(stretched, angles.clone()), s_sq_minus_1, deviation)
+        };
+        let floor_of = |outcome: &Result<PlaneRotation, OperatorRefusal>| match outcome {
+            Ok(rotation) => rotation.orthonormality_floor(),
+            Err(OperatorRefusal::NonOrthonormalPlaneBasis { floor, .. }) => *floor,
+            Err(other) => panic!("unexpected refusal {other:?}"),
+        };
+
+        let (below, excess_below, deviation_below) = stretch(floor_0 / 8.0);
+        let floor_below = floor_of(&below);
+        let upper_side = excess_below + deviation_below;
+        assert!(upper_side <= floor_below, "fixture: upper side {upper_side:e} not under the floor {floor_below:e}");
+        assert!(below.is_ok(), "a basis derived under the floor was refused: {:?}", below.as_ref().err());
+
+        let (above, excess_above, deviation_above) = stretch(2.0 * floor_0);
+        let floor_above = floor_of(&above);
+        let lower_side = excess_above - deviation_above;
+        assert!(lower_side > floor_above, "fixture: lower side {lower_side:e} not over the floor {floor_above:e}");
+        assert!(
+            matches!(above, Err(OperatorRefusal::NonOrthonormalPlaneBasis { .. })),
+            "a basis derived over the floor was accepted"
         );
     }
 }

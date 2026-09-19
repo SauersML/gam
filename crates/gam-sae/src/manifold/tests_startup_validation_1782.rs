@@ -166,8 +166,8 @@ pub(crate) fn objective_and_seed(
 }
 
 /// Assert the seed passes the EFS OUTER STARTUP VALIDATION — the exact gate the
-/// issue reports failing. For an all-penalty-like objective with `n_params > 8`
-/// the outer planner selects the EFS solver, whose seed validation is a single
+/// issue reports failing. For this fixed-point-capable objective the outer planner
+/// selects the EFS solver (asserted below), whose seed validation is a single
 /// `eval_efs(seed)` (`run_fixed_point_outer_solver`): it must return a finite
 /// cost and finite steps. Before the fix a recoverable non-PD-seed / did-not-
 /// converge refusal `?`-propagated out of `efs_step` as a fatal error and — with
@@ -180,12 +180,18 @@ fn seed_passes_startup_validation(
     mode: AssignmentMode,
 ) -> Result<f64, String> {
     let (mut objective, seed) = objective_and_seed(z, k, topo, mode);
-    // n_params = 1 (sparse) + K (smooth) + K (ARD) = 1 + 2K; K = 4 -> 9 > 8, so
-    // the production planner routes this through the EFS lane, whose startup
-    // validation is exactly this call.
+    // The production planner must route this objective through the EFS lane, whose
+    // startup validation is exactly this call. Assert the plan itself, not a
+    // parameter count: a fixed-concentration ordered Beta--Bernoulli prior carries no
+    // sparse coordinate (#2933 F45), and a fixed-point-capable objective routes to
+    // EFS at every dimension (`efs_plan_eligible`), so no count threshold decides it.
+    let solver = gam_solve::rho_optimizer::plan(&objective.capability()).solver;
     assert!(
-        seed.len() > 8,
-        "test must exercise the EFS lane (n_params={} must exceed 8)",
+        matches!(
+            solver,
+            gam_solve::rho_optimizer::Solver::Efs | gam_solve::rho_optimizer::Solver::HybridEfs
+        ),
+        "test must exercise the EFS lane (n_params={}, planned solver {solver:?})",
         seed.len()
     );
     let eval = objective.eval_efs(&seed).map_err(|e| e.to_string())?;
@@ -774,7 +780,7 @@ fn d2_portfolio_loses_at_measured_parameter_parity_2502() {
 /// `+inf` is the documented infeasible encoding — so the open question is WHICH
 /// of the four channels that can emit it actually fires here. `eval` collapses
 /// all four into one value, so reading the value cannot answer it, and
-/// `log::debug!` cannot either: a `--lib` test binary installs no logger backend.
+/// `log::trace!` cannot either: a `--lib` test binary installs no logger backend.
 ///
 /// This calls the criterion the objective calls, on a term this test builds
 /// itself, and matches the TYPED outcome:
@@ -836,6 +842,9 @@ fn seed_infeasibility_channel_is_named_2609() {
             }
             Err(SaeCriterionError::IndefiniteObservedInformation { block }) => {
                 format!("INDEFINITE-OBSERVED-INFORMATION block={block}")
+            }
+            Err(SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { atom, refusal }) => {
+                format!("ORBIT-CRITERION-UNAVAILABLE-ON-ARROW-ROUTE atom={atom} lane={}: {refusal}", refusal.lane())
             }
             Err(SaeCriterionError::Numerical(message)) => {
                 format!("NUMERICAL(fatal, never mapped to +inf) {message}")

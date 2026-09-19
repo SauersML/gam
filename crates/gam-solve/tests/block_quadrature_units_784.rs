@@ -149,13 +149,12 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
         );
     }
 
-    /// Never consulted. The probe reports every axis resolved at the first rule it is asked
-    /// for (order four), so the order search's stop predicate never judges an axis, and the
-    /// ceiling is only ever compared against, never reached. `usize::MAX` is the no-ceiling
-    /// sentinel. The pin asserts order four, so a change that makes the ceiling reachable
-    /// breaks the pin instead of comparing against this value.
+    /// The production ceiling, measured by the rule builder the standard corrector integrates
+    /// with. The probe reports every axis resolved at the first rule it is asked for (order
+    /// four), so the order search's stop predicate never judges an axis and the ceiling is
+    /// only compared against. The pin asserts order four.
     fn max_representable_order(&self) -> usize {
-        usize::MAX
+        gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
     }
 }
 

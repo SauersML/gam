@@ -93,7 +93,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
-    let p_intercept = usize::from(!term_collection_has_anchored_bspline(spec));
+    let p_intercept = usize::from(term_collection_has_global_intercept(spec));
     let p_lin = spec.linear_terms.len();
 
     // Smooth construction, random-effect construction, and linear-column
@@ -184,6 +184,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         data,
         &spec.linear_terms,
         &spec.smooth_terms,
+        level_carrier_smooth(spec),
     )?;
 
     let p_rand: usize = random_blocks.iter().map(|b| b.num_groups).sum();
@@ -456,6 +457,21 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         random_effect_levels,
         smooth,
     })
+}
+
+/// Whether the design leads with the global all-ones intercept column: the
+/// formula kept its intercept and no anchored B-spline pins the level.
+pub fn term_collection_has_global_intercept(spec: &TermCollectionSpec) -> bool {
+    matches!(spec.level, ModelLevel::Intercept) && !term_collection_has_anchored_bspline(spec)
+}
+
+/// The smooth that carries the constant level of a no-intercept model, if one
+/// was chosen (see [`ModelLevel`]).
+fn level_carrier_smooth(spec: &TermCollectionSpec) -> Option<usize> {
+    match spec.level {
+        ModelLevel::NoIntercept { level_smooth } => level_smooth,
+        ModelLevel::Intercept => None,
+    }
 }
 
 /// Whether any smooth term carries an anchored B-spline endpoint (one *or* two
@@ -1155,6 +1171,9 @@ pub struct LocalTermRealization<'a> {
     /// The rotation the local build applied to `design` and reported
     /// separately. It is folded into the returned metadata.
     pub joint_null_rotation: Option<&'a crate::basis::JointNullRotation>,
+    /// A Duchon term's operator-penalty request, which its penalty set is
+    /// re-derived from in the collection chart; `None` for every other kind.
+    pub duchon_operator_penalties: Option<&'a crate::basis::DuchonOperatorPenaltySpec>,
     pub termname: &'a str,
 }
 
@@ -1198,6 +1217,7 @@ pub fn place_term_in_collection_gauge(
         dropped_penalties,
         linear_constraints_local,
         joint_null_rotation,
+        duchon_operator_penalties,
         termname,
     } = local;
     let realized = realize_smooth_collection_gauge(design, gauge, termname)?;
@@ -1215,6 +1235,7 @@ pub fn place_term_in_collection_gauge(
         dropped_penalties,
         Some(&coefficient_gauge),
         &metadata,
+        duchon_operator_penalties,
         termname,
     )?;
     let linear_constraints_local = linear_constraints_local.map(|lin| {
@@ -1238,6 +1259,17 @@ pub fn place_term_in_collection_gauge(
     })
 }
 
+/// The operator-penalty request of a Duchon term's spec, which
+/// [`penalties_in_collection_chart`] re-derives its penalty set from.
+pub fn duchon_operator_penalty_request(
+    termspec: &SmoothTermSpec,
+) -> Option<&crate::basis::DuchonOperatorPenaltySpec> {
+    match &termspec.basis {
+        SmoothBasisSpec::Duchon { spec, .. } => Some(&spec.operator_penalties),
+        _ => None,
+    }
+}
+
 /// A smooth term's penalty set in its collection's coefficient chart: the active
 /// blocks, and the dropped ones following `local_dropped`.
 ///
@@ -1251,11 +1283,21 @@ pub fn place_term_in_collection_gauge(
 /// The triplet applies the chart to the collocation operators before forming
 /// each Gram, and it is the builder the n-free κ re-key and the ψ-derivative
 /// already read, so the criterion and its gradient see the same blocks.
+///
+/// A non-periodic, non-spectral Duchon term's penalty set is re-derived the same
+/// way, through the builder the n-free re-key reads, with `duchon_operator_penalties`
+/// saying which operator orders its build requested. Congruencing its local
+/// blocks left the primary penalty's structural null space carrying 4.2e-10
+/// beside a top eigenvalue of 0.86 on gam#2959's single-block cache fixture,
+/// where the same block built in the composed chart has exact nulls (6e-19); the
+/// re-derived set agrees with that build to 4.2e-16 in every block (lane probe
+/// jobs 1245315, 1250166).
 fn penalties_in_collection_chart(
     active_penalties: &[ActivePenalty],
     local_dropped: Vec<DroppedPenaltyInfo>,
     coefficient_gauge: Option<&gam_problem::Gauge>,
     placed_metadata: &BasisMetadata,
+    duchon_operator_penalties: Option<&crate::basis::DuchonOperatorPenaltySpec>,
     term_name: &str,
 ) -> Result<(Vec<ActivePenalty>, Vec<DroppedPenaltyInfo>), BasisError> {
     if coefficient_gauge.is_some() && matches!(placed_metadata, BasisMetadata::Matern { .. }) {
@@ -1265,27 +1307,54 @@ fn penalties_in_collection_chart(
         let filtered = matern_operator_penalty_triplet_from_metadata(placed_metadata)?;
         return Ok((filtered.active, filtered.dropped));
     }
+    if coefficient_gauge.is_some()
+        && let (
+            BasisMetadata::Duchon {
+                centers,
+                length_scale,
+                periodic: None,
+                power,
+                nullspace_order,
+                identifiability_transform,
+                input_scale,
+                aniso_log_scales,
+                operator_collocation_points,
+                radial_reparam,
+                spectral_basis: None,
+            },
+            Some(operator_penalties),
+        ) = (placed_metadata, duchon_operator_penalties)
+    {
+        // The local build filtered this same candidate set, so its dropped
+        // blocks are the set's own and are not counted twice.
+        let filtered = crate::basis::duchon_penalty_set_at_length_scale(
+            centers.view(),
+            identifiability_transform.as_ref(),
+            operator_collocation_points.as_ref().map(|points| points.view()),
+            operator_penalties,
+            *power,
+            *nullspace_order,
+            aniso_log_scales.as_deref(),
+            radial_reparam.as_ref(),
+            length_scale
+                .clone()
+                .map(|length| input_scale.to_standardized_units(length).standardized_value()),
+            &mut crate::basis::BasisWorkspace::default(),
+        )?;
+        return Ok((filtered.active, filtered.dropped));
+    }
     let candidates =
         penalty_candidates_under_collection_gauge(active_penalties, coefficient_gauge, term_name)?;
-    let mut filtered = filter_penalty_candidates(candidates)?;
     // `filter_penalty_candidates` numbers its input from zero, but that input is
-    // the term-local build's ACTIVE penalties, one candidate each and in order.
-    // Carry each block's local original index, so the numbering stays the local
-    // build's, whose dropped blocks travel alongside in `local_dropped`. The
-    // renumbering had a trial whose odd-order Matérn collocation Grams underflowed
-    // hand back its survivors as [Mass 0, Stiffness 1] while the drops said
-    // Tension 1 and ThirdOrder 3. The incremental realizer then read a dropped
-    // block as lost, and aborted the fit instead of refusing the trial (#2817).
-    for active in &mut filtered.active {
-        if let Some(local) = active_penalties.get(active.info.original_index) {
-            active.info.original_index = local.info.original_index;
-        }
-    }
-    for dropped in &mut filtered.dropped {
-        if let Some(local) = active_penalties.get(dropped.original_index) {
-            dropped.original_index = local.info.original_index;
-        }
-    }
+    // the term-local build's ACTIVE penalties, one candidate each and in order,
+    // so it hands back the local build's numbering, whose dropped blocks travel
+    // alongside in `local_dropped` (#2817).
+    let build_numbering: Vec<usize> = active_penalties
+        .iter()
+        .map(|penalty| penalty.info.original_index)
+        .collect();
+    let filtered =
+        filter_penalty_candidates(candidates)?.with_build_numbering(&build_numbering)?;
     let mut dropped = local_dropped;
     dropped.extend(filtered.dropped);
     Ok((filtered.active, dropped))
@@ -1302,12 +1371,11 @@ fn assert_orthogonal_to_constraint_block(
 ) -> Result<(), BasisError> {
     let rel = orthogonality_relative_residual_for_design(design, constraint)?;
     if rel > ORTHOGONALITY_REL_RESIDUAL_TOL {
-        gam_problem::bail_invalid_basis!(
-            "smooth orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
-            termname,
-            rel,
-            ORTHOGONALITY_REL_RESIDUAL_TOL
-        );
+        return Err(BasisError::CollectionGaugeNotOrthogonal {
+            term: termname.to_string(),
+            residual: rel,
+            tolerance: ORTHOGONALITY_REL_RESIDUAL_TOL,
+        });
     }
     Ok(())
 }
@@ -1490,6 +1558,7 @@ fn apply_global_smooth_identifiability(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
+    level_smooth: Option<usize>,
 ) -> Result<(SmoothDesign, Array1<f64>), BasisError> {
     // Global smooth identifiability policy:
     //
@@ -1567,8 +1636,14 @@ fn apply_global_smooth_identifiability(
         // block. So it bypasses both the owner analysis and the frozen-skip
         // gate below.
         let replay_z = frozen_global_orthogonality(termspec);
+        // A shape cone (coordinate bounds or exact inequality rows) is written
+        // in the term's own coefficient chart; residualizing that chart against
+        // other blocks would move the constant and linear directions the cone
+        // is anchored on, so shaped terms keep their local chart.
         let skip_global_transform = replay_z.is_none()
-            && (smooth_has_frozen_identifiability(termspec) || term.lower_bounds_local.is_some());
+            && (smooth_has_frozen_identifiability(termspec)
+                || term.lower_bounds_local.is_some()
+                || term.linear_constraints_local.is_some());
         // A marginally-centered tensor interaction (`ti(...)`, MarginalSumToZero)
         // has ALREADY removed each axis's main effect analytically, in
         // coefficient space, via its per-margin sum-to-zero reparameterization
@@ -1643,6 +1718,9 @@ fn apply_global_smooth_identifiability(
                         || factor_by_level_gate(termspec).is_some())
             }
         };
+        // The level-carrying smooth of a no-intercept model keeps its
+        // constant, so the constant column stays out of its block; a block
+        // left with no column is no block at all.
         let parametric_block = if !needs_parametric_block {
             None
         } else {
@@ -1650,7 +1728,9 @@ fn apply_global_smooth_identifiability(
                 data,
                 linear_terms,
                 termspec,
+                level_smooth != Some(idx),
             )?)
+            .filter(|block| block.ncols() > 0)
         };
         // The replay's own owner blocks, named by the chart rather than
         // re-derived: which owners bound is decided by a cross-residual on the
@@ -1857,6 +1937,7 @@ fn apply_global_smooth_identifiability(
             term.dropped_penalties.clone(),
             coefficient_gauge.as_ref(),
             &placed_metadata,
+            duchon_operator_penalty_request(termspec),
             &term.name,
         )?;
         let linear_constraints_constrained =
@@ -1958,7 +2039,7 @@ fn apply_global_smooth_identifiability(
         terms_out.push(SmoothTerm {
             name: smooth.terms[idx].name.clone(),
             coeff_range: col_start..col_end,
-            shape: smooth.terms[idx].shape,
+            shape: smooth.terms[idx].shape.clone(),
             active_penalties: local_active_penalties[idx].clone(),
             dropped_penalties: local_dropped_penalties[idx].clone(),
             metadata: local_metadata[idx]
@@ -2082,6 +2163,7 @@ fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     termspec: &SmoothTermSpec,
+    include_constant: bool,
 ) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
@@ -2133,10 +2215,13 @@ fn build_parametric_constraint_block_for_term(
         }
     }
 
-    let mut c = Array2::<f64>::zeros((n, 1 + parametric_cols.len()));
-    c.column_mut(0).fill(1.0);
+    let lead = usize::from(include_constant);
+    let mut c = Array2::<f64>::zeros((n, lead + parametric_cols.len()));
+    if include_constant {
+        c.column_mut(0).fill(1.0);
+    }
     for (j, &feature_col) in parametric_cols.iter().enumerate() {
-        c.column_mut(j + 1).assign(&data.column(feature_col));
+        c.column_mut(j + lead).assign(&data.column(feature_col));
     }
     Ok(c)
 }
@@ -2551,7 +2636,7 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                 frozen_parametric_residualization: None,
                 name: termspec.name.clone(),
                 basis: (**inner).clone(),
-                shape: termspec.shape,
+                shape: termspec.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -2560,7 +2645,7 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                 frozen_parametric_residualization: None,
                 name: termspec.name.clone(),
                 basis: (**smooth).clone(),
-                shape: termspec.shape,
+                shape: termspec.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -2744,7 +2829,6 @@ fn with_identifiability_transform(
             eps_band,
             order_s,
             alpha,
-            tau0,
             masses,
             support_means,
             penalty_normalization_scales,
@@ -2759,7 +2843,6 @@ fn with_identifiability_transform(
             eps_band: eps_band.clone(),
             order_s: *order_s,
             alpha: *alpha,
-            tau0: *tau0,
             masses: masses.clone(),
             support_means: support_means.clone(),
             penalty_normalization_scales: penalty_normalization_scales.clone(),
@@ -3102,6 +3185,7 @@ mod frozen_linear_term_mass_rebuild_tests {
                     coefficient_min: None, coefficient_max: None, frozen_function_mass: None,
                 }).collect(),
                 random_effect_terms: vec![], smooth_terms: vec![],
+                level: Default::default(),
             };
             let before = hwm();
             let built = build_term_collection_design(data.view(), &spec).expect("million-row design");
@@ -3149,6 +3233,7 @@ mod frozen_linear_term_mass_rebuild_tests {
             }],
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
+            level: Default::default(),
         }
     }
 

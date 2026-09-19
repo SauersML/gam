@@ -115,7 +115,7 @@ fn absorption_audit_dict<'py>(
         pair.set_item("lift", entry.lift)?;
         pair.set_item("weight_correlation", entry.weight_correlation)?;
         pair.set_item("dependence", entry.dependence)?;
-        pair.set_item("fusion_evidence", entry.fusion_evidence)?;
+        pair.set_item("fusion_score", entry.fusion_score)?;
         pair.set_item("absorption_asymmetry", entry.absorption_asymmetry)?;
         pair_list.append(pair)?;
     }
@@ -1904,13 +1904,11 @@ mod sae_spectral_ffi_tests {
     }
 }
 
-/// Compose a chain of component contracts into one end-to-end shadowing bound.
-/// Each contract is `(name, domain_radius, defect, lipschitz)`; returns the
-/// total defect, its per-stage additive contributions, and the drift-only
-/// domain-feasibility flag.
-#[pyfunction(signature = (chain,))]
-fn compose_contracts(py: Python<'_>, chain: Vec<(String, f64, f64, f64)>) -> PyResult<Py<PyDict>> {
-    let contracts: Vec<gam::terms::sae::inference::contracts::Contract> = chain
+/// `(name, domain_radius, defect, lipschitz)` tuples as the engine's contract chain.
+fn contract_chain_from_tuples(
+    chain: Vec<(String, f64, f64, f64)>,
+) -> Vec<gam::terms::sae::inference::contracts::Contract> {
+    chain
         .into_iter()
         .map(|(name, domain_radius, defect, lipschitz)| {
             gam::terms::sae::inference::contracts::Contract {
@@ -1920,12 +1918,67 @@ fn compose_contracts(py: Python<'_>, chain: Vec<(String, f64, f64, f64)>) -> PyR
                 lipschitz,
             }
         })
-        .collect();
-    let report = gam::terms::sae::inference::contracts::compose_contracts(&contracts);
+        .collect()
+}
+
+fn composed_contract_pydict<'py>(
+    py: Python<'py>,
+    report: &gam::terms::sae::inference::contracts::ComposedContract,
+) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     out.set_item("total_defect", report.total_defect)?;
-    out.set_item("per_stage_contribution", report.per_stage_contribution)?;
+    out.set_item("per_stage_contribution", report.per_stage_contribution.as_slice())?;
     out.set_item("domain_ok", report.domain_ok)?;
+    Ok(out)
+}
+
+/// Compose a chain of component contracts into one end-to-end shadowing bound.
+/// Each contract is `(name, domain_radius, defect, lipschitz)`; returns the
+/// total defect, its per-stage additive contributions, and the drift-only
+/// domain-feasibility flag.
+#[pyfunction(signature = (chain,))]
+fn compose_contracts(py: Python<'_>, chain: Vec<(String, f64, f64, f64)>) -> PyResult<Py<PyDict>> {
+    let report = gam::terms::sae::inference::contracts::compose_contracts(
+        &contract_chain_from_tuples(chain),
+    );
+    Ok(composed_contract_pydict(py, &report)?.unbind())
+}
+
+/// Check a contract chain's shadowing bound over a whole ball of inputs, not only
+/// at the nominal input (#2951 P14). Each contract is `(name, domain_radius,
+/// defect, lipschitz)`; `nominal_offsets[k]` is stage `k + 1`'s declared distance
+/// from the nominal trajectory to its certificate's center. Returns the composed
+/// bound, every stage's entry requirement with its rounding band, and whether
+/// every stage is contained. Invalid inputs are refused by the engine.
+#[pyfunction(signature = (chain, initial_radius, nominal_offsets))]
+fn whole_set_containment(
+    py: Python<'_>,
+    chain: Vec<(String, f64, f64, f64)>,
+    initial_radius: f64,
+    nominal_offsets: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    let report = gam::terms::sae::inference::contracts::whole_set_containment(
+        &contract_chain_from_tuples(chain),
+        initial_radius,
+        &nominal_offsets,
+    )
+    .map_err(py_value_error)?;
+    let stages = PyList::empty(py);
+    for stage in &report.stages {
+        let entry = PyDict::new(py);
+        entry.set_item("nominal_spread", stage.nominal_spread)?;
+        entry.set_item("drift", stage.drift)?;
+        entry.set_item("nominal_offset", stage.nominal_offset)?;
+        entry.set_item("required_radius", stage.required_radius)?;
+        entry.set_item("rounding_band", stage.rounding_band)?;
+        entry.set_item("contained", stage.contained)?;
+        stages.append(entry)?;
+    }
+    let out = PyDict::new(py);
+    out.set_item("composed", composed_contract_pydict(py, &report.composed)?)?;
+    out.set_item("initial_radius", report.initial_radius)?;
+    out.set_item("stages", stages)?;
+    out.set_item("contained", report.contained)?;
     Ok(out.unbind())
 }
 

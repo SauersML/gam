@@ -31,10 +31,7 @@
 //! exactly, so the control measures whether the curved atoms can still find the
 //! ring on the peeled residual.
 
-use gam_sae::manifold::{
-    SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER, SaeSupportSparseFit, SaeSupportSparseFitRequest,
-    fit_sae_support_sparse,
-};
+use gam_sae::manifold::{SaeSupportSparseFit, SaeSupportSparseFitRequest, fit_sae_support_sparse};
 use gam_sae::sparse_dict::{block_sparse_dictionary_transform, reconstruct_block_sparse_rows};
 use gam_sae::tiered::{TieredFitConfig, fit_tiered};
 use ndarray::{Array1, Array2, ArrayView2, Axis};
@@ -179,7 +176,6 @@ fn ring_curved_fit(target: ArrayView2<'_, f64>) -> Result<SaeSupportSparseFit, S
         support_k: 2,
         initial_smoothness: 1.0,
         max_outer_iter: 32,
-        max_inner_iter: SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER,
         trust_radius: 1.0,
         random_state: 0xC0FF_EE00_D15E_A5E5,
     })

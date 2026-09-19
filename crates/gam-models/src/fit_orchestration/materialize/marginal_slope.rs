@@ -65,35 +65,70 @@ fn validate_bernoulli_marginal_slope_z_column_variance(
     })
 }
 
-/// Resolve a marginal-slope fit's base link from the main formula's `link(...)`.
-/// The calibrated de-nested kernel is probit-only, so another link, a
-/// `flexible(...)` wrapper, or link parameters that only another link reads are
-/// refused rather than fitted as probit without a word.
-pub(super) fn resolve_marginal_slope_base_link(
+/// Resolve a marginal-slope fit's link from the main formula's `link(...)` and the
+/// request's `link` and `flexible_link` arguments (gamfit's `link=` and
+/// `flexible_link=`). The calibrated de-nested kernel is probit-only, so another
+/// link named in either place, or link parameters that only another link reads,
+/// are refused rather than fitted as probit without a word. The returned choice is
+/// flexible when either place asks for `flexible(probit)` or `flexible_link` is
+/// set; the caller turns that into the default link deviation through
+/// [`effectivelinkwiggle_formulaspec`], as every other family does.
+pub(super) fn resolve_marginal_slope_link(
     linkspec: Option<&gam_terms::inference::formula_dsl::LinkFormulaSpec>,
+    link_argument: Option<&str>,
+    flexible_link: bool,
     context: &'static str,
-) -> Result<InverseLink, WorkflowError> {
+) -> Result<(InverseLink, Option<LinkChoice>), WorkflowError> {
+    use gam_terms::inference::formula_dsl::LinkMode;
     let refuse = |refusal| WorkflowError::MarginalSlopeLink { context, refusal };
-    let Some(linkspec) = linkspec else {
-        return Ok(InverseLink::Standard(StandardLink::Probit));
-    };
-    let Some(choice) = parse_link_choice(Some(&linkspec.link), false).map_err(|error| {
-        WorkflowError::InvalidConfig {
+    let parse = |raw: Option<&str>, flexible: bool| {
+        parse_link_choice(raw, flexible).map_err(|error| WorkflowError::InvalidConfig {
             reason: String::from(error),
-        }
-    })?
-    else {
-        return Ok(InverseLink::Standard(StandardLink::Probit));
+        })
     };
-    if matches!(
-        choice.mode,
-        gam_terms::inference::formula_dsl::LinkMode::Flexible
-    ) {
-        return Err(refuse(MarginalSlopeLinkRefusal::Flexible));
-    }
-    if choice.mixture_components.is_some() || choice.link != LinkFunction::Probit {
+    let is_probit = |choice: &LinkChoice| {
+        choice.mixture_components.is_none() && choice.link == LinkFunction::Probit
+    };
+    let formula_choice = match linkspec {
+        Some(linkspec) => parse(Some(&linkspec.link), false)?,
+        None => None,
+    };
+    if formula_choice.as_ref().is_some_and(|choice| !is_probit(choice)) {
         return Err(refuse(MarginalSlopeLinkRefusal::NonProbit));
     }
+    let argument_choice = parse(link_argument, flexible_link)?;
+    if let Some(link) = link_argument
+        && argument_choice.as_ref().is_some_and(|choice| !is_probit(choice))
+    {
+        return Err(refuse(MarginalSlopeLinkRefusal::NonProbitArgument {
+            link: link.to_string(),
+        }));
+    }
+    if let Some(linkspec) = linkspec {
+        validate_marginal_slope_link_parameters(linkspec, context)?;
+    }
+    let flexible = [&formula_choice, &argument_choice]
+        .into_iter()
+        .flatten()
+        .any(|choice| matches!(choice.mode, LinkMode::Flexible));
+    let choice = (formula_choice.is_some() || argument_choice.is_some()).then(|| LinkChoice {
+        mode: if flexible {
+            LinkMode::Flexible
+        } else {
+            LinkMode::Strict
+        },
+        link: LinkFunction::Probit,
+        mixture_components: None,
+    });
+    Ok((InverseLink::Standard(StandardLink::Probit), choice))
+}
+
+/// Refuse the formula `link(...)` parameters that only a non-probit link reads.
+fn validate_marginal_slope_link_parameters(
+    linkspec: &gam_terms::inference::formula_dsl::LinkFormulaSpec,
+    context: &'static str,
+) -> Result<(), WorkflowError> {
+    let refuse = |refusal| WorkflowError::MarginalSlopeLink { context, refusal };
     if linkspec.sas_init.is_some() {
         return Err(refuse(MarginalSlopeLinkRefusal::ForeignParameter {
             parameter: "sas_init",
@@ -112,7 +147,7 @@ pub(super) fn resolve_marginal_slope_base_link(
             requires: "blended(...)/mixture(...)",
         }));
     }
-    Ok(InverseLink::Standard(StandardLink::Probit))
+    Ok(())
 }
 
 pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
@@ -154,8 +189,12 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         }
         .into());
     }
-    let base_link =
-        resolve_marginal_slope_base_link(parsed.linkspec.as_ref(), "bernoulli marginal-slope")?;
+    let (base_link, link_choice) = resolve_marginal_slope_link(
+        parsed.linkspec.as_ref(),
+        config.link.as_deref(),
+        config.flexible_link,
+        "bernoulli marginal-slope",
+    )?;
     validate_marginal_slope_z_column_exclusion(
         parsed,
         &parsed_slope,
@@ -174,7 +213,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         "Bernoulli marginal-slope",
     )?;
 
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
     // Bernoulli marginal-slope: structurally operator-only at large scale, so
     // flip the hint regardless of n to keep dense fallbacks blocked.
     let policy = resolved_resource_policy(
@@ -218,8 +257,12 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let slope_offset =
         resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
+    // A flexible link, however it was asked for, is the main formula's default link
+    // deviation, the one `linkwiggle()` gives; an explicit `linkwiggle(...)` wins.
+    let main_linkwiggle =
+        effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
     let routing = route_marginal_slope_deviation_blocks(
-        parsed.linkwiggle.as_ref(),
+        main_linkwiggle.as_ref(),
         parsed_slope.linkwiggle.as_ref(),
     )?;
 
@@ -229,6 +272,30 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     let z = data.values.column(z_idx).to_owned();
     validate_bernoulli_marginal_slope_z_column_variance(z_column, z.view(), weights.view())?;
     let score_influence_jacobian = None;
+    // gam#2924: the residual repair block, read by column name. The columns
+    // must be absent from both formulas — a residual feature that also enters
+    // a surface would be read twice, once as a covariate and once as drive.
+    let residual = if config.residual_columns.is_empty() {
+        None
+    } else {
+        let n = data.values.nrows();
+        let mut features = Array2::<f64>::zeros((n, config.residual_columns.len()));
+        for (local, name) in config.residual_columns.iter().enumerate() {
+            let idx = resolve_role_col(col_map, name, "residual")?;
+            features.column_mut(local).assign(&data.values.column(idx));
+            validate_marginal_slope_z_column_exclusion(
+                parsed,
+                &parsed_slope,
+                name,
+                "Bernoulli marginal-slope residual column",
+                "slope_formula",
+            )?;
+        }
+        Some(gam_models_bms_residual_spec(
+            config.residual_columns.clone(),
+            features,
+        ))
+    };
 
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
@@ -244,6 +311,8 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         link_dev: routing.link_dev,
         latent_z_policy: config.marginal_slope_latent_policy(),
         score_influence_jacobian,
+        residual,
+        declared_latent_law: config.declared_latent_law_grid()?,
     };
 
     Ok(MaterializedModel {
@@ -251,20 +320,18 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         request: FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
             data: data.values.view(),
             spec,
-            options: BlockwiseFitOptions {
-                // gam#2718: honor the caller instead of forcing `true`. `None`
-                // keeps the historical behaviour (compute it), so this is a
-                // widening -- no existing caller changes behaviour.
-                compute_covariance: config.compute_covariance.unwrap_or(true),
-                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                // Robustness (Firth/Jeffreys stabilizer) is the unconditional
-                // default for bernoulli marginal-slope — no flag to thread.
-                ..Default::default()
-            },
+            options: blockwise_fit_options(config),
             kappa_options: config.spatial_optimization.clone(),
             policy,
         }),
         inference_notes,
         unidentified_scalar_terms,
     })
+}
+
+fn gam_models_bms_residual_spec(
+    columns: Vec<String>,
+    features: Array2<f64>,
+) -> crate::bms::ResidualRepairSpec {
+    crate::bms::ResidualRepairSpec { columns, features }
 }

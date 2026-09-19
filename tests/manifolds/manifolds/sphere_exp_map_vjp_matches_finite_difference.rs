@@ -6,10 +6,10 @@
 //! "silently-wrong gradient" failure mode this VJP exists to prevent, so the
 //! tolerance is intentionally tight and must never be loosened to pass.
 //!
-//! The forward `exp_map` uses `point` verbatim (it does NOT renormalize), so we
+//! The forward `exp_map` takes `point` as given and normalizes its image, so we
 //! exercise both a unit `p` (textbook on-sphere Jacobi field) and a non-unit
-//! `p` (the general-ambient branch that carries the `c(1-|p|^2)` terms), plus
-//! the small-`theta` Taylor branch.
+//! `p` (the general-ambient branch that carries the `c(1-|p|^2)` terms and the
+//! normalization's adjoint), plus the small-`theta` Taylor branch.
 
 use gam::{RiemannianManifold, SphereManifold};
 use ndarray::{Array1, ArrayView1, arr1};
@@ -103,7 +103,7 @@ fn sphere_exp_map_vjp_matches_finite_difference_unit_point() {
 fn sphere_exp_map_vjp_matches_finite_difference_nonunit_point() {
     // Non-unit base point exercises the general-ambient branch (the
     // c(1-|p|^2) terms in w_v / w_p) that a unit-p-only derivation would
-    // silently get wrong. exp_map uses `point` verbatim, so this is a real
+    // silently get wrong. exp_map takes `point` as given, so this is a real
     // path the VJP must match.
     let p = arr1(&[0.2, -0.4, 0.5]); // |p|^2 = 0.45 != 1
     let v = arr1(&[0.25, 0.10, -0.20]);
@@ -120,36 +120,38 @@ fn sphere_exp_map_vjp_matches_finite_difference_nonunit_point() {
 }
 
 #[test]
-fn sphere_exp_map_accepts_nonunit_point_verbatim() {
-    // The forward must consume the base point verbatim — neither rejecting a
-    // non-unit `p` (the regression that made `exp_map_vjp` unreachable on the
-    // off-sphere finite-difference path) nor silently renormalizing it. We pin
-    // the exact ambient closed form `y = cos(θ) p + (sin(θ)/θ) (v − (p·v) p)`
-    // for a deliberately non-unit `p`, which is also the curve the VJP above
-    // differentiates.
+fn sphere_exp_map_takes_a_nonunit_point_and_returns_its_normalized_image() {
+    // The forward must accept a non-unit `p` (rejecting it made `exp_map_vjp`
+    // unreachable on the off-sphere finite-difference path) and return the
+    // normalized ambient geodesic `g/‖g‖`, `g = cos(θ) p + (sin(θ)/θ) (v − (p·v) p)`,
+    // for a deliberately non-unit `p`: the curve the VJP above differentiates.
+    // The image is unit-norm to the f64 normalization band, so a chain of steps
+    // cannot drift off the sphere.
     let manifold = SphereManifold::new(2);
     let p = arr1(&[0.2, -0.4, 0.5]); // |p|^2 = 0.45 != 1
     let v = arr1(&[0.25, 0.10, -0.20]);
 
     let y = manifold
         .exp_map(p.view(), v.view())
-        .expect("exp_map must accept a non-unit base point verbatim");
+        .expect("exp_map must accept a non-unit base point");
 
     let c = p.dot(&v);
     let xi = &v - &(&p * c);
     let theta = xi.dot(&xi).sqrt();
-    let expected = &(&p * theta.cos()) + &(&xi * (theta.sin() / theta));
+    let geodesic = &(&p * theta.cos()) + &(&xi * (theta.sin() / theta));
+    let expected = &geodesic / geodesic.dot(&geodesic).sqrt();
     assert!(
         max_abs_diff(&y, &expected) < 1.0e-12,
-        "exp_map on non-unit p must equal the verbatim ambient closed form"
+        "exp_map on non-unit p must equal the normalized ambient closed form"
     );
-    // It must NOT renormalize: for a non-unit p the ambient image is off the
-    // unit sphere, and forcing it back would contradict the map the VJP
-    // differentiates.
-    let out_norm_sq = y.dot(&y);
+    // The un-normalized geodesic is far off the sphere here, so the check below
+    // fails if the normalization is dropped.
+    assert!((geodesic.dot(&geodesic) - 1.0).abs() > 1.0e-6);
+    let band = gam_math::roundoff::unit_normalization_band(y.len());
+    let out_defect = (y.dot(&y) - 1.0).abs();
     assert!(
-        (out_norm_sq - 1.0).abs() > 1.0e-6,
-        "exp_map silently renormalized a non-unit base point (|y|^2 = {out_norm_sq})"
+        out_defect <= band,
+        "exp_map image is off the unit sphere: |‖y‖² − 1| = {out_defect:.3e} > {band:.3e}"
     );
 }
 

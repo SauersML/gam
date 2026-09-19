@@ -19,6 +19,7 @@ use crate::marginal_slope_shared::{
     add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     eval_coeff4_at, first_parameter_directional_order2_terms, first_parameter_order2_terms,
+    observed_denested_calibration_newton_coefficients as shared_observed_denested_calibration_newton_coefficients,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_weighted_rows, parameter_block_specs_match_rows, probit_frailty_scale,
     psi_derivative_location, scale_coeff4, second_parameter_order2_terms,
@@ -68,6 +69,7 @@ pub(crate) use alo_replay::{
 };
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;
+pub use moving_law_rule::{MovingLawArm, MovingLawArmScore, MovingLawCertificate};
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -145,6 +147,17 @@ pub struct BernoulliMarginalSlopeTermSpec {
     /// Stage-1, in which case the free 1-D `score_warp` spline is the
     /// fallback basis (it spans only the x-free leakage column).
     pub score_influence_jacobian: Option<Array2<f64>>,
+    /// Residual genetic repair block (gam#2924): `K` conditionally centred
+    /// features entering the genetic drive with constant, ridge-shrunk
+    /// coefficients, the anchor integrating the joint `(z, r)` law. `None` is
+    /// the single-score family unchanged.
+    pub residual: Option<residual_repair::ResidualRepairSpec>,
+    /// A DECLARED finite law of the latent score (gam#2926): nodes and weights
+    /// the intercept is anchored on as given, in place of anything
+    /// `latent_z_policy` would estimate or check. The score is taken as supplied
+    /// and the law is persisted as the fit's latent measure. `None` leaves the
+    /// law to `latent_z_policy`.
+    pub declared_latent_law: Option<EmpiricalZGrid>,
 }
 
 pub struct BernoulliMarginalSlopeFitResult {
@@ -168,34 +181,25 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// keeping it would leave the joint Hessian rank-deficient). Empty
     /// for fits where every flex block carried independent directions.
     pub cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning>,
-    /// Optional weighted rank inverse-normal (Blom rankit) calibration
-    /// installed at fit time when the auto latent-z normality check
-    /// failed. `Some(_)` ⇒ the training z was transformed in place via
-    /// [`LatentZRankIntCalibration::apply_to_training`] before any
-    /// downstream consumer (pooled probit baseline, term-collection
-    /// designs, family PIRLS loops) saw it, and the rigid kernel
-    /// routes through the standard-normal closed-form path on the
-    /// calibrated scale. `None` ⇒ no calibration was applied (training
-    /// z already passed the standard-normal diagnostics, or the caller
-    /// explicitly selected a non-Auto `LatentMeasureSpec`).
-    ///
-    /// Persisted to disk so prediction applies the same monotone map
-    /// via [`LatentZRankIntCalibration::apply_at_predict`] to incoming
-    /// z before the standard-normal kernel runs. The public field name
-    /// is `latent_z_rank_int_calibration` — Agent D's persistence
-    /// pipeline reads it under that exact identifier.
-    pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
-    /// Optional conditional location-scale calibration of the latent score
-    /// (#905). `Some(_)` ⇒ the Auto path's conditional `E[z|C]`/`Var(z|C)` Rao
-    /// gate detected PC/grouping-dependence that the pooled-marginal gate
-    /// cannot see, so the training z was replaced in place by
-    /// `ζ = (z − m(C))/√v(C)` (via [`LatentZConditionalCalibration::apply`])
-    /// before any downstream consumer saw it. Mutually exclusive with
-    /// `latent_z_rank_int_calibration`: rank-INT fixes a pooled-marginal
-    /// defect, the conditional correction fixes a conditional-shift defect that
-    /// rank-INT provably cannot. Persisted so prediction rebuilds `a(C)` from
-    /// the (reproducible) marginal design and applies the identical map.
+    /// Which latent law the fit consumed (gam#2926): the estimated law of the
+    /// score (global or local by context), a declared finite law, the declared
+    /// conditional location-scale law, or the declared Gaussian closed form.
+    /// The law itself is [`Self::latent_measure`]. Persisted with the model.
+    pub latent_law_consumed: LatentLawConsumed,
+    /// Conditional location-scale calibration of the latent score (#905),
+    /// `Some(_)` only under the declared `conditional-location-scale` law when
+    /// its `E[z|C]`/`Var(z|C)` Rao test fired: the training z was then replaced
+    /// in place by `ζ = (z − m(C))/√v(C)` (via
+    /// [`LatentZConditionalCalibration::apply`]) before any downstream consumer
+    /// saw it, and the residual is anchored on its empirical law. Persisted so
+    /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
+    /// applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
+    /// The fitted residual repair geometry (gam#2924) when a residual block was
+    /// supplied: column names, the pooled joint `(z, r)` covariance, the
+    /// conditional model when the pairwise gate escalated, and the centring
+    /// p-values. The coefficients live in `fit.block_states[2]`.
+    pub residual_repair: Option<residual_repair::ResidualRepairGeometry>,
 }
 
 #[derive(Clone, Debug)]
@@ -213,28 +217,23 @@ pub enum LatentZNormalizationMode {
 }
 
 pub(crate) const DEFAULT_EMPIRICAL_LATENT_GRID_SIZE: usize = 65;
-pub(crate) const AUTO_Z_NORMAL_SKEW_TOL: f64 = 0.10;
-pub(crate) const AUTO_Z_NORMAL_KURT_TOL: f64 = 0.25;
-pub(crate) const AUTO_Z_NORMAL_KS_TOL: f64 = 0.025;
-pub(crate) const AUTO_Z_NORMAL_MAX_ABS: f64 = 8.0;
+/// The standard-normal adequacy screen's design false-fail rate (gam#2926): the
+/// probability that a score drawn exactly N(0, 1) fails it. It is a stated
+/// policy, not a tuning knob. Each clause's bound is the null quantile of its own
+/// statistic at the sample's Kish effective size, at this level split evenly over
+/// the clauses, so no bound is a constant and the screen's family-wise
+/// false-fail rate is at most this. The screen decides only which route a fit
+/// starts on; the post-fit `D̂` certificate carries the accuracy claim.
+pub(crate) const AUTO_Z_NORMAL_SCREEN_ALPHA: f64 = 0.05;
+/// The screen's clauses: mean, sd, skewness, excess kurtosis, KS distance, the
+/// two tail masses and the largest `|z|`.
+const AUTO_Z_NORMAL_SCREEN_CLAUSES: f64 = 8.0;
 /// Inner σ level at which the empirical tail mass of latent z is compared
-/// against the standard normal's theoretical two-sided tail in the auto
-/// normality gate. Chosen well inside `AUTO_Z_NORMAL_MAX_ABS` so a fat inner
-/// tail is caught before any single observation trips the hard `max |z|` bound.
+/// against the standard normal's two-sided tail in the adequacy screen.
 pub(crate) const AUTO_Z_NORMAL_TAIL_SIGMA_INNER: f64 = 4.0;
 /// Outer σ level for the same tail-mass comparison; catches heavier far-tail
 /// excess that the inner level can miss.
 pub(crate) const AUTO_Z_NORMAL_TAIL_SIGMA_OUTER: f64 = 6.0;
-/// Multiplier applied to the normal's theoretical tail mass before comparison:
-/// the empirical tail may be up to this many times the Gaussian tail at the
-/// same σ before the gate fails, allowing for finite-sample sampling noise.
-pub(crate) const AUTO_Z_NORMAL_TAIL_MASS_SLACK: f64 = 2.0;
-/// Absolute additive floor on the inner-σ tail comparison, so the gate does
-/// not fail on round-off when the Gaussian tail itself is already tiny.
-pub(crate) const AUTO_Z_NORMAL_TAIL_FLOOR_INNER: f64 = 1e-5;
-/// Absolute additive floor on the outer-σ tail comparison; smaller than the
-/// inner floor because the 6σ Gaussian tail is many orders smaller than 4σ.
-pub(crate) const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
 /// Significance level for the conditional `E[z|C]` / `Var(z|C)` Rao gate in the
 /// core Auto path (#905). When the latent score's conditional mean or variance
 /// on the marginal-index span `a(C)` is significant at this level, the Auto
@@ -256,11 +255,32 @@ pub(crate) const AUTO_Z_CONDITIONAL_RIDGE_REL: f64 = 1.0e-8;
 /// non-positive or vanishing conditional variance.
 pub(crate) const AUTO_Z_CONDITIONAL_VAR_FLOOR_FRAC: f64 = 1.0e-3;
 
+/// Which law of the latent score a marginal-slope fit anchors on (gam#2926).
+///
+/// The anchoring equation `E_p[Φ(α + b·z) | a] = π(a)` has a unique solution on
+/// every finite law, and the closed-form Gaussian lowering is its `N(0, 1)`
+/// case, so the default is the law the score HAS and the Gaussian form is a
+/// declaration a caller makes about the score, never the target of a transform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatentMeasureSpec {
+    /// The default: estimate the conditional law of the score on the
+    /// marginal-index span and anchor on it, the score on its own axis — the
+    /// closed-form Gaussian law when the span shows no structure in that law and
+    /// the score passes the standard-normal adequacy check, one global finite law
+    /// when it fails the check, and when the law moves the simplest of the
+    /// Gaussian, location-scale and local laws its cross-fitted certificate admits.
     Auto { grid_size: usize },
+    /// A declared Gaussian law: the closed-form lowering, refused when the score's
+    /// conditional moments move on the span, and warned about with its estimated
+    /// excess anchoring loss when the pooled score fails the adequacy screen.
     StandardNormal,
+    /// Always anchor on the pooled empirical law of the score, whatever the span
+    /// shows.
     GlobalEmpirical { grid_size: usize },
+    /// Declare the conditional law a location-scale family on the span: fit
+    /// `m(a)`, `v(a)`, and anchor `ζ = (z − m)/√v` on the empirical law of the
+    /// standardised residual. The slope then lives on the `ζ` axis.
+    ConditionalLocationScale { grid_size: usize },
 }
 
 impl LatentMeasureSpec {
@@ -274,6 +294,436 @@ impl LatentMeasureSpec {
 impl Default for LatentMeasureSpec {
     fn default() -> Self {
         Self::auto_default()
+    }
+}
+
+/// What the conditional-law structure test measured on the marginal-index span
+/// (gam#2926): robust Rao score tests of `E[z|a]`, `Var(z|a)` and the third
+/// standardised moment against the span's non-constant directions, each at
+/// level [`AUTO_Z_CONDITIONAL_RAO_ALPHA`].
+///
+/// A `None` p-value means the test could not be formed — no span was supplied
+/// (a CTN influence absorber owns the conditional leakage), or the span has no
+/// usable direction — which is not evidence of structure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalLawEvidence {
+    pub mean_p_value: Option<f64>,
+    pub variance_p_value: Option<f64>,
+    pub skewness_p_value: Option<f64>,
+    pub alpha: f64,
+}
+
+impl ConditionalLawEvidence {
+    fn fires(p_value: Option<f64>, alpha: f64) -> bool {
+        p_value.is_some_and(|p| p < alpha)
+    }
+
+    /// The conditional mean or variance of the score moves on the span: a
+    /// declared `N(0, 1)` law is then false in context.
+    pub fn mean_or_variance_moves(&self) -> bool {
+        Self::fires(self.mean_p_value, self.alpha) || Self::fires(self.variance_p_value, self.alpha)
+    }
+
+    /// Any tested moment of the conditional law moves on the span: one pooled
+    /// law then misstates the law in context.
+    pub fn law_moves(&self) -> bool {
+        self.mean_or_variance_moves() || Self::fires(self.skewness_p_value, self.alpha)
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        fn p(value: Option<f64>) -> String {
+            value.map_or_else(|| "untestable".to_string(), |p| format!("{p:.3e}"))
+        }
+        format!(
+            "p(E[z|a])={} p(Var(z|a))={} p(skew(z|a))={} at level {:.1e}",
+            p(self.mean_p_value),
+            p(self.variance_p_value),
+            p(self.skewness_p_value),
+            self.alpha
+        )
+    }
+}
+
+/// The closed form's anchoring choice at a converged fit (gam#2926): whichever of
+/// the closed form and the estimated law's own anchor is expected to be the more
+/// accurate on the rows of the fit.
+///
+/// Per anchor `i`, the residual `r_i = Σ_k w_k Φ(a_cf,i + h_k) − π_i` under the
+/// estimated law `Ĝ`, at the closed-form intercept, is `bias_i + ε_i`. `bias_i` is
+/// the closed form's probability error under the true law `G`, and
+/// `ε_i = (E_Ĝ − E_G)[Φ(a_cf,i + h)]` is `Ĝ`'s sampling error, with variance
+/// `se_i² = Var_Ĝ(Φ(a_cf,i + h))/n_eff`. The estimated law's own anchor errs by
+/// about `−(E_Ĝ − E_G)[Φ(a_emp,i + h)]`, whose variance is `se_i²` to first order,
+/// so the closed form's excess risk on the anchor is `bias_i² − se_i²`. Because
+/// `E[r_i²] = bias_i² + se_i²`, `r_i² − 2·se_i²` estimates it without bias, whatever
+/// the correlation between anchors that share `Ĝ`. Weighted by the log-loss
+/// curvature, `KL ≈ Δp²/(2π(1−π))`, and summed over the fit:
+///
+/// ```text
+/// D̂ = Σ_i w_i (r_i² − 2·se_i²) / (π_i(1−π_i))
+/// ```
+///
+/// The closed form is kept when `D̂ ≤ 0`, and the fit is re-solved on the estimated
+/// law otherwise. Nothing is tuned: as `n` grows the closed form survives only on
+/// Gaussian scores, and at small `n` it wins exactly when the estimated law is too
+/// noisy to beat it. On an exactly Gaussian score the anchors' noise is close to one
+/// shared mode, so about `P(Z² > 2) ≈ 16%` of fits re-solve: slower, and no less
+/// accurate in expectation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClosedFormAnchorResidual {
+    /// `D̂`.
+    pub excess_kl: f64,
+    /// `Σ_i w_i r_i² / (π_i(1−π_i))`.
+    pub residual_energy: f64,
+    /// `Σ_i w_i se_i² / (π_i(1−π_i))`.
+    pub noise_energy: f64,
+    /// Kish effective size of the scores the estimated law was compressed from.
+    pub effective_n: f64,
+    /// Anchors measured: positive prior weight and `π(1−π) > 0`.
+    pub anchors: usize,
+    /// Nodes of the estimated law.
+    pub nodes: usize,
+    /// The decision, `excess_kl ≤ 0`: the closed form was kept.
+    pub closed_form_chosen: bool,
+}
+
+impl ClosedFormAnchorResidual {
+    /// Aggregate per-anchor `(residual, standard error, π(1−π), prior weight)`.
+    /// Anchors whose `π(1−π)` is zero carry no probability to anchor and are not
+    /// measured.
+    pub(crate) fn from_rows(
+        rows: &[(f64, f64, f64, f64)],
+        nodes: usize,
+        effective_n: f64,
+    ) -> Result<Self, String> {
+        let mut residual_energy = 0.0;
+        let mut noise_energy = 0.0;
+        let mut anchors = 0usize;
+        for &(residual, standard_error, scale, weight) in rows {
+            if !(weight > 0.0 && scale > 0.0) {
+                continue;
+            }
+            if !(residual.is_finite() && standard_error.is_finite() && scale.is_finite()) {
+                return Err(format!(
+                    "closed-form anchoring residual is not measurable at an anchor: \
+                     residual={residual}, standard error={standard_error}, π(1−π)={scale}"
+                ));
+            }
+            residual_energy += weight * residual * residual / scale;
+            noise_energy += weight * standard_error * standard_error / scale;
+            anchors += 1;
+        }
+        if anchors == 0 {
+            return Err(
+                "closed-form anchoring residual pass saw no measurable positive-weight anchor"
+                    .to_string(),
+            );
+        }
+        let excess_kl = residual_energy - 2.0 * noise_energy;
+        Ok(Self {
+            excess_kl,
+            residual_energy,
+            noise_energy,
+            effective_n,
+            anchors,
+            nodes,
+            closed_form_chosen: excess_kl <= 0.0,
+        })
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "D̂ = Σ w (r² − 2·se²)/π(1−π) = {:.4e} (Σ w r²/π(1−π) = {:.4e}, Σ w se²/π(1−π) = \
+             {:.4e}) over {} anchors, n_eff = {:.1}, estimated law of {} nodes: {}",
+            self.excess_kl,
+            self.residual_energy,
+            self.noise_energy,
+            self.anchors,
+            self.effective_n,
+            self.nodes,
+            if self.closed_form_chosen {
+                "the closed form is kept"
+            } else {
+                "the estimated law is the more accurate anchor"
+            }
+        )
+    }
+}
+
+/// The law of the latent score a marginal-slope fit consumed, and how it came
+/// to consume it (gam#2926). Persisted with the model beside
+/// `latent_measure`, which carries the law itself; this records what the law
+/// IS — an estimate, a declaration, or the Gaussian closed form — so a reader
+/// of a saved model never has to infer it from the shape of the grid.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "law", rename_all = "kebab-case")]
+pub enum LatentLawConsumed {
+    /// Default, span without structure, a score the standard-normal adequacy
+    /// screen cannot tell from `N(0, 1)`, and a converged closed-form fit whose
+    /// excess-KL certificate ([`ClosedFormAnchorResidual`]) keeps the closed form:
+    /// the closed-form Gaussian lowering, chosen by that evidence and never by
+    /// transforming the score. `evidence` is the span test, `adequacy` every
+    /// pooled statistic beside its bound, `residual` the certificate.
+    EstimatedGaussianAdequate {
+        evidence: ConditionalLawEvidence,
+        adequacy: LatentNormalAdequacy,
+        /// `None` only between the gate and the family's certificate pass; a
+        /// model is never persisted without it.
+        residual: Option<ClosedFormAnchorResidual>,
+    },
+    /// Default, span without structure, and a score that passes the adequacy
+    /// screen, but a converged closed-form fit whose excess-KL certificate
+    /// ([`ClosedFormAnchorResidual`]) says the estimated law is the more accurate
+    /// anchor: the fit is re-solved on that estimated law, warm-started from the
+    /// closed form.
+    EstimatedGlobalByResidual {
+        evidence: ConditionalLawEvidence,
+        adequacy: LatentNormalAdequacy,
+        residual: ClosedFormAnchorResidual,
+    },
+    /// Default on a configuration whose kernel evaluates only the closed form, where
+    /// no certified choice exists yet: the score's law departs or moves and the
+    /// kernel cannot anchor on a finite law, the anchoring residual cannot yet be
+    /// evaluated on the configuration, or the estimated law is the more accurate
+    /// anchor and nothing can re-solve on it. The closed-form lowering on the score as
+    /// given, as the default fitted before gam#2926, recorded with what is missing and
+    /// warned about, never as a certified closed form.
+    GaussianUncertified {
+        evidence: ConditionalLawEvidence,
+        adequacy: Option<LatentNormalAdequacy>,
+        certificate: Option<ClosedFormAnchorResidual>,
+        missing: String,
+    },
+    /// Default, span without structure, and a score that fails the adequacy
+    /// check: one finite law estimated from the training score on its own axis.
+    EstimatedGlobal { evidence: ConditionalLawEvidence },
+    /// Default, span with structure: the arm the moving-law certificate
+    /// ([`MovingLawCertificate`]) chose at the converged fit, the simplest of the
+    /// Gaussian, location-scale and local laws whose cross-fitted excess anchoring
+    /// loss is within one paired standard error of the lowest. `contexts` is the
+    /// local arm's context count, whichever arm was chosen.
+    EstimatedMovingLaw {
+        evidence: ConditionalLawEvidence,
+        arm: MovingLawArm,
+        contexts: usize,
+        /// `None` between the gate and the family's certificate pass, and where no
+        /// certificate can be taken, which `uncertified` then names; a model is
+        /// never persisted with neither.
+        certificate: Option<MovingLawCertificate>,
+        /// Why no certificate was taken: the anchor is one the certificate does
+        /// not evaluate. `arm` is then the arm the default fits first.
+        #[serde(default)]
+        uncertified: Option<String>,
+    },
+    /// `latent_measure = "global-empirical"`: the pooled law of the score,
+    /// requested whatever the span shows.
+    RequestedGlobalEmpirical,
+    /// `declared_latent_law`: exactly the caller's finite law.
+    DeclaredFiniteLaw { nodes: usize },
+    /// `latent_measure = "conditional-location-scale"`: `m(a)`, `v(a)` fitted
+    /// on the span and the standardised residual's empirical law.
+    /// `calibrated = false` when neither moment moves, so the score reached the
+    /// kernel unchanged on the pooled law.
+    ConditionalLocationScale {
+        calibrated: bool,
+        evidence: ConditionalLawEvidence,
+    },
+    /// `latent_measure = "gaussian"`, `frozen_score`, or the CTN chain: the
+    /// closed-form `N(0, 1)` lowering, admitted because the score's conditional
+    /// moments do not move on the span. When the pooled score fails the adequacy
+    /// screen, `adequacy` is the failing ledger and `residual` the declaration's
+    /// estimated excess anchoring loss at the converged fit, both warned about;
+    /// neither refuses the declaration.
+    DeclaredGaussian {
+        evidence: ConditionalLawEvidence,
+        adequacy: Option<LatentNormalAdequacy>,
+        /// `None` when the screen passed, or between the gate and the family's
+        /// certificate pass, or where the measurement cannot be taken, which
+        /// `uncertified` then names; a model whose screen failed is never persisted
+        /// with neither.
+        residual: Option<ClosedFormAnchorResidual>,
+        /// Why the excess anchoring loss of a failing declaration was not measured.
+        #[serde(default)]
+        uncertified: Option<String>,
+    },
+}
+
+impl LatentLawConsumed {
+    /// The stable spelling a report or log names this law by.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::EstimatedGaussianAdequate { .. } => "estimated-gaussian-adequate",
+            Self::EstimatedGlobalByResidual { .. } => "estimated-global-by-residual",
+            Self::GaussianUncertified { .. } => "gaussian-uncertified",
+            Self::EstimatedGlobal { .. } => "estimated-global",
+            Self::EstimatedMovingLaw { arm, .. } => match arm {
+                MovingLawArm::Gaussian => "estimated-gaussian",
+                MovingLawArm::PooledEmpirical => "estimated-pooled-empirical",
+                MovingLawArm::LocationScaleGaussian => "estimated-location-scale-gaussian",
+                MovingLawArm::LocationScaleEmpirical => "estimated-location-scale-empirical",
+                MovingLawArm::Local => "estimated-local",
+            },
+            Self::RequestedGlobalEmpirical => "requested-global-empirical",
+            Self::DeclaredFiniteLaw { .. } => "declared-finite-law",
+            Self::ConditionalLocationScale { .. } => "conditional-location-scale",
+            Self::DeclaredGaussian { .. } => "declared-gaussian",
+        }
+    }
+
+    /// The reason no certificate was taken, when the fit recorded one instead: a
+    /// default whose anchor the certificate cannot evaluate. `None` for every
+    /// certified or declared law, and for a provisional record.
+    pub fn uncertified_reason(&self) -> Option<&str> {
+        match self {
+            Self::GaussianUncertified { missing, .. } => Some(missing),
+            Self::EstimatedMovingLaw { uncertified, .. }
+            | Self::DeclaredGaussian { uncertified, .. } => uncertified.as_deref(),
+            Self::EstimatedGaussianAdequate { .. }
+            | Self::EstimatedGlobalByResidual { .. }
+            | Self::EstimatedGlobal { .. }
+            | Self::RequestedGlobalEmpirical
+            | Self::DeclaredFiniteLaw { .. }
+            | Self::ConditionalLocationScale { .. } => None,
+        }
+    }
+
+    /// Refuse a fit whose law carries no certificate where one is due (gam#2926):
+    /// a provisional closed form, a failing Gaussian declaration never measured, a
+    /// moving law never certified, or a default recorded uncertified. A recorded
+    /// reason is named in the refusal, never taken in place of the certificate.
+    pub fn require_certified(&self, context: &str) -> Result<(), String> {
+        self.require_recorded(context)?;
+        match self.uncertified_reason() {
+            Some(reason) => Err(format!(
+                "{context}: the {} law carries no certificate: {reason}",
+                self.label()
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Refuse a provisional record, whose certificate was due and never taken and
+    /// which states no reason: the gate a saved model passes (gam#2926). A default
+    /// the certificate cannot evaluate records why and is saved, uncertified.
+    pub(crate) fn require_recorded(&self, context: &str) -> Result<(), String> {
+        if let Self::EstimatedGaussianAdequate { residual: None, .. } = self {
+            return Err(format!(
+                "{context}: the closed form was chosen by the adequacy screen, and its anchoring \
+                 residual was never certified at the converged fit"
+            ));
+        }
+        if let Self::DeclaredGaussian {
+            adequacy: Some(_),
+            residual: None,
+            uncertified: None,
+            ..
+        } = self
+        {
+            return Err(format!(
+                "{context}: the declared Gaussian law failed the adequacy screen, and its excess \
+                 anchoring loss was never measured at the converged fit"
+            ));
+        }
+        if let Self::EstimatedMovingLaw {
+            certificate: None,
+            uncertified: None,
+            arm,
+            ..
+        } = self
+        {
+            return Err(format!(
+                "{context}: the {} law was fitted for a score whose law moves on the span, and \
+                 the moving-law certificate was never taken at the converged fit",
+                arm.label()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Why a marginal-slope fit refused the latent law it was asked for, or could
+/// not reach the default one (gam#2926). Rendered into the fit's error; the
+/// variants are what a caller can act on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LatentLawRefusal {
+    /// A Gaussian law was declared, but the score's conditional mean or
+    /// variance moves on the marginal-index span.
+    GaussianConditionalMomentsMove {
+        context: String,
+        evidence: ConditionalLawEvidence,
+    },
+    /// The requested law needs the empirical anchoring kernel, and this
+    /// configuration's kernel is the closed-form Gaussian lowering only.
+    EmpiricalKernelUnavailable { context: String, requested: String },
+    /// The conditional law moves on the span, so the default law is local by
+    /// context, and this caller supplied no context to estimate it on.
+    LocalLawContextUnavailable {
+        context: String,
+        evidence: ConditionalLawEvidence,
+    },
+    /// `conditional-location-scale` needs the marginal-index span, and none was
+    /// available.
+    LocationScaleSpanUnavailable { context: String },
+    /// The moving-law certificate could not build an arm's law without one fold's
+    /// rows at the full-data law's configuration, so it cannot score that arm.
+    MovingLawFoldUnfittable {
+        context: String,
+        fold: usize,
+        arm: MovingLawArm,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for LatentLawRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GaussianConditionalMomentsMove { context, evidence } => write!(
+                f,
+                "{context}: the Gaussian latent law was declared (latent_measure=\"gaussian\", \
+                 frozen_score, or the CTN chain), but the score's conditional mean or variance \
+                 moves on the marginal-index span ({}), so z | a is not N(0, 1) and the \
+                 closed-form lowering would put b(a)·E[z|a] into the marginal index. Refused. \
+                 Drop the declaration to anchor on the estimated conditional law (the default), \
+                 or supply a score that is conditionally standard normal",
+                evidence.summary()
+            ),
+            Self::EmpiricalKernelUnavailable { context, requested } => write!(
+                f,
+                "{context}: the latent law requested ({requested}) is a finite law, and this \
+                 configuration's row kernel evaluates only the closed-form Gaussian lowering. \
+                 Declare latent_measure=\"gaussian\" to fit the Gaussian law (the score must pass \
+                 the adequacy check), or remove what confines the kernel to the closed form"
+            ),
+            Self::LocalLawContextUnavailable { context, evidence } => write!(
+                f,
+                "{context}: the score's conditional law moves on the marginal-index span ({}), so \
+                 the default law is local by context, and no context columns were available to \
+                 estimate it on. Declare latent_measure=\"conditional-location-scale\" to anchor \
+                 on a location-scale law on the span, or latent_measure=\"global-empirical\" to \
+                 anchor on the pooled law (miscalibrated where the law moves)",
+                evidence.summary()
+            ),
+            Self::LocationScaleSpanUnavailable { context } => write!(
+                f,
+                "{context}: latent_measure=\"conditional-location-scale\" fits m(a) and v(a) on \
+                 the marginal-index span, and no span is available here (a CTN influence absorber \
+                 owns the conditional leakage). Use the default latent measure"
+            ),
+            Self::MovingLawFoldUnfittable {
+                context,
+                fold,
+                arm,
+                reason,
+            } => write!(
+                f,
+                "{context}: the score's conditional law moves on the marginal-index span, and the \
+                 moving-law certificate cannot build the {} law without fold {fold}'s rows at the \
+                 full-data law's configuration ({reason}), so it cannot choose among the laws. \
+                 Declare latent_measure=\"conditional-location-scale\" or \
+                 latent_measure=\"global-empirical\"",
+                arm.label()
+            ),
+        }
     }
 }
 
@@ -322,12 +772,76 @@ pub enum LatentMeasureKind {
         grids: Vec<EmpiricalZGrid>,
         top_k: usize,
         bandwidth: f64,
+        /// How a row's mixture weights are formed from its centre distances.
+        /// Absent on laws saved before gam#2926, which keep the meaning they
+        /// were fitted under.
+        #[serde(default)]
+        mixture: LocalLawMixture,
         #[serde(skip)]
         train_row_mixtures: Arc<Vec<Vec<(usize, f64)>>>,
     },
 }
 
+/// How a row's local-law mixture weights are formed from its distances to the
+/// context centres (gam#2926). Every row's weights come from one function,
+/// [`estimated_latent_law::local_empirical_mixture_for_point`], at fit and at
+/// prediction alike.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalLawMixture {
+    /// The `top_k` nearest centres with Gaussian kernel weights, renormalised:
+    /// the meaning a saved local law has always had (the fit-time builder that
+    /// once minted one, removed after bd1c5ac5c5, used `top_k = 4` and
+    /// `bandwidth = 1.0`). A row's law jumps where the ranking at rank `top_k`
+    /// swaps, because a centre enters or leaves the mixture with a nonzero
+    /// weight.
+    #[default]
+    NearestNormalized,
+    /// Kernel weights `K(d) = exp(−d²/2h²)` of the `top_k` nearest centres less
+    /// the `(top_k + 1)`-th centre's value, so a centre's weight reaches zero
+    /// exactly where it leaves the top `top_k`, plus the pooled law — the grid
+    /// after the context grids — at the fixed weight `floor` in units of
+    /// `K(0) = 1`, renormalised. The floor keeps the normaliser positive where
+    /// the `top_k + 1` nearest centres tie, so the law is continuous in the
+    /// covariates everywhere. New fits mint it with `top_k = 4`, `bandwidth = 1`
+    /// in the scaled covariates, and `floor = 1e-3`.
+    VanishingAtTruncation { floor: f64 },
+}
+
+/// How the flexible row algebra integrates a row over its latent law — the one
+/// property of a law that a row kernel has to implement (gam#3000). The CPU
+/// row lowering takes one branch per form, and a device kernel declares the
+/// forms it transcribes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LatentIntegral {
+    /// Closed-form moments of the standard normal density on each denested
+    /// cubic cell.
+    GaussianCellMoments,
+    /// A finite weighted sum over the law's grid nodes.
+    DiscreteGrid,
+}
+
+impl LatentIntegral {
+    /// The capability a kernel needs to compute a model of this form.
+    pub(crate) const fn capability(self) -> &'static str {
+        match self {
+            Self::GaussianCellMoments => "the Gaussian cell-moment latent integral",
+            Self::DiscreteGrid => "the discrete-grid latent integral of an empirical latent law",
+        }
+    }
+}
+
 impl LatentMeasureKind {
+    /// The form in which the row algebra integrates over this law.
+    pub(crate) fn integral(&self) -> LatentIntegral {
+        match self {
+            Self::StandardNormal => LatentIntegral::GaussianCellMoments,
+            Self::GlobalEmpirical { .. } | Self::LocalEmpirical { .. } => {
+                LatentIntegral::DiscreteGrid
+            }
+        }
+    }
+
     pub fn validate(&self, context: &str) -> Result<(), String> {
         match self {
             Self::StandardNormal => Ok(()),
@@ -341,6 +855,7 @@ impl LatentMeasureKind {
                 grids,
                 top_k,
                 bandwidth,
+                mixture,
                 ..
             } => {
                 if feature_cols.is_empty() {
@@ -353,11 +868,24 @@ impl LatentMeasureKind {
                         "{context} local empirical latent measure needs centers"
                     ));
                 }
-                if centers.len() != grids.len() {
+                let pooled_grids =
+                    usize::from(matches!(mixture, LocalLawMixture::VanishingAtTruncation { .. }));
+                if grids.len() != centers.len() + pooled_grids {
                     return Err(format!(
-                        "{context} local empirical latent measure center/grid length mismatch: centers={}, grids={}",
+                        "{context} local empirical latent measure center/grid length mismatch: \
+                         centers={}, grids={}, expected {} (a floored mixture carries the pooled \
+                         law after the context grids)",
                         centers.len(),
-                        grids.len()
+                        grids.len(),
+                        centers.len() + pooled_grids
+                    ));
+                }
+                if let LocalLawMixture::VanishingAtTruncation { floor } = mixture
+                    && !(floor.is_finite() && *floor > 0.0)
+                {
+                    return Err(format!(
+                        "{context} local empirical latent measure pooled floor must be finite \
+                         and positive, got {floor}"
                     ));
                 }
                 if *top_k == 0 || *top_k > centers.len() {
@@ -411,13 +939,6 @@ impl LatentMeasureKind {
                 Ok(())
             }
         }
-    }
-
-    pub(crate) fn is_empirical(&self) -> bool {
-        matches!(
-            self,
-            Self::GlobalEmpirical { .. } | Self::LocalEmpirical { .. }
-        )
     }
 
     /// Per-row empirical latent grid, borrowed where possible. This sits in
@@ -549,19 +1070,38 @@ pub(crate) fn combine_empirical_grids(
     let mut nodes = Vec::new();
     let mut weights = Vec::new();
     for &(grid_idx, grid_weight) in mixture {
-        if !grid_weight.is_finite() || grid_weight <= 0.0 {
+        if !(grid_weight.is_finite() && grid_weight >= 0.0) {
             return Err(format!(
-                "local empirical latent mixture weight must be finite and positive, got {grid_weight}"
+                "local empirical latent mixture weight must be finite and non-negative, got {grid_weight}"
             ));
         }
         let grid = grids.get(grid_idx).ok_or_else(|| {
             format!("local empirical latent mixture references missing grid {grid_idx}")
         })?;
-        for (node, weight) in grid.pairs() {
-            nodes.push(node);
-            weights.push(grid_weight * weight);
+        // A centre whose kernel weight underflowed to zero carries no mass.
+        if grid_weight > 0.0 {
+            for (node, weight) in grid.pairs() {
+                nodes.push(node);
+                weights.push(grid_weight * weight);
+            }
         }
     }
+    // Sort once, then coalesce equal nodes by summing their weights: the grids
+    // of a mixture share nodes (every context grid and the pooled law are
+    // compressions of one score), and the combined law carries each node once.
+    sort_empirical_node_weight_pairs(&mut nodes, &mut weights);
+    let mut merged = 0usize;
+    for idx in 0..nodes.len() {
+        if merged > 0 && nodes[idx].total_cmp(&nodes[merged - 1]).is_eq() {
+            weights[merged - 1] += weights[idx];
+        } else {
+            nodes[merged] = nodes[idx];
+            weights[merged] = weights[idx];
+            merged += 1;
+        }
+    }
+    nodes.truncate(merged);
+    weights.truncate(merged);
     let total = weights.iter().copied().sum::<f64>();
     if !(total.is_finite() && total > 0.0) {
         return Err(
@@ -571,7 +1111,6 @@ pub(crate) fn combine_empirical_grids(
     for weight in &mut weights {
         *weight /= total;
     }
-    sort_empirical_node_weight_pairs(&mut nodes, &mut weights);
     validate_empirical_z_grid(&nodes, &weights, "local empirical latent combined grid")?;
     Ok(EmpiricalZGrid { nodes, weights })
 }
@@ -664,16 +1203,11 @@ impl LatentZNormalization {
 /// Gaussian. The closed-form standard-normal kernel is therefore
 /// adequate only when the calibrated sample itself passes the same
 /// standard-normal adequacy gate applied to raw z
-/// (`latent_z_normal_adequacy`);
-/// `build_latent_measure_with_geometry` re-checks the calibrated
-/// sample and falls back to the mathematically exact global-empirical
-/// latent measure when that re-check fails. On the passing path the
-/// kept work is the same closed-form
-/// `signed_probit_logcdf_and_mills_ratio` evaluation as the
-/// no-calibration path; the dropped work is the empirical-grid jet
-/// machinery. Persisted to disk so prediction applies the same
-/// monotone map to incoming z and re-routes through the closed-form
-/// kernel.
+/// (`latent_z_normal_adequacy`). Since gam#2926 no fit mints one: the
+/// default anchors on the estimated law of the score instead of making
+/// the score look Gaussian. Models saved with one still carry it, and
+/// prediction applies the same monotone map to incoming z and re-routes
+/// through the closed-form kernel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LatentZRankIntCalibration {
     /// Sorted unique positive-mass z values seen during training, ascending.
@@ -876,7 +1410,7 @@ impl LatentZRankIntCalibration {
         // Φ⁻¹(p); clip away from {0, 1} to keep the quantile finite.
         standard_normal_quantile(p).unwrap_or_else(|err| {
             let clipped = if p < 0.5 { -8.0 } else { 8.0 };
-            log::debug!(
+            log::trace!(
                 "standard_normal_quantile({p}) failed ({err}); clipping the latent score to {clipped}"
             );
             clipped
@@ -884,14 +1418,14 @@ impl LatentZRankIntCalibration {
     }
 }
 
-/// Optional calibration applied to the latent score before the BMS
-/// kernel runs. When `RankInverseNormal`, both the training and predict
-/// paths route the input z through `LatentZRankIntCalibration::apply_*`
-/// before the standard-normal closed-form kernel is invoked.
+/// The map a fit applies to the latent score before the kernel runs. Only the
+/// declared conditional location-scale law has one (gam#2926); every other law
+/// is anchored on the score as given. A rank inverse-normal calibration is never
+/// minted by a fit any more — making the score look Gaussian is not a law — and
+/// survives only as a saved-model field older models replay.
 #[derive(Clone, Debug)]
 pub enum LatentMeasureCalibration {
     None,
-    RankInverseNormal(LatentZRankIntCalibration),
     ConditionalLocationScale(LatentZConditionalCalibration),
 }
 
@@ -915,11 +1449,10 @@ pub enum LatentMeasureCalibration {
 /// active) by construction, so the `b(C)·m(C)` leakage vanishes. Matching the
 /// first two conditional moments does **not** by itself make `ζ` standard
 /// normal (a two-point residual law survives location-scale correction
-/// unchanged in shape), so `build_latent_measure_with_geometry` re-checks
-/// the calibrated sample against the standard-normal adequacy gate and
-/// retains an empirical latent measure for the residual distribution when
-/// that re-check fails; only a passing `ζ` uses the closed-form
-/// standard-normal kernel. Persisted so prediction rebuilds `a(C)` from the
+/// unchanged in shape), so the declared location-scale law always anchors `ζ`
+/// on its empirical law and never on the closed form (gam#2926); only an
+/// explicit Gaussian declaration reaches that kernel. Persisted so prediction
+/// rebuilds `a(C)` from the
 /// (reproducible) marginal design and applies the identical map to incoming
 /// z.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1772,6 +2305,59 @@ pub(crate) fn fit_conditional_latent_calibration_if_needed(
     if !mean_fires && !var_fires {
         return Ok(None);
     }
+    fit_conditional_latent_calibration(z, weights, a_block, var_fires).map(Some)
+}
+
+/// Fit the conditional location-scale calibration at a given structure, with no
+/// gate: the mean `m(a)` always, and the variance `v(a)` when `fit_variance`.
+/// [`fit_conditional_latent_calibration_if_needed`] fits it at the structure its
+/// Rao gate chose; the moving-law certificate refits every fold at the full-data
+/// fit's structure (gam#2926). Inputs that admit no fit are refused.
+pub(crate) fn fit_conditional_latent_calibration(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    a_block: ArrayView2<'_, f64>,
+    fit_variance: bool,
+) -> Result<LatentZConditionalCalibration, String> {
+    let var_fires = fit_variance;
+    let n = z.len();
+    let p = a_block.ncols();
+    if n != weights.len() || a_block.nrows() != n {
+        return Err(format!(
+            "conditional latent calibration length mismatch: z={n}, weights={}, basis rows={}",
+            weights.len(),
+            a_block.nrows()
+        ));
+    }
+    if p == 0 {
+        return Err("conditional latent calibration needs a non-empty span".to_string());
+    }
+    let total_weight = weights.iter().copied().sum::<f64>();
+    if !(total_weight.is_finite() && total_weight > 0.0) {
+        return Err(format!(
+            "conditional latent calibration needs positive finite total weight, got {total_weight}"
+        ));
+    }
+    if z.iter().any(|v| !v.is_finite()) || a_block.iter().any(|v| !v.is_finite()) {
+        return Err("conditional latent calibration needs a finite score and span".to_string());
+    }
+    let z_mean = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi)
+        .sum::<f64>()
+        / total_weight;
+    let global_var = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * (zi - z_mean) * (zi - z_mean))
+        .sum::<f64>()
+        / total_weight;
+    if !(global_var.is_finite() && global_var > 0.0) {
+        return Err(format!(
+            "conditional latent calibration needs a score with positive variance, got {global_var}"
+        ));
+    }
 
     // Escalation fires. Fit the conditional mean over the full basis
     // [1 | a(C)] via a weighted ridge (the ridge stabilizes a rank-deficient
@@ -1929,7 +2515,7 @@ pub(crate) fn fit_conditional_latent_calibration_if_needed(
     calibration.post_mean = post_mean;
     calibration.post_sd = post_var.max(0.0).sqrt();
 
-    Ok(Some(calibration))
+    Ok(calibration)
 }
 
 /// Prepend a column of ones to `a_block`, producing the `[1 | a(C)]` regression
@@ -1945,313 +2531,397 @@ pub(crate) fn build_intercept_basis(a_block: ArrayView2<'_, f64>) -> Array2<f64>
 /// Which latent measures the *calling family's row kernel* can actually
 /// evaluate.
 ///
-/// This is the only thing that differs between the two marginal-slope families'
-/// latent-measure decisions, so it is the only argument
-/// [`build_latent_measure_decision`] takes to serve both. The Bernoulli kernel
-/// owns an empirical-grid branch (`empirical_rigid_primary_grad_hess_closed_form`
-/// and its higher-order siblings, driven by a per-row intercept Newton solve);
-/// the survival marginal-slope kernel does not — its row program is the
-/// closed-form standard-normal probit lowering and nothing else. A decision that
-/// handed the survival family a `GlobalEmpirical` measure would be a measure it
-/// cannot evaluate, so the two families must reach *different* terminal states
-/// from the *same* gate. Making the capability an argument is what keeps the
-/// gate itself a single object (gam#2768).
+/// This is the only thing about the kernel that differs between the two
+/// marginal-slope families' latent-measure decisions, so it is the only
+/// capability [`build_latent_measure_decision`] takes to serve both. The
+/// Bernoulli kernel owns an empirical-grid branch; the survival kernel owns one
+/// (the anchored frame, gam#2923) on the configurations
+/// `anchored_kernel_unavailable_reason` admits, and only the closed-form
+/// Gaussian lowering elsewhere. A finite law handed to a closed-form-only
+/// kernel would be a law it cannot evaluate, so the gate refuses it by name
+/// instead (gam#2926).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EmpiricalLatentMeasureSupport {
-    /// The caller can evaluate `LatentMeasureKind::GlobalEmpirical`.
+    /// The caller can evaluate `GlobalEmpirical` and `LocalEmpirical` laws.
     Available,
     /// The caller can only evaluate `LatentMeasureKind::StandardNormal`.
     StandardNormalOnly,
 }
 
-/// The latent-measure gate's verdict: the measure the kernel will integrate
-/// against, the pre-transform applied to z before it reaches that kernel, and —
-/// for a [`EmpiricalLatentMeasureSupport::StandardNormalOnly`] caller — the
-/// adequacy ledger of the sample the standard-normal kernel is actually being
-/// handed when that sample failed the gate.
+/// The latent-measure gate's verdict: the law the kernel will integrate
+/// against, the pre-transform applied to z before it reaches that kernel (only
+/// the declared conditional location-scale law has one), and the record of
+/// which law the fit consumed.
 pub(crate) struct LatentMeasureDecision {
     pub(crate) kind: LatentMeasureKind,
     pub(crate) calibration: LatentMeasureCalibration,
-    /// `Some` only for a `StandardNormalOnly` caller, and only when the sample
-    /// the kernel sees failed the standard-normal adequacy gate with no
-    /// empirical measure available to carry the residual law. Never a silent
-    /// state: the caller must route it through its own [`LatentZCheckMode`].
-    pub(crate) unmodelled_residual: Option<LatentNormalAdequacy>,
-    /// `Some` exactly when `kind` is a freshly built `GlobalEmpirical`: the
-    /// record of the equal-mass compression that produced it, which is what
-    /// makes the measure differentiable in the sample it was built from.
+    /// `Some` exactly when `kind` is a `GlobalEmpirical` law compressed from the
+    /// conditionally standardised residual `ζ`: the record of the equal-mass
+    /// compression that produced it, which is what makes the measure
+    /// differentiable in the first stage it was built from.
     ///
     /// Fit-time only and deliberately not part of `kind`: the measure is on the
     /// persistence wire and its identity is its nodes and weights, while this is
     /// provenance about the rows behind them. The gam#2484 Murphy–Topel
-    /// correction is its only consumer.
+    /// correction is its only consumer, and it is engaged only beside a
+    /// conditional calibration; a law estimated from the raw score has no first
+    /// stage to correct for.
     pub(crate) empirical_build: Option<empirical_measure_sensitivity::EmpiricalZGridBuild>,
+    /// `Some` exactly when `consumed` is a provisional
+    /// [`LatentLawConsumed::EstimatedGaussianAdequate`], or a
+    /// [`LatentLawConsumed::DeclaredGaussian`] whose score failed the adequacy
+    /// screen: the estimated law the family measures the converged closed-form
+    /// fit's anchoring residual under, and, for the default only, re-solves on when
+    /// the certificate prefers it.
+    pub(crate) certificate_law: Option<EmpiricalZGrid>,
+    pub(crate) consumed: LatentLawConsumed,
+    /// `Some` exactly when `consumed` is a provisional
+    /// [`LatentLawConsumed::EstimatedMovingLaw`]: the held-out laws its
+    /// certificate scores at the converged fit, and the full-data law of every
+    /// arm a re-solve can anchor on.
+    pub(crate) moving_law: Option<Box<moving_law_rule::MovingLawCandidates>>,
 }
 
-impl LatentMeasureDecision {
-    fn standard_normal(calibration: LatentMeasureCalibration) -> Self {
-        Self {
-            kind: LatentMeasureKind::StandardNormal,
-            calibration,
-            unmodelled_residual: None,
-            empirical_build: None,
-        }
-    }
-}
-
-pub(crate) fn build_latent_measure_with_geometry(
-    z: &Array1<f64>,
-    weights: &Array1<f64>,
-    policy: &LatentZPolicy,
-    conditioning: Option<ArrayView2<'_, f64>>,
-) -> Result<
-    (
-        LatentMeasureKind,
-        LatentMeasureCalibration,
-        Option<empirical_measure_sensitivity::EmpiricalZGridBuild>,
-    ),
-    String,
-> {
-    let decision = build_latent_measure_decision(
-        z,
-        weights,
-        policy,
-        conditioning,
-        EmpiricalLatentMeasureSupport::Available,
-        "BMS",
-    )?;
-    if decision.unmodelled_residual.is_some() {
-        // Structurally unreachable: an `Available` caller always has an
-        // empirical measure to carry a failing residual law, so the gate never
-        // hands one back unmodelled. Checked rather than assumed, because the
-        // silent alternative is publishing a standard-normal kernel over a
-        // sample the gate rejected — the exact failure this decision exists to
-        // make impossible.
-        return Err(
-            "BMS latent-measure gate returned an unmodelled residual law even though the \
-             empirical latent measure is available to this kernel"
-                .to_string(),
-        );
-    }
-    Ok((
-        decision.kind,
-        decision.calibration,
-        decision.empirical_build,
-    ))
-}
-
-/// The latent-measure gate, shared by both marginal-slope families.
+/// The latent-measure gate, shared by both marginal-slope families (gam#2768,
+/// gam#2926).
 ///
-/// The gate order is fixed and family-independent:
+/// The default estimates the law the score has and anchors on it, the score on
+/// its own axis; nothing is done to the score to make it look Gaussian:
 ///
-/// 1. the conditional `E[z|C]` / `Var(z|C)` Rao gate on the marginal-index span
-///    `a(C)` (#905) — the `b(C)·m(C)` leakage the pooled gate cannot see and
-///    that rank-INT provably cannot fix, so it takes precedence;
-/// 2. the pooled standard-normal adequacy gate on raw z;
-/// 3. the weighted mid-rank inverse-normal transform, re-gated on its own
-///    output.
+/// 1. the conditional-law structure test on the marginal-index span `a(C)`
+///    ([`estimated_latent_law::conditional_law_evidence`]);
+/// 2. no structure, and a score the standard-normal adequacy check cannot tell
+///    from `N(0, 1)`: the closed-form Gaussian law, with that evidence recorded
+///    ([`LatentLawConsumed::EstimatedGaussianAdequate`]);
+/// 3. no structure, and a score that fails the check: one finite law of the
+///    score ([`LatentLawConsumed::EstimatedGlobal`]);
+/// 4. structure: the location-scale Gaussian law (the closed form when neither
+///    conditional moment moves), certified at the converged fit against the
+///    Gaussian, location-scale empirical and local arms by the moving-law rule
+///    ([`moving_law_rule`], [`LatentLawConsumed::EstimatedMovingLaw`]).
 ///
-/// What differs between families is only the *terminal* state when the sample a
-/// kernel would see fails the adequacy gate, and that is exactly what `support`
-/// selects. With [`EmpiricalLatentMeasureSupport::Available`] the decision falls
-/// back to the mathematically exact empirical latent measure. With
-/// [`EmpiricalLatentMeasureSupport::StandardNormalOnly`] there is no such
-/// fallback, so the decision instead keeps the *best available pre-transform* —
-/// the one whose sample is closest to the kernel's own assumption — and returns
-/// the failing ledger rather than dropping it.
-///
-/// Keeping the pre-transform in that case is not a smaller version of the
-/// empirical branch, it is the correct choice among the two axes a
-/// standard-normal-only kernel can be given: the kernel assumes N(0,1) by
-/// construction, the mid-rank transform matches every quantile of that law up to
-/// the sample's own discreteness, and raw z can be arbitrarily far from it. The
-/// residual inadequacy is reported, never absorbed.
+/// Otherwise the Gaussian closed form is reached only by declaration
+/// (`LatentMeasureSpec::StandardNormal`). A declaration whose conditional mean or
+/// variance moves on the span is refused with the typed [`LatentLawRefusal`]: no
+/// single declared law can be right. One whose pooled score fails the fixed
+/// adequacy screen is fitted and warned about, with its estimated excess anchoring
+/// loss measured at the converged fit, because the screen's tolerances say nothing
+/// about what the declaration costs. A finite law asked of a kernel that evaluates
+/// only the closed form is refused, which is the one thing `support` changes.
 pub(crate) fn build_latent_measure_decision(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     policy: &LatentZPolicy,
     conditioning: Option<ArrayView2<'_, f64>>,
+    local_context: Option<&estimated_latent_law::LocalLawContext<'_>>,
     support: EmpiricalLatentMeasureSupport,
     context: &str,
 ) -> Result<LatentMeasureDecision, String> {
+    let refuse_closed_form_only = |requested: &str| -> Result<(), String> {
+        if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
+            return Err(LatentLawRefusal::EmpiricalKernelUnavailable {
+                context: context.to_string(),
+                requested: requested.to_string(),
+            }
+            .to_string());
+        }
+        Ok(())
+    };
     match policy.latent_measure {
         LatentMeasureSpec::Auto { grid_size } => {
-            // #905: conditional `E[z|C]`/`Var(z|C)` Rao gate. Inspect the latent
-            // score's conditional moments on the marginal-index span a(C)
-            // BEFORE the pooled-marginal gate. A significant conditional shift
-            // is the `b(C)·m(C)` leakage the pooled gate cannot see and that
-            // rank-INT provably cannot fix, so it takes precedence: route to the
-            // conditional location-scale correction `ζ = (z−m(C))/√v(C)`.
-            if let Some(a_block) = conditioning
-                && let Some(cal) =
-                    fit_conditional_latent_calibration_if_needed(z, weights, a_block)?
-            {
-                // Matching the first two conditional moments does not
-                // establish Gaussianity of the residual ζ (a two-point
-                // residual law survives location-scale correction unchanged
-                // in shape). The closed-form standard-normal kernel is only
-                // admissible when the calibrated sample passes the same
-                // pooled adequacy gate raw z faces; otherwise retain an
-                // empirical latent measure built from ζ, so the residual
-                // distribution stays the one the data show.
-                let zeta = cal.apply(z.view(), a_block)?;
-                let residual_adequacy = latent_z_normal_adequacy(&zeta, weights, policy)?;
-                let residual_is_standard_normal = residual_adequacy.passes();
-                let (kind, empirical_build) = match (residual_is_standard_normal, support) {
-                    (true, _) | (false, EmpiricalLatentMeasureSupport::StandardNormalOnly) => {
-                        (LatentMeasureKind::StandardNormal, None)
-                    }
-                    (false, EmpiricalLatentMeasureSupport::Available) => {
-                        let (kind, build) =
-                            build_global_empirical_latent_measure(&zeta, weights, grid_size)?;
-                        (kind, Some(build))
-                    }
-                };
-                log::info!(
-                    "[{context} latent-z] conditional location-scale calibrated: basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e} residual_measure={} (E[z|C]/Var(z|C) Rao gate fired)",
-                    cal.basis_ncols,
-                    !cal.var_coeffs.is_empty(),
-                    cal.post_mean,
-                    cal.post_sd,
-                    if matches!(kind, LatentMeasureKind::StandardNormal) {
-                        "standard-normal"
-                    } else {
-                        "global-empirical"
-                    },
-                );
-                if !residual_is_standard_normal
-                    && support == EmpiricalLatentMeasureSupport::StandardNormalOnly
-                {
-                    // No empirical measure exists for this kernel, so the
-                    // conditional correction is kept (it removes the first-order
-                    // `b(C)·m(C)` leakage regardless of the residual's shape)
-                    // and the residual's distance from the kernel's assumption
-                    // is handed back to the caller's `LatentZCheckMode`.
+            let evidence =
+                estimated_latent_law::conditional_law_evidence(z, weights, conditioning)?;
+            if !evidence.law_moves() {
+                let adequacy = latent_z_normal_adequacy(z, weights, policy)?;
+                if adequacy.passes() {
+                    // The screen says nothing directly about the anchoring error,
+                    // so the closed form is provisional: the family measures each
+                    // row's anchoring residual under this estimated law at the
+                    // converged fit, and re-solves on it when that is over
+                    // tolerance.
+                    let certificate_law = estimated_latent_law::build_empirical_law_on_own_axis(
+                        z.view(),
+                        weights.view(),
+                        grid_size,
+                        "estimated latent law",
+                    )?;
+                    log::debug!(
+                        "[{context} latent-z] the conditional law of the score does not move on \
+                         the marginal-index span ({}) and the score passes the standard-normal \
+                         adequacy screen ({}); fitting the closed-form Gaussian law, to be \
+                         certified by its anchoring residual at the converged fit (gam#2926)",
+                        evidence.summary(),
+                        adequacy.ledger(),
+                    );
                     return Ok(LatentMeasureDecision {
-                        kind,
-                        calibration: LatentMeasureCalibration::ConditionalLocationScale(cal),
-                        unmodelled_residual: Some(residual_adequacy),
-                        empirical_build,
+                        kind: LatentMeasureKind::StandardNormal,
+                        calibration: LatentMeasureCalibration::None,
+                        empirical_build: None,
+                        certificate_law: Some(certificate_law),
+                        moving_law: None,
+                        consumed: LatentLawConsumed::EstimatedGaussianAdequate {
+                            evidence,
+                            adequacy,
+                            residual: None,
+                        },
                     });
                 }
-                if !residual_is_standard_normal {
-                    // gam#2484: this pair is a legitimate POINT-ESTIMATION
-                    // state, so it is minted rather than refused here. Whether
-                    // its Murphy-Topel generated-regressor covariance can be
-                    // corrected is not known at this decision: it depends on the
-                    // fitted measure's build record and on any score-warp or
-                    // link-deviation block, so the covariance step classifies it
-                    // (`classify_empirical_generated_regressor_channel`) and logs
-                    // the outcome from that value. This warning used to predict a
-                    // refusal that gam#2484 removed for the ordinary rigid fit
-                    // (gam#2943).
-                    log::warn!(
-                        "[{context} latent-z] the calibrated residual FAILED the standard-normal \
-                         adequacy gate, so the second-stage latent measure is global-empirical. \
-                         Point estimation is unaffected; whether the Murphy-Topel \
-                         generated-regressor covariance is corrected or withheld is decided from \
-                         the fitted measure at the covariance step, which logs that decision. \
-                         Adequacy ledger (x = statistic / bound, x<=1 passed): {}",
-                        residual_adequacy.ledger(),
+                if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
+                    let missing = format!(
+                        "the score fails the standard-normal adequacy screen (adequacy ledger, x = \
+                         statistic / bound, x<=1 passed: {}), and this configuration's row kernel \
+                         evaluates only the closed form",
+                        adequacy.ledger()
                     );
+                    log::debug!(
+                        "[{context} latent-z] fitting the closed form uncertified: {missing} \
+                         (gam#2926)"
+                    );
+                    return Ok(LatentMeasureDecision {
+                        kind: LatentMeasureKind::StandardNormal,
+                        calibration: LatentMeasureCalibration::None,
+                        empirical_build: None,
+                        certificate_law: None,
+                        moving_law: None,
+                        consumed: LatentLawConsumed::GaussianUncertified {
+                            evidence,
+                            adequacy: Some(adequacy),
+                            certificate: None,
+                            missing,
+                        },
+                    });
                 }
+                let grid = estimated_latent_law::build_empirical_law_on_own_axis(
+                    z.view(),
+                    weights.view(),
+                    grid_size,
+                    "estimated latent law",
+                )?;
+                log::debug!(
+                    "[{context} latent-z] the conditional law of the score does not move on the \
+                     marginal-index span ({}) and the score fails the standard-normal adequacy \
+                     check ({}); anchoring on its estimated law of {} nodes, the score on its own \
+                     axis (gam#2926)",
+                    evidence.summary(),
+                    adequacy.ledger(),
+                    grid.nodes.len(),
+                );
                 return Ok(LatentMeasureDecision {
-                    kind,
-                    calibration: LatentMeasureCalibration::ConditionalLocationScale(cal),
-                    unmodelled_residual: None,
-                    empirical_build,
+                    kind: LatentMeasureKind::GlobalEmpirical { grid },
+                    calibration: LatentMeasureCalibration::None,
+                    empirical_build: None,
+                    certificate_law: None,
+                    moving_law: None,
+                    consumed: LatentLawConsumed::EstimatedGlobal { evidence },
                 });
             }
-            let pooled_adequacy = latent_z_normal_adequacy(z, weights, policy)?;
-            if pooled_adequacy.passes() {
-                Ok(LatentMeasureDecision::standard_normal(
-                    LatentMeasureCalibration::None,
-                ))
-            } else {
-                // P4: route bad-normal latent z through a weighted
-                // mid-distribution-rank inverse-normal transform. Rank-INT
-                // redefines the latent axis (the affine rigid model is
-                // specified on the calibrated score); it makes the calibrated
-                // sample approximately — not exactly — N(0,1), so the
-                // closed-form standard-normal kernel is admitted only when
-                // the calibrated sample itself passes the adequacy gate.
-                // When it cannot (heavy ties leave the calibrated law
-                // discrete), fall back to the mathematically exact
-                // global-empirical latent measure on the raw score.
-                let calibration = LatentZRankIntCalibration::fit(z, weights)?;
-                let calibrated = calibration.apply_to_training(z)?;
-                let calibrated_adequacy = latent_z_normal_adequacy(&calibrated, weights, policy)?;
-                if calibrated_adequacy.passes() {
-                    log::info!(
-                        "[{context} latent-z] rank-INT calibrated: post_mean={:.3e} post_sd={:.3e} knots={}",
-                        calibration.post_mean,
-                        calibration.post_sd,
-                        calibration.sorted_z.len(),
+            if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
+                let missing = format!(
+                    "the conditional law of the score moves on the marginal-index span ({}), and \
+                     this configuration's row kernel evaluates only the closed form",
+                    evidence.summary()
+                );
+                log::debug!(
+                    "[{context} latent-z] fitting the closed form uncertified: {missing} (gam#2926)"
+                );
+                return Ok(LatentMeasureDecision {
+                    kind: LatentMeasureKind::StandardNormal,
+                    calibration: LatentMeasureCalibration::None,
+                    empirical_build: None,
+                    certificate_law: None,
+                    moving_law: None,
+                    consumed: LatentLawConsumed::GaussianUncertified {
+                        evidence,
+                        adequacy: None,
+                        certificate: None,
+                        missing,
+                    },
+                });
+            }
+            let local = local_context.ok_or_else(|| {
+                LatentLawRefusal::LocalLawContextUnavailable {
+                    context: context.to_string(),
+                    evidence: evidence.clone(),
+                }
+                .to_string()
+            })?;
+            // The law moves, so it is chosen among nested arms by the moving-law
+            // certificate at the converged fit. The fit starts on the simplest arm
+            // that follows a moving mean and variance.
+            let a_block = conditioning.ok_or_else(|| {
+                format!(
+                    "{context}: the conditional-law evidence moved without a marginal-index span \
+                     to test it on"
+                )
+            })?;
+            let candidates = moving_law_rule::MovingLawCandidates::build(
+                z,
+                weights,
+                a_block,
+                local,
+                grid_size,
+                evidence.clone(),
+                context,
+            )
+            .map_err(|error| error.to_string())?;
+            let fitted = candidates.fitted_arm();
+            log::debug!(
+                "[{context} latent-z] the conditional law of the score moves on the \
+                 marginal-index span ({}); fitting the {} law, to be certified against the \
+                 other arms ({}) by their cross-fitted excess anchoring loss at the converged \
+                 fit (gam#2926)",
+                evidence.summary(),
+                fitted.label(),
+                candidates
+                    .arms()
+                    .iter()
+                    .map(|arm| arm.label())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            let mut decision = candidates
+                .decision_for(fitted, None)
+                .map_err(|error| error.to_string())?;
+            decision.moving_law = Some(Box::new(candidates));
+            Ok(decision)
+        }
+        LatentMeasureSpec::StandardNormal => {
+            let evidence =
+                estimated_latent_law::conditional_law_evidence(z, weights, conditioning)?;
+            if evidence.mean_or_variance_moves() {
+                return Err(LatentLawRefusal::GaussianConditionalMomentsMove {
+                    context: context.to_string(),
+                    evidence,
+                }
+                .to_string());
+            }
+            let adequacy = latent_z_normal_adequacy(z, weights, policy)?;
+            if adequacy.passes() {
+                return Ok(LatentMeasureDecision {
+                    kind: LatentMeasureKind::StandardNormal,
+                    calibration: LatentMeasureCalibration::None,
+                    empirical_build: None,
+                    certificate_law: None,
+                    moving_law: None,
+                    consumed: LatentLawConsumed::DeclaredGaussian {
+                        evidence,
+                        adequacy: None,
+                        residual: None,
+                        uncertified: None,
+                    },
+                });
+            }
+            // The shape screen's bounds are fixed tolerances, not tests of the
+            // declaration's consequence: at small n they reject exact Gaussian
+            // scores, at large n harmless departures. So a failed screen does not
+            // refuse a declaration. The family measures what the declaration costs
+            // at the converged fit instead, the excess anchoring loss `D̂` under the
+            // estimated law, and warns with both.
+            let certificate_law = estimated_latent_law::build_empirical_law_on_own_axis(
+                z.view(),
+                weights.view(),
+                DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+                "estimated latent law",
+            )?;
+            log::debug!(
+                "[{context} latent-z] the Gaussian latent law was declared, and the score fails \
+                 the standard-normal adequacy screen (adequacy ledger, x = statistic / bound, \
+                 x<=1 passed: {}); fitting the declared closed form, whose estimated excess \
+                 anchoring loss is measured at the converged fit (gam#2926)",
+                adequacy.ledger(),
+            );
+            Ok(LatentMeasureDecision {
+                kind: LatentMeasureKind::StandardNormal,
+                calibration: LatentMeasureCalibration::None,
+                empirical_build: None,
+                certificate_law: Some(certificate_law),
+                moving_law: None,
+                consumed: LatentLawConsumed::DeclaredGaussian {
+                    evidence,
+                    adequacy: Some(adequacy),
+                    residual: None,
+                    uncertified: None,
+                },
+            })
+        }
+        LatentMeasureSpec::GlobalEmpirical { grid_size } => {
+            refuse_closed_form_only("latent_measure=\"global-empirical\"")?;
+            let grid = estimated_latent_law::build_empirical_law_on_own_axis(
+                z.view(),
+                weights.view(),
+                grid_size,
+                "global-empirical latent law",
+            )?;
+            Ok(LatentMeasureDecision {
+                kind: LatentMeasureKind::GlobalEmpirical { grid },
+                calibration: LatentMeasureCalibration::None,
+                empirical_build: None,
+                certificate_law: None,
+                moving_law: None,
+                consumed: LatentLawConsumed::RequestedGlobalEmpirical,
+            })
+        }
+        LatentMeasureSpec::ConditionalLocationScale { grid_size } => {
+            refuse_closed_form_only("latent_measure=\"conditional-location-scale\"")?;
+            let a_block = conditioning.ok_or_else(|| {
+                LatentLawRefusal::LocationScaleSpanUnavailable {
+                    context: context.to_string(),
+                }
+                .to_string()
+            })?;
+            let evidence =
+                estimated_latent_law::conditional_law_evidence(z, weights, Some(a_block))?;
+            match fit_conditional_latent_calibration_if_needed(z, weights, a_block)? {
+                Some(cal) => {
+                    // The residual law is anchored on as it is, never lowered in
+                    // closed form: a two-point residual survives location-scale
+                    // correction unchanged in shape, and only a declaration may
+                    // make it Gaussian.
+                    let zeta = cal.apply(z.view(), a_block)?;
+                    let (kind, build) =
+                        build_global_empirical_latent_measure(&zeta, weights, grid_size)?;
+                    log::debug!(
+                        "[{context} latent-z] declared conditional location-scale law: \
+                         basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e}; the \
+                         residual is anchored on its empirical law (gam#2926)",
+                        cal.basis_ncols,
+                        !cal.var_coeffs.is_empty(),
+                        cal.post_mean,
+                        cal.post_sd,
                     );
-                    Ok(LatentMeasureDecision::standard_normal(
-                        LatentMeasureCalibration::RankInverseNormal(calibration),
-                    ))
-                } else {
-                    match support {
-                        EmpiricalLatentMeasureSupport::Available => {
-                            log::info!(
-                                "[{context} latent-z] rank-INT output failed the standard-normal adequacy gate (post_mean={:.3e} post_sd={:.3e} knots={}); using the global-empirical latent measure",
-                                calibration.post_mean,
-                                calibration.post_sd,
-                                calibration.sorted_z.len(),
-                            );
-                            let (kind, build) =
-                                build_global_empirical_latent_measure(z, weights, grid_size)?;
-                            Ok(LatentMeasureDecision {
-                                kind,
-                                calibration: LatentMeasureCalibration::None,
-                                unmodelled_residual: None,
-                                empirical_build: Some(build),
-                            })
-                        }
-                        EmpiricalLatentMeasureSupport::StandardNormalOnly => {
-                            // Both candidate axes are inadequate and there is no
-                            // empirical measure to carry either law. Take the
-                            // one the gate itself measures as closer to the
-                            // kernel's assumption -- by construction the mid-rank
-                            // transform matches every quantile of N(0,1) up to
-                            // the sample's discreteness, which raw z need not do
-                            // at all -- and report the residual gap.
-                            Ok(LatentMeasureDecision {
-                                kind: LatentMeasureKind::StandardNormal,
-                                calibration: LatentMeasureCalibration::RankInverseNormal(
-                                    calibration,
-                                ),
-                                unmodelled_residual: Some(calibrated_adequacy),
-                                empirical_build: None,
-                            })
-                        }
-                    }
+                    Ok(LatentMeasureDecision {
+                        kind,
+                        calibration: LatentMeasureCalibration::ConditionalLocationScale(cal),
+                        empirical_build: Some(build),
+                        certificate_law: None,
+                        moving_law: None,
+                        consumed: LatentLawConsumed::ConditionalLocationScale {
+                            calibrated: true,
+                            evidence,
+                        },
+                    })
+                }
+                None => {
+                    let grid = estimated_latent_law::build_empirical_law_on_own_axis(
+                        z.view(),
+                        weights.view(),
+                        grid_size,
+                        "conditional location-scale latent law",
+                    )?;
+                    Ok(LatentMeasureDecision {
+                        kind: LatentMeasureKind::GlobalEmpirical { grid },
+                        calibration: LatentMeasureCalibration::None,
+                        empirical_build: None,
+                        certificate_law: None,
+                        moving_law: None,
+                        consumed: LatentLawConsumed::ConditionalLocationScale {
+                            calibrated: false,
+                            evidence,
+                        },
+                    })
                 }
             }
         }
-        LatentMeasureSpec::StandardNormal => Ok(LatentMeasureDecision::standard_normal(
-            LatentMeasureCalibration::None,
-        )),
-        LatentMeasureSpec::GlobalEmpirical { grid_size } => match support {
-            EmpiricalLatentMeasureSupport::Available => {
-                let (kind, build) = build_global_empirical_latent_measure(z, weights, grid_size)?;
-                Ok(LatentMeasureDecision {
-                    kind,
-                    calibration: LatentMeasureCalibration::None,
-                    unmodelled_residual: None,
-                    empirical_build: Some(build),
-                })
-            }
-            EmpiricalLatentMeasureSupport::StandardNormalOnly => Err(format!(
-                "{context} was asked for a global-empirical latent measure, but its row kernel \
-                 exists only in the closed-form standard-normal branch: there is no empirical-grid \
-                 lowering to integrate against. Use the Auto latent measure (which will apply the \
-                 conditional location-scale or rank inverse-normal pre-transform when the data \
-                 need one) or fit this data with the Bernoulli marginal-slope family, whose kernel \
-                 owns the empirical branch"
-            )),
-        },
     }
 }
 
@@ -2268,26 +2938,29 @@ pub(crate) fn build_latent_measure_decision(
 ///
 /// Every field is in the units of its own clause; no field is a ratio, so a
 /// consumer can report either the raw statistic or its margin.
-#[derive(Clone, Debug)]
-pub(crate) struct LatentNormalAdequacy {
+///
+/// Persisted in [`LatentLawConsumed::EstimatedGaussianAdequate`], which is minted
+/// only when every clause passed, so every persisted statistic is finite.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LatentNormalAdequacy {
     /// Kish effective sample size `(Σw)² / Σw²`, which sets the moment bounds.
-    pub(crate) effective_n: f64,
-    pub(crate) mean: f64,
-    pub(crate) mean_tol: f64,
-    pub(crate) sd: f64,
-    pub(crate) sd_tol: f64,
-    pub(crate) skew: f64,
-    pub(crate) skew_tol: f64,
-    pub(crate) excess_kurtosis: f64,
-    pub(crate) excess_kurtosis_tol: f64,
-    pub(crate) ks: f64,
-    pub(crate) ks_tol: f64,
-    pub(crate) tail_mass_inner: f64,
-    pub(crate) tail_bound_inner: f64,
-    pub(crate) tail_mass_outer: f64,
-    pub(crate) tail_bound_outer: f64,
-    pub(crate) max_abs: f64,
-    pub(crate) max_abs_tol: f64,
+    pub effective_n: f64,
+    pub mean: f64,
+    pub mean_tol: f64,
+    pub sd: f64,
+    pub sd_tol: f64,
+    pub skew: f64,
+    pub skew_tol: f64,
+    pub excess_kurtosis: f64,
+    pub excess_kurtosis_tol: f64,
+    pub ks: f64,
+    pub ks_tol: f64,
+    pub tail_mass_inner: f64,
+    pub tail_bound_inner: f64,
+    pub tail_mass_outer: f64,
+    pub tail_bound_outer: f64,
+    pub max_abs: f64,
+    pub max_abs_tol: f64,
 }
 
 impl LatentNormalAdequacy {
@@ -2348,6 +3021,106 @@ impl LatentNormalAdequacy {
     }
 }
 
+/// The adequacy screen's bounds at Kish effective size `n` (gam#2926). Each is the
+/// level-`α/8` null quantile of its clause's statistic for `n` draws of an exact
+/// N(0, 1) score, so such a score fails the screen with probability at most
+/// [`AUTO_Z_NORMAL_SCREEN_ALPHA`], at every `n`. The mean and sd bounds are the
+/// two-sided normal quantile over their standard errors, skewness and excess
+/// kurtosis the same over their exact normal-sample moments, the KS distance
+/// Kolmogorov's critical value in Stephens' finite-`n` form, each tail mass the
+/// Poisson upper quantile of its expected count, and `max |z|` the level `n` draws
+/// exceed with probability `α/8`. A stricter policy cap still binds the mean, sd,
+/// skewness and kurtosis. Skewness and kurtosis are not testable below four
+/// effective draws, and do not bound there.
+struct NormalScreenBounds {
+    mean: f64,
+    sd: f64,
+    skew: f64,
+    excess_kurtosis: f64,
+    ks: f64,
+    tail_inner: f64,
+    tail_outer: f64,
+    max_abs: f64,
+}
+
+fn normal_screen_bounds(n: f64, policy: &LatentZPolicy) -> Result<NormalScreenBounds, String> {
+    let alpha = AUTO_Z_NORMAL_SCREEN_ALPHA / AUTO_Z_NORMAL_SCREEN_CLAUSES;
+    let two_sided = standard_normal_quantile(1.0 - alpha / 2.0)?;
+    let (skew, excess_kurtosis) = if n > 3.0 {
+        let skew_sd = (6.0 * (n - 2.0) / ((n + 1.0) * (n + 3.0))).sqrt();
+        let kurtosis_mean = -6.0 / (n + 1.0);
+        let kurtosis_sd = (24.0 * n * (n - 2.0) * (n - 3.0)
+            / ((n + 1.0) * (n + 1.0) * (n + 3.0) * (n + 5.0)))
+            .sqrt();
+        (
+            two_sided * skew_sd,
+            kurtosis_mean.abs() + two_sided * kurtosis_sd,
+        )
+    } else {
+        (f64::INFINITY, f64::INFINITY)
+    };
+    let root_n = n.sqrt();
+    let ks = kolmogorov_upper_quantile(alpha) / (root_n + 0.12 + 0.11 / root_n);
+    let tail = |sigma: f64| {
+        poisson_upper_quantile(n * normal_two_sided_probability(sigma), alpha) / n
+    };
+    // 1 − (1 − α)^{1/n}: the per-draw exceedance that n draws reach with
+    // probability α.
+    let per_draw = -((-alpha).ln_1p() / n).exp_m1();
+    let max_abs = -standard_normal_quantile(per_draw / 2.0)?;
+    Ok(NormalScreenBounds {
+        mean: policy.mean_tol_multiplier.min(two_sided) / root_n,
+        sd: policy.sd_tol_multiplier.min(two_sided) / (2.0 * (n - 1.0).max(1.0)).sqrt(),
+        skew: policy.max_abs_skew.min(skew),
+        excess_kurtosis: policy.max_abs_excess_kurtosis.min(excess_kurtosis),
+        ks,
+        tail_inner: tail(AUTO_Z_NORMAL_TAIL_SIGMA_INNER),
+        tail_outer: tail(AUTO_Z_NORMAL_TAIL_SIGMA_OUTER),
+        max_abs,
+    })
+}
+
+/// `λ` with `P(K > λ) = α` for Kolmogorov's limit law,
+/// `P(K > λ) = 2 Σ_{j≥1} (−1)^{j−1} e^{−2 j² λ²}`, by bisection on its
+/// decreasing survival function.
+fn kolmogorov_upper_quantile(alpha: f64) -> f64 {
+    let survival = |lambda: f64| {
+        let mut sum = 0.0;
+        for j in 1..=100_u32 {
+            let jf = f64::from(j);
+            let term = (-2.0 * jf * jf * lambda * lambda).exp();
+            sum += if j % 2 == 1 { term } else { -term };
+            if term < 1e-18 {
+                break;
+            }
+        }
+        2.0 * sum
+    };
+    let (mut low, mut high) = (0.2_f64, 5.0_f64);
+    for _ in 0..200 {
+        let middle = 0.5 * (low + high);
+        if survival(middle) > alpha {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    high
+}
+
+/// The smallest count `k` with `P(X > k) ≤ α` for `X ~ Poisson(mean)`.
+fn poisson_upper_quantile(mean: f64, alpha: f64) -> f64 {
+    let mut log_pmf = -mean;
+    let mut cdf = log_pmf.exp();
+    let mut k = 0.0_f64;
+    while 1.0 - cdf > alpha {
+        k += 1.0;
+        log_pmf += mean.ln() - k.ln();
+        cdf += log_pmf.exp();
+    }
+    k
+}
+
 /// Measure a latent-z sample against the standard-normal adequacy gate,
 /// returning every statistic and bound rather than only the verdict.
 pub(crate) fn latent_z_normal_adequacy(
@@ -2391,10 +3164,9 @@ pub(crate) fn latent_z_normal_adequacy(
         .sum::<f64>()
         / weight_sum;
     let sd = var.sqrt();
-    // The two moment bounds depend only on the effective sample size, so they
-    // are formed before the degeneracy check and stated once for both exits.
-    let mean_tol = policy.mean_tol_multiplier / effective_n.sqrt();
-    let sd_tol = policy.sd_tol_multiplier / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
+    // Every bound depends only on the effective sample size, so they are formed
+    // before the degeneracy check and stated once for both exits.
+    let bounds = normal_screen_bounds(effective_n, policy)?;
     if !(mean.is_finite() && sd.is_finite() && sd > 0.0) {
         // A constant or non-finite sample has no shape: every standardized
         // statistic divides by `sd`, so skewness, kurtosis and the tail masses
@@ -2406,25 +3178,21 @@ pub(crate) fn latent_z_normal_adequacy(
         return Ok(LatentNormalAdequacy {
             effective_n,
             mean,
-            mean_tol,
+            mean_tol: bounds.mean,
             sd,
-            sd_tol,
+            sd_tol: bounds.sd,
             skew: f64::NAN,
-            skew_tol: policy.max_abs_skew.min(AUTO_Z_NORMAL_SKEW_TOL),
+            skew_tol: bounds.skew,
             excess_kurtosis: f64::NAN,
-            excess_kurtosis_tol: policy.max_abs_excess_kurtosis.min(AUTO_Z_NORMAL_KURT_TOL),
+            excess_kurtosis_tol: bounds.excess_kurtosis,
             ks: f64::NAN,
-            ks_tol: AUTO_Z_NORMAL_KS_TOL,
+            ks_tol: bounds.ks,
             tail_mass_inner: f64::NAN,
-            tail_bound_inner: AUTO_Z_NORMAL_TAIL_MASS_SLACK
-                * normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_INNER)
-                + AUTO_Z_NORMAL_TAIL_FLOOR_INNER,
+            tail_bound_inner: bounds.tail_inner,
             tail_mass_outer: f64::NAN,
-            tail_bound_outer: AUTO_Z_NORMAL_TAIL_MASS_SLACK
-                * normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_OUTER)
-                + AUTO_Z_NORMAL_TAIL_FLOOR_OUTER,
+            tail_bound_outer: bounds.tail_outer,
             max_abs: f64::NAN,
-            max_abs_tol: AUTO_Z_NORMAL_MAX_ABS,
+            max_abs_tol: bounds.max_abs,
         });
     }
     let skew = z
@@ -2450,28 +3218,24 @@ pub(crate) fn latent_z_normal_adequacy(
     let tail_mass_4 = weighted_tail_mass(z, weights, weight_sum, AUTO_Z_NORMAL_TAIL_SIGMA_INNER);
     let tail_mass_6 = weighted_tail_mass(z, weights, weight_sum, AUTO_Z_NORMAL_TAIL_SIGMA_OUTER);
     let max_abs_z = z.iter().fold(0.0_f64, |acc, &zi| acc.max(zi.abs()));
-    let normal_tail_4 = normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_INNER);
-    let normal_tail_6 = normal_two_sided_probability(AUTO_Z_NORMAL_TAIL_SIGMA_OUTER);
     Ok(LatentNormalAdequacy {
         effective_n,
         mean,
-        mean_tol,
+        mean_tol: bounds.mean,
         sd,
-        sd_tol,
+        sd_tol: bounds.sd,
         skew,
-        skew_tol: policy.max_abs_skew.min(AUTO_Z_NORMAL_SKEW_TOL),
+        skew_tol: bounds.skew,
         excess_kurtosis,
-        excess_kurtosis_tol: policy.max_abs_excess_kurtosis.min(AUTO_Z_NORMAL_KURT_TOL),
+        excess_kurtosis_tol: bounds.excess_kurtosis,
         ks: ks_to_normal,
-        ks_tol: AUTO_Z_NORMAL_KS_TOL,
+        ks_tol: bounds.ks,
         tail_mass_inner: tail_mass_4,
-        tail_bound_inner: AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_4
-            + AUTO_Z_NORMAL_TAIL_FLOOR_INNER,
+        tail_bound_inner: bounds.tail_inner,
         tail_mass_outer: tail_mass_6,
-        tail_bound_outer: AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_6
-            + AUTO_Z_NORMAL_TAIL_FLOOR_OUTER,
+        tail_bound_outer: bounds.tail_outer,
         max_abs: max_abs_z,
-        max_abs_tol: AUTO_Z_NORMAL_MAX_ABS,
+        max_abs_tol: bounds.max_abs,
     })
 }
 
@@ -2620,6 +3384,11 @@ pub(super) fn bms_row_chunk_size(n: usize) -> usize {
     n.div_ceil(target_chunks)
         .clamp(ROW_CHUNK_MIN, ROW_CHUNK_SIZE)
 }
+/// Row count from which `log_exact_work` turns on the BMS exact-path stage logs.
+///
+/// Work bound (#2469): result-invariant. Every `log_exact_work` gate encloses
+/// only `log` macros, the elapsed times and sizes they print, and progress
+/// counters that feed nothing but those lines.
 pub(super) const EXACT_WORK_LOG_MIN_ROWS: usize = 50_000;
 pub(super) const BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES: usize = 3;
 pub(super) const BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES: usize = 2;
@@ -2635,14 +3404,21 @@ pub(super) const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 
 // ---------------------------------------------------------------------------
 pub(crate) mod block_specs;
 pub mod conditional_score_covariance;
+pub(crate) mod estimated_latent_law;
+pub(crate) mod moving_law_rule;
 pub(crate) mod exact_eval_cache;
+mod expected_information;
 pub(crate) mod family;
 pub(crate) mod flex_row_program;
 pub(crate) mod gradient_paths;
 pub(crate) mod hessian_paths;
 mod information_third;
 pub(crate) mod install_flex;
+pub mod residual_repair;
+mod residual_repair_kernel;
 pub(crate) mod row_kernel;
+#[cfg(test)]
+mod tests_residual_repair_laws;
 #[cfg(test)]
 mod tests {
     include!("../../../../tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs");
@@ -2830,6 +3606,10 @@ pub(crate) mod cell_moment_assembly;
 mod empirical_intercept_solve_tests;
 #[cfg(test)]
 mod empirical_measure_2484_tests;
+#[cfg(test)]
+mod anchor_law_2926_tests;
+#[cfg(test)]
+mod normal_screen_2926_tests;
 mod standard_normal_flex_fifth;
 pub(crate) mod empirical_measure_sensitivity;
 // #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT
@@ -2864,12 +3644,22 @@ mod latent_measure_2768_tests;
 // tensors. Bare `#[cfg(test)] mod` with the allowed `*_tests` name.
 #[cfg(test)]
 mod psi_axis_contractions_979_tests;
+// gnomon#2359: a multistart member reuses only its own same-β stores. Bare
+// `#[cfg(test)] mod` with the allowed `*_tests` name.
+#[cfg(test)]
+mod multistart_member_2359_tests;
 pub(crate) mod row_primary_hessian;
+mod second_correction_traces;
 
 pub(crate) use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use conditional_score_covariance::{
     ConditionalScoreCoordinate, ConditionalScoreCovariance, ScoreCovarianceField,
 };
+pub use residual_repair::{
+    RESIDUAL_BLOCK_NAME, ResidualBlockRuntime, ResidualRepairGeometry,
+    ResidualRepairRefusal, ResidualRepairSpec,
+};
+pub(crate) use residual_repair::residual_row_index;
 pub use gradient_paths::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     padded_deviation_seed,

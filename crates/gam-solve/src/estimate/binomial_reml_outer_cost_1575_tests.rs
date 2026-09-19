@@ -1024,6 +1024,47 @@ fn binomial_logit_inner_refusal_names_its_carried_datum_1575() {
 /// a constant coefficient vector lies in the second-difference null, so
 /// `v_j = (1, −1 on block j)` has `Xv_j = 0` and `Sv_j = 0`: H has exactly three
 /// structural nulls, while the data resolve every linear trend.
+/// #2901, the ruling's pin (1): a canonical logit fit has Fisher weights
+/// `μ(1 − μ) ≥ 0` and no Firth term, so `XᵀWX ⪰ 0` certifies every block's trace
+/// against its rank without an eigendecomposition.
+#[test]
+fn a_fisher_weight_fit_certifies_every_block_structurally_2901() {
+    let (x, y, s_list) = build_fixture();
+    let weights = Array1::<f64>::ones(N);
+    let offset = Array1::<f64>::zeros(N);
+    let fit = fit_gamwith_heuristic_log_lambdas(
+        x,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &s_list,
+        None,
+        LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        ),
+        &logit_options(),
+    )
+    .expect("binomial/logit P-spline REML fit should succeed");
+    let inference = fit.inference.as_ref().expect("the fit computed inference");
+    assert_eq!(
+        inference.edf_rank_bound.len(),
+        inference.penalty_block_trace.len(),
+        "one rank-bound status per penalty block"
+    );
+    assert!(
+        !inference.edf_rank_bound.is_empty()
+            && inference.edf_rank_bound.iter().all(|bound| matches!(
+                bound,
+                crate::estimate::EdfRankBound::Certified(
+                    crate::estimate::EdfRankCertificate::Structural
+                )
+            )),
+        "{:?}",
+        inference.edf_rank_bound
+    );
+}
+
 #[test]
 fn binomial_logit_fit_publishes_a_certified_identified_subspace_2901() {
     let (x, y, s_list) = build_fixture();
@@ -1148,14 +1189,22 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
         let design = gam_linalg::matrix::DesignMatrix::from(x);
         let coordinates = fit.lambdas.len();
         let outer_hessian = Array2::<f64>::eye(coordinates);
+        let rho = fit.lambdas.mapv(f64::ln);
+        let unbounded_below = Array1::<f64>::from_elem(coordinates, f64::NEG_INFINITY);
+        let unbounded_above = Array1::<f64>::from_elem(coordinates, f64::INFINITY);
         let (at_zero_step, zero_radius) = super::identified_hessian::certify_fitted_identified_rank(
             pirls,
             &spectrum,
             &fit.lambdas,
             &design,
-            &outer_hessian,
-            &Array1::<f64>::zeros(coordinates),
-            &[],
+            super::identified_hessian::OuterCertificatePoint {
+                hessian_rho: &outer_hessian,
+                gradient: &Array1::<f64>::zeros(coordinates),
+                railed: &[],
+                rho: &rho,
+                lower: &unbounded_below,
+                upper: &unbounded_above,
+            },
         )
         .expect("a zero step certifies the fitted rank");
         assert_eq!(zero_radius, 0.0);
@@ -1197,9 +1246,14 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
             &spectrum,
             &fit.lambdas,
             &design,
-            &outer_hessian.mapv(|entry| entry / reaching_step),
-            &Array1::<f64>::ones(coordinates),
-            &[],
+            super::identified_hessian::OuterCertificatePoint {
+                hessian_rho: &outer_hessian.mapv(|entry| entry / reaching_step),
+                gradient: &Array1::<f64>::ones(coordinates),
+                railed: &[],
+                rho: &rho,
+                lower: &unbounded_below,
+                upper: &unbounded_above,
+            },
         )
         .expect_err("a step reaching the band refuses the fitted rank");
         assert!(

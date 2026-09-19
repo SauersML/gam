@@ -58,6 +58,87 @@ mod exact_hessian_fixture_tests {
         (term, target, rho, cache)
     }
 
+    /// #2080/#2228 — the polish tests' entry: the PD-basin fixture's term and `rho`
+    /// at a state that still carries a live residual.
+    ///
+    /// `converged_state_with_residual` prices through the criterion, and the criterion
+    /// carries an accepted state to its root before pricing it (`refine_accepted_root`,
+    /// ae0d368e20). At that root the gradient sits inside the KKT tolerance and no
+    /// polish step resolves a decrease: bis2 (job 1162220) read the entry `‖g‖` as
+    /// 4.67e-16 at ae0d368e20 against 1.01e-4 at its parent, with byte-identical test
+    /// bodies. A polish test built on it measures an early return.
+    ///
+    /// This state is the majorized evidence inner loop's own fixed point instead: the
+    /// same term and `rho` re-enter `run_joint_fit_arrow_schur_for_quasi_laplace` until
+    /// a whole re-entry finds no strict decrease. That drive has no acceptance,
+    /// refinement or polish site, so nothing on its path carries the state to the
+    /// root, and the exact-A step the polish takes still resolves descent there. The
+    /// premise is a property of the state, asserted with the criterion's own KKT gate
+    /// (`quasi_laplace_kkt_stationary` at `SAE_MANIFOLD_INNER_GRAD_REL_TOL ·
+    /// inner_iterate_scale`), and printed before it is asserted.
+    pub(super) fn majorized_fixed_point_with_residual()
+    -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+        use crate::manifold::term::SAE_MANIFOLD_INNER_GRAD_REL_TOL;
+        use crate::manifold::tests::gamma_fd_tiny_fixture;
+
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        rho.log_lambda_sparse = 0.0;
+        for value in rho.log_lambda_smooth.iter_mut() {
+            *value = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for value in axis.iter_mut() {
+                *value = -1.0;
+            }
+        }
+        // Each re-entry that is not a fixed point committed a strict decrease of the
+        // penalized objective under its own gates, so the loop ends where the drive
+        // itself stops moving the state.
+        let mut reentries = 0usize;
+        loop {
+            let outcome = term
+                .run_joint_fit_arrow_schur_for_quasi_laplace(
+                    target.view(),
+                    &mut rho,
+                    None,
+                    40,
+                    0.4,
+                    1.0e-6,
+                    1.0e-6,
+                )
+                .expect("the majorized evidence drive must run on the PD-basin fixture");
+            reentries += 1;
+            if outcome.fixed_point {
+                break;
+            }
+        }
+        let system = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("arrow-Schur assembly at the majorized fixed point");
+        let grad_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
+        let lambda_smooth = rho.lambda_smooth_vec().expect("smoothness strengths");
+        let quotient_grad_norm =
+            term.quotient_gradient_norm_from_system(&system, grad_norm_sq, &lambda_smooth);
+        let tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * term.inner_iterate_scale();
+        eprintln!(
+            "[#2080 polish fixture] majorized fixed point after {reentries} re-entries: \
+             ‖g‖={:.6e} ‖Π⊥null g‖={quotient_grad_norm:.6e} tol={tolerance:.6e}",
+            grad_norm_sq.sqrt(),
+        );
+        assert!(
+            !SaeManifoldTerm::quasi_laplace_kkt_stationary(
+                grad_norm_sq.sqrt(),
+                quotient_grad_norm,
+                tolerance,
+            ),
+            "#2080 polish fixture premise: the majorized fixed point must carry a live \
+             residual the criterion's KKT gate refuses: ‖g‖={:.6e} ‖Π⊥null g‖=\
+             {quotient_grad_norm:.6e} tol={tolerance:.6e}",
+            grad_norm_sq.sqrt(),
+        );
+        (term, target, rho)
+    }
+
     /// #2330/#2336 PRICING-branch companion to `converged_state_with_residual`.
     /// The historical softmax `gamma_fd_tiny_fixture` target is NOT ordered-Beta--
     /// Bernoulli reachable, so its majorizer-converged mode is an exact-A saddle
@@ -620,6 +701,7 @@ mod exact_stationarity_solve_1418_tests {
             metric_frobenius: scale * (dimension as f64).sqrt(),
             band,
             band_metric_images,
+            orbit: None,
         };
         for index in 0..dimension {
             let realised = block.rank_floor(index) * scale;
@@ -878,11 +960,12 @@ mod exact_stationarity_solve_1418_tests {
     /// former residual-monotonicity assertion was itself wrong: objective descent
     /// along resolved negative curvature necessarily increases `||g||`.  Driving
     /// with an unreachable tolerance forces a real step and pins the scalar
-    /// currency on which terminal globalization is now accepted.
+    /// currency on which terminal globalization is now accepted. The entry is the
+    /// majorized fixed point, whose live residual the fixture asserts.
     #[test]
     fn terminal_polish_never_raises_the_penalized_objective_2080() {
-        let (mut term, target, rho, _cache) =
-            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let (mut term, target, rho) =
+            super::exact_hessian_fixture_tests::majorized_fixed_point_with_residual();
         let lambda_smooth = rho.lambda_smooth_vec().expect("smoothness strengths");
         let options = ArrowSolveOptions::direct()
             .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
@@ -942,11 +1025,12 @@ mod exact_stationarity_solve_1418_tests {
     /// fixture's live residual, the shifted Newton step on the arrow exact-A system
     /// predicts a positive decrease, commits an Armijo decrease, and reports both
     /// objectives exactly as an independent evaluation at the entry and committed
-    /// states reads them.
+    /// states reads them. The entry is the majorized fixed point, whose live residual
+    /// the fixture asserts.
     #[test]
     fn arrow_exact_a_polish_step_commits_objective_descent_2283() {
-        let (mut term, target, rho, _cache) =
-            super::exact_hessian_fixture_tests::converged_state_with_residual();
+        let (mut term, target, rho) =
+            super::exact_hessian_fixture_tests::majorized_fixed_point_with_residual();
         let options = term.evidence_factor_options();
         let majorizer = term
             .assemble_arrow_schur(target.view(), &rho, None)
@@ -1103,141 +1187,6 @@ mod exact_stationarity_solve_1418_tests {
             range_resid < 1.0e-3 * surrogate_resid,
             "exact A-solve range residual {range_resid:.3e} must be far below surrogate \
              {surrogate_resid:.3e}"
-        );
-    }
-}
-
-/// Validates the matrix-free Hutchinson stochastic-trace estimator that replaces
-/// the exact `Σ_k M_k·r_k`-solve per-atom decoder-smoothness effective-dof at
-/// massive `K` (the `O(K³·M·p)` wall). The estimator is exercised here on a
-/// small (`K = 2`) fixture — where the exact column-solve is the ground truth —
-/// so the block-restricted one-solve-per-probe identity
-/// `E[z_kᵀ (S_β⁻¹ M z)_k] = tr((S_β⁻¹)_{kk} M_k)` (including cross-atom
-/// cancellation, which only a `K ≥ 2` fixture can exhibit) is checked against the
-/// exact trace, plus determinism for a fixed seed.
-#[cfg(test)]
-mod smoothness_dof_hutchinson_tests {
-    use super::*;
-
-    /// Rebuild the exact function's `(offsets, out_dim)` β-layout so the estimator
-    /// is fed the identical geometry.
-    fn beta_layout(term: &SaeManifoldTerm) -> (Vec<usize>, Box<dyn Fn(usize) -> usize>) {
-        let p = term.output_dim();
-        if term.frames_active() {
-            let ranks: Vec<usize> = term.atoms.iter().map(|a| a.border_frame_rank()).collect();
-            (
-                term.factored_beta_offsets(),
-                Box::new(move |k: usize| ranks[k]),
-            )
-        } else {
-            (term.beta_offsets(), Box::new(move |_: usize| p))
-        }
-    }
-
-    #[test]
-    fn hutchinson_smoothness_dof_matches_exact_and_is_deterministic() {
-        // #2253: small_two_atom_periodic_term is p=1 output, where two decoders
-        // are trivially collinear (the scalar output-Gram makes the barrier
-        // coherence O identically 1) and K=2 is non-identifiable, so the fit
-        // co-collapses. Rank the p=3 REACHABLE gamma_fd_tiny two-atom fixture into
-        // its converging PD basin instead; the per-atom smoothness-DOF split this
-        // test pins (Hutchinson vs exact column-solve, cross-atom coupling) is
-        // exercised identically on two identifiable atoms.
-        let (mut term, target, mut rho) =
-            crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture();
-        rho.log_lambda_sparse = 0.0;
-        for v in rho.log_lambda_smooth.iter_mut() {
-            *v = -1.0;
-        }
-        for axis in rho.log_ard.iter_mut() {
-            for v in axis.iter_mut() {
-                *v = -1.0;
-            }
-        }
-        let (_value, _loss, cache) = term
-            .penalized_quasi_laplace_criterion_with_cache(
-                target.view(),
-                &rho,
-                None,
-                40,
-                0.4,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("converged cache for the two-atom fixture");
-        let lambda = rho.lambda_smooth_vec().unwrap();
-
-        // Ground truth: the exact column-by-column trace (the `K < threshold`
-        // path this fixture actually takes).
-        let exact = term
-            .decoder_smoothness_effective_dof_per_atom(&cache, &lambda)
-            .expect("exact per-atom smoothness edof");
-        assert_eq!(exact.len(), 2, "two-atom fixture must return two edofs");
-
-        let (offsets, out_dim) = beta_layout(&term);
-        let solve = |rhs: ndarray::ArrayView1<'_, f64>| {
-            cache
-                .schur_inverse_apply(rhs)
-                .map_err(|e| format!("schur_inverse_apply: {e:?}"))
-        };
-
-        // Many probes so the Monte-Carlo band is tight enough to pin the math.
-        let probes = 6000;
-        let seed = 0xC0FFEE_1234;
-        let est = term
-            .decoder_smoothness_effective_dof_per_atom_hutchinson(
-                cache.k,
-                &offsets,
-                out_dim.as_ref(),
-                &lambda,
-                probes,
-                seed,
-                solve,
-            )
-            .expect("hutchinson per-atom smoothness edof");
-
-        // Total trace tr(S_β⁻¹ M) — the sum averages the per-atom variance, so it
-        // pins tightly to the exact total.
-        let exact_sum: f64 = exact.iter().sum();
-        let est_sum: f64 = est.iter().sum();
-        assert!(
-            (est_sum - exact_sum).abs() <= 0.03 * exact_sum.abs().max(1.0e-3),
-            "hutchinson total edof {est_sum:.6} vs exact {exact_sum:.6}"
-        );
-
-        // Per-atom: looser Monte-Carlo band (per-atom carries the cross-atom
-        // coupling variance), but tight enough that a block-indexing bug — which
-        // would scramble the per-atom split by O(1) — cannot pass.
-        for k in 0..2 {
-            assert!(
-                (est[k] - exact[k]).abs() <= 0.10 * exact[k].abs().max(1.0e-2) + 0.05,
-                "atom {k}: hutchinson edof {:.6} vs exact {:.6}",
-                est[k],
-                exact[k]
-            );
-        }
-
-        // Determinism: a second run with the SAME seed is bit-identical (the REML
-        // outer-loop reproducibility contract).
-        let solve2 = |rhs: ndarray::ArrayView1<'_, f64>| {
-            cache
-                .schur_inverse_apply(rhs)
-                .map_err(|e| format!("schur_inverse_apply: {e:?}"))
-        };
-        let est2 = term
-            .decoder_smoothness_effective_dof_per_atom_hutchinson(
-                cache.k,
-                &offsets,
-                out_dim.as_ref(),
-                &lambda,
-                probes,
-                seed,
-                solve2,
-            )
-            .expect("hutchinson rerun");
-        assert_eq!(
-            est, est2,
-            "hutchinson smoothness edof must be bit-reproducible for a fixed seed"
         );
     }
 }

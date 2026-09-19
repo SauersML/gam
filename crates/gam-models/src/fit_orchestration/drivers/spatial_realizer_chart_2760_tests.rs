@@ -73,9 +73,10 @@ mod spatial_realizer_chart_2760_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 
@@ -100,9 +101,10 @@ mod spatial_realizer_chart_2760_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 
@@ -320,6 +322,9 @@ mod spatial_realizer_chart_2760_tests {
                     dropped_penalties: local.dropped_penalties.clone(),
                     linear_constraints_local: None,
                     joint_null_rotation: None,
+                    duchon_operator_penalties: gam_terms::smooth::duchon_operator_penalty_request(
+                        &spec.smooth_terms[0],
+                    ),
                     termname: "duchon_1d",
                 },
             )

@@ -13,6 +13,7 @@ warnings = "deny"
 [dependencies]
 dyn-stack = "0.13.2"
 faer = "0.24.4"
+gam-math = { path = "../gam-math", version = "=0.3.157" }
 gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }

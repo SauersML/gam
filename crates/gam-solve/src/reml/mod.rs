@@ -1,6 +1,5 @@
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
-use crate::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::pirls::assemble_and_factor_sparse_penalized_system;
 use gam_linalg::sparse_exact::SparseExactFactor;
 use gam_problem::OuterEval;
@@ -17,6 +16,7 @@ pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
+mod glm_outer_hessian_fd_tests;
 pub(super) mod hyper;
 mod inner_strategy;
 // #1521 carve: promoted `pub(crate)` -> `pub` so the extracted
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     pub(crate) fn eval_cache_manager_stores_first_order_outer_eval() {
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let rho = array![0.25, -0.0];
         let rho_key = super::rho_key::sanitized_rhokey(&rho);
         let eval = OuterEval {
@@ -1075,7 +1075,7 @@ mod tests {
                     .all(|(x, y)| x.to_bits() == y.to_bits())
         };
 
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
 
         // (1) Round-trip fidelity: store at rho_a, then a forced hit must equal
         // the stored eval bit-for-bit (the "hit == miss" guarantee).
@@ -1123,7 +1123,7 @@ mod tests {
         // (3) Honest eviction: overflow the LRU with fresh keys. The
         // least-recently-used entry must be evicted and then MISS (forcing a
         // recompute), while a still-resident key returns its exact stored bits.
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let mut keys = Vec::new();
         let mut evals = Vec::new();
         for i in 0..OUTER_EVAL_LRU_CAPACITY {
@@ -4614,6 +4614,19 @@ pub(crate) struct FirthDesignFactor {
     pub(crate) n: usize,
 }
 
+/// The Jeffreys log-density `½ log|I(β)|` of a fixed design under one inverse
+/// link, as a function of `η = Xβ` alone.
+///
+/// It holds the β-independent [`FirthDesignFactor`] and evaluates the same
+/// identifiable-subspace value [`FirthDenseOperator`] carries, without the
+/// Fisher inverse, hat diagonal, and weight derivatives only the gradient
+/// needs: the per-state cost is `X_rᵀ W X_r` and one factorization. A
+/// Metropolis ratio `|I(β')|^½ / |I(β)|^½` needs nothing more.
+pub struct JeffreysHalfLogDet {
+    pub(crate) factor: FirthDesignFactor,
+    pub(crate) link: InverseLink,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthDirection {
     pub(crate) deta: Array1<f64>,
@@ -4716,6 +4729,60 @@ pub(crate) struct FirthTauBetaPartialKernel {
     pub(super) d_beta_dot_h: Array1<f64>,
 }
 
+/// The predicate a dense criterion builder decided `½log|H|₊`'s rank with
+/// (#2959 D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CriterionRankPredicate {
+    /// `H`'s identified subspace: the eigenvalues above `p·ε·‖H‖₂`, never fewer
+    /// than `rank(S_λ)` ([`reml_outer_engine::DenseSpectralOperator::identified_rank`]).
+    IdentifiedSubspace,
+    /// A structural rank taken from the unscaled design and penalty roots (Firth).
+    StructuralRank,
+    /// The root `B = [√W·X; √λ_k R_k]`'s singular values, every mode priced
+    /// (#2644, gam#2735).
+    RootScale,
+}
+
+/// The coefficient frame a criterion rank decision was taken in (#2959 D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CriterionFrame {
+    /// PIRLS's transformed frame: the matrix is the bundle's `h_total`.
+    Transformed,
+    /// The original frame: the matrix is `Qs·h_total·Qsᵀ` with the transformed
+    /// barrier swapped for the original-basis one.
+    Original,
+}
+
+/// The rank decision the dense criterion priced `½log|H|₊` with at one
+/// evaluation point, published by the builder that priced it (#2959 D1).
+///
+/// The identified-rank certificate (#2901 V22) certifies this decision. It used
+/// to re-rank PIRLS's stabilized Hessian with its own call to the predicate, so
+/// wherever a builder priced a different rank (the root upgrade pricing a mode the
+/// assembled band masks) the certificate vouched for a rank the criterion never
+/// used.
+pub(crate) struct CriterionRankDecision {
+    pub(crate) predicate: CriterionRankPredicate,
+    pub(crate) frame: CriterionFrame,
+    /// `rank(S_λ)`, the floor the predicate was taken at.
+    pub(crate) penalty_rank: usize,
+    /// The matrix the decision was taken on, in `frame`.
+    pub(crate) hessian: Arc<Array2<f64>>,
+    /// The operator the criterion priced: its raw eigenpairs and active set.
+    pub(crate) operator: Arc<reml_outer_engine::DenseSpectralOperator>,
+}
+
+impl CriterionRankDecision {
+    /// The number of eigenpairs the criterion priced.
+    pub(crate) fn priced_rank(&self) -> usize {
+        self.operator
+            .active_mask
+            .iter()
+            .filter(|&&active| active)
+            .count()
+    }
+}
+
 /// Holds the state for the outer REML optimization and supplies cost and
 /// gradient evaluations to the `opt` optimizer.
 ///
@@ -4772,6 +4839,12 @@ pub(crate) struct EvalShared {
     /// once per ρ rather than once per value/gradient/Hessian call at that ρ.
     pub(crate) root_scale_hessian_operator:
         std::sync::OnceLock<Option<Arc<reml_outer_engine::DenseSpectralOperator>>>,
+    /// The rank decision the dense criterion priced at this evaluation point,
+    /// published by its builder (#2959 D1). Shared across the bundle's clones, so
+    /// the copy the cache keeps carries what the evaluation's own copy decided.
+    /// Empty until a builder prices a spectral operator here: the value-only
+    /// Cholesky and the sparse route publish none.
+    pub(crate) criterion_rank_decision: Arc<std::sync::OnceLock<Arc<CriterionRankDecision>>>,
     /// The penalty components the criterion APPLIES, `S̃_k = Π S_k Π`, in the
     /// ORIGINAL coefficient frame (#2454).
     ///
@@ -4890,6 +4963,23 @@ impl EvalShared {
             (Some(a), Some(b)) => a == b,
             _ => false,
         }
+    }
+
+    /// Publish the rank decision the builder priced at this point. The first
+    /// builder to price a spectral operator here decides; every later build at
+    /// the same point prices the same matrix with the same predicate.
+    pub(crate) fn publish_criterion_rank_decision(
+        &self,
+        decision: impl FnOnce() -> CriterionRankDecision,
+    ) {
+        self.criterion_rank_decision
+            .get_or_init(|| Arc::new(decision()));
+    }
+
+    /// The rank decision a builder published at this point, if one priced a
+    /// spectral operator here.
+    pub(crate) fn criterion_rank_decision(&self) -> Option<Arc<CriterionRankDecision>> {
+        self.criterion_rank_decision.get().map(Arc::clone)
     }
 
     /// Lazily build — once per evaluation point — the original-frame
@@ -5014,9 +5104,11 @@ impl SparseRemlDecision {
 /// Eviction is byte-budgeted rather than entry-count-budgeted: each entry
 /// records its own estimated footprint (the surviving n-length vectors plus
 /// the two p×p Hessians plus per-entry overhead) and the cache evicts in
-/// LRU order until the running total fits under the budget. An entry that
-/// individually exceeds the budget is rejected silently rather than poisoning
-/// the cache.
+/// LRU order until the running total fits under the budget. The newest entry
+/// is always kept, alone if it alone exceeds the budget, so the next
+/// evaluation at its ρ (a gradient after a value) reuses the solve: the cache
+/// holds at most the larger of its budget and one solve, which the evaluation
+/// that produced it held anyway.
 pub(crate) struct PirlsLruCache {
     // Stored tuple: (compacted result, last-touched clock, estimated bytes).
     pub(crate) map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
@@ -5048,19 +5140,10 @@ impl PirlsLruCache {
     pub(crate) fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
         self.clock += 1;
         let bytes = pirls_result_cache_bytes(&value);
-        // Refuse entries that on their own already exceed the entire budget;
-        // caching one would force eviction of every other entry without
-        // leaving room for the new one anyway.
-        if bytes > self.byte_budget {
-            if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
-                self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
-            }
-            return;
-        }
         if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
             self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
         }
-        while self.current_bytes + bytes > self.byte_budget {
+        while !self.map.is_empty() && self.current_bytes + bytes > self.byte_budget {
             let evict_key = self
                 .map
                 .iter()
@@ -5141,6 +5224,27 @@ impl PenaltySubspaceCacheKey {
     }
 }
 
+/// Byte budget of one fit's PIRLS result cache.
+///
+/// A cache hit saves one P-IRLS solve, and a solve costs passes over the
+/// design, so the memo may hold as many bytes as the dense design it
+/// memoizes and no more: at any `n` and any number of outer evaluations it is
+/// one further design-sized store, or the newest solve alone where one solve
+/// outgrows the design (see [`PirlsLruCache::insert`]). The
+/// host bound is the governor's stationary per-operation ceiling rather than
+/// live availability, so which evaluations hit the cache never depends on
+/// what else the machine is doing (SPEC-20).
+///
+/// A fixed budget was pyGAM audit speed F11: 128 MiB regardless of the
+/// design, so a Poisson fit at n = 1e5 with an 8.8 MB design pinned 133 MB of
+/// cached solves.
+pub(crate) fn pirls_cache_byte_budget(x: &DesignMatrix) -> usize {
+    let host_ceiling =
+        gam_runtime::resource::MemoryGovernor::global().single_materialization_cap_bytes();
+    gam_runtime::resource::dense_f64_bytes(x.nrows(), x.ncols())
+        .map_or(host_ceiling, |design_bytes| design_bytes.min(host_ceiling))
+}
+
 /// Estimate the in-cache footprint of a (compacted) PIRLS result.
 ///
 /// Mirrors what `compact_for_reml_cache` keeps:
@@ -5148,13 +5252,16 @@ impl PenaltySubspaceCacheKey {
 ///   solveworking_response, solvemu, solve_c_array, solve_d_array);
 /// * the p-length coefficient vector;
 /// * the two p×p Hessians (dense or CSC sparse);
-/// * the `ReparamResult` payload — the dominant scaling term beyond n, since
-///   it carries `s_transformed`, `qs`, and `e_transformed` as p×p / rank×p
-///   matrices.
+/// * the `ReparamResult` payload, the dominant term beyond n: besides
+///   `s_transformed`, `qs` and `e_transformed` it carries one rotated penalty
+///   per smoothing coordinate, each with a dense p×p Gram, so it grows as K·p²;
+/// * the p-length penalized gradient, the Firth hat diagonal and any
+///   transformed inequality constraints.
 /// A small constant overhead absorbs scalar fields, enum discriminants, and
-/// the HashMap entry. This errs on the conservative side: overestimation
-/// causes earlier eviction, never under-counting that would let the cache
-/// silently exceed the byte budget.
+/// the HashMap entry. Every array the entry owns is counted: an entry that
+/// under-reports lets the cache hold many times its byte budget (pyGAM audit
+/// speed F1: forty coordinates at p = 221 put 16 MB of rotated penalties in
+/// each entry against a 2.5 MB estimate, so the 128 MiB cache pinned 1.3 GB).
 pub(crate) fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
     use std::mem::size_of;
     let n_array_elems = result.final_eta.len()
@@ -5166,12 +5273,24 @@ pub(crate) fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
     let p = result.beta_transformed.0.len();
     let pen_h = symmetric_matrix_cache_bytes(&result.penalized_hessian_transformed);
     let stab_h = symmetric_matrix_cache_bytes(&result.stabilizedhessian_transformed);
-    let reparam = (result.reparam_result.s_transformed.len()
-        + result.reparam_result.qs.len()
-        + result.reparam_result.e_transformed.len()
-        + result.reparam_result.det1.len())
-        * size_of::<f64>();
-    n_array_elems * size_of::<f64>() + p * size_of::<f64>() + pen_h + stab_h + reparam + 1024
+    let firth = match &result.firth {
+        crate::pirls::FirthDiagnostics::Inactive => 0,
+        crate::pirls::FirthDiagnostics::Active { hat_diag, .. } => hat_diag.len(),
+    };
+    let constraints = result
+        .linear_constraints_transformed
+        .as_ref()
+        .map_or(0, |constraints| constraints.a.len() + constraints.b.len());
+    let small_arrays = n_array_elems
+        + p
+        + result.penalized_gradient_transformed.len()
+        + firth
+        + constraints;
+    small_arrays * size_of::<f64>()
+        + pen_h
+        + stab_h
+        + result.reparam_result.resident_bytes()
+        + 1024
 }
 
 pub(crate) fn symmetric_matrix_cache_bytes(m: &gam_linalg::matrix::SymmetricMatrix) -> usize {
@@ -5286,9 +5405,11 @@ pub(crate) struct EvalCacheManager {
 }
 
 impl EvalCacheManager {
-    pub(crate) fn new() -> Self {
+    /// `pirls_cache_byte_budget` is the fit's PIRLS result-cache budget,
+    /// derived once per fit by [`pirls_cache_byte_budget`].
+    pub(crate) fn new(pirls_cache_byte_budget: usize) -> Self {
         Self {
-            pirls_cache: RwLock::new(PirlsLruCache::new(PIRLS_CACHE_BYTE_BUDGET)),
+            pirls_cache: RwLock::new(PirlsLruCache::new(pirls_cache_byte_budget)),
             penalty_subspace_cache: RwLock::new(PenaltySubspaceCache::new()),
             current_eval_bundle: RwLock::new(None),
             current_outer_eval: RwLock::new(None),
@@ -5428,6 +5549,50 @@ impl RemlArena {
     }
 }
 
+/// The ρ at which a fit decides the #784 block-local correction's admission,
+/// which [`RemlState::block_correction_admission`] then freezes for the fit
+/// (#2748, #1082).
+///
+/// A fixed-ρ evaluation publishes the ρ it is handed, so it decides there, at
+/// its first evaluation whose skewness verdict engages. A search publishes its
+/// certified optimum, and deciding at whichever ρ it evaluates first made the
+/// fitted criterion a function of the start. On
+/// `gam_tensor_te_2d_poisson_matches_mgcv` the verdict engaged at the first
+/// evaluation (`max|γ| = 0.238` against `τ = 0.126`) and not at the Laplace
+/// optimum (`0.066`), so that latch integrated an `m = 8` block at every one of
+/// 132 later inner solutions for a correction the published ρ declines (job
+/// 1246493). A search therefore prices the Laplace criterion, decides once at
+/// its certified optimum, and either declines there or latches and continues
+/// the corrected search from that optimum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockCorrectionDecision {
+    /// Decided at the first evaluation whose verdict engages (a fixed-ρ caller).
+    AtFirstEngagedEvaluation,
+    /// A search is running on the Laplace criterion: the correction is zero and
+    /// nothing latches.
+    DeferredToOptimum,
+    /// The next evaluation, at the search's certified optimum, decides.
+    DecidingAtOptimum,
+    /// The verdict declined at the certified optimum: zero for the fit.
+    DeclinedAtOptimum,
+    /// Admitted at the certified optimum and latched.
+    AdmittedAtOptimum,
+}
+
+/// The #784 block quadrature latched beside the admission (#2623): the
+/// Gauss–Hermite order of each block axis, and whether the block marginal is
+/// integrated axis by axis with the analytic mixed-axis term, or as one tensor
+/// rule over the whole block. Beside them sit the paired-rule errors measured
+/// at that admission: the certificate every later evaluation at those orders
+/// carries, since the paired error no longer switches anything once the
+/// orders are latched (#2748).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BlockQuadratureLatch {
+    pub(crate) axis_orders: Vec<usize>,
+    pub(crate) axis_quadrature_errors: Vec<f64>,
+    pub(crate) axis_split: bool,
+}
+
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5493,13 +5658,20 @@ pub(crate) struct RemlState<'a> {
     /// whose correction never engages is bit-identical to the pre-#2748 fit and
     /// a fit that engaged consistently keeps the same block it always had; only
     /// the fits that were toggling change.
+    ///
+    /// WHERE that admission is decided is [`Self::block_correction_decision`]
+    /// (#1082).
     pub(crate) block_correction_admission: AtomicUsize,
+    /// The ρ at which [`Self::block_correction_admission`] is decided (#1082); see
+    /// [`BlockCorrectionDecision`].
+    pub(crate) block_correction_decision: std::sync::Mutex<BlockCorrectionDecision>,
     /// The per-axis Gauss–Hermite orders latched beside
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve
     /// `min(|Δ_b|, 1/n_eff²)`, and held for the fit, so the nodes, and with them
-    /// the value, gradient and moments, are one measure at every ρ.
-    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<Vec<usize>>>,
+    /// the value, gradient and moments, are one measure at every ρ. Whether the
+    /// block is integrated axis by axis is latched with them, for the same reason.
+    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<BlockQuadratureLatch>>,
     /// Adaptive IFT step-cap controller, the hypergradient budget controller,
     /// and the two mode-response caches.
     ///
@@ -5651,6 +5823,13 @@ pub(crate) struct RemlState<'a> {
     /// final reported fit still Pearson-refreshes `phi` at the converged η. Reset
     /// on `reset_surface`.
     pub(crate) frozen_beta_phi: Arc<AtomicU64>,
+
+    /// Gaussian (non-identity link) / inverse Gaussian dispersion `phi` frozen
+    /// for the λ search, bit-packed `f64`; `0` means "not yet frozen". Captured
+    /// once as the converged-η MLE `Σwd/Σw` and applied via
+    /// `GlmLikelihoodSpec::with_dispersion_phi_frozen_for_search`, exactly like
+    /// [`Self::frozen_tweedie_phi`]; the final reported fit refreshes it.
+    pub(crate) frozen_dispersion_phi: Arc<AtomicU64>,
 
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where
@@ -5823,4 +6002,8 @@ pub(crate) struct RemlState<'a> {
     pub(crate) gaussian_dp_floor_scale_cache: std::sync::OnceLock<f64>,
     pub(crate) positive_weight_observation_count_cache: std::sync::OnceLock<usize>,
     pub(crate) rho_weight_anchor_cache: std::sync::OnceLock<f64>,
+    /// The data half `R_G` (`R_GᵀR_G = XᵀWX`) of the root-scale Hessian
+    /// operator, kept for the weights it was formed at. Keyed to `x`, so
+    /// `reset_surface` clears it.
+    pub(crate) data_root_cache: laml_logdet::DataRootCache,
 }

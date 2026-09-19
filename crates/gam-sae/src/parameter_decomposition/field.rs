@@ -75,6 +75,8 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
 
 use crate::basis::SaeBasisEvaluator;
 
+use super::apply::{FactorView, edit_factor_cotangents, edit_frobenius_contractions};
+
 /// One basis coefficient `B_j` of a `rows x cols` field.
 #[derive(Debug, Clone)]
 pub enum FieldCoefficient {
@@ -175,14 +177,14 @@ impl ParameterCotangent {
         (self.rows, self.cols)
     }
 
-    /// `<G, B>_F`, never forming a product-form `B` or an outer-product `G`. It
-    /// returns `Result` so that a governed outer-product contraction can refuse
-    /// instead of allocating.
+    /// `<G, B>_F`, never forming a product-form `B` or an outer-product `G`. An
+    /// outer-product term against a product-form coefficient streams through
+    /// `apply`'s governed contraction, which refuses rather than allocate past
+    /// its memory admission.
     pub fn frobenius_inner(&self, coefficient: &FieldCoefficient) -> Result<f64, String> {
-        Ok(self
-            .terms
-            .iter()
-            .map(|term| match (term, coefficient) {
+        let mut total = 0.0;
+        for term in &self.terms {
+            total += match (term, coefficient) {
                 (CotangentTerm::Dense(g), FieldCoefficient::Dense(b)) => frobenius(g.view(), b.view()),
                 (CotangentTerm::Dense(g), FieldCoefficient::Factored { left, right }) => {
                     frobenius(g.dot(right).view(), left.view())
@@ -191,34 +193,41 @@ impl ParameterCotangent {
                     frobenius(output.view(), input.dot(&b.t()).view())
                 }
                 (CotangentTerm::Outer { output, input }, FieldCoefficient::Factored { left, right }) => {
-                    frobenius(output.dot(left).view(), input.dot(right).view())
+                    let view = FactorView::new(left.view(), right.view()).map_err(|e| e.to_string())?;
+                    edit_frobenius_contractions(view, output.view(), input.view())
+                        .map_err(|e| e.to_string())?
+                        .sum()
                 }
-            })
-            .sum())
+            };
+        }
+        Ok(total)
     }
 
-    /// `G V` for a `cols x r` factor `V`.
-    fn right_apply(&self, right: ArrayView2<'_, f64>) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.rows, right.ncols()));
+    /// `(G V, G^T U)` for a product-form coefficient `U V^T`, with outer-product
+    /// terms streamed through `apply`.
+    fn factor_cotangents(
+        &self,
+        left: ArrayView2<'_, f64>,
+        right: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
+        let mut g_v = Array2::<f64>::zeros((self.rows, right.ncols()));
+        let mut g_t_u = Array2::<f64>::zeros((self.cols, left.ncols()));
         for term in &self.terms {
             match term {
-                CotangentTerm::Dense(g) => out += &g.dot(&right),
-                CotangentTerm::Outer { output, input } => out += &output.t().dot(&input.dot(&right)),
+                CotangentTerm::Dense(g) => {
+                    g_v += &g.dot(&right);
+                    g_t_u += &g.t().dot(&left);
+                }
+                CotangentTerm::Outer { output, input } => {
+                    let view = FactorView::new(left, right).map_err(|e| e.to_string())?;
+                    let pieces = edit_factor_cotangents(view, output.view(), input.view())
+                        .map_err(|e| e.to_string())?;
+                    g_v += &pieces.left;
+                    g_t_u += &pieces.right;
+                }
             }
         }
-        out
-    }
-
-    /// `G^T U` for a `rows x r` factor `U`.
-    fn left_adjoint_apply(&self, left: ArrayView2<'_, f64>) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.cols, left.ncols()));
-        for term in &self.terms {
-            match term {
-                CotangentTerm::Dense(g) => out += &g.t().dot(&left),
-                CotangentTerm::Outer { output, input } => out += &input.t().dot(&output.dot(&left)),
-            }
-        }
-        out
+        Ok((g_v, g_t_u))
     }
 }
 
@@ -482,19 +491,19 @@ impl ParameterFamily {
                 labels[[c, a]] = scaled_gaps[c] * along;
             }
         }
-        let coefficients = self
-            .field
-            .coefficients
-            .iter()
-            .zip(anchor_weights.iter())
-            .map(|(coefficient, &s)| match coefficient {
+        let mut coefficients = Vec::with_capacity(self.field.coefficients.len());
+        for (coefficient, &s) in self.field.coefficients.iter().zip(anchor_weights.iter()) {
+            coefficients.push(match coefficient {
                 FieldCoefficient::Dense(..) => CoefficientPullback::Dense { weight: s },
-                FieldCoefficient::Factored { left, right } => CoefficientPullback::Factored {
-                    left: cotangent.right_apply(right.view()).mapv_into(|v| s * v),
-                    right: cotangent.left_adjoint_apply(left.view()).mapv_into(|v| s * v),
-                },
-            })
-            .collect();
+                FieldCoefficient::Factored { left, right } => {
+                    let (g_v, g_t_u) = cotangent.factor_cotangents(left.view(), right.view())?;
+                    CoefficientPullback::Factored {
+                        left: g_v.mapv_into(|v| s * v),
+                        right: g_t_u.mapv_into(|v| s * v),
+                    }
+                }
+            });
+        }
         Ok(FamilyPullback {
             coefficients,
             labels,
@@ -611,7 +620,7 @@ impl FieldPenalty {
         }
         let phi = basis_at_centers(basis, centers)?;
         let band = measure_jet_band(centers, spec.num_scales).map_err(|e| e.to_string())?;
-        let energy = measure_jet_energy_form(centers, masses, &band, spec.order_s, spec.alpha, spec.tau0)
+        let energy = measure_jet_energy_form(centers, masses, &band, spec.order_s, spec.alpha)
             .map_err(|e| e.to_string())?;
         let mut gram = phi.t().dot(&energy).dot(&phi);
         symmetrize_in_place(&mut gram);
@@ -1344,7 +1353,7 @@ mod tests {
         let (centers, masses) = latent_measure();
         let spec = declared_spec();
         let band = measure_jet_band(centers.view(), spec.num_scales).expect("band");
-        measure_jet_energy_form(centers.view(), masses.view(), &band, spec.order_s, spec.alpha, spec.tau0)
+        measure_jet_energy_form(centers.view(), masses.view(), &band, spec.order_s, spec.alpha)
             .expect("energy")
     }
 

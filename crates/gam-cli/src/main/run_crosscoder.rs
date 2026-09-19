@@ -4,61 +4,57 @@ use gam_sae::manifold::{
     NamedCrosscoderTarget, SaeCrosscoderAutoFitOverrides, SaeCrosscoderAutoFitRequest,
     run_auto_sae_crosscoder_fit,
 };
-use ndarray::ShapeBuilder;
+use ndarray::{ArrayD, Ix2, IxDyn, ShapeBuilder};
 use npyz::{NpyFile, Order};
 use std::io::{BufReader, BufWriter, Write};
 
-/// Load one floating-point, two-dimensional NPY without owning any scientific
-/// preprocessing. Row alignment, finite values, and crosscoder structure are
-/// validated by the GAM-SAE request owner after all matrices are loaded.
-fn read_npy_matrix(path: &Path) -> Result<Array2<f64>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|err| format!("open activation NPY {}: {err}", path.display()))?;
+/// Load one floating-point NPY of any number of axes without owning any scientific
+/// preprocessing. Shapes, finite values and structure are validated by the request
+/// owner after every array is loaded. `f16` and `f32` widen to `f64` exactly.
+pub(crate) fn read_npy_array(path: &Path) -> Result<ArrayD<f64>, String> {
+    let file =
+        std::fs::File::open(path).map_err(|err| format!("open NPY {}: {err}", path.display()))?;
     let npy = NpyFile::new(BufReader::new(file))
-        .map_err(|err| format!("read activation NPY header {}: {err}", path.display()))?;
-    let shape = npy.shape();
-    let [n_u64, p_u64] = shape else {
-        return Err(format!(
-            "activation NPY {} must be 2-D; got shape {shape:?}",
-            path.display()
-        ));
-    };
-    let n = usize::try_from(*n_u64).map_err(|_| {
-        format!(
-            "activation NPY {} row count {n_u64} exceeds this platform",
-            path.display()
-        )
-    })?;
-    let p = usize::try_from(*p_u64).map_err(|_| {
-        format!(
-            "activation NPY {} column count {p_u64} exceeds this platform",
-            path.display()
-        )
-    })?;
-    n.checked_mul(p).ok_or_else(|| {
-        format!(
-            "activation NPY {} shape ({n}, {p}) overflows this platform",
-            path.display()
-        )
-    })?;
+        .map_err(|err| format!("read NPY header {}: {err}", path.display()))?;
+    let shape = npy
+        .shape()
+        .iter()
+        .map(|&axis| {
+            usize::try_from(axis).map_err(|err| {
+                format!(
+                    "NPY {} axis length {axis} exceeds this platform: {err}",
+                    path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<usize>, String>>()?;
+    shape
+        .iter()
+        .try_fold(1_usize, |count, &axis| count.checked_mul(axis))
+        .ok_or_else(|| {
+            format!(
+                "NPY {} shape {shape:?} overflows this platform",
+                path.display()
+            )
+        })?;
     let order = npy.order();
     let values = match npy.try_data::<f64>() {
         Ok(reader) => reader
             .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|err| format!("read f64 activation NPY {}: {err}", path.display()))?,
+            .map_err(|err| format!("read f64 NPY {}: {err}", path.display()))?,
         Err(npy) => match npy.try_data::<f32>() {
             Ok(reader) => reader
                 .map(|value| value.map(f64::from))
                 .collect::<std::io::Result<Vec<_>>>()
-                .map_err(|err| format!("read f32 activation NPY {}: {err}", path.display()))?,
+                .map_err(|err| format!("read f32 NPY {}: {err}", path.display()))?,
             Err(npy) => match npy.try_data::<npyz::half::f16>() {
                 Ok(reader) => reader
                     .map(|value| value.map(npyz::half::f16::to_f64))
                     .collect::<std::io::Result<Vec<_>>>()
-                    .map_err(|err| format!("read f16 activation NPY {}: {err}", path.display()))?,
+                    .map_err(|err| format!("read f16 NPY {}: {err}", path.display()))?,
                 Err(npy) => {
                     return Err(format!(
-                        "activation NPY {} must have dtype f16, f32, or f64; got {}",
+                        "NPY {} must have dtype f16, f32, or f64; got {}",
                         path.display(),
                         npy.dtype().descr()
                     ));
@@ -67,12 +63,26 @@ fn read_npy_matrix(path: &Path) -> Result<Array2<f64>, String> {
         },
     };
     let result = match order {
-        Order::C => Array2::from_shape_vec((n, p), values),
-        Order::Fortran => Array2::from_shape_vec((n, p).f(), values),
+        Order::C => ArrayD::from_shape_vec(IxDyn(&shape), values),
+        Order::Fortran => ArrayD::from_shape_vec(IxDyn(&shape).f(), values),
     };
     result.map_err(|err| {
         format!(
-            "activation NPY {} has invalid shape ({n}, {p}): {err}",
+            "NPY {} has invalid shape {shape:?}: {err}",
+            path.display()
+        )
+    })
+}
+
+/// Load one floating-point, two-dimensional NPY. Row alignment, finite values, and
+/// crosscoder structure are validated by the GAM-SAE request owner after all
+/// matrices are loaded.
+fn read_npy_matrix(path: &Path) -> Result<Array2<f64>, String> {
+    let array = read_npy_array(path)?;
+    let shape = array.shape().to_vec();
+    array.into_dimensionality::<Ix2>().map_err(|err| {
+        format!(
+            "activation NPY {} must be 2-D; got shape {shape:?}: {err}",
             path.display()
         )
     })

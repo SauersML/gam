@@ -33,6 +33,8 @@ fn survival_fit_from_parts_rejects_mismatched_lambda_lengths() {
         used_device: false,
         penalty_block_trace: Vec::new(),
         edf_by_block: Vec::new(),
+        edf_rank_bound: Vec::new(),
+        coefficient_mode_selection: Default::default(),
     };
 
     let result = survival_fit_from_parts(parts);

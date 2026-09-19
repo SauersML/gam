@@ -79,23 +79,19 @@ use crate::manifold::{GeometryError, GeometryResult, RiemannianManifold};
 use gam_math::jet_tower::Tower2;
 
 /// Branch threshold for the `C`/`S` series in `u = κt²`. The series terms
-/// decay factorially, so at `|u| ≤ 0.5` the truncation error of
-/// [`CS_SERIES_TERMS`] terms is far below one ulp; beyond it the closed
-/// trig/hyperbolic forms are well-conditioned.
+/// decay factorially; beyond `|u| = 0.5` the closed trig/hyperbolic forms are
+/// well-conditioned.
+///
+/// Every series below is summed until a term no longer moves its sum. On the
+/// series branch the ratio of consecutive terms has magnitude at most `0.25`
+/// for `C`/`S` (its first step in slot 0) and below `0.54` for `T` (the first
+/// step of slot 2), so the terms shrink geometrically and one fails to move
+/// the sum after finitely many steps: no term count is chosen.
 const CS_SERIES_U_MAX: f64 = 0.5;
 
-/// Series length for `C`/`S` stacks. Term m of the j-th derivative series
-/// is bounded by `|u|^m / (2m)!`; 18 terms at `|u| = 0.5` is < 1e−40.
-const CS_SERIES_TERMS: usize = 18;
-
 /// Branch threshold for the `T` series in `w = κr²`. `T`'s series is only
-/// geometric (radius 1), so the switch happens earlier than for `C`/`S`
-/// and the term count is correspondingly larger.
+/// geometric (radius 1), so the switch happens earlier than for `C`/`S`.
 const T_SERIES_W_MAX: f64 = 0.25;
-
-/// Series length for the `T` stack: `0.25^48 ≈ 1e−29` dominates the
-/// truncation tail at the branch edge.
-const T_SERIES_TERMS: usize = 48;
 
 /// Derivative stacks `[f, f′, f″, f‴, f⁗]` (in `u`) of the entire
 /// functions `C(u)` and `S(u)`. Exact: series inside
@@ -116,17 +112,37 @@ pub(crate) fn cs_stacks(u: f64) -> ([f64; 5], [f64; 5]) {
             }
             let mut acc_c = term_c;
             let mut acc_s = term_s;
-            for m in j..(j + CS_SERIES_TERMS) {
+            // The same per-channel stop as `cs_stacks3` and `cs_val`: each
+            // accumulator is summed until its own next term no longer moves it.
+            let mut done_c = false;
+            let mut done_s = false;
+            let mut m = j;
+            while !(done_c && done_s) {
                 let mf = m as f64;
                 let jf = j as f64;
-                let ratio_c =
-                    -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 1.0) * (2.0 * mf + 2.0));
-                let ratio_s =
-                    -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 2.0) * (2.0 * mf + 3.0));
-                term_c *= ratio_c;
-                term_s *= ratio_s;
-                acc_c += term_c;
-                acc_s += term_s;
+                if !done_c {
+                    let ratio_c =
+                        -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 1.0) * (2.0 * mf + 2.0));
+                    term_c *= ratio_c;
+                    let next = acc_c + term_c;
+                    if next == acc_c {
+                        done_c = true;
+                    } else {
+                        acc_c = next;
+                    }
+                }
+                if !done_s {
+                    let ratio_s =
+                        -u * (mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 2.0) * (2.0 * mf + 3.0));
+                    term_s *= ratio_s;
+                    let next = acc_s + term_s;
+                    if next == acc_s {
+                        done_s = true;
+                    } else {
+                        acc_s = next;
+                    }
+                }
+                m += 1;
             }
             c[j] = acc_c;
             s[j] = acc_s;
@@ -156,7 +172,7 @@ pub(crate) fn cs_stacks(u: f64) -> ([f64; 5], [f64; 5]) {
 ///
 /// The κ-jets ride [`Tower2`], whose `compose_unary` reads only `d[0..=2]`; the
 /// `T‴`/`T⁗` slots are pure waste on that path (in the series branch each is its
-/// own 48-term sum). Each slot `j` is an
+/// own series). Each slot `j` is an
 /// independent series, and the closed-form recurrence advances one slot at a
 /// time, so these three entries are exactly the first three slots of the full
 /// five-slot stack.
@@ -171,19 +187,20 @@ pub(crate) fn t_stacks3(w: f64) -> [f64; 3] {
                 term *= -fj * (2.0 * fj - 1.0) / (2.0 * fj + 1.0);
             }
             let mut acc = term;
-            for m in j..(j + T_SERIES_TERMS) {
+            let mut m = j;
+            loop {
                 let mf = m as f64;
                 let jf = j as f64;
                 term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 3.0));
-                // Bit-identical early stop: on |w| ≤ T_SERIES_W_MAX the term ratio
-                // has magnitude < 1, so |term| decreases monotonically; once a term
-                // is too small to move `acc`, every successor is too, so summing the
-                // remaining T_SERIES_TERMS terms reproduces `acc` exactly.
+                // On |w| ≤ T_SERIES_W_MAX the term ratio has magnitude below one
+                // (see `CS_SERIES_U_MAX`), so |term| shrinks monotonically and the
+                // first term too small to move `acc` ends the sum.
                 let next = acc + term;
                 if next == acc {
                     break;
                 }
                 acc = next;
+                m += 1;
             }
             *slot = acc;
         }
@@ -210,8 +227,8 @@ pub(crate) fn t_stacks3(w: f64) -> [f64; 3] {
 /// prefix the second-order κ-jets consume.
 ///
 /// As with [`t_stacks3`], the [`Tower2`] `compose_unary` reads only `d[0..=2]`,
-/// so the `C‴/C⁗`, `S‴/S⁗` slots [`cs_stacks`] builds (each a fresh 18-term
-/// series in the small-`u` branch) are never read on the jet path. Both `C` and
+/// so the `C‴/C⁗`, `S‴/S⁗` slots [`cs_stacks`] builds (each a fresh series in
+/// the small-`u` branch) are never read on the jet path. Both `C` and
 /// `S` value-channels are still computed (so the closed-form `___sincos`
 /// pairing — and hence the value channel — is bit-for-bit identical), and the
 /// per-slot series / one-step recurrence make the first three orders identical
@@ -230,16 +247,14 @@ pub(crate) fn cs_stacks3(u: f64) -> ([f64; 3], [f64; 3]) {
             }
             let mut acc_c = term_c;
             let mut acc_s = term_s;
-            // Independent bit-identical early stops for the two channels: each
-            // accumulator is touched only by its own term chain, whose magnitude
-            // decreases monotonically on |u| ≤ CS_SERIES_U_MAX, so dropping the
-            // no-op tail of either reproduces its full CS_SERIES_TERMS sum exactly.
+            // Independent stops for the two channels: each accumulator is
+            // touched only by its own term chain, whose magnitude decreases
+            // monotonically on |u| ≤ CS_SERIES_U_MAX, and ends at its first term
+            // too small to move it.
             let mut done_c = false;
             let mut done_s = false;
-            for m in j..(j + CS_SERIES_TERMS) {
-                if done_c && done_s {
-                    break;
-                }
+            let mut m = j;
+            while !(done_c && done_s) {
                 let mf = m as f64;
                 let jf = j as f64;
                 if !done_c {
@@ -264,6 +279,7 @@ pub(crate) fn cs_stacks3(u: f64) -> ([f64; 3], [f64; 3]) {
                         acc_s = next;
                     }
                 }
+                m += 1;
             }
             c[j] = acc_c;
             s[j] = acc_s;
@@ -291,15 +307,16 @@ pub(crate) fn cs_stacks3(u: f64) -> ([f64; 3], [f64; 3]) {
 /// the *only* slot the geodesic-distance / log-map value paths consume.
 ///
 /// `distance`, `log_map`, and the radial code read just `[0]`, yet a derivative
-/// stack builds several independent 48-term series to do it. This computes
-/// the `j = 0` series alone — the identical arithmetic (`jf = 0`, so
-/// `mf + 1.0 - jf == mf + 1.0`) — and stops as soon as a term no longer moves
-/// the sum (monotone tail on `|w| ≤ T_SERIES_W_MAX`, so a strict no-op prune).
+/// stack builds several independent series to do it. This computes the `j = 0`
+/// series alone — the identical arithmetic (`jf = 0`, so
+/// `mf + 1.0 - jf == mf + 1.0`) and the same stop at the first term that no
+/// longer moves the sum.
 pub(crate) fn t0(w: f64) -> f64 {
     if w.abs() <= T_SERIES_W_MAX {
         let mut term = 1.0;
         let mut acc = 1.0;
-        for m in 0..T_SERIES_TERMS {
+        let mut m = 0usize;
+        loop {
             let mf = m as f64;
             term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0) * (2.0 * mf + 3.0));
             let next = acc + term;
@@ -307,6 +324,7 @@ pub(crate) fn t0(w: f64) -> f64 {
                 break;
             }
             acc = next;
+            m += 1;
         }
         acc
     } else if w > 0.0 {
@@ -328,7 +346,8 @@ pub(crate) fn cs_val(u: f64) -> (f64, f64) {
     if u.abs() <= CS_SERIES_U_MAX {
         let mut term_c = 1.0;
         let mut acc_c = 1.0;
-        for m in 0..CS_SERIES_TERMS {
+        let mut m = 0usize;
+        loop {
             let mf = m as f64;
             term_c *= -u * (mf + 1.0) / ((mf + 1.0) * (2.0 * mf + 1.0) * (2.0 * mf + 2.0));
             let next = acc_c + term_c;
@@ -336,10 +355,12 @@ pub(crate) fn cs_val(u: f64) -> (f64, f64) {
                 break;
             }
             acc_c = next;
+            m += 1;
         }
         let mut term_s = 1.0;
         let mut acc_s = 1.0;
-        for m in 0..CS_SERIES_TERMS {
+        let mut m = 0usize;
+        loop {
             let mf = m as f64;
             term_s *= -u * (mf + 1.0) / ((mf + 1.0) * (2.0 * mf + 2.0) * (2.0 * mf + 3.0));
             let next = acc_s + term_s;
@@ -347,6 +368,7 @@ pub(crate) fn cs_val(u: f64) -> (f64, f64) {
                 break;
             }
             acc_s = next;
+            m += 1;
         }
         (acc_c, acc_s)
     } else if u > 0.0 {
@@ -1147,6 +1169,35 @@ mod tests {
                 dense, product,
                 "κ = {kappa}: dense {dense} != matrix-free {product}"
             );
+        }
+    }
+
+    /// The value and order-≤2 fast paths are documented as bit-for-bit slices of
+    /// the full stacks. Every one of them sums each series until its first term
+    /// that no longer moves the sum, so a slice is the same arithmetic with the
+    /// same stop, on both branches and at the branch edges.
+    #[test]
+    fn series_fast_paths_are_bitwise_slices_of_the_full_stacks() {
+        let mut points: Vec<f64> = (0..=200).map(|i| -0.5 + i as f64 * 0.005).collect();
+        points.extend([
+            CS_SERIES_U_MAX,
+            -CS_SERIES_U_MAX,
+            f64::EPSILON,
+            -f64::EPSILON,
+            0.75,
+            -2.0,
+        ]);
+        for u in points {
+            let (c, s) = cs_stacks(u);
+            let (c3, s3) = cs_stacks3(u);
+            assert_eq!(cs_val(u), (c[0], s[0]), "u = {u}");
+            assert_eq!(c3, [c[0], c[1], c[2]], "u = {u}");
+            assert_eq!(s3, [s[0], s[1], s[2]], "u = {u}");
+        }
+        let mut points: Vec<f64> = (0..=200).map(|i| -0.25 + i as f64 * 0.0025).collect();
+        points.extend([T_SERIES_W_MAX, -T_SERIES_W_MAX, f64::EPSILON, 0.5, -0.5]);
+        for w in points {
+            assert_eq!(t0(w), t_stacks3(w)[0], "w = {w}");
         }
     }
 

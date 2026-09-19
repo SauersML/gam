@@ -128,7 +128,6 @@
         ]
       ],
       "decoder_covariance_channel_factors": null,
-      "evidence": -12.5,
       "functional_evidence": {
         "average_derivative": -0.4,
         "average_value": 1.25,
@@ -322,7 +321,6 @@
         ]
       ],
       "decoder_covariance_channel_factors": null,
-      "evidence": -13.5,
       "functional_evidence": null,
       "shape_band_coords": null,
       "shape_band_mean": null,
@@ -394,7 +392,6 @@
         ]
       ],
       "decoder_covariance_channel_factors": null,
-      "evidence": -14.5,
       "functional_evidence": null,
       "shape_band_coords": null,
       "shape_band_mean": null,
@@ -888,7 +885,7 @@
     "generators": [],
     "group_signature": "SO(2)"
   },
-  "schema": "gamfit.ManifoldSAE/v7",
+  "schema": "gamfit.ManifoldSAE/v10",
   "selected_log_ard": [
     [
       0.1
@@ -908,6 +905,8 @@
     1.1
   ],
   "selected_log_lambda_sparse": -0.6,
+  "shape_covariance_frame_conditioning_reason": "unframed_observed_information_not_admitted",
+  "shape_covariance_operator": "observed_information_conditional_on_fitted_frames",
   "smoothness": 0.9,
   "solver_plan": {
     "max_outer": 3,

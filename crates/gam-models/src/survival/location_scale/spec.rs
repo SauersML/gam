@@ -348,6 +348,14 @@ pub struct SurvivalLocationScaleFitResultParts {
     /// concatenated block lambdas. Carried through from the inner blockwise fit
     /// (basis-invariant, so valid on the lifted raw fit) for `edf_by_block`.
     pub edf_by_block: Vec<f64>,
+    /// Each penalty's rank-bound status, aligned 1:1 with `penalty_block_trace`
+    /// (#2901). A block's EDF is clamped to its coefficient count only when every
+    /// penalty on it is certified. Empty when the inner solver recorded none.
+    pub edf_rank_bound: Vec<gam_solve::estimate::EdfRankBound>,
+    /// Which rule selected the inner custom-family fit's coefficient mode (#2661),
+    /// carried through rather than defaulted so finalization cannot drop the record the
+    /// inner fit made.
+    pub coefficient_mode_selection: gam_solve::model_types::CoefficientModeSelection,
 }
 
 #[derive(Clone, Copy)]
@@ -464,6 +472,8 @@ pub fn survival_fit_from_parts(
         geometry,
         penalty_block_trace,
         edf_by_block,
+        edf_rank_bound,
+        coefficient_mode_selection,
     } = parts;
 
     // Validation (preserved from the old impl).
@@ -674,20 +684,32 @@ pub fn survival_fit_from_parts(
             0.0
         }
     };
-    let effective_edf = |ncoef: usize, trace_sum: f64| -> f64 {
-        (ncoef as f64 - trace_sum).clamp(0.0, ncoef as f64)
+    // #2901: `|coeff| − Σ tr_kk` is clamped to `[0, |coeff|]` only when every penalty on
+    // the block certifies `tr_kk ≤ rank_kk`. This likelihood's observed information need
+    // not dominate its penalties, and a penalty that is not certified publishes its trace
+    // unclamped, so the block figure built from it is not clamped either.
+    let block_certified = |offset: usize, count: usize| -> bool {
+        !traces_available
+            || count == 0
+            || (edf_rank_bound.len() == total_penalties
+                && edf_rank_bound[offset..offset + count]
+                    .iter()
+                    .all(gam_solve::estimate::EdfRankBound::is_certified))
     };
-    let edf_time = effective_edf(beta_time.len(), block_trace_sum(0, n_time));
-    let edf_threshold = effective_edf(beta_threshold.len(), block_trace_sum(n_time, n_threshold));
-    let edf_log_sigma = effective_edf(
-        beta_log_sigma.len(),
-        block_trace_sum(n_time + n_threshold, n_log_sigma),
-    );
+    let effective_edf = |ncoef: usize, offset: usize, count: usize| -> f64 {
+        let raw = ncoef as f64 - block_trace_sum(offset, count);
+        if block_certified(offset, count) {
+            raw.clamp(0.0, ncoef as f64)
+        } else {
+            raw
+        }
+    };
+    let edf_time = effective_edf(beta_time.len(), 0, n_time);
+    let edf_threshold = effective_edf(beta_threshold.len(), n_time, n_threshold);
+    let edf_log_sigma = effective_edf(beta_log_sigma.len(), n_time + n_threshold, n_log_sigma);
     let wiggle_len = beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
-    let edf_link_wiggle = effective_edf(
-        wiggle_len,
-        block_trace_sum(n_time + n_threshold + n_log_sigma, n_wiggle),
-    );
+    let edf_link_wiggle =
+        effective_edf(wiggle_len, n_time + n_threshold + n_log_sigma, n_wiggle);
     let edf_total = edf_time + edf_threshold + edf_log_sigma + edf_link_wiggle;
 
     use crate::model_types::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResultParts};
@@ -745,12 +767,18 @@ pub fn survival_fit_from_parts(
     } else {
         Vec::new()
     };
+    let inference_edf_rank_bound = if edf_rank_bound.len() == all_lambdas.len() {
+        edf_rank_bound.clone()
+    } else {
+        Vec::new()
+    };
     // One gate owns the negative-diagonal judgement for every lane's
-    // `sqrt(diag(V))` (`gam_problem::se_from_covariance`). The location-scale
+    // `sqrt(diag(V))` (`gam_problem::se_from_covariance`), and the published
+    // standard errors derive from this matrix (#2955). The location-scale
     // conditional covariance is only conditionally SPD, and a local
     // `max(0, ·)` would publish a materially negative variance as `SE = 0` —
     // an infinitely precise coefficient — instead of refusing it.
-    let beta_standard_errors = covariance_conditional
+    covariance_conditional
         .as_ref()
         .map(gam_problem::se_from_covariance)
         .transpose()
@@ -786,7 +814,7 @@ pub fn survival_fit_from_parts(
     // One gate for the CORRECTED marginal SEs too: `V_c = V_cond + C` is only
     // conditionally SPD, so a materially negative variance must be refused
     // here rather than published as `SE = 0`.
-    let beta_standard_errors_corrected = covariance_corrected
+    covariance_corrected
         .as_ref()
         .map(gam_problem::se_from_covariance)
         .transpose()
@@ -802,6 +830,7 @@ pub fn survival_fit_from_parts(
         .map(|geom| gam_solve::estimate::FitInference {
             edf_by_block: inference_edf_by_block.clone(),
             penalty_block_trace: inference_penalty_block_trace.clone(),
+            edf_rank_bound: inference_edf_rank_bound.clone(),
             edf_total,
             // This lane's correction is only ever the first-order IFT term
             // (the custom-family fit never runs a cubature upgrade), so the
@@ -815,10 +844,7 @@ pub fn survival_fit_from_parts(
             penalized_hessian: geom.penalized_hessian.clone(),
             reparam_qs: None,
             dispersion: gam_solve::estimate::Dispersion::UNIT,
-            beta_covariance: covariance_conditional.clone().map(Into::into),
-            beta_standard_errors,
-            beta_covariance_corrected: covariance_corrected.clone(),
-            beta_standard_errors_corrected: beta_standard_errors_corrected.clone(),
+            factorized_standard_errors: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -861,7 +887,7 @@ pub fn survival_fit_from_parts(
             survival_link_wiggle_degree: link_wiggle_degree,
             criterion_certificate,
             // The survival location-scale fit never passes the REML evaluator's
-            // post-fit certificate seam.
+            // post-fit adequacy seam.
             rho_posterior: gam_problem::rho_posterior::RhoPosteriorOutcome::NotComputed(
                 gam_problem::rho_posterior::RhoPosteriorNotComputed::NotFormedOnThisRoute,
             ),
@@ -876,6 +902,10 @@ pub fn survival_fit_from_parts(
             // seam, so it never withholds a covariance it could have published.
             covariance_declined: None,
             jeffreys_arming_evidence: None,
+            // Assembled outside the custom-family outer search, so it records no
+            // point `warm_start_from` could resume.
+            outer_warm_start: None,
+            coefficient_mode_selection,
         },
         inner_cycles: 0,
     })

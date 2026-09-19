@@ -61,7 +61,26 @@ pub struct NuclearNormPenalty {
 /// are equal at `|Δλ|/λ̄ = ∛(64ε/5)`, and each route is the more accurate one
 /// on its own side of that gap.
 fn frechet_route_balance() -> f64 {
+    // Derived (#2469): `64/5` and the cube root come from equating the two error
+    // bounds above, so the crossover follows from the rounding counts, not a choice.
     (64.0 / 5.0 * f64::EPSILON).cbrt()
+}
+
+/// Orthonormal basis `S` of the joint row space of `T` and `V`, by reorthogonalized
+/// modified Gram–Schmidt over their stacked rows in order. It is deterministic.
+///
+/// A row joins the basis when `gam_linalg::gram_schmidt::ReorthogonalizedRowBasis`
+/// resolves its residual: above its own Gram–Schmidt band plus the error the
+/// directions already collected carry (#2469). A zero row is skipped, and the
+/// first nonzero row always joins.
+pub(crate) fn joint_row_space_basis(t: ArrayView2<'_, f64>, v: ArrayView2<'_, f64>) -> Vec<Array1<f64>> {
+    let mut basis = gam_linalg::gram_schmidt::ReorthogonalizedRowBasis::new();
+    for source in [&t, &v] {
+        for row in source.rows() {
+            basis.admit(row);
+        }
+    }
+    basis.into_directions()
 }
 
 struct NuclearSvdCache {
@@ -250,32 +269,7 @@ impl NuclearNormPenalty {
             let (rf, rfd) = self.right_spectral_inverse_sqrt_derivative(t, v)?;
             return Ok((v.dot(&rf), t.dot(&rfd)));
         }
-        // Joint row-space basis S (d × s) by modified Gram-Schmidt over the
-        // 2m stacked rows of T and V. Deterministic; relative drop tolerance.
-        let mut basis: Vec<Array1<f64>> = Vec::with_capacity(2 * m);
-        for source in [&t, &v] {
-            for row in source.rows() {
-                let scale = row.iter().fold(0.0_f64, |a, &x| a + x * x).sqrt();
-                if scale <= 0.0 {
-                    continue;
-                }
-                let mut r = row.to_owned();
-                for b in &basis {
-                    let proj = b.dot(&r);
-                    r.scaled_add(-proj, b);
-                }
-                // Re-orthogonalize once (classical MGS twice-is-enough) so the
-                // basis stays orthonormal to working precision.
-                for b in &basis {
-                    let proj = b.dot(&r);
-                    r.scaled_add(-proj, b);
-                }
-                let norm = r.iter().fold(0.0_f64, |a, &x| a + x * x).sqrt();
-                if norm > 1.0e-13 * scale {
-                    basis.push(r / norm);
-                }
-            }
-        }
+        let basis = joint_row_space_basis(t, v);
         let s_dim = basis.len();
         if s_dim == 0 {
             // T = V = 0: R is the constant f₀ filter and dR vanishes.
@@ -305,10 +299,17 @@ impl NuclearNormPenalty {
         let (evals, q) = gh.eigh(Side::Lower).map_err(|err| {
             format!("NuclearNormPenalty right-Gram eigendecomposition failed: {err}")
         })?;
-        let trace_scale = evals
-            .iter()
-            .fold(0.0_f64, |acc, &lambda| acc.max(lambda.abs()));
-        let psd_tol = 1.0e-10 * trace_scale;
+        // `T S` forms each entry as a `d`-term inner product and `Sᵀ G S` forms an
+        // `m`-term one over those, so entrywise `|δ(SᵀGS)| ≤ (γ_m + 2γ_d)·(BᵀB)` with
+        // `B = |T||S|`. That Frobenius norm plus the eigensolver's own
+        // `s·ε·‖SᵀGS‖₂` bounds how far each computed eigenvalue sits from the
+        // spectrum of the Gram it stands for (#2469).
+        let abs_ts = t.mapv(f64::abs).dot(&s.mapv(f64::abs));
+        let formation = (gam_linalg::roundoff::accumulation_growth(m)
+            + 2.0 * gam_linalg::roundoff::accumulation_growth(d))
+            * abs_ts.t().dot(&abs_ts).iter().map(|value| value * value).sum::<f64>().sqrt();
+        let band =
+            gam_linalg::roundoff::symmetric_spectrum_rounding_band(&evals.to_vec()) + formation;
         let mut raw_evals = Array1::<f64>::zeros(s_dim);
         for i in 0..s_dim {
             let lambda = evals[i];
@@ -317,10 +318,10 @@ impl NuclearNormPenalty {
                     "NuclearNormPenalty expected finite right-Gram eigenvalue; got {lambda}"
                 ));
             }
-            if lambda < -psd_tol {
+            if lambda < -band {
                 return Err(format!(
                     "NuclearNormPenalty expected PSD right Gram; eigenvalue {lambda:.3e} \
-                     is below numerical tolerance {psd_tol:.3e}"
+                     is below its rounding band {band:.3e}"
                 ));
             }
             raw_evals[i] = lambda.max(0.0);
@@ -353,8 +354,10 @@ impl NuclearNormPenalty {
             } else {
                 (0.0, evals[0])
             };
-            let scale = left.abs() + right.abs();
-            if (right - left).abs() <= 1.0e-12 * scale {
+            // Two computed eigenvalues whose exact values tie can sit up to twice
+            // the band apart. The top of the S⊥ zero class is exact and adds none.
+            let computed_endpoints = if active_start_s > 0 { 2.0 } else { 1.0 };
+            if (right - left).abs() <= computed_endpoints * band {
                 return Err(format!(
                     "NuclearNormPenalty HVP is undefined: max_rank splits a tied \
                      right-Gram eigenvalue at the active/inactive cutoff \
@@ -459,10 +462,15 @@ impl NuclearNormPenalty {
         let (evals, q) = gram.eigh(Side::Lower).map_err(|err| {
             format!("NuclearNormPenalty right-Gram eigendecomposition failed: {err}")
         })?;
-        let trace_scale = evals
-            .iter()
-            .fold(0.0_f64, |acc, &lambda| acc.max(lambda.abs()));
-        let psd_tol = 1.0e-10 * trace_scale;
+        // Each Gram entry is an `m`-term inner product, so `|δG| ≤ γ_m·(|T|ᵀ|T|)`
+        // entrywise. That Frobenius norm plus the eigensolver's own `d·ε·‖G‖₂`
+        // bounds how far each computed eigenvalue sits from the exact spectrum
+        // (#2469).
+        let abs_t = t.mapv(f64::abs);
+        let formation = gam_linalg::roundoff::accumulation_growth(t.nrows())
+            * abs_t.t().dot(&abs_t).iter().map(|value| value * value).sum::<f64>().sqrt();
+        let band =
+            gam_linalg::roundoff::symmetric_spectrum_rounding_band(&evals.to_vec()) + formation;
         let mut raw_evals = Array1::<f64>::zeros(d);
         for i in 0..d {
             let lambda = evals[i];
@@ -471,10 +479,10 @@ impl NuclearNormPenalty {
                     "NuclearNormPenalty expected finite right-Gram eigenvalue; got {lambda}"
                 ));
             }
-            if lambda < -psd_tol {
+            if lambda < -band {
                 return Err(format!(
                     "NuclearNormPenalty expected PSD right Gram; eigenvalue {lambda:.3e} \
-                     is below numerical tolerance {psd_tol:.3e}"
+                     is below its rounding band {band:.3e}"
                 ));
             }
             raw_evals[i] = lambda.max(0.0);
@@ -482,8 +490,9 @@ impl NuclearNormPenalty {
         if self.max_rank.is_some() && active_count < d && active_start > 0 {
             let left = evals[active_start - 1];
             let right = evals[active_start];
-            let scale = left.abs() + right.abs();
-            if (right - left).abs() <= 1.0e-12 * scale {
+            // Two computed eigenvalues whose exact values tie can sit up to twice
+            // the band apart.
+            if (right - left).abs() <= 2.0 * band {
                 return Err(format!(
                     "NuclearNormPenalty HVP is undefined: max_rank splits a tied \
                      right-Gram eigenvalue at the active/inactive cutoff \

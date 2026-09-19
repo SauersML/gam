@@ -1,39 +1,39 @@
 use gam_math::paired_timing::{SpeedGate, paired_interleaved};
-use gam_row_macros::row_program;
+use gam_row_macros::row_atom;
 
-// The binomial location-scale row program, declared exactly as production's
-// `binomial_ls_row_program` (gam-models gamlss/binomial/kernel.rs): local
-// coordinates `q(δ) = (q0 − δ_t/σ)·e^{−δ_ls}` around the row, the exponential's
-// stack at `δ_ls = 0` supplied as ones, the q-space loss stack supplied, and an
-// all-zero loss stack skipped instead of composed.
-row_program! {
-    fn generated_binomial_ls(
+// The binomial location-scale row, declared exactly as production's
+// `binomial_ls_row` (gam-models gamlss/binomial/kernel.rs): local coordinates
+// `q(δ) = (q0 − δ_t/σ)·e^{−δ_ls}` around the row, the q-space loss through its
+// Taylor polynomial in `D = q(δ) − q0` from the supplied stack, the constants in
+// production's Horner order, and an all-zero loss stack answered with zero
+// instead of evaluated.
+row_atom! {
+    fn generated_binomial_ls [order2_at_zero, third_at_zero, fourth_at_zero](
         delta_eta_t,
         delta_eta_ls;
-        q0,
-        inv_sigma,
-        neg_ll,
-        m1,
-        m2,
-        m3,
-        m4
-    )
-    emit [order2, third, fourth];
-    leaves {
-        unit_exponential => supplied,
-        loss => supplied,
-    }
-    witnesses [];
-    {
-        let neg_delta_eta_ls = neg(delta_eta_ls);
-        let scale_ratio = compose(unit_exponential, neg_delta_eta_ls, 1.0, 1.0, 1.0, 1.0, 1.0);
-        let shifted_q = add_constant(scale(delta_eta_t, -inv_sigma), q0);
-        let q = mul(shifted_q, scale_ratio);
-        let mut nll = zero();
-        if (neg_ll != 0.0 || m1 != 0.0 || m2 != 0.0 || m3 != 0.0 || m4 != 0.0) {
-            nll = compose(loss, q, neg_ll, m1, m2, m3, m4);
-        }
-        return nll;
+        inv_sigma: f64,
+        q0: f64,
+        m1: f64,
+        m2: f64,
+        m3: f64,
+        m4: f64,
+        neg_ll: f64
+    ) {
+        neg_ll
+            + m1 * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+            + 0.5
+                * m2
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+            + m3 / 6.0
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+            + m4 / 24.0
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
     }
 }
 
@@ -48,46 +48,59 @@ struct Row {
     direction_v: [f64; 2],
 }
 
-/// Production's order-2 call: the value entry and the entries the surface does
-/// not read passed as literal zeros, as the row-coefficient builder does.
+/// Production's order-2 call (`binomial_ls_row_order2`): an all-zero stack is
+/// answered with zero, the value entry is passed as a literal zero, as the
+/// row-coefficient builder does, and the entries above order two are not read.
 #[inline(always)]
 fn generated_order2(row: Row) -> Channels {
     let [m1, m2, _, _] = row.stack;
-    let (_, gradient, hessian, []) =
-        generated_binomial_ls_order2(0.0, 0.0, row.q0, row.inv_sigma, 0.0, m1, m2, 0.0, 0.0);
-    (gradient, hessian)
+    if m1 == 0.0 && m2 == 0.0 {
+        return ([0.0; 2], [[0.0; 2]; 2]);
+    }
+    let atom = generated_binomial_ls_order2_at_zero(row.inv_sigma, row.q0, m1, m2, 0.0, 0.0, 0.0);
+    (
+        atom.gradient(),
+        [
+            [atom.hessian_at(0, 0), atom.hessian_at(0, 1)],
+            [atom.hessian_at(1, 0), atom.hessian_at(1, 1)],
+        ],
+    )
 }
 
+/// Production's third call (`binomial_ls_row_third_contracted`).
 #[inline(always)]
 fn generated_third(row: Row) -> [[f64; 2]; 2] {
     let [m1, m2, m3, _] = row.stack;
-    generated_binomial_ls_third_contracted(
-        0.0,
-        0.0,
-        row.q0,
+    if m1 == 0.0 && m2 == 0.0 && m3 == 0.0 {
+        return [[0.0; 2]; 2];
+    }
+    generated_binomial_ls_third_contracted_at_zero(
         row.inv_sigma,
-        0.0,
+        row.q0,
         m1,
         m2,
         m3,
+        0.0,
         0.0,
         &row.direction_u,
     )
 }
 
+/// Production's fourth call (`binomial_ls_row_fourth_contracted`).
 #[inline(always)]
 fn generated_fourth(row: Row) -> [[f64; 2]; 2] {
     let [m1, m2, m3, m4] = row.stack;
-    generated_binomial_ls_fourth_contracted(
-        0.0,
-        0.0,
-        row.q0,
+    if m1 == 0.0 && m2 == 0.0 && m3 == 0.0 && m4 == 0.0 {
+        return [[0.0; 2]; 2];
+    }
+    generated_binomial_ls_fourth_contracted_at_zero(
         row.inv_sigma,
-        0.0,
+        row.q0,
         m1,
         m2,
         m3,
         m4,
+        0.0,
         &row.direction_u,
         &row.direction_v,
     )

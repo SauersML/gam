@@ -7,8 +7,9 @@ use super::weighted_design_products::{mirror_upper_to_lower, xt_diag_x_design, x
 use super::{
     BlockwiseTermFitResult, GamlssLambdaLayout, LOCATION_SCALE_N_OUTPUTS,
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
-    solve_penalizedweighted_projection, spatial_length_scale_term_indices,
+    input_failure, solve_penalizedweighted_projection, spatial_length_scale_term_indices,
 };
+use crate::fit_orchestration::FitFailure;
 use crate::block_layout::block_count::validate_block_count;
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -157,6 +158,11 @@ pub const FAMILY_TWEEDIE_LOCATION_SCALE: &str = "tweedie-location-scale";
 /// oversubscription). Below it the serial map beats the fork/join overhead.
 /// Mirrors the row-chunk guard in
 /// [`row_coeff_operator`](super::gaussian::row_coeff_operator).
+///
+/// Work bound (#2469): result-invariant. Each of its four uses maps every row
+/// through the same row function on either side of it and collects the per-row
+/// values in index order, so everything downstream sees the identical `Vec`
+/// (`parallel_evaluate_matches_serial_reference` exercises the parallel side).
 const DISPERSION_PARALLEL_ROW_THRESHOLD: usize = 1024;
 
 /// Per-row working quantities for both channels at the current `(η_μ, η_d)`.
@@ -2717,9 +2723,9 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
         family: &Self::Family,
         blocks: &[crate::custom_family::ParameterBlockSpec],
         options: &crate::custom_family::BlockwiseFitOptions,
-    ) -> Result<UnifiedFitResult, String> {
+    ) -> Result<UnifiedFitResult, FitFailure> {
         crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
-            .map_err(|error| error.to_string())
+            .map_err(FitFailure::from)
     }
 
     fn meanspec(&self) -> &TermCollectionSpec {
@@ -3025,21 +3031,23 @@ pub fn fit_dispersion_glm_location_scale_terms(
     spec: DispersionGlmLocationScaleTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermFitResult, String> {
+) -> Result<BlockwiseTermFitResult, FitFailure> {
     if let DispersionFamilyKind::Tweedie { p } = spec.kind {
         if !(p.is_finite() && p > 1.0 && p < 2.0) {
-            return Err(format!(
+            return Err(input_failure(format!(
                 "Tweedie location-scale requires a variance power strictly in (1, 2); got p={p}"
-            ));
+            )));
         }
     }
-    validate_dispersion_family_data(spec.kind, &spec.y, &spec.weights)?;
+    // Both validators refuse only what the caller supplied (#2937).
+    validate_dispersion_family_data(spec.kind, &spec.y, &spec.weights).map_err(input_failure)?;
     validate_dispersion_spatial_hyperparameter_request(
         spec.kind,
         &spec.meanspec,
         &spec.log_dispspec,
         kappa_options,
-    )?;
+    )
+    .map_err(|err| input_failure(err.to_string()))?;
     // A dispersion location-scale model is an inherently *predictable* model:
     // posterior-mean prediction (the response-scale predict path the CLI/FFI
     // drive) needs the joint `(β_μ, β_d)` posterior covariance, and so does the
@@ -3230,7 +3238,12 @@ mod tests {
             Ok(_) => panic!("public fit must not silently freeze spatial optimization"),
             Err(error) => error,
         };
-        assert!(public_error.contains("will not silently freeze"));
+        assert!(public_error.to_string().contains("will not silently freeze"));
+        assert_eq!(
+            public_error.category(),
+            gam_problem::FailureCategory::Input,
+            "a refused spatial request is the caller's configuration (#2937)"
+        );
 
         validate_dispersion_spatial_hyperparameter_request(
             DispersionFamilyKind::Gamma,

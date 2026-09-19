@@ -307,7 +307,7 @@ fn weighted_crossprod_dense_view(
     let work = (n as u64)
         .saturating_mul(p_left as u64)
         .saturating_mul(p_right as u64);
-    if rayon::current_num_threads() <= 1 || work < WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS {
+    if work < WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS {
         return weighted_crossprod_dense_rows(left, weights, right, 0..n);
     }
 
@@ -320,18 +320,25 @@ fn weighted_crossprod_dense_view(
     ) else {
         return weighted_crossprod_dense_rows(left, weights, right, 0..n);
     };
-    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-    let partials: Vec<Array2<f64>> = starts
-        .into_par_iter()
-        .map(|start| {
-            weighted_crossprod_dense_rows(left, weights, right, start..(start + chunk_rows).min(n))
-        })
-        .collect();
-    let mut out = Array2::<f64>::zeros((p_left, p_right));
-    for partial in &partials {
-        out += partial;
-    }
-    out
+    // The chunking and the pairwise combine tree are functions of the shape
+    // alone, so the sum's bits are the same at every thread count.
+    crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        crate::parallel::row_reduction_chunk_count(n, chunk_rows),
+        chunk_rows,
+        |chunks| {
+            weighted_crossprod_dense_rows(
+                left,
+                weights,
+                right,
+                chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
+            )
+        },
+        |mut acc, partial| {
+            acc += &partial;
+            acc
+        },
+    )
+    .unwrap_or_else(|| Array2::<f64>::zeros((p_left, p_right)))
 }
 
 fn weighted_crossprod_dense_rows(
@@ -627,7 +634,7 @@ fn sparse_csr_weighted_xtwx(
     let nnz = vals.len() as u64;
     let avg = nnz.checked_div(n.max(1) as u64).unwrap_or(0);
     let work = (n as u64).saturating_mul(avg.saturating_mul(avg));
-    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
+    if work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
         return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     }
 
@@ -640,25 +647,25 @@ fn sparse_csr_weighted_xtwx(
     ) else {
         return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     };
-    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-    let partials: Vec<Array2<f64>> = starts
-        .into_par_iter()
-        .map(|start| {
+    crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        crate::parallel::row_reduction_chunk_count(n, chunk_rows),
+        chunk_rows,
+        |chunks| {
             sparse_csr_weighted_xtwx_rows(
                 row_ptr,
                 col_idx,
                 vals,
                 p,
                 weights,
-                start..(start + chunk_rows).min(n),
+                chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
             )
-        })
-        .collect();
-    let mut xtwx = Array2::<f64>::zeros((p, p));
-    for partial in &partials {
-        xtwx += partial;
-    }
-    xtwx
+        },
+        |mut acc, partial| {
+            acc += &partial;
+            acc
+        },
+    )
+    .unwrap_or_else(|| Array2::<f64>::zeros((p, p)))
 }
 
 fn sparse_csr_weighted_xtwx_rows(
@@ -770,7 +777,7 @@ fn sparse_csr_diag_gram(
     weights: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
     let work = vals.len() as u64;
-    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
+    if work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     }
     let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
@@ -778,25 +785,25 @@ fn sparse_csr_diag_gram(
     else {
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     };
-    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-    let partials: Vec<Array1<f64>> = starts
-        .into_par_iter()
-        .map(|start| {
+    crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        crate::parallel::row_reduction_chunk_count(n, chunk_rows),
+        chunk_rows,
+        |chunks| {
             sparse_csr_diag_gram_rows(
                 row_ptr,
                 col_idx,
                 vals,
                 p,
                 weights,
-                start..(start + chunk_rows).min(n),
+                chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
             )
-        })
-        .collect();
-    let mut diag = Array1::<f64>::zeros(p);
-    for partial in &partials {
-        diag += partial;
-    }
-    diag
+        },
+        |mut acc, partial| {
+            acc += &partial;
+            acc
+        },
+    )
+    .unwrap_or_else(|| Array1::<f64>::zeros(p))
 }
 
 fn sparse_csr_diag_gram_rows(
@@ -1119,6 +1126,17 @@ impl SparseDesignMatrix {
         Some(arc)
     }
 
+    /// The cached CSR view, borrowed. Per-row callers read through this instead of
+    /// [`Self::to_csr_arc`]: cloning the shared `Arc` writes its reference count, and
+    /// under a row-parallel kernel every worker then contends on that one counter for
+    /// every row. The cache is write-once, so the borrow is the same matrix.
+    pub(crate) fn csr_ref(&self) -> Option<&SparseRowMat<usize, f64>> {
+        if self.csr_cache.get().is_none() {
+            self.to_csr_arc()?;
+        }
+        self.csr_cache.get().map(|arc| arc.as_ref())
+    }
+
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
@@ -1159,6 +1177,70 @@ impl AsRef<SparseColMat<usize, f64>> for SparseDesignMatrix {
     fn as_ref(&self) -> &SparseColMat<usize, f64> {
         &self.matrix
     }
+}
+
+/// `out = lhs · rhs` with one sequential faer GEMM: every entry is the same
+/// k-ordered sum whatever the number of rows, so a row range's product equals
+/// that range of the whole product.
+fn sequential_matmul_into(
+    lhs: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+    mut out: ArrayViewMut2<'_, f64>,
+) -> Result<(), MatrixMaterializationError> {
+    if lhs.ncols() != rhs.nrows() || out.dim() != (lhs.nrows(), rhs.ncols()) {
+        return Err(MatrixMaterializationError::MissingRowChunk {
+            context: "row_chunk_matmul_into shape mismatch",
+        });
+    }
+    if lhs.ncols() == 0 {
+        out.fill(0.0);
+        return Ok(());
+    }
+    let mut product = faer::Mat::<f64>::zeros(lhs.nrows(), rhs.ncols());
+    let (left, right) = (FaerArrayView::new(&lhs), FaerArrayView::new(&rhs));
+    matmul(
+        product.as_mut(),
+        Accum::Replace,
+        left.as_ref(),
+        right.as_ref(),
+        1.0,
+        faer::Par::Seq,
+    );
+    for ((i, j), value) in out.indexed_iter_mut() {
+        *value = product[(i, j)];
+    }
+    Ok(())
+}
+
+/// `out = lhs · rhs` with every entry a compensated dot product (Ogita, Rump and
+/// Oishi's Dot2): each product's rounding error is recovered with a fused
+/// multiply-add and each partial sum's with TwoSum, so an entry is as accurate
+/// as a dot product in twice the working precision, rounded once. The order is
+/// fixed, so the result does not depend on the thread count.
+fn compensated_matmul_into(
+    lhs: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+    mut out: ArrayViewMut2<'_, f64>,
+) -> Result<(), MatrixMaterializationError> {
+    if lhs.ncols() != rhs.nrows() || out.dim() != (lhs.nrows(), rhs.ncols()) {
+        return Err(MatrixMaterializationError::MissingRowChunk {
+            context: "compensated row_chunk_matmul_into shape mismatch",
+        });
+    }
+    for ((i, c), value) in out.indexed_iter_mut() {
+        let (mut sum, mut error) = (0.0_f64, 0.0_f64);
+        for (k, &a) in lhs.row(i).iter().enumerate() {
+            let b = rhs[[k, c]];
+            let product = a * b;
+            let product_error = a.mul_add(b, -product);
+            let next = sum + product;
+            let product_part = next - sum;
+            error += (sum - (next - product_part)) + (product - product_part) + product_error;
+            sum = next;
+        }
+        *value = sum + error;
+    }
+    Ok(())
 }
 
 /// Trait for dense-backed design operators that avoid eager materialization.
@@ -1236,6 +1318,23 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         rows: Range<usize>,
         out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), MatrixMaterializationError>;
+
+    /// `rows · rhs` for a row range, written into `out` (`rows.len() × rhs.ncols()`),
+    /// with one row of `rhs` per design column. The default reads the rows through
+    /// [`Self::row_chunk_into`] and multiplies them with one sequential GEMM. An
+    /// operator whose rows are a product of factors overrides it to contract `rhs`
+    /// into its own factors first, keeping the association its `apply` uses
+    /// rather than rounding each materialized row entry before the product.
+    fn row_chunk_matmul_into(
+        &self,
+        rows: Range<usize>,
+        rhs: ArrayView2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        let mut chunk = Array2::<f64>::zeros((rows.end - rows.start, self.ncols()));
+        self.row_chunk_into(rows, chunk.view_mut())?;
+        sequential_matmul_into(chunk.view(), rhs, out)
+    }
 
     /// Extract a dense row chunk without materializing the full matrix.
     /// Non-panicking owned-chunk API built on top of `row_chunk_into`.
@@ -1941,6 +2040,26 @@ impl DenseDesignOperator for DenseDesignMatrix {
                 Ok(())
             }
             Self::Lazy(op) => op.row_chunk_into(rows, out),
+        }
+    }
+
+    fn row_chunk_matmul_into(
+        &self,
+        rows: Range<usize>,
+        rhs: ArrayView2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        // A materialized matrix, or an operator's governed dense memo, is read
+        // directly: the same rows the dense GEMM paths read.
+        if let Some(dense) = self.as_dense_ref() {
+            return sequential_matmul_into(dense.slice(s![rows, ..]), rhs, out);
+        }
+        match self {
+            Self::Lazy(op) => op.row_chunk_matmul_into(rows, rhs, out),
+            // `as_dense_ref` already borrowed every materialized matrix above.
+            Self::Materialized(matrix) => {
+                sequential_matmul_into(matrix.slice(s![rows, ..]), rhs, out)
+            }
         }
     }
 
@@ -3508,6 +3627,41 @@ impl DenseDesignOperator for CoefficientTransformOperator {
         out.assign(&fast_ab(&chunk, &self.transform));
         Ok(())
     }
+
+    /// `(X·T)·rhs` as `X·(T·rhs)`, the association [`LinearOperator::apply`]
+    /// uses: the transform is contracted into `rhs` first, so its rounding lands
+    /// on the few transformed columns rather than on every materialized entry of
+    /// `X·T`. Both products are compensated dot products, so each entry carries
+    /// about one rounding: a sequential GEMM chain over `X`'s and `Q`'s columns
+    /// measured a 2.5-9% higher RMS error than `apply`'s gemv reductions on the
+    /// gauged J·F fixtures (gnomon#2337). A materialized `X·T` is read directly,
+    /// as the default would.
+    ///
+    /// The compensated products are deliberate; do not trade them back for a
+    /// faster plain GEMM. The accuracy bar ruled for this path (gnomon#2337) is a
+    /// gauged J·F RMS error no worse than the former per-column build's plus
+    /// u/√N, and meeting it costs 2.7× the former build's task-clock (4.5× its
+    /// instructions) here, on the path taken only when the design memo is
+    /// refused.
+    fn row_chunk_matmul_into(
+        &self,
+        rows: Range<usize>,
+        rhs: ArrayView2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if rhs.nrows() != self.p_out {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "CoefficientTransformOperator::row_chunk_matmul_into shape mismatch",
+            });
+        }
+        if let Some(combined) = self.materialized_combined() {
+            return sequential_matmul_into(combined.slice(s![rows, ..]), rhs, out);
+        }
+        let mut transformed = Array2::<f64>::zeros((self.transform.nrows(), rhs.ncols()));
+        compensated_matmul_into(self.transform.view(), rhs, transformed.view_mut())?;
+        let inner_rows = self.inner.try_row_chunk(rows)?;
+        compensated_matmul_into(inner_rows.view(), transformed.view(), out)
+    }
 }
 
 // The subtract-form residualised design `C_b · V_b − Σ_{a<b} A_a · R_{a,b}` is
@@ -3760,8 +3914,12 @@ pub use symmetric::*;
 /// with the same key (gam#2515). The pass is `O(n·p)`, negligible beside the
 /// `O(n·p²)` products such caches exist to skip, and bit-exact: `-0.0` and
 /// `+0.0` differ, every NaN payload differs, exactly as the arithmetic that
-/// consumes the matrix would see them.
-pub fn array2_bits_fingerprint(matrix: &ndarray::Array2<f64>) -> u64 {
+/// consumes the matrix would see them. Any storage hashes by its logical
+/// row-major order, so a view and an owned copy of the same values agree and a
+/// caller never copies a large matrix just to fingerprint it.
+pub fn array2_bits_fingerprint<S: ndarray::Data<Elem = f64>>(
+    matrix: &ndarray::ArrayBase<S, ndarray::Ix2>,
+) -> u64 {
     let mut hash = Fnv1a::new();
     hash.absorb(matrix.nrows() as u64);
     hash.absorb(matrix.ncols() as u64);
@@ -3963,7 +4121,7 @@ pub trait LinearOperator {
         if !solution.iter().all(|value| value.is_finite()) {
             return Err("matrix-free PCG produced a non-finite solution".to_string());
         }
-        log::debug!(
+        log::trace!(
             "[matrix-free PCG] solved: p={p} ridge={baseridge:.3e} iters={} rel_resid={:.3e} elapsed={:.3}s",
             info.iterations,
             info.relative_residual_norm,
@@ -4063,13 +4221,13 @@ pub trait LinearOperator {
                     && let Some((solution, info)) = self
                         .solve_system_matrix_free_pcg_within(weights, rhs, penalty, ridge, products)?
                 {
-                    log::debug!(
+                    log::trace!(
                         "[normal-equations] route=pcg p={p} cg_iterations={} budget={products}",
                         info.iterations
                     );
                     return Ok(solution);
                 }
-                log::debug!("[normal-equations] route=dense p={p} budget={products}");
+                log::trace!("[normal-equations] route=dense p={p} budget={products}");
             }
         }
         let mut system = self.diag_xtw_x(weights)?;
@@ -4465,6 +4623,26 @@ impl DenseDesignOperator for DesignMatrix {
         }
     }
 
+    fn row_chunk_matmul_into(
+        &self,
+        rows: Range<usize>,
+        rhs: ArrayView2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        match self {
+            Self::Dense(matrix) => {
+                <DenseDesignMatrix as DenseDesignOperator>::row_chunk_matmul_into(
+                    matrix, rows, rhs, out,
+                )
+            }
+            Self::Sparse(matrix) => {
+                let mut chunk = Array2::<f64>::zeros((rows.end - rows.start, matrix.ncols()));
+                matrix.row_chunk_into(rows, chunk.view_mut())?;
+                sequential_matmul_into(chunk.view(), rhs, out)
+            }
+        }
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         DesignMatrix::to_dense(self)
     }
@@ -4714,6 +4892,17 @@ impl DesignMatrix {
         <Self as LinearOperator>::ncols(self)
     }
 
+    /// Cache token naming this design's contents: the shared-`Arc` identity
+    /// ([`DenseDesignMatrix::cache_identity`]) for a dense design, which every
+    /// clone shares, and the value fingerprint for a sparse one, whose address
+    /// is an allocation rather than a matrix (gam#2515).
+    pub fn cache_token(&self) -> usize {
+        match self {
+            Self::Dense(dense) => dense.cache_identity(),
+            Self::Sparse(sparse) => sparse.value_fingerprint() as usize,
+        }
+    }
+
     /// Extract a dense row chunk without materializing the full matrix.
     ///
     /// Returns a `(rows.len(), ncols())` dense `Array2` for the requested row
@@ -4760,6 +4949,18 @@ impl DesignMatrix {
         out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), MatrixMaterializationError> {
         <Self as DenseDesignOperator>::row_chunk_into(self, rows, out)
+    }
+
+    /// `rows · rhs` for a row range, written into `out`; see
+    /// [`DenseDesignOperator::row_chunk_matmul_into`]. An operator-backed
+    /// design keeps its own association.
+    pub fn row_chunk_matmul_into(
+        &self,
+        rows: Range<usize>,
+        rhs: ArrayView2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        <Self as DenseDesignOperator>::row_chunk_matmul_into(self, rows, rhs, out)
     }
 
     /// Fully materialize this design under the process-wide byte governor.
@@ -4846,7 +5047,7 @@ impl DesignMatrix {
                 // invariant was violated upstream.
                 // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let csr = matrix
-                    .to_csr_arc()
+                    .csr_ref()
                     .expect("DesignMatrix::dot_row: failed to obtain CSR view");
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
@@ -4936,7 +5137,7 @@ impl DesignMatrix {
                 // that `SparseDesignMatrix` is contractually allowed to hold.
                 // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let csr = matrix
-                    .to_csr_arc()
+                    .csr_ref()
                     .ok_or_else(|| format!("DesignMatrix::{method}: failed to obtain CSR view"))?;
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
@@ -4997,10 +5198,10 @@ impl DesignMatrix {
                 // structurally impossible, but the function returns `Result`
                 // so propagate rather than panic if a future invariant break
                 // surfaces here.
-                let lhs_csr = lhs.to_csr_arc().ok_or_else(|| {
+                let lhs_csr = lhs.csr_ref().ok_or_else(|| {
                     "crossdiag_axpy_row_into: failed to obtain lhs CSR view".to_string()
                 })?;
-                let rhs_csr = rhs.to_csr_arc().ok_or_else(|| {
+                let rhs_csr = rhs.csr_ref().ok_or_else(|| {
                     "crossdiag_axpy_row_into: failed to obtain rhs CSR view".to_string()
                 })?;
                 let lhs_sym = lhs_csr.symbolic();
@@ -5047,7 +5248,7 @@ impl DesignMatrix {
                 // Same CSR conversion contract as the (Sparse, Sparse) arm
                 // above — propagate the (structurally impossible) failure
                 // through this fn's `Result` rather than panicking.
-                let csr = sparse_mat.to_csr_arc().ok_or_else(|| {
+                let csr = sparse_mat.csr_ref().ok_or_else(|| {
                     "crossdiag_axpy_row_into: failed to obtain CSR view".to_string()
                 })?;
                 let sym = csr.symbolic();
@@ -5135,7 +5336,7 @@ impl DesignMatrix {
                 // failure for a malformed sparse matrix; `SparseDesignMatrix`
                 // invariants forbid that case.
                 // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
-                let csr = matrix.to_csr_arc().ok_or_else(|| {
+                let csr = matrix.csr_ref().ok_or_else(|| {
                     "DesignMatrix::syr_row_into: failed to obtain CSR view".to_string()
                 })?;
                 let sym = csr.symbolic();
@@ -5226,11 +5427,11 @@ impl DesignMatrix {
                 // upstream guarantee both inputs round-trip to CSR.
                 // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let lhs_csr = lhs
-                    .to_csr_arc()
+                    .csr_ref()
                     .ok_or_else(|| "row_outer_into: failed to obtain lhs CSR view".to_string())?;
                 // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let rhs_csr = rhs
-                    .to_csr_arc()
+                    .csr_ref()
                     .ok_or_else(|| "row_outer_into: failed to obtain rhs CSR view".to_string())?;
                 let lhs_sym = lhs_csr.symbolic();
                 let rhs_sym = rhs_csr.symbolic();
@@ -5813,6 +6014,92 @@ impl From<&DesignMatrix> for DesignBlock {
 
 #[cfg(test)]
 mod tests {
+    /// Words of `product()` on a fresh pool of `width` threads.
+    fn words_at_width<T: Sync>(
+        width: usize,
+        product: impl Fn() -> T + Sync,
+        words: impl Fn(&T) -> Vec<u64> + Sync,
+    ) -> Vec<u64> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .build()
+            .expect("pool");
+        pool.install(|| words(&product()))
+    }
+
+    fn assert_pool_width_invariant<T: Sync>(
+        label: &str,
+        product: impl Fn() -> T + Sync,
+        words: impl Fn(&T) -> Vec<u64> + Sync,
+    ) {
+        let single = words_at_width(1, &product, &words);
+        for width in [2, 3, 8] {
+            assert!(
+                single == words_at_width(width, &product, &words),
+                "{label}: pool width {width} changed the words"
+            );
+        }
+    }
+
+    /// The dense and sparse row reductions chunk their rows by shape alone, so
+    /// their sums carry the same words at every pool width, and agree with a
+    /// single serial pass to rounding.
+    #[test]
+    fn row_reductions_carry_the_same_words_at_every_pool_width() {
+        use ndarray::{Array1, Array2};
+        let n = 200_000usize;
+        let p = 40usize;
+        let weights = Array1::from_shape_fn(n, |i| (0.29 * i as f64).sin() + 0.2);
+
+        let left = Array2::from_shape_fn((60_000, 20), |(i, j)| {
+            ((i * 7 + j * 13) % 29) as f64 / 29.0 - 0.4 + 1e-3 * (i as f64).sqrt()
+        });
+        let right = Array2::from_shape_fn((60_000, 7), |(i, j)| {
+            ((i * 11 + j * 5) % 31) as f64 / 31.0 - 0.6
+        });
+        let dense_weights = weights.slice(ndarray::s![..60_000]).to_owned();
+        let matrix_words = |a: &Array2<f64>| a.iter().map(|v| v.to_bits()).collect::<Vec<u64>>();
+        assert_pool_width_invariant(
+            "weighted_crossprod_dense",
+            || super::weighted_crossprod_dense_view(&left, dense_weights.view(), &right),
+            matrix_words,
+        );
+        let chunked = super::weighted_crossprod_dense_view(&left, dense_weights.view(), &right);
+        let serial =
+            super::weighted_crossprod_dense_rows(&left, dense_weights.view(), &right, 0..60_000);
+        let err = (&chunked - &serial)
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            err <= 1e-9,
+            "chunked dense reduction drifted {err:e} from one serial pass"
+        );
+
+        // Four entries per row at shifting columns: a banded CSR.
+        let mut row_ptr = Vec::with_capacity(n + 1);
+        let mut col_idx = Vec::with_capacity(4 * n);
+        let mut vals = Vec::with_capacity(4 * n);
+        row_ptr.push(0);
+        for i in 0..n {
+            let first = (i * 3) % (p - 4);
+            for k in 0..4 {
+                col_idx.push(first + k);
+                vals.push(((i + 17 * k) % 23) as f64 / 23.0 - 0.3);
+            }
+            row_ptr.push(col_idx.len());
+        }
+        assert_pool_width_invariant(
+            "sparse_csr_weighted_xtwx",
+            || super::sparse_csr_weighted_xtwx(&row_ptr, &col_idx, &vals, n, p, weights.view()),
+            matrix_words,
+        );
+        assert_pool_width_invariant(
+            "sparse_csr_diag_gram",
+            || super::sparse_csr_diag_gram(&row_ptr, &col_idx, &vals, n, p, weights.view()),
+            |d: &Array1<f64>| d.iter().map(|v| v.to_bits()).collect(),
+        );
+    }
+
     #[test]
     fn array2_bits_fingerprint_is_a_value_identity_not_an_address() {
         use ndarray::array;
@@ -7321,5 +7608,139 @@ mod tests {
                 "small-data densification should be permitted", e
             )
         });
+    }
+
+    /// gnomon#2337: `row_chunk_matmul_into` is the row chunk times `rhs` in one
+    /// sequential GEMM, bit for bit, for every design type that does not keep an
+    /// association of its own: the materialized and lazy dense designs, sparse,
+    /// the reparameterized, random-effect, block, multi-channel, conditioned and
+    /// row-wise Kronecker operators, and `DesignMatrix` over dense and sparse. On
+    /// full, partial and one-row ranges and a one- and a four-column `rhs`. The
+    /// coefficient transform, which contracts `rhs` into its transform first, is
+    /// held to accuracy by the survival kernel's J·F gates instead.
+    #[test]
+    fn row_chunk_matmul_into_is_the_row_chunk_times_rhs_bitwise_2337() {
+        let ledger = ledger_read_guard();
+        assert_eq!(*ledger, (), "ledger read guard is held for this test");
+        fn noise(i: usize, j: usize, salt: f64) -> f64 {
+            ((i as f64 * 12.9898 + j as f64 * 78.233 + salt).sin() * 43758.5453).fract() - 0.5
+        }
+        fn sparse_of(dense: &Array2<f64>) -> SparseDesignMatrix {
+            let triplets: Vec<Triplet<usize, usize, f64>> = dense
+                .indexed_iter()
+                .filter(|(_, value)| **value != 0.0)
+                .map(|((i, j), value)| Triplet::new(i, j, *value))
+                .collect();
+            SparseDesignMatrix::new(
+                SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
+                    .expect("sparse fixture"),
+            )
+        }
+        let n = 37;
+        let dense = Array2::from_shape_fn((n, 5), |(i, j)| noise(i, j, 1.0));
+        let other = Array2::from_shape_fn((n, 3), |(i, j)| noise(i, j, 2.0));
+        let holey = Array2::from_shape_fn((n, 5), |(i, j)| {
+            if (i + 2 * j) % 3 == 0 {
+                0.0
+            } else {
+                noise(i, j, 3.0)
+            }
+        });
+        let dense_design = || DesignMatrix::Dense(DenseDesignMatrix::from(dense.clone()));
+        let reparam = || {
+            ReparamOperator::new(
+                dense_design(),
+                Arc::new(Array2::from_shape_fn((5, 3), |(i, j)| noise(i, j, 4.0))),
+            )
+        };
+        let designs: Vec<(&str, Box<dyn DenseDesignOperator>)> = vec![
+            (
+                "dense materialized",
+                Box::new(DenseDesignMatrix::from(dense.clone())),
+            ),
+            (
+                "dense lazy",
+                Box::new(DenseDesignMatrix::from(Arc::new(reparam()))),
+            ),
+            ("design dense", Box::new(dense_design())),
+            (
+                "design sparse",
+                Box::new(DesignMatrix::Sparse(sparse_of(&holey))),
+            ),
+            ("reparam", Box::new(reparam())),
+            (
+                "random effect",
+                Box::new(RandomEffectOperator::new(
+                    (0..n).map(|i| (i % 5 != 2).then_some(i % 4)).collect(),
+                    4,
+                )),
+            ),
+            (
+                "block",
+                Box::new(
+                    BlockDesignOperator::new(vec![
+                        DesignBlock::Dense(DenseDesignMatrix::from(dense.clone())),
+                        DesignBlock::Sparse(sparse_of(&holey)),
+                        DesignBlock::Intercept(n),
+                    ])
+                    .expect("block fixture"),
+                ),
+            ),
+            (
+                "multi-channel",
+                Box::new(
+                    MultiChannelOperator::new(vec![
+                        dense_design(),
+                        DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_shape_fn(
+                            (n, 5),
+                            |(i, j)| noise(i, j, 5.0),
+                        ))),
+                    ])
+                    .expect("multi-channel fixture"),
+                ),
+            ),
+            (
+                "conditioned",
+                Box::new(ConditionedDesign::new(dense_design(), vec![(1, 0.25, 1.5)])),
+            ),
+            (
+                "row-wise Kronecker",
+                Box::new(
+                    RowwiseKroneckerOperator::new(
+                        DesignMatrix::Sparse(sparse_of(&holey)),
+                        Arc::new(other.clone()),
+                    )
+                    .expect("Kronecker fixture"),
+                ),
+            ),
+        ];
+        for (label, design) in &designs {
+            let design: &dyn DenseDesignOperator = &**design;
+            for rows in [0..n, 3..17, 20..21] {
+                for rhs_cols in [1, 4] {
+                    let rhs = Array2::from_shape_fn((design.ncols(), rhs_cols), |(i, j)| {
+                        noise(i, j, 6.0)
+                    });
+                    let mut chunk = Array2::<f64>::zeros((rows.len(), design.ncols()));
+                    design
+                        .row_chunk_into(rows.clone(), chunk.view_mut())
+                        .expect("row chunk");
+                    let mut expected = Array2::<f64>::zeros((rows.len(), rhs_cols));
+                    super::sequential_matmul_into(chunk.view(), rhs.view(), expected.view_mut())
+                        .expect("reference product");
+                    let mut got = Array2::<f64>::zeros((rows.len(), rhs_cols));
+                    design
+                        .row_chunk_matmul_into(rows.clone(), rhs.view(), got.view_mut())
+                        .expect("row chunk product");
+                    for (index, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{label} rows {rows:?} rhs width {rhs_cols} entry {index}: {a:e} vs {b:e}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

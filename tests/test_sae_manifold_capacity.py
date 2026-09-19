@@ -39,7 +39,7 @@ def test_penalized_quasi_laplace_picks_k1_on_one_harmonic_data():
     candidates = [1, 2, 4, 8]
     scores: dict[int, float] = {}
     for k in candidates:
-        fit = gamfit.sae_manifold_fit(
+        fit = gamfit.sae.sae_manifold_fit(
             X=z,
             K=k,
             atom_basis="periodic",

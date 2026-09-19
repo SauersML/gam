@@ -82,19 +82,23 @@ pub struct SurvivalMarginalSlopeTermSpec {
     /// warns), the standard-normal adequacy thresholds, and — through its
     /// `latent_measure` — whether the AUTOMATIC latent-measure gate runs.
     ///
-    /// Under the default `LatentMeasureSpec::Auto` this family runs the SAME
-    /// gate the Bernoulli marginal-slope runs (gam#2768): a Rao score test on
-    /// `E[z|C]` / `Var(z|C)` over the marginal-index span `a(C)`, escalating to
-    /// the conditional location-scale correction `ζ = (z − m(C))/√v(C)` when it
-    /// fires, with the rank inverse-normal transform below it. It is engaged by
+    /// This family runs the SAME latent-law gate the Bernoulli marginal-slope
+    /// runs (gam#2768, gam#2926). Under the default `LatentMeasureSpec::Auto`
+    /// the fit estimates the law of the score on the marginal-index span `a(C)`
+    /// and anchors on it — one global finite law, or local laws by context when
+    /// the law moves on the span — with the score on its own axis.
+    /// `LatentMeasureSpec::StandardNormal` declares the Gaussian closed form,
+    /// refused when the score's conditional moments move on the span and warned
+    /// about, with its excess anchoring loss, when the score fails the adequacy
+    /// screen;
+    /// `ConditionalLocationScale` declares `ζ = (z − m(C))/√v(C)` with an
+    /// empirical residual law. The gate is engaged by
     /// `resolve_survival_latent_score_calibration` (`latent_measure.rs`) on the
-    /// frozen marginal design, before any consumer reads `z`; the decision is
+    /// frozen marginal design, before any consumer reads `z`; a calibration is
     /// carried per score column in
     /// `SurvivalMarginalSlopeFitResult::latent_z_calibrations`, persisted
     /// through `persisted_latent_z_calibrations`, and replayed at predict
-    /// against the marginal block of the q-design. The normalisation is
-    /// therefore NOT the whole of what happens to `z` on this path;
-    /// `LatentMeasureSpec::StandardNormal` is what switches the gate off.
+    /// against the marginal block of the q-design.
     pub latent_z_policy: LatentZPolicy,
     /// A DECLARED finite law of the latent score (gam#2923): nodes and weights
     /// the row index is anchored on as given, in place of anything the
@@ -106,12 +110,6 @@ pub struct SurvivalMarginalSlopeTermSpec {
 }
 
 pub(crate) const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
-
-pub(crate) const SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL: f64 = 1e-12;
-
-pub(crate) const SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL: f64 = 1e-8;
-
-pub(crate) const SURVIVAL_INTERCEPT_LOG_TAIL_THRESHOLD: f64 = 1e-8;
 
 #[inline]
 pub(crate) fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
@@ -209,6 +207,22 @@ pub struct SurvivalMarginalSlopeFitResult {
     /// `latent_measure`, which the shared marginal-slope predictor already
     /// replays by the same anchoring equation.
     pub latent_measure: crate::bms::LatentMeasureKind,
+    /// The certified compression the fit anchored on in place of a declared law
+    /// with many atoms (gam#2928): atoms, bins and nodes, and the certified
+    /// anchor error at every row's converged inputs against the anchor's
+    /// sampling error. [`Self::latent_measure`] is then the compressed law, which
+    /// is what the coefficients are defined against. `None` for a law anchored
+    /// as declared.
+    pub(crate) latent_law_compression:
+        Option<crate::latent_law_compression::DeclaredLawCompressionRecord>,
+    /// The declared atoms a compressed fit was certified against (gam#2928),
+    /// persisted beside the compressed law it anchored on; `None` for a law
+    /// anchored as declared, which [`Self::latent_measure`] already is.
+    pub(crate) declared_latent_law: Option<crate::bms::EmpiricalZGrid>,
+    /// Which latent law the fit consumed (gam#2926): the estimated law of the
+    /// score, a declared finite law, the declared conditional location-scale
+    /// law, or the declared Gaussian closed form. Persisted with the model.
+    pub latent_law_consumed: crate::bms::LatentLawConsumed,
     /// Whether the conditioning span `a(C)` the conditional calibration was fit
     /// against is the span prediction will rebuild (gam#2768).
     ///
@@ -270,13 +284,10 @@ pub struct SurvivalMarginalSlopeFitResult {
 }
 
 impl SurvivalMarginalSlopeFitResult {
-    /// Split [`Self::latent_z_calibrations`] into the single-surface pair the
-    /// on-disk model contract carries (`latent_z_rank_int_calibration`,
-    /// `latent_z_conditional_calibration`).
-    ///
-    /// The two are mutually exclusive per score column by construction: the gate
-    /// escalates to the conditional location-scale correction *instead of*
-    /// rank-INT, never alongside it.
+    /// The single-surface calibration the on-disk model contract carries
+    /// (`latent_z_conditional_calibration`) out of
+    /// [`Self::latent_z_calibrations`]. Only the declared conditional
+    /// location-scale law calibrates a score (gam#2926).
     ///
     /// `K > 1` is a refusal, not a truncation. The saved payload carries one
     /// `z_column`, one slope term collection and one calibration, so a
@@ -287,13 +298,7 @@ impl SurvivalMarginalSlopeFitResult {
     /// the point of loss.
     pub fn persisted_latent_z_calibrations(
         &self,
-    ) -> Result<
-        (
-            Option<crate::bms::LatentZRankIntCalibration>,
-            Option<crate::bms::LatentZConditionalCalibration>,
-        ),
-        String,
-    > {
+    ) -> Result<Option<crate::bms::LatentZConditionalCalibration>, String> {
         split_persisted_latent_calibrations(
             &self.latent_z_calibrations,
             self.latent_conditioning_reproducible,
@@ -338,30 +343,23 @@ impl SurvivalMarginalSlopeFitResult {
 pub(crate) fn split_persisted_latent_calibrations(
     calibrations: &[crate::bms::LatentMeasureCalibration],
     conditioning_reproducible: bool,
-) -> Result<
-    (
-        Option<crate::bms::LatentZRankIntCalibration>,
-        Option<crate::bms::LatentZConditionalCalibration>,
-    ),
-    String,
-> {
+) -> Result<Option<crate::bms::LatentZConditionalCalibration>, String> {
     {
         use crate::bms::LatentMeasureCalibration;
         for (column, calibration) in calibrations.iter().enumerate().skip(1) {
             if !matches!(calibration, LatentMeasureCalibration::None) {
                 return Err(format!(
-                    "survival marginal-slope latent-score column {column} carries an automatic \
-                     latent calibration, but the saved-model contract holds exactly one score \
-                     surface: persisting this fit would give prediction an uncalibrated axis for \
-                     that column and a different model from the one that was fitted. Fit the \
-                     multi-surface model without the automatic gate \
-                     (LatentMeasureSpec::StandardNormal) if it must be saved"
+                    "survival marginal-slope latent-score column {column} carries a conditional \
+                     location-scale calibration, but the saved-model contract holds exactly one \
+                     score surface: persisting this fit would give prediction an uncalibrated axis \
+                     for that column and a different model from the one that was fitted. Fit the \
+                     multi-surface model without latent_measure=\"conditional-location-scale\" if \
+                     it must be saved"
                 ));
             }
         }
         Ok(match calibrations.first() {
-            None | Some(LatentMeasureCalibration::None) => (None, None),
-            Some(LatentMeasureCalibration::RankInverseNormal(cal)) => (Some(cal.clone()), None),
+            None | Some(LatentMeasureCalibration::None) => None,
             Some(LatentMeasureCalibration::ConditionalLocationScale(cal)) => {
                 if !conditioning_reproducible {
                     return Err(
@@ -375,7 +373,7 @@ pub(crate) fn split_persisted_latent_calibrations(
                             .to_string(),
                     );
                 }
-                (None, Some(cal.clone()))
+                Some(cal.clone())
             }
         })
     }
@@ -383,7 +381,7 @@ pub(crate) fn split_persisted_latent_calibrations(
 
 pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] fit start n={} marginal_terms={} slope_terms={}",
         n,
         spec.marginalspec.linear_terms.len()

@@ -100,10 +100,11 @@ fn headers() -> Vec<String> {
     HEADERS.iter().map(|s| s.to_string()).collect()
 }
 
-/// A landmarked cohort: every row enters at the landmark `0`, follow-up is
-/// administrative censoring uniform on (0.05, 5.5) years with a light loss to
-/// follow-up, and events follow a constant proportional hazard.
-fn build_cohort(seed: u64) -> Cohort {
+/// A landmarked cohort: every row enters at `entry` (the landmark `0`, or a
+/// delayed entry just after it), follow-up is administrative censoring uniform
+/// on (0.05, 5.5) years with a light loss to follow-up, and events follow a
+/// constant proportional hazard.
+fn build_cohort(seed: u64, entry: f64) -> Cohort {
     let mut state = seed;
     let mut age = Vec::with_capacity(N);
     let mut sex = Vec::with_capacity(N);
@@ -139,8 +140,8 @@ fn build_cohort(seed: u64) -> Cohort {
         exit.push(observed);
         event.push(happened);
         rows.push(record([
-            0.0,
-            observed,
+            entry,
+            entry + observed,
             f64::from(u8::from(happened)),
             age[i],
             sex[i],
@@ -383,7 +384,7 @@ fn assert_continuous_at_origin(label: &str, report: &Report) {
 fn landmark_marginal_slope_is_calibrated_at_short_horizons_and_continuous_at_origin_2336() {
     // Before anything that can touch the global rayon pool.
     super::initialize_cpu_fitting();
-    let cohort = build_cohort(SEED);
+    let cohort = build_cohort(SEED, 0.0);
     let default_anchor = fit_and_report(
         "marginal-slope anchor=default",
         &cohort,
@@ -417,7 +418,7 @@ fn landmark_marginal_slope_is_calibrated_at_short_horizons_and_continuous_at_ori
 fn landmark_transformation_reference_is_calibrated_at_short_horizons_2336() {
     // Before anything that can touch the global rayon pool.
     super::initialize_cpu_fitting();
-    let cohort = build_cohort(SEED);
+    let cohort = build_cohort(SEED, 0.0);
     let report = fit_and_report(
         "transformation",
         &cohort,
@@ -429,4 +430,76 @@ fn landmark_transformation_reference_is_calibrated_at_short_horizons_2336() {
     );
     assert_calibrated("transformation", &cohort, &report);
     assert_continuous_at_origin("transformation", &report);
+}
+
+/// #979 ruling (c): the same cohort entering just after the landmark, at `1e-6`, is
+/// fitted as delayed entry and ends on a boundary mode whose quadratic posterior is
+/// improper and whose boundary-mode approximation its own certificate refuses. That
+/// model is saved with its mode instead of refused. It keeps the typed decline that
+/// says why its moments are unavailable at the boundary, with the refused
+/// certificate's overturn tail mass, gives finite plug-in predictions, and still
+/// refuses posterior moments.
+#[test]
+fn landmark_delayed_entry_boundary_mode_is_saved_with_its_decline_2336() {
+    // Before anything that can touch the global rayon pool.
+    super::initialize_cpu_fitting();
+    gam_runtime::test_support::install_diagnostic_logger();
+    #[cfg(target_os = "macos")]
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+    let cohort = build_cohort(SEED, 1e-6);
+    let payload =
+        fit_formula_to_payload(FORMULA.to_string(), &cohort.data, &marginal_slope_config())
+            .unwrap_or_else(|error| {
+                panic!("gnomon#2336 delayed entry: the boundary-mode fit was not saved: {error}")
+            });
+    let fit = payload
+        .fit_result
+        .clone()
+        .expect("the saved payload carries its fit");
+    let decline = fit
+        .posterior_moment_decline()
+        .expect("the delayed-entry fit ends on a boundary mode under a moment decline");
+    let refusal = decline
+        .boundary_approximation_refusal
+        .as_ref()
+        .expect("the decline records why no boundary-mode approximation was published");
+    let certificate = refusal
+        .certificate
+        .as_ref()
+        .unwrap_or_else(|| panic!("the refusal carries its measured certificate: {refusal}"));
+    eprintln!(
+        "[2336 delayed entry] {} | overturn tail mass {:e} against tolerance {:e}",
+        decline.summary(),
+        certificate.overturn_tail_mass,
+        certificate.tolerance
+    );
+    assert!(
+        refusal.reason.contains("not certified")
+            && certificate.overturn_tail_mass > certificate.tolerance
+            && certificate.overturn_tail_mass <= 1.0,
+        "the recorded overturn tail mass {:e} must be the probability that refused the \
+         approximation at tolerance {:e}: {refusal}",
+        certificate.overturn_tail_mass,
+        certificate.tolerance
+    );
+    assert!(
+        decline.summary().contains("no boundary-mode approximation"),
+        "the decline summary must name the refused approximation: {}",
+        decline.summary()
+    );
+    assert!(
+        fit.require_posterior_mean("survival posterior mean").is_err(),
+        "a saved boundary mode has no posterior mean to report"
+    );
+
+    let model = FittedModel::from_payload(payload);
+    let predictions = predict_on(&model, &cohort.data, &HORIZONS)
+        .unwrap_or_else(|error| panic!("gnomon#2336 delayed entry: plug-in prediction: {error}"));
+    assert!(
+        predictions
+            .cumulative_hazard
+            .iter()
+            .all(|hazard| hazard.is_finite() && *hazard >= 0.0),
+        "plug-in predictions at the saved mode must be finite cumulative hazards"
+    );
 }

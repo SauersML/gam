@@ -181,6 +181,8 @@ fn mfixture(is_score_warp: bool) -> MFixture {
     };
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
+        search: None,
         y: Arc::new(Array1::from_vec(vec![1.0])),
         weights: Arc::new(Array1::from_vec(vec![1.0])),
         z: Arc::new(Array1::from_vec(vec![0.45])),
@@ -524,6 +526,8 @@ fn build_fixture_with_runtime(is_score_warp: bool, runtime: DeviationRuntime) ->
     };
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
+        search: None,
         y: Arc::new(Array1::from_vec(vec![1.0])),
         weights: Arc::new(Array1::from_vec(vec![1.0])),
         z: Arc::new(Array1::from_vec(vec![0.45])),

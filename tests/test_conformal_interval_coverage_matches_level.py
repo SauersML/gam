@@ -1,6 +1,6 @@
 """``predict(interval="conformal", conformal_level=L)`` must cover ~``L``.
 
-Without a calibration fold the conformal route is the exact full-conformal set
+With ``training_data`` (the training table) the conformal route is the exact full-conformal set
 at the fitted smoothing parameters (``gam_predict::conformal_routes``, shared
 with ``gam predict --conformal``), built at ``alpha = 1 - conformal_level``. The
 jackknife+ route this path replaced over-covered at ``(1+L)/2`` because it
@@ -37,12 +37,16 @@ def test_conformal_interval_coverage_matches_requested_level() -> None:
     for _ in range(seeds):
         xtr = rng.uniform(0.0, 1.0, n_train)
         ytr = _truef(xtr) + rng.normal(0.0, 0.3, n_train)
-        model = gamfit.fit(pd.DataFrame({"x": xtr, "y": ytr}), "y ~ s(x)")
+        train = pd.DataFrame({"x": xtr, "y": ytr})
+        model = gamfit.fit(train, "y ~ s(x)")
 
         xte = rng.uniform(0.0, 1.0, n_test)
         yte = _truef(xte) + rng.normal(0.0, 0.3, n_test)
         out = model.predict(
-            pd.DataFrame({"x": xte}), interval="conformal", conformal_level=level
+            pd.DataFrame({"x": xte}),
+            interval="conformal",
+            training_data=train,
+            conformal_level=level,
         )
         lo = np.asarray(out["posterior_mean_lower"], dtype=float)
         hi = np.asarray(out["posterior_mean_upper"], dtype=float)

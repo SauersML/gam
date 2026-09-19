@@ -136,6 +136,10 @@ pub(crate) struct JointHessianBundle<'a> {
                 + Sync,
         >,
     >,
+    /// The outer Hessian's second-order correction traces from the workspace's
+    /// own row kernels (gam#2922), when it has them. Threaded through to
+    /// `OwnedJointDerivProvider`.
+    pub(crate) owned_second_correction_traces: Option<Arc<DriftSecondCorrectionTracesFn>>,
     pub(crate) rho_curvature_scale: f64,
     pub(crate) hessian_logdet_correction: f64,
 }
@@ -155,6 +159,15 @@ pub(crate) type DriftSecondDerivManyFn<'a> = dyn Fn(&[(Array1<f64>, Array1<f64>)
     + Send
     + Sync
     + 'a;
+
+/// `tr(Fᵀ·C·F)` of each `(v_k, v_l, u_kl)` triple's second-order correction
+/// `C` against the logdet factor `F` (gam#2922); `None` when unavailable.
+pub(crate) type DriftSecondCorrectionTracesFn = dyn Fn(
+        &Array2<f64>,
+        &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Option<Vec<f64>>, CustomFamilyError>
+    + Send
+    + Sync;
 
 /// Cheap, deterministic non-finite-curvature probe for the joint Hessian
 /// source (gam#1088). A `NaN`/`Inf` in the penalized Hessian `H_pen = H +
@@ -609,6 +622,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
             owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
             owned_compute_d2h_many: None,
+            owned_second_correction_traces: None,
             rho_curvature_scale: curvature.rho_curvature_scale,
             hessian_logdet_correction: curvature.hessian_logdet_correction,
         }));
@@ -677,6 +691,8 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
         let compute_d2h_many = exact_newton_d2h_many_closure(1.0, hessian_workspace.clone());
         let owned_compute_d2h_many =
             exact_newton_d2h_many_closure_owned(1.0, hessian_workspace.clone());
+        let owned_second_correction_traces =
+            exact_newton_second_correction_traces_closure_owned(1.0, hessian_workspace.clone());
         return Ok(Some(JointHessianBundle {
             source: h_joint_unpen,
             beta_flat,
@@ -688,6 +704,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
             owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
             owned_compute_d2h_many,
+            owned_second_correction_traces,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -801,6 +818,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
             owned_compute_dh_many: None,
             owned_compute_d2h: Some(owned_compute_d2h),
             owned_compute_d2h_many: None,
+            owned_second_correction_traces: None,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -1143,6 +1161,74 @@ pub(crate) fn exact_newton_d2h_many_closure_owned(
             })
             .collect()
     }))
+}
+
+/// The second-order correction traces from the workspace's row kernels
+/// (gam#2922), for the drifts the `scale`d workspace closures above form.
+///
+/// The correction for `(v_k, v_l, u_kl)` is `D_β H[u_kl] + D²_β H[−v_l, −v_k]`
+/// (`joint_second_derivative_correction_result`), so its trace against `F` is
+/// the workspace's trace with mode `u_kl` at the direction pair `(v_l, v_k)`:
+/// the two sign flips cancel in the bilinear term. The distinct `v` directions
+/// are passed once each, so the kernel reads all K(K+1)/2 pairs off one
+/// contraction per row. The closure answers `None` when the workspace has no
+/// such kernel.
+pub(crate) fn exact_newton_second_correction_traces_closure_owned(
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Option<Arc<DriftSecondCorrectionTracesFn>> {
+    let workspace = workspace?;
+    Some(Arc::new(
+        move |factor: &Array2<f64>, triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)]| {
+            let total = factor.nrows();
+            let mut second_modes = Array2::<f64>::zeros((total, triples.len()));
+            let mut distinct: Vec<&Array1<f64>> = Vec::new();
+            let mut pairs = Vec::with_capacity(triples.len());
+            for (column, (v_k, v_l, u_kl)) in triples.iter().enumerate() {
+                second_modes.column_mut(column).assign(u_kl);
+                let l = distinct_direction_index(&mut distinct, v_l);
+                let k = distinct_direction_index(&mut distinct, v_k);
+                pairs.push((l, k));
+            }
+            let mut directions = Array2::<f64>::zeros((total, distinct.len()));
+            for (column, direction) in distinct.iter().enumerate() {
+                directions.column_mut(column).assign(*direction);
+            }
+            let Some(traces) = workspace.projected_second_correction_traces(
+                factor,
+                &second_modes,
+                &directions,
+                &pairs,
+            )?
+            else {
+                return Ok(None);
+            };
+            if traces.len() != triples.len() {
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "second-order correction traces: {} traces for {} triples",
+                        traces.len(),
+                        triples.len()
+                    ),
+                });
+            }
+            Ok(Some(traces.iter().map(|trace| scale * trace).collect()))
+        },
+    ))
+}
+
+/// The index of `direction` among `distinct`, appending it the first time it
+/// is seen. Equality is exact, so a direction repeated across triples is one
+/// column of the second-order kernel's direction matrix.
+fn distinct_direction_index<'d>(
+    distinct: &mut Vec<&'d Array1<f64>>,
+    direction: &'d Array1<f64>,
+) -> usize {
+    if let Some(index) = distinct.iter().position(|seen| *seen == direction) {
+        return index;
+    }
+    distinct.push(direction);
+    distinct.len() - 1
 }
 
 pub(crate) fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
@@ -2341,23 +2427,27 @@ pub(crate) fn joint_objective_roundoff_slack(
 ///
 /// # The ceiling, which is not a chosen constant
 ///
-/// Rounding in a sum of `m` terms is bounded by `m·ε·Σ|terms|` — the textbook
-/// forward-error bound for the summation the evaluation performs. Both factors
-/// are facts about this evaluation: `m` is the number of rows it sums over, and
-/// `Σ|terms|` is bounded by the magnitudes the objective accumulates. So no
-/// rounding claim above `m·ε·Σ|terms|` can be true, whatever a ladder appears
+/// Rounding in a sum of `m` terms is bounded by `γ_m·Σ|terms|`, with
+/// `γ_m = m·u/(1 − m·u)` — the textbook forward-error bound for the summation
+/// the evaluation performs, in the roundoff owner's denomination. Both factors
+/// are facts about this evaluation: `m` is the number of summands it charges,
+/// and `Σ|terms|` is bounded by the magnitudes the objective accumulates. So no
+/// rounding claim above `γ_m·Σ|terms|` can be true, whatever a ladder appears
 /// to show.
 ///
 /// The accumulation is NOT `|F|`, which is the whole content of gam#2612: the
-/// penalty `½βᵀS_λβ` is evaluated as `β·(S_λβ)` with signed `S_ij`, so it
-/// accumulates at scale `max|S_λ|·‖β‖₁²` while returning `O(10)`. That term is
-/// carried explicitly here, which is what keeps the ceiling far above the
-/// resolutions gam#2612 was opened to measure (its banded witness measures
-/// `1.5e-10` against a ceiling of `O(1e-5)`) while refusing this one by nine
-/// orders.
+/// penalty `½βᵀS_λβ` is evaluated as `β·(S_λβ)` with signed `S_ij`, so it sums
+/// `½Σ|β_i S_ij β_j|` while returning `O(10)`. That term is carried explicitly
+/// here, as each endpoint's own sum from one pass over the entries (gam#2959),
+/// which is what keeps the ceiling far above the resolutions gam#2612 was
+/// opened to measure (its banded witness measures `6.1e-11` against a ceiling
+/// of `1.2e-6`) while refusing this one by nine orders. The cruder
+/// `max|S_λ|·‖β‖₁²` it replaced sat four decades higher on the survival
+/// marginal-slope fixture and admitted an evaluator gap (gam#2952) as rounding.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ObjectiveAccumulation {
-    /// Number of terms the likelihood summation accumulates.
+    /// Number of summands charged: the likelihood's rows, plus the penalty entries
+    /// when a caller charges an explicit accumulation of `½βᵀS_λβ`.
     pub(crate) summed_terms: usize,
     /// An upper bound on `Σ|terms|` over everything the evaluation accumulates:
     /// the objective values themselves plus the penalty's own cancellation
@@ -2377,8 +2467,15 @@ pub(crate) struct ObjectiveAccumulation {
 }
 
 impl ObjectiveAccumulation {
-    /// `m·ε·(1 + Σ|terms|) + logdet_roundoff` — the largest rounding one
-    /// evaluation can carry.
+    /// `γ_m·Σ|terms| + logdet_roundoff` — the largest rounding one evaluation can
+    /// carry, with `γ_m = m·u/(1 − m·u)` from the roundoff owner
+    /// ([`gam_linalg::roundoff::accumulation_growth`]).
+    ///
+    /// `m` is the number of summands charged. Any parenthesization of an
+    /// `m`-term sum rounds by at most `γ_m·Σ|terms|`, so one `γ_m` covers a
+    /// sequential and a tree reduction alike. The magnitude carries no additive
+    /// constant: a sum whose summands are all zero is exact, and a `+1` inside
+    /// would set a floor unrelated to what was summed (gam#2959).
     ///
     /// Non-finite or absurd inputs yield `f64::INFINITY`, i.e. no ceiling: this
     /// guard exists to refuse an impossible measurement, never to suppress a
@@ -2387,8 +2484,36 @@ impl ObjectiveAccumulation {
         if !self.magnitude.is_finite() || !self.logdet_roundoff.is_finite() {
             return f64::INFINITY;
         }
-        let terms = (self.summed_terms.max(1) as f64).max(1.0);
-        terms * f64::EPSILON * (1.0 + self.magnitude.abs()) + self.logdet_roundoff.max(0.0)
+        let growth = gam_linalg::roundoff::accumulation_growth(self.summed_terms.max(1));
+        if !(growth.is_finite() && growth >= 0.0) {
+            return f64::INFINITY;
+        }
+        growth * self.magnitude.abs() + self.logdet_roundoff.max(0.0)
+    }
+
+    /// What comparing one evaluation of `F = −ℓ + ½βᵀS_λβ − Φ` at each of two
+    /// coefficient vectors accumulates (gam#2748, gam#2959).
+    ///
+    /// The summands are the likelihood's rows and every penalty entry. The
+    /// magnitude is both objective values plus what each endpoint's `½βᵀS_λβ`
+    /// summed, `½Σ|β_i S_ij β_j|` from one explicit pass
+    /// ([`crate::blockwise_solve::total_quadratic_penalty_with_accumulation`]).
+    /// The log-determinant rounding is both endpoints' certified bound.
+    pub(crate) fn between_endpoints(
+        likelihood_rows: usize,
+        penalty_entries: usize,
+        objectives: [f64; 2],
+        penalty_accumulations: [f64; 2],
+        logdet_roundoffs: [f64; 2],
+    ) -> Self {
+        Self {
+            summed_terms: likelihood_rows + penalty_entries,
+            magnitude: objectives[0].abs()
+                + objectives[1].abs()
+                + penalty_accumulations[0]
+                + penalty_accumulations[1],
+            logdet_roundoff: logdet_roundoffs[0] + logdet_roundoffs[1],
+        }
     }
 }
 
@@ -3039,7 +3164,7 @@ pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
         return Ok(JointFeasibilityLimit::Unlimited);
     }
     if joint_alpha <= 0.0 {
-        log::debug!(
+        log::trace!(
             "[PIRLS/joint-Newton] feasibility blocked by an active face (block {:?}); \
              leaving the step for the cone projection",
             limiting_block,
@@ -3049,7 +3174,7 @@ pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
         });
     }
     trial_delta.mapv_inplace(|v| joint_alpha * v);
-    log::debug!(
+    log::trace!(
         "[PIRLS/joint-Newton] feasibility scaled joint step by α={:.3e} (block {:?} binding)",
         joint_alpha,
         limiting_block,
@@ -3176,19 +3301,67 @@ pub(crate) fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> boo
 /// the strictly weaker premise — and the guard is sequenced first, so on a
 /// roundoff-floor optimum the certificate never ran. Restating a stopping rule in
 /// two places is what let them disagree; keep it in one.
+///
+/// Both sites pass the settling head's decrement resolution (#2977): each marks a
+/// state tentative for a head that settles on
+/// [`joint_newton_decrements_at_resolution`], and a looser bar here only marks
+/// states that head revokes.
 pub(crate) fn joint_newton_decrement_certifies(
     decrement: f64,
     weakly_identified_decrement: f64,
     numerical_null_stationarity: f64,
-    objective_tol: f64,
+    decrement_resolution: DecrementResolution,
     residual_tol: f64,
 ) -> bool {
-    decrement.is_finite()
-        && decrement <= objective_tol
-        && weakly_identified_decrement.is_finite()
-        && weakly_identified_decrement <= objective_tol
+    joint_newton_decrements_at_resolution(decrement, weakly_identified_decrement, decrement_resolution)
         && numerical_null_stationarity.is_finite()
         && numerical_null_stationarity <= residual_tol
+}
+
+/// Whether the Newton decrements over the identified and the weakly identified
+/// modes are each within their resolution: the decrement arm of the
+/// returned-mode settlement, and of the certificates that mark states for it.
+pub(crate) fn joint_newton_decrements_at_resolution(
+    decrement: f64,
+    weakly_identified_decrement: f64,
+    decrement_resolution: DecrementResolution,
+) -> bool {
+    decrement.is_finite()
+        && decrement <= decrement_resolution.identified
+        && weakly_identified_decrement.is_finite()
+        && weakly_identified_decrement <= decrement_resolution.weakly_identified
+}
+
+/// The smallest Newton decrement that promises a correction the returned state
+/// can act on, one per mode set (#2977).
+///
+/// A decrement settles when it is within the rounding its own inputs carry
+/// ([`whitened_spectrum::WhitenedHessianSpectrum::decrement_rounding_bands`]),
+/// so that it is indistinguishable from zero, or within the change one
+/// evaluation of the objective resolves, so that no trust region can referee the
+/// correction (#2695). Each mode set has its own band: the weakly identified
+/// modes' small curvatures magnify their inputs' rounding, and a band shared with
+/// the identified modes would loosen those by it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DecrementResolution {
+    /// The resolution of the decrement over the identified modes.
+    pub(crate) identified: f64,
+    /// The resolution of the decrement over the weakly identified modes.
+    pub(crate) weakly_identified: f64,
+}
+
+impl DecrementResolution {
+    /// Each band raised to `objective_resolution`, the change one evaluation of
+    /// the objective resolves at the returned state: a correction whose promised
+    /// decrease one evaluation cannot resolve is no correction the trust region
+    /// can referee (#2695).
+    pub(crate) fn with_objective_resolution(self, objective_resolution: f64) -> Self {
+        let floor = if objective_resolution.is_finite() { objective_resolution.max(0.0) } else { 0.0 };
+        Self {
+            identified: self.identified.max(floor),
+            weakly_identified: self.weakly_identified.max(floor),
+        }
+    }
 }
 
 /// Per-iterate diagnostic snapshot assembled when the joint Newton inner solve
@@ -3544,7 +3717,7 @@ pub(crate) mod whitened_spectrum {
                 .count();
             if band_modes > 0 {
                 let cert_null_modes = gamma.iter().filter(|g| g.abs() <= null_cutoff).count();
-                log::warn!(
+                log::debug!(
                     "[joint-newton spectrum gam#979] λ_max={:.6e} null_cutoff={:.6e} numerical_floor={:.6e} band_modes={} cert_null_modes={} (band now resolved by the step; cert still classifies on null_cutoff)",
                     lambda_max_abs,
                     null_cutoff,
@@ -3781,6 +3954,77 @@ pub(crate) mod whitened_spectrum {
                 }
             }
             0.5 * acc
+        }
+
+        /// The rounding the two Newton decrements carry, given the rounding band
+        /// `rhs_band` of the right-hand side this spectrum was decomposed with,
+        /// per coordinate and in that right-hand side's own coordinates (#2977).
+        ///
+        /// Each decrement is `½ Σ_k c_k²/|γ_k|` over its mode set, with
+        /// `c = Vᵀ D^{-1/2} rhs`. A right-hand side read to within `b` moves each
+        /// `c_k` by at most `δc_k = Σ_i |v_ik| D^{-1/2}_i b_i`, so `c_k²` by at most
+        /// `δc_k (2|c_k| + δc_k)`. The eigensolver resolves each `γ_k` to within the
+        /// spectrum's numerical floor `f` (Weyl), which moves `1/|γ_k|` by at most
+        /// `f / (|γ_k| (|γ_k| − f))`. Summing both over the mode set and adding the
+        /// sum's own rounding gives the band: a decrement within it is
+        /// indistinguishable from zero on the arithmetic that formed it. The
+        /// rounding of the eigenvectors, of `D`, and of the right-hand side's
+        /// terms before their sum is not charged, so the band can only be too
+        /// narrow, never settle a resolvable correction.
+        ///
+        /// Measured on ad-2627a's settle-head print (job 1232311): of 59,466
+        /// constrained revokes whose residual met its target, 32,644 had an
+        /// identified decrement within `P/2`, where `P` is this band without the
+        /// `½` and with the first-order Weyl term `c²f/γ²` (so this band is at
+        /// least `P/2`), and `64ε(1 + 2|f|)` revoked every one of them.
+        pub(crate) fn decrement_rounding_bands(
+            &self,
+            rhs_band: &Array1<f64>,
+        ) -> Result<DecrementResolution, CustomFamilyError> {
+            let p = self.gamma.len();
+            if rhs_band.len() != p {
+                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                    "decrement rounding bands: right-hand-side band has {} coordinates for a \
+                     spectrum of dimension {p}",
+                    rhs_band.len()
+                ) });
+            }
+            let numerical_floor = joint_hessian_numerical_eigenvalue_floor(self.lambda_max_abs, p);
+            let whitened_band: Vec<f64> =
+                (0..p).map(|i| self.d_inv_sqrt[i] * rhs_band[i].abs()).collect();
+            let (mut identified, mut weak) = (0.0_f64, 0.0_f64);
+            let (mut identified_terms, mut weak_terms) = (0usize, 0usize);
+            let (mut identified_decrement, mut weak_decrement) = (0.0_f64, 0.0_f64);
+            for k in 0..p {
+                let abs_gamma = self.gamma[k].abs();
+                if abs_gamma <= numerical_floor {
+                    continue;
+                }
+                let coefficient = self.c[k].abs();
+                let coefficient_band: f64 =
+                    (0..p).map(|i| self.evecs[[i, k]].abs() * whitened_band[i]).sum();
+                let term = 0.5 * coefficient * coefficient / abs_gamma;
+                let band = 0.5
+                    * (coefficient_band * (2.0 * coefficient + coefficient_band) / abs_gamma
+                        + (coefficient + coefficient_band).powi(2) * numerical_floor
+                            / (abs_gamma * (abs_gamma - numerical_floor)));
+                if abs_gamma > self.null_cutoff {
+                    identified += band;
+                    identified_terms += 1;
+                    identified_decrement += term;
+                } else {
+                    weak += band;
+                    weak_terms += 1;
+                    weak_decrement += term;
+                }
+            }
+            Ok(DecrementResolution {
+                identified: identified
+                    + gam_linalg::roundoff::accumulation_growth(identified_terms.max(1))
+                        * identified_decrement,
+                weakly_identified: weak
+                    + gam_linalg::roundoff::accumulation_growth(weak_terms.max(1)) * weak_decrement,
+            })
         }
 
         /// Infinity norm of the original-coordinate score carried by the
@@ -4413,7 +4657,7 @@ mod trust_region_subproblem_tests {
                 spec.newton_decrement(),
                 spec.weakly_identified_decrement(),
                 null_stationarity,
-                1.0,
+                super::DecrementResolution { identified: 1.0, weakly_identified: 1.0 },
                 1e-8,
             ),
             "a null Hessian direction with non-zero score is locally linear, not converged"
@@ -4428,11 +4672,83 @@ mod trust_region_subproblem_tests {
                 gauge_spec.newton_decrement(),
                 gauge_spec.weakly_identified_decrement(),
                 gauge_spec.numerical_null_stationarity_inf(),
-                1.0,
+                super::DecrementResolution { identified: 1.0, weakly_identified: 1.0 },
                 1e-8,
             ),
             "a structurally invariant null direction has zero score and remains admissible"
         );
+    }
+
+    /// #2977: a Newton decrement settles within the rounding its own inputs
+    /// carry, and a decrement well above that band does not.
+    ///
+    /// On a diagonal `H` with metric `D` the whitened eigenbasis is the
+    /// coordinate basis, so each mode's band has a closed form to check against:
+    /// `½ [b̃ (2|c| + b̃)/γ + (|c| + b̃)² f / (γ (γ − f))]` with `c = rᵢ/√Dᵢ`,
+    /// `b̃ = bᵢ/√Dᵢ`, `γ = Hᵢᵢ/Dᵢ` and `f` the spectrum's numerical floor, plus the
+    /// sum's own rounding. A right-hand side read to within `b ~ 1e-5` and lying
+    /// inside that band promises a decrement of `2.0e-11`: the objective-scaled
+    /// bar `64ε(1 + 2|f|)` at `f = 0` is `1.4e-14` and refuses it, while the band,
+    /// `~1e-10`, settles it. The same system at a right-hand side `1e-3`, far
+    /// outside its band, promises `1.75e-6` and does not settle.
+    #[test]
+    pub(crate) fn a_decrement_within_its_rounding_band_settles_and_one_above_it_does_not_2977() {
+        let h = array![[3.0, 0.0], [0.0, 8.0]];
+        let d = array![1.0, 4.0];
+        let rhs_band = array![1.0e-5, 2.0e-5];
+        let within = array![6.0e-6, -1.5e-5];
+        let spectrum =
+            WhitenedHessianSpectrum::decompose(&h, &within, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        let bands = spectrum.decrement_rounding_bands(&rhs_band).unwrap();
+        let floor = spectrum.numerical_floor;
+        let mode = |r: f64, b: f64, h: f64, d: f64| {
+            let (c, band, gamma) = (r.abs() / d.sqrt(), b / d.sqrt(), h / d);
+            0.5 * (band * (2.0 * c + band) / gamma
+                + (c + band).powi(2) * floor / (gamma * (gamma - floor)))
+        };
+        let decrement = spectrum.newton_decrement();
+        let expected = mode(within[0], rhs_band[0], 3.0, 1.0)
+            + mode(within[1], rhs_band[1], 8.0, 4.0)
+            + gam_linalg::roundoff::accumulation_growth(2) * decrement;
+        assert!(
+            (bands.identified - expected).abs() <= 1e-12 * expected,
+            "identified band {} against the closed form {expected}",
+            bands.identified
+        );
+        assert_eq!(bands.weakly_identified, 0.0, "no mode is weakly identified here");
+        let literal = 64.0 * f64::EPSILON;
+        assert!(
+            decrement > literal,
+            "the fixture's decrement {decrement:.3e} must exceed the literal bar {literal:.3e}"
+        );
+        assert!(
+            super::joint_newton_decrements_at_resolution(
+                decrement,
+                spectrum.weakly_identified_decrement(),
+                bands,
+            ),
+            "a decrement {decrement:.3e} of a right-hand side inside its own band must settle \
+             within that band {:.3e}",
+            bands.identified
+        );
+        // Negative control: the same system read far outside its band still
+        // promises a correction.
+        let descending = array![3.0e-3, -2.0e-3];
+        let spectrum =
+            WhitenedHessianSpectrum::decompose(&h, &descending, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        let bands = spectrum.decrement_rounding_bands(&rhs_band).unwrap();
+        assert!(
+            !super::joint_newton_decrements_at_resolution(
+                spectrum.newton_decrement(),
+                spectrum.weakly_identified_decrement(),
+                bands,
+            ),
+            "a decrement {:.3e} far above its band {:.3e} must not settle",
+            spectrum.newton_decrement(),
+            bands.identified
+        );
+        // A band of the wrong width is refused, not read.
+        assert!(spectrum.decrement_rounding_bands(&array![1.0e-5]).is_err());
     }
 
     /// gam#979/#1449 (completes #1082): a weakly-identified mode below the
@@ -5010,19 +5326,22 @@ pub(crate) fn compute_kkt_refusal_report(
         .iter()
         .map(|maybe_rows| maybe_rows.as_ref().map(|v| v.len()).unwrap_or(0))
         .sum();
-    let any_block_has_constraints = block_constraints.iter().any(|c| c.is_some());
 
     let diagnosis = if hpen_spectrum_unavailable || hpen_nullity_at_rank_tol > 0 {
         KktRefusalDiagnosis::RankDeficientHPen
-    } else if any_block_has_constraints
-        && cached_active_sets.iter().any(|s| s.is_some())
-        && projected_residual_inf > residual_tol
-    {
-        // Well-conditioned H_pen, the user has bound constraints, the current
-        // active set already pinned some rows, yet the projected residual is
-        // still many tolerances above the threshold. The cert refused
-        // *because* the projection captured part of the multiplier but not
-        // all of it — i.e. the active set is missing a row.
+    } else if active_set_rows_total > 0 && projected_residual_inf > residual_tol {
+        // Well-conditioned H_pen, the current active set already pinned some
+        // rows, yet the projected residual is still many tolerances above the
+        // threshold. The cert refused *because* the projection captured part
+        // of the multiplier but not all of it — i.e. the active set is missing
+        // a row.
+        //
+        // The joint path scatters an EMPTY row list into every constrained
+        // block, so `Some(rows)` alone says only that a block has constraints.
+        // Counting rows is what makes "already pinned" true: with none pinned
+        // the projection captured nothing, and no row owns the residual
+        // (gam#3019: all 23 early-exit refusals of the survival link-deviation
+        // fixture, s4b job 1332832 arm A, had active_set_rows_total=0).
         KktRefusalDiagnosis::ActiveSetIncomplete
     } else {
         KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH
@@ -5460,7 +5779,7 @@ pub(crate) fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     let shift =
         exact_newton_stabilizing_shift_psd_penalized(&lhs, h_joint, ridge_floor).unwrap_or(0.0);
     if shift > 0.0 {
-        log::debug!(
+        log::trace!(
             "[PIRLS/joint-Newton] stabilized dense penalized Hessian with diagonal shift {:.3e}",
             shift
         );
@@ -5810,6 +6129,17 @@ pub(crate) fn constrained_stationary_certificate_decision(
 /// `linearized_rel ≥ 0.5` (the feasible Newton step leaves the residual, so it is
 /// constraint-normal multiplier mass, not resolvable descent) before accepting.
 ///
+/// The caller's `objective_floor` is the rounding the two endpoint evaluations can
+/// carry (`ObjectiveAccumulation::roundoff_ceiling`, gam#2959). That ceiling can sit
+/// far above the change a flat objective actually shows, and there the objective
+/// arm cannot fire. The other two arms carry the guarantee: under an exact local
+/// model, a step within `step_tol` predicts a decrease no larger than the gradient
+/// against that step, so a representable descent cannot hide under a loose floor.
+/// Each arm has a pin that fails when the arm is removed:
+/// `rejects_when_objective_still_descending_above_eps_floor`,
+/// `rejects_when_accepted_step_exceeds_step_tol` and
+/// `rejects_when_local_model_is_inexact`.
+///
 /// Returns the conditions that fail, each with its value and bound. The fixed
 /// point is reached exactly when the list is empty, so the certificate and its
 /// refusal message cannot disagree about which condition decided.
@@ -6142,5 +6472,41 @@ mod constrained_numerical_fixed_point_tests {
             "{step_verdict}"
         );
         assert!(constrained_fixed_point_declining_conditions(false, &[], None).is_empty());
+    }
+
+    // gam#2959. The objective ceiling is denominated in its summands: the roundoff
+    // owner's `γ_m` over `Σ|terms|`, with no additive constant. Doubling the charged
+    // magnitude doubles the ceiling, and a sum of zero-magnitude summands, which is
+    // exact, has a zero ceiling. The former `m·ε·(1 + Σ|terms|)` fails both.
+    #[test]
+    fn objective_ceiling_is_denominated_in_its_summands_2959() {
+        let charged = super::ObjectiveAccumulation {
+            summed_terms: 240,
+            magnitude: 1.0e-6,
+            logdet_roundoff: 0.0,
+        };
+        let doubled = super::ObjectiveAccumulation {
+            magnitude: 2.0e-6,
+            ..charged
+        };
+        let empty = super::ObjectiveAccumulation {
+            magnitude: 0.0,
+            ..charged
+        };
+        assert_eq!(
+            charged.roundoff_ceiling(),
+            gam_linalg::roundoff::accumulation_growth(240) * 1.0e-6,
+            "the ceiling is γ_m over the charged magnitude"
+        );
+        assert_eq!(
+            doubled.roundoff_ceiling(),
+            2.0 * charged.roundoff_ceiling(),
+            "an additive constant would stop the ceiling scaling with what was summed"
+        );
+        assert_eq!(
+            empty.roundoff_ceiling(),
+            0.0,
+            "a sum of zero-magnitude summands is exact and carries no rounding"
+        );
     }
 }

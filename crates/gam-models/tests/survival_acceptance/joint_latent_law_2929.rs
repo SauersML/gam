@@ -97,6 +97,12 @@ impl Fixture {
 /// Simulate `S(t | x, z) = Φ(−(q(t)·c(x) + bᵀz))`: the closed form at the
 /// CONDITIONAL covariance, whose marginal survival is `Φ(−q(t))` at every `x`.
 fn build_fixture(seed: u64) -> Fixture {
+    build_fixture_with(seed, |e| e)
+}
+
+/// [`build_fixture`] with the first score's standard-normal innovation mapped
+/// through `plant`, and the outcome simulated on the scores as planted.
+fn build_fixture_with(seed: u64, plant: impl Fn(f64) -> f64) -> Fixture {
     let headers = ["time", "event", "x", "x2", "z0", "z1"]
         .iter()
         .map(|name| name.to_string())
@@ -110,7 +116,7 @@ fn build_fixture(seed: u64) -> Fixture {
         let x = 2.0 * next_unit(&mut state) - 1.0;
         let radius = (-2.0 * next_unit(&mut state).ln()).sqrt();
         let angle = std::f64::consts::TAU * next_unit(&mut state);
-        let (e0, e1) = (radius * angle.cos(), radius * angle.sin());
+        let (e0, e1) = (plant(radius * angle.cos()), radius * angle.sin());
         let rho = CORRELATION_AMPLITUDE * x;
         let z = [e0, rho * e0 + (1.0 - rho * rho).sqrt() * e1];
         let drive = SLOPES[0] * z[0] + SLOPES[1] * z[1];
@@ -165,6 +171,7 @@ struct Fitted {
     pooled_covariance: Array2<f64>,
     marginal_design: Array2<f64>,
     joint_law_present: bool,
+    latent_law_consumed: gam_models::bms::LatentLawConsumed,
 }
 
 fn fit(data: &gam_data::EncodedDataset, formula: &str, config: &FitConfig) -> Fitted {
@@ -188,6 +195,7 @@ fn fit(data: &gam_data::EncodedDataset, formula: &str, config: &FitConfig) -> Fi
         pooled_covariance: fit.score_covariance.clone(),
         marginal_design: fit.marginal_design.design.to_dense(),
         joint_law_present: fit.joint_latent_law.is_some(),
+        latent_law_consumed: fit.latent_law_consumed.clone(),
     }
 }
 
@@ -236,6 +244,22 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
     // pair gate has no span to condition on and one `Σ̄` serves every row.
     let pooled = fit(&fixture.data, "Surv(time, event) ~ 1", &config("standard-normal"));
     assert!(!pooled.joint_law_present);
+    // gam#2926: one of these exact-Gaussian scores has a point beyond 4σ, which the
+    // former fixed shape screen failed at n = 3 000 (its 4σ tail bound was 0.41 of a
+    // point there). The screen's bounds are now its statistics' null quantiles at
+    // this n, and one point beyond 4σ is inside the Poisson bound of two, so the
+    // declaration is fitted as the Gaussian law it is, with nothing to warn about.
+    let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
+        adequacy: None,
+        residual: None,
+        ..
+    } = &pooled.latent_law_consumed
+    else {
+        panic!(
+            "a Gaussian declaration on exact Gaussian scores must pass the shape screen; got {:?}",
+            pooled.latent_law_consumed
+        )
+    };
     // The anchored fit: the marginal-index span carries `x`, and the joint law
     // is transported by the conditional covariance fitted on it.
     let anchored_config = config("global-empirical");
@@ -253,16 +277,24 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
             + s[1] * s[1] * sigma[[1, 1]])
             .sqrt()
     };
-    let pooled_error = (0..N)
-        .map(|row| {
-            let z = fixture.scores[row];
-            let eta = pooled.exit_index[row] * pooled_scale
-                + pooled.slopes[0] * z[0]
-                + pooled.slopes[1] * z[1];
-            (normal_cdf(-eta) - truth[row]).abs()
-        })
-        .sum::<f64>()
-        / N as f64;
+    // The mean absolute error over the rows and its Monte Carlo standard error.
+    let mean_and_se = |errors: Vec<f64>| -> (f64, f64) {
+        let count = errors.len() as f64;
+        let mean = errors.iter().sum::<f64>() / count;
+        let variance = errors.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / (count - 1.0);
+        (mean, (variance / count).sqrt())
+    };
+    let (pooled_error, pooled_error_se) = mean_and_se(
+        (0..N)
+            .map(|row| {
+                let z = fixture.scores[row];
+                let eta = pooled.exit_index[row] * pooled_scale
+                    + pooled.slopes[0] * z[0]
+                    + pooled.slopes[1] * z[1];
+                (normal_cdf(-eta) - truth[row]).abs()
+            })
+            .collect(),
+    );
 
     let payload = fit_formula_to_payload(
         "Surv(time, event) ~ x + x2".to_string(),
@@ -271,10 +303,11 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
     )
     .expect("fit the anchored K=2 model to a saved payload");
     let prediction = predict_at_training_rows(&FittedModel::from_payload(payload), &fixture.data);
-    let anchored_error = (0..N)
-        .map(|row| (prediction.survival[[row, 0]] - truth[row]).abs())
-        .sum::<f64>()
-        / N as f64;
+    let (anchored_error, anchored_error_se) = mean_and_se(
+        (0..N)
+            .map(|row| (prediction.survival[[row, 0]] - truth[row]).abs())
+            .collect(),
+    );
     // The planted correlation's reach: the factor the pooled lowering is off by
     // at the covariate extremes.
     let planted_factor = conditional_scale(1.0).max(conditional_scale(-1.0))
@@ -282,8 +315,8 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
     eprintln!(
         "[2929 calibration] n={N} planted b=({:.3}, {:.3}) c(x) range factor={planted_factor:.3} | \
          slopes pooled=({:.4}, {:.4}) anchored=({:.4}, {:.4}) | mean |Ŝ(t,x,z) − S(t,x,z)|: \
-         pooled closed form={pooled_error:.4} anchored={anchored_error:.4} | log-lik pooled={:.3} \
-         anchored={:.3}",
+         pooled closed form={pooled_error:.4} (se {pooled_error_se:.5}) anchored={anchored_error:.4} \
+         (se {anchored_error_se:.5}) | log-lik pooled={:.3} anchored={:.3}",
         SLOPES[0],
         SLOPES[1],
         pooled.slopes[0],
@@ -297,10 +330,16 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
         anchored_error < 0.02,
         "the anchored K=2 fit must be calibrated in context; mean |Ŝ − S| = {anchored_error:.4}"
     );
+    // The pooled lowering's miscalibration must be real, well clear of the Monte
+    // Carlo error of its mean over the rows, and more than twice the anchored
+    // fit's. The second half used to be an absolute floor of 0.03, calibrated
+    // while a Linear baseline was pinned to its cold-start Weibull offset
+    // (gnomon#2336): that put time-curve misfit into both arms on top of the
+    // pooled lowering's wrong scale, which is the only thing this test is about.
     assert!(
-        pooled_error > 2.0 * anchored_error && pooled_error > 0.03,
+        pooled_error > 2.0 * anchored_error && pooled_error >= 4.0 * pooled_error_se,
         "the pooled-Σ closed form must be measurably miscalibrated under a moving correlation; \
-         pooled {pooled_error:.4} vs anchored {anchored_error:.4}"
+         pooled {pooled_error:.4} (Monte Carlo se {pooled_error_se:.5}) vs anchored {anchored_error:.4}"
     );
     for k in 0..2 {
         assert!(
@@ -310,6 +349,90 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
             SLOPES[k]
         );
     }
+}
+
+/// The record of a Gaussian declaration on K = 2 scores whose first score's
+/// innovation is planted through `plant`: the failing ledger and the declaration's
+/// excess anchoring loss on the joint law, which the screen's failure makes the
+/// fit measure (gam#2926).
+fn declared_on_planted_scores(
+    seed: u64,
+    plant: impl Fn(f64) -> f64,
+) -> (
+    gam_models::bms::LatentNormalAdequacy,
+    gam_models::bms::ClosedFormAnchorResidual,
+) {
+    let fixture = build_fixture_with(seed, plant);
+    let declared = fit(&fixture.data, "Surv(time, event) ~ 1", &config("standard-normal"));
+    let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
+        adequacy: Some(adequacy),
+        residual: Some(certificate),
+        ..
+    } = &declared.latent_law_consumed
+    else {
+        panic!(
+            "a Gaussian declaration on a score planted non-Gaussian must fail the shape screen and \
+             record its excess anchoring loss; got {:?}",
+            declared.latent_law_consumed
+        )
+    };
+    assert_eq!(
+        certificate.anchors,
+        2 * N,
+        "the declaration's certificate reads every row's exit and entry anchor on the joint law: \
+         {certificate:?}"
+    );
+    (adequacy.clone(), certificate.clone())
+}
+
+/// gam#2926: lighter tails beyond 1.8σ on the first of K = 2 scores, the bulk
+/// untouched, fail the adequacy screen on the score's own kurtosis at n = 3 000,
+/// and the declaration's certificate is measured on the joint law. The departure
+/// is symmetric, so it moves each anchor only at second order: its anchoring error
+/// stays below the estimated law's own sampling error, and the certificate keeps
+/// the closed form. The screen rejects a departure the anchor does not pay for.
+#[test]
+fn a_gaussian_declaration_on_lighter_k2_tails_fails_the_screen_and_keeps_its_certificate_2926() {
+    install();
+    let lighter_tails = |e: f64| {
+        if e.abs() > 1.8 {
+            e.signum() * (1.8 + 0.5 * (e.abs() - 1.8))
+        } else {
+            e
+        }
+    };
+    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0005, lighter_tails);
+    eprintln!("[2926 declared K=2 lighter tails] {adequacy:?} | {certificate:?}");
+    assert!(
+        adequacy.excess_kurtosis.abs() > adequacy.excess_kurtosis_tol,
+        "the lighter tails must fail the screen on the score's own kurtosis: {adequacy:?}"
+    );
+    assert!(
+        certificate.residual_energy < certificate.noise_energy && certificate.closed_form_chosen,
+        "a symmetric tail departure must leave the anchor within its sampling error: \
+         {certificate:?}"
+    );
+}
+
+/// gam#2926: the first of K = 2 scores stretched above +1σ, a skew that moves each
+/// anchor at first order, fails the adequacy screen at n = 3 000, and the
+/// declaration's recorded excess anchoring loss on the joint law is positive: the
+/// certificate prefers the estimated law.
+#[test]
+fn a_gaussian_declaration_on_a_skewed_k2_score_records_a_certificate_beyond_noise_2926() {
+    install();
+    let upper_stretch = |e: f64| if e > 1.0 { 1.0 + 1.5 * (e - 1.0) } else { e };
+    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0006, upper_stretch);
+    eprintln!("[2926 declared K=2 skewed] {adequacy:?} | {certificate:?}");
+    assert!(
+        adequacy.skew.abs() > adequacy.skew_tol,
+        "the stretched upper tail must fail the screen on the score's own skewness: {adequacy:?}"
+    );
+    assert!(
+        certificate.excess_kl > 0.0 && !certificate.closed_form_chosen,
+        "a skewed score must cost the declaration's anchor beyond the estimated law's own \
+         sampling error: {certificate:?}"
+    );
 }
 
 #[test]
@@ -414,6 +537,75 @@ fn joint_law_is_persisted_and_replayed_at_prediction_2929() {
     assert_eq!(
         worst_roundtrip, 0.0,
         "a JSON round trip of the payload must predict bit for bit what the payload did"
+    );
+}
+
+/// gam#2926: the default on the same two conditionally standard-normal scores.
+/// Each score passes the adequacy screen, so the fit lowers the identity in
+/// closed form at the conditional `Σ(x)` provisionally, and the converged fit
+/// certifies it on the joint law of the score vector. Either branch is a result:
+/// `D̂ ≤ 0` keeps the closed form with its certificate, `D̂ > 0` re-solves on the
+/// joint law. Both must be calibrated on the marginal index under the true law.
+#[test]
+fn default_on_several_scores_certifies_its_closed_form_on_the_joint_law_2926() {
+    install();
+    let fixture = build_fixture(0x2929_0000_0004);
+    let result = fit_from_formula("Surv(time, event) ~ x + x2", &fixture.data, &config("auto"))
+        .expect("the default K=2 fit");
+    let FitResult::SurvivalMarginalSlope(fit) = result else {
+        panic!("expected a SurvivalMarginalSlope fit result");
+    };
+    let marginal_error = fit
+        .fitted_exit_index
+        .iter()
+        .zip(fixture.times.iter())
+        .map(|(&q_hat, &time)| (normal_cdf(-q_hat) - normal_cdf(-planted_index(time))).abs())
+        .sum::<f64>()
+        / N as f64;
+    match &fit.latent_law_consumed {
+        gam_models::bms::LatentLawConsumed::EstimatedGaussianAdequate {
+            residual: Some(certificate),
+            ..
+        } => {
+            eprintln!(
+                "[2926 K=2 default] n={N} kept the closed form: {certificate:?} | mean \
+                 |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
+            );
+            assert!(
+                certificate.closed_form_chosen && certificate.excess_kl <= 0.0,
+                "a kept closed form's recorded decision must be the sign of its D̂: {certificate:?}"
+            );
+            assert!(
+                fit.joint_latent_law.is_none(),
+                "a kept closed form must not persist a joint latent law"
+            );
+        }
+        gam_models::bms::LatentLawConsumed::EstimatedGlobalByResidual {
+            residual: certificate,
+            ..
+        } => {
+            eprintln!(
+                "[2926 K=2 default] n={N} re-solved on the joint law: {certificate:?} | mean \
+                 |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
+            );
+            assert!(
+                !certificate.closed_form_chosen && certificate.excess_kl > 0.0,
+                "a re-solve's recorded decision must be the sign of its D̂: {certificate:?}"
+            );
+            assert!(
+                fit.joint_latent_law.is_some(),
+                "a re-solve on the estimated law must anchor on the joint latent law"
+            );
+        }
+        other => panic!(
+            "the default on two scores that pass the screen must record a certified decision; \
+             got {other:?}"
+        ),
+    }
+    assert!(
+        marginal_error < 0.02,
+        "the default K=2 fit must be calibrated on the marginal index under the true law; mean \
+         |Φ(−q̂)−Φ(−q)| = {marginal_error:.4}"
     );
 }
 

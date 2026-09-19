@@ -9,7 +9,10 @@
 //! These are the building blocks a library consumer needs to construct
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
-use crate::probability::{normal_pdf, standard_normal_quantile};
+use crate::probability::{
+    signed_probit_logcdf_and_mills_ratio, standard_normal_quantile,
+    standard_normal_quantile_from_log_cdf,
+};
 use crate::survival::location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, ResidualDistribution,
     SurvivalCovariateTermBlockTemplate, SurvivalCovariateTimeBasis,
@@ -176,8 +179,9 @@ pub enum SurvivalTimeBasisConfig {
     ///   `q'(t) ≥ 0` pointwise. The `derivative_guard` constant is added
     ///   externally by [`add_survival_time_derivative_guard_offset`],
     ///   leaving the derivative guarantee `q'(t) ≥ guard` exact.
-    /// * 2nd-difference penalty on the underlying degree-`(k+1)` B-spline
-    ///   coefficients, filtered through `keep_cols` for identifiability.
+    /// * the exact `∫(f'')²` roughness Gram of the underlying degree-`(k+1)`
+    ///   B-spline, carried to the I-spline increments by the value-space
+    ///   congruence and filtered through `keep_cols` for identifiability.
     ///
     /// `TimeBlockInput::time_monotonicity` declares to the consuming
     /// family how monotonicity is enforced. The marginal-slope
@@ -1005,7 +1009,7 @@ fn run_baseline_theta_optimizer<Fc, Fe>(
     contract: BaselineDerivativeContract,
     cost_fn: Fc,
     eval_fn: Fe,
-) -> Result<SurvivalBaselineConfig, String>
+) -> Result<SurvivalBaselineConfig, crate::fit_orchestration::WorkflowError>
 where
     Fc: FnMut(&mut (), &Array1<f64>) -> Result<f64, crate::model_types::EstimationError>,
     Fe: FnMut(
@@ -1013,8 +1017,12 @@ where
         &Array1<f64>,
     ) -> Result<gam_problem::OuterEval, crate::model_types::EstimationError>,
 {
+    use crate::fit_orchestration::{FitFailure, WorkflowError};
     use gam_solve::rho_optimizer::OuterProblem;
-    let Some(seed) = survival_baseline_theta_from_config(initial)? else {
+    // The initial config and its search domain are configuration; what the
+    // search itself reaches is a fit's failure, kept typed (#2937).
+    let config = |reason: String| WorkflowError::InvalidConfig { reason };
+    let Some(seed) = survival_baseline_theta_from_config(initial).map_err(config)? else {
         return Ok(initial.clone());
     };
     let dim = seed.len();
@@ -1023,7 +1031,7 @@ where
     // one the frozen offset chart owns. Neither the private `seed ± 6` box that
     // decided the survival time-block λ until a03438645 (#2670) nor the
     // engine's ±30 fallback applies (#2902 row 8).
-    let (lower, upper) = survival_baseline_theta_domain(target, &seed, age_exit)?;
+    let (lower, upper) = survival_baseline_theta_domain(target, &seed, age_exit).map_err(config)?;
     let problem = contract
         .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
         .with_bounds(lower, upper)
@@ -1048,19 +1056,21 @@ where
     );
     let result = problem
         .run(&mut obj, context)
-        .map_err(|e| format!("{context} failed: {e}"))?;
+        .map_err(|e| WorkflowError::from(FitFailure::from(e).context(format!("{context} failed"))))?;
     if !result.converged() {
-        return Err(SurvivalConstructionError::InvalidConfig {
-            reason: format!(
+        return Err(WorkflowError::from(FitFailure::raised(
+            gam_problem::FailureCategory::Convergence,
+            format!(
                 "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
                 result.iterations,
                 result.final_value,
                 result.final_grad_norm_report(),
             ),
-        }
-        .into());
+        )));
     }
+    // The theta is the search's own optimum on the target it was seeded from.
     survival_baseline_config_from_theta(target, &result.rho)
+        .map_err(|reason| WorkflowError::from(FitFailure::invariant(reason)))
 }
 
 /// Shared engine for the two derivative-carrying baseline-config optimizers.
@@ -1081,7 +1091,7 @@ fn run_baseline_theta_optimizer_with_eval<F>(
     context: &str,
     contract: BaselineDerivativeContract,
     objective: F,
-) -> Result<SurvivalBaselineConfig, String>
+) -> Result<SurvivalBaselineConfig, crate::fit_orchestration::WorkflowError>
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<gam_problem::OuterEval, String>,
 {
@@ -1168,7 +1178,7 @@ pub fn optimize_survival_baseline_config_with_gradient_only<F>(
     age_exit: ndarray::ArrayView1<'_, f64>,
     context: &str,
     mut objective: F,
-) -> Result<SurvivalBaselineConfig, String>
+) -> Result<SurvivalBaselineConfig, crate::fit_orchestration::WorkflowError>
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
 {
@@ -1484,6 +1494,7 @@ pub fn build_survival_time_basis(
                         knotspec: BSplineKnotSpec::Automatic {
                             num_internal_knots: Some(num_internal_knots),
                             placement,
+                            adaptive: false,
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
@@ -1895,6 +1906,7 @@ pub fn build_survival_time_basis(
             // `d(log Λ)/dt = d(log Λ)/d(log t) · 1/t`. The `d/d(log t)` half is
             // the M-spline block the value basis was built with, so no second
             // opinion about the exterior can arise here.
+            // Structural (#2469): a capacity hint only; the triplets are pushed.
             let mut deriv_triplets = Vec::with_capacity(n * p_time.min(16));
             let mut found_nonfinite: Option<(usize, usize)> = None;
             for i in 0..n {
@@ -1965,18 +1977,20 @@ pub fn build_survival_time_basis(
             // The I-spline coefficient γ is the consecutive increment of the B-spline
             // value coefficients `c`: `c_0 = 0`, `c_k = Σ_{j<k} γ_j = (L γ)_k`, where
             // `L` is the `p_time × p_time` lower-triangular cumsum matrix. The
-            // second-difference penalty on the B-spline values is `S_B = D₂ᵀD₂`
-            // (the active `penalty_basis` matrix block). The correct curvature penalty
-            // on γ is the **value-space congruence transform**
+            // curvature penalty on the B-spline values is the exact function-space
+            // Gram `S_B = ∫ B''B''ᵀ` (the active `penalty_basis` matrix block), not a
+            // coefficient-difference operator. The correct curvature penalty on γ is
+            // the **value-space congruence transform**
             //
             //   `S_I = Lᵀ S_B[1:,1:] L`,
             //
             // which satisfies `γᵀ S_I γ = (Lγ)ᵀ S_B[1:,1:] (Lγ)`.
             //
-            // A constant γ (γ_k = γ₀ ∀k) maps to the linear value sequence
-            // `c_k = k·γ₀`, which is annihilated by D₂: `D₂c = 0`. Therefore
-            // `γᵀ S_I γ = 0` for constant γ, i.e. the **affine trend lies in the
-            // penalty null space**. REML does not penalize the baseline slope
+            // `S_B` annihilates exactly the value coefficients of an affine function,
+            // `c_k = a + b·ξ_k` (ξ the Greville abscissae), so the increments
+            // `γ_k = b·(ξ_{k+1} − ξ_k)` of that affine trend satisfy `γᵀ S_I γ = 0`
+            // (constant γ when the knots are uniform), i.e. the **affine trend lies
+            // in the penalty null space**. REML does not penalize the baseline slope
             // `d(log Λ)/d(log t)` or the overall level, so it correctly lets the
             // data determine these quantities without bias. The previous increment-
             // space form `S_B[1:,1:]` (applied directly to γ instead of Lγ) did NOT
@@ -2495,10 +2509,10 @@ pub fn center_survival_time_designs_at_anchor(
 /// The `eta`-channel derivatives are closed-form for every branch.  The
 /// `o_D`-channel derivatives use the log-derivative identity
 /// `∂o_D/∂θ = o_D · ∂log(o_D)/∂θ` which is more numerically stable near
-/// the small-shape limit (shape·t → 0).  Near shape = 0 we fall back to
-/// a third-order Taylor expansion with the same 1e-10 pivot that
-/// `evaluate_survival_baseline` uses, keeping the value/derivative pair
-/// continuous and agreement with the linear-hazard limit exact at shape=0.
+/// the small-shape limit (shape·t → 0).  Near `shape·t = 0` the shape channel
+/// falls back to a Taylor expansion, switched on `shape·t` where its error
+/// crosses the closed form's (`gompertz_offset_shape_series_switch`), keeping
+/// agreement with the linear-hazard limit exact at shape = 0.
 pub fn baseline_offset_theta_partials(
     age: f64,
     cfg: &SurvivalBaselineConfig,
@@ -2536,9 +2550,9 @@ pub fn baseline_offset_theta_partials(
             //     ∂eta/∂shape   = −1/shape + t·E/(E−1)
             //     ∂log(o_D)/∂shape = 1/shape − t/(E−1)
             //     ∂o_D/∂shape  = o_D · ∂log(o_D)/∂shape
-            //   Near shape=0 both numerators are 1/shape cancellations. Use
-            //   Taylor expansions with the same 1e-10 pivot that
-            //   gompertz_components uses in evaluate_survival_baseline.
+            //   Near shape·t = 0 both numerators are 1/shape cancellations, so
+            //   `gompertz_shape_derivatives` switches to their Taylor expansions
+            //   at the derived crossing of the two routes' errors.
             let (d_eta_d_shape, d_od_d_shape) = gompertz_shape_derivatives(age, shape);
             Ok(Some(vec![(1.0, 0.0), (d_eta_d_shape, d_od_d_shape)]))
         }
@@ -2814,25 +2828,63 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
     )
 }
 
-/// Shared Gompertz hazard components `(H_G(t), h_G(t))`.
-/// Mirrors the private helper in `evaluate_survival_baseline` with the
-/// same 1e-10 small-shape pivot.
+/// Shared Gompertz hazard components `(H_G(t), h_G(t))`, with
+/// `H_G = (rate/shape)·(e^{shape·t} − 1)` and `h_G = rate·e^{shape·t}`.
+///
+/// `H_G` is evaluated as `rate·t·expm1(x)/x` with `x = shape·t`: a quotient of two
+/// values each correct to rounding, so it carries no cancellation at any `x ≠ 0`
+/// and needs no small-shape series. Its removable singularity at `x = 0` takes the
+/// limit `rate·t`.
 #[inline]
 fn gompertz_hazard_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
-    if shape.abs() < 1e-10 {
-        // Taylor at shape=0: H_G(t) = rate·t·(1 + shape·t/2 + (shape·t)²/6),
-        // h_G(t) = rate·(1 + shape·t + (shape·t)²/2).
-        let x = shape * age;
-        (
-            rate * age * (1.0 + 0.5 * x + x * x / 6.0),
-            rate * (1.0 + x + 0.5 * x * x),
-        )
-    } else {
-        let shape_age = shape * age;
-        let cumulative_hazard = (rate / shape) * shape_age.exp_m1();
-        let instant_hazard = rate * shape_age.exp();
-        (cumulative_hazard, instant_hazard)
-    }
+    let x = shape * age;
+    let expm1_ratio = if x == 0.0 { 1.0 } else { x.exp_m1() / x };
+    (rate * age * expm1_ratio, rate * x.exp())
+}
+
+/// `|x|` below which the three-term series of `(x·eˣ − expm1(x))/x²` is the more
+/// accurate route to `∂H_G/∂shape = rate·t²·(x·eˣ − expm1(x))/x²`.
+///
+/// The closed form `age·eˣ·shape − expm1(x)` subtracts two terms of size `|x|` from
+/// a result `≈ x²/2`. They carry five roundings of `u` between them: `exp`, the two
+/// products, `expm1`, and the rounding of `x = shape·age`, which `expm1` sees but the
+/// unrounded product `age·shape` does not. That is a relative error of
+/// `10u/|x| = 5ε/|x|`. The series `1/2 + x/3 + x²/8` drops `x³/30` of `1/2`, a
+/// relative `x³/15`. The two cross at `x⁴ = 75ε`, about `3.6e-4`, where both err by
+/// about `3e-12`.
+fn gompertz_first_shape_series_switch() -> f64 {
+    // Derived (#2469): the error crossing `(75ε)^{1/4}` stated above.
+    (75.0 * f64::EPSILON).sqrt().sqrt()
+}
+
+/// `|x|` below which the series of `gompertz_shape_derivatives` is the more
+/// accurate route.
+///
+/// Its worst output is `∂η/∂shape = −1/shape + t·eˣ/expm1(x) = t·(1/2 + x/12 −
+/// x³/720 + …)`. The closed form subtracts two terms of size `t/|x|` from a result
+/// `≈ t/2`. They carry six roundings of `u` between them: `1/shape`, `exp`, `expm1`,
+/// the product and the quotient, and the rounding of `x`, which the second term sees
+/// through `1/x` and the first does not. That is a relative error of
+/// `12u/|x| = 6ε/|x|`. The series `1/2 + x/12` drops `x³/720` of `1/2`, a relative
+/// `x³/360`. The two cross at `x⁴ = 2160ε`, about `8.3e-4`, where both err by about
+/// `1.6e-12`. There the other outputs err by no more. `∂log(o_D)/∂shape` carries four
+/// roundings, `4ε/|x|` against the same `x³/360`, and `o_D` carries no cancellation.
+fn gompertz_offset_shape_series_switch() -> f64 {
+    // Derived (#2469): the error crossing `(2160ε)^{1/4}` stated above.
+    (2160.0 * f64::EPSILON).sqrt().sqrt()
+}
+
+/// `|x|` below which the three-term series of `∂²H_G/∂shape² = rate·t³·φ(x)`,
+/// `φ(x) = 1/3 + x/4 + x²/10 + x³/36 + …`, is the more accurate route.
+///
+/// The closed form `t²·eˣ/shape − 2·(x·eˣ − expm1(x))/shape³` subtracts two terms of
+/// size `t³/|x|`. The second carries the first derivative's numerator, whose rounding
+/// of about `3u·|x|` is divided by `x³`, so the difference `≈ t³/3` errs by a relative
+/// `18u/x² = 9ε/x²`. The series drops `x³/36` of `1/3`, a relative `x³/12`. The two
+/// cross at `x⁵ = 108ε`, about `1.9e-3`, where both err by about `6e-10`.
+fn gompertz_second_shape_series_switch() -> f64 {
+    // Derived (#2469): the error crossing `(108ε)^{1/5}` stated above.
+    (108.0 * f64::EPSILON).powf(0.2)
 }
 
 /// Partials of `(H_G(t), h_G(t))` with respect to the shape parameter.
@@ -2859,10 +2911,9 @@ fn gompertz_cumulative_shape_derivative(age: f64, rate: f64, shape: f64) -> (f64
     // governed by the dimensionless product x = shape·age, NOT by `shape`
     // alone. Pivoting on `shape < 1e-10` ignored `age`: for large ages a small
     // shape still yields a small x where the catastrophic cancellation has
-    // already corrupted the difference. Pivot on x instead; the 3-term Taylor
-    // (through O(x²)) is accurate to <1e-9 for |x| < 1e-4, and the exact branch
-    // is clean above it.
-    let dhg_dshape = if x.abs() < 1e-4 {
+    // already corrupted the difference. Pivot on x instead, at the crossing of the
+    // two routes' errors (`gompertz_first_shape_series_switch`).
+    let dhg_dshape = if x.abs() < gompertz_first_shape_series_switch() {
         let t = age;
         // Truncated to O(x³): t²/2 + x·t²/3 + x²·t²/8
         rate * t * t * (0.5 + x / 3.0 + x * x / 8.0)
@@ -2882,7 +2933,9 @@ fn gompertz_cumulative_shape_derivative(age: f64, rate: f64, shape: f64) -> (f64
 /// helper only covers the shape channel.
 #[inline]
 fn gompertz_shape_derivatives(age: f64, shape: f64) -> (f64, f64) {
-    if shape.abs() < 1e-10 {
+    // The closed forms below cancel in `x = shape·t`, not in `shape` alone, so the
+    // pivot is on `x`, at the crossing of the two routes' errors.
+    if (shape * age).abs() < gompertz_offset_shape_series_switch() {
         // Closed-form limits from the series t·E/(E−1) = 1/x + 1/2 + x/12 + ...
         // with E = e^x, x = shape·t:
         //   ∂eta/∂shape  = −1/shape + t·E/(E−1)
@@ -3079,6 +3132,8 @@ fn survival_cumulative_and_instant_hazard(
 struct MarginalSlopeBaselinePoint {
     instant_hazard: f64,
     q: f64,
+    /// `A = S/φ(q)`, the factor every θ partial of the chart carries.
+    survival_over_density: f64,
     q_t: f64,
 }
 
@@ -3103,30 +3158,46 @@ fn evaluate_marginal_slope_baseline_point(
             survival_baseline_targetname(cfg.target)
         ));
     }
-    let survival = (-cumulative_hazard).exp();
-    if !(survival.is_finite() && survival > 0.0 && survival < 1.0) {
-        return Err(format!(
-            "{} marginal-slope baseline survival must be strictly inside (0,1), got {survival}",
-            survival_baseline_targetname(cfg.target)
-        ));
+    // q = −Φ⁻¹(S). While S > ½ the small quantity is the event probability
+    // F = 1 − S = −expm1(−H), and q = Φ⁻¹(F) reads it in the quantile's lower
+    // tail at full relative accuracy. Forming S first loses F to cancellation
+    // and rounds S to exactly 1 once H < 2⁻⁵⁴, where q is still finite. Every
+    // row without delayed entry enters at SURVIVAL_TIME_FLOOR = 1e-9, and a
+    // Weibull chart with scale 3.35 and shape 1.71 already puts H there below
+    // 2⁻⁵⁴: the #2930 fixture's outer search refused 135 such probes around its
+    // planted law and certified a railed model instead.
+    //
+    // Otherwise the quantile reads ln S = −H, which is exact for every finite H.
+    // S = exp(−H) itself underflows to zero once H exceeds 745, where q ≈ √(2H)
+    // is still finite: the Weibull chart's k → 0, λ → 0 limit crosses that point
+    // (#2969), and forming S refused every probe beyond it.
+    let q = if cumulative_hazard < std::f64::consts::LN_2 {
+        standard_normal_quantile(-(-cumulative_hazard).exp_m1())
+    } else {
+        standard_normal_quantile_from_log_cdf(-cumulative_hazard).map(|x| -x)
     }
-    let q = -standard_normal_quantile(survival).map_err(|e| {
+    .map_err(|e| {
         format!(
-            "{} marginal-slope baseline failed to invert survival probability {survival}: {e}",
+            "{} marginal-slope baseline failed to invert the survival probability at cumulative hazard {cumulative_hazard}: {e}",
             survival_baseline_targetname(cfg.target)
         )
     })?;
-    let phi_q = normal_pdf(q);
-    if !(phi_q.is_finite() && phi_q > 0.0) {
+    // A = S/φ(q) = Φ(−q)/φ(q) is the reciprocal of the Mills ratio φ(−q)/Φ(−q),
+    // which the erfcx form keeps finite and relatively accurate where S and φ(q)
+    // both underflow.
+    let (_, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-q);
+    let survival_over_density = mills_ratio.recip();
+    if !(survival_over_density.is_finite() && survival_over_density > 0.0) {
         return Err(format!(
-            "{} marginal-slope baseline produced non-positive probit density phi(q)={phi_q} at q={q}",
+            "{} marginal-slope baseline produced a non-positive survival-to-density ratio {survival_over_density} at q={q}",
             survival_baseline_targetname(cfg.target)
         ));
     }
     Ok(Some(MarginalSlopeBaselinePoint {
         instant_hazard,
         q,
-        q_t: instant_hazard * survival / phi_q,
+        survival_over_density,
+        q_t: instant_hazard * survival_over_density,
     }))
 }
 
@@ -3175,11 +3246,10 @@ pub fn evaluate_survival_baseline(
         ValidatedBaselineTarget::Gompertz { rate, shape } => {
             let (h, inst) = gompertz_hazard_components(age, rate, shape);
             if h <= 0.0 || !h.is_finite() {
-                return Err(if shape.abs() < 1e-10 {
-                    "invalid gompertz baseline at near-zero shape".to_string()
-                } else {
-                    "gompertz baseline produced non-positive cumulative hazard".to_string()
-                });
+                return Err(format!(
+                    "gompertz baseline produced a non-positive or non-finite cumulative hazard \
+                     {h:e} at age {age:e} (rate {rate:e}, shape {shape:e})"
+                ));
             }
             let derivative = inst / h;
             Ok((h.ln(), derivative))
@@ -3253,7 +3323,7 @@ pub fn marginal_slope_baseline_offset_theta_partials(
     };
     let hazard_partials = survival_hazard_theta_partials(age, cfg)?
         .ok_or_else(|| "unexpected missing hazard partials for nonlinear baseline".to_string())?;
-    let a = point.q_t / point.instant_hazard;
+    let a = point.survival_over_density;
     let a_log_derivative_factor = point.q * a - 1.0;
     Ok(Some(
         hazard_partials
@@ -3304,9 +3374,8 @@ pub(crate) fn marginal_slope_baseline_offset_theta_geometry(
     let Some((hazard, first, second)) = survival_hazard_theta_first_second(age, cfg)? else {
         return Ok(None);
     };
-    let (cum_hazard, instant_hazard) = hazard;
-    let survival = (-cum_hazard).exp();
-    let a = survival / normal_pdf(point.q);
+    let (_, instant_hazard) = hazard;
+    let a = point.survival_over_density;
     let b = point.q * a - 1.0;
     let b_factor = a + point.q * b;
     let dim = first.len();
@@ -3415,24 +3484,20 @@ fn gompertz_cumulative_shape_second_derivative(age: f64, rate: f64, shape: f64) 
     // x=1e-9 gives a ~98% relative error; x=1e-10 a ~9700% error). The old
     // `shape < 1e-10` pivot ignored `age` and so routed those small-x cases
     // through the cancelling exact form, corrupting the marginal-slope baseline
-    // Hessian near small shape. Pivot on x with a wider threshold than the
-    // first derivative: the 3-term Taylor (through O(x²)) holds to <1e-8 for
-    // |x| < 1e-3, and the exact branch is clean above it.
-    if x.abs() < 1e-3 {
+    // Hessian near small shape. Pivot on x, at the crossing of the two routes'
+    // errors (`gompertz_second_shape_series_switch`). `∂²h_G/∂shape² = rate·t²·eˣ`
+    // carries no cancellation, so it takes the closed form on both sides.
+    let e = x.exp();
+    let d2_instant = rate * age * age * e;
+    let d2_cumulative = if x.abs() < gompertz_second_shape_series_switch() {
         let t = age;
-        (
-            rate * t * t * t * (1.0 / 3.0 + x / 4.0 + x * x / 10.0),
-            rate * t * t * (1.0 + x + 0.5 * x * x),
-        )
+        rate * t * t * t * (1.0 / 3.0 + x / 4.0 + x * x / 10.0)
     } else {
-        let e = x.exp();
         let em1 = x.exp_m1();
         let n = shape * age * e - em1;
-        (
-            rate * (age * age * e / shape - 2.0 * n / (shape * shape * shape)),
-            rate * age * age * e,
-        )
-    }
+        rate * (age * age * e / shape - 2.0 * n / (shape * shape * shape))
+    };
+    (d2_cumulative, d2_instant)
 }
 
 // ---------------------------------------------------------------------------
@@ -3899,13 +3964,15 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
     }
 }
 
-/// The additive time offsets of a latent-survival fit and their first partials
-/// with respect to a nonlinear baseline chart, realized at one chart point
-/// (#2714).
+/// The additive time offsets of a latent-survival fit and their first and second
+/// partials with respect to a nonlinear baseline chart, realized at one chart
+/// point (#2714, #2677).
 ///
 /// The four channels are the ones the latent row reads through additive offsets:
 /// `q_entry`, `q_exit`, `q̇_exit` and the interval upper bound `q_right`. Each
-/// `*_theta` array is `n × d`, `d = theta.len()`.
+/// `*_theta` array is `n × d` and each `*_theta_theta` array is `n × d × d`,
+/// `d = theta.len()`. A loaded/unloaded split's `ln m` axis moves no offset, so
+/// its rows and columns are zero.
 #[derive(Clone, Debug)]
 pub(crate) struct LatentSurvivalOffsetGeometry {
     pub(crate) baseline_config: SurvivalBaselineConfig,
@@ -3918,6 +3985,10 @@ pub(crate) struct LatentSurvivalOffsetGeometry {
     pub(crate) offset_exit_theta: Array2<f64>,
     pub(crate) derivative_offset_exit_theta: Array2<f64>,
     pub(crate) offset_right_theta: Array2<f64>,
+    pub(crate) offset_entry_theta_theta: ndarray::Array3<f64>,
+    pub(crate) offset_exit_theta_theta: ndarray::Array3<f64>,
+    pub(crate) derivative_offset_exit_theta_theta: ndarray::Array3<f64>,
+    pub(crate) offset_right_theta_theta: ndarray::Array3<f64>,
     /// The background components a loaded/unloaded split realizes at this chart
     /// point; `None` for a fully loaded hazard, whose chart moves only offsets.
     pub(crate) unloaded: Option<LatentSurvivalUnloadedGeometry>,
@@ -4093,15 +4164,28 @@ impl LatentSurvivalFrozenOffsetChart {
             }
             Ok((value, partials))
         };
+        type SecondChannel = Vec<Vec<(f64, f64)>>;
+        let second = |age: f64| -> Result<SecondChannel, String> {
+            let partials = log_cumulative_hazard_offset_theta_second_partials(age, &loaded_config)?;
+            if partials.len() != loaded_dim {
+                return Err(format!(
+                    "latent survival baseline chart has {} second partials for the {loaded_dim} loaded coordinates of a {dim}-coordinate theta",
+                    partials.len()
+                ));
+            }
+            Ok(partials)
+        };
+        type RowChannel = (Channel, SecondChannel);
+        let at_age = |age: f64| -> Result<RowChannel, String> { Ok((channel(age)?, second(age)?)) };
         let rows = (0..n)
             .into_par_iter()
-            .map(|row| -> Result<(Channel, Channel, Option<Channel>), String> {
-                let entry = channel(self.age_entry[row])?;
-                let exit = channel(self.age_exit[row])?;
+            .map(|row| -> Result<(RowChannel, RowChannel, Option<RowChannel>), String> {
+                let entry = at_age(self.age_entry[row])?;
+                let exit = at_age(self.age_exit[row])?;
                 let right = self
                     .age_right
                     .as_ref()
-                    .map(|ages| channel(ages[row]))
+                    .map(|ages| at_age(ages[row]))
                     .transpose()?;
                 Ok((entry, exit, right))
             })
@@ -4117,6 +4201,10 @@ impl LatentSurvivalFrozenOffsetChart {
             offset_exit_theta: Array2::zeros((n, dim)),
             derivative_offset_exit_theta: Array2::zeros((n, dim)),
             offset_right_theta: Array2::zeros((n, dim)),
+            offset_entry_theta_theta: ndarray::Array3::zeros((n, dim, dim)),
+            offset_exit_theta_theta: ndarray::Array3::zeros((n, dim, dim)),
+            derivative_offset_exit_theta_theta: ndarray::Array3::zeros((n, dim, dim)),
+            offset_right_theta_theta: ndarray::Array3::zeros((n, dim, dim)),
             unloaded: makeham.map(|makeham| LatentSurvivalUnloadedGeometry {
                 axis: loaded_dim,
                 mass_entry: self.age_entry.mapv(|age| makeham * age),
@@ -4128,7 +4216,9 @@ impl LatentSurvivalFrozenOffsetChart {
                     .map_or_else(|| Array1::zeros(n), |ages| ages.mapv(|age| makeham * age)),
             }),
         };
-        for (row, (entry, exit, right)) in rows.into_iter().enumerate() {
+        for (row, ((entry, entry_second), (exit, exit_second), right)) in
+            rows.into_iter().enumerate()
+        {
             geometry.offset_entry[row] = entry.0.0;
             geometry.offset_exit[row] = exit.0.0;
             geometry.derivative_offset_exit[row] = exit.0.1;
@@ -4136,16 +4226,73 @@ impl LatentSurvivalFrozenOffsetChart {
                 geometry.offset_entry_theta[[row, axis]] = entry.1[axis].0;
                 geometry.offset_exit_theta[[row, axis]] = exit.1[axis].0;
                 geometry.derivative_offset_exit_theta[[row, axis]] = exit.1[axis].1;
+                for other in 0..loaded_dim {
+                    geometry.offset_entry_theta_theta[[row, axis, other]] =
+                        entry_second[axis][other].0;
+                    geometry.offset_exit_theta_theta[[row, axis, other]] =
+                        exit_second[axis][other].0;
+                    geometry.derivative_offset_exit_theta_theta[[row, axis, other]] =
+                        exit_second[axis][other].1;
+                }
             }
-            if let Some(((value, _), partials)) = right {
+            if let Some((((value, _), partials), right_second)) = right {
                 geometry.offset_right[row] = value;
                 for axis in 0..loaded_dim {
                     geometry.offset_right_theta[[row, axis]] = partials[axis].0;
+                    for other in 0..loaded_dim {
+                        geometry.offset_right_theta_theta[[row, axis, other]] =
+                            right_second[axis][other].0;
+                    }
                 }
             }
         }
         Ok(geometry)
     }
+}
+
+/// Second partials `(∂²η/∂θ_k∂θ_l, ∂²o_D/∂θ_k∂θ_l)` of the log-cumulative-hazard
+/// offsets `η = log H(t)` and `o_D = h(t)/H(t)` at one age, in the coordinates of
+/// [`survival_baseline_theta_from_config`] (#2677). From the hazard's own first and
+/// second partials, `η = log H` and `H·o_D = h` give
+///
+/// ```text
+///   η_kl   = H_kl/H − H_k·H_l/H²,
+///   o_D,kl = (h_kl − o_D·H_kl − o_D,l·H_k − o_D,k·H_l)/H,   o_D,k = (h_k − o_D·H_k)/H.
+/// ```
+fn log_cumulative_hazard_offset_theta_second_partials(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Vec<Vec<(f64, f64)>>, String> {
+    let ((cumulative, instant), first, second) = survival_hazard_theta_first_second(age, cfg)?
+        .ok_or_else(|| {
+            "latent survival nonlinear baseline chart lost its hazard second partials".to_string()
+        })?;
+    let rate = instant / cumulative;
+    let rate_first: Vec<f64> = first
+        .iter()
+        .map(|&(cumulative_k, instant_k)| (instant_k - rate * cumulative_k) / cumulative)
+        .collect();
+    let dim = first.len();
+    Ok((0..dim)
+        .map(|k| {
+            (0..dim)
+                .map(|l| {
+                    let (cumulative_k, _) = first[k];
+                    let (cumulative_l, _) = first[l];
+                    let (cumulative_kl, instant_kl) = second[k][l];
+                    (
+                        cumulative_kl / cumulative
+                            - cumulative_k * cumulative_l / (cumulative * cumulative),
+                        (instant_kl
+                            - rate * cumulative_kl
+                            - rate_first[l] * cumulative_k
+                            - rate_first[k] * cumulative_l)
+                            / cumulative,
+                    )
+                })
+                .collect()
+        })
+        .collect())
 }
 
 pub fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&InverseLink>) -> bool {
@@ -4241,26 +4388,6 @@ pub(crate) fn build_latent_survival_baseline_offsets(
         );
     }
 
-    fn gompertz_components(age: f64, rate: f64, shape: f64) -> (f64, f64) {
-        if shape.abs() < 1e-10 {
-            // Taylor at shape=0 matching `gompertz_hazard_components`:
-            //   H_G(t) = rate·t·(1 + (shape·t)/2 + (shape·t)²/6)
-            //   h_G(t) = rate·(1 + shape·t + (shape·t)²/2)
-            // Dropping the higher-order `shape*t` corrections silently
-            // diverges this helper from its sibling for non-zero shape near
-            // the cutoff and gives inconsistent loaded-vs-unloaded offsets.
-            let x = shape * age;
-            return (
-                rate * age * (1.0 + 0.5 * x + x * x / 6.0),
-                rate * (1.0 + x + 0.5 * x * x),
-            );
-        }
-        let shape_age = shape * age;
-        let cumulative_hazard = (rate / shape) * shape_age.exp_m1();
-        let instant_hazard = rate * shape_age.exp();
-        (cumulative_hazard, instant_hazard)
-    }
-
     let n = age_entry.len();
 
     // Per-row 6-tuple is independent. Evaluate in parallel into a Vec and then
@@ -4303,8 +4430,8 @@ pub(crate) fn build_latent_survival_baseline_offsets(
                     let makeham = cfg.makeham.ok_or_else(|| {
                         "gompertz-makeham latent survival is missing baseline makeham".to_string()
                     })?;
-                    let (loaded_entry, _) = gompertz_components(entry, rate, shape);
-                    let (loaded_exit, loaded_hazard) = gompertz_components(exit, rate, shape);
+                    let (loaded_entry, _) = gompertz_hazard_components(entry, rate, shape);
+                    let (loaded_exit, loaded_hazard) = gompertz_hazard_components(exit, rate, shape);
                     if !(loaded_entry.is_finite()
                         && loaded_entry > 0.0
                         && loaded_exit.is_finite()
@@ -4616,6 +4743,7 @@ pub fn build_time_varying_survival_covariate_template(
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(num_internal_knots),
             placement: gam_terms::basis::BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -4970,7 +5098,7 @@ mod tests {
         SurvivalLikelihoodMode::LatentBinary,
     ];
 
-    use super::{SURVIVAL_TIME_FLOOR,SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
+    use super::{SURVIVAL_TIME_FLOOR,SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_first_shape_series_switch, gompertz_offset_shape_series_switch, gompertz_second_shape_series_switch, gompertz_shape_derivatives, gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
     use super::optimize_survival_baseline_config_with_gradient_only;
     use super::{
         center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
@@ -4981,7 +5109,7 @@ mod tests {
         build_time_varying_survival_covariate_template, slope_time_margin_rows,
         replay_slope_follow_up_designs, replay_slope_time_margin_value_tangent_design,
     };
-    use crate::probability::normal_cdf;
+    use crate::probability::{normal_cdf, normal_logcdf, normal_pdf};
     use crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD;
     use crate::survival::OffsetChannelResiduals;
     use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
@@ -5906,6 +6034,177 @@ mod tests {
         }
     }
 
+    /// A row without delayed entry enters at `SURVIVAL_TIME_FLOOR`, where a Weibull cumulative
+    /// hazard can fall below 2⁻⁵⁴ so that `exp(−H)` rounds to exactly 1. The probit index
+    /// `q = Φ⁻¹(1 − S)` is finite there, and it must be evaluated rather than refused: the
+    /// #2930 fixture's outer search refused 135 probes at such charts around its planted law
+    /// (shape 1.675) and certified a model with every penalty railed. The witness is one of
+    /// those refused charts, `log λ = 1.2093`, `log k = 0.5365`, with `H(1e-9) = 5.2e-17`.
+    #[test]
+    fn marginal_slope_baseline_is_finite_where_the_entry_floor_rounds_survival_to_one_2930() {
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(1.2093_f64.exp()),
+            shape: Some(0.5365_f64.exp()),
+            rate: None,
+            makeham: None,
+        };
+        let scale = cfg.scale.expect("scale");
+        let shape = cfg.shape.expect("shape");
+        let age = SURVIVAL_TIME_FLOOR;
+        let cumulative_hazard = (age / scale).powf(shape);
+        assert_eq!(
+            (-cumulative_hazard).exp(),
+            1.0,
+            "this witness has stopped being one: exp(−H) no longer rounds to 1 at H = {cumulative_hazard:e}"
+        );
+        let event_probability = -(-cumulative_hazard).exp_m1();
+
+        let (q, q_derivative) = evaluate_survival_marginal_slope_baseline(age, &cfg)
+            .expect("the probit baseline is finite at the entry floor");
+        assert!(
+            (normal_cdf(q) / event_probability - 1.0).abs() <= 1e-12,
+            "Φ(q) = {:e} must reproduce the event probability {event_probability:e}",
+            normal_cdf(q)
+        );
+
+        // dq/dlog t = t·q′, against a central difference in log age.
+        let log_step = 1e-4_f64;
+        let q_later = evaluate_survival_marginal_slope_baseline(age * log_step.exp(), &cfg)
+            .expect("q at a later age")
+            .0;
+        let q_earlier = evaluate_survival_marginal_slope_baseline(age * (-log_step).exp(), &cfg)
+            .expect("q at an earlier age")
+            .0;
+        assert_close(
+            age * q_derivative,
+            (q_later - q_earlier) / (2.0 * log_step),
+            1e-6,
+            "floor-age probit q' in log age",
+        );
+
+        let analytic = marginal_slope_baseline_offset_theta_partials(age, &cfg)
+            .expect("partials")
+            .expect("nonlinear");
+        let fd = fd_marginal_slope_baseline_offset(age, &cfg, &[1e-7, 1e-7]);
+        assert_eq!(analytic.len(), fd.len());
+        for (k, ((aq, aqt), (fq, fqt))) in analytic.iter().zip(fd.iter()).enumerate() {
+            assert_close(*aq, *fq, 1e-6, &format!("floor-age weibull-probit q theta[{k}]"));
+            assert_close(*aqt, *fqt, 1e-6, &format!("floor-age weibull-probit q' theta[{k}]"));
+        }
+
+        let age_entry = array![SURVIVAL_TIME_FLOOR, SURVIVAL_TIME_FLOOR];
+        let age_exit = array![0.5, 2.0];
+        let geometry =
+            build_survival_marginal_slope_baseline_geometry(&age_entry, &age_exit, &cfg)
+                .expect("the row geometry builds at the entry floor")
+                .expect("Weibull is a nonlinear chart");
+        for row in 0..age_entry.len() {
+            assert_eq!(geometry.offset_entry[row].to_bits(), q.to_bits(), "entry row {row}");
+            let exit_hazard = (age_exit[row] / scale).powf(shape);
+            assert!(
+                (normal_cdf(-geometry.offset_exit[row]) - (-exit_hazard).exp()).abs() <= 1e-12,
+                "exit row {row}"
+            );
+        }
+    }
+
+    /// gam#2969: along the Weibull chart's k → 0, λ → 0 limit the cumulative hazard passes 745,
+    /// where `exp(−H)` underflows to zero while `q ≈ √(2H)` is still finite. The chart reads `q`
+    /// through `ln S = −H` and `S/φ(q)` as the reciprocal Mills ratio, so a member the old
+    /// evaluation refused ("survival must be positive, got 0") is evaluable with its exact time
+    /// and θ derivatives.
+    #[test]
+    fn marginal_slope_baseline_is_finite_where_survival_underflows_2969() {
+        // On the limit curve through the #2969 log-normal law (anchor slope 0.945 at t = 1).
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some((-132.0632_f64).exp()),
+            shape: Some((-3.0_f64).exp()),
+            rate: None,
+            makeham: None,
+        };
+        let scale = cfg.scale.expect("scale");
+        let shape = cfg.shape.expect("shape");
+        let age = 3.0_f64;
+        let cumulative_hazard = (age / scale).powf(shape);
+        assert_eq!(
+            (-cumulative_hazard).exp(),
+            0.0,
+            "this witness has stopped being one: exp(−H) no longer underflows at H = {cumulative_hazard:e}"
+        );
+
+        let (q, q_derivative) = evaluate_survival_marginal_slope_baseline(age, &cfg)
+            .expect("the probit baseline is finite where the survival probability underflows");
+        assert_close(normal_logcdf(-q), -cumulative_hazard, 1e-12, "ln Φ(−q) against ln S = −H");
+
+        // dq/dlog t = t·q′, against a central difference in log age.
+        let log_step = 1e-4_f64;
+        let q_later = evaluate_survival_marginal_slope_baseline(age * log_step.exp(), &cfg)
+            .expect("q at a later age")
+            .0;
+        let q_earlier = evaluate_survival_marginal_slope_baseline(age * (-log_step).exp(), &cfg)
+            .expect("q at an earlier age")
+            .0;
+        assert_close(
+            age * q_derivative,
+            (q_later - q_earlier) / (2.0 * log_step),
+            1e-6,
+            "underflow-age probit q' in log age",
+        );
+
+        let analytic = marginal_slope_baseline_offset_theta_partials(age, &cfg)
+            .expect("partials")
+            .expect("nonlinear");
+        let fd = fd_marginal_slope_baseline_offset(age, &cfg, &[1e-7, 1e-7]);
+        assert_eq!(analytic.len(), fd.len());
+        for (k, ((aq, aqt), (fq, fqt))) in analytic.iter().zip(fd.iter()).enumerate() {
+            assert_close(*aq, *fq, 1e-6, &format!("underflow-age weibull-probit q theta[{k}]"));
+            assert_close(*aqt, *fqt, 1e-6, &format!("underflow-age weibull-probit q' theta[{k}]"));
+        }
+
+        // Rows whose exits straddle the underflow point build one finite geometry.
+        let age_entry = array![SURVIVAL_TIME_FLOOR, SURVIVAL_TIME_FLOOR, SURVIVAL_TIME_FLOOR];
+        let age_exit = array![1.0, age, 5.0];
+        let geometry =
+            build_survival_marginal_slope_baseline_geometry(&age_entry, &age_exit, &cfg)
+                .expect("the row geometry builds across the underflow point")
+                .expect("Weibull is a nonlinear chart");
+        for row in 0..age_exit.len() {
+            let exit_hazard = (age_exit[row] / scale).powf(shape);
+            assert_close(
+                normal_logcdf(-geometry.offset_exit[row]),
+                -exit_hazard,
+                1e-12,
+                &format!("exit row {row}"),
+            );
+            assert!(geometry.derivative_offset_exit[row].is_finite(), "exit row {row} q'");
+        }
+
+        // Positive control: where S is representable the Mills form reproduces q′ = h·S/φ(q).
+        let representable = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(1.2093_f64.exp()),
+            shape: Some(0.5365_f64.exp()),
+            rate: None,
+            makeham: None,
+        };
+        let age = 5.0_f64;
+        let scale = representable.scale.expect("scale");
+        let shape = representable.shape.expect("shape");
+        let cumulative_hazard = (age / scale).powf(shape);
+        assert!(cumulative_hazard > std::f64::consts::LN_2, "the control reads the log-survival side");
+        let instant_hazard = shape * cumulative_hazard / age;
+        let (q, q_derivative) =
+            evaluate_survival_marginal_slope_baseline(age, &representable).expect("q");
+        assert_close(
+            q_derivative,
+            instant_hazard * (-cumulative_hazard).exp() / normal_pdf(q),
+            1e-13,
+            "q' against h·S/φ(q) where S is representable",
+        );
+    }
+
     #[test]
     fn marginal_slope_baseline_chain_rule_gradient_contracts_probit_partials() {
         let cfg = SurvivalBaselineConfig {
@@ -6317,7 +6616,7 @@ mod tests {
     ///
     /// `steps` is per-θ-component: the caller picks the step size appropriate
     /// for each channel. Gompertz / Gompertz–Makeham need a tiny step on the
-    /// shape channel near the Taylor pivot |shape| < 1e-10 (so θ±h stays on
+    /// shape channel near the Taylor pivot on `shape·t` (so θ±h stays on
     /// the same branch), but a normal-scale step on log_rate / log_makeham;
     /// using the tiny shape-step on every channel corrupts the log_rate
     /// channel with `eps/(2h)` cancellation noise and has nothing to do with
@@ -6371,8 +6670,8 @@ mod tests {
     #[test]
     fn gompertz_offset_partials_match_central_diff() {
         // Several (rate, shape, age) combinations spanning the small-shape
-        // Taylor branch (|shape| < 1e-10) and the normal branch
-        // (shape >> 1e-10), plus sign-reversed shape.
+        // Taylor branch (`shape·t` below its switch) and the closed-form branch,
+        // plus sign-reversed shape.
         let cases = [
             (0.5_f64, 0.01_f64, 30.0_f64),
             (0.2, 0.05, 60.0),
@@ -6452,40 +6751,94 @@ mod tests {
 
     #[test]
     fn gompertz_offset_partials_small_shape_taylor_agrees_with_direct_branch() {
-        // Both branches of gompertz_shape_derivatives should agree to high
-        // precision at shape = 1e-10 + epsilon on the direct side vs
-        // shape = 1e-10 - epsilon on the Taylor side. Here we spot-check
-        // the continuity at the branch cutoff: shape slightly above and
-        // slightly below 1e-10 must give values within O(shape²·t²)
-        // (the Taylor truncation error).
+        // `gompertz_shape_derivatives` switches from its Taylor series to the closed
+        // form at `|shape·t| = gompertz_offset_shape_series_switch()`, where the two
+        // routes' error bounds cross at `6ε/|x|`, about `1.6e-12`. Straddle the switch
+        // on both signs and hold both sides to that bound against the series carried
+        // two orders further, whose own truncation at these `x` is below `1e-20`.
         let age = 25.0;
-        let rate = 0.4;
-        let cfg_taylor = SurvivalBaselineConfig {
+        let t = age;
+        let switch = gompertz_offset_shape_series_switch();
+        let bound = 6.0 * f64::EPSILON / switch + 32.0 * f64::EPSILON;
+        for factor in [0.5, 0.9, 1.1, 2.0, -0.9, -1.1] {
+            let x = factor * switch;
+            let (d_eta, d_od) = gompertz_shape_derivatives(age, x / age);
+            let d_eta_ref = t * (0.5 + x / 12.0 - x.powi(3) / 720.0 + x.powi(5) / 30240.0);
+            let dlog_ref = t * (0.5 - x / 12.0 + x.powi(3) / 720.0 - x.powi(5) / 30240.0);
+            let od_ref =
+                (1.0 + x / 2.0 + x * x / 12.0 - x.powi(4) / 720.0 + x.powi(6) / 30240.0) / t;
+            let d_od_ref = od_ref * dlog_ref;
+            let eta_error = ((d_eta - d_eta_ref) / d_eta_ref).abs();
+            let od_error = ((d_od - d_od_ref) / d_od_ref).abs();
+            assert!(
+                eta_error <= bound,
+                "x = {x:e}: ∂η/∂shape relative error {eta_error:e} > {bound:e}"
+            );
+            assert!(
+                od_error <= bound,
+                "x = {x:e}: ∂o_D/∂shape relative error {od_error:e} > {bound:e}"
+            );
+        }
+        // The public entry reaches the same helper.
+        let cfg = SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::Gompertz,
             scale: None,
-            shape: Some(0.5e-10),
-            rate: Some(rate),
+            shape: Some(0.9 * switch / age),
+            rate: Some(0.4),
             makeham: None,
         };
-        let cfg_direct = SurvivalBaselineConfig {
-            target: SurvivalBaselineTarget::Gompertz,
-            scale: None,
-            shape: Some(2.0e-10),
-            rate: Some(rate),
-            makeham: None,
+        let partials = baseline_offset_theta_partials(age, &cfg).expect("ok").expect("nl");
+        assert_eq!(partials[1], gompertz_shape_derivatives(age, 0.9 * switch / age));
+    }
+
+    #[test]
+    fn gompertz_hazard_shape_series_switches_hold_their_derived_errors() {
+        // `∂H_G/∂shape = rate·t²·φ₁(x)` and `∂²H_G/∂shape² = rate·t³·φ₂(x)` switch to
+        // their three-term series below the crossings of the two routes' error
+        // bounds: `5ε/|x|` against `x³/15` at `(75ε)^{1/4}`, and `9ε/x²` against
+        // `x³/12` at `(108ε)^{1/5}`. Straddle each switch on both signs and hold both
+        // sides to the bound there, against each series carried eight more orders.
+        let (age, rate) = (30.0_f64, 0.7_f64);
+        let t = age;
+        let phi_1 = |x: f64| {
+            (0..11).fold(0.0, |sum, k| sum + (k + 1) as f64 * x.powi(k) / factorial(k + 2))
         };
-        let p_t = baseline_offset_theta_partials(age, &cfg_taylor)
-            .expect("ok")
-            .expect("nl");
-        let p_d = baseline_offset_theta_partials(age, &cfg_direct)
-            .expect("ok")
-            .expect("nl");
-        // ∂eta/∂shape at shape≈0 should be t/2 = 12.5 on both sides.
-        assert_close(p_t[1].0, 12.5, 1e-8, "taylor ∂eta/∂shape near 0");
-        assert_close(p_d[1].0, 12.5, 1e-8, "direct ∂eta/∂shape near 0");
-        // ∂o_D/∂shape at shape≈0 should be 1/2.
-        assert_close(p_t[1].1, 0.5, 1e-8, "taylor ∂o_D/∂shape near 0");
-        assert_close(p_d[1].1, 0.5, 1e-8, "direct ∂o_D/∂shape near 0");
+        let phi_2 = |x: f64| {
+            (0..11).fold(0.0, |sum, j| {
+                sum + ((j + 2) * (j + 1)) as f64 * x.powi(j) / factorial(j + 3)
+            })
+        };
+        let first = gompertz_first_shape_series_switch();
+        let first_bound = 5.0 * f64::EPSILON / first + 32.0 * f64::EPSILON;
+        let second = gompertz_second_shape_series_switch();
+        let second_bound = 9.0 * f64::EPSILON / (second * second) + 32.0 * f64::EPSILON;
+        for factor in [0.5, 0.9, 1.1, 2.0, -0.9, -1.1] {
+            let x = factor * first;
+            let (d_cum, _) = gompertz_cumulative_shape_derivative(age, rate, x / age);
+            let reference = rate * t * t * phi_1(x);
+            let error = ((d_cum - reference) / reference).abs();
+            assert!(
+                error <= first_bound,
+                "x = {x:e}: ∂H_G/∂shape relative error {error:e} > {first_bound:e}"
+            );
+
+            let x = factor * second;
+            let (d2_cum, d2_inst) =
+                gompertz_cumulative_shape_second_derivative(age, rate, x / age);
+            let reference = rate * t * t * t * phi_2(x);
+            let error = ((d2_cum - reference) / reference).abs();
+            assert!(
+                error <= second_bound,
+                "x = {x:e}: ∂²H_G/∂shape² relative error {error:e} > {second_bound:e}"
+            );
+            // `rate·t²·eˣ` carries no cancellation on either side of the switch.
+            let instant = rate * t * t * x.exp();
+            assert!(((d2_inst - instant) / instant).abs() <= 8.0 * f64::EPSILON);
+        }
+    }
+
+    fn factorial(n: i32) -> f64 {
+        (1..=n).fold(1.0, |product, k| product * k as f64)
     }
 
     // ----------------------------------------------------------------------

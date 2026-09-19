@@ -229,8 +229,46 @@ impl ClosedInterval {
         Self::new(lo.lo, hi.hi)
     }
 
+    /// The exact-real product of two binary64 values, one ulp wide at most. Its fused residual `a·b − fl(a·b)` is exact
+    /// above the residual floor, so a zero residual keeps an exact product a point, and its sign picks the neighbour.
+    /// Below the floor it is the outward-rounded product.
+    pub fn product(left: f64, right: f64) -> Self {
+        let value = left * right;
+        if value.is_finite() && value.abs() >= EXACT_RESIDUAL_FLOOR {
+            let residual = left.mul_add(right, -value);
+            return residual_side(value, residual == 0.0, residual > 0.0);
+        }
+        Self::point(left).mul(Self::point(right))
+    }
+
+    /// The exact-real quotient of two binary64 values with a positive denominator, one ulp wide at most. The remainder
+    /// `a − fl(a/b)·b` of a rounded division is representable, and fused it is exact above the residual floor, so a zero
+    /// remainder keeps an exact quotient a point. Below the floor it is the outward-rounded quotient.
+    pub fn quotient(numerator: f64, denominator: f64) -> Self {
+        let value = numerator / denominator;
+        if denominator > 0.0
+            && denominator.is_finite()
+            && value.is_finite()
+            && value.abs() >= EXACT_RESIDUAL_FLOOR
+            && numerator.abs() >= EXACT_RESIDUAL_FLOOR
+        {
+            let remainder = (-value).mul_add(denominator, numerator);
+            return residual_side(value, remainder == 0.0, remainder > 0.0);
+        }
+        Self::point(numerator).div_positive(Self::point(denominator))
+    }
+
+    /// Directed outer enclosure of the square root of the interval's nonnegative part. The binary64 square root is
+    /// correctly rounded, so one step outward encloses an inexact root.
+    pub fn sqrt(self) -> Self {
+        Self {
+            lo: sqrt_down(self.lo.max(0.0)),
+            hi: sqrt_up(self.hi.max(0.0)),
+        }
+    }
+
     /// Divide by an interval known to be strictly positive.
-    fn div_positive(self, denominator: Self) -> Self {
+    pub fn div_positive(self, denominator: Self) -> Self {
         assert!(
             denominator.lo > 0.0,
             "div_positive requires a strictly positive denominator interval, got lo={}",
@@ -4193,6 +4231,50 @@ fn quotient_up(numerator: f64, denominator: f64) -> f64 {
         value
     } else {
         next_up(value)
+    }
+}
+
+/// `2^−916`. With results at or above it, a fused residual is exact: `root² − value` for a square root (`root ≥ 2^−458`,
+/// so the residual is an integer multiple of `2^−1020`), `a·b − fl(a·b)` for a product and `a − fl(a/b)·b` for a
+/// quotient (each an integer multiple of at least `2^−1074` with at most 53 significant bits).
+const EXACT_RESIDUAL_FLOOR: f64 = f64::MIN_POSITIVE * (1_u64 << 53) as f64 * (1_u64 << 53) as f64;
+
+/// Whether `root = fl(√value)` is the exact root: the fused residual `root² − value` is zero.
+#[inline]
+fn sqrt_is_exact(value: f64, root: f64) -> bool {
+    value == 0.0 || (value >= EXACT_RESIDUAL_FLOOR && root.mul_add(root, -value) == 0.0)
+}
+
+/// The rounded `value` and its neighbour on the side of the exact result, or `value` alone when the residual is zero.
+/// `above` says the exact result exceeds `value`.
+#[inline]
+fn residual_side(value: f64, residual_zero: bool, above: bool) -> ClosedInterval {
+    if residual_zero {
+        ClosedInterval::point(value)
+    } else if above {
+        ClosedInterval::new(value, next_up(value))
+    } else {
+        ClosedInterval::new(next_down(value), value)
+    }
+}
+
+#[inline]
+fn sqrt_down(value: f64) -> f64 {
+    let root = value.sqrt();
+    if sqrt_is_exact(value, root) {
+        root
+    } else {
+        next_down(root).max(0.0)
+    }
+}
+
+#[inline]
+fn sqrt_up(value: f64) -> f64 {
+    let root = value.sqrt();
+    if sqrt_is_exact(value, root) {
+        root
+    } else {
+        next_up(root)
     }
 }
 

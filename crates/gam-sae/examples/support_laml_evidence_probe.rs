@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! cargo run -p gam-sae --release --example support_laml_evidence_probe -- \
-//!     chart.bin <rows> <cols> <k_atoms> <top_k> <inner_cycles>
+//!     chart.bin <rows> <cols> <k_atoms> <top_k>
 //! ```
 
 use gam_sae::front_door::{SaeFitLane, admit_topk_manifold};
@@ -35,16 +35,15 @@ const DENSE_ORACLE_MAX_BORDER: usize = 1_200;
 fn main() -> Result<(), String> {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 7 {
+    if args.len() != 6 {
         return Err("usage: support_laml_evidence_probe <f64-le.bin> <rows> <cols> <k_atoms> \
-                    <top_k> <inner_cycles>"
+                    <top_k>"
             .to_string());
     }
     let rows: usize = args[2].parse().map_err(|e| format!("rows: {e}"))?;
     let cols: usize = args[3].parse().map_err(|e| format!("cols: {e}"))?;
     let k_atoms: usize = args[4].parse().map_err(|e| format!("k_atoms: {e}"))?;
     let top_k: usize = args[5].parse().map_err(|e| format!("top_k: {e}"))?;
-    let cycles: usize = args[6].parse().map_err(|e| format!("inner_cycles: {e}"))?;
     let bytes = std::fs::read(&args[1]).map_err(|e| format!("{}: {e}", args[1]))?;
     if bytes.len() != rows * cols * 8 {
         return Err(format!(
@@ -100,15 +99,13 @@ fn main() -> Result<(), String> {
     // Drive the inner fixed point toward its optimum: the evidence is only the
     // Laplace normalizer AT a stationary inner state, and a random seed's arrow
     // system is not the one production factors.
-    // Running out of cycles is the expected outcome here and not a probe
-    // failure — this harness measures the EVIDENCE stage, which is downstream —
-    // so the non-convergence is reported rather than discarded.
+    // A refusal is not a probe failure — this harness measures the EVIDENCE
+    // stage, which is downstream — so it is reported rather than discarded.
     let t_inner = Instant::now();
     let inner = match term.solve_fixed_point(
         centered.view(),
         &lambda_smooth,
         &ard_precisions,
-        cycles,
         1.0e-4,
         1.0,
     ) {
@@ -116,7 +113,7 @@ fn main() -> Result<(), String> {
         Err(error) => format!("did not recur: {error}"),
     };
     println!(
-        "inner fixed point: {cycles} cycles, {:.1}s — {inner}",
+        "inner fixed point: {:.1}s — {inner}",
         t_inner.elapsed().as_secs_f64()
     );
 

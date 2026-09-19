@@ -1672,6 +1672,46 @@ impl SaeManifoldAtom {
         Ok(())
     }
 
+    /// Install an exact chart transport of this atom's basis: `decoder` is the
+    /// old decoder re-expressed as `T·B` against the new basis, and the declared
+    /// quadratic follows it by the same congruence, `S' = (T⁻¹)ᵀ S T⁻¹` and
+    /// likewise `∂S/∂κ`.
+    ///
+    /// The geometry plan is carried through the same transport. It is the
+    /// authority every later trial curvature rebuilds `S(κ)` and `∂S/∂κ` from, so
+    /// a plan left in the old chart would install the old chart's Gram on the
+    /// transported decoder at the next trial κ (#2935, #2947).
+    pub(crate) fn install_chart_transport(
+        &mut self,
+        basis_values: Array2<f64>,
+        basis_jacobian: Array3<f64>,
+        decoder: Array2<f64>,
+        decoder_transport: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        let smooth_penalty =
+            transport_smooth_penalty_for_decoder(decoder_transport, self.smooth_penalty.view())?;
+        let smooth_penalty_kappa_derivative = self
+            .smooth_penalty_kappa_derivative()?
+            .map(|derivative| {
+                transport_smooth_penalty_for_decoder(decoder_transport, derivative.view())
+            })
+            .transpose()?;
+        let geometry_plan = self
+            .geometry_plan
+            .as_ref()
+            .map(|plan| plan.transported(decoder_transport))
+            .transpose()?;
+        self.install_reparameterized_basis(
+            basis_values,
+            basis_jacobian,
+            decoder,
+            smooth_penalty,
+            smooth_penalty_kappa_derivative,
+        )?;
+        self.geometry_plan = geometry_plan;
+        Ok(())
+    }
+
     /// The atom's cross-field shape contract, stated once.
     ///
     /// ```text

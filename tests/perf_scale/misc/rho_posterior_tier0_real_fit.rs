@@ -1,11 +1,11 @@
-//! #938 Tier-0 marginal-smoothing certificate against a REAL fit artifact.
+//! #938 Tier-0 marginal-smoothing adequacy diagnostic against a REAL fit artifact.
 //!
-//! The PSIS `ρ`-uncertainty certificate (`src/inference/rho_posterior.rs`) is
+//! The PSIS `ρ`-uncertainty adequacy diagnostic (`src/inference/rho_posterior.rs`) is
 //! unit-tested against closed-form Gaussian / heavy-tail fixtures. This test
 //! exercises the *objective-lifecycle seam*: a genuine `fit_from_formula` GAM
-//! must produce the certificate from its own converged REML objective and
+//! must produce the diagnostic from its own converged REML objective and
 //! surface it on the fit artifact, so the tiers that consume it (1-2) have a
-//! real entry point. It asserts the certificate is present and structurally
+//! real entry point. It asserts the diagnostic is present and structurally
 //! sound, and that it is deterministic across identical fits.
 
 use csv::StringRecord;
@@ -23,7 +23,7 @@ const N: usize = 300;
 const SIGMA: f64 = 0.30;
 
 /// Known smooth-plus-linear ground truth, the canonical `s(x) + z` design that
-/// genuinely exercises the smoothing-parameter (ρ) machinery the certificate
+/// genuinely exercises the smoothing-parameter (ρ) machinery the diagnostic
 /// is about.
 fn mu_true(x: f64, z: f64) -> f64 {
     (2.0 * PI * x).sin() + 0.6 * z
@@ -45,9 +45,9 @@ fn build_dataset(seed: u64) -> EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
 }
 
-fn fit_and_take_certificate(
+fn fit_and_take_adequacy(
     seed: u64,
-) -> (f64, gam::inference::rho_posterior::RhoPosteriorCertificate) {
+) -> (f64, gam::inference::rho_posterior::RhoPosteriorAdequacy) {
     let ds = build_dataset(seed);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -61,51 +61,51 @@ fn fit_and_take_certificate(
         .fit
         .reml_score()
         .expect("the fit reports a REML/LAML criterion");
-    let cert = match &fit.fit.artifacts.rho_posterior {
-        RhoPosteriorOutcome::Certified(cert) => cert.clone(),
+    let adequacy = match &fit.fit.artifacts.rho_posterior {
+        RhoPosteriorOutcome::Assessed(adequacy) => adequacy.clone(),
         other => panic!(
             "a smooth-term Gaussian GAM has ρ parameters and an SPD outer Hessian, so the \
-             Tier-0 ρ-posterior seam must certify on the real fit artifact, got {other:?}"
+             Tier-0 ρ-posterior seam must grade the real fit artifact, got {other:?}"
         ),
     };
-    (reml_score, cert)
+    (reml_score, adequacy)
 }
 
-/// The seam delivers: a real fit carries a Certified Tier-0 outcome with a finite
+/// The seam delivers: a real fit carries an Assessed Tier-0 outcome with a finite
 /// tail shape and a Kish effective sample size inside its bounds.
 #[test]
-fn real_gaussian_fit_carries_a_sound_tier0_certificate() {
+fn real_gaussian_fit_carries_a_sound_tier0_adequacy_diagnostic() {
     init_parallelism();
-    let (_reml_score, cert) = fit_and_take_certificate(938_001);
+    let (_reml_score, adequacy) = fit_and_take_adequacy(938_001);
 
     assert!(
-        cert.k_hat.is_finite(),
+        adequacy.k_hat.is_finite(),
         "the Pareto tail shape k̂ must be finite, got {}",
-        cert.k_hat
+        adequacy.k_hat
     );
-    assert!(cert.n_samples >= 2, "the certificate must draw proposals");
+    assert!(adequacy.n_samples >= 2, "the diagnostic must draw proposals");
 
     // Kish's (Σw)²/Σw² over the M self-normalized weights lies in [1, M]: Σw = 1
     // and Cauchy–Schwarz give 1/M ≤ Σw² ≤ 1. Both edges carry the M-term
     // summations' relative rounding M·ε.
-    let m = cert.n_samples as f64;
+    let m = adequacy.n_samples as f64;
     let rounding = 1.0 + m * f64::EPSILON;
     assert!(
-        cert.effective_sample_size * rounding >= 1.0
-            && cert.effective_sample_size <= m * rounding,
+        adequacy.effective_sample_size * rounding >= 1.0
+            && adequacy.effective_sample_size <= m * rounding,
         "ESS {} must lie in [1, M = {m}]",
-        cert.effective_sample_size
+        adequacy.effective_sample_size
     );
 }
 
-/// The certificate is deterministic: the fixed-seed proposal stream means two
+/// The diagnostic is deterministic: the fixed-seed proposal stream means two
 /// fits of identical data yield bit-identical `k̂` (the lifecycle seam injects
 /// the same live criterion both times).
 #[test]
-fn tier0_certificate_is_deterministic_across_identical_fits() {
+fn tier0_adequacy_is_deterministic_across_identical_fits() {
     init_parallelism();
-    let (score_a, a) = fit_and_take_certificate(938_002);
-    let (score_b, b) = fit_and_take_certificate(938_002);
+    let (score_a, a) = fit_and_take_adequacy(938_002);
+    let (score_b, b) = fit_and_take_adequacy(938_002);
     assert_eq!(
         score_a.to_bits(),
         score_b.to_bits(),
@@ -114,7 +114,7 @@ fn tier0_certificate_is_deterministic_across_identical_fits() {
     assert_eq!(
         a.k_hat.to_bits(),
         b.k_hat.to_bits(),
-        "the fixed-seed certificate must give bit-identical k̂ across identical fits"
+        "the fixed-seed diagnostic must give bit-identical k̂ across identical fits"
     );
     assert_eq!(a.n_samples, b.n_samples);
 }

@@ -56,7 +56,7 @@ fn duchon_pc_term(name: &str, d: usize, centers: usize, power: usize) -> SmoothT
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -70,6 +70,7 @@ fn ctn_bootstrap_design_16d_duchon_order0_power9_centers24_succeeds() {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![duchon_pc_term("duchon_pc16", d, 24, 9)],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec)
         .expect("bootstrap CTN design build should succeed at large-scale shape");

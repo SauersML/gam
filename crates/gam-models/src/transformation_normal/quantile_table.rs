@@ -338,7 +338,12 @@ impl HermiteCell {
         }
         let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
         let mut t = ((target - self.h0) / (self.h1 - self.h0)).clamp(0.0, 1.0);
-        for _ in 0..64 {
+        // No budget: every step moves one bracket end onto `t`, and each next `t`
+        // lies strictly inside the bracket (Newton only when strictly inside,
+        // else the midpoint, which is strictly inside while the width exceeds ε).
+        // So the bracket strictly shrinks, and the loop ends at width ε or at a
+        // Newton fixed point.
+        loop {
             let value = self.value(t);
             if value > target {
                 hi = t;

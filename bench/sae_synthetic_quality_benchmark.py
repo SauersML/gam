@@ -96,7 +96,7 @@ def run_one(
     test, test_truth = _data(n_test, seed=seed + 10_000, noise=noise)
 
     t0 = time.perf_counter()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=train,
         K=2,
         atom_basis="periodic",
@@ -104,7 +104,6 @@ def run_one(
         assignment="softmax",
         top_k=1,
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=int(max_iter),

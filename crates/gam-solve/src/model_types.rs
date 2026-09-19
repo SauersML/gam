@@ -155,13 +155,17 @@ pub(crate) mod result_types;
 
 pub(crate) use result_types::CERTIFICATE_RAIL_MARGIN;
 pub use result_types::{
-    BlockRole, CertifiedRung, CoefficientCovarianceDefinition,
+    BlockRole, CertifiedRung, CoefficientCovarianceDefinition, CoefficientModeSelection,
     CovarianceDeclined, CurvatureAdmissibility, CurvatureEvidence, CurvatureFloorClearance,
     DisplayCoefficientUncertainty,
     ExecutionPath, FitArtifacts, FitGeometry, FitInference, FitOptions, FittedBlock,
     FittedLinkState, IdentifiedCoefficientSubspace, IdentifiedRankConstancy,
-    InferenceCovarianceMode, NO_CRITERION_AT_EXACT_FIT, OuterCriterionCertificate,
-    OuterHessianAbsence, OuterStationarityCertificate, RailCoordinate, RailTailEvidence,
+    InferenceCovarianceMode, NO_CRITERION_AT_EXACT_FIT,
+    NewtonPolishRail, NewtonPolishRecord,
+    OuterCriterionCertificate,
+    RailFaceKind,
+    OuterHessianAbsence, OuterStationarityCertificate, OuterWarmStartRecord, RailCoordinate,
+    RailTailEvidence,
     RailedCoordinateFact, RankConstancyNotEvaluated, SmoothingCorrectionAbsence,
     SmoothingCorrectionMethod, UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,
     ensure_finite_scalar, is_zero_dispersion_boundary,

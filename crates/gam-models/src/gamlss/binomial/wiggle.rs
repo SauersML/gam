@@ -3054,15 +3054,17 @@ impl BinomialLocationScaleWiggleFamily {
             coeff_ww_bd,
         } = program.first_directional_rows(&d_eta_t, &d_eta_ls, uw.view())?;
 
-        let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());
-        let basis_d1: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[1].clone());
-        let basis_d2: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[2].clone());
+        // This call builds its own row program, so its designs mint fresh identities: a
+        // pair-gram cache miss, never a false hit (#2940).
+        let basis = SharedDesign::new(program.basis_derivatives[0].clone());
+        let basis_d1 = SharedDesign::new(program.basis_derivatives[1].clone());
+        let basis_d2 = SharedDesign::new(program.basis_derivatives[2].clone());
 
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
             vec![
-                (0, x_t_arc),
-                (1, x_ls_arc),
+                (0, SharedDesign::from_arc(x_t_arc)),
+                (1, SharedDesign::from_arc(x_ls_arc)),
                 (2, basis),
                 (2, basis_d1),
                 (2, basis_d2),
@@ -3141,15 +3143,17 @@ impl BinomialLocationScaleWiggleFamily {
             v_w.view(),
         )?;
 
-        let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());
-        let basis_d1: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[1].clone());
-        let basis_d2: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[2].clone());
-        let basis_d3: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[3].clone());
+        // Fresh identities for this call's own row program, as in the first directional
+        // operator (#2940).
+        let basis = SharedDesign::new(program.basis_derivatives[0].clone());
+        let basis_d1 = SharedDesign::new(program.basis_derivatives[1].clone());
+        let basis_d2 = SharedDesign::new(program.basis_derivatives[2].clone());
+        let basis_d3 = SharedDesign::new(program.basis_derivatives[3].clone());
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
             vec![
-                (0, x_t_arc),
-                (1, x_ls_arc),
+                (0, SharedDesign::from_arc(x_t_arc)),
+                (1, SharedDesign::from_arc(x_ls_arc)),
                 (2, basis),
                 (2, basis_d1),
                 (2, basis_d2),

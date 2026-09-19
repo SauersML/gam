@@ -126,13 +126,13 @@ fn same_class_race_keeps_evidence_headline() {
     let candidates = vec![
         PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
-            negative_log_evidence: 100.0,
+            bic_half:100.0,
             certification: EvidenceCertification::Exact,
             density_provider: provider_a,
         },
         PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
-            negative_log_evidence: 250.0,
+            bic_half:250.0,
             certification: EvidenceCertification::Exact,
             density_provider: provider_b,
         },
@@ -149,7 +149,7 @@ fn same_class_race_keeps_evidence_headline() {
     assert_eq!(verdict.headline, Headline::Evidence);
     assert_eq!(
         verdict.winner_index, 0,
-        "lower rank-aware evidence wins the same-class headline"
+        "lower BIC/2 wins the same-class headline"
     );
     assert!(verdict.stacking.is_none());
 }

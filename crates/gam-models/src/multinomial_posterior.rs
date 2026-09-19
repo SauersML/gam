@@ -19,6 +19,7 @@
 use crate::model_types::EstimationError;
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_math::quadrature::gauss_hermite_rule as physicists_gauss_hermite_rule;
+use gam_math::sparse_grid::{self, QuadratureAccumulator, SmolyakLevelError, StandardNormalRule};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::collections::BTreeMap;
 
@@ -823,7 +824,7 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
         maximum_function_evaluations: usize,
         absolute_tolerance: f64,
     ) -> Result<Vec<f64>, EstimationError> {
-        let mut accumulator = QuadratureAccumulator::new(packed_moment_count(3)?)?;
+        let mut accumulator = accumulator_over(packed_moment_count(3)?)?;
         for (&standard_normal, &weight) in rule.nodes.iter().zip(rule.weights.iter()) {
             if *total_evaluations >= maximum_function_evaluations {
                 return Err(EstimationError::InvalidInput(format!(
@@ -1042,16 +1043,21 @@ impl<'a> RowIntegrand<'a> {
             }
         }
         let axes: Vec<&GaussHermiteRule> = orders.iter().map(|order| &rules[order]).collect();
+        let mut z = zeroed_vec(
+            self.projected.factor.ncols(),
+            "standard-normal quadrature coordinate",
+        )?;
         let mut workspace = QuadratureWorkspace::new(
             self.active_mean,
             self.projected,
-            &[],
             &self.upper_offsets,
             self.moment_count,
             total_evaluations,
             maximum_function_evaluations,
         )?;
-        workspace.stream_axes(0, &axes, 1.0)?;
+        sparse_grid::stream_axes(&axes, 0, 1.0, &mut z, &mut |z: &[f64], weight: f64| {
+            workspace.accumulate_node(z, weight)
+        })?;
         let (mut raw_moments, mass, absolute_weight_sum) = workspace.accumulator.finish();
         let node_counts: Vec<usize> = orders.iter().map(|order| 2 * order - 1).collect();
         let maximum_rule_nodes = node_counts.iter().copied().max().unwrap_or(0);
@@ -1560,33 +1566,36 @@ fn evaluate_smolyak_level(
     absolute_tolerance: f64,
 ) -> Result<SmolyakEvaluation, EstimationError> {
     let rank = projected.factor.ncols();
-    let q = rank.checked_add(level).ok_or_else(|| {
+    let bounds = sparse_grid::isotropic_smolyak_bounds(rank, level).map_err(|_| {
         EstimationError::InvalidInput(
             "multinomial posterior Smolyak index overflowed usize".to_string(),
         )
     })?;
-    let lower_total = q.saturating_sub(rank.saturating_sub(1)).max(rank);
     let moment_count = packed_moment_count(k)?;
     let upper_offsets = upper_triangle_offsets(k)?;
+    let mut z = zeroed_vec(rank, "standard-normal quadrature coordinate")?;
     let mut workspace = QuadratureWorkspace::new(
         active_mean,
         projected,
-        rules,
         &upper_offsets,
         moment_count,
         total_evaluations,
         maximum_function_evaluations,
     )?;
-    let mut indices = vec![1usize; rank];
-
-    for total in lower_total..=q {
-        let alternating_power = q - total;
-        let mut coefficient = binomial_as_f64(rank - 1, alternating_power)?;
-        if alternating_power % 2 == 1 {
-            coefficient = -coefficient;
-        }
-        workspace.stream_compositions(0, total, &mut indices, coefficient)?;
-    }
+    sparse_grid::stream_isotropic_smolyak_level(
+        rules,
+        rank,
+        bounds,
+        &mut z,
+        &mut |z: &[f64], weight: f64| workspace.accumulate_node(z, weight),
+    )
+    .map_err(|error| match error {
+        SmolyakLevelError::BinomialOverflow(overflow) => EstimationError::InvalidInput(format!(
+            "multinomial posterior Smolyak binomial coefficient C({},{}) overflowed f64",
+            overflow.n, overflow.k
+        )),
+        SmolyakLevelError::Visit(error) => error,
+    })?;
 
     let (mut raw_moments, mass, absolute_weight_sum) = workspace.accumulator.finish();
     // A composition's indices are at most `level + 1`, so it reads `rules[..=level]`.
@@ -1655,80 +1664,19 @@ fn zeroed_vec(length: usize, label: &str) -> Result<Vec<f64>, EstimationError> {
     Ok(values)
 }
 
-struct CompensatedSum {
-    sum: f64,
-    correction: f64,
-}
-
-impl CompensatedSum {
-    fn new() -> Self {
-        Self {
-            sum: 0.0,
-            correction: 0.0,
-        }
-    }
-
-    fn add(&mut self, value: f64) {
-        let combined = self.sum + value;
-        if self.sum.abs() >= value.abs() {
-            self.correction += (self.sum - combined) + value;
-        } else {
-            self.correction += (value - combined) + self.sum;
-        }
-        self.sum = combined;
-    }
-
-    fn value(&self) -> f64 {
-        self.sum + self.correction
-    }
-}
-
-struct QuadratureAccumulator {
-    sums: Vec<f64>,
-    corrections: Vec<f64>,
-    mass: CompensatedSum,
-    absolute_weight_sum: f64,
-}
-
-impl QuadratureAccumulator {
-    fn new(moment_count: usize) -> Result<Self, EstimationError> {
-        Ok(Self {
-            sums: zeroed_vec(moment_count, "quadrature sums")?,
-            corrections: zeroed_vec(moment_count, "quadrature corrections")?,
-            mass: CompensatedSum::new(),
-            absolute_weight_sum: 0.0,
-        })
-    }
-
-    fn add_moment(&mut self, index: usize, value: f64) {
-        let combined = self.sums[index] + value;
-        if self.sums[index].abs() >= value.abs() {
-            self.corrections[index] += (self.sums[index] - combined) + value;
-        } else {
-            self.corrections[index] += (value - combined) + self.sums[index];
-        }
-        self.sums[index] = combined;
-    }
-
-    fn add_weight(&mut self, weight: f64) {
-        self.mass.add(weight);
-        self.absolute_weight_sum += weight.abs();
-    }
-
-    fn finish(mut self) -> (Vec<f64>, f64, f64) {
-        for (sum, correction) in self.sums.iter_mut().zip(self.corrections.iter()) {
-            *sum += *correction;
-        }
-        (self.sums, self.mass.value(), self.absolute_weight_sum)
-    }
+/// A compensated accumulator over `moment_count` zeroed moments, allocated here so an allocation refusal keeps
+/// this module's message.
+fn accumulator_over(moment_count: usize) -> Result<QuadratureAccumulator, EstimationError> {
+    Ok(QuadratureAccumulator::from_zeroed(
+        zeroed_vec(moment_count, "quadrature sums")?,
+        zeroed_vec(moment_count, "quadrature corrections")?,
+    ))
 }
 
 struct QuadratureWorkspace<'a, 'b> {
     active_mean: &'a [f64],
     projected: &'a ProjectedGaussian,
-    rules: &'a [GaussHermiteRule],
     upper_offsets: &'a [usize],
-    z: Vec<f64>,
     active_eta: Vec<f64>,
     probabilities: Vec<f64>,
     accumulator: QuadratureAccumulator,
@@ -1740,96 +1688,26 @@ impl<'a, 'b> QuadratureWorkspace<'a, 'b> {
     fn new(
         active_mean: &'a [f64],
         projected: &'a ProjectedGaussian,
-        rules: &'a [GaussHermiteRule],
         upper_offsets: &'a [usize],
         moment_count: usize,
         total_evaluations: &'b mut usize,
         maximum_function_evaluations: usize,
     ) -> Result<Self, EstimationError> {
-        let rank = projected.factor.ncols();
         let m = active_mean.len();
         Ok(Self {
             active_mean,
             projected,
-            rules,
             upper_offsets,
-            z: zeroed_vec(rank, "standard-normal quadrature coordinate")?,
             active_eta: zeroed_vec(m, "active-logit quadrature buffer")?,
             probabilities: zeroed_vec(m + 1, "softmax quadrature buffer")?,
-            accumulator: QuadratureAccumulator::new(moment_count)?,
+            accumulator: accumulator_over(moment_count)?,
             total_evaluations,
             maximum_function_evaluations,
         })
     }
 
-    fn stream_compositions(
-        &mut self,
-        position: usize,
-        remaining: usize,
-        indices: &mut [usize],
-        coefficient: f64,
-    ) -> Result<(), EstimationError> {
-        let dimensions_left = indices.len() - position;
-        if dimensions_left == 1 {
-            if remaining == 0 {
-                return Ok(());
-            }
-            indices[position] = remaining;
-            return self.stream_tensor(0, indices, coefficient);
-        }
-        let maximum_here = remaining.saturating_sub(dimensions_left - 1);
-        for index in 1..=maximum_here {
-            indices[position] = index;
-            self.stream_compositions(position + 1, remaining - index, indices, coefficient)?;
-        }
-        Ok(())
-    }
-
-    fn stream_tensor(
-        &mut self,
-        axis: usize,
-        indices: &[usize],
-        weight: f64,
-    ) -> Result<(), EstimationError> {
-        if axis == indices.len() {
-            return self.accumulate_node(weight);
-        }
-        let rule_index = indices[axis] - 1;
-        let node_count = self.rules[rule_index].nodes.len();
-        for node_index in 0..node_count {
-            let node = self.rules[rule_index].nodes[node_index];
-            let node_weight = self.rules[rule_index].weights[node_index];
-            self.z[axis] = node;
-            self.stream_tensor(axis + 1, indices, weight * node_weight)?;
-        }
-        Ok(())
-    }
-
-    /// Tensor product over one explicitly chosen rule per direction.
-    ///
-    /// `stream_tensor` above resolves each axis through `rules[index - 1]`,
-    /// which forces the rule cache to be dense; the tensor path visits indices
-    /// that double, so it resolves its axes once and hands them over directly.
-    fn stream_axes(
-        &mut self,
-        axis: usize,
-        axes: &[&GaussHermiteRule],
-        weight: f64,
-    ) -> Result<(), EstimationError> {
-        if axis == axes.len() {
-            return self.accumulate_node(weight);
-        }
-        let node_count = axes[axis].nodes.len();
-        for node_index in 0..node_count {
-            let node = axes[axis].nodes[node_index];
-            let node_weight = axes[axis].weights[node_index];
-            self.z[axis] = node;
-            self.stream_axes(axis + 1, axes, weight * node_weight)?;
-        }
-        Ok(())
-    }
-
-    fn accumulate_node(&mut self, weight: f64) -> Result<(), EstimationError> {
+    /// Evaluate the integrand at standard-normal coordinates `z` and accumulate it with `weight`.
+    fn accumulate_node(&mut self, z: &[f64], weight: f64) -> Result<(), EstimationError> {
         if *self.total_evaluations >= self.maximum_function_evaluations {
             return Err(EstimationError::InvalidInput(format!(
                 "multinomial logistic-normal quadrature exhausted its function-evaluation budget ({}) before convergence",
@@ -1840,8 +1718,8 @@ impl<'a, 'b> QuadratureWorkspace<'a, 'b> {
 
         for row in 0..self.active_mean.len() {
             let mut value = self.active_mean[row];
-            for column in 0..self.z.len() {
-                value += self.projected.factor[[row, column]] * self.z[column];
+            for column in 0..z.len() {
+                value += self.projected.factor[[row, column]] * z[column];
             }
             self.active_eta[row] = value;
         }
@@ -1906,21 +1784,14 @@ fn gauss_hermite_rule(index: usize) -> Result<GaussHermiteRule, EstimationError>
     Ok(GaussHermiteRule { nodes, weights })
 }
 
-fn binomial_as_f64(n: usize, k: usize) -> Result<f64, EstimationError> {
-    if k > n {
-        return Ok(0.0);
+impl StandardNormalRule for GaussHermiteRule {
+    fn nodes(&self) -> &[f64] {
+        &self.nodes
     }
-    let k = k.min(n - k);
-    let mut value = 1.0_f64;
-    for step in 1..=k {
-        value *= (n - k + step) as f64 / step as f64;
-        if !value.is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "multinomial posterior Smolyak binomial coefficient C({n},{k}) overflowed f64"
-            )));
-        }
+
+    fn weights(&self) -> &[f64] {
+        &self.weights
     }
-    Ok(value)
 }
 
 /// Reference-coded softmax of one row of ACTIVE logits, with the reference

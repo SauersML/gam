@@ -69,6 +69,8 @@ use gam_problem::LatentRetractionRegistry;
 use gam_problem::riemannian_retraction::RetractionKind;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::{AnalyticPenaltyRegistry, IsometryEvaluationOrder, PenaltyTier};
+use ndarray::s;
 const SPHERE_NORMAL_PIN: f64 = 1.0;
 static NEXT_LATENT_COORD_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1635,6 +1637,226 @@ fn solve_spd(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Result<Array2<f6
         }
     }
     Ok(out)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LatentAuxStrengthState {
+    pub log_mu: f64,
+    pub mu: f64,
+    pub auto: bool,
+}
+
+pub struct LatentAuxPriorStats {
+    pub targets: Array2<f64>,
+    pub residual_sq: f64,
+    pub strength: LatentAuxStrengthState,
+    pub score: f64,
+}
+
+pub fn latent_aux_prior_stats(
+    t_mat: ArrayView2<'_, f64>,
+    u_view: ArrayView2<'_, f64>,
+    aux_family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+) -> Result<LatentAuxPriorStats, String> {
+    let targets = aux_prior_targets(t_mat, u_view, aux_family)?;
+    // The closed-form auxiliary-prior REML statistics (residual norm + the
+    // log_mu optimum at fixed t + the prior score) live in core; this packs
+    // them into the FFI latent-fit plumbing struct.
+    let stats = crate::latent::aux_prior_reml_stats(t_mat, targets.view(), aux_strength)?;
+    Ok(LatentAuxPriorStats {
+        targets,
+        residual_sq: stats.residual_sq,
+        strength: LatentAuxStrengthState {
+            log_mu: stats.log_mu,
+            mu: stats.mu,
+            auto: stats.auto,
+        },
+        score: stats.score,
+    })
+}
+
+/// Atomically validated diagonal latent precision state.
+///
+/// Python supplies logarithmic precisions.  This carrier validates the whole
+/// vector against the engine's one exact log-strength domain and materializes
+/// `exp(log_alpha)` once, before any fit or gradient work.  Keeping both views
+/// prevents value/gradient desynchronization and removes exponentials from the
+/// observation loops and latent-optimizer iterations.
+#[derive(Clone, Debug)]
+pub struct ValidatedDimSelectionPrecisions {
+    log: Array1<f64>,
+    physical: Array1<f64>,
+}
+
+impl ValidatedDimSelectionPrecisions {
+    /// The validated precisions on the physical scale.
+    pub fn physical(&self) -> &Array1<f64> {
+        &self.physical
+    }
+
+    pub fn new(log: ArrayView1<'_, f64>, latent_dim: usize) -> Result<Self, String> {
+        if log.len() != latent_dim {
+            return Err(format!(
+                "dim_selection_log_precision length {} must equal latent_dim {latent_dim}",
+                log.len()
+            ));
+        }
+        let mut physical = Array1::<f64>::zeros(latent_dim);
+        for (axis, (&log_alpha, alpha)) in log.iter().zip(physical.iter_mut()).enumerate() {
+            *alpha = gam_problem::checked_exp_log_strength(log_alpha)
+                .map_err(|error| format!("dim_selection_log_precision[{axis}]: {error}"))?;
+        }
+        Ok(Self {
+            log: log.to_owned(),
+            physical,
+        })
+    }
+
+    /// `0.5*alpha_axis*||t_axis||^2`, evaluated by a scaled sum-of-squares so
+    /// `t^2` cannot overflow before multiplication by a small precision.
+    pub fn axis_energy(&self, t: ArrayView2<'_, f64>, axis: usize) -> Result<f64, String> {
+        if t.ncols() != self.log.len() || axis >= self.log.len() {
+            return Err(format!(
+                "dim-selection precision has {} axes but latent coordinates have {}",
+                self.log.len(),
+                t.ncols()
+            ));
+        }
+        let multiplier = (0.5 * self.physical[axis]).sqrt();
+        let mut scale = 0.0_f64;
+        let mut sumsq = 1.0_f64;
+        for &coordinate in t.column(axis) {
+            if !coordinate.is_finite() {
+                return Err(format!(
+                    "latent coordinate on dim-selection axis {axis} must be finite; got \
+                         {coordinate}"
+                ));
+            }
+            let magnitude = (multiplier * coordinate).abs();
+            if !magnitude.is_finite() {
+                return Err(format!(
+                    "dim-selection prior energy is unrepresentable on axis {axis}"
+                ));
+            }
+            if magnitude == 0.0 {
+                continue;
+            }
+            if scale < magnitude {
+                let ratio = scale / magnitude;
+                sumsq = 1.0 + sumsq * ratio * ratio;
+                scale = magnitude;
+            } else {
+                let ratio = magnitude / scale;
+                sumsq += ratio * ratio;
+            }
+        }
+        let energy = if scale == 0.0 {
+            0.0
+        } else {
+            scale * scale * sumsq
+        };
+        if energy.is_finite() {
+            Ok(energy)
+        } else {
+            Err(format!(
+                "dim-selection prior energy is unrepresentable on axis {axis}"
+            ))
+        }
+    }
+
+    /// Normalized Gaussian ARD negative-log prior
+    /// `sum_a [0.5*alpha_a*||t_a||^2 - 0.5*n*log(alpha_a)]`.
+    pub fn prior_score(&self, t: ArrayView2<'_, f64>) -> Result<f64, String> {
+        if t.ncols() != self.log.len() {
+            return Err(format!(
+                "dim-selection precision has {} axes but latent coordinates have {}",
+                self.log.len(),
+                t.ncols()
+            ));
+        }
+        let mut total = 0.0_f64;
+        let mut compensation = 0.0_f64;
+        for axis in 0..self.log.len() {
+            let energy = self.axis_energy(t, axis)?;
+            let axis_score = energy - 0.5 * t.nrows() as f64 * self.log[axis];
+            if !axis_score.is_finite() {
+                return Err(format!(
+                    "dim-selection prior score is unrepresentable on axis {axis}"
+                ));
+            }
+            let updated = total + axis_score;
+            compensation += if total.abs() >= axis_score.abs() {
+                (total - updated) + axis_score
+            } else {
+                (axis_score - updated) + total
+            };
+            total = updated;
+        }
+        let score = total + compensation;
+        if score.is_finite() {
+            Ok(score)
+        } else {
+            Err("dim-selection prior score is unrepresentable".to_string())
+        }
+    }
+}
+
+pub fn latent_prior_score_and_aux_state_for_t(
+    t_mat: ArrayView2<'_, f64>,
+    aux_u: Option<ArrayView2<'_, f64>>,
+    aux_family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+    dim_selection_precision: Option<&ValidatedDimSelectionPrecisions>,
+) -> Result<(f64, Option<LatentAuxStrengthState>), String> {
+    let latent_dim = t_mat.ncols();
+    let mut latent_prior_score = 0.0_f64;
+    let mut aux_strength_state = None;
+    if let Some(u_view) = aux_u {
+        let stats = latent_aux_prior_stats(t_mat, u_view, aux_family, aux_strength)?;
+        latent_prior_score += stats.score;
+        aux_strength_state = Some(stats.strength);
+    }
+    if let Some(precisions) = dim_selection_precision {
+        assert_eq!(latent_dim, precisions.log.len());
+        latent_prior_score += precisions.prior_score(t_mat)?;
+    }
+    Ok((latent_prior_score, aux_strength_state))
+}
+
+/// The registry energy a latent REML score adds, at descriptor-pinned weights
+/// (ρ = 0 on every owned axis).
+///
+/// #2933 F02 — these fits declare only the latent block `t` and install no
+/// decoder jets. A β-tier penalty would be priced on the fitted coefficients,
+/// whose layout none of the β-tier kinds describes here (each self-disables to
+/// 0 on the mismatch), so it is refused instead of scored as zero; an isometry
+/// penalty has no `J` and refuses through the registry precondition.
+pub fn latent_analytic_penalty_value(
+    registry: &AnalyticPenaltyRegistry,
+    t: ArrayView1<'_, f64>,
+) -> Result<f64, String> {
+    if let Some((_, _, name)) = registry
+        .rho_layout()
+        .into_iter()
+        .find(|(_, tier, _)| matches!(tier, PenaltyTier::Beta))
+    {
+        return Err(format!(
+            "analytic penalty `{name}` is β-tier, but a latent REML fit declares only the latent \
+             block t, so it has no coefficient block to price; refused instead of scored as zero"
+        ));
+    }
+    registry.isometry_evaluation_precondition(IsometryEvaluationOrder::Value, t.len())?;
+    let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    registry.validate_rho(rho.view())?;
+    let mut value = 0.0_f64;
+    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
+    {
+        if matches!(tier, PenaltyTier::Psi) {
+            value += penalty.value(t, rho.slice(s![rho_slice]));
+        }
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use super::{
     write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
-    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs,
+    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs, log_level_for_verbosity,
     run_fit, run_predict, run_sample, write_model_json,
 };
 use crate::config_resolve::{
@@ -400,6 +400,7 @@ mod tests {
             curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         };
         UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
@@ -509,6 +510,7 @@ mod tests {
             curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         };
         let result = UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
@@ -618,6 +620,7 @@ fn empty_termspec() -> TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     }
 }
 
@@ -706,6 +709,7 @@ fn saved_fit_summary_fixture() -> SavedFitSummary {
             curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         }),
     }
@@ -1096,6 +1100,7 @@ fn location_scale_fit_args(
         predict_noise: Some(noise_formula.to_string()),
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1117,8 +1122,6 @@ fn location_scale_fit_args(
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(out),
     }
 }
@@ -1154,25 +1157,21 @@ fn cli_predict_has_no_point_estimand_switch_2670() {
 }
 
 #[test]
-fn cli_log_level_is_typed_and_rejects_unknown_values_2670() {
-    let parsed = Cli::try_parse_from(["gam", "--log-level", "debug", "report", "model.json"])
-        .expect("a canonical log level must parse");
-    assert_eq!(parsed.log_level, Some(log::LevelFilter::Debug));
-
-    let error = Cli::try_parse_from([
-        "gam",
-        "--log-level",
-        "verbose",
-        "report",
-        "model.json",
-    ])
-    .expect_err("an unknown log level must be rejected rather than guessed as info");
-    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("accepted values: off, error, warn, info, debug, trace"),
-        "the parser error must enumerate the canonical levels: {rendered}"
-    );
+fn cli_verbose_flag_counts_up_from_silent_diagnostics() {
+    // Library diagnostics are debug/trace records: the unflagged CLI shows none,
+    // `-v` shows the debug trace and `-vv` adds trace records.
+    for (argv, expected) in [
+        (vec!["gam", "report", "model.json"], log::LevelFilter::Warn),
+        (vec!["gam", "-v", "report", "model.json"], log::LevelFilter::Debug),
+        (vec!["gam", "report", "model.json", "--verbose"], log::LevelFilter::Debug),
+        (vec!["gam", "-vv", "report", "model.json"], log::LevelFilter::Trace),
+    ] {
+        let parsed = Cli::try_parse_from(argv.iter().copied()).expect("verbosity flags must parse");
+        assert_eq!(log_level_for_verbosity(parsed.verbose), expected, "{argv:?}");
+    }
+    let error = Cli::try_parse_from(["gam", "--log-level", "debug", "report", "model.json"])
+        .expect_err("the retired --log-level flag must not parse");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[test]
@@ -1197,7 +1196,6 @@ fn cli_fit_request_replaces_formula_and_scientific_flags() {
         vec!["y ~ x"],
         vec!["--family", "auto"],
         vec!["--transformation-normal"],
-        vec!["--persistent-warm-start-root", "caller-owned/warm"],
     ] {
         let mut argv = vec![
             "gam",
@@ -1216,26 +1214,24 @@ fn cli_fit_request_replaces_formula_and_scientific_flags() {
     }
 }
 
+/// The on-disk warm-start root is a cache directory, not a model input, so
+/// `gam fit` takes no flag for it (PKG-11); the fit stays disk-silent.
 #[test]
-fn cli_persistent_warm_start_root_is_explicit_and_preserved_exactly_2639() {
-    let cli = Cli::try_parse_from([
+fn cli_fit_has_no_persistent_warm_start_root_flag() {
+    let error = Cli::try_parse_from([
         "gam",
         "fit",
         "train.csv",
         "y ~ x",
         "--persistent-warm-start-root",
-        "caller-owned/../warm",
+        "warm",
         "--out",
         "model.json",
     ])
-    .expect("an explicit persistent warm-start root should parse");
-    let Command::Fit(args) = cli.command else {
-        panic!("expected fit command");
-    };
-    assert_eq!(
-        args.persistent_warm_start_root,
-        Some(PathBuf::from("caller-owned/../warm")),
-        "the CLI must not canonicalize or relocate the requested root"
+    .expect_err("the removed cache flag must not parse");
+    assert!(
+        error.to_string().contains("persistent-warm-start-root"),
+        "{error}"
     );
 }
 
@@ -1503,6 +1499,7 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1529,8 +1526,6 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -1637,6 +1632,7 @@ fn cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1658,8 +1654,6 @@ fn cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -1724,6 +1718,7 @@ fn cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1745,8 +1740,6 @@ fn cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -1835,6 +1828,76 @@ fn cli_request_document_survival_time_anchor_reaches_the_fit_2631() {
          requested {EXPLICIT_ANCHOR}, saved {anchor}"
     );
     remove_temp_file(&model_path);
+}
+
+/// gam#2926: a `--request` document's `latent_measure` must reach the Bernoulli
+/// marginal-slope fit, and the saved model must record the law the fit consumed
+/// under that spelling's own label. `latent_measure` has no CLI flag, so the
+/// document is the only way to request one.
+#[test]
+fn cli_request_document_latent_measure_reaches_the_marginal_slope_fit_2926() {
+    fn unit(state: &mut u64) -> f64 {
+        (gam::utils::splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("request_latent_measure.csv");
+    let rows = 240;
+    let mut csv = String::from("y,z,x\n");
+    let mut state = 0x2926_C11E_0000_0001_u64;
+    for row in 0..rows {
+        let x = -1.5 + 3.0 * (row as f64 + 0.5) / rows as f64;
+        let u1 = unit(&mut state).max(f64::MIN_POSITIVE);
+        let u2 = unit(&mut state);
+        let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+        let probability = gam::probability::normal_cdf(-0.2 + 0.5 * x + 0.6 * z);
+        let y = u8::from(unit(&mut state) < probability);
+        csv.push_str(&format!("{y},{z},{x}\n"));
+    }
+    fs::write(&train_path, csv)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write marginal-slope csv", e));
+
+    for (latent_measure, label) in [
+        ("global-empirical", "requested-global-empirical"),
+        ("conditional-location-scale", "conditional-location-scale"),
+    ] {
+        let request_path = td.path().join(format!("request_{latent_measure}.request.json"));
+        let model_path = td.path().join(format!("request_{latent_measure}.model.json"));
+        fs::write(
+            &request_path,
+            format!(
+                r#"{{"schema":"gam.fit-request","schema_version":1,
+                     "formula":"y ~ x",
+                     "config":{{"family":"bernoulli-marginal-slope","z_column":"z",
+                                "slope_formula":"1","latent_measure":"{latent_measure}"}}}}"#
+            ),
+        )
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write fit-request document", e));
+        let mut args = binomial_link_fit_args(
+            train_path.clone(),
+            model_path.clone(),
+            "unused ~ when --request is supplied",
+        );
+        args.request = Some(request_path);
+        args.formula_positional = None;
+        run_fit(args).unwrap_or_else(|e| {
+            panic!(
+                "fit from a --request document with latent_measure={latent_measure} should \
+                 succeed: {e:?}"
+            )
+        });
+        let saved = SavedModel::load_from_path(&model_path)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+        let consumed = saved
+            .latent_law_consumed
+            .as_ref()
+            .expect("a saved marginal-slope model must record the latent law it consumed");
+        assert_eq!(
+            consumed.label(),
+            label,
+            "a --request document's latent_measure={latent_measure} must reach the fit"
+        );
+        remove_temp_file(&model_path);
+    }
 }
 
 /// A `--request` document's frailty must reach the survival routes. `SurvivalArgs`
@@ -2164,6 +2227,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         predict_noise: Some("1".to_string()),
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -2185,8 +2249,6 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2242,6 +2304,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -2400,6 +2463,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         predict_noise: None,
         slope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -2431,8 +2495,6 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2466,6 +2528,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -2513,6 +2576,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         predict_noise: None,
         slope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -2534,8 +2598,6 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(td.path().join("model.json")),
     })
     .expect_err("main formula should reject z-column reuse");
@@ -2558,6 +2620,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         predict_noise: None,
         slope_formula: Some("1 + s(z, type=duchon, centers=6)".to_string()),
         z_column: Some("z".to_string()),
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -2579,8 +2642,6 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(td.path().join("model.json")),
     })
     .expect_err("slope formula should reject z-column reuse");
@@ -3023,6 +3084,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -3054,8 +3116,6 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit should succeed", e));
@@ -3083,6 +3143,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(predict_args).unwrap_or_else(|e| {
         panic!(
@@ -3124,6 +3185,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(band_args).unwrap_or_else(|e| {
         panic!(
@@ -3159,6 +3221,7 @@ fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -3190,8 +3253,6 @@ fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(out),
     }
 }
@@ -3311,6 +3372,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -3337,8 +3399,6 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "Firth fit should succeed", e));
@@ -3366,6 +3426,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(predict_args).unwrap_or_else(|e| {
         panic!(
@@ -3407,6 +3468,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(band_args).unwrap_or_else(|e| {
         panic!(
@@ -3581,6 +3643,7 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(args)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "predict binomial location-scale", e));
@@ -3732,6 +3795,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
         inference: Some(FitInference {
             edf_by_block: vec![1.5],
             penalty_block_trace: vec![],
+            edf_rank_bound: Vec::new(),
             edf_total: 1.5,
             smoothing_correction: None,
             smoothing_correction_method: None,
@@ -3742,10 +3806,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             reparam_qs: Some(Array2::eye(2)),
             dispersion: gam::estimate::Dispersion::known(1.0)
                 .expect("unit known dispersion is valid"),
-            beta_covariance: None,
-            beta_standard_errors: None,
-            beta_covariance_corrected: None,
-            beta_standard_errors_corrected: None,
+            factorized_standard_errors: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -3792,6 +3853,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
                 curvature: gam::solver::rho_optimizer::CurvatureEvidence::Measured { psd: true },
                 lambdas_railed: Vec::new(),
                 railed_facts: Vec::new(),
+                newton_polish: None,
                 curvature_floor: None,
             }),
             ..Default::default()
@@ -3870,6 +3932,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
                 curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
                 lambdas_railed: Vec::new(),
                 railed_facts: Vec::new(),
+                newton_polish: None,
                 curvature_floor: None,
             }),
         },
@@ -4002,7 +4065,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                     },
                     input_scale: None,
                 },
-                shape: gam::smooth::ShapeConstraint::None,
+                shape: gam::smooth::ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -4024,7 +4087,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                     },
                     input_scale: None,
                 },
-                shape: gam::smooth::ShapeConstraint::None,
+                shape: gam::smooth::ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -4046,10 +4109,11 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                     },
                     input_scale: None,
                 },
-                shape: gam::smooth::ShapeConstraint::None,
+                shape: gam::smooth::ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4087,9 +4151,10 @@ fn does_notwarn_for_singlemultivariate_matern_spatial_term() {
                 },
                 input_scale: None,
             },
-            shape: gam::smooth::ShapeConstraint::None,
+            shape: gam::smooth::ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4119,7 +4184,7 @@ fn warns_for_repeated_univariate_thinplate_spatial_terms() {
                     },
                     input_scale: None,
                 },
-                shape: gam::smooth::ShapeConstraint::None,
+                shape: gam::smooth::ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -4137,10 +4202,11 @@ fn warns_for_repeated_univariate_thinplate_spatial_terms() {
                     },
                     input_scale: None,
                 },
-                shape: gam::smooth::ShapeConstraint::None,
+                shape: gam::smooth::ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string()];
 
@@ -4186,9 +4252,10 @@ fn warns_for_linear_terms_overlappingwith_smoothvariables() {
                 },
                 input_scale: None,
             },
-            shape: gam::smooth::ShapeConstraint::None,
+            shape: gam::smooth::ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string(), "pc3".to_string()];
 
@@ -4227,7 +4294,7 @@ fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
                     },
                     input_scale: None,
                 },
-                shape: gam::smooth::ShapeConstraint::None,
+                shape: gam::smooth::ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -4248,10 +4315,11 @@ fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
-                shape: gam::smooth::ShapeConstraint::None,
+                shape: gam::smooth::ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
         ],
+        level: Default::default(),
     };
     let headers = vec!["pc1".to_string(), "pc2".to_string()];
 
@@ -4621,7 +4689,7 @@ fn bernoulli_marginal_slope_saved_model_fixture(
     baseline_slope: f64,
     latent_z_normalization: SavedLatentZNormalization,
     latent_measure: LatentMeasureKind,
-    latent_z_rank_int_calibration: Option<gam::families::bms::LatentZRankIntCalibration>,
+    latent_law_consumed: gam::families::bms::LatentLawConsumed,
     latent_z_conditional_calibration: Option<gam::families::bms::LatentZConditionalCalibration>,
     score_warp_runtime: Option<&gam::families::bms::DeviationRuntime>,
     link_dev_runtime: Option<&gam::families::bms::DeviationRuntime>,
@@ -4642,12 +4710,13 @@ fn bernoulli_marginal_slope_saved_model_fixture(
             baseline_slope,
             latent_z_normalization,
             latent_measure,
-            latent_z_rank_int_calibration,
+            latent_law_consumed,
             latent_z_conditional_calibration,
             score_warp_runtime,
             link_dev_runtime,
             base_link,
             frailty,
+            residual_repair: None,
         },
         SavedModelSourceMetadata {
             training_headers,
@@ -4685,7 +4754,17 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
         0.0,
         SavedLatentZNormalization { mean: 0.2, sd: 1.3 },
         LatentMeasureKind::StandardNormal,
-        None,
+        gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         None,
         None,
         None,
@@ -4758,12 +4837,23 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
         baseline_slope: 0.7,
         latent_z_normalization: SavedLatentZNormalization { mean: 1.1, sd: 2.2 },
         latent_measure: LatentMeasureKind::StandardNormal,
-        latent_z_rank_int_calibration: None,
+        latent_law_consumed: gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         latent_z_conditional_calibration: None,
         score_warp_runtime: None,
         link_dev_runtime: None,
         base_link: InverseLink::Standard(StandardLink::Probit),
         frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
+        residual_repair: None,
     };
 
     // CLI source metadata: headers + per-feature ranges, no offset columns.
@@ -4909,7 +4999,17 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         1.0,
         SavedLatentZNormalization { mean: 1.0, sd: 2.0 },
         LatentMeasureKind::StandardNormal,
-        None,
+        gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         None,
         None,
         None,
@@ -4939,6 +5039,7 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -4995,7 +5096,17 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         0.0,
         SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
         LatentMeasureKind::StandardNormal,
-        None,
+        gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         None,
         None,
         None,
@@ -5585,6 +5696,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         mean.view(),
         Some(mean.view()),
         Some(sigma.view()),
+        &[],
         None,
         None,
         None,
@@ -5625,6 +5737,7 @@ fn location_scale_map_prediction_omits_the_posterior_estimand() {
         mean.view(),
         None,
         Some(sigma.view()),
+        &[],
         None,
         None,
         None,
@@ -5668,6 +5781,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
         mean.view(),
         Some(mean.view()),
         Some(sigma.view()),
+        &[],
         Some(std_error.view()),
         Some(mean_lower.view()),
         Some(mean_upper.view()),
@@ -6156,6 +6270,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         &derivative_offset_exit,
         &primary_offset,
         &noise_offset,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -6374,6 +6489,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
         &derivative_offset_exit,
         &primary_offset,
         &noise_offset,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -6556,6 +6672,7 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         covariance_mode: None,
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     super::run_predict_survival(
         &args,
@@ -6719,6 +6836,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         covariance_mode: None,
         conformal: false,
         calibration: None,
+        training_data: None,
     };
 
     super::run_predict_survival(

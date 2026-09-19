@@ -11,7 +11,7 @@ pub struct CollocationOperatorMatrices {
     /// (identifiability-projected, intercept-padded). It is accumulated in closed
     /// form rather than materializing the `points·d³`-row operator, and is
     /// present exactly when the kernel admits the third-order operator penalty
-    /// (isotropic Matérn with ν ≥ 5/2, [`MaternNu::admits_third_order_operator`]).
+    /// (Matérn with ν ≥ 5/2 under either metric, [`MaternNu::admits_third_order_operator`]).
     /// `None` for Duchon.
     pub third_order_gram: Option<Array2<f64>>,
     pub collocation_points: Array2<f64>,

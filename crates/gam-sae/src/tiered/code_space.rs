@@ -44,8 +44,8 @@ use crate::manifold::curve_promotion::{
     CurvePromotionProposal, LinearCommunity, PromotionContext, propose_curve_promotion,
 };
 use crate::manifold::{
-    GraphCompressionKind, LocalAtlas, LocalAtlasConfig, SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER,
-    SaeSupportSparseFitRequest, fit_sae_support_sparse, observe_atlas_topology,
+    GraphCompressionKind, LocalAtlas, LocalAtlasConfig, SaeSupportSparseFitRequest,
+    fit_sae_support_sparse, observe_atlas_topology,
 };
 use crate::sparse_dict::BlockSparseFit;
 
@@ -405,7 +405,9 @@ fn hashed_permutation(f: usize, m: usize) -> Vec<usize> {
 /// A ring and a flat cloud differ in topology, so the verdict comes from the #2280
 /// local-chart atlas of the `f × 2` code cloud at chart rank 1. The readout names a
 /// closed curve only when the charts' transitions close a cycle, and it abstains on
-/// a union of lines or a solid blob. Once it names a circle, the `d = 1` race fits
+/// a union of lines or a solid blob. The name is promoted to a ring only when the
+/// cover's intersections are certified contractible
+/// (`AtlasTopologyReadout::certified_manifold`). Once it is, the `d = 1` race fits
 /// the circle chart on the image and reports its basis kind, so the label comes
 /// from a fitted candidate. Returns `(kind, latent_dim, refusal)`: the atlas's or
 /// the race's own text rides in `refusal` whenever no kind is returned.
@@ -434,11 +436,13 @@ fn adjudicate_pair_ring(
             );
         }
     };
-    if readout.observed_manifold() != Some(GraphCompressionKind::Circle) {
+    if readout.certified_manifold() != Some(GraphCompressionKind::Circle) {
         return (
             None,
             None,
-            Some(format!("the pair's code cloud is not a closed curve: {readout}")),
+            Some(format!(
+                "the pair's code cloud is not a certified closed curve: {readout}"
+            )),
         );
     }
     match crate::structure_harvest::discover_primary_atom_topologies(
@@ -834,7 +838,6 @@ fn fit_pair_chart_at_seed(
         support_k: 2,
         initial_smoothness: 1.0,
         max_outer_iter: 32,
-        max_inner_iter: SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER,
         trust_radius: 1.0,
         random_state,
     })?;

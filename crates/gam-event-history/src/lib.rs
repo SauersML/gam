@@ -11,12 +11,16 @@
 //! likelihood derivatives check loading curvature. Sampled directional
 //! profiles and Laplace rank comparisons remain approximations.
 
+#[cfg(test)]
+mod test_support;
+
 mod chain;
 mod cohort;
 mod covariance;
 mod family;
 mod forecast;
 mod formula;
+pub mod joint;
 mod marginal;
 mod preserve;
 mod scalar;

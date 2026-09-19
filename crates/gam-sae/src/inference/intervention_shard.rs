@@ -42,6 +42,9 @@ use std::fmt;
 
 use crate::inference::steering::SteerPlan;
 use gam_math::probability::standard_normal_from_uniform_bits;
+use gam_linalg::faer_ndarray::FaerQr;
+use gam_linalg::roundoff::factor_rank_partition;
+use ndarray::{Array2, ArrayView2};
 
 /// One shard of executed interventions. All per-record vectors share length
 /// `m`; `dose` is row-major `(m, d_dose)`.
@@ -743,9 +746,13 @@ pub struct DrawKey {
     pub stream: u64,
 }
 
-/// The #2946 declared law `h = h0 + L z` with `z ~ N(0, I_rank)`, drawn by this
-/// module. The fields are private, so [`GaussianLoadingLaw::draw`] is the only way
-/// to hold one: hand-picked or correlated `z` cannot pass as randomized.
+/// The #2946 declared law `h = h0 + L z` with `z ~ N(0, I_rank)`, together with the
+/// coupled draws `z′ = P z + (I − P) z̃` of R4's estimator, drawn by this module.
+///
+/// The law records `z`, an independent copy `z̃`, and orthonormal frames `Q` with
+/// `P = Q Qᵀ`. `P Z` and `(I − P) Z̃` are independent, so `Z′ ~ N(0, I)` and it shares
+/// exactly `P Z` with `Z`. The fields are private, so [`GaussianLoadingLaw::draw`] is
+/// the only way to hold one: hand-picked or correlated rows cannot pass as randomized.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussianLoadingLaw {
     baseline: Vec<f64>,
@@ -753,22 +760,42 @@ pub struct GaussianLoadingLaw {
     rank: usize,
     key: DrawKey,
     draws: Vec<f64>,
+    independent_draws: Vec<f64>,
+    frames: Vec<Array2<f64>>,
+}
+
+/// Which rows of a [`GaussianLoadingLaw`] an experiment executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LawArm {
+    /// `h0 + L z`.
+    Draw,
+    /// `h0 + L z′`, with `z′ = P z + (I − P) z̃` for the law's frame `frame`. A frame of
+    /// rank 0 executes `z̃`.
+    Coupled { frame: usize },
 }
 
 impl GaussianLoadingLaw {
-    /// Draw the law's rows at `positions` positions. `baseline` is `h0` (its length
-    /// is the site width) and `loading` is `L`, row-major `(width, rank)`.
+    /// Draw `draws` rows of the law. `baseline` is `h0` (its length is the site width),
+    /// `loading` is `L`, row-major `(width, rank)`, and each frame basis has shape
+    /// `(rank, r)`.
     ///
-    /// Each coordinate of `z` is [`standard_normal_from_uniform_bits`], the one draw
-    /// owner, applied to successive words of the SplitMix64 stream keyed by `key`.
-    /// The draws are recorded in the law, so consumers read them and never re-derive
-    /// them: on another platform a re-derivation would match only to libm rounding.
+    /// `z` and then `z̃` come from [`standard_normal_from_uniform_bits`], the one draw
+    /// owner, applied to successive words of the SplitMix64 stream keyed by `key`,
+    /// row-major. The draws are recorded in the law, so consumers read them and never
+    /// re-derive them: on another platform a re-derivation would match only to libm
+    /// rounding.
+    ///
+    /// A frame basis is refused when the owned rank predicate [`factor_rank_partition`]
+    /// resolves fewer directions than the basis has columns. Otherwise the thin-QR owner
+    /// orthonormalizes it and the law records that `Q`, so `P = Q Qᵀ` is the
+    /// experiment's projector with no orthonormality tolerance.
     pub fn draw(
         baseline: Vec<f64>,
         loading: Vec<f64>,
         rank: usize,
         key: DrawKey,
-        positions: usize,
+        draws: usize,
+        frames: &[Array2<f64>],
     ) -> Result<Self, InterventionPlanError> {
         let width = baseline.len();
         if width == 0 || rank == 0 || loading.len() != width * rank {
@@ -783,19 +810,68 @@ impl GaussianLoadingLaw {
                 "the baseline and loading must be finite".to_string(),
             ));
         }
+        let mut orthonormal_frames: Vec<Array2<f64>> = Vec::with_capacity(frames.len());
+        for (frame, basis) in frames.iter().enumerate() {
+            let (rows, columns) = basis.dim();
+            if rows != rank || !basis.iter().all(|value| value.is_finite()) {
+                return Err(InterventionPlanError::InvalidFrame {
+                    frame,
+                    reason: format!(
+                        "the basis has shape ({rows}, {columns}) for a law of rank {rank} and must be finite"
+                    ),
+                });
+            }
+            if columns == 0 {
+                orthonormal_frames.push(Array2::zeros((rank, 0)));
+                continue;
+            }
+            let partition = factor_rank_partition(basis).map_err(|error| {
+                InterventionPlanError::InvalidFrame {
+                    frame,
+                    reason: error.to_string(),
+                }
+            })?;
+            if partition.rank < columns {
+                return Err(InterventionPlanError::RankDeficientFrame {
+                    frame,
+                    rank: partition.rank,
+                    columns,
+                });
+            }
+            let orthonormal = basis
+                .qr()
+                .map_err(|error| InterventionPlanError::InvalidFrame {
+                    frame,
+                    reason: error.to_string(),
+                })?
+                .0;
+            if orthonormal.dim() != (rank, columns) {
+                return Err(InterventionPlanError::InvalidFrame {
+                    frame,
+                    reason: format!("thin QR returned shape {:?}", orthonormal.dim()),
+                });
+            }
+            orthonormal_frames.push(orthonormal);
+        }
         let mut state = splitmix64(key.seed ^ splitmix64(key.stream));
-        let draws = std::iter::repeat_with(|| {
-            standard_normal_from_uniform_bits(gam_linalg::utils::splitmix64(&mut state))
-        })
-        .take(positions * rank)
-        .collect::<Result<Vec<f64>, String>>()
+        let mut next =
+            || standard_normal_from_uniform_bits(gam_linalg::utils::splitmix64(&mut state));
+        let z = std::iter::repeat_with(&mut next)
+            .take(draws * rank)
+            .collect::<Result<Vec<f64>, String>>()
+            .map_err(InterventionPlanError::InvalidGaussianLaw)?;
+        let z_tilde = std::iter::repeat_with(&mut next)
+            .take(draws * rank)
+            .collect::<Result<Vec<f64>, String>>()
             .map_err(InterventionPlanError::InvalidGaussianLaw)?;
         Ok(Self {
             baseline,
             loading,
             rank,
             key,
-            draws,
+            draws: z,
+            independent_draws: z_tilde,
+            frames: orthonormal_frames,
         })
     }
 
@@ -807,30 +883,64 @@ impl GaussianLoadingLaw {
         self.baseline.len()
     }
 
-    /// The drawn `z`, row-major `(positions, rank)`.
+    pub fn key(&self) -> DrawKey {
+        self.key
+    }
+
+    /// The number `n` of recorded draws.
+    pub fn draw_count(&self) -> usize {
+        self.draws.len() / self.rank
+    }
+
+    /// The drawn `z`, row-major `(n, rank)`.
     pub fn draws(&self) -> &[f64] {
         &self.draws
     }
 
-    /// The replacement rows `h0 + L z`, row-major `(positions, width)`.
-    pub fn rows(&self) -> Vec<f64> {
-        let mut rows = Vec::with_capacity(self.draws.len() / self.rank * self.width());
-        for z in self.draws.chunks_exact(self.rank) {
-            for (h0, loading_row) in self
-                .baseline
-                .iter()
-                .zip(self.loading.chunks_exact(self.rank))
-            {
-                rows.push(
-                    h0 + loading_row
-                        .iter()
-                        .zip(z)
-                        .map(|(&loading, &coordinate)| loading * coordinate)
-                        .sum::<f64>(),
-                );
+    /// The independent copy `z̃`, row-major `(n, rank)`.
+    pub fn independent_draws(&self) -> &[f64] {
+        &self.independent_draws
+    }
+
+    /// The recorded orthonormal frames `Q`, each of shape `(rank, r)`.
+    pub fn frames(&self) -> &[Array2<f64>] {
+        &self.frames
+    }
+
+    /// `z′ = P z + (z̃ − P z̃)` for frame `frame`, row-major `(n, rank)`, or `None` for an
+    /// unknown frame. The residual `z̃ − P z̃` is formed first. Where `P` reproduces its
+    /// input exactly, as identity-column frames do, a full frame therefore gives `z′ = z`
+    /// and a rank-0 frame gives `z′ = z̃`, bit for bit.
+    pub fn coupled_draws(&self, frame: usize) -> Option<Vec<f64>> {
+        let q = self.frames.get(frame)?;
+        let shape = (self.draw_count(), self.rank);
+        let z = ArrayView2::from_shape(shape, &self.draws).ok()?;
+        let z_tilde = ArrayView2::from_shape(shape, &self.independent_draws).ok()?;
+        let residual = &z_tilde - &z_tilde.dot(q).dot(&q.t());
+        let coupled = z.dot(q).dot(&q.t()) + residual;
+        Some(coupled.iter().copied().collect())
+    }
+
+    /// The replacement rows `h0 + L z` (arm `Draw`) or `h0 + L z′` (arm `Coupled`),
+    /// row-major `(n, width)`: row `i` is draw `i`. `None` for an unknown frame.
+    pub fn rows(&self, arm: LawArm) -> Option<Vec<f64>> {
+        match arm {
+            LawArm::Draw => self.affine_rows(&self.draws),
+            LawArm::Coupled { frame } => self.affine_rows(&self.coupled_draws(frame)?),
+        }
+    }
+
+    /// `h0 + L x` for each row-major latent row `x` of width `rank`.
+    fn affine_rows(&self, latent: &[f64]) -> Option<Vec<f64>> {
+        let latent = ArrayView2::from_shape((latent.len() / self.rank, self.rank), latent).ok()?;
+        let loading = ArrayView2::from_shape((self.width(), self.rank), &self.loading).ok()?;
+        let mut rows = latent.dot(&loading.t());
+        for mut row in rows.rows_mut() {
+            for (value, &h0) in row.iter_mut().zip(&self.baseline) {
+                *value += h0;
             }
         }
-        rows
+        Some(rows.iter().copied().collect())
     }
 }
 
@@ -852,8 +962,9 @@ pub enum ReplacementRows {
         source_positions: Vec<usize>,
         rows: Vec<f64>,
     },
-    /// Rows drawn from the declared Gaussian law.
-    GaussianLaw(GaussianLoadingLaw),
+    /// Rows of the plan's Gaussian law `law` for arm `arm`: draw `i` replaces the
+    /// change's `i`-th position.
+    GaussianLaw { law: usize, arm: LawArm },
 }
 
 /// One declared change. Every kind is a do-operator on the executed network that
@@ -890,7 +1001,8 @@ pub enum InterventionChange {
         value: f64,
     },
     /// Add the rank-`rank` product `left · rightᵀ` (`left` row-major `(rows, rank)`,
-    /// `right` row-major `(cols, rank)`) to one named parameter for the whole pass.
+    /// `right` row-major `(cols, rank)`) to one named parameter, at the reads `scope`
+    /// names.
     ParameterEdit {
         parameter: String,
         rows: usize,
@@ -898,8 +1010,225 @@ pub enum InterventionChange {
         rank: usize,
         left: Vec<f64>,
         right: Vec<f64>,
+        scope: ParameterEditScope,
     },
 }
+
+/// Which reads of a parameter an [`InterventionChange::ParameterEdit`] reaches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParameterEditScope {
+    /// Every read of the tensor in the pass. The shared tensor changes for the whole
+    /// batch, so the clean response needs its own forward pass.
+    Global,
+    /// One read of the tensor: the `ordinal`-th read (0-based, forward order) of the
+    /// parameter's storage on the plan's declared forward path, seen only by query
+    /// `positions` (every position when `None`).
+    ///
+    /// `read_module` and `read_op` name that read as the executing framework's
+    /// discovery reports it: the innermost executing module (`""` for the root
+    /// module's own forward, as torch names the root) and the op. The ordinal
+    /// addresses the read, and the names validate it, because a (module, call) pair
+    /// cannot address a functional read outside a module call, such as a tied
+    /// `lm_head` weight read through `F.linear`. An executed experiment is accepted
+    /// only when its forward made the ordinal's read by these names
+    /// ([`InterventionChange::check_executed_reads`]). The runner applies the edit to
+    /// the patched copy alone. The clean copy therefore stays in the same batch, and
+    /// under the causal mask every position before the first query position reads
+    /// back exactly clean.
+    UseSite {
+        ordinal: usize,
+        read_module: String,
+        read_op: String,
+        positions: Option<Vec<usize>>,
+    },
+}
+
+impl InterventionChange {
+    /// Check a use-site parameter edit against the reads of the forward that executed
+    /// it ([`ParameterEditScope::check_executed_reads`]). Every other change names no
+    /// read and passes.
+    pub fn check_executed_reads(
+        &self,
+        executed: &ExecutedParameterReads,
+    ) -> Result<(), ParameterReadRefusal> {
+        match self {
+            InterventionChange::ParameterEdit { parameter, scope, .. } => {
+                scope.check_executed_reads(parameter, executed)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl ParameterEditScope {
+    /// Check this scope of an edit of `parameter` against the reads of the forward that
+    /// executed it. A use-site scope passes only when that forward read the parameter's
+    /// storage at its ordinal, by the module and op it names; a read by any other names
+    /// means the ordinal addressed another read. A global scope names no read and
+    /// passes.
+    pub fn check_executed_reads(
+        &self,
+        parameter: &str,
+        executed: &ExecutedParameterReads,
+    ) -> Result<(), ParameterReadRefusal> {
+        let ParameterEditScope::UseSite {
+            ordinal,
+            read_module,
+            read_op,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let reads = executed
+            .reads
+            .iter()
+            .filter(|read| read.parameter == parameter)
+            .count();
+        let read = executed
+            .reads
+            .iter()
+            .find(|read| read.parameter == parameter && read.ordinal == *ordinal)
+            .ok_or_else(|| ParameterReadRefusal::Unread {
+                parameter: parameter.to_string(),
+                ordinal: *ordinal,
+                reads,
+            })?;
+        if read.read_module != *read_module || read.read_op != *read_op {
+            return Err(ParameterReadRefusal::LabelMismatch {
+                parameter: parameter.to_string(),
+                ordinal: *ordinal,
+                declared_module: read_module.clone(),
+                declared_op: read_op.clone(),
+                executed_module: read.read_module.clone(),
+                executed_op: read.read_op.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One read of a stored parameter in an executed forward, as the executing framework
+/// reports it: the storage read (whichever alias the code used), the read's ordinal
+/// among that storage's reads in execution order, and the module and op that made it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutedParameterRead {
+    pub parameter: String,
+    pub ordinal: usize,
+    pub read_module: String,
+    pub read_op: String,
+}
+
+/// Every parameter read of one executed forward, in execution order. The field is
+/// private, so every value has passed [`ExecutedParameterReads::new`], and each
+/// storage's reads are numbered `0, 1, 2, …` in the order they executed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutedParameterReads {
+    reads: Vec<ExecutedParameterRead>,
+}
+
+impl ExecutedParameterReads {
+    /// Refuse a read that names no parameter or no op. Also refuse reads of one storage
+    /// that are not numbered in execution order, because under another numbering an
+    /// ordinal addresses another read.
+    pub fn new(reads: Vec<ExecutedParameterRead>) -> Result<Self, ParameterReadRefusal> {
+        let mut next: BTreeMap<&str, usize> = BTreeMap::new();
+        for (index, read) in reads.iter().enumerate() {
+            if read.parameter.is_empty() || read.read_op.is_empty() {
+                return Err(ParameterReadRefusal::Unnamed { index });
+            }
+            let expected = next.entry(read.parameter.as_str()).or_insert(0);
+            if read.ordinal != *expected {
+                return Err(ParameterReadRefusal::OutOfOrder {
+                    index,
+                    parameter: read.parameter.clone(),
+                    ordinal: read.ordinal,
+                    expected: *expected,
+                });
+            }
+            *expected += 1;
+        }
+        Ok(Self { reads })
+    }
+
+    pub fn reads(&self) -> &[ExecutedParameterRead] {
+        &self.reads
+    }
+}
+
+/// Typed refusals of executed parameter reads, and of a use-site edit checked against
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParameterReadRefusal {
+    /// Read `index` names no parameter or no op.
+    Unnamed { index: usize },
+    /// Read `index` is not the next read of its storage, so the forward numbered its
+    /// reads in another order.
+    OutOfOrder {
+        index: usize,
+        parameter: String,
+        ordinal: usize,
+        expected: usize,
+    },
+    /// The executed forward read `parameter` only `reads` times, so it made no read at
+    /// the edit's ordinal.
+    Unread {
+        parameter: String,
+        ordinal: usize,
+        reads: usize,
+    },
+    /// The executed read at the edit's ordinal was made by another module or op, so
+    /// the ordinal addressed another read.
+    LabelMismatch {
+        parameter: String,
+        ordinal: usize,
+        declared_module: String,
+        declared_op: String,
+        executed_module: String,
+        executed_op: String,
+    },
+}
+
+impl fmt::Display for ParameterReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unnamed { index } => write!(
+                f,
+                "parameter reads: read {index} names no parameter or no op"
+            ),
+            Self::OutOfOrder {
+                index,
+                parameter,
+                ordinal,
+                expected,
+            } => write!(
+                f,
+                "parameter reads: read {index} is {parameter}#{ordinal}, but the next read of {parameter} in execution order is #{expected}"
+            ),
+            Self::Unread {
+                parameter,
+                ordinal,
+                reads,
+            } => write!(
+                f,
+                "parameter reads: the executed forward read {parameter} {reads} times, so it made no read #{ordinal}"
+            ),
+            Self::LabelMismatch {
+                parameter,
+                ordinal,
+                declared_module,
+                declared_op,
+                executed_module,
+                executed_op,
+            } => write!(
+                f,
+                "parameter reads: the edit names {parameter}#{ordinal} as ({declared_module:?}, {declared_op:?}), but the executed forward made that read as ({executed_module:?}, {executed_op:?}), so the ordinal addressed another read"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParameterReadRefusal {}
 
 /// The positions a KL readout reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -923,7 +1252,7 @@ pub enum Readout {
         token_ids: Vec<u32>,
         positions: Vec<usize>,
     },
-    /// Clean and patched rows of a declared site at `positions`.
+    /// Rows of a declared site at `positions`, as executed in the patched pass.
     Activation { site: usize, positions: Vec<usize> },
 }
 
@@ -934,7 +1263,7 @@ pub enum CleanPass {
     /// The clean and patched copies share one batched forward pass, so every
     /// position before the earliest edit must read back exactly the clean response.
     SameBatch,
-    /// A parameter edit reaches every position, so the clean pass is its own
+    /// A global parameter edit reaches every position, so the clean pass is its own
     /// forward pass.
     SeparateForward,
 }
@@ -956,20 +1285,28 @@ pub struct InterventionExperiment {
 }
 
 impl InterventionExperiment {
+    /// `SeparateForward` exactly when a global parameter edit changes the shared tensor
+    /// for the whole batch. Every other change, a use-site edit included, is applied to
+    /// the patched copy alone.
     pub fn clean_pass(&self) -> CleanPass {
-        if self
-            .changes
-            .iter()
-            .any(|change| matches!(change, InterventionChange::ParameterEdit { .. }))
-        {
+        if self.changes.iter().any(|change| {
+            matches!(
+                change,
+                InterventionChange::ParameterEdit {
+                    scope: ParameterEditScope::Global,
+                    ..
+                }
+            )
+        }) {
             CleanPass::SeparateForward
         } else {
             CleanPass::SameBatch
         }
     }
 
-    /// Sorted positions some change writes. A parameter edit writes no single
-    /// position and contributes none.
+    /// Sorted positions some change writes. A global parameter edit writes no single
+    /// position and contributes none. A use-site edit contributes its query positions,
+    /// or every position of the unit when it declares none.
     pub fn edited_positions(&self) -> Vec<usize> {
         let mut edited = BTreeSet::new();
         for change in &self.changes {
@@ -982,7 +1319,20 @@ impl InterventionExperiment {
                 InterventionChange::ChartCoordinateMove { position, .. } => {
                     edited.insert(*position);
                 }
-                InterventionChange::ParameterEdit { .. } => {}
+                InterventionChange::ParameterEdit { scope, .. } => match scope {
+                    ParameterEditScope::Global => {}
+                    ParameterEditScope::UseSite {
+                        positions: Some(query_positions),
+                        ..
+                    } => {
+                        edited.extend(query_positions.iter().copied());
+                    }
+                    ParameterEditScope::UseSite {
+                        positions: None, ..
+                    } => {
+                        edited.extend(0..self.unit.length);
+                    }
+                },
             }
         }
         edited.into_iter().collect()
@@ -1009,8 +1359,10 @@ impl InterventionExperiment {
 #[derive(Clone, Debug, PartialEq)]
 pub struct InterventionExperimentPlan {
     sites: Vec<InterventionSite>,
+    laws: Vec<GaussianLoadingLaw>,
     experiments: Vec<InterventionExperiment>,
     split_seed: u64,
+    forward_path: Option<String>,
 }
 
 /// Typed refusals of an experiment plan.
@@ -1045,10 +1397,16 @@ pub enum InterventionPlanError {
         experiment: usize,
         change: usize,
     },
+    /// Two laws share a draw key, so their draws would not be independent.
     RepeatedDrawKey {
-        experiment: usize,
-        change: usize,
+        law: usize,
         key: DrawKey,
+    },
+    /// One arm of one law is executed twice, so its responses could not be paired.
+    RepeatedLawArm {
+        experiment: usize,
+        law: usize,
+        arm: LawArm,
     },
     InvalidReadout {
         experiment: usize,
@@ -1056,6 +1414,24 @@ pub enum InterventionPlanError {
         reason: String,
     },
     InvalidGaussianLaw(String),
+    InvalidFrame {
+        frame: usize,
+        reason: String,
+    },
+    /// The frame basis resolves fewer directions than it has columns, so no projector
+    /// of its declared rank exists.
+    RankDeficientFrame {
+        frame: usize,
+        rank: usize,
+        columns: usize,
+    },
+    /// A use-site edit names a read by its ordinal, which only means something on a
+    /// declared forward path: KV-cache decode and a full forward can order reads
+    /// differently.
+    MissingForwardPath {
+        experiment: usize,
+        change: usize,
+    },
 }
 
 impl fmt::Display for InterventionPlanError {
@@ -1093,14 +1469,18 @@ impl fmt::Display for InterventionPlanError {
                 f,
                 "intervention plan: experiment {experiment} change {change} copies rows from a unit on the other side of the G2 split"
             ),
-            Self::RepeatedDrawKey {
+            Self::RepeatedDrawKey { law, key } => write!(
+                f,
+                "intervention plan: law {law} repeats draw key (seed {}, stream {}), so its draws would not be independent",
+                key.seed, key.stream
+            ),
+            Self::RepeatedLawArm {
                 experiment,
-                change,
-                key,
+                law,
+                arm,
             } => write!(
                 f,
-                "intervention plan: experiment {experiment} change {change} repeats draw key (seed {}, stream {}), so its draws would not be independent",
-                key.seed, key.stream
+                "intervention plan: experiment {experiment} executes arm {arm:?} of law {law} a second time, so its responses could not be paired"
             ),
             Self::InvalidReadout {
                 experiment,
@@ -1113,6 +1493,21 @@ impl fmt::Display for InterventionPlanError {
             Self::InvalidGaussianLaw(reason) => {
                 write!(f, "intervention plan: invalid Gaussian law: {reason}")
             }
+            Self::InvalidFrame { frame, reason } => {
+                write!(f, "intervention plan: invalid frame {frame}: {reason}")
+            }
+            Self::RankDeficientFrame {
+                frame,
+                rank,
+                columns,
+            } => write!(
+                f,
+                "intervention plan: frame {frame} resolves {rank} directions for {columns} columns, so no projector of its declared rank exists"
+            ),
+            Self::MissingForwardPath { experiment, change } => write!(
+                f,
+                "intervention plan: experiment {experiment} change {change} edits a parameter read by ordinal, but the plan declares no forward path the ordinal was recorded on"
+            ),
         }
     }
 }
@@ -1193,11 +1588,15 @@ fn check_values(name: &str, values: &[f64], expected: usize) -> Result<(), Strin
 }
 
 impl InterventionExperimentPlan {
-    /// Validate sites and experiments under the permanent split `split_seed`.
+    /// Validate sites, laws and experiments under the permanent split `split_seed`.
+    /// `forward_path` identifies the forward on which parameter-read ordinals were
+    /// recorded, and every use-site parameter edit requires one.
     pub fn new(
         sites: Vec<InterventionSite>,
+        laws: Vec<GaussianLoadingLaw>,
         experiments: Vec<InterventionExperiment>,
         split_seed: u64,
+        forward_path: Option<String>,
     ) -> Result<Self, InterventionPlanError> {
         let mut paths = BTreeSet::new();
         for (index, site) in sites.iter().enumerate() {
@@ -1211,15 +1610,35 @@ impl InterventionExperimentPlan {
         if experiments.is_empty() {
             return Err(InterventionPlanError::NoExperiments);
         }
-        let seed_mix = splitmix64(split_seed);
         let mut draw_keys = BTreeSet::new();
+        for (index, law) in laws.iter().enumerate() {
+            if !draw_keys.insert(law.key) {
+                return Err(InterventionPlanError::RepeatedDrawKey {
+                    law: index,
+                    key: law.key,
+                });
+            }
+        }
+        let has_forward_path = forward_path.as_ref().is_some_and(|path| !path.is_empty());
+        let seed_mix = splitmix64(split_seed);
+        let mut law_arms = BTreeSet::new();
         for (index, experiment) in experiments.iter().enumerate() {
-            validate_experiment(index, experiment, &sites, seed_mix, &mut draw_keys)?;
+            validate_experiment(
+                index,
+                experiment,
+                &sites,
+                &laws,
+                seed_mix,
+                has_forward_path,
+                &mut law_arms,
+            )?;
         }
         Ok(Self {
             sites,
+            laws,
             experiments,
             split_seed,
+            forward_path,
         })
     }
 
@@ -1227,8 +1646,17 @@ impl InterventionExperimentPlan {
         &self.sites
     }
 
+    pub fn laws(&self) -> &[GaussianLoadingLaw] {
+        &self.laws
+    }
+
     pub fn experiments(&self) -> &[InterventionExperiment] {
         &self.experiments
+    }
+
+    /// The forward path on which parameter-read ordinals were recorded.
+    pub fn forward_path(&self) -> Option<&str> {
+        self.forward_path.as_deref()
     }
 
     /// Indices of the experiments on `side` of the permanent split, in plan order.
@@ -1248,8 +1676,10 @@ fn validate_experiment(
     index: usize,
     experiment: &InterventionExperiment,
     sites: &[InterventionSite],
+    laws: &[GaussianLoadingLaw],
     seed_mix: u64,
-    draw_keys: &mut BTreeSet<DrawKey>,
+    has_forward_path: bool,
+    law_arms: &mut BTreeSet<(usize, LawArm)>,
 ) -> Result<(), InterventionPlanError> {
     let unit = experiment.unit;
     if experiment.changes.is_empty() || experiment.readouts.is_empty() || unit.length == 0 {
@@ -1307,21 +1737,28 @@ fn validate_experiment(
                             });
                         }
                     }
-                    ReplacementRows::GaussianLaw(law) => {
-                        if law.width() != width || law.draws.len() != positions.len() * law.rank {
+                    ReplacementRows::GaussianLaw { law, arm } => {
+                        let recorded = laws
+                            .get(*law)
+                            .ok_or_else(|| invalid(format!("law {law} is not in the plan")))?;
+                        if recorded.width() != width || recorded.draw_count() != positions.len() {
                             return Err(invalid(format!(
-                                "the Gaussian law has width {} and {} draws of rank {}; the site has width {width} and {} positions",
-                                law.width(),
-                                law.draws.len(),
-                                law.rank,
+                                "law {law} has width {} and {} draws; the site has width {width} and the change has {} positions",
+                                recorded.width(),
+                                recorded.draw_count(),
                                 positions.len()
                             )));
                         }
-                        if !draw_keys.insert(law.key) {
-                            return Err(InterventionPlanError::RepeatedDrawKey {
+                        if let LawArm::Coupled { frame } = arm {
+                            if *frame >= recorded.frames.len() {
+                                return Err(invalid(format!("law {law} has no frame {frame}")));
+                            }
+                        }
+                        if !law_arms.insert((*law, *arm)) {
+                            return Err(InterventionPlanError::RepeatedLawArm {
                                 experiment: index,
-                                change: change_index,
-                                key: law.key,
+                                law: *law,
+                                arm: *arm,
                             });
                         }
                     }
@@ -1393,6 +1830,7 @@ fn validate_experiment(
                 rank,
                 left,
                 right,
+                scope,
             } => {
                 if parameter.is_empty() || *rank == 0 || *rank > (*rows).min(*cols) {
                     return Err(invalid(format!(
@@ -1401,6 +1839,24 @@ fn validate_experiment(
                 }
                 check_values("left factor entries", left, rows * rank).map_err(invalid)?;
                 check_values("right factor entries", right, cols * rank).map_err(invalid)?;
+                if let ParameterEditScope::UseSite { read_op, positions, .. } = scope {
+                    // The module may be `""`: torch names the root module so, and a tied
+                    // head read through `F.linear` in the root's own forward is made there.
+                    if read_op.is_empty() {
+                        return Err(invalid(
+                            "a use-site parameter edit names the op of its read".to_string(),
+                        ));
+                    }
+                    if let Some(query_positions) = positions {
+                        check_positions(query_positions, unit.length).map_err(invalid)?;
+                    }
+                    if !has_forward_path {
+                        return Err(InterventionPlanError::MissingForwardPath {
+                            experiment: index,
+                            change: change_index,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1417,7 +1873,7 @@ fn validate_experiment(
                     check_positions(declared, unit.length).map_err(invalid)?;
                 } else if clean_pass == CleanPass::SeparateForward {
                     return Err(invalid(
-                        "a parameter edit reaches every position, so its KL readout must declare positions"
+                        "a global parameter edit reaches every position, so its KL readout must declare positions"
                             .to_string(),
                     ));
                 }
@@ -1452,8 +1908,10 @@ pub enum ReadoutMeasurement {
     Kl(Vec<f64>),
     /// Log-probabilities, row-major `(positions, token_ids)`.
     TokenLogProb { clean: Vec<f64>, patched: Vec<f64> },
-    /// Rows of the readout site, row-major `(positions, width)`.
-    Activation { clean: Vec<f64>, patched: Vec<f64> },
+    /// Executed rows of the readout site in the patched pass, row-major
+    /// `(positions, width)`. They may come from an external execution, such as a torch
+    /// run of the block, as long as row `i` answers the experiment's `i`-th position.
+    Activation { rows: Vec<f64> },
 }
 
 /// What one executed experiment measured.
@@ -1464,6 +1922,10 @@ pub struct ExperimentMeasurement {
     /// For a same-batch experiment whose earliest edit is after position 0: the
     /// largest KL over the positions before that edit. `None` otherwise.
     pub pre_edit_kl_max: Option<f64>,
+    /// Every parameter read the patched forward executed, when the runner recorded
+    /// them. An experiment with a use-site parameter edit must carry them, so that each
+    /// edit is accepted only where the read it names executed.
+    pub parameter_reads: Option<ExecutedParameterReads>,
 }
 
 /// A validated plan together with what its execution measured.
@@ -1473,18 +1935,19 @@ pub struct ExecutedInterventionExperiments {
     measurements: Vec<ExperimentMeasurement>,
 }
 
-/// Aligned randomized draws and executed responses, one record per replaced
-/// position.
+/// Paired executed responses of one law and frame: row `i` of `at_draw` answers
+/// `h0 + L z_i` and row `i` of `at_coupled` answers `h0 + L z′_i`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GaussianLawResponses {
-    pub rank: usize,
+pub struct GaussianLawResponses<'a> {
+    /// The law, which records `z`, `z̃`, the orthonormal frames and the draw key.
+    pub law: &'a GaussianLoadingLaw,
+    pub frame: usize,
+    /// Width of the readout rows.
     pub width: usize,
-    /// `z`, row-major `(records, rank)`.
-    pub draws: Vec<f64>,
-    /// Patched readout rows, row-major `(records, width)`.
-    pub responses: Vec<f64>,
-    /// The plan experiment each record came from.
-    pub experiment: Vec<usize>,
+    /// Readout rows at the draws, row-major `(n, width)`.
+    pub at_draw: &'a [f64],
+    /// Readout rows at the coupled draws, row-major `(n, width)`.
+    pub at_coupled: &'a [f64],
 }
 
 /// Typed refusals of executed measurements and of their consumers.
@@ -1508,18 +1971,31 @@ pub enum ExecutedInterventionError {
     UnknownSite {
         site: usize,
     },
-    NoExperimentsOnSide(SplitSide),
-    /// The experiment is not exactly one Gaussian-law replacement, so its rows are
-    /// not a randomized draw.
-    NotRandomized {
-        experiment: usize,
+    /// The plan has no such law, or the law has no such frame.
+    UnknownLawFrame {
+        law: usize,
+        frame: usize,
+    },
+    /// No experiment on the requested side executes exactly this arm of this law and
+    /// nothing else, so no randomized response exists for it.
+    MissingLawArm {
+        law: usize,
+        arm: LawArm,
     },
     MissingActivationReadout {
         experiment: usize,
         site: usize,
     },
-    MixedGaussianLawRanks {
+    /// An experiment with a use-site parameter edit reported no executed parameter
+    /// reads, so nothing shows that its edits reached the reads they name.
+    MissingParameterReads {
         experiment: usize,
+    },
+    /// A use-site parameter edit disagrees with the reads its forward executed.
+    ParameterRead {
+        experiment: usize,
+        change: usize,
+        refusal: ParameterReadRefusal,
     },
 }
 
@@ -1541,21 +2017,29 @@ impl fmt::Display for ExecutedInterventionError {
             Self::UnknownSite { site } => {
                 write!(f, "executed interventions: site {site} is not in the plan")
             }
-            Self::NoExperimentsOnSide(side) => write!(
+            Self::UnknownLawFrame { law, frame } => write!(
                 f,
-                "executed interventions: no experiment falls on the {side:?} side of the split"
+                "executed interventions: the plan has no law {law} with a frame {frame}"
             ),
-            Self::NotRandomized { experiment } => write!(
+            Self::MissingLawArm { law, arm } => write!(
                 f,
-                "executed interventions: experiment {experiment} is not exactly one Gaussian-law replacement, so its rows are not a randomized draw"
+                "executed interventions: no experiment on this side executes exactly arm {arm:?} of law {law}, so no randomized response exists for it"
             ),
             Self::MissingActivationReadout { experiment, site } => write!(
                 f,
                 "executed interventions: experiment {experiment} has no activation readout at site {site} over its replaced positions"
             ),
-            Self::MixedGaussianLawRanks { experiment } => write!(
+            Self::MissingParameterReads { experiment } => write!(
                 f,
-                "executed interventions: experiment {experiment} draws a different rank from the experiments before it"
+                "executed interventions: experiment {experiment} edits a parameter at a use site but reported no executed parameter reads"
+            ),
+            Self::ParameterRead {
+                experiment,
+                change,
+                refusal,
+            } => write!(
+                f,
+                "executed interventions: experiment {experiment} change {change}: {refusal}"
             ),
         }
     }
@@ -1564,7 +2048,8 @@ impl fmt::Display for ExecutedInterventionError {
 impl std::error::Error for ExecutedInterventionError {}
 
 impl ExecutedInterventionExperiments {
-    /// Validate one measurement per experiment against its declared readouts.
+    /// Validate one measurement per experiment against its declared readouts, and each
+    /// use-site parameter edit against the parameter reads its forward executed.
     pub fn new(
         plan: InterventionExperimentPlan,
         measurements: Vec<ExperimentMeasurement>,
@@ -1609,17 +2094,47 @@ impl ExecutedInterventionExperiments {
                     }
                     (
                         Readout::Activation { site, positions },
-                        ReadoutMeasurement::Activation { clean, patched },
+                        ReadoutMeasurement::Activation { rows },
                     ) => {
-                        let expected = positions.len() * plan.sites[*site].width;
-                        check_values("clean activation rows", clean, expected).map_err(invalid)?;
-                        check_values("patched activation rows", patched, expected)
-                            .map_err(invalid)?;
+                        check_values(
+                            "activation rows",
+                            rows,
+                            positions.len() * plan.sites[*site].width,
+                        )
+                        .map_err(invalid)?;
                     }
                     _ => {
                         return Err(invalid(
                             "a readout was measured as a different kind".to_string(),
                         ));
+                    }
+                }
+            }
+            match &measurement.parameter_reads {
+                Some(executed) => {
+                    for (change_index, change) in experiment.changes.iter().enumerate() {
+                        change.check_executed_reads(executed).map_err(|refusal| {
+                            ExecutedInterventionError::ParameterRead {
+                                experiment: index,
+                                change: change_index,
+                                refusal,
+                            }
+                        })?;
+                    }
+                }
+                None => {
+                    if experiment.changes.iter().any(|change| {
+                        matches!(
+                            change,
+                            InterventionChange::ParameterEdit {
+                                scope: ParameterEditScope::UseSite { .. },
+                                ..
+                            }
+                        )
+                    }) {
+                        return Err(ExecutedInterventionError::MissingParameterReads {
+                            experiment: index,
+                        });
                     }
                 }
             }
@@ -1662,42 +2177,65 @@ impl ExecutedInterventionExperiments {
         &self.measurements
     }
 
-    /// The randomized draws and executed responses on `side` of the split, read at
-    /// the activation readout of `readout_site` over each replaced position. Every
-    /// experiment on that side must be exactly one Gaussian-law replacement, so
-    /// designed or observed rows can never enter an estimator as randomized.
+    /// The paired executed responses of law `law` at its draws and at frame `frame`'s
+    /// coupled draws, on `side` of the split, read at the activation readout of
+    /// `readout_site`. Only an experiment that is exactly one Gaussian-law replacement
+    /// executes an arm, so designed or observed rows never enter an estimator as
+    /// randomized.
     pub fn gaussian_law_responses(
         &self,
         side: SplitSide,
         readout_site: usize,
-    ) -> Result<GaussianLawResponses, ExecutedInterventionError> {
+        law: usize,
+        frame: usize,
+    ) -> Result<GaussianLawResponses<'_>, ExecutedInterventionError> {
         let width = self
             .plan
             .sites
             .get(readout_site)
             .map(|site| site.width)
             .ok_or(ExecutedInterventionError::UnknownSite { site: readout_site })?;
-        let indices = self.plan.experiments_on(side);
-        let mut rank = None;
-        let mut draws = Vec::new();
-        let mut responses = Vec::new();
-        let mut experiment_of_record = Vec::new();
-        for index in indices {
+        let recorded = self
+            .plan
+            .laws
+            .get(law)
+            .filter(|recorded| frame < recorded.frames.len())
+            .ok_or(ExecutedInterventionError::UnknownLawFrame { law, frame })?;
+        Ok(GaussianLawResponses {
+            law: recorded,
+            frame,
+            width,
+            at_draw: self.law_arm_rows(side, readout_site, law, LawArm::Draw)?,
+            at_coupled: self.law_arm_rows(side, readout_site, law, LawArm::Coupled { frame })?,
+        })
+    }
+
+    /// The executed readout rows of the experiment on `side` that executes exactly arm
+    /// `arm` of law `law`, read at `readout_site` over the replaced positions.
+    fn law_arm_rows(
+        &self,
+        side: SplitSide,
+        readout_site: usize,
+        law: usize,
+        arm: LawArm,
+    ) -> Result<&[f64], ExecutedInterventionError> {
+        for index in self.plan.experiments_on(side) {
             let experiment = &self.plan.experiments[index];
-            let (positions, law) = match experiment.changes.as_slice() {
+            let positions = match experiment.changes.as_slice() {
                 [
                     InterventionChange::AmbientReplacement {
                         positions,
-                        rows: ReplacementRows::GaussianLaw(law),
+                        rows:
+                            ReplacementRows::GaussianLaw {
+                                law: executed_law,
+                                arm: executed_arm,
+                            },
                         ..
                     },
-                ] => (positions, law),
-                _ => return Err(ExecutedInterventionError::NotRandomized { experiment: index }),
+                ] if *executed_law == law && *executed_arm == arm => positions,
+                _ => continue,
             };
-            if *rank.get_or_insert(law.rank) != law.rank {
-                return Err(ExecutedInterventionError::MixedGaussianLawRanks { experiment: index });
-            }
-            let patched = experiment
+            return experiment
                 .readouts
                 .iter()
                 .zip(&self.measurements[index].readouts)
@@ -1707,26 +2245,16 @@ impl ExecutedInterventionExperiments {
                             site,
                             positions: read,
                         },
-                        ReadoutMeasurement::Activation { patched, .. },
-                    ) if *site == readout_site && read == positions => Some(patched),
+                        ReadoutMeasurement::Activation { rows },
+                    ) if *site == readout_site && read == positions => Some(rows.as_slice()),
                     _ => None,
                 })
                 .ok_or(ExecutedInterventionError::MissingActivationReadout {
                     experiment: index,
                     site: readout_site,
-                })?;
-            draws.extend_from_slice(&law.draws);
-            responses.extend_from_slice(patched);
-            experiment_of_record.extend(std::iter::repeat_n(index, positions.len()));
+                });
         }
-        let rank = rank.ok_or(ExecutedInterventionError::NoExperimentsOnSide(side))?;
-        Ok(GaussianLawResponses {
-            rank,
-            width,
-            draws,
-            responses,
-            experiment: experiment_of_record,
-        })
+        Err(ExecutedInterventionError::MissingLawArm { law, arm })
     }
 }
 
@@ -2059,13 +2587,14 @@ mod tests {
         }
     }
 
-    fn two_by_two_law(stream: u64, positions: usize) -> GaussianLoadingLaw {
+    fn two_by_two_law(stream: u64, draws: usize, frames: &[Array2<f64>]) -> GaussianLoadingLaw {
         GaussianLoadingLaw::draw(
             vec![0.5, -0.5],
             vec![1.0, 0.0, 0.0, 2.0],
             2,
             DrawKey { seed: 3, stream },
-            positions,
+            draws,
+            frames,
         )
         .unwrap()
     }
@@ -2080,7 +2609,10 @@ mod tests {
                 InterventionChange::AmbientReplacement {
                     site: 0,
                     positions: vec![2],
-                    rows: ReplacementRows::GaussianLaw(two_by_two_law(0, 1)),
+                    rows: ReplacementRows::GaussianLaw {
+                        law: 0,
+                        arm: LawArm::Draw,
+                    },
                 },
                 InterventionChange::AmbientAddition {
                     site: 1,
@@ -2121,13 +2653,16 @@ mod tests {
                 rank: 1,
                 left: vec![1.0, -1.0],
                 right: vec![0.5, 0.0, 0.5],
+                scope: ParameterEditScope::Global,
             }],
             readouts: vec![Readout::Kl(KlPositions::Declared(vec![0, 5]))],
         };
         let plan = InterventionExperimentPlan::new(
             experiment_sites(),
+            vec![two_by_two_law(0, 1, &[])],
             vec![same_batch, parameter_edit],
             seed,
+            None,
         )
         .unwrap();
         let experiments = plan.experiments();
@@ -2153,12 +2688,14 @@ mod tests {
         let plan_with = |second: InterventionChange| {
             InterventionExperimentPlan::new(
                 experiment_sites(),
+                Vec::new(),
                 vec![InterventionExperiment {
                     unit: unit_in(4),
                     changes: vec![addition(2), second],
                     readouts: vec![Readout::Kl(KlPositions::Edited)],
                 }],
                 0,
+                None,
             )
         };
         // Additions commute, and a clamp at another site does not overlap.
@@ -2206,6 +2743,7 @@ mod tests {
         let patch_from = |source_group: i64| {
             InterventionExperimentPlan::new(
                 experiment_sites(),
+                Vec::new(),
                 vec![InterventionExperiment {
                     unit: unit_in(train_group),
                     changes: vec![InterventionChange::AmbientReplacement {
@@ -2220,6 +2758,7 @@ mod tests {
                     readouts: vec![Readout::Kl(KlPositions::Following { horizon: 2 })],
                 }],
                 seed,
+                None,
             )
         };
         assert!(patch_from(train_group).is_ok());
@@ -2232,11 +2771,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gaussian_law_responses_refuse_designed_rows_with_identical_values() {
-        let train_group = group_on_side(0, false);
-        let replace = |rows: ReplacementRows| InterventionExperiment {
-            unit: unit_in(train_group),
+    /// An experiment that replaces positions 0 and 1 of site 0 with `rows` and reads
+    /// site 1 back over the same positions.
+    fn law_arm_experiment(group: i64, rows: ReplacementRows) -> InterventionExperiment {
+        InterventionExperiment {
+            unit: unit_in(group),
             changes: vec![InterventionChange::AmbientReplacement {
                 site: 0,
                 positions: vec![0, 1],
@@ -2246,119 +2785,314 @@ mod tests {
                 site: 1,
                 positions: vec![0, 1],
             }],
-        };
-        let measured = || ExperimentMeasurement {
+        }
+    }
+
+    fn activation_rows(rows: [f64; 4]) -> ExperimentMeasurement {
+        ExperimentMeasurement {
             readouts: vec![ReadoutMeasurement::Activation {
-                clean: vec![0.0; 4],
-                patched: vec![1.0, 2.0, 3.0, 4.0],
+                rows: rows.to_vec(),
             }],
             pre_edit_kl_max: None,
+            parameter_reads: None,
+        }
+    }
+
+    #[test]
+    fn gaussian_law_responses_pair_draw_and_coupled_rows_and_refuse_designed_rows() {
+        let train_group = group_on_side(0, false);
+        let frame = ndarray::array![[1.0], [1.0]];
+        let law = || two_by_two_law(0, 2, std::slice::from_ref(&frame));
+        let draw_arm = || ReplacementRows::GaussianLaw {
+            law: 0,
+            arm: LawArm::Draw,
         };
-        let randomized = InterventionExperimentPlan::new(
+        let coupled_arm = || ReplacementRows::GaussianLaw {
+            law: 0,
+            arm: LawArm::Coupled { frame: 0 },
+        };
+        let plan = InterventionExperimentPlan::new(
             experiment_sites(),
+            vec![law()],
             vec![
-                replace(ReplacementRows::GaussianLaw(two_by_two_law(0, 2))),
-                replace(ReplacementRows::GaussianLaw(two_by_two_law(1, 2))),
+                law_arm_experiment(train_group, draw_arm()),
+                law_arm_experiment(train_group, coupled_arm()),
             ],
             0,
+            None,
         )
         .unwrap();
-        let executed =
-            ExecutedInterventionExperiments::new(randomized, vec![measured(), measured()]).unwrap();
-        let recovered = executed
-            .gaussian_law_responses(SplitSide::Train, 1)
+        let executed = ExecutedInterventionExperiments::new(
+            plan,
+            vec![
+                activation_rows([1.0, 2.0, 3.0, 4.0]),
+                activation_rows([5.0, 6.0, 7.0, 8.0]),
+            ],
+        )
+        .unwrap();
+        let paired = executed
+            .gaussian_law_responses(SplitSide::Train, 1, 0, 0)
             .unwrap();
-        let expected_draws: Vec<f64> = two_by_two_law(0, 2)
-            .draws()
-            .iter()
-            .chain(two_by_two_law(1, 2).draws())
-            .copied()
-            .collect();
-        assert_eq!(recovered.rank, 2);
-        assert_eq!(recovered.width, 2);
-        assert_eq!(recovered.draws, expected_draws);
+        assert_eq!(paired.width, 2);
+        assert_eq!(paired.frame, 0);
+        assert_eq!(paired.law, &law());
+        assert_eq!(paired.at_draw, &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(paired.at_coupled, &[5.0, 6.0, 7.0, 8.0]);
         assert_eq!(
-            recovered.responses,
-            vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+            executed
+                .gaussian_law_responses(SplitSide::EvalForever, 1, 0, 0)
+                .unwrap_err(),
+            ExecutedInterventionError::MissingLawArm {
+                law: 0,
+                arm: LawArm::Draw,
+            }
         );
-        assert_eq!(recovered.experiment, vec![0, 0, 1, 1]);
-        assert_ne!(two_by_two_law(0, 2).draws(), two_by_two_law(1, 2).draws());
+        assert_eq!(
+            executed
+                .gaussian_law_responses(SplitSide::Train, 1, 0, 1)
+                .unwrap_err(),
+            ExecutedInterventionError::UnknownLawFrame { law: 0, frame: 1 }
+        );
 
-        // Positive control: the same rows declared as designed are refused, so the
-        // fence is the type, not the values.
+        // Positive control: identical rows declared as designed execute no law arm, so
+        // the fence is the type, not the values.
         let designed = InterventionExperimentPlan::new(
             experiment_sites(),
-            vec![replace(ReplacementRows::Designed(
-                two_by_two_law(0, 2).rows(),
-            ))],
+            vec![law()],
+            vec![
+                law_arm_experiment(
+                    train_group,
+                    ReplacementRows::Designed(law().rows(LawArm::Draw).unwrap()),
+                ),
+                law_arm_experiment(train_group, coupled_arm()),
+            ],
             0,
+            None,
         )
         .unwrap();
-        let executed_designed =
-            ExecutedInterventionExperiments::new(designed, vec![measured()]).unwrap();
+        let executed_designed = ExecutedInterventionExperiments::new(
+            designed,
+            vec![
+                activation_rows([1.0, 2.0, 3.0, 4.0]),
+                activation_rows([5.0, 6.0, 7.0, 8.0]),
+            ],
+        )
+        .unwrap();
         assert_eq!(
             executed_designed
-                .gaussian_law_responses(SplitSide::Train, 1)
+                .gaussian_law_responses(SplitSide::Train, 1, 0, 0)
                 .unwrap_err(),
-            ExecutedInterventionError::NotRandomized { experiment: 0 }
+            ExecutedInterventionError::MissingLawArm {
+                law: 0,
+                arm: LawArm::Draw,
+            }
         );
 
-        // A repeated draw key would repeat the draws.
+        // An arm executed twice could not be paired, and two laws sharing a key would
+        // share their draws.
         assert_eq!(
             InterventionExperimentPlan::new(
                 experiment_sites(),
+                vec![law()],
                 vec![
-                    replace(ReplacementRows::GaussianLaw(two_by_two_law(0, 2))),
-                    replace(ReplacementRows::GaussianLaw(two_by_two_law(0, 2))),
+                    law_arm_experiment(train_group, draw_arm()),
+                    law_arm_experiment(train_group, draw_arm()),
                 ],
                 0,
+                None,
+            )
+            .unwrap_err(),
+            InterventionPlanError::RepeatedLawArm {
+                experiment: 1,
+                law: 0,
+                arm: LawArm::Draw,
+            }
+        );
+        assert_eq!(
+            InterventionExperimentPlan::new(
+                experiment_sites(),
+                vec![law(), law()],
+                vec![law_arm_experiment(train_group, draw_arm())],
+                0,
+                None,
             )
             .unwrap_err(),
             InterventionPlanError::RepeatedDrawKey {
-                experiment: 1,
-                change: 0,
+                law: 1,
                 key: DrawKey { seed: 3, stream: 0 },
             }
         );
     }
 
     #[test]
+    fn coupled_draws_copy_retained_coordinates_and_take_the_rest_from_the_independent_copy() {
+        let frames = [
+            Array2::eye(2),
+            ndarray::array![[1.0], [0.0]],
+            Array2::zeros((2, 0)),
+        ];
+        let law = two_by_two_law(7, 64, &frames);
+        assert_ne!(law.draws(), law.independent_draws());
+        // The full frame reproduces z bit for bit.
+        assert_eq!(law.coupled_draws(0).unwrap(), law.draws());
+        assert_eq!(
+            law.rows(LawArm::Coupled { frame: 0 }),
+            law.rows(LawArm::Draw)
+        );
+        // The rank-0 frame executes the independent copy bit for bit.
+        assert_eq!(law.coupled_draws(2).unwrap(), law.independent_draws());
+        // The first-axis frame keeps z's first coordinate and z̃'s second.
+        let partial = law.coupled_draws(1).unwrap();
+        for ((coupled, z), z_tilde) in partial
+            .chunks_exact(2)
+            .zip(law.draws().chunks_exact(2))
+            .zip(law.independent_draws().chunks_exact(2))
+        {
+            assert_eq!(coupled, &[z[0], z_tilde[1]]);
+        }
+        assert!(law.coupled_draws(3).is_none());
+    }
+
+    #[test]
+    fn a_rank_deficient_or_misshaped_frame_is_refused() {
+        let draw_with = |frame: Array2<f64>| {
+            GaussianLoadingLaw::draw(
+                vec![0.5, -0.5],
+                vec![1.0, 0.0, 0.0, 2.0],
+                2,
+                DrawKey { seed: 3, stream: 0 },
+                4,
+                &[frame],
+            )
+        };
+        assert_eq!(
+            draw_with(ndarray::array![[1.0, 0.0], [1.0, 0.0]]).unwrap_err(),
+            InterventionPlanError::RankDeficientFrame {
+                frame: 0,
+                rank: 1,
+                columns: 2,
+            }
+        );
+        assert!(matches!(
+            draw_with(Array2::ones((3, 1))),
+            Err(InterventionPlanError::InvalidFrame { frame: 0, .. })
+        ));
+        // Positive control: the same columns made independent are accepted.
+        assert!(draw_with(ndarray::array![[1.0, 0.0], [1.0, 1.0]]).is_ok());
+    }
+
+    /// The Kolmogorov distance between the empirical law of `values` and the standard
+    /// normal, with the Dvoretzky-Kiefer-Wolfowitz bound (Massart's constant) it must
+    /// stay within at false-failure probability 1e-9.
+    fn kolmogorov_distance_and_dkw_bound(values: &[f64]) -> (f64, f64) {
+        let n = values.len() as f64;
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let distance = sorted
+            .iter()
+            .enumerate()
+            .fold(0.0_f64, |distance, (index, &value)| {
+                let cdf = gam_math::probability::normal_cdf(value);
+                distance
+                    .max(cdf - index as f64 / n)
+                    .max((index + 1) as f64 / n - cdf)
+            });
+        (distance, ((2.0 / 1.0e-9_f64).ln() / (2.0 * n)).sqrt())
+    }
+
+    #[test]
+    fn coupled_draws_are_standard_normal_and_share_the_frame_component() {
+        let n = 20_000;
+        let law = two_by_two_law(
+            11,
+            n,
+            &[ndarray::array![[1.0], [1.0]], Array2::zeros((2, 0))],
+        );
+        let coupled = law.coupled_draws(0).unwrap();
+        for axis in 0..2 {
+            let marginal: Vec<f64> = coupled.iter().skip(axis).step_by(2).copied().collect();
+            let (distance, bound) = kolmogorov_distance_and_dkw_bound(&marginal);
+            assert!(
+                distance <= bound,
+                "coupled axis {axis} is not standard normal: {distance} > {bound}"
+            );
+        }
+        // Positive control: adding z̃ without removing its frame component gives variance
+        // 3/2 along each axis, which the same bound detects.
+        let q = &law.frames()[0];
+        let unremoved: Vec<f64> = law
+            .draws()
+            .chunks_exact(2)
+            .zip(law.independent_draws().chunks_exact(2))
+            .map(|(z, z_tilde)| q[[0, 0]] * (q[[0, 0]] * z[0] + q[[1, 0]] * z[1]) + z_tilde[0])
+            .collect();
+        let (distance, bound) = kolmogorov_distance_and_dkw_bound(&unremoved);
+        assert!(
+            distance > bound,
+            "an unremoved frame component was not detected: {distance} <= {bound}"
+        );
+
+        // Z′ shares exactly P Z with Z, so on axis 0 its correlation with z is P₀₀ = 1/2.
+        // The sample correlation must match within the normal-approximation standard
+        // error (1 − ρ²)/√n times the two-sided 1e-9 quantile.
+        let axis_zero = |values: &[f64]| values.iter().step_by(2).copied().collect::<Vec<f64>>();
+        let sample_correlation = |a: &[f64], b: &[f64]| {
+            let count = a.len() as f64;
+            let mean_a = a.iter().sum::<f64>() / count;
+            let mean_b = b.iter().sum::<f64>() / count;
+            let (cross, square_a, square_b) = a.iter().zip(b).fold(
+                (0.0_f64, 0.0_f64, 0.0_f64),
+                |(cross, square_a, square_b), (&x, &y)| {
+                    let (dx, dy) = (x - mean_a, y - mean_b);
+                    (cross + dx * dy, square_a + dx * dx, square_b + dy * dy)
+                },
+            );
+            cross / (square_a * square_b).sqrt()
+        };
+        let quantile = gam_math::probability::standard_normal_quantile(1.0 - 0.5e-9).unwrap();
+        let tolerance = quantile * (1.0 - 0.25) / (n as f64).sqrt();
+        let draws_axis_zero = axis_zero(law.draws());
+        let shared = sample_correlation(&axis_zero(&coupled), &draws_axis_zero);
+        assert!(
+            (shared - 0.5).abs() <= tolerance,
+            "the coupled draws do not share the frame component: correlation {shared}, tolerance {tolerance}"
+        );
+        // Positive control: the rank-0 frame shares nothing, and the same tolerance
+        // detects it.
+        let independent = sample_correlation(
+            &axis_zero(&law.coupled_draws(1).unwrap()),
+            &draws_axis_zero,
+        );
+        assert!(
+            (independent - 0.5).abs() > tolerance,
+            "an independent copy was not detected: correlation {independent}, tolerance {tolerance}"
+        );
+    }
+
+    #[test]
     fn gaussian_law_rows_are_baseline_plus_loading_times_standard_normal_draws() {
-        let law = two_by_two_law(5, 20_000);
-        for (row, z) in law.rows().chunks_exact(2).zip(law.draws().chunks_exact(2)) {
+        let law = two_by_two_law(5, 20_000, &[]);
+        for (row, z) in law
+            .rows(LawArm::Draw)
+            .unwrap()
+            .chunks_exact(2)
+            .zip(law.draws().chunks_exact(2))
+        {
             assert_eq!(row[0], 0.5 + z[0]);
             assert_eq!(row[1], -0.5 + 2.0 * z[1]);
         }
-        // Dvoretzky-Kiefer-Wolfowitz with Massart's constant: n i.i.d. draws give
-        // sup|F_n - Phi| > eps with probability at most 2 exp(-2 n eps^2). `epsilon`
-        // is that eps at false-failure probability 1e-9.
-        let draws = law.draws();
-        let n = draws.len() as f64;
-        let epsilon = ((2.0 / 1.0e-9_f64).ln() / (2.0 * n)).sqrt();
-        let kolmogorov_distance = |shift: f64| {
-            let mut sorted: Vec<f64> = draws.iter().map(|z| z + shift).collect();
-            sorted.sort_by(f64::total_cmp);
-            sorted
-                .iter()
-                .enumerate()
-                .fold(0.0_f64, |distance, (index, &z)| {
-                    let cdf = gam_math::probability::normal_cdf(z);
-                    distance
-                        .max(cdf - index as f64 / n)
-                        .max((index + 1) as f64 / n - cdf)
-                })
-        };
-        let distance = kolmogorov_distance(0.0);
+        let (distance, bound) = kolmogorov_distance_and_dkw_bound(law.draws());
         assert!(
-            distance <= epsilon,
-            "the draws are not standard normal: Kolmogorov distance {distance} > {epsilon}"
+            distance <= bound,
+            "the draws are not standard normal: Kolmogorov distance {distance} > {bound}"
         );
         // Positive control: the same draws shifted by a tenth of a standard deviation
         // exceed the bound, so the bound can detect a wrong stream.
-        let shifted = kolmogorov_distance(0.1);
+        let shifted: Vec<f64> = law.draws().iter().map(|z| z + 0.1).collect();
+        let (shifted_distance, shifted_bound) = kolmogorov_distance_and_dkw_bound(&shifted);
         assert!(
-            shifted > epsilon,
-            "a 0.1 shift was not detected: {shifted} <= {epsilon}"
+            shifted_distance > shifted_bound,
+            "a 0.1 shift was not detected: {shifted_distance} <= {shifted_bound}"
         );
     }
 
@@ -2367,6 +3101,7 @@ mod tests {
         let plan = || {
             InterventionExperimentPlan::new(
                 experiment_sites(),
+                Vec::new(),
                 vec![InterventionExperiment {
                     unit: unit_in(4),
                     changes: vec![InterventionChange::AmbientAddition {
@@ -2380,6 +3115,7 @@ mod tests {
                     ],
                 }],
                 0,
+                None,
             )
             .unwrap()
         };
@@ -2390,6 +3126,7 @@ mod tests {
                     ReadoutMeasurement::Kl(vec![0.02, 0.01]),
                 ],
                 pre_edit_kl_max,
+                parameter_reads: None,
             }]
         };
         assert!(ExecutedInterventionExperiments::new(plan(), measured(Some(0.0))).is_ok());
@@ -2418,6 +3155,7 @@ mod tests {
         let edit = |readout: Readout| {
             InterventionExperimentPlan::new(
                 experiment_sites(),
+                Vec::new(),
                 vec![InterventionExperiment {
                     unit: unit_in(4),
                     changes: vec![InterventionChange::ParameterEdit {
@@ -2427,10 +3165,12 @@ mod tests {
                         rank: 1,
                         left: vec![1.0, 0.0],
                         right: vec![0.0, 1.0],
+                        scope: ParameterEditScope::Global,
                     }],
                     readouts: vec![readout],
                 }],
                 0,
+                None,
             )
         };
         assert!(edit(Readout::Kl(KlPositions::Declared(vec![5]))).is_ok());
@@ -2442,5 +3182,289 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_use_site_parameter_edit_keeps_the_clean_prefix_in_the_batch() {
+        let experiment = |scope: ParameterEditScope, readout: Readout| InterventionExperiment {
+            unit: unit_in(4),
+            changes: vec![InterventionChange::ParameterEdit {
+                parameter: "gpt_neox.embed_out.weight".to_string(),
+                rows: 2,
+                cols: 2,
+                rank: 1,
+                left: vec![1.0, 0.0],
+                right: vec![0.0, 1.0],
+                scope,
+            }],
+            readouts: vec![readout],
+        };
+        let use_site = |positions: Option<Vec<usize>>| ParameterEditScope::UseSite {
+            ordinal: 1,
+            read_module: "embed_out".to_string(),
+            read_op: "F.linear".to_string(),
+            positions,
+        };
+        let forward_path = || Some("full-forward:len6".to_string());
+        let following = || Readout::Kl(KlPositions::Following { horizon: 2 });
+        let plan = InterventionExperimentPlan::new(
+            experiment_sites(),
+            Vec::new(),
+            vec![experiment(use_site(Some(vec![3])), following())],
+            0,
+            forward_path(),
+        )
+        .unwrap();
+        assert_eq!(plan.experiments()[0].clean_pass(), CleanPass::SameBatch);
+        assert_eq!(plan.experiments()[0].edited_positions(), vec![3]);
+        assert_eq!(plan.forward_path(), Some("full-forward:len6"));
+
+        // Positions before the first query position must read back exactly clean.
+        let executed = ExecutedParameterReads::new(vec![
+            ExecutedParameterRead {
+                parameter: "gpt_neox.embed_out.weight".to_string(),
+                ordinal: 0,
+                read_module: "gpt_neox.embed_in".to_string(),
+                read_op: "F.embedding".to_string(),
+            },
+            ExecutedParameterRead {
+                parameter: "gpt_neox.embed_out.weight".to_string(),
+                ordinal: 1,
+                read_module: "embed_out".to_string(),
+                read_op: "F.linear".to_string(),
+            },
+        ])
+        .unwrap();
+        let measured = |pre_edit_kl_max: Option<f64>| {
+            vec![ExperimentMeasurement {
+                readouts: vec![ReadoutMeasurement::Kl(vec![0.02, 0.01])],
+                pre_edit_kl_max,
+                parameter_reads: Some(executed.clone()),
+            }]
+        };
+        assert!(ExecutedInterventionExperiments::new(plan.clone(), measured(Some(0.0))).is_ok());
+        assert_eq!(
+            ExecutedInterventionExperiments::new(plan, measured(Some(1.0e-12))).unwrap_err(),
+            ExecutedInterventionError::PreEditResponse {
+                experiment: 0,
+                kl: 1.0e-12,
+            }
+        );
+
+        // A read ordinal means nothing without the forward path it was recorded on.
+        assert_eq!(
+            InterventionExperimentPlan::new(
+                experiment_sites(),
+                Vec::new(),
+                vec![experiment(use_site(Some(vec![3])), following())],
+                0,
+                None,
+            )
+            .unwrap_err(),
+            InterventionPlanError::MissingForwardPath {
+                experiment: 0,
+                change: 0,
+            }
+        );
+
+        // A use-site edit read at every position edits every position.
+        let everywhere = InterventionExperimentPlan::new(
+            experiment_sites(),
+            Vec::new(),
+            vec![experiment(use_site(None), Readout::Kl(KlPositions::Edited))],
+            0,
+            forward_path(),
+        )
+        .unwrap();
+        assert_eq!(
+            everywhere.experiments()[0].edited_positions(),
+            (0..6).collect::<Vec<usize>>()
+        );
+
+        // Negative control: a global edit of the same tensor changes the whole batch.
+        let global = InterventionExperimentPlan::new(
+            experiment_sites(),
+            Vec::new(),
+            vec![experiment(
+                ParameterEditScope::Global,
+                Readout::Kl(KlPositions::Declared(vec![5])),
+            )],
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            global.experiments()[0].clean_pass(),
+            CleanPass::SeparateForward
+        );
+    }
+
+    #[test]
+    fn a_use_site_edit_is_accepted_only_where_its_forward_made_the_named_read() {
+        // A tied embedding: read #0 by the embedding module, read #1 as the head through
+        // F.linear in the root module's own forward, which torch names "".
+        let tied = "embed.weight";
+        let read = |parameter: &str, ordinal: usize, module: &str, op: &str| {
+            ExecutedParameterRead {
+                parameter: parameter.to_string(),
+                ordinal,
+                read_module: module.to_string(),
+                read_op: op.to_string(),
+            }
+        };
+        let linear = "torch.nn.functional.linear";
+        let forward = || {
+            vec![
+                read(tied, 0, "embed", "torch.nn.functional.embedding"),
+                read("block.mlp.weight", 0, "block.mlp", linear),
+                read(tied, 1, "", linear),
+            ]
+        };
+        let plan = |scope: ParameterEditScope, readout: Readout| {
+            InterventionExperimentPlan::new(
+                experiment_sites(),
+                Vec::new(),
+                vec![InterventionExperiment {
+                    unit: unit_in(4),
+                    changes: vec![InterventionChange::ParameterEdit {
+                        parameter: tied.to_string(),
+                        rows: 2,
+                        cols: 2,
+                        rank: 1,
+                        left: vec![1.0, 0.0],
+                        right: vec![0.0, 1.0],
+                        scope,
+                    }],
+                    readouts: vec![readout],
+                }],
+                0,
+                Some("full-forward:len6".to_string()),
+            )
+        };
+        let head = |ordinal: usize, module: &str, op: &str| ParameterEditScope::UseSite {
+            ordinal,
+            read_module: module.to_string(),
+            read_op: op.to_string(),
+            positions: None,
+        };
+        // Every position is edited, so the KL readout has one value per position.
+        let execute = |scope: ParameterEditScope, reads: Option<Vec<ExecutedParameterRead>>| {
+            ExecutedInterventionExperiments::new(
+                plan(scope, Readout::Kl(KlPositions::Edited)).unwrap(),
+                vec![ExperimentMeasurement {
+                    readouts: vec![ReadoutMeasurement::Kl(vec![0.1; 6])],
+                    pre_edit_kl_max: None,
+                    parameter_reads: reads
+                        .map(|reads| ExecutedParameterReads::new(reads).unwrap()),
+                }],
+            )
+        };
+        let mismatch = |ordinal: usize, declared: (&str, &str), executed: (&str, &str)| {
+            ExecutedInterventionError::ParameterRead {
+                experiment: 0,
+                change: 0,
+                refusal: ParameterReadRefusal::LabelMismatch {
+                    parameter: tied.to_string(),
+                    ordinal,
+                    declared_module: declared.0.to_string(),
+                    declared_op: declared.1.to_string(),
+                    executed_module: executed.0.to_string(),
+                    executed_op: executed.1.to_string(),
+                },
+            }
+        };
+
+        // The head read, named as the forward made it, root module "" included.
+        assert!(execute(head(1, "", linear), Some(forward())).is_ok());
+        // Another op, or another module, at that ordinal is another read.
+        assert_eq!(
+            execute(head(1, "", "torch.matmul"), Some(forward())).unwrap_err(),
+            mismatch(1, ("", "torch.matmul"), ("", linear))
+        );
+        assert_eq!(
+            execute(head(1, "lm_head", linear), Some(forward())).unwrap_err(),
+            mismatch(1, ("lm_head", linear), ("", linear))
+        );
+        // An ordinal off by one addresses the embedding read, which the names catch.
+        assert_eq!(
+            execute(head(0, "", linear), Some(forward())).unwrap_err(),
+            mismatch(0, ("", linear), ("embed", "torch.nn.functional.embedding"))
+        );
+        // The forward read the tied tensor twice, so it made no read #2.
+        assert_eq!(
+            execute(head(2, "", linear), Some(forward())).unwrap_err(),
+            ExecutedInterventionError::ParameterRead {
+                experiment: 0,
+                change: 0,
+                refusal: ParameterReadRefusal::Unread {
+                    parameter: tied.to_string(),
+                    ordinal: 2,
+                    reads: 2,
+                },
+            }
+        );
+        // Without the executed reads, nothing shows the edit reached its read.
+        assert_eq!(
+            execute(head(1, "", linear), None).unwrap_err(),
+            ExecutedInterventionError::MissingParameterReads { experiment: 0 }
+        );
+        // Negative control: a global edit names no read, so it needs no reads.
+        assert!(ExecutedInterventionExperiments::new(
+            plan(
+                ParameterEditScope::Global,
+                Readout::Kl(KlPositions::Declared(vec![5]))
+            )
+            .unwrap(),
+            vec![ExperimentMeasurement {
+                readouts: vec![ReadoutMeasurement::Kl(vec![0.1])],
+                pre_edit_kl_max: None,
+                parameter_reads: None,
+            }],
+        )
+        .is_ok());
+        // The op is required even where the module is the root's "".
+        assert!(matches!(
+            plan(head(1, "", ""), Readout::Kl(KlPositions::Edited)),
+            Err(InterventionPlanError::InvalidChange {
+                experiment: 0,
+                change: 0,
+                ..
+            })
+        ));
+
+        // Each storage is numbered in execution order on its own, so the interleaved
+        // forward is accepted. A read out of order, a repeated ordinal and a read with
+        // no op are refused.
+        assert!(ExecutedParameterReads::new(forward()).is_ok());
+        assert_eq!(
+            ExecutedParameterReads::new(vec![
+                read(tied, 1, "", linear),
+                read(tied, 0, "embed", linear),
+            ])
+            .unwrap_err(),
+            ParameterReadRefusal::OutOfOrder {
+                index: 0,
+                parameter: tied.to_string(),
+                ordinal: 1,
+                expected: 0,
+            }
+        );
+        assert_eq!(
+            ExecutedParameterReads::new(vec![
+                read(tied, 0, "embed", linear),
+                read(tied, 0, "", linear),
+            ])
+            .unwrap_err(),
+            ParameterReadRefusal::OutOfOrder {
+                index: 1,
+                parameter: tied.to_string(),
+                ordinal: 0,
+                expected: 1,
+            }
+        );
+        assert_eq!(
+            ExecutedParameterReads::new(vec![read(tied, 0, "embed", "")]).unwrap_err(),
+            ParameterReadRefusal::Unnamed { index: 0 }
+        );
     }
 }

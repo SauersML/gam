@@ -52,15 +52,16 @@
 //! EV describes the pass's measured frames with their profiled γ. Proposed frames
 //! remain an uncertified checkpoint until a paired pass reroutes both proposal
 //! and baseline and profiles a gamma for each. Only a strict full-objective
-//! improvement commits; rejection retracts halfway along the same frame direction
-//! and cannot certify stationarity. Finalize
+//! improvement commits, measured over the rows whose codes can differ between the two
+//! passes, since every other row is priced to the same bits in both; rejection retracts
+//! halfway along the same frame direction and cannot certify stationarity. Finalize
 //! requires EV, γ, projector closure and tangent stationarity and returns the exact measured frames,
 //! γ and EV; an EV coincidence alone never certifies an unmeasured proposal.
 
 use super::BlockSparseConfig;
 use super::block::{
     RowBlockCode, block_birth_evidence_margin, gram_schmidt_rows, relative_scalar_change,
-    route_and_code_all, stable_rank_symmetric,
+    StoredSpans, route_and_code_all, span_coordinates, stable_rank_symmetric, stored_spans,
 };
 use super::block_frame::{STORED_FRAME_RESOLUTION, ritz_tied_frame_step, stored_projector_distance};
 use super::residual_reservoir::{ResidualReservoir, residual_rounding_energy};
@@ -162,12 +163,14 @@ fn append_supports(supports: &mut Vec<u32>, codes: &[RowBlockCode], k: usize) {
 }
 
 /// The tied code of a row's retained support `prior` at `decoder` and `gamma`:
-/// each retained block's projections `w_g = U_g x`, in the retained slot order and
-/// padded to `k` slots. A retained block the row no longer projects onto takes a
-/// zero gate and is not admitted.
+/// each retained block's span coordinates `w_g = (U_gU_gᵀ)⁻¹U_g x`, in the retained
+/// slot order and padded to `k` slots, with gate `‖P_g x‖`. A retained block the row
+/// no longer projects onto takes a zero gate and is not admitted. `inverse_grams` is the
+/// `inverse_grams` of `stored_spans(decoder, b)`.
 fn kept_block_code(
     row: ArrayView1<'_, f32>,
     decoder: ArrayView2<'_, f32>,
+    inverse_grams: &[f64],
     gamma: f32,
     b: usize,
     k: usize,
@@ -178,17 +181,27 @@ fn kept_block_code(
     let mut gates = Vec::with_capacity(k);
     let mut codes = Vec::with_capacity(k * b);
     let mut projections = Vec::with_capacity(k * b);
+    let mut inner = vec![0.0f64; b];
+    let mut coordinates = vec![0.0f64; b];
     for &block in prior.iter().take_while(|&&block| block != NO_BLOCK) {
         let base = block as usize * b;
-        let mut energy = 0.0f64;
-        for axis in 0..b {
+        for (axis, value) in inner.iter_mut().enumerate() {
             let mut projection = 0.0f64;
-            for (value, direction) in row.iter().zip(decoder.row(base + axis).iter()) {
-                projection += *value as f64 * *direction as f64;
+            for (x, direction) in row.iter().zip(decoder.row(base + axis).iter()) {
+                projection += *x as f64 * *direction as f64;
             }
-            energy += projection * projection;
-            projections.push(projection);
-            codes.push((gamma64 * projection) as f32);
+            *value = projection;
+        }
+        span_coordinates(
+            &inverse_grams[base * b..(base + b) * b],
+            &inner,
+            &mut coordinates,
+        );
+        let mut energy = 0.0f64;
+        for (&product, &coordinate) in inner.iter().zip(&coordinates) {
+            energy += product * coordinate;
+            projections.push(coordinate);
+            codes.push((gamma64 * coordinate) as f32);
         }
         blocks.push(block);
         gates.push(energy.sqrt() as f32);
@@ -224,10 +237,12 @@ fn kept_block_code(
 /// so a row changes support only finitely often: #2283's rule for the atom lane.
 ///
 /// The third value is the routed loss minus the retained loss when the routed support
-/// admits different blocks and is declined, and `None` otherwise.
+/// admits different blocks and is declined, and `None` otherwise. `spans` is
+/// `stored_spans` of `decoder`.
 fn descend_block_support(
     row: ArrayView1<'_, f32>,
     decoder: ArrayView2<'_, f32>,
+    spans: &StoredSpans,
     gamma: f32,
     b: usize,
     k: usize,
@@ -238,7 +253,7 @@ fn descend_block_support(
     if prior.first().is_none_or(|&block| block == NO_BLOCK) {
         return (fresh, fresh_projection, None);
     }
-    let kept = kept_block_code(row, decoder, gamma, b, k, prior);
+    let kept = kept_block_code(row, decoder, &spans.inverse_grams, gamma, b, k, prior);
     let kept_projection = row_projection(row, decoder, &kept, b, gamma);
     if same_admitted_blocks(&fresh, &kept) {
         return (kept, kept_projection, None);
@@ -248,26 +263,45 @@ fn descend_block_support(
         .map(|&x| x as f64 * x as f64)
         .sum::<f64>()
         .sqrt();
-    // Each loss is `‖r‖²` of a residual whose entries round within the band
-    // `residual_rounding_energy` bounds (the reservoir's currency for the same
-    // residual), so the loss itself rounds within `2‖r‖·band + band²`.
-    let rounding = |projection: &RowProjection| {
-        let band_energy = residual_rounding_energy(
-            gam_linalg::roundoff::UNIT_ROUNDOFF,
-            3 * projection.live_terms + 2,
-            row_norm,
-            (gamma as f64).abs() * projection.projection_mass,
-        );
-        2.0 * projection.rss.sqrt() * band_energy.sqrt() + band_energy
+    // Each loss is `‖r‖²` of a residual that rounds within `residual_band` (the
+    // reservoir's currency for the same residual), so the loss itself rounds within
+    // `2‖r‖·band + band²`.
+    let rounding = |code: &RowBlockCode, projection: &RowProjection| {
+        let band = residual_band(row_norm, code, projection, spans, b, gamma);
+        2.0 * projection.rss.sqrt() * band + band * band
     };
-    if fresh_projection.rss + rounding(&fresh_projection)
-        < kept_projection.rss - rounding(&kept_projection)
+    if fresh_projection.rss + rounding(&fresh, &fresh_projection)
+        < kept_projection.rss - rounding(&kept, &kept_projection)
     {
         (fresh, fresh_projection, None)
     } else {
         let excess = fresh_projection.rss - kept_projection.rss;
         (kept, kept_projection, Some(excess))
     }
+}
+
+/// The Euclidean band within which a row's residual `x − γ Σ_g U_gᵀw_g`, coded as
+/// `code` and projected as `projection`, rounds: the residual's own formation from its
+/// coordinates (`residual_rounding_energy`), plus the rounding of the coordinates
+/// themselves, which each admitted block's conditioning amplifies
+/// (`StoredSpans::coordinate_rounding`). `spans` is `stored_spans` of the pass's decoder.
+fn residual_band(
+    row_norm: f64,
+    code: &RowBlockCode,
+    projection: &RowProjection,
+    spans: &StoredSpans,
+    b: usize,
+    gamma: f32,
+) -> f64 {
+    let scale = (gamma as f64).abs();
+    let formation = residual_rounding_energy(
+        gam_linalg::roundoff::UNIT_ROUNDOFF,
+        3 * projection.live_terms + 2,
+        row_norm,
+        scale * projection.projection_mass,
+    )
+    .sqrt();
+    formation + scale * spans.coordinate_rounding(code, b, projection.sum.len(), row_norm)
 }
 
 /// The routed supports one minibatch declined: rows whose routed support admits
@@ -286,6 +320,7 @@ struct DeclinedRoutes {
 fn descend_supports(
     rows: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
+    spans: &StoredSpans,
     gamma: f32,
     b: usize,
     k: usize,
@@ -302,7 +337,16 @@ fn descend_supports(
             } else {
                 &retained[(offset + row) * k..(offset + row + 1) * k]
             };
-            descend_block_support(rows.row(row), decoder, gamma, b, k, fresh, prior)
+            descend_block_support(
+                rows.row(row),
+                decoder,
+                spans,
+                gamma,
+                b,
+                k,
+                fresh,
+                prior,
+            )
         })
         .collect();
     let mut codes = Vec::with_capacity(arbitrated.len());
@@ -349,20 +393,38 @@ fn same_admitted_blocks(left: &RowBlockCode, right: &RowBlockCode) -> bool {
     admitted(left) == admitted(right)
 }
 
+/// Whether two codes admit the same blocks in the same slots. In a paired frame trial a
+/// row whose two codes agree slot for slot on blocks the proposal did not move is coded,
+/// decoded and priced by the same operations on the same bits in both passes.
+fn same_slot_support(left: &RowBlockCode, right: &RowBlockCode) -> bool {
+    let admitted = |code: &RowBlockCode| {
+        code.blocks
+            .iter()
+            .zip(&code.gates)
+            .filter(|(_, gate)| **gate != 0.0)
+            .map(|(block, _)| *block)
+            .collect::<Vec<u32>>()
+    };
+    admitted(left) == admitted(right)
+}
+
 /// One selected row's contribution to its block's tied projector moments over
 /// `W = [U, D]`: `coupling += v (Wᵀx)ᵀ + x (Wᵀv)ᵀ − m x (Wᵀx)ᵀ` and
 /// `data_cross += x (Wᵀx)ᵀ`, where `v = m P_g x − Σ_h P_h x` is formed from the
-/// row's code `w = Uᵀx`, its gamma-free reconstruction `sum`, and `m`, the number
-/// of blocks the row admits this pass (see `end_epoch`).
+/// row's span coordinates `w` (`P_g x = Uᵀw`), its gamma-free reconstruction `sum`,
+/// and `m`, the number of blocks the row admits this pass (see `end_epoch`).
+///
+/// The moments are `H` applied to the stored rows, so they take the inner products
+/// `Wᵀx` with those rows, summed here. The span coordinates equal `Ux` only for exactly
+/// orthonormal rows, which `f32` storage never holds (see
+/// `super::block::stored_span_inverse_gram`).
 ///
 /// `frame` holds the block's `b` directions and `directions` its `d` search rows,
 /// both f64 and row-major (`frame[axis * p + c]`); `d` may be zero. `coupling` and
 /// `data_cross` are the block's `P×n` moments, row-major (`[c * n + column]`) with
 /// `n ≥ b + d`, and only their first `b + d` columns are written. `v` (length `P`)
-/// and `coordinates` (length `b + 2d`) are caller-owned scratch. The frame columns
-/// receive the same floating-point operations in the same order as the
-/// per-element `[[c, axis]]` loop, extended by the weighted data term, so they are
-/// bit-identical to that loop (#2826).
+/// and `coordinates` (length `2(b + d)`) are caller-owned scratch. Every column
+/// receives the same floating-point operations in the same order (#2826).
 fn accumulate_tied_row_moments(
     frame: &[f64],
     directions: &[f64],
@@ -380,31 +442,37 @@ fn accumulate_tied_row_moments(
     let searched = directions.len() / p;
     let columns = coupling.len() / p;
     coordinates.fill(0.0);
-    // `v_coordinates` holds Wᵀv over all `b + d` columns; `x_coordinates` holds Dᵀx.
+    // `v_coordinates` holds Wᵀv and `x_coordinates` holds Wᵀx, over all `b + d` columns.
     let (v_coordinates, x_coordinates) = coordinates.split_at_mut(b + searched);
-    // Pass 1: v, then U v and the search projections, each summed in `c` order.
-    for (c, ((value, &x), &total)) in v.iter_mut().zip(xi.iter()).zip(sum).enumerate() {
-        let mut own = 0.0;
-        for (axis, &weight) in w.iter().enumerate() {
-            own += weight * frame[axis * p + c];
-        }
-        *value = majorizer_weight * own - total;
-        for (axis, coordinate) in v_coordinates[..b].iter_mut().enumerate() {
-            *coordinate += frame[axis * p + c] * *value;
-        }
-        let x = x as f64;
-        for (row, (v_coordinate, x_coordinate)) in v_coordinates[b..]
-            .iter_mut()
-            .zip(x_coordinates.iter_mut())
-            .enumerate()
-        {
-            let direction = directions[row * p + c];
-            *v_coordinate += direction * *value;
-            *x_coordinate += direction * x;
+    // Pass 1: v, then W v and W x, each summed in `c` order.
+    {
+        let (frame_v, search_v) = v_coordinates.split_at_mut(b);
+        let (frame_x, search_x) = x_coordinates.split_at_mut(b);
+        for (c, ((value, &x), &total)) in v.iter_mut().zip(xi.iter()).zip(sum).enumerate() {
+            let mut own = 0.0;
+            for (axis, &weight) in w.iter().enumerate() {
+                own += weight * frame[axis * p + c];
+            }
+            *value = majorizer_weight * own - total;
+            let x = x as f64;
+            for (axis, (v_coordinate, x_coordinate)) in
+                frame_v.iter_mut().zip(frame_x.iter_mut()).enumerate()
+            {
+                let direction = frame[axis * p + c];
+                *v_coordinate += direction * *value;
+                *x_coordinate += direction * x;
+            }
+            for (row, (v_coordinate, x_coordinate)) in
+                search_v.iter_mut().zip(search_x.iter_mut()).enumerate()
+            {
+                let direction = directions[row * p + c];
+                *v_coordinate += direction * *value;
+                *x_coordinate += direction * x;
+            }
         }
     }
-    // Pass 2: each frame coupling entry takes `v w` and then `x (U v)` as two
-    // separate additions, exactly as the two loops it replaced did.
+    // Pass 2: each coupling entry takes `v (Wᵀx)`, then `x (Wᵀv)`, then `−m x (Wᵀx)`,
+    // as separate additions.
     for (((coupling_row, data_row), &value), &x) in coupling
         .chunks_exact_mut(columns)
         .zip(data_cross.chunks_exact_mut(columns))
@@ -412,14 +480,7 @@ fn accumulate_tied_row_moments(
         .zip(xi.iter())
     {
         let x = x as f64;
-        for (axis, &weight) in w.iter().enumerate() {
-            coupling_row[axis] += value * weight;
-            data_row[axis] += x * weight;
-            coupling_row[axis] += x * v_coordinates[axis];
-            coupling_row[axis] -= majorizer_weight * x * weight;
-        }
-        for (row, &projection) in x_coordinates.iter().enumerate() {
-            let column = b + row;
+        for (column, &projection) in x_coordinates.iter().enumerate() {
             coupling_row[column] += value * projection;
             data_row[column] += x * projection;
             coupling_row[column] += x * v_coordinates[column];
@@ -443,14 +504,41 @@ fn profiled_scalar(old_gamma: f32, rss: f64, numerator: f64, denominator: f64) -
 /// Grassmann retraction halfway between a rejected proposal and its baseline.
 /// Repeated rejection therefore backtracks on the same proposed direction;
 /// there is no user-selected damping constant or search box.
-fn bisect_frame_trial(baseline: &Array2<f32>, proposal: &Array2<f32>, b: usize) -> Array2<f32> {
-    let mut midpoint = (baseline + proposal) * 0.5;
-    for mut block in midpoint.axis_chunks_iter_mut(Axis(0), b) {
-        let mut owned = block.to_owned();
+///
+/// Only the blocks the proposal moved are bisected, and a block keeps the baseline's
+/// bits when its midpoint lies within the storage resolution of the baseline, or when
+/// storage rounds the midpoint back to the proposal's own bits, so the move cannot be
+/// halved in the type the frames are stored in. Re-orthonormalising an unmoved block,
+/// or a midpoint the stored rows cannot tell from the baseline, rewrites the same
+/// span at `f32` rounding: on the Spark layer-18 fit
+/// every one of the 274 frame trials from epoch 2727 to 3000 was a rewrite of all
+/// 1024 blocks at projector displacement 6.19e-8, so backtracking never returned to
+/// the baseline and every residual stayed infinite (#2502, run 1165180). Here
+/// backtracking ends at the baseline itself.
+fn bisect_frame_trial(
+    baseline: &Array2<f32>,
+    proposal: &Array2<f32>,
+    b: usize,
+) -> Result<Array2<f32>, String> {
+    let mut midpoint = baseline.clone();
+    for (index, ((mut block, stored), proposed)) in midpoint
+        .axis_chunks_iter_mut(Axis(0), b)
+        .zip(baseline.axis_chunks_iter(Axis(0), b))
+        .zip(proposal.axis_chunks_iter(Axis(0), b))
+        .enumerate()
+    {
+        if stored == proposed {
+            continue;
+        }
+        let mut owned = (&stored + &proposed) * 0.5;
         gram_schmidt_rows(&mut owned);
-        block.assign(&owned);
+        let distance = stored_projector_distance(stored, owned.view())
+            .map_err(|error| format!("frame trial bisection block {index}: {error}"))?;
+        if distance > STORED_FRAME_RESOLUTION && owned != proposed {
+            block.assign(&owned);
+        }
     }
-    midpoint
+    Ok(midpoint)
 }
 
 /// Per-shard summary returned by [`BlockSparseStreamState::partial_fit`].
@@ -473,11 +561,11 @@ pub struct BlockShardStats {
 /// at the shared pass γ, so the passes' difference at that γ lives in the moved rows.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameTrialMeasurement {
-    /// Whether the proposal committed.
+    /// Whether the proposal committed: `moved_decrease` exceeded `moved_resolution`.
     pub committed: bool,
-    /// Baseline RSS minus proposal RSS, each at its own profiled γ.
+    /// Baseline RSS minus proposal RSS over the whole corpus, each at its own profiled γ.
     pub decrease: f64,
-    /// The bar `decrease` had to exceed: `√(rows·p)·ε` times the baseline RSS.
+    /// `√(rows·p)·ε` times the baseline RSS: the corpus-wide rounding band of `decrease`.
     pub resolution: f64,
     /// The baseline's profiled γ.
     pub baseline_gamma: f32,
@@ -487,11 +575,14 @@ pub struct FrameTrialMeasurement {
     pub moved_blocks: usize,
     /// The largest relative projector distance among the moved blocks.
     pub moved_displacement: f64,
-    /// Rows whose admitted blocks, in either pass, include a moved block.
+    /// Rows whose codes can differ between the passes: their admitted blocks, in either pass,
+    /// include a moved block, or the two passes admit different blocks or slots. Every other
+    /// row is priced to the same bits in both passes.
     pub moved_rows: usize,
     /// Baseline RSS minus proposal RSS over the moved rows, at the pass γ.
     pub moved_decrease: f64,
-    /// `√(moved_rows·p)·ε` times the baseline RSS over the moved rows.
+    /// `√(moved_rows·p)·ε` times the baseline RSS over the moved rows: the bar
+    /// `moved_decrease` had to exceed to commit.
     pub moved_resolution: f64,
 }
 
@@ -953,7 +1044,7 @@ impl BlockSparseStreamState {
             }
             // Route, then let each row keep its committed support unless the routed
             // one lowers its loss beyond rounding (`descend_block_support`).
-            let route_descending = |decoder: ArrayView2<'_, f32>, scale: f32| {
+            let route_descending = |decoder: ArrayView2<'_, f32>, scale: f32, spans: &StoredSpans| {
                 route_and_code_all(
                     rows,
                     decoder,
@@ -968,6 +1059,7 @@ impl BlockSparseStreamState {
                     descend_supports(
                         rows,
                         decoder,
+                        spans,
                         scale,
                         b,
                         k,
@@ -977,14 +1069,22 @@ impl BlockSparseStreamState {
                     )
                 })
             };
-            let (codes, projected, declined) = route_descending(self.decoder.view(), gamma)?;
+            let spans = stored_spans(self.decoder.view(), b)?;
+            let (codes, projected, declined) = route_descending(self.decoder.view(), gamma, &spans)?;
             // Route the complete pre-birth model on these same rows before
             // mutating moments. Birth evidence uses a true paired full pass.
             let baseline_codes = self
                 .pending_birth
                 .as_ref()
                 .map(|pending| {
-                    route_descending(pending.baseline_decoder.view(), pending.baseline_gamma)
+                    stored_spans(pending.baseline_decoder.view(), b)
+                        .and_then(|spans| {
+                            route_descending(
+                                pending.baseline_decoder.view(),
+                                pending.baseline_gamma,
+                                &spans,
+                            )
+                        })
                         .map(|arbitrated| (arbitrated.0, arbitrated.1))
                 })
                 .transpose()?;
@@ -992,7 +1092,14 @@ impl BlockSparseStreamState {
                 .pending_frame
                 .as_ref()
                 .map(|pending| {
-                    route_descending(pending.baseline_decoder.view(), pending.baseline_gamma)
+                    stored_spans(pending.baseline_decoder.view(), b)
+                        .and_then(|spans| {
+                            route_descending(
+                                pending.baseline_decoder.view(),
+                                pending.baseline_gamma,
+                                &spans,
+                            )
+                        })
                         .map(|arbitrated| (arbitrated.0, arbitrated.1))
                 })
                 .transpose()?;
@@ -1035,22 +1142,18 @@ impl BlockSparseStreamState {
                         .zip(&projection.sum)
                         .map(|(&x, &sum)| (x as f64 - gamma as f64 * sum) as f32)
                         .collect();
-                    // Frame rows are orthonormal, so `|γ|·Σ_t |w_t|` is the
-                    // reconstruction mass. An entry costs a product and an addition per
-                    // term, an addition per block, and the scaling and subtraction: at
-                    // most `3t + 2` f64 operations.
+                    // Each entry costs a product and an addition per term, an addition
+                    // per block, and the scaling and subtraction: at most `3t + 2` f64
+                    // operations over the `|γ|·Σ_t |w_t|` reconstruction mass; the
+                    // coordinates carry their own rounding too (`residual_band`).
                     let row_norm = rows
                         .row(row)
                         .iter()
                         .map(|&x| x as f64 * x as f64)
                         .sum::<f64>()
                         .sqrt();
-                    let rounding_energy = residual_rounding_energy(
-                        gam_linalg::roundoff::UNIT_ROUNDOFF,
-                        3 * projection.live_terms + 2,
-                        row_norm,
-                        (gamma as f64).abs() * projection.projection_mass,
-                    );
+                    let band = residual_band(row_norm, &codes[row], projection, &spans, b, gamma);
+                    let rounding_energy = band * band;
                     self.reservoir.offer(
                         projection.rss,
                         rounding_energy,
@@ -1102,7 +1205,7 @@ impl BlockSparseStreamState {
                             .as_slice_mut()
                             .expect("block data moments are standard layout");
                         let mut v = vec![0.0; p];
-                        let mut coordinates = vec![0.0; b + 2 * (directions.len() / p)];
+                        let mut coordinates = vec![0.0; 2 * (b + directions.len() / p)];
                         for &(row, slot) in entries {
                             let w = &codes[row].projections[slot * b..(slot + 1) * b];
                             let majorizer_weight = admitted_counts[row] as f64;
@@ -1225,7 +1328,10 @@ impl BlockSparseStreamState {
                             .zip(baseline_codes)
                             .zip(projected.iter().zip(baseline))
                     {
-                        if reaches_moved_block(candidate) || reaches_moved_block(baseline_code) {
+                        if reaches_moved_block(candidate)
+                            || reaches_moved_block(baseline_code)
+                            || !same_slot_support(candidate, baseline_code)
+                        {
                             moved_rows += 1;
                             moved_baseline_rss += baseline_projection.rss;
                             moved_proposal_rss += proposal_projection.rss;
@@ -1250,7 +1356,7 @@ impl BlockSparseStreamState {
         // stalled shard stops advancing this line; under `RUST_LOG=info` a route
         // that never returns is diagnosable immediately rather than after a whole
         // silent epoch.
-        log::info!(
+        log::debug!(
             "[SAE block shard] rows={} total_rows={} rss={:.6e} alive_blocks={}/{} \
              shard_s={:.2}",
             shard.nrows(),
@@ -1328,17 +1434,28 @@ impl BlockSparseStreamState {
                 trial.baseline_gamma_num,
                 trial.baseline_gamma_den,
             );
-            // The two objectives were accumulated on identical rows. Only a
-            // measured decrease may commit a rerouted proposal (#2634): each RSS
-            // sums `rows · p` cells, so two sums closer than `√cells · ε · RSS` are
-            // two roundings of one number, not a direction. A tie inside that band
-            // carries no directional information and is handled by backtracking.
+            // The two passes route and code identical rows at the pass γ they share. A row
+            // whose two committed codes admit the same blocks in the same slots, none of them
+            // moved, is priced to the same bits in both, so the objectives can differ only over
+            // the other rows, which the paired pass sums on their own (`TrialMoves`). Only a
+            // measured decrease may commit a rerouted proposal (#2634): each of those sums
+            // covers `rows · p` cells, so two sums closer than `√cells · ε · RSS` are two
+            // roundings of one number, not a direction. A tie inside that band carries no
+            // directional information and is handled by backtracking. Over the whole corpus
+            // the same band also counts the rounding of every row the passes share. On the
+            // Spark layer-18 fit that bar (2.462e-6) refused, from epoch 3792 on, a step whose
+            // paired decrease of 2.461e-6 cleared its own bar (7.7e-7) three times over, and
+            // the fit cycled at a frame residual of 1.163e-4 against 1e-4 (#2502, lane job
+            // 1248199). The profiled corpus decrease and its bar are still reported.
             let cells = (self.row_count * p).max(1) as f64;
             let resolution = cells.sqrt() * f64::EPSILON * baseline_rss.abs();
             let moves = &trial.moves;
             let moved_cells = (moves.rows * p) as f64;
+            let moved_decrease = moves.baseline_rss - moves.proposal_rss;
+            let moved_resolution = moved_cells.sqrt() * f64::EPSILON * moves.baseline_rss.abs();
+            let committed = moved_decrease > moved_resolution;
             frame_trial = Some(FrameTrialMeasurement {
-                committed: baseline_rss - candidate_rss > resolution,
+                committed,
                 decrease: baseline_rss - candidate_rss,
                 resolution,
                 baseline_gamma,
@@ -1349,12 +1466,12 @@ impl BlockSparseStreamState {
                     .map_or(0, |moved| moved.iter().filter(|&&flag| flag).count()),
                 moved_displacement: moves.displacement,
                 moved_rows: moves.rows,
-                moved_decrease: moves.baseline_rss - moves.proposal_rss,
-                moved_resolution: moved_cells.sqrt() * f64::EPSILON * moves.baseline_rss.abs(),
+                moved_decrease,
+                moved_resolution,
             });
-            if !(baseline_rss - candidate_rss > resolution) {
+            if !committed {
                 let midpoint =
-                    bisect_frame_trial(&trial.baseline_decoder, &trial.proposed_decoder, b);
+                    bisect_frame_trial(&trial.baseline_decoder, &trial.proposed_decoder, b)?;
                 self.decoder = trial.baseline_decoder.clone();
                 self.gamma = baseline_gamma;
                 self.rss = baseline_rss;
@@ -1523,6 +1640,7 @@ impl BlockSparseStreamState {
                             moment.view(),
                             normal.view(),
                             1.0,
+                            frame_bar,
                             proposal.view_mut(),
                             directions.view_mut(),
                         )
@@ -1998,6 +2116,335 @@ fn validate_config(config: &BlockSparseConfig) -> Result<(), String> {
         return Err("BlockSparseStream tolerance must be finite".to_string());
     }
     Ok(())
+}
+
+/// Schema tag of a stream checkpoint's fixed little-endian layout. Bump on any layout change,
+/// so a checkpoint written by another layout is refused rather than mis-decoded.
+const CHECKPOINT_SCHEMA: &[u8; 8] = b"GAMBSS01";
+
+/// A little-endian writer for [`BlockSparseStreamState::checkpoint`].
+#[derive(Default)]
+struct CheckpointWriter {
+    bytes: Vec<u8>,
+}
+
+impl CheckpointWriter {
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+    fn usize(&mut self, value: usize) {
+        self.bytes.extend_from_slice(&(value as u64).to_le_bytes());
+    }
+    fn f32(&mut self, value: f32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fn f64(&mut self, value: f64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fn f32s<'a>(&mut self, values: impl IntoIterator<Item = &'a f32>) {
+        for &value in values {
+            self.f32(value);
+        }
+    }
+    fn f64s<'a>(&mut self, values: impl IntoIterator<Item = &'a f64>) {
+        for &value in values {
+            self.f64(value);
+        }
+    }
+    fn u32s(&mut self, values: &[u32]) {
+        self.usize(values.len());
+        for &value in values {
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    fn u64s(&mut self, values: &[u64]) {
+        self.usize(values.len());
+        for &value in values {
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
+/// The reader matching [`CheckpointWriter`]; every read names the checkpoint when it runs out.
+struct CheckpointReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> CheckpointReader<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8], String> {
+        let end = self
+            .at
+            .checked_add(count)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| format!("checkpoint is truncated at byte {}", self.at))?;
+        let chunk = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(chunk)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn usize(&mut self) -> Result<usize, String> {
+        let value = u64::from_le_bytes(self.take(8)?.try_into().map_err(|_| "u64 width")?);
+        usize::try_from(value).map_err(|_| format!("checkpoint count {value} overflows usize"))
+    }
+    fn f32(&mut self) -> Result<f32, String> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into().map_err(|_| "f32 width")?))
+    }
+    fn f64(&mut self) -> Result<f64, String> {
+        Ok(f64::from_le_bytes(self.take(8)?.try_into().map_err(|_| "f64 width")?))
+    }
+    fn f32s(&mut self, count: usize) -> Result<Vec<f32>, String> {
+        (0..count).map(|_| self.f32()).collect()
+    }
+    fn f64s(&mut self, count: usize) -> Result<Vec<f64>, String> {
+        (0..count).map(|_| self.f64()).collect()
+    }
+    fn u32s(&mut self) -> Result<Vec<u32>, String> {
+        let count = self.usize()?;
+        (0..count)
+            .map(|_| Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(|_| "u32 width")?)))
+            .collect()
+    }
+    fn u64s(&mut self) -> Result<Vec<u64>, String> {
+        let count = self.usize()?;
+        (0..count)
+            .map(|_| Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(|_| "u64 width")?)))
+            .collect()
+    }
+    fn matrix_f32(&mut self, rows: usize, columns: usize) -> Result<Array2<f32>, String> {
+        Array2::from_shape_vec((rows, columns), self.f32s(rows * columns)?)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl BlockSparseStreamState {
+    /// Write the stream's complete cross-epoch state to `path`, so [`Self::resume`] continues
+    /// the fit where it stands: every later epoch of the resumed stream is bit-identical to
+    /// the same epoch of this one. A long fit then runs as a chain of bounded jobs (#2502).
+    ///
+    /// A checkpoint is taken between epochs, after `end_epoch` and before the next
+    /// `partial_fit`. Every per-pass accumulator is zero there, and a staged birth or frame
+    /// trial holds only its baseline and proposal, so those are all it records; a state with
+    /// rows of an unfinished pass streamed is refused. The layout is fixed little-endian under
+    /// [`CHECKPOINT_SCHEMA`]. The file is written to a sibling and renamed into place, so an
+    /// interrupted write never leaves a truncated checkpoint at `path`.
+    pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.row_count != 0 {
+            return Err(format!(
+                "BlockSparseStream.checkpoint: {} rows of an unfinished pass are streamed; a \
+                 checkpoint is taken between epochs, after end_epoch",
+                self.row_count
+            ));
+        }
+        let mut out = CheckpointWriter::default();
+        out.bytes.extend_from_slice(CHECKPOINT_SCHEMA);
+        let config = &self.config;
+        for value in [
+            config.n_blocks,
+            config.block_size,
+            config.block_topk,
+            config.max_epochs,
+            config.minibatch,
+            config.block_tile,
+            config.aux_k,
+        ] {
+            out.usize(value);
+        }
+        out.f64(config.frame_ridge);
+        out.f64(config.tolerance);
+        out.u8(u8::from(config.matryoshka_prefix));
+        out.usize(self.p);
+        out.f32s(self.decoder.iter());
+        out.f32(self.gamma);
+        out.f32s(self.search_directions.iter());
+        out.f64s(
+            [
+                self.prev_ev,
+                self.last_ev,
+                self.last_ev_residual,
+                self.last_gamma_residual,
+                self.last_frame_residual,
+                self.last_rss,
+            ]
+            .iter(),
+        );
+        out.usize(self.epochs_run);
+        out.usize(self.last_accepted_births);
+        out.usize(self.last_rows);
+        out.u8(u8::from(self.converged));
+        out.f32s(self.last_util.iter());
+        out.f32s(self.last_stable.iter());
+        for second in &self.last_second {
+            out.f64s(second.iter());
+        }
+        for &usage in &self.last_usage {
+            out.usize(usage);
+        }
+        out.u32s(&self.retained_supports);
+        out.u64s(&self.retained_fingerprints);
+        match &self.pending_birth {
+            None => out.u8(0),
+            Some(birth) => {
+                out.u8(1);
+                out.usize(birth.block);
+                out.f32(birth.baseline_gamma);
+                out.f32s(birth.baseline_decoder.iter());
+            }
+        }
+        match &self.pending_frame {
+            None => out.u8(0),
+            Some(trial) => {
+                out.u8(1);
+                out.f32(trial.baseline_gamma);
+                out.f32s(trial.baseline_decoder.iter());
+                out.f32s(trial.proposed_decoder.iter());
+            }
+        }
+        let staged = path.with_extension("staged");
+        std::fs::write(&staged, &out.bytes)
+            .map_err(|error| format!("BlockSparseStream.checkpoint {}: {error}", staged.display()))?;
+        std::fs::rename(&staged, path)
+            .map_err(|error| format!("BlockSparseStream.checkpoint {}: {error}", path.display()))
+    }
+
+    /// Continue a stream from a [`Self::checkpoint`] written with the same `config`. A
+    /// checkpoint of another layout, another configuration or a truncated file is refused
+    /// by name.
+    pub fn resume(path: &std::path::Path, config: &BlockSparseConfig) -> Result<Self, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("BlockSparseStream.resume {}: {error}", path.display()))?;
+        let mut input = CheckpointReader {
+            bytes: &bytes,
+            at: 0,
+        };
+        if input.take(CHECKPOINT_SCHEMA.len())? != CHECKPOINT_SCHEMA {
+            return Err(format!(
+                "BlockSparseStream.resume {}: not a {} checkpoint",
+                path.display(),
+                String::from_utf8_lossy(CHECKPOINT_SCHEMA)
+            ));
+        }
+        // `max_epochs` bounds the one-shot fit's loop. A stream's epochs are its driver's,
+        // so a resumed stream may be driven to another cap and the saved value is skipped.
+        for (name, expected) in [
+            ("n_blocks", Some(config.n_blocks)),
+            ("block_size", Some(config.block_size)),
+            ("block_topk", Some(config.block_topk)),
+            ("max_epochs", None),
+            ("minibatch", Some(config.minibatch)),
+            ("block_tile", Some(config.block_tile)),
+            ("aux_k", Some(config.aux_k)),
+        ] {
+            let saved = input.usize()?;
+            if let Some(expected) = expected
+                && saved != expected
+            {
+                return Err(format!(
+                    "BlockSparseStream.resume: the checkpoint was written with {name}={saved}, \
+                     not {expected}"
+                ));
+            }
+        }
+        for (name, expected) in [
+            ("frame_ridge", config.frame_ridge),
+            ("tolerance", config.tolerance),
+        ] {
+            let saved = input.f64()?;
+            if saved.to_bits() != expected.to_bits() {
+                return Err(format!(
+                    "BlockSparseStream.resume: the checkpoint was written with {name}={saved:e}, \
+                     not {expected:e}"
+                ));
+            }
+        }
+        let saved_matryoshka = input.u8()? != 0;
+        if saved_matryoshka != config.matryoshka_prefix {
+            return Err(format!(
+                "BlockSparseStream.resume: the checkpoint was written with \
+                 matryoshka_prefix={saved_matryoshka}, not {}",
+                config.matryoshka_prefix
+            ));
+        }
+        let p = input.usize()?;
+        let (g, b) = (config.n_blocks, config.block_size);
+        let decoder = input.matrix_f32(g * b, p)?;
+        let mut state = Self::new_with_decoder(decoder, config)?;
+        state.gamma = input.f32()?;
+        state.search_directions = input.matrix_f32(g * 2 * b, p)?;
+        let scalars = input.f64s(6)?;
+        state.prev_ev = scalars[0];
+        state.last_ev = scalars[1];
+        state.last_ev_residual = scalars[2];
+        state.last_gamma_residual = scalars[3];
+        state.last_frame_residual = scalars[4];
+        state.last_rss = scalars[5];
+        state.epochs_run = input.usize()?;
+        state.last_accepted_births = input.usize()?;
+        state.last_rows = input.usize()?;
+        state.converged = input.u8()? != 0;
+        state.last_util = input.f32s(g)?;
+        state.last_stable = input.f32s(g)?;
+        state.last_second = (0..g)
+            .map(|_| {
+                Array2::from_shape_vec((b, b), input.f64s(b * b)?).map_err(|error| error.to_string())
+            })
+            .collect::<Result<_, String>>()?;
+        state.last_usage = (0..g).map(|_| input.usize()).collect::<Result<_, String>>()?;
+        state.retained_supports = input.u32s()?;
+        state.retained_fingerprints = input.u64s()?;
+        if state.retained_supports.len() != state.retained_fingerprints.len() * state.k {
+            return Err(format!(
+                "BlockSparseStream.resume: {} retained support slots for {} rows at k={}",
+                state.retained_supports.len(),
+                state.retained_fingerprints.len(),
+                state.k
+            ));
+        }
+        if input.u8()? == 1 {
+            let block = input.usize()?;
+            let baseline_gamma = input.f32()?;
+            let baseline_decoder = input.matrix_f32(g * b, p)?;
+            state.pending_birth = Some(PendingBlockBirth {
+                block,
+                baseline_decoder,
+                baseline_gamma,
+                baseline_rss: 0.0,
+                baseline_rows: 0,
+                baseline_usage: vec![0; g],
+                baseline_second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
+                baseline_supports: Vec::new(),
+            });
+        }
+        if input.u8()? == 1 {
+            let baseline_gamma = input.f32()?;
+            let baseline_decoder = input.matrix_f32(g * b, p)?;
+            let proposed_decoder = input.matrix_f32(g * b, p)?;
+            state.pending_frame = Some(PendingFrameTrial {
+                baseline_decoder,
+                baseline_gamma,
+                proposed_decoder,
+                baseline_rss: 0.0,
+                baseline_gamma_num: 0.0,
+                baseline_gamma_den: 0.0,
+                baseline_rows: 0,
+                baseline_usage: vec![0; g],
+                baseline_second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
+                baseline_supports: Vec::new(),
+                rerouted_rows: 0,
+                moves: TrialMoves::default(),
+            });
+        }
+        if input.at != bytes.len() {
+            return Err(format!(
+                "BlockSparseStream.resume {}: {} trailing bytes after the state",
+                path.display(),
+                bytes.len() - input.at
+            ));
+        }
+        Ok(state)
+    }
 }
 
 #[cfg(test)]

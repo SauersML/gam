@@ -154,31 +154,12 @@ impl SaeSupportSmoothingLayout {
     }
 }
 
-/// Inner fixed-point iteration budget for the support-sparse engine.
-///
-/// This is a different quantity from the outer budget and must not be derived
-/// from it. `max_outer_iter` counts quasi-Newton steps of the grouped-LAML
-/// search over log-smoothing; `max_inner_iter` counts alternating
-/// decoder/coordinate cycles spent reaching a stationary point *within a single*
-/// outer evaluation. One outer step consumes a whole inner solve, so tying the
-/// two together silently caps the inner solve at the length of the outer search
-/// — and since [`SaeSupportSparseTerm::solve_fixed_point`] requires two
-/// consecutive candidate cycles before it may report success, a small outer
-/// budget then makes convergence unreachable rather than merely slow.
-///
-/// Both drivers of this engine read this one declaration: the tiered driver
-/// through `Tier2SupportConfig`, and the public support-sparse fit entry through
-/// its FFI request. They previously carried independent values, which is how they
-/// came to disagree 4:1.
-pub const SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER: usize = 256;
-
 pub struct SaeSupportOuterRequest {
     pub term: SaeSupportSparseTerm,
     pub target: Array2<f64>,
     pub initial_smoothness: f64,
     pub ard_precisions: Vec<Vec<f64>>,
     pub max_outer_iter: usize,
-    pub max_inner_iter: usize,
     pub trust_radius: f64,
     pub random_state: u64,
 }
@@ -326,7 +307,6 @@ struct SaeSupportOuterObjective {
     layout: SaeSupportSmoothingLayout,
     spectrum: PenaltySpectrum,
     ard_precisions: Vec<Vec<f64>>,
-    max_inner_iter: usize,
     inner_tolerance: f64,
     trust_radius: f64,
     random_state: u64,
@@ -608,10 +588,33 @@ impl SaeSupportOuterObjective {
         // eigendecomposition and its derivative bundle is the exact `tr(S⁻¹·D)`;
         // otherwise it walks the frozen rational surrogate. The route prices its own peak
         // with `dense_lane_reduced_schur_peak_bytes`, the one admission rule the criterion
-        // lane uses as well.
+        // lane uses as well, and takes the dense route only where it costs no more products
+        // than the surrogate would spend (#2900 row 6.16). One reduced-Schur product pushes
+        // every row through its cross block and back: `p·(support + q)` flops each way on the
+        // support rows' gather and local Jacobian, or `q·k` each way on a dense row slab.
+        let reduced_schur_apply_flops: u64 = match system.device_sae_pcg.as_deref() {
+            Some(data) => data
+                .a_phi
+                .iter()
+                .zip(data.local_jac.iter())
+                .map(|(support, jacobian)| {
+                    2 * (data.p as u64 * support.len() as u64 + jacobian.len() as u64)
+                })
+                .sum(),
+            None => system
+                .rows
+                .iter()
+                .map(|row| 2 * row.htt.nrows() as u64 * system.k as u64)
+                .sum(),
+        };
         let dense_reduced_schur_admitted =
             gam_solve::arrow_schur::dense_lane_reduced_schur_peak_bytes(system.k)
-                .is_some_and(|bytes| bytes <= self.in_core_budget_bytes);
+                .is_some_and(|bytes| bytes <= self.in_core_budget_bytes)
+                && gam_solve::arrow_schur::surrogate_lane_prices_dense_reduced_schur(
+                    lane,
+                    system.k,
+                    reduced_schur_apply_flops,
+                );
         let evaluated = gam_solve::arrow_schur::matrix_free_arrow_evidence_evaluation(
             system,
             0.0,
@@ -650,7 +653,7 @@ impl SaeSupportOuterObjective {
         // before #2576 it emitted nothing at all — six minutes of fourteen busy
         // cores between two log lines is what kept the cost invisible.
         if dense_reduced_schur_admitted {
-            log::info!(
+            log::debug!(
                 "support LAML evidence: border {}, row log|H_tt| = {:.6e}, dense exact log|S| = \
                  {:.6e} from one eigendecomposition, {:.1}s",
                 system.k,
@@ -660,7 +663,7 @@ impl SaeSupportOuterObjective {
             );
         } else {
             let metrics = bundle.evaluation_metrics();
-            log::info!(
+            log::debug!(
                 "support LAML evidence: border {}, row log|H_tt| = {:.6e}, surrogate log|S| = \
                  {:.6e}; {} total shifted-CG iterations, {} rational nodes, deflation rank {}, \
                  {:.1}s",
@@ -766,7 +769,6 @@ impl SaeSupportOuterObjective {
                 self.target.view(),
                 &lambda_smooth,
                 &self.ard_precisions,
-                self.max_inner_iter,
                 self.inner_tolerance,
                 self.trust_radius,
             )
@@ -1140,7 +1142,6 @@ pub fn run_sae_support_outer(
         layout: layout.clone(),
         spectrum,
         ard_precisions: request.ard_precisions.clone(),
-        max_inner_iter: request.max_inner_iter,
         inner_tolerance,
         trust_radius: request.trust_radius,
         random_state: request.random_state,
@@ -1317,7 +1318,7 @@ fn run_support_outer_search(
         let std_err_norm = unseen_std_err.dot(&unseen_std_err).sqrt();
         let seen_std_err_norm = seen_std_err.dot(&seen_std_err).sqrt();
         let band = certificate.stationarity.bound();
-        log::info!(
+        log::debug!(
             "support LAML certified point re-scored on {seen} unseen probes: |Pg| = \
              {gradient_norm:.6e}, standard error {std_err_norm:.6e}; certificate band \
              {band:.6e}, search-probe resolution {seen_std_err_norm:.6e} (plan {plans})"
@@ -1448,8 +1449,6 @@ pub struct SaeSupportSparseFitRequest<'a> {
     pub initial_smoothness: f64,
     /// Outer (smoothing-selection) iteration budget.
     pub max_outer_iter: usize,
-    /// Inner fixed-point iteration budget.
-    pub max_inner_iter: usize,
     /// Inner coordinate trust radius.
     pub trust_radius: f64,
     /// Deterministic seed for the support routing and the evidence probes.
@@ -1555,7 +1554,6 @@ pub fn fit_sae_support_sparse(
         initial_smoothness: request.initial_smoothness,
         ard_precisions,
         max_outer_iter: request.max_outer_iter,
-        max_inner_iter: request.max_inner_iter,
         trust_radius: request.trust_radius,
         random_state: request.random_state,
     })
@@ -1615,7 +1613,7 @@ pub fn fit_sae_support_sparse(
             outer.criterion.value(),
         );
     }
-    log::info!(
+    log::debug!(
         "support-sparse migration ledger: {} births, {} deaths, {} refusals, {} \
          principal-component reseeds",
         migration.n_births,
@@ -1673,7 +1671,7 @@ pub fn fit_sae_support_sparse_with_census(
         .unwrap_or(1);
     let linear_bulk_census = crate::tiered::linear_bulk_census(target, d_max, support_k);
     match &linear_bulk_census {
-        Ok(report) => log::info!(
+        Ok(report) => log::debug!(
             "support-sparse linear-bulk census: {} blocks of size {}, EV {:.6}, {} of {} \
              communities curve ({:.1} bits saved)",
             report.tier1.block_utilization.len(),
@@ -1683,7 +1681,7 @@ pub fn fit_sae_support_sparse_with_census(
             report.code_space.n_communities,
             report.code_space.dl_saved_bits,
         ),
-        Err(reason) => log::warn!("support-sparse linear-bulk census refused: {reason}"),
+        Err(reason) => log::debug!("support-sparse linear-bulk census refused: {reason}"),
     }
     Ok(SaeSupportSparseCensusedFit {
         fit,
@@ -1793,7 +1791,6 @@ mod tests {
             layout,
             spectrum,
             ard_precisions: vec![vec![1.0], vec![1.0, 1.0]],
-            max_inner_iter: 5000,
             inner_tolerance: 1.0e-9,
             trust_radius: 1.0,
             random_state: 0xC0FF_EE00_D15E_A5E5,
@@ -1909,7 +1906,6 @@ mod tests {
                 objective.target.view(),
                 &lambda,
                 &objective.ard_precisions,
-                objective.max_inner_iter,
                 objective.inner_tolerance,
                 objective.trust_radius,
             )
@@ -1955,7 +1951,6 @@ mod tests {
                 objective.target.view(),
                 &lambda_base,
                 &objective.ard_precisions,
-                objective.max_inner_iter,
                 objective.inner_tolerance,
                 objective.trust_radius,
             )
@@ -2128,7 +2123,6 @@ mod tests {
                 objective.target.view(),
                 &lambda_base,
                 &objective.ard_precisions,
-                objective.max_inner_iter,
                 objective.inner_tolerance,
                 objective.trust_radius,
             )
@@ -2588,7 +2582,6 @@ mod tests {
             layout,
             spectrum,
             ard_precisions: vec![vec![1.0], vec![1.0, 1.0]],
-            max_inner_iter: 5000,
             inner_tolerance: 1.0e-9,
             trust_radius: 1.0,
             random_state: 0xC0FF_EE00_D15E_A5E5,

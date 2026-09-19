@@ -50,6 +50,9 @@ pub(super) struct PsiAxisSpec {
 pub(super) struct BlockSlices {
     pub(super) marginal: std::ops::Range<usize>,
     pub(super) slope: std::ops::Range<usize>,
+    /// The residual repair block (gam#2924), immediately after the slope
+    /// surface; mutually exclusive with the flex ranges below.
+    pub(super) residual: Option<std::ops::Range<usize>>,
     pub(super) h: Option<std::ops::Range<usize>>,
     pub(super) w: Option<std::ops::Range<usize>>,
     pub(super) total: usize,
@@ -61,6 +64,11 @@ pub(super) fn block_slices(family: &BernoulliMarginalSlopeFamily) -> BlockSlices
     cursor = marginal.end;
     let slope = cursor..cursor + family.slope_design.ncols();
     cursor = slope.end;
+    let residual = family.residual.as_ref().map(|runtime| {
+        let range = cursor..cursor + runtime.width();
+        cursor = range.end;
+        range
+    });
     let h = family.score_warp.as_ref().map(|runtime| {
         let range = cursor..cursor + runtime.basis_dim();
         cursor = range.end;
@@ -74,6 +82,7 @@ pub(super) fn block_slices(family: &BernoulliMarginalSlopeFamily) -> BlockSlices
     BlockSlices {
         marginal,
         slope,
+        residual,
         h,
         w,
         total: cursor,

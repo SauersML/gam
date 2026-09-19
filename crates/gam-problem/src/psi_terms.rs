@@ -202,6 +202,54 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
         Err(format!("exact third information derivatives are unavailable for psi pair ({psi_i}, {psi_j})"))
     }
+    /// The ψ axes on which [`Self::contracted_trace_hessian_psi`] and its directional and pair
+    /// forms serve a one-pass contraction (gam#2930); empty where the workspace has no such pass.
+    fn contracted_trace_hessian_psi_axes(&self) -> Result<Vec<usize>, String> {
+        Ok(Vec::new())
+    }
+    /// {⟨W, D_psi D_beta_a D_beta_b H⟩} for every coefficient axis pair, under this workspace's row
+    /// measure: the explicit ψ derivative of the contracted trace Hessian, which the ψ drift of a
+    /// priced Jeffreys completion reads (gam#2930). Served on the axes
+    /// [`Self::contracted_trace_hessian_psi_axes`] names.
+    fn contracted_trace_hessian_psi(
+        &self,
+        psi_index: usize,
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Err(format!(
+            "a one-pass contracted trace Hessian derivative is unavailable for psi axis {psi_index} with a {:?} weight",
+            weight.dim()
+        ))
+    }
+    /// {⟨W, D_psi D_beta_v D_beta_a D_beta_b H⟩} for every coefficient axis pair along coefficient
+    /// direction `v`, under this workspace's row measure (gam#2930). Served on the axes
+    /// [`Self::contracted_trace_hessian_psi_axes`] names.
+    fn contracted_trace_hessian_psi_directional(
+        &self,
+        psi_index: usize,
+        weight: &Array2<f64>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Err(format!(
+            "a one-pass directional contracted trace Hessian derivative is unavailable for psi axis {psi_index} with a {:?} weight and a direction of length {}",
+            weight.dim(),
+            d_beta_flat.len()
+        ))
+    }
+    /// {⟨W, D_psi_i D_psi_j D_beta_a D_beta_b H⟩} for every coefficient axis pair, under this
+    /// workspace's row measure (gam#2930). Served where both axes are among
+    /// [`Self::contracted_trace_hessian_psi_axes`].
+    fn contracted_trace_hessian_psi_pair(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Err(format!(
+            "a one-pass contracted trace Hessian pair derivative is unavailable for psi pair ({psi_i}, {psi_j}) with a {:?} weight",
+            weight.dim()
+        ))
+    }
 }
 
 /// Assemble the coefficient-axis tensor from exact directional derivatives.

@@ -22,6 +22,60 @@ pub struct SmoothTermSummary {
     /// user's requested `(degree, num_internal_knots)`. `None` means no
     /// shrink occurred (or the term is not a B-spline 1D smooth).
     pub basis_note: Option<String>,
+    /// #2901: the label a term's `edf` carries when a penalty block it spends is not
+    /// rank-bound certified ([`crate::estimate::EdfRankBound`]). That block's trace is
+    /// published raw, so `edf` may lie outside `[0, dim]` and is not clamped. `None`
+    /// when every block of the term is certified, or the fit recorded no bounds.
+    pub edf_rank_bound: Option<String>,
+    /// Why `pvalue` is absent, when the absence is a refusal rather than a
+    /// missing input. `None` whenever `pvalue` is present.
+    pub pvalue_unavailable: Option<SmoothPValueUnavailable>,
+}
+
+/// Why a smooth term reports no significance p-value.
+///
+/// A reason, not a status: each variant names the property of the term that
+/// leaves no valid reference distribution, so an absent p-value is never
+/// confusable with a missing input or a term that was never tested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothPValueUnavailable {
+    /// The term is shape-constrained (`shape=` monotone, convex, concave).
+    ///
+    /// Its coefficients live in a cone `δ ≥ 0`, and the null `f ≡ 0` is the
+    /// cone's apex, so every coordinate of the null sits on the boundary.
+    /// A `χ²` or spectral reference assumes the estimate can fall on either
+    /// side of the null, which it cannot. The boundary-aware references do not
+    /// apply either:
+    ///
+    /// - The chi-bar-square law (Silvapulle & Sen 2005; Meyer 2003) is the
+    ///   null law of the cone-*projected* estimate, whose face is the active
+    ///   set. The term's estimate is the truncated posterior mean, which lies
+    ///   strictly inside the cone and has no active set.
+    /// - Conditioning on the active set is unavailable for the same reason.
+    /// - Both laws hold for a fixed, unpenalized cone. Here the penalty and its
+    ///   REML-selected λ shrink every face together, and the mixture weights
+    ///   move with them.
+    ShapeConstrained,
+}
+
+impl SmoothPValueUnavailable {
+    /// Serialized label carried into the model payload and the Python surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ShapeConstrained => "shape_constrained",
+        }
+    }
+
+    /// One-line explanation printed beside the summary table.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::ShapeConstrained => {
+                "shape-constrained: the null f = 0 is the apex of the constraint cone, so no \
+                 chi-square, spectral or chi-bar-square reference is valid for the truncated \
+                 posterior mean; no p-value is reported"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -470,6 +524,22 @@ impl fmt::Display for ModelSummary {
                 namew = smoothnamew
             )?;
         }
+        for term in &self.smooth_terms {
+            if let Some(reason) = term.pvalue_unavailable {
+                writeln!(f, "  {}: {}", term.name, reason.explanation())?;
+            }
+        }
+        // #2901: a term spending an uncertified penalty block publishes its EDF
+        // unclamped, and says so here rather than in a number that looks clamped.
+        for term in &self.smooth_terms {
+            if let Some(label) = term.edf_rank_bound.as_deref() {
+                writeln!(
+                    f,
+                    "  {}: {label}; its effective degrees of freedom are published unclamped",
+                    term.name
+                )?;
+            }
+        }
         writeln!(f)?;
         let order_terms = self
             .smooth_terms
@@ -534,5 +604,124 @@ impl fmt::Display for ModelSummary {
             "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod edf_rank_bound_label_tests {
+    use super::*;
+
+    /// #2901: a smooth term whose EDF spends an uncertified penalty block names the
+    /// label beside the table, and a certified term adds no line.
+    #[test]
+    fn the_summary_names_an_uncertified_terms_edf_label_2901() {
+        let row = |name: &str, edf: f64, label: Option<&str>| SmoothTermSummary {
+            name: name.to_string(),
+            edf,
+            ref_df: edf.max(0.0),
+            chi_sq: None,
+            pvalue: None,
+            continuous_order: None,
+            basis_note: None,
+            edf_rank_bound: label.map(str::to_string),
+            pvalue_unavailable: None,
+        };
+        let summary = ModelSummary {
+            family: "gaussian".to_string(),
+            deviance_explained: None,
+            reml_score: None,
+            raw_reml_score: None,
+            parametric_terms: Vec::new(),
+            smooth_terms: vec![
+                row("s(x1)", 3.2, None),
+                row("s(x2)", 5.0003, Some("rank bound not certified")),
+            ],
+            coefficient_se_source: None,
+        };
+        let text = summary.to_string();
+        assert!(
+            text.contains(
+                "s(x2): rank bound not certified; its effective degrees of freedom are published \
+                 unclamped"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("s(x1): rank bound"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod pvalue_unavailable_tests {
+    use super::*;
+    use crate::estimate::smooth_pvalue_unavailable;
+    use gam_terms::smooth::{ShapeConstraint, ShapeSet, ShapeSpec};
+
+    /// Every shape request (atom, conjunction, per-margin tensor) withholds
+    /// the p-value with the typed reason, and only the unconstrained smooth is
+    /// testable.
+    #[test]
+    fn every_shape_constraint_withholds_the_smooth_pvalue() {
+        assert_eq!(smooth_pvalue_unavailable(&ShapeSpec::None), None);
+        let mut conjunction = ShapeSet::single(ShapeConstraint::MonotoneIncreasing);
+        conjunction
+            .insert(ShapeConstraint::Concave)
+            .expect("increasing and concave are compatible");
+        let per_margin = ShapeSpec::PerMargin(vec![
+            ShapeSet::single(ShapeConstraint::MonotoneIncreasing),
+            ShapeSet::default(),
+        ]);
+        for shape in [
+            ShapeConstraint::MonotoneIncreasing.into(),
+            ShapeConstraint::MonotoneDecreasing.into(),
+            ShapeConstraint::Convex.into(),
+            ShapeConstraint::Concave.into(),
+            ShapeSpec::Joint(conjunction),
+            per_margin,
+        ] {
+            assert_eq!(
+                smooth_pvalue_unavailable(&shape),
+                Some(SmoothPValueUnavailable::ShapeConstrained),
+                "{shape:?}"
+            );
+        }
+        assert_eq!(
+            SmoothPValueUnavailable::ShapeConstrained.label(),
+            "shape_constrained"
+        );
+    }
+
+    /// The printed summary names the reason beside the table, so a blank
+    /// p-value column is never read as "not significant".
+    #[test]
+    fn the_summary_names_a_withheld_shape_pvalue() {
+        let row = |name: &str, reason: Option<SmoothPValueUnavailable>| SmoothTermSummary {
+            name: name.to_string(),
+            edf: 2.5,
+            ref_df: 3.0,
+            chi_sq: None,
+            pvalue: None,
+            continuous_order: None,
+            basis_note: None,
+            edf_rank_bound: None,
+            pvalue_unavailable: reason,
+        };
+        let summary = ModelSummary {
+            family: "gaussian".to_string(),
+            deviance_explained: None,
+            reml_score: None,
+            raw_reml_score: None,
+            parametric_terms: Vec::new(),
+            smooth_terms: vec![
+                row("s(x1)", None),
+                row("s(x2)", Some(SmoothPValueUnavailable::ShapeConstrained)),
+            ],
+            coefficient_se_source: None,
+        };
+        let text = summary.to_string();
+        assert!(
+            text.contains("s(x2): shape-constrained: the null f = 0 is the apex"),
+            "{text}"
+        );
+        assert!(!text.contains("s(x1): shape-constrained"), "{text}");
     }
 }

@@ -1,6 +1,6 @@
 """Golden round-trip contract for ``ManifoldSAE`` serialization (issue #2091).
 
-These fixtures are the exact v7 output of the Rust-owned
+These fixtures are the exact v9 output of the Rust-owned
 ``ManifoldSAE.to_dict()`` on a representative model exercising every optional
 field (see ``tests/fixtures/manifold_sae/generate_golden.py``). They pin the
 on-disk schema so the Rust-owned ``ManifoldSaePayload`` port (and the eventual
@@ -29,9 +29,9 @@ def _load(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def test_golden_fixture_exists_and_is_schema_v7() -> None:
+def test_golden_fixture_exists_and_is_schema_v10() -> None:
     payload = _load(GOLDEN_FULL)
-    assert payload["schema"] == "gamfit.ManifoldSAE/v7"
+    assert payload["schema"] == "gamfit.ManifoldSAE/v10"
     # The representative model exercises the full optional surface.
     assert len(payload["atoms"]) == 3
     assert payload["fisher_factors"] is not None
@@ -68,6 +68,68 @@ def test_all_fields_are_explicit_and_runtime_diagnostics_round_trip() -> None:
     missing.pop("fisher_factors")
     with pytest.raises(ValueError, match="missing field.*fisher_factors"):
         ManifoldSAE.from_dict(missing)
+
+
+def test_shape_covariance_conditioning_and_reason_are_exposed() -> None:
+    """#2900: which shape covariance a model holds, and why frames are held fixed.
+
+    Admission to the covariance integrated over the learned frames depends on host
+    memory, so a lower-memory host reports the covariance conditional on the fitted
+    frames. The model must say so, and why, through its getters and its artifact.
+    """
+    conditional = _load(GOLDEN_FULL)
+    assert conditional["shape_covariance_operator"] == (
+        "observed_information_conditional_on_fitted_frames"
+    )
+    model = ManifoldSAE.from_dict(conditional)
+    assert model.shape_covariance_operator == conditional["shape_covariance_operator"]
+    assert model.shape_covariance_frame_conditioning_reason == (
+        "unframed_observed_information_not_admitted"
+    )
+    integrated = _load(GOLDEN_COV)
+    model = ManifoldSAE.from_dict(integrated)
+    assert model.shape_covariance_operator == (
+        "observed_information_marginal_over_learned_frames"
+    )
+    assert model.shape_covariance_frame_conditioning_reason is None
+    missing = dict(conditional)
+    missing.pop("shape_covariance_frame_conditioning_reason")
+    with pytest.raises(ValueError, match="missing field.*shape_covariance_frame_conditioning_reason"):
+        ManifoldSAE.from_dict(missing)
+
+
+def test_a_v8_artifact_is_refused_by_the_loader() -> None:
+    """#2900: the strict schema has no migrations. A v8 artifact, which has neither the
+    shape covariance operator nor the frame conditioning reason, is refused."""
+    v8 = dict(_load(GOLDEN_FULL))
+    v8["schema"] = "gamfit.ManifoldSAE/v8"
+    v8.pop("shape_covariance_operator")
+    v8.pop("shape_covariance_frame_conditioning_reason")
+    with pytest.raises(ValueError, match="ManifoldSAE.from_json"):
+        ManifoldSAE.from_dict(v8)
+    tagged_only = dict(_load(GOLDEN_FULL))
+    tagged_only["schema"] = "gamfit.ManifoldSAE/v8"
+    with pytest.raises(ValueError, match="unsupported schema"):
+        ManifoldSAE.from_dict(tagged_only)
+
+
+def test_a_v9_artifact_loads_without_its_per_atom_evidence_copy() -> None:
+    """#2946: v10 drops each atom's `evidence`, a copy of the fit-level
+    `penalized_loss_score`. A v9 artifact still loads, and writes back as v10 with
+    no per-atom evidence and the same score."""
+    golden = _load(GOLDEN_FULL)
+    assert all("evidence" not in atom for atom in golden["atoms"])
+    v9 = json.loads(json.dumps(golden))
+    v9["schema"] = "gamfit.ManifoldSAE/v9"
+    for k, atom in enumerate(v9["atoms"]):
+        atom["evidence"] = -12.5 - k
+    again = ManifoldSAE.from_dict(v9).to_dict()
+    assert again == golden
+    assert again["penalized_loss_score"] == v9["penalized_loss_score"]
+    v10_with = json.loads(json.dumps(v9))
+    v10_with["schema"] = "gamfit.ManifoldSAE/v10"
+    with pytest.raises(ValueError, match="unknown field.*evidence"):
+        ManifoldSAE.from_dict(v10_with)
 
 
 def test_deprecated_score_alias_is_rejected() -> None:

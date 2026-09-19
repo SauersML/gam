@@ -202,6 +202,7 @@ pub(crate) fn resolve_fit_request_config(
         fit_config.slope_time_degree = value;
     }
     fit_config.z_column = json_config.z_column;
+    fit_config.residual_columns = json_config.residual_columns.unwrap_or_default();
     fit_config.frozen_score = json_config.frozen_score.unwrap_or(false);
     fit_config.latent_measure = json_config.latent_measure;
     fit_config.declared_latent_law = json_config.declared_latent_law.map(|law| {
@@ -229,9 +230,6 @@ pub(crate) fn resolve_fit_request_config(
     if let Some(flag) = json_config.flexible_link {
         fit_config.flexible_link = flag;
     }
-    if let Some(flag) = json_config.precompute_conformal {
-        fit_config.precompute_conformal = Some(flag);
-    }
     if let Some(flag) = json_config.scale_dimensions {
         fit_config.scale_dimensions = flag;
     }
@@ -243,9 +241,6 @@ pub(crate) fn resolve_fit_request_config(
     }
     if let Some(flag) = json_config.firth {
         fit_config.firth = flag;
-    }
-    if let Some(root) = json_config.persistent_warm_start_root {
-        fit_config = fit_config.with_persistent_warm_start_root(root);
     }
     if let Some(raw_gpu) = json_config.gpu {
         fit_config.gpu_policy = parse_gpu_policy(&raw_gpu)?;
@@ -424,59 +419,39 @@ mod tests {
         );
     }
 
-    /// #2633: the conformal-precompute switch must reach `FitConfig` through the
-    /// shared wire document, which is the single path BOTH front ends use — the
-    /// CLI maps `--precompute-conformal` into this document and the Python FFI
-    /// parses the same JSON key. A knob only reachable from Rust would be the
-    /// front-end parity gap this campaign exists to remove.
+    /// Solver tolerances are derived from the problem (gam SPEC 18-23), so the wire
+    /// document has no key for one: `outer_tol` and `inner_tol` are refused by
+    /// name, like `outer_max_iter` above.
     #[test]
-    fn precompute_conformal_threads_from_the_wire_document_2633() {
-        // Absent means "use the default", which is to precompute. It must stay
-        // `None` rather than being materialized into `Some(true)`, so the core
-        // default remains the single source of truth for the behaviour.
-        let defaulted = resolved_json(json!({})).expect("empty config resolves");
-        assert_eq!(
-            defaulted.precompute_conformal, None,
-            "omitting the key must leave the core default untouched"
-        );
-
-        let off = resolved_json(json!({"precompute_conformal": false}))
-            .expect("precompute_conformal=false resolves");
-        assert_eq!(
-            off.precompute_conformal,
-            Some(false),
-            "an explicit false must reach FitConfig, or the substrates are still precomputed"
-        );
-
-        let on = resolved_json(json!({"precompute_conformal": true}))
-            .expect("precompute_conformal=true resolves");
-        assert_eq!(on.precompute_conformal, Some(true));
+    fn solver_tolerances_are_refused_by_the_wire_document() {
+        for key in ["outer_tol", "inner_tol"] {
+            let config = Value::Object(serde_json::Map::from_iter([(
+                key.to_string(),
+                json!(1e-8),
+            )]));
+            let error = serde_json::from_value::<FitRequestConfigDocument>(config)
+                .expect_err("the wire document has no tolerance key");
+            assert!(
+                error.to_string().contains(&format!("unknown field `{key}`")),
+                "{error}"
+            );
+        }
     }
 
+    /// The on-disk warm-start root is not a request field: a cache directory
+    /// does not change the fitted model. The request document is
+    /// `deny_unknown_fields`, so a document naming it is refused by name rather
+    /// than silently ignored, and no request enables on-disk persistence.
     #[test]
-    fn persistent_warm_start_is_disabled_by_default_and_preserves_explicit_root_2639() {
+    fn persistent_warm_start_root_is_not_a_request_field() {
+        let error = resolved_json(json!({"persistent_warm_start_root": "warm-root"}))
+            .expect_err("the removed cache key is refused");
+        assert!(error.contains("persistent_warm_start_root"), "{error}");
         let defaulted = resolved_json(json!({})).expect("empty config resolves");
         assert!(
             defaulted.persistent_warm_start_store.is_none(),
-            "omitting the root must leave persistence disabled"
+            "a request cannot enable on-disk warm-start persistence"
         );
-
-        let exact_root = std::path::PathBuf::from("caller-owned/../warm-root");
-        let configured = resolved_json(json!({
-            "persistent_warm_start_root": exact_root
-        }))
-        .expect("an explicit persistence root resolves")
-        .persistent_warm_start_store
-        .expect("the root must become a store capability");
-        assert_eq!(
-            configured.root(),
-            exact_root,
-            "configuration must not canonicalize or relocate the caller's root"
-        );
-
-        let empty = resolved_json(json!({"persistent_warm_start_root": ""}))
-            .expect_err("an empty persistence root is not an explicit location");
-        assert!(empty.contains("persistent_warm_start_root must not be empty"));
     }
 
     #[test]

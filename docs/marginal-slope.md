@@ -256,16 +256,19 @@ they are what makes the replay faithful rather than merely well-typed:
 
 ## Externally calibrated score (raw `z_column`)
 
-If the score is already conditionally `N(0, 1)` — for example a
-standardised score produced outside this pipeline — pass it directly with
+If the score was produced outside this pipeline, pass it directly with
 `z_column=` and omit the Stage-1 recipe. This raw-`z` path uses the
-free-warp `score_warp` fallback for shape miscalibration, and the
-automatic latent-measure gate described below for conditional
-miscalibration. Use `config={"frozen_score": True}` when an external
-transformation already supplies the declared conditional standard-normal
-measure and must not be normalized again. This asserts a score-distribution
-assumption; it does not prove it. Prefer the CTN chain when the fitted
-transformation should travel with the outcome predictor.
+free-warp `score_warp` fallback for shape miscalibration, and anchors the
+index on the estimated law of the score described below — the score does
+not have to be standard normal, conditionally or at all. Use
+`config={"frozen_score": True}` when an external transformation already
+supplies a conditionally standard-normal score and the fit should use the
+Gaussian closed form. That is a declaration about the score, and the fit
+checks it: it refuses the declaration when the score's conditional law moves,
+and warns with what the declaration costs when the pooled score only looks
+non-normal. Prefer the CTN
+chain when the fitted transformation should travel with the outcome
+predictor.
 
 ```python
 model = gamfit.fit(
@@ -291,52 +294,114 @@ gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
 
 Bernoulli marginal-slope currently consumes a single `z_column`.
 
-### The automatic latent-measure gate
+### Which latent law the index is anchored on
 
-You do not have to get the raw score exactly right. Both marginal-slope
-families run an automatic gate on the score before it reaches the kernel,
-and both run the same one.
-
-The gate matters because the parameterisation's whole point is an
-identity that is *conditional*:
+You do not have to make the raw score look normal. The parameterisation's
+whole point is that `q` is the **marginal** index, and that is an identity
+about the law of the score in context:
 
 ```text
-E_z[Φ(q·√(1+b²) + b·z)] = Φ(q)        for   z | C ~ N(0, 1),
+E[Φ(α(a) + b(a)·z) | a] = Φ(q(a))
 ```
 
-which is what makes `q` the **marginal** index. It needs `z | C` standard
-normal, not merely `z` standard normal — and those are very different
-requirements. A score can be exactly `N(0, 1)` overall while every
-conditional law `z | C` is shifted, in which case `b(C)·E[z|C]` leaks into
-`q` and the marginal coefficients are wrong. No transform of the score's
-*marginal* distribution can fix that, because the marginal distribution is
-already correct.
+On any finite law of `z | a` this equation has exactly one solution
+`α(a)`, and the familiar closed form `α = q·√(1+b²)` is its
+`z | a ~ N(0, 1)` case. The model does not need the score to be Gaussian;
+it needs the fit to anchor on the law the score has. So by default both
+marginal-slope families estimate that law and anchor on it, with the score
+on its own axis:
 
-So the gate looks at the conditional moments first:
+1. a robust Rao score test of `E[z|a]`, `Var(z|a)` and the third
+   standardised moment over the marginal-index span;
+2. if none moves and the score passes the standard-normal adequacy screen
+   (mean, SD, skewness, kurtosis, KS distance, tail mass, largest `|z|`),
+   the closed form, provisionally. Each of the screen's eight bounds is the
+   null quantile of its own statistic at the sample's Kish effective size,
+   at level 0.05 split over the eight, so an exactly Gaussian score fails the
+   screen at most 5% of the time at every `n`, and a departure fails it once
+   `n` resolves it: the KS bound is Kolmogorov's critical value, about
+   `1.70/√n`. The screen only decides which route the fit starts on and says
+   nothing directly about the anchoring error, so at the converged fit one
+   pass over the rows measures each row's residual `r = Σ_k w_k Φ(a_cf + h_k) − π` under the
+   estimated law at the closed-form intercept, and its sampling standard
+   error `se` under that law. `r² − 2·se²` estimates without bias how much
+   less accurate the closed form is than the estimated law's own anchor on
+   that row, so the fit keeps the closed form when
+   `D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0` and records the certificate
+   (`estimated-gaussian-adequate`), and otherwise re-solves on the estimated
+   law from the closed-form coefficients (`estimated-global-by-residual`).
+   Nothing is tuned; on an exactly Gaussian score about 16% of fits
+   re-solve, which costs speed and not expected accuracy;
+3. if none moves and the score fails that check, one finite law of the
+   score — a 65-node equal-mass compression that keeps the score's own
+   location and scale;
+4. if any moves, local finite laws by context: the training rows are
+   partitioned over the covariates the marginal formula reads, each context
+   gets its own law, and every row anchors on a kernel mixture of its four
+   nearest contexts plus a small fixed share (1e-3 of the kernel's peak) of
+   the pooled law. A context's weight falls to zero exactly where it stops
+   being one of the four nearest, and the pooled share keeps the mixture
+   defined where contexts tie, so the law, the anchor and the prediction are
+   continuous in the covariates everywhere.
 
-1. a Rao score test on `E[z|C]` and `Var(z|C)` over the marginal-index
-   span. If it fires, the score is replaced by
-   `ζ = (z − m(C))/√v(C)`, which is conditionally centred and at unit
-   variance by construction;
-2. otherwise, a standard-normal adequacy check on the pooled score;
-3. otherwise, a weighted mid-rank inverse-normal transform, re-checked on
-   its own output.
+The conditional test comes first because a score can be exactly `N(0, 1)`
+overall while every conditional law `z | a` is shifted. One pooled law then
+puts `b(a)·E[z|a]` into `q` and the marginal coefficients are wrong, and no
+transform of the score's marginal distribution can fix that, because the
+marginal distribution is already correct. A law estimated by context does.
 
-Whatever it decides is **persisted with the model** and replayed at
-prediction and in leave-one-out diagnostics, because the fitted
-coefficients live on the calibrated axis: a predictor that rebuilt the
-score differently would be evaluating a different model.
+Every other law is a declaration, set with `config={"latent_measure": ...}`:
 
-Both kernels own an empirical-grid branch, so when no transform makes the
-score adequately normal the fit falls back to the exact empirical latent
-measure of the (calibrated) score instead of pretending it is Gaussian —
-see the next section for what that means on the survival side. When the
-conditional branch fires, the score becomes a generated regressor: the
-coefficient covariance carries a Murphy–Topel correction for the first
-stage's estimation error, or is withheld with a typed reason if the fit's
-shape cannot supply the correction (an empirical measure built from the
-calibrated residual is one such shape: the law itself then moves with the
-first stage). It is never published uncorrected.
+| `latent_measure` | Law anchored on | When the score contradicts it |
+|---|---|---|
+| `"auto"` (default) | the closed form when the estimated law passes the adequacy check, else the estimated law, global or local by context | — |
+| `"gaussian"` | the closed form, `N(0, 1)` | refused when the conditional law moves; otherwise fitted with a warning and its `D̂` |
+| `"global-empirical"` | the pooled estimated law, whatever the span shows | — |
+| `"conditional-location-scale"` | `z = m(a) + √v(a)·ε` with `ε` on its estimated law; the slope lives on `ε`'s axis | — |
+
+`config={"declared_latent_law": {"nodes": [...], "weights": [...]}}` anchors
+on exactly the finite law given. `frozen_score=True` and the CTN chain
+declare the Gaussian law.
+
+A Gaussian declaration is checked, never assumed. When `E[z|a]` or
+`Var(z|a)` moves on the span, no single declared law can be right, and the
+fit is refused with the p-values. When the pooled score fails the
+standard-normal adequacy screen (mean, SD, skewness, kurtosis, KS distance,
+tail mass, largest `|z|`), the declaration is fitted and the fit warns with
+the adequacy ledger and the declaration's estimated excess anchoring loss
+`D̂` at the converged fit, both recorded with the model. The screen is a
+level-0.05 test of the standard normal, and a failed test is not grounds to
+refuse a declaration: at large `n` it detects departures that cost no
+anchoring accuracy, and `D̂` measures what the departure costs. To fit the closed form
+on purpose on a score that is not normal without the warning, declare a
+Gauss–Hermite law: it is the Gaussian case to quadrature tolerance.
+
+Which law the fit consumed is **persisted with the model** as
+`latent_law_consumed` — `estimated-gaussian-adequate` (with every adequacy
+statistic beside its bound and the anchoring certificate),
+`estimated-global-by-residual`, `gaussian-uncertified` (with what is
+missing), `estimated-global`, `estimated-local`,
+`requested-global-empirical`, `declared-finite-law`,
+`conditional-location-scale` or `declared-gaussian`, with the test
+evidence — beside the law itself (`latent_measure`). Prediction and
+leave-one-out diagnostics replay that law by the same anchoring equation,
+because the fitted coefficients are defined against its anchor and mean
+nothing under another; a local law is replayed from the prediction table's
+own covariates. Models saved before the field existed replay their old
+calibration unchanged.
+
+When the declared location-scale law calibrates the score, the score
+becomes a generated regressor: the coefficient covariance carries a
+Murphy–Topel correction for the first stage's estimation error, or is
+withheld with a typed reason if the fit's shape cannot supply the
+correction. It is never published uncorrected. The estimated laws are built
+from the score as given and have no first stage to correct for.
+
+On a Gaussian score the default is the closed form, the pooled estimated law
+(`global-empirical`) agrees with it to sampling tolerance, and a declared Gauss–Hermite law agrees with the closed form to
+quadrature tolerance once its node count is tied to the drive scale
+`b·sd(z)`: at drive SD 2–4 a 64-node law is within about 1.5e-4 and a
+128-node law within about 4e-8.
 
 ### The survival kernel anchors on a declared law
 
@@ -366,15 +431,18 @@ amount; the anchored `q̂` is the marginal index, as the identity says.
 
 Three ways to get there:
 
-- the automatic gate (default): when no pre-transform makes the score
-  adequately normal, the fit anchors on the global empirical law of the
-  calibrated score, exactly as the Bernoulli family does;
+- the default: the fit anchors on the estimated law of the score, global
+  or local by context, exactly as the Bernoulli family does (the closed form
+  when the score passes the adequacy check);
 - `config={"latent_measure": "global-empirical"}`: always anchor on the
-  global empirical law of the score;
+  pooled estimated law of the score;
 - `config={"declared_latent_law": {"nodes": [...], "weights": [...]}}`:
-  anchor on exactly this law. The score is then taken as supplied — no
-  pre-transform is fitted to it, because the law is your statement about
-  that very score.
+  anchor on exactly this law. The score is then taken as supplied — nothing
+  is estimated or checked, because the law is your statement about that
+  very score.
+
+`config={"latent_measure": "gaussian"}` reaches the closed form, checked as
+described above.
 
 Whichever way, the law is **persisted with the model** as its latent
 measure and replayed at prediction and in leave-one-out diagnostics by
@@ -385,7 +453,18 @@ Current boundaries, refused with a message rather than silently
 reinterpreted: a declared law is a law of one score (several scores anchor
 on their joint law, below); no score-warp or
 link-deviation flex block, no CTN Stage-1 influence absorber, no
-time-wiggle baseline, and a time-constant slope. The Jeffreys/Firth arming's closed-form fifth
+time-wiggle baseline, and a time-constant slope. On those configurations an
+explicitly requested finite law is refused by name, and the default keeps the
+closed form and certifies it by `D̂` as above: a flex block through its own
+de-nested index at each node of the estimated law, a follow-up-varying slope on
+each anchor's own slope, and an influence absorber on the offset-free anchor
+the fit solves, because the absorber's offset is added only after the anchor.
+Where the certificate prefers the estimated law, which nothing there can
+re-solve on yet (gam#2948), the fit keeps the closed form, recorded
+`gaussian-uncertified` with that certificate and why nothing re-solves on it,
+which `require_certified` refuses by name. A fit on any of
+them whose law departs or moves records `gaussian-uncertified` with a warning
+naming what is missing. The Jeffreys/Firth arming's closed-form fifth
 and sixth derivatives are the Gaussian lowering's and are not served on a
 declared law; the fit runs without them.
 
@@ -464,6 +543,141 @@ Two limits are worth stating plainly:
   a spatial length scale on a slope surface or in the marginal formula, a
   learned frailty, per-score pre-transforms, uncertainty bands, the
   posterior-mean estimand, and leave-one-out replay.
+- **The default on several scores.** Under `"auto"` each score is tested as
+  above. When some score departs from the standard normal without moving on
+  the span, the fit anchors on the joint law, and the scores the screen
+  passed are recorded as `estimated-global`, the law they are anchored on.
+  When some score's law moves, the transport `μ + L(a)ε` follows a moving
+  covariance but not a moving mean or shape, so every score keeps the closed
+  form, recorded as `gaussian-uncertified` naming the moving score (gam#2949).
+  When every score passes the screen, the closed form at `Σ(a)` is
+  provisional, and the converged fit certifies it by `D̂` under the joint
+  law, each row's residual `Σ_m w_m Φ(−(q·√(1 + rᵀΣ(a)r) + rᵀu_m)) − Φ(−q)`
+  on the row's transported nodes. `D̂ > 0` re-solves on the joint law; where
+  nothing can re-solve on it, as with a slope shared across the scores, the
+  fit keeps the closed form, recorded `gaussian-uncertified` with `D̂`.
+
+## Residual genetic repair: reading what the score discarded
+
+A polygenic score keeps **one** direction of the genome. A varying slope
+`b(a)` rescales that direction across covariate space; it cannot turn it
+into a different predictive direction, and no calibration of the same
+scalar — affine or not — recovers variation in `E[Y | genome, a]` that
+`(S, A)` does not determine. What can is a block of genetic features the
+score threw away, entered next to the score and shrunk like everything
+else:
+
+```text
+η_i = c(a_i)·q(a_i) + b(a_i)·z_i + βᵀ r_i ,        r_i = φ_i − E_ref[φ | S_i, A_i]
+```
+
+`r` is a block of `K` **conditionally centred** residual features — block
+partial scores, local-ancestry contrasts, selected dosages — and `β` is a
+constant coefficient block under one ridge penalty whose smoothing
+parameter is estimated by REML/LAML like every other penalty. Under
+`r ⟂ Y` the marginal likelihood drives that penalty up and `β → 0`,
+leaving the score-only fit unchanged. The population value a linear read
+of `r` removes from squared risk is exactly `c_rᵀ Σ_r⁺ c_r` with
+`c_r = E[rY]`, `Σ_r = E[rrᵀ]`, whatever the rank
+(`Descent.Portability.ResidualGeneticRepair.residual_repair_law`).
+
+```python
+model = gamfit.fit(
+    df,
+    "case ~ s(age) + matern(pc1, pc2, pc3)",
+    family="bernoulli-marginal-slope",
+    z_column="z",
+    slope_formula="matern(pc1, pc2, pc3)",
+    residual_columns=["chr6_partial", "chr11_partial", "afr_contrast"],
+)
+```
+
+CLI: repeat `--residual-column NAME` for every column. The prediction table
+must carry the same columns, centred on the same reference law.
+
+### The anchor moves with the block
+
+The marginal interpretation `E[p | a] = Φ(q(a))` is what keeps the
+baseline surface meaningful, and it needs the anchor to integrate the
+**whole** genetic drive. Under the conditionally Gaussian joint law of
+`(z, r)` that is
+
+```text
+c(a) = √(1 + b̃(a)ᵀ Σ(a) b̃(a)) ,      b̃(a) = (b(a), β) ,      Σ(a) = Var((z, r) | a) ,
+```
+
+the several-scores identity above with the residual block appended to the
+score vector. The score's coordinate keeps its declared unit variance, so
+at `β = 0` the anchor is exactly the score-only `√(1 + b²)`; its couplings
+to `r` and `Var(r)` are estimated. `Σ(a)` is the pooled joint covariance
+unless the pairwise Rao gate of the several-scores section escalates it to
+a conditional `Σ(a)`; either way it is persisted with the model and
+replayed at prediction, plug-in and posterior-mean alike. The posterior
+mean integrates the residual coefficients' uncertainty jointly with the
+surfaces to first order (the complete gradient of `η`, the anchor moved
+through `b̃ᵀΣb̃`): the anchor now reads the whole coefficient vector, not
+`(q, b)` alone, so the exact bivariate integration of the score-only model
+does not apply. Adding `βᵀr` without moving
+the anchor would leak `Var(βᵀr | a)` into the baseline — the unconditioned-
+score defect in another coat. With the anchor holding along every
+parameter path the baseline and predictor-shape directions are
+Fisher-orthogonal under the declared law
+(`Descent.Portability.MarginalAnchor.crossInformation_baseline_shape_zero`),
+which is what makes `β` estimable without corrupting `q`.
+
+The default latent-law certificates read this joint anchor through the score
+(gam#2985). Given the score, the fit models `βᵀr | z ~ N(u z, v − u²)` with
+`u = βᵀγ(a)`, `v = βᵀΣ_rr(a)β`, so at the row's index intercept `α` the
+residual integrates out: `E_{r|z}[Φ(α + s(g z + βᵀr))] = Φ(ã + B z)` with
+`B = s(g + u)/τ`, `ã = α/τ`, `τ = √(1 + s²(v − u²))`. Under any law of the
+score the joint anchor is the score-only anchor at the row's `(ã, B)`, so the
+closed form's excess anchoring loss and the moving-law certificate run on it
+unchanged, and a fit with the block is certified like one without it.
+
+### What the fit checks and refuses
+
+- Every residual column is tested for `E_w[r | marginal-index span] = 0`
+  with the same robust Rao score test the score's conditional gate uses, at
+  the same level, **including the level**. A column that fails is refused
+  with a typed reason; the fit never centres a feature for you, because a
+  level absorbed into the baseline is a different model.
+- The block is lowered through the rigid row kernel with the coefficients
+  as row primaries, so it cannot be combined with `linkwiggle(...)`
+  score-warp / link-deviation blocks, a learned frailty scale, or an
+  absorbed CTN influence block. Each of those is a typed refusal, not a
+  silent reinterpretation. Spatial length scales are held at their seeded
+  values in the presence of the block; pass `length_scale=` to choose them.
+- When the score's conditional law moves and the conditional location-scale
+  calibration fires, the calibrated score is a generated regressor, and the
+  block has no Murphy–Topel channel: it reads the score through each row's
+  `ζ_i` and through the joint covariance, which is fitted on the calibrated
+  score. The fit publishes its point estimates and certificate and withholds
+  the coefficient covariance, recording why
+  (`CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable`,
+  gam#2985). An uncorrected covariance would be too narrow.
+
+### On a declared finite law of the score
+
+When the score's law is declared as a finite law (`latent_measure=
+"global-empirical"`, or the gate's empirical fallback, global or local), the
+residual block keeps its Gaussian law given the score, `r | z, a ~ N(γz,
+Σ_{r·z})`, read off the same persisted joint covariance (its first column and
+Schur complement). Given node `z_k` the drive `s(g z + βᵀr)` is then
+`N(m z_k, v)` with `m = s(g + βᵀγ)` and `v = s²βᵀΣ_{r·z}β` — a finite mixture
+of Gaussians — and the anchor is the finite-law probit anchor on the scaled
+coordinates:
+
+```text
+Σ_k w_k Φ(ã + B·z_k) = Φ(q) ,      α = τ·ã ,   B = m/τ ,   τ = √(1 + v) .
+```
+
+On a Gauss–Hermite law it is the closed form above to quadrature tolerance.
+The fit differentiates the root through fourth order, so the REML/LAML outer
+derivatives read the same anchor the plug-in prediction replays.
+- There is no width ceiling. The row likelihood reads `β` only through
+  `t = βᵀr`, `u = βᵀγ` and `v = βᵀΣ_rrβ`, so the row program has five
+  primaries whatever the width, and the Hessian channels add the constant
+  curvature `2Σ_rr` of `v` to the design pullback: `O(nK²)` assembly.
 
 ## Fixed external baseline (slope-only fit)
 

@@ -67,12 +67,12 @@ fn constant_curvature_verdict_is_translation_invariant() {
     let dim = 4;
     let cloud = unit_normalized_cloud(500, dim, 0xC0FF_EE12_3456_7890);
 
-    let at_origin = fit_response_curvature(cloud.view(), dim, 0.95, 1e-9, 200)
+    let at_origin = fit_response_curvature(cloud.view(), dim, 0.95)
         .expect("fit at the ambient origin");
 
     let shift = 10.0_f64;
     let translated = cloud.mapv(|v| v + shift);
-    let away_from_origin = fit_response_curvature(translated.view(), dim, 0.95, 1e-9, 200)
+    let away_from_origin = fit_response_curvature(translated.view(), dim, 0.95)
         .expect("fit translated far from the ambient origin");
 
     // A rigid ambient translation must not change the reported geometric

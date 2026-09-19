@@ -29,11 +29,43 @@ where
 /// `apply_b` is the metric `Φ`; `apply_b_raw` is the physical majorizer `Φ` conditions.
 /// The two agree off the evidence factor's pins; where they differ the positive band edge
 /// rises to the stiffness `Φ` substituted, as on the dense route (#2267).
+///
+/// Each operator is applied in the coordinates it acts on, so its images are priced at
+/// their dimension; see [`solve_exact_stationarity_krylov_with_rounding`].
 fn solve_exact_stationarity_krylov<A, B, R>(
     rhs: &SaeArrowVector,
     apply_a: &A,
     apply_b: &B,
     apply_b_raw: &R,
+) -> Result<SaeArrowVector, String>
+where
+    A: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    B: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    R: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+{
+    let dim = rhs.t.len() + rhs.beta.len();
+    solve_exact_stationarity_krylov_with_rounding(rhs, apply_a, apply_b, apply_b_raw, dim)
+}
+
+/// [`solve_exact_stationarity_krylov`] with the operators' images priced at
+/// `operator_terms` rounded terms per entry.
+///
+/// Every operator-denominated bar is the accumulation band `γ` of that many terms: the
+/// Lanczos stopping tolerances, the Ritz residual that seeds an expansion, and the
+/// physical and dual residual bars that certify the solve. An operator applied in its own
+/// coordinates is priced at their dimension. One pulled back through dense lifts, such as
+/// `Tᵀ·A·T + E` on a learned frame's tangent coordinates (#2933 F39), accumulates the
+/// lifts' inner sums too: the dimension `A` is applied in, plus each lift's inner
+/// dimension. Priced at the trial space's dimension instead, a solve whose every Ritz pair
+/// is resolved can fail its dual bar by the lifts' own rounding and refuse an exact
+/// answer. Orthogonalizing the trial basis stays denominated in the trial space's own
+/// dimension.
+fn solve_exact_stationarity_krylov_with_rounding<A, B, R>(
+    rhs: &SaeArrowVector,
+    apply_a: &A,
+    apply_b: &B,
+    apply_b_raw: &R,
+    operator_terms: usize,
 ) -> Result<SaeArrowVector, String>
 where
     A: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
@@ -78,7 +110,15 @@ where
     let b_flat = |v: &Array1<f64>| checked(apply_b(&split(v))?);
     let b_raw_flat = |v: &Array1<f64>| checked(apply_b_raw(&split(v))?);
     let tolerance = f64::EPSILON.sqrt();
-    let gamma = dim as f64 * f64::EPSILON / (1.0 - dim as f64 * f64::EPSILON);
+    if operator_terms < dim {
+        return Err(format!(
+            "exact-stationarity Krylov solve: operator images priced at {operator_terms} terms, \
+             under the dimension {dim} they are applied in"
+        ));
+    }
+    let band = |terms: usize| terms as f64 * f64::EPSILON / (1.0 - terms as f64 * f64::EPSILON);
+    let gamma = band(dim);
+    let operator_gamma = band(operator_terms);
     let a_slice = |input: &[f64], output: &mut [f64]| -> Result<(), String> {
         let value = a_flat(&Array1::from_vec(input.to_vec()))?;
         for (slot, &value) in output.iter_mut().zip(value.iter()) {
@@ -133,7 +173,7 @@ where
     loop {
         let options = SymmetricLanczosOptions {
             max_steps: steps,
-            residual_tol: gamma * initial_a,
+            residual_tol: operator_gamma * initial_a,
             local_reorthogonalize: false,
             full_reorthogonalize: true,
         };
@@ -153,7 +193,7 @@ where
             largest(&scale_pairs).ok_or("exact-stationarity Krylov solve: empty norm probe")?;
         drop(scale_pairs);
         let metric_options = SymmetricLanczosOptions {
-            residual_tol: gamma * initial_b,
+            residual_tol: operator_gamma * initial_b,
             ..options
         };
         let metric_pairs =
@@ -163,7 +203,7 @@ where
         drop(metric_pairs);
         let scale_resolved = operator_resolved && metric_resolved;
         let generator_options = SymmetricLanczosOptions {
-            residual_tol: gamma * (spectral_norm.max(initial_a) + tolerance * metric_norm.max(initial_b)),
+            residual_tol: operator_gamma * (spectral_norm.max(initial_a) + tolerance * metric_norm.max(initial_b)),
             ..options
         };
         let generate_slice = |input: &[f64], output: &mut [f64]| -> Result<(), String> {
@@ -242,10 +282,15 @@ where
             let mut classification_resolved = true;
             let mut seed: Option<Array1<f64>> = None;
             let mut worst_seed_excess = 0.0_f64;
+            // `ΦVc` and `‖ΦV‖²_F`, for the basis's `Φ`-orthonormality defect below.
+            let mut metric_image_of_coefficients = Array1::<f64>::zeros(dim);
+            let mut metric_images_frobenius_sq = 0.0_f64;
             for index in 0..values.len() {
                 let direction = vectors.column(index).to_owned();
                 let a_image = a_flat(&direction)?;
                 let b_image = b_flat(&direction)?;
+                metric_image_of_coefficients.scaled_add(coefficients[index], &b_image);
+                metric_images_frobenius_sq += b_image.dot(&b_image);
                 let metric = direction.dot(&b_image);
                 if !(metric.is_finite() && metric > 0.0) {
                     return Err(format!(
@@ -278,7 +323,7 @@ where
                         worst_seed_excess = excess;
                         seed = Some(ritz_residual);
                     }
-                } else if seed.is_none() && norm(&ritz_residual) > gamma * spectral_norm * norm_sq.sqrt() {
+                } else if seed.is_none() && norm(&ritz_residual) > operator_gamma * spectral_norm * norm_sq.sqrt() {
                     seed = Some(ritz_residual);
                 }
                 if magnitude > floor {
@@ -305,6 +350,18 @@ where
                 + norm(&projected_rhs);
             let dual_norm = norm(&vectors.t().dot(&residual));
             let dual_scale = curvature_norm * solution_metric_norm + norm(&coefficients);
+            // The Ritz vectors are `Φ`-orthonormal only to the Rayleigh--Ritz arithmetic,
+            // `VᵀΦV = I + E` with `‖E‖` of order `κ(VᵀΦV)·ε`. On a basis that spans the space,
+            // `ΦV(VᵀΦV)⁻¹Vᵀ = I`, so even the exact pseudoinverse on this basis leaves the dual
+            // residual `Ec` and the physical residual `ΦVEc`, to first order in `E`. That floor
+            // belongs to the basis, not to the solve's convergence, and `Ec = Vᵀ(ΦVc) − c` is
+            // measured here. At #2828 item 2's in-band state, `κ(VᵀΦV)` reached `1.3e9` and
+            // `‖Ec‖ = 1.4e-13` against the `γ` bar of `1.3e-14`, so a converged solve was refused
+            // (job 1273989). A basis that misses directions still leaves `(I − ΦVVᵀ)rhs`, which
+            // this floor does not cover, and a defect above `√ε` of the coefficients is no
+            // basis to certify on.
+            let gram_defect = norm(&(vectors.t().dot(&metric_image_of_coefficients) - &coefficients));
+            let physical_gram_defect = metric_images_frobenius_sq.sqrt() * gram_defect;
             let band_mass = band_images
                 .iter()
                 .fold(0.0_f64, |n, image| n.hypot(image.dot(&solution)));
@@ -314,8 +371,9 @@ where
             if scale_resolved
                 && classification_resolved
                 && solution.iter().all(|x| x.is_finite())
-                && residual_norm <= gamma * physical_scale
-                && dual_norm <= gamma * dual_scale
+                && gram_defect <= tolerance * norm(&coefficients)
+                && residual_norm <= operator_gamma * physical_scale + physical_gram_defect
+                && dual_norm <= operator_gamma * dual_scale + gram_defect
                 && band_mass <= tolerance * solution_metric_norm
             {
                 return Ok(split(&solution));

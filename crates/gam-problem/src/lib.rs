@@ -124,6 +124,7 @@ pub use dispersion_cov::{
     se_from_covariance,
 };
 pub use estimation_error::{
+    DominanceRefusalKind,
     EstimationError,
     FixedLambdaCheckpoint,
     FixedLambdaResidualKind,

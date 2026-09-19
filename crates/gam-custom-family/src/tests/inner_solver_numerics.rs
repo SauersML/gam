@@ -866,6 +866,7 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         outer_score_subsample: None,
         auto_outer_subsample: false,
         cache_session: None,
+        warm_start: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
@@ -5753,6 +5754,134 @@ pub(crate) fn an_unsizable_accumulation_refuses_nothing_2748() {
     assert!(witness.refused().is_none());
 }
 
+/// gam#2959: the trust loop charges the penalty what each endpoint's `½βᵀS_λβ`
+/// summed, `½Σ|β_i S_ij β_j|`, and that is what separates rounding from an
+/// evaluator gap on a real ladder. The crude `max|S_λ|·(‖β_old‖₁² + ‖β_trial‖₁²)`
+/// it replaced admitted the gap as rounding.
+///
+/// Both ladders are verbatim from lane-only prints in the trust loop under this
+/// charge (job 1245154).
+///
+/// The refused arm is `survival_marginal_slope_removes_the_conditional_latent_shift`'s
+/// cycle-2 ladder. Attempt 0 reads the trial through the fused workspace
+/// likelihood and agrees with the incumbent to 2.5e-10. Attempts 1–16 read it
+/// through the scalar line-search likelihood and sit 3.4449e-4 above it at every
+/// step from 1.0e-4 down to 1.0e-12 (the evaluator gap of gam#2952). A change the
+/// step does not move is not the objective moving, and 3.4e-4 is seven times what
+/// any summation at this state can round by. Under the crude scale the ceiling was
+/// 1.08, and the same solve's cycle 21 accepted a 3.58e-2 objective INCREASE on
+/// such a claim (job 1245153).
+///
+/// The admitted arm is gam#2612's banded witness, cycle 5, whose flat ~1e-10
+/// discrepancy is the penalty's real rounding. It must survive the tighter
+/// charge, or the #2612 ratchet comes back.
+#[test]
+pub(crate) fn the_penalty_is_charged_what_it_summed_so_an_evaluator_gap_is_not_rounding_2959() {
+    // n = 3000 rows, 432 penalty entries. The explicit pass sums 1.352930e8 over
+    // both endpoints, where `max|S_λ|·(‖β_old‖₁² + ‖β_trial‖₁²)` = 3.252230e12.
+    let (incumbent, trial) = (2.837656175870e3, 2.837656520358e3);
+    let summed = ObjectiveAccumulation::between_endpoints(
+        3000,
+        432,
+        [incumbent, trial],
+        [0.5 * 1.352930e8, 0.5 * 1.352930e8],
+        [0.0, 0.0],
+    );
+    let crude = ObjectiveAccumulation {
+        summed_terms: 3000,
+        magnitude: incumbent + trial + 3.252230e12,
+        logdet_roundoff: 0.0,
+    };
+    let gap_ladder = [
+        ladder_rung(2.074986e-4, -2.482921e-10, 2.031140e-13),
+        ladder_rung(1.037493e-4, -3.444886e-4, 1.523355e-13),
+        ladder_rung(2.593732e-5, -3.444902e-4, 4.760484e-14),
+        ladder_rung(6.484330e-6, -3.444884e-4, 1.249627e-14),
+        ladder_rung(1.621083e-6, -3.444896e-4, 3.161259e-15),
+        ladder_rung(4.052706e-7, -3.444888e-4, 7.926391e-16),
+        ladder_rung(1.013177e-7, -3.444895e-4, 1.983051e-16),
+        ladder_rung(2.532941e-8, -3.444878e-4, 4.958535e-17),
+        ladder_rung(6.332354e-9, -3.444882e-4, 1.239690e-17),
+        ladder_rung(1.583088e-9, -3.444883e-4, 3.099261e-18),
+        ladder_rung(3.957721e-10, -3.444880e-4, 7.748176e-19),
+        ladder_rung(9.894303e-11, -3.444892e-4, 1.937045e-19),
+        ladder_rung(2.473576e-11, -3.444890e-4, 4.842614e-20),
+        ladder_rung(6.183939e-12, -3.444888e-4, 1.210654e-20),
+        ladder_rung(1.545985e-12, -3.444885e-4, 3.026634e-21),
+        ladder_rung(1.036508e-12, -3.444889e-4, 2.029211e-21),
+        ladder_rung(1.036508e-12, -3.444889e-4, 2.029211e-21),
+    ];
+    let read = |accumulation: ObjectiveAccumulation| {
+        let mut witness = ObjectiveResolutionWitness::default();
+        witness.start_ladder();
+        for (step_norm, actual, predicted) in gap_ladder {
+            witness.observe(step_norm, actual, predicted, accumulation);
+        }
+        witness
+    };
+
+    // NON-VACUITY: under the crude scale the gap IS admitted as rounding. That is
+    // the defect, asserted so this fixture cannot stop exercising it.
+    let admitted = read(crude);
+    assert!(
+        admitted.measured() > 3.4e-4,
+        "the crude scale's ceiling of {:.3e} must admit the 3.44e-4 gap, else the \
+         refusal below repairs nothing (measured={:.3e})",
+        crude.roundoff_ceiling(),
+        admitted.measured(),
+    );
+
+    let refused = read(summed);
+    assert_eq!(
+        refused.measured(),
+        0.0,
+        "an objective change no step moves is an evaluator gap, not rounding: it must \
+         not become the trust controller's noise floor"
+    );
+    let (claim, ceiling) = refused
+        .refused()
+        .expect("the ladder spans two decades, so it reaches a verdict the ceiling refuses");
+    assert!(
+        (claim - 3.444896e-4).abs() <= 1.0e-10,
+        "the refused claim is the gap itself: {claim:.6e}"
+    );
+    assert!(
+        ceiling < claim && ceiling == summed.roundoff_ceiling(),
+        "the refusal compares against what the penalty summed: claim={claim:.6e}, \
+         ceiling={ceiling:.6e}, summed ceiling={:.6e}",
+        summed.roundoff_ceiling(),
+    );
+
+    // gam#2612's banded witness, cycle 5: n = 180 rows, 1664 penalty entries, the
+    // explicit pass summing 6.005779e6 over both endpoints.
+    let banded = ObjectiveAccumulation::between_endpoints(
+        180,
+        1664,
+        [1.612317740935e1, 1.612317740942e1],
+        [0.5 * 6.005779e6, 0.5 * 6.005779e6],
+        [0.0, 0.0],
+    );
+    let mut kept = ObjectiveResolutionWitness::default();
+    kept.start_ladder();
+    for (step_norm, actual, predicted) in [
+        ladder_rung(1.034222e-5, -6.883027e-11, 5.176451e-16),
+        ladder_rung(2.309286e-6, -1.837535e-10, 2.053588e-16),
+        ladder_rung(5.773216e-7, -6.905410e-11, 5.617875e-17),
+        ladder_rung(1.443304e-7, -1.110934e-10, 1.434713e-17),
+        ladder_rung(3.608260e-8, -6.112799e-11, 3.605685e-18),
+    ] {
+        kept.observe(step_norm, actual, predicted, banded);
+    }
+    assert!(
+        kept.refused().is_none() && kept.measured() > 6.0e-11,
+        "gam#2612's real rounding must survive the summed charge: measured={:.3e}, \
+         ceiling={:.3e}, refused={}",
+        kept.measured(),
+        banded.roundoff_ceiling(),
+        kept.refused().is_some(),
+    );
+}
+
 #[test]
 pub(crate) fn joint_objective_roundoff_slack_accepts_large_scale_wobble() {
     let old_objective = 1.218530e5;
@@ -6918,8 +7047,16 @@ pub(crate) fn per_penalty_edf_uses_realized_penalty_rank_2288() {
     let h = Array2::from_diag(&array![4.0, 5.0, 10.0, 8.0, 10.0, 20.0]);
     let lambdas = array![1.0, 0.5, 0.25, 2.0];
 
-    let (edf_total, edf_by_penalty, block_edf, penalty_trace) =
+    let (edf_total, edf_by_penalty, block_edf, penalty_trace, rank_bound) =
         custom_family_blockwise_edf(&h, &specs, &lambdas.view()).expect("exact composed EDF");
+    // #2901: every `H − λ_k S_k` is diagonal and nonnegative here, so each penalty
+    // is certified and the oracle below reads clamped, in-range traces.
+    assert!(
+        rank_bound
+            .iter()
+            .all(gam_solve::estimate::EdfRankBound::is_certified),
+        "{rank_bound:?}"
+    );
 
     // Independent diagonal oracle:
     //   λ tr(H⁻¹S) = [1/4, (1/2)(2/5+3/10), (1/4)(4/8), 2(1/10+2/20)].
@@ -7216,5 +7353,101 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
         "raw asymmetric assembly must diverge from the reference (symmetrization is \
          load-bearing): raw={unsymmetrized_logdet:.9e} reference={reference_logdet:.9e} \
          tol={tol:.3e}"
+    );
+}
+
+/// gam#3019: a refusal is `active_set_incomplete` only when the active set it
+/// reads pins a row. The joint path scatters an empty row list into every
+/// constrained block, so "the block has constraints" is not "rows were pinned".
+/// The survival link-deviation fixture exited early 23 times under that label, each
+/// with `active_set_rows_total=0` (s4b job 1332832 arm A). In each of those solves the
+/// rejected trials repeated one objective increase at every trust radius: the
+/// objective jumps along the step, and no constraint row owns the residual.
+///
+/// Both arms share a well-conditioned `H = I` and the #3019 seed-0 residual,
+/// 3.772 on the unconstrained block, far above tolerance. Only the active set
+/// differs. With the row `β₀ ≥ 0` slack and nothing pinned, the refusal is a
+/// phantom multiplier whose guidance names the jump. With the row binding and
+/// pinned, it is an incomplete active set (the positive control).
+#[test]
+fn kkt_refusal_names_an_incomplete_active_set_only_when_it_holds_a_row_3019() {
+    use gam_problem::test_support::spec_from_dense;
+    let specs = vec![
+        spec_from_dense("constrained", Array2::<f64>::zeros((1, 1))),
+        spec_from_dense("free", Array2::<f64>::zeros((1, 1))),
+    ];
+    let s_lambdas = vec![Array2::<f64>::zeros((1, 1)), Array2::<f64>::zeros((1, 1))];
+    let ranges = vec![(0usize, 1usize), (1, 2)];
+    let block_constraints = vec![
+        Some(ConstraintSet::Dense(LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        })),
+        None,
+    ];
+    let source = JointHessianSource::Dense(Array2::<f64>::eye(2));
+    let joint_grad = array![0.0, 3.772];
+    let residual_tol = 5.932e-11;
+    let refuse = |constrained_beta: f64, active: Vec<Option<Vec<usize>>>| {
+        let states = vec![
+            ParameterBlockState {
+                beta: array![constrained_beta],
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: Array1::zeros(1),
+            },
+        ];
+        compute_kkt_refusal_report(
+            25,
+            &states,
+            &specs,
+            &s_lambdas,
+            &ranges,
+            Some(&joint_grad),
+            &active,
+            &block_constraints,
+            Some(&source),
+            2,
+            1.034e-11,
+            7.596e-2,
+            2.245e-10,
+            residual_tol,
+            1.486e-8,
+            2.082e-11,
+            2.069e-11,
+            3.772,
+            None,
+        )
+    };
+
+    let unpinned = refuse(0.5, vec![Some(Vec::new()), None]);
+    assert_eq!(unpinned.hpen_nullity_at_rank_tol, 0, "H = I has no null space");
+    assert_eq!(unpinned.active_set_rows_total, 0);
+    assert_eq!(
+        unpinned.diagnosis,
+        KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
+        "an active set that pins no row cannot be missing one from a projection that captured \
+         nothing; got {:?}",
+        unpinned.diagnosis,
+    );
+    assert_eq!(unpinned.carrying_block_name().as_deref(), Some("free"));
+    let bubbled = unpinned.format_bubbled_error();
+    assert!(
+        bubbled.contains("active_set_rows_total=0")
+            && bubbled.contains("jump or kink")
+            && bubbled.contains("a discontinuity, not a multiplier"),
+        "a zero-row refusal must point at the objective along the step: {bubbled}",
+    );
+
+    let pinned = refuse(0.0, vec![Some(vec![0]), None]);
+    assert_eq!(pinned.active_set_rows_total, 1);
+    assert_eq!(
+        pinned.diagnosis,
+        KktRefusalDiagnosis::ActiveSetIncomplete,
+        "a pinned row with the projected residual above tolerance is an incomplete active set; \
+         got {:?}",
+        pinned.diagnosis,
     );
 }

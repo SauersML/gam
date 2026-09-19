@@ -37,6 +37,30 @@ impl_reason_error_boilerplate! {
     }
 }
 
+impl SurvivalLocationScaleError {
+    /// The fixed category of this refusal, so a fit that stops on it raises the
+    /// class that names what failed (#2937).
+    #[must_use]
+    pub fn failure_category(&self) -> gam_problem::FailureCategory {
+        use gam_problem::FailureCategory;
+        match self {
+            // The pipeline's contract on the spec and data it is handed.
+            Self::InvalidConfiguration { .. } => FailureCategory::Input,
+            // Monotonicity, bounds and represented constraints the fit's own
+            // iterates or projections broke.
+            Self::ConstraintViolation { .. } | Self::NumericalFailure { .. } => {
+                FailureCategory::Numerical
+            }
+            // Shapes of the designs, penalty blocks and coefficients the
+            // pipeline built itself disagreeing, as for the marginal-slope
+            // family's `IncompatibleDimensions`.
+            Self::DimensionMismatch { .. } | Self::InternalInvariant { .. } => {
+                FailureCategory::Invariant
+            }
+        }
+    }
+}
+
 impl From<crate::block_layout::block_count::BlockCountMismatch> for SurvivalLocationScaleError {
     fn from(
         err: crate::block_layout::block_count::BlockCountMismatch,
@@ -108,3 +132,45 @@ impl From<String> for SurvivalLocationScaleError {
 // code — picks up the same clamp. Keeping a local copy here previously
 // allowed silent semantic divergence between the canonical sigma_link
 // version (unclamped) and the survival-local clamped version.
+
+#[cfg(test)]
+mod tests {
+    use super::SurvivalLocationScaleError;
+    use crate::fit_orchestration::FitFailure;
+    use gam_problem::FailureCategory;
+
+    /// #2937: a fit that stops on a `SurvivalLocationScaleError` raises the
+    /// class of its variant's category, with the refusal's own text.
+    #[test]
+    fn survival_location_scale_error_failure_categories_2937() {
+        let reason = || "row 3".to_string();
+        let cases = [
+            (
+                SurvivalLocationScaleError::InvalidConfiguration { reason: reason() },
+                FailureCategory::Input,
+            ),
+            (
+                SurvivalLocationScaleError::ConstraintViolation { reason: reason() },
+                FailureCategory::Numerical,
+            ),
+            (
+                SurvivalLocationScaleError::NumericalFailure { reason: reason() },
+                FailureCategory::Numerical,
+            ),
+            (
+                SurvivalLocationScaleError::DimensionMismatch { reason: reason() },
+                FailureCategory::Invariant,
+            ),
+            (
+                SurvivalLocationScaleError::InternalInvariant { reason: reason() },
+                FailureCategory::Invariant,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.failure_category(), expected, "{error}");
+            let failure = FitFailure::from(error.clone());
+            assert_eq!(failure.category(), expected, "{failure}");
+            assert_eq!(failure.to_string(), error.to_string());
+        }
+    }
+}

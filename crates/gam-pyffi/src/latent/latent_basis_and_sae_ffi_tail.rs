@@ -34,7 +34,6 @@ fn sae_manifold_fit_minimal<'py>(
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
     threshold_gate_threshold: f64,
-    native_ard_enabled: bool,
     // WP-D output-Fisher shard (#980). `(n, p, r)` f64 factors; presence activates
     // `RowMetric::OutputFisher`. This is the entry point the high-level Python
     // `sae_manifold_fit` facade routes through, so it carries the explicit shard
@@ -131,7 +130,6 @@ fn sae_manifold_fit_minimal<'py>(
         analytic_penalties,
         top_k,
         threshold_gate_threshold,
-        native_ard_enabled,
         refine_routing,
         random_state,
         // WP-D → fit wiring (#980): the factor shard selects the native
@@ -459,7 +457,6 @@ impl Tier0SaeCore {
     assignment_kind="softmax",
     gumbel_schedule=None,
     isometry_weight=0.0,
-    native_ard_enabled=true,
     decoder_feature_sparsity_groups=None,
     max_iter=50,
     sparsity_strength=None,
@@ -504,7 +501,6 @@ fn sae_manifold_fit_model<'py>(
     assignment_kind: &str,
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     isometry_weight: f64,
-    native_ard_enabled: bool,
     decoder_feature_sparsity_groups: Option<Vec<Vec<usize>>>,
     max_iter: usize,
     sparsity_strength: Option<f64>,
@@ -630,9 +626,8 @@ fn sae_manifold_fit_model<'py>(
         p_out,
     })
     .map_err(py_value_error)?;
-    if native_ard_enabled {
-        penalties.push("ARDPenalty".to_string());
-    }
+    // #2822 — the coordinate ARD prior is mandatory, so every fit carries it.
+    penalties.push("ARDPenalty".to_string());
 
     // Crossing K>P under hard TopK changes representation before the dense
     // minimal seed is even named. The support driver owns admission, seeding,
@@ -692,11 +687,6 @@ fn sae_manifold_fit_model<'py>(
             return Err(py_value_error(format!(
                 "support-sparse ManifoldSAE does not accept dense-coordinate or coefficient penalties; requested {penalties:?}. Its smoothing term is the LAML-selected final-function seminorm"
             )));
-        }
-        if !native_ard_enabled {
-            return Err(py_value_error(
-                "support-sparse ManifoldSAE requires its coordinate ARD prior".to_string(),
-            ));
         }
         if learnable_alpha || gumbel_schedule.is_some() || threshold_gate_threshold != 0.0 {
             return Err(py_value_error(
@@ -763,7 +753,6 @@ fn sae_manifold_fit_model<'py>(
         initial_logits,
         initial_coords,
         threshold_gate_threshold,
-        native_ard_enabled,
         fisher_factors.clone(),
         fisher_mass_residual,
         fisher_provenance.clone(),
@@ -2392,7 +2381,7 @@ fn gaussian_reml_fit_latent_backward_impl(
         let mut grad_log_prec = Array1::<f64>::zeros(latent_dim);
         for n in 0..n_obs {
             for a in 0..latent_dim {
-                let prec = precisions.physical[a];
+                let prec = precisions.physical()[a];
                 if grad_reml_score != 0.0 {
                     grad_t[n * latent_dim + a] += grad_reml_score * prec * t_mat[[n, a]];
                 }
@@ -2422,444 +2411,6 @@ fn gaussian_reml_fit_latent_backward_impl(
         grad_aux_log_strength,
         grad_dim_selection_log_precision,
     })
-}
-
-/// Owned inputs for the latent outer-optimization objective.
-///
-/// Bundles the data the value/gradient evaluation needs so a single struct can
-/// be reused across trust-region iterations and restarts without re-copying
-/// from Python.
-struct LatentOuterProblem {
-    y: Array2<f64>,
-    centers: Array2<f64>,
-    penalty: Array2<f64>,
-    weights: Option<Array1<f64>>,
-    aux_u: Option<Array2<f64>>,
-    dim_selection: Option<ValidatedDimSelectionPrecisions>,
-    family: AuxPriorFamily,
-    aux_strength: Option<f64>,
-    init_lambda: Option<f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    m: usize,
-    basis_kind: String,
-    tensor_knots: Option<Array1<f64>>,
-    tensor_knot_offsets: Option<Vec<usize>>,
-    tensor_degrees: Option<Vec<usize>>,
-    /// Per-axis chart period of the optimizer's manifold (radians) for the
-    /// Duchon decoder; `None` on Euclidean / sphere so the decoder stays the
-    /// open Euclidean basis. Derived from the `manifold` string in
-    /// `gaussian_reml_optimize_latent` via `latent_manifold_periodic_descriptor`.
-    periodic: Option<Vec<Option<f64>>>,
-}
-
-impl LatentOuterProblem {
-    /// REML score (inner Gaussian REML plus aux/dim identifiability priors) and,
-    /// when `want_grad`, the outer latent gradient `∂(reml_score)/∂t`.
-    ///
-    /// The value reproduces [`gaussian_reml_fit_latent`]'s `reml_score` and the
-    /// gradient reproduces [`gaussian_reml_fit_latent_backward`]'s `grad_t` at
-    /// `grad_reml_score = 1`, so the optimizer descends exactly the quantity the
-    /// forward primitive reports. A non-finite or unsolvable configuration maps
-    /// to `+∞` with no gradient, which the trust region rejects rather than
-    /// propagating a NaN into the inner adjoint.
-    fn value_and_grad(
-        &self,
-        t_flat: ArrayView1<'_, f64>,
-        want_grad: bool,
-    ) -> (f64, Option<Array1<f64>>) {
-        match self.try_value_and_grad(t_flat, want_grad) {
-            Ok(pair) => pair,
-            Err(_) => (f64::INFINITY, None),
-        }
-    }
-
-    fn try_value_and_grad(
-        &self,
-        t_flat: ArrayView1<'_, f64>,
-        want_grad: bool,
-    ) -> Result<(f64, Option<Array1<f64>>), String> {
-        let (design, t_mat, jet) = build_latent_forward_design(
-            &self.basis_kind,
-            t_flat,
-            self.n_obs,
-            self.latent_dim,
-            self.centers.view(),
-            self.m,
-            self.tensor_knots.as_ref().map(|a| a.view()),
-            self.tensor_knot_offsets.as_deref(),
-            self.tensor_degrees.as_deref(),
-            self.periodic.as_deref(),
-        )?;
-        let weights_view = self.weights.as_ref().map(|w| w.view());
-        let fit = gaussian_reml_multi_closed_form_with_cache(
-            design.view(),
-            self.y.view(),
-            self.penalty.view(),
-            weights_view,
-            self.init_lambda,
-            None,
-        )
-        .map_err(|err| err.to_string())?;
-        let (prior_score, _aux_state) = latent_prior_score_and_aux_state_for_t(
-            t_mat.view(),
-            self.aux_u.as_ref().map(|a| a.view()),
-            self.family,
-            self.aux_strength,
-            self.dim_selection.as_ref(),
-        )?;
-        let value = fit.reml_score + prior_score;
-        if !value.is_finite() {
-            return Ok((f64::INFINITY, None));
-        }
-        if !want_grad {
-            return Ok((value, None));
-        }
-        let backward = gaussian_reml_multi_closed_form_backward_from_fit(
-            design.view(),
-            self.y.view(),
-            self.penalty.view(),
-            weights_view,
-            &fit,
-            0.0,
-            None,
-            None,
-            1.0,
-            0.0,
-        )
-        .map_err(|err| err.to_string())?;
-        let mut grad_t = contract_input_loc_gradient(backward.grad_x.view(), &jet)
-            .map_err(|err| err.to_string())?;
-        // Identifiability-prior contributions, identical to the backward path's
-        // grad_t assembly at `grad_reml_score = 1`.
-        if let Some(u_arr) = self.aux_u.as_ref() {
-            let u_view = u_arr.view();
-            let stats =
-                latent_aux_prior_stats(t_mat.view(), u_view, self.family, self.aux_strength)?;
-            let residual = &t_mat - &stats.targets;
-            let projected_residual = aux_prior_targets(residual.view(), u_view, self.family)?;
-            let grad_base = residual - projected_residual;
-            for n in 0..self.n_obs {
-                for a in 0..self.latent_dim {
-                    grad_t[n * self.latent_dim + a] += stats.strength.mu * grad_base[[n, a]];
-                }
-            }
-        }
-        if let Some(precisions) = self.dim_selection.as_ref() {
-            for n in 0..self.n_obs {
-                for a in 0..self.latent_dim {
-                    let prec = precisions.physical[a];
-                    grad_t[n * self.latent_dim + a] += prec * t_mat[[n, a]];
-                }
-            }
-        }
-        if !grad_t.iter().all(|value| value.is_finite()) {
-            return Ok((f64::INFINITY, None));
-        }
-        Ok((value, Some(grad_t)))
-    }
-}
-
-/// Adapter exposing [`LatentOuterProblem`] to the Riemannian trust region.
-struct LatentOuterObjective<'a> {
-    problem: &'a LatentOuterProblem,
-}
-
-impl gam::geometry::RiemannianObjective for LatentOuterObjective<'_> {
-    fn value_gradient(
-        &mut self,
-        point: ArrayView1<'_, f64>,
-    ) -> gam::geometry::GeometryResult<(f64, Array1<f64>)> {
-        // A degenerate point yields `+∞` and a zero gradient: the trust region
-        // reads a zero gradient at the start as "stationary" (it stops at the
-        // finite init) and a `+∞` trial value as a rejected step (it shrinks).
-        match self.problem.value_and_grad(point, true) {
-            (value, Some(grad)) => Ok((value, grad)),
-            (_, None) => Ok((f64::INFINITY, Array1::<f64>::zeros(point.len()))),
-        }
-    }
-}
-
-/// Build the manifold the outer optimizer walks `t` on. `manifold` names the
-/// per-observation geometry; the full latent lives on the `n_obs`-fold product.
-/// Per-axis chart period for the latent decoder, derived from the optimizer's
-/// manifold so the Duchon decoder is a genuine function ON that manifold.
-///
-/// The circle manifold (`src/geometry/circle.rs`) wraps each coordinate to
-/// `[-π, π)`, i.e. period `2π = TAU` radians; the torus is its `d`-fold product.
-/// The optimizer retracts the latent in radians on these charts, and the
-/// periodic eigenmap seed (`latent_periodic_seed_start`) also produces radians,
-/// so the decoder kernel distance must be measured modulo `TAU` per circular
-/// axis and satisfy `Φ(θ) = Φ(θ + TAU)`. A non-periodic axis is `None`.
-///
-/// Euclidean / sphere return `None` (no axis is a circle): those latent fits
-/// stay byte-identical to the open Euclidean Duchon basis. (`sphere` is `S^{d-1}`
-/// embedded in `R^d` with NO periodic chart axis here — the spherical structure
-/// is carried by the retraction, not by a per-axis wrap.)
-fn latent_manifold_periodic_descriptor(
-    manifold: &str,
-    latent_dim: usize,
-) -> Option<Vec<Option<f64>>> {
-    match manifold.to_ascii_lowercase().replace('-', "_").as_str() {
-        "circle" | "s1" if latent_dim == 1 => Some(vec![Some(std::f64::consts::TAU)]),
-        "torus" => Some(vec![Some(std::f64::consts::TAU); latent_dim]),
-        _ => None,
-    }
-}
-
-fn build_latent_outer_manifold(
-    manifold: &str,
-    n_obs: usize,
-    latent_dim: usize,
-) -> Result<Box<dyn gam::geometry::RiemannianManifold>, String> {
-    let per_point = match manifold.to_ascii_lowercase().replace('-', "_").as_str() {
-        "euclidean" | "rn" => {
-            // One flat Euclidean block over the whole latent is equivalent to
-            // the product and avoids the per-observation slicing overhead.
-            return Ok(Box::new(gam::geometry::EuclideanManifold::new(
-                n_obs * latent_dim,
-            )));
-        }
-        "circle" | "s1" => {
-            if latent_dim != 1 {
-                return Err(format!(
-                    "circle latent manifold requires latent_dim == 1; got {latent_dim}"
-                ));
-            }
-            gam::geometry::ManifoldSpec::Circle
-        }
-        "sphere" => {
-            if latent_dim < 2 {
-                return Err(format!(
-                    "sphere latent manifold requires latent_dim >= 2 (S^{{d-1}} embeds in R^d); got {latent_dim}"
-                ));
-            }
-            gam::geometry::ManifoldSpec::Sphere {
-                intrinsic_dim: latent_dim - 1,
-            }
-        }
-        "torus" => gam::geometry::ManifoldSpec::Torus { dim: latent_dim },
-        other => {
-            return Err(format!(
-                "unknown latent manifold {other:?}; expected one of euclidean|circle|sphere|torus"
-            ));
-        }
-    };
-    let parts = std::iter::repeat_with(|| per_point.clone())
-        .take(n_obs)
-        .collect();
-    gam::geometry::ManifoldSpec::Product(parts)
-        .build()
-        .map_err(|err| err.to_string())
-}
-
-/// Build the restart-0 start for the latent outer optimizer from a spectral
-/// (Laplacian-eigenmaps) embedding of the responses `y`.
-///
-/// The embedding recovers the intrinsic coordinate up to monotone/rotation
-/// gauge; each axis is then affinely mapped from `[0, 1]` onto the span of the
-/// decoder `centers` for that axis so the seed lands where the basis `Φ` is
-/// well-conditioned. On a *periodic* latent manifold (circle/torus) the natural
-/// seed is the circular coordinate recovered from the leading Laplacian modes
-/// (see [`latent_periodic_seed_start`]); the sphere has no closed-form spectral
-/// seed here, so the caller's `t` is used unchanged.
-///
-/// A spread seed is essential, not optional: the outer optimizer's REML
-/// objective is degenerate at a *collapsed* latent (all rows at the same
-/// coordinate give identical decoder rows → a rank-deficient inner solve and no
-/// usable descent direction). The default caller start is the all-zero vector,
-/// which on a periodic manifold is exactly the collapsed configuration; without
-/// a spread seed the circle/torus optimizer can never escape it (issue #876).
-fn latent_spectral_seed_start(
-    y: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    manifold: &str,
-    n_obs: usize,
-    latent_dim: usize,
-    seed_neighbors: usize,
-    caller_t: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let manifold_norm = manifold.to_ascii_lowercase().replace('-', "_");
-    if matches!(manifold_norm.as_str(), "circle" | "s1" | "torus") {
-        return latent_periodic_seed_start(y, n_obs, latent_dim, seed_neighbors, caller_t);
-    }
-    if !matches!(manifold_norm.as_str(), "euclidean" | "rn") {
-        return Ok(caller_t.to_owned());
-    }
-    if y.nrows() != n_obs {
-        return Err(format!(
-            "spectral seed: y has {} rows but n_obs = {n_obs}",
-            y.nrows()
-        ));
-    }
-    // Too few rows to expose `latent_dim` non-trivial modes: fall back to the
-    // caller's start rather than failing the whole optimize call.
-    if n_obs < latent_dim + 2 {
-        return Ok(caller_t.to_owned());
-    }
-    let coords = gam::geometry::laplacian_eigenmap_coords(y, latent_dim, seed_neighbors)?;
-    // Per-axis target span from the decoder centers; fall back to [0, 1] when an
-    // axis has no corresponding center column or a degenerate span.
-    let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
-    for a in 0..latent_dim {
-        let (lo, hi) = if a < centers.ncols() {
-            let col = centers.column(a);
-            let lo = col.iter().cloned().fold(f64::INFINITY, f64::min);
-            let hi = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            if lo.is_finite() && hi.is_finite() && hi > lo {
-                (lo, hi)
-            } else {
-                (0.0, 1.0)
-            }
-        } else {
-            (0.0, 1.0)
-        };
-        for n in 0..n_obs {
-            start[n * latent_dim + a] = lo + coords[[n, a]] * (hi - lo);
-        }
-    }
-    Ok(start)
-}
-
-/// Spectral seed for a *periodic* latent (circle / torus), returning each row's
-/// angle in `[-π, π)` per axis.
-///
-/// On a circle the two leading non-trivial Laplacian-eigenmap modes of the
-/// responses are (up to rotation/reflection — exactly the circle's gauge) the
-/// `cos θ` / `sin θ` pair of the intrinsic angle, so `θ = atan2(sin-mode,
-/// cos-mode)` recovers the circular coordinate directly. A torus of dimension
-/// `d` is `d` independent circles; we recover one angle per axis from its own
-/// pair of modes, requesting `2·d` modes from the embedding and pairing them in
-/// order. The recovered angle is a *seed* — correct up to the periodic gauge the
-/// decoder is free in — that the Riemannian outer optimizer then polishes.
-///
-/// Crucially this seed is *spread* around the circle, breaking the collapsed
-/// all-zero start (issue #876). When there are too few rows to expose `2·d`
-/// non-trivial modes the embedding cannot run; rather than start collapsed we
-/// fall back to a deterministic equispaced angular sweep on each axis, which is
-/// still non-degenerate (distinct decoder rows) so the optimizer has a usable
-/// gradient.
-fn latent_periodic_seed_start(
-    y: ArrayView2<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    seed_neighbors: usize,
-    caller_t: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    use std::f64::consts::TAU;
-
-    if latent_dim == 0 {
-        return Ok(caller_t.to_owned());
-    }
-    if y.nrows() != n_obs {
-        return Err(format!(
-            "periodic spectral seed: y has {} rows but n_obs = {n_obs}",
-            y.nrows()
-        ));
-    }
-    // A circle/torus axis needs two embedding modes (cos/sin); recover one angle
-    // per axis. If the caller already supplied a *spread* warm start (not the
-    // collapsed default), keep it — the optimizer can polish a good start, but it
-    // can never escape a collapsed one. "Spread" is measured per axis by the
-    // angular range the wrapped coordinates cover.
-    let caller_spread = caller_t.len() == n_obs * latent_dim
-        && (0..latent_dim).any(|a| {
-            let mut lo = f64::INFINITY;
-            let mut hi = f64::NEG_INFINITY;
-            for n in 0..n_obs {
-                let v = wrap_to_pi(caller_t[n * latent_dim + a]);
-                lo = lo.min(v);
-                hi = hi.max(v);
-            }
-            (hi - lo) > 1.0e-6
-        });
-    if caller_spread {
-        return Ok(caller_t.to_owned());
-    }
-
-    let modes = 2 * latent_dim;
-    // `laplacian_eigenmap_coords` needs `n >= modes + 2` rows to expose `modes`
-    // non-trivial eigenvectors. With fewer rows, sweep angles deterministically.
-    if n_obs < modes + 2 {
-        let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
-        for a in 0..latent_dim {
-            for n in 0..n_obs {
-                let frac = if n_obs > 0 {
-                    n as f64 / n_obs as f64
-                } else {
-                    0.0
-                };
-                start[n * latent_dim + a] = wrap_to_pi(frac * TAU);
-            }
-        }
-        return Ok(start);
-    }
-
-    // The raw (un-rescaled) generalized eigenvectors are what carry the cos/sin
-    // structure; `laplacian_eigenmap_coords` already rescales each axis to
-    // [0, 1], which destroys the relative sign/scale needed for atan2. We
-    // instead read `2·d` modes and undo the per-axis affine map by recentering
-    // each mode to zero mean before pairing — the rescale is affine per mode, so
-    // recentering recovers the angle up to the same rotation gauge.
-    let coords = gam::geometry::laplacian_eigenmap_coords(y, modes, seed_neighbors)?;
-    let mut mode_mean = vec![0.0f64; modes];
-    for a in 0..modes {
-        let mut sum = 0.0;
-        for n in 0..n_obs {
-            sum += coords[[n, a]];
-        }
-        mode_mean[a] = sum / n_obs as f64;
-    }
-
-    let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
-    for axis in 0..latent_dim {
-        let cos_mode = 2 * axis;
-        let sin_mode = 2 * axis + 1;
-        for n in 0..n_obs {
-            let c = coords[[n, cos_mode]] - mode_mean[cos_mode];
-            let s = coords[[n, sin_mode]] - mode_mean[sin_mode];
-            let angle = if c == 0.0 && s == 0.0 {
-                // Degenerate row (both modes vanish): place it deterministically
-                // around the circle so it does not coincide with its neighbours.
-                wrap_to_pi((n as f64 / n_obs as f64) * TAU)
-            } else {
-                s.atan2(c)
-            };
-            start[n * latent_dim + axis] = angle;
-        }
-        // Guard against a collapsed axis (both modes constant → all angles
-        // equal): fall back to an equispaced sweep on that axis only.
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for n in 0..n_obs {
-            let v = start[n * latent_dim + axis];
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-        if !(hi - lo > 1.0e-6) {
-            for n in 0..n_obs {
-                let frac = if n_obs > 0 {
-                    n as f64 / n_obs as f64
-                } else {
-                    0.0
-                };
-                start[n * latent_dim + axis] = wrap_to_pi(frac * TAU);
-            }
-        }
-    }
-    Ok(start)
-}
-
-/// Wrap an angle to the half-open interval `[-π, π)`.
-fn wrap_to_pi(angle: f64) -> f64 {
-    use std::f64::consts::{PI, TAU};
-    let mut a = angle % TAU;
-    if a >= PI {
-        a -= TAU;
-    } else if a < -PI {
-        a += TAU;
-    }
-    a
 }
 
 /// Optimize the latent coordinate `t` against the Gaussian-REML objective.

@@ -12,8 +12,9 @@
 //!
 //! **The nerve.** `N(𝒰)` is the simplicial complex whose `k`-simplices are the
 //! `(k+1)`-subsets `S` with `⋂_{i∈S} U_i ≠ ∅`. By the nerve theorem, when every
-//! non-empty finite intersection is contractible, `N(𝒰) ≃ M`; its `GF(2)` homology
-//! and its Euler characteristic are then the manifold's. Two things this module
+//! non-empty finite intersection is contractible, the nerve has the homotopy type of
+//! the union of the cover. [`AtlasGoodCover`] checks that hypothesis on the rows'
+//! own complex, and a certified name is read through it. Two things this module
 //! refuses to get wrong, both of them measured mistakes recorded on the issue:
 //! the 1-skeleton alone is the OVERLAP GRAPH and its cycle rank is a property of
 //! the cover, not of `M`; and truncating `χ` at triples is wrong for any data
@@ -75,14 +76,18 @@
 //!
 //! Every quantity here is named `observed_*` for the same reason
 //! [`LocalAtlas::observed_orientability`] is: this module has no sampling model
-//! and no error probability, so it may PROPOSE a topology but never promote one.
+//! and no error probability. An observed name may only PROPOSE a topology: it puts
+//! the recognized manifold in front of the evidence race, which then adjudicates
+//! it on the same REML scale as every other candidate. A name is PROMOTED
+//! ([`AtlasTopologyReadout::certified_manifold`]) only when [`AtlasGoodCover`]
+//! certifies every intersection of the cover contractible, so that the invariants it
+//! was read from are theorem outputs about the rows' complex. That promotion is a
+//! statement about the sampled complex, not about the population it was drawn from.
 //! A population claim continues to route through
-//! [`crate::inference::atlas_holonomy::AtlasHolonomyCertificate`]. What the
-//! verdict is authorized to do is put the recognized manifold in front of the
-//! evidence race, which then adjudicates it on the same REML scale as every other
-//! candidate.
+//! [`crate::inference::atlas_holonomy::AtlasHolonomyCertificate`].
 
 use super::local_charts::sorted_intersection;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -206,6 +211,70 @@ impl fmt::Display for TopologyRefusal {
     }
 }
 
+/// Whether every non-empty intersection of the atlas's patches is contractible, as a
+/// finite simplicial complex on the rows (#2280).
+///
+/// # The complex
+///
+/// The rows carry the atlas's own neighbourhood graph `G`
+/// ([`LocalAtlas::neighbourhood`]), the graph patch membership grew through. Patch `i`
+/// spans the flag complex `K_i` of the subgraph `G[U_i]` its members induce, and
+/// `{K_i}` covers `K = ⋃_i K_i`. The flag complexes of induced subgraphs intersect as
+/// the flag complex of the induced subgraph on the common rows, so
+/// `⋂_{i∈S} K_i = Flag(G[⋂_{i∈S} U_i])`, and the nerve of `{K_i}` is exactly the
+/// membership nerve the readout enumerates.
+///
+/// # The certificate
+///
+/// A graph is DISMANTLABLE when its vertices can be deleted one at a time, each
+/// dominated at its deletion by a surviving neighbour (`N[v] ⊆ N[u]`), down to one
+/// vertex. Deleting a dominated vertex is a strong collapse of the flag complex, so a
+/// dismantlable graph's flag complex is contractible. When every `G[⋂_{i∈S} U_i]`
+/// dismantles, `{K_i}` is a good cover and the nerve theorem gives `N ≃ K`: the
+/// nerve's `b₀, b₁, b₂` and `χ` are then those of `K`. The check is exact, with no
+/// tolerance, and its outcome does not depend on the deletion order, because a graph
+/// is dismantlable exactly when every maximal sequence of dominated-vertex deletions
+/// ends at one vertex.
+///
+/// Dismantlability is sufficient for contractibility, not necessary. A refusal
+/// therefore says the cover could not be certified, and it names the first
+/// intersection that does not dismantle. The certificate says nothing about how `K`
+/// relates to the manifold the rows were sampled from; that is a sampling claim it
+/// does not price.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AtlasGoodCover {
+    /// Every non-empty intersection dismantles. `intersections` counts them, patches
+    /// included.
+    Certified { intersections: usize },
+    /// The first intersection, in canonical nerve order, that does not dismantle.
+    Refused(GoodCoverRefusal),
+    /// The readout refused before enumerating the nerve, so no intersection was examined.
+    NotExamined,
+}
+
+/// An intersection of patches whose induced neighbourhood graph does not dismantle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GoodCoverRefusal {
+    /// The patches whose members intersect, ascending.
+    pub simplex: Vec<usize>,
+    /// Rows the patches share.
+    pub shared_rows: usize,
+    /// Rows left when no remaining row is dominated.
+    pub remaining_rows: usize,
+    /// Connected components of the graph those rows induce.
+    pub components: usize,
+}
+
+impl fmt::Display for GoodCoverRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "patches {:?} share {} rows whose neighbourhood graph stops dismantling at {} rows in {} components",
+            self.simplex, self.shared_rows, self.remaining_rows, self.components
+        )
+    }
+}
+
 /// The exact invariants measured on one atlas: the nerve's `GF(2)` homology, its
 /// full-nerve Euler characteristic, and the orientation class of the transition
 /// signs.
@@ -261,6 +330,7 @@ pub struct AtlasTopologyReadout {
     orientation_gauge: Vec<i8>,
     twisted_edges: Vec<(usize, usize)>,
     verdict: Result<GraphCompressionKind, TopologyRefusal>,
+    good_cover: AtlasGoodCover,
 }
 
 impl AtlasTopologyReadout {
@@ -304,6 +374,23 @@ impl AtlasTopologyReadout {
     #[must_use]
     pub fn refusal(&self) -> Option<&TopologyRefusal> {
         self.verdict.as_ref().err()
+    }
+
+    /// Whether the cover's intersections are certified contractible; see [`AtlasGoodCover`].
+    #[must_use]
+    pub fn good_cover(&self) -> &AtlasGoodCover {
+        &self.good_cover
+    }
+
+    /// The recognized manifold, PROMOTED: returned only when [`AtlasGoodCover`] certifies
+    /// the cover, so the invariants the name was read from are those of the rows' complex
+    /// by the nerve theorem rather than an observation of the nerve.
+    #[must_use]
+    pub fn certified_manifold(&self) -> Option<GraphCompressionKind> {
+        match self.good_cover {
+            AtlasGoodCover::Certified { .. } => self.observed_manifold(),
+            AtlasGoodCover::Refused(_) | AtlasGoodCover::NotExamined => None,
+        }
     }
 
     /// Whether the recognized manifold is non-orientable — POSITIVE evidence of a
@@ -358,7 +445,14 @@ impl fmt::Display for AtlasTopologyReadout {
             inv.signed_subcomplex_betti.b0,
             inv.signed_subcomplex_betti.b1,
             inv.dropped_center_count,
-        )
+        )?;
+        match &self.good_cover {
+            AtlasGoodCover::Certified { intersections } => {
+                write!(f, " good_cover=certified({intersections} intersections)")
+            }
+            AtlasGoodCover::Refused(refusal) => write!(f, " good_cover=refused({refusal})"),
+            AtlasGoodCover::NotExamined => write!(f, " good_cover=not_examined"),
+        }
     }
 }
 
@@ -421,6 +515,7 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
             orientation_gauge: Vec::new(),
             twisted_edges: Vec::new(),
             verdict: Err(TopologyRefusal::EmptyAtlas),
+            good_cover: AtlasGoodCover::NotExamined,
         });
     }
 
@@ -546,6 +641,7 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
                 admissible: admissible_multiplicity,
                 mean: mean_cover_multiplicity,
             }),
+            good_cover: AtlasGoodCover::NotExamined,
         });
     }
 
@@ -563,6 +659,27 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
         }
     }
 
+    // The good-cover certificate examines every non-empty intersection the enumeration
+    // admits, patches included, and keeps the first one that does not dismantle.
+    let neighbourhood = atlas.neighbourhood();
+    let good_cover_refusal: RefCell<Option<GoodCoverRefusal>> = RefCell::new(None);
+    let examine = |simplex: &[usize], rows: &[usize]| {
+        if good_cover_refusal.borrow().is_some() {
+            return;
+        }
+        if let Err((remaining_rows, components)) = dismantle(neighbourhood, rows) {
+            *good_cover_refusal.borrow_mut() = Some(GoodCoverRefusal {
+                simplex: simplex.to_vec(),
+                shared_rows: rows.len(),
+                remaining_rows,
+                components,
+            });
+        }
+    };
+    for (chart, rows) in members.iter().enumerate() {
+        examine(&[chart], rows);
+    }
+
     let nonempty = |simplex: &[usize]| -> bool {
         let Some((&first, rest)) = simplex.split_first() else {
             return false;
@@ -574,10 +691,17 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
                 return false;
             }
         }
-        !shared.is_empty()
+        examine(simplex, &shared);
+        true
     };
 
     let inventory = enumerate_full_nerve(chart_count, &nonempty, &adjacency)?;
+    let good_cover = match good_cover_refusal.into_inner() {
+        Some(refusal) => AtlasGoodCover::Refused(refusal),
+        None => AtlasGoodCover::Certified {
+            intersections: inventory.counts.iter().sum(),
+        },
+    };
     let betti = compute_betti(
         &inventory.vertices,
         &inventory.edges,
@@ -686,7 +810,80 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
         orientation_gauge,
         twisted_edges,
         verdict,
+        good_cover,
     })
+}
+
+/// Dismantle the subgraph of `neighbourhood` that `rows` (ascending) induce: repeatedly
+/// delete a row dominated by a surviving neighbour, `N[v] ⊆ N[u]` over the surviving rows,
+/// lowest index first. `Ok` when one row remains (or none were given); otherwise the rows
+/// left when none is dominated and the number of components they induce.
+///
+/// Closed neighbourhoods are bitsets over the induced rows, so a domination test costs
+/// `⌈m/64⌉` words and a deletion pass `O(m·deg·⌈m/64⌉)`.
+fn dismantle(neighbourhood: &[Vec<(usize, f64)>], rows: &[usize]) -> Result<(), (usize, usize)> {
+    let m = rows.len();
+    if m <= 1 {
+        return Ok(());
+    }
+    let words = m.div_ceil(64);
+    let mut closed = vec![vec![0u64; words]; m];
+    let mut neighbours: Vec<Vec<usize>> = vec![Vec::new(); m];
+    for (local, &row) in rows.iter().enumerate() {
+        closed[local][local / 64] |= 1u64 << (local % 64);
+        for &(other_row, _) in &neighbourhood[row] {
+            if let Ok(other) = rows.binary_search(&other_row) {
+                if other != local {
+                    closed[local][other / 64] |= 1u64 << (other % 64);
+                    neighbours[local].push(other);
+                }
+            }
+        }
+    }
+    let mut alive = vec![!0u64; words];
+    if m % 64 != 0 {
+        alive[words - 1] = (1u64 << (m % 64)) - 1;
+    }
+    let is_alive = |alive: &[u64], vertex: usize| alive[vertex / 64] & (1u64 << (vertex % 64)) != 0;
+    let mut remaining = m;
+    while remaining > 1 {
+        let dominated = (0..m).find(|&vertex| {
+            is_alive(&alive, vertex)
+                && neighbours[vertex].iter().any(|&dominator| {
+                    is_alive(&alive, dominator)
+                        && (0..words)
+                            .all(|word| closed[vertex][word] & alive[word] & !closed[dominator][word] == 0)
+                })
+        });
+        match dominated {
+            Some(vertex) => {
+                alive[vertex / 64] &= !(1u64 << (vertex % 64));
+                remaining -= 1;
+            }
+            None => {
+                let mut seen = vec![false; m];
+                let mut components = 0usize;
+                for start in 0..m {
+                    if seen[start] || !is_alive(&alive, start) {
+                        continue;
+                    }
+                    components += 1;
+                    seen[start] = true;
+                    let mut stack = vec![start];
+                    while let Some(vertex) = stack.pop() {
+                        for &next in &neighbours[vertex] {
+                            if !seen[next] && is_alive(&alive, next) {
+                                seen[next] = true;
+                                stack.push(next);
+                            }
+                        }
+                    }
+                }
+                return Err((remaining, components));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reduce the sign cochain to a gauge: one coherent sign per chart plus the edges
@@ -840,6 +1037,71 @@ mod tests_2280 {
         let config = LocalAtlasConfig::balanced(z.nrows(), d);
         let atlas = LocalAtlas::build(z, config).expect("fixture atlas must build");
         observe_atlas_topology(&atlas).expect("fixture readout must not error")
+    }
+
+    /// An undirected graph on rows `0..n` from its edge list, in the neighbourhood-graph
+    /// format `dismantle` reads.
+    fn graph(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<(usize, f64)>> {
+        let mut adjacency = vec![Vec::new(); n];
+        for &(a, b) in edges {
+            adjacency[a].push((b, 1.0));
+            adjacency[b].push((a, 1.0));
+        }
+        adjacency
+    }
+
+    /// #2280 — the good-cover certificate's contractibility test against graphs whose flag
+    /// complexes are known exactly. A path and a cone contract, and they dismantle. The
+    /// 4-cycle's flag complex is a circle and two disjoint edges are two points; neither is
+    /// contractible, and both are refused with their measured components. The induced
+    /// subgraph is what is tested: rows outside `rows` never count, as the square's diagonal
+    /// row set shows.
+    #[test]
+    fn dismantling_certifies_exactly_the_contractible_test_graphs_2280() {
+        let path = graph(4, &[(0, 1), (1, 2), (2, 3)]);
+        assert_eq!(dismantle(&path, &[0, 1, 2, 3]), Ok(()));
+        let cone = graph(5, &[(0, 1), (1, 2), (2, 3), (3, 0), (4, 0), (4, 1), (4, 2), (4, 3)]);
+        assert_eq!(dismantle(&cone, &[0, 1, 2, 3, 4]), Ok(()));
+        let square = graph(4, &[(0, 1), (1, 2), (2, 3), (3, 0)]);
+        assert_eq!(dismantle(&square, &[0, 1, 2, 3]), Err((4, 1)));
+        assert_eq!(dismantle(&square, &[0, 2]), Err((2, 2)));
+        let two_edges = graph(4, &[(0, 1), (2, 3)]);
+        assert_eq!(dismantle(&two_edges, &[0, 1, 2, 3]), Err((2, 2)));
+    }
+
+    /// #2280 — a cover measured not to be a good cover is refused promotion, while its
+    /// observed name stands, and a good cover is promoted.
+    ///
+    /// `mobius_strip(60, 14)` is named `mobius_strip` by the observed readout, but some of its
+    /// pair intersections are disconnected in the atlas's own neighbourhood graph (probe job
+    /// 1102967 on the dumps of 1101765: 10 of 257 failing pairs, every listed example
+    /// disconnected). No contraction exists for a disconnected intersection, so a sound
+    /// certificate must refuse this cover. `circle(400, 2)` is the positive control: its
+    /// intersections are arcs, which dismantle, so the name is promoted.
+    #[test]
+    fn a_cover_that_is_not_good_is_named_but_not_promoted_2280() {
+        let band = read(mobius_strip(60, 14).view(), 2);
+        let circle_readout = read(circle(400, 2.0).view(), 1);
+        eprintln!("[2280-good-cover] band: {band}\n  circle: {circle_readout}");
+        assert_eq!(
+            band.observed_manifold(),
+            Some(GraphCompressionKind::MobiusStrip),
+            "the band's observed name is the control that the refusal below is about the cover: {band}"
+        );
+        assert!(
+            matches!(band.good_cover(), AtlasGoodCover::Refused(_)),
+            "a cover with disconnected intersections must not certify: {band}"
+        );
+        assert_eq!(band.certified_manifold(), None, "{band}");
+        assert!(
+            matches!(circle_readout.good_cover(), AtlasGoodCover::Certified { .. }),
+            "the circle's arc intersections must certify: {circle_readout}"
+        );
+        assert_eq!(
+            circle_readout.certified_manifold(),
+            Some(GraphCompressionKind::Circle),
+            "{circle_readout}"
+        );
     }
 
     /// A round circle is `S¹`: one 1-cycle in the nerve's `GF(2)` homology, `χ = 0`,

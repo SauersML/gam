@@ -1,5 +1,4 @@
 use super::*;
-use gam_problem::dispersion_cov::se_from_covariance;
 
 /// Above this rho dimension, startup work must be linear in "one real solve",
 /// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
@@ -274,6 +273,30 @@ impl ParametricColumnConditioning {
         out
     }
 
+    /// Row `index` of [`Self::left_multiply_by_m`]`(mat_internal)`, written
+    /// into `out` without forming the product. `M` moves only the intercept
+    /// row and the conditioned rows, so every other row is `mat_internal`'s own.
+    pub(crate) fn write_left_multiplied_row(
+        &self,
+        mat_internal: &Array2<f64>,
+        index: usize,
+        mut out: ndarray::ArrayViewMut1<'_, f64>,
+    ) {
+        out.assign(&mat_internal.row(index));
+        if self.intercept_idx == Some(index) {
+            for &(j, mean, scale) in &self.columns {
+                if mean != 0.0 {
+                    out.scaled_add(-(mean / scale), &mat_internal.row(j));
+                }
+            }
+        }
+        if let Some(&(_, _, scale)) = self.columns.iter().find(|&&(j, _, _)| j == index)
+            && scale != 1.0
+        {
+            out.mapv_inplace(|v| v / scale);
+        }
+    }
+
     /// Right-multiply `mat_internal` by `Mᵀ` (the transpose of the
     /// coefficient back-transform). Mirror of [`Self::left_multiply_by_m`]
     /// on columns.
@@ -399,6 +422,14 @@ impl ParametricColumnConditioning {
             return Ok(result);
         }
         result.beta = self.backtransform_beta(&result.beta);
+        result.covariance_conditional = result
+            .covariance_conditional
+            .take()
+            .map(|cov| self.backtransform_covariance(&cov));
+        result.covariance_corrected = result
+            .covariance_corrected
+            .take()
+            .map(|cov| self.backtransform_covariance(&cov));
         if let Some(geometry) = result.geometry.as_mut() {
             geometry.penalized_hessian = self
                 .backtransform_penalized_hessian(geometry.penalized_hessian.as_array())
@@ -421,34 +452,10 @@ impl ParametricColumnConditioning {
             inf.penalized_hessian = self
                 .backtransform_penalized_hessian(inf.penalized_hessian.as_array())
                 .into();
-            inf.beta_covariance = inf
-                .beta_covariance
-                .take()
-                .map(|cov| self.backtransform_covariance(cov.as_array()).into());
-            inf.beta_standard_errors = inf
-                .beta_covariance
-                .as_ref()
-                .map(|c| se_from_covariance(c.as_array()))
-                .transpose()
-                .map_err(|err| {
-                    EstimationError::InvalidInput(format!(
-                        "back-transformed conditional covariance is invalid: {err}"
-                    ))
-                })?;
-            inf.beta_covariance_corrected = inf
-                .beta_covariance_corrected
-                .take()
-                .map(|cov| self.backtransform_covariance(&cov));
-            inf.beta_standard_errors_corrected = inf
-                .beta_covariance_corrected
-                .as_ref()
-                .map(se_from_covariance)
-                .transpose()
-                .map_err(|err| {
-                    EstimationError::InvalidInput(format!(
-                        "back-transformed corrected covariance is invalid: {err}"
-                    ))
-                })?;
+            // `factorized_standard_errors` is left as it is: a diagonal does not
+            // survive the congruence, because `diag(M·Σ·Mᵀ)` reads the intercept
+            // cross-covariances, so the factorized branch solves those standard
+            // errors in the original coordinates directly (#2960).
             inf.beta_covariance_frequentist = inf
                 .beta_covariance_frequentist
                 .take()
@@ -590,6 +597,241 @@ pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
         cov
     } else {
         cov * phi
+    }
+}
+
+/// Standard errors of the published coefficients `β_orig = M·β_int` on the
+/// factorized inference branch, where no dense covariance exists (#2960).
+///
+/// The published covariance is `M·Σ·Mᵀ` with `Σ = s·Qs·H_t⁻¹·Qsᵀ − G·Δ·Gᵀ`, so
+/// its diagonal entry `i` is `s·r_iᵀ·H_t⁻¹·r_i − g_iᵀ·Δ·g_i`, with `r_i` row `i`
+/// of `M·Qs` and `g_i` row `i` of `M·G`: one solve against the Hessian factor
+/// per row, chunked under the governor exactly as `diag(H⁻¹)` is. `M` is the
+/// identity except on the intercept row and the conditioned rows, so a moved
+/// row replaces its own `Qs` row in the right-hand side and costs no extra
+/// solve.
+///
+/// A diagonal solved in the internal coordinates cannot be carried across
+/// afterwards, because `diag(M·Σ·Mᵀ)` reads the intercept cross-covariances.
+/// That is why these standard errors used to be dropped on every conditioned
+/// design.
+///
+/// `solve` returns `H_t⁻¹·rhs` for a right-hand side holding the rows `range`.
+pub(crate) fn factorized_standard_errors(
+    conditioning: &ParametricColumnConditioning,
+    qs: &Array2<f64>,
+    cov_scale: f64,
+    correction: Option<&crate::constrained_posterior::ConstrainedPosteriorCorrection>,
+    zero_covariance_boundary: bool,
+    chunk_cols: usize,
+    mut solve: impl FnMut(&Array2<f64>, std::ops::Range<usize>) -> Result<Array2<f64>, EstimationError>,
+) -> Result<Array1<f64>, EstimationError> {
+    let (p_cov, p_t) = qs.dim();
+    if chunk_cols == 0 {
+        return Err(EstimationError::RemlOptimizationFailed(
+            "resource policy cannot admit even one exact factorized coefficient-SE column"
+                .to_string(),
+        ));
+    }
+    let governor = gam_runtime::resource::MemoryGovernor::global();
+    let mut diag_inv = Array1::<f64>::zeros(p_cov);
+    let mut col_start = 0usize;
+    while col_start < p_cov {
+        let col_end = (col_start + chunk_cols).min(p_cov);
+        let chunk = col_end - col_start;
+        let chunk_reservation = governor
+            .try_reserve_dense_f64_copies(p_t, chunk, 2, "factorized coefficient-SE solve chunk")
+            // The typed refusal carries the budget, what was already
+            // reserved, and the availability observation the budget was
+            // derived from. Discarding it left two runs that refused for
+            // different reasons indistinguishable in the log, which is
+            // half of why #2702 took a filed issue to diagnose: state the
+            // measured quantities, not just the verdict.
+            .map_err(|refusal| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "resource policy refused exact coefficient-SE columns \
+                     {col_start}..{col_end} ({chunk} of {p_cov} columns, \
+                     {p_t} transformed rows): {refusal}"
+                ))
+            })?;
+        // Column `k` of the right-hand side is row `col_start + k` of `M·Qs`.
+        // The reservation covers this buffer and the solution jointly.
+        let mut mapped_rows = Array2::<f64>::zeros((p_t, chunk));
+        for local_i in 0..chunk {
+            conditioning.write_left_multiplied_row(
+                qs,
+                col_start + local_i,
+                mapped_rows.column_mut(local_i),
+            );
+        }
+        let rhs = chunk_reservation.bind(mapped_rows);
+        let z_chunk = solve(&*rhs, col_start..col_end)?;
+        for local_i in 0..chunk {
+            diag_inv[col_start + local_i] = rhs.column(local_i).dot(&z_chunk.column(local_i));
+        }
+        col_start = col_end;
+    }
+    let removed_variance = match correction {
+        Some(correction) => {
+            let mut mapped = correction.clone();
+            mapped.lift = conditioning.left_multiply_by_m(&mapped.lift);
+            mapped.removed_variance_diagonal()
+        }
+        None => Array1::<f64>::zeros(p_cov),
+    };
+    let mut se = Array1::<f64>::zeros(p_cov);
+    for (index, &variance_unscaled) in diag_inv.iter().enumerate() {
+        if !(variance_unscaled.is_finite() && variance_unscaled > 0.0) {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "exact factorized SPD inverse has invalid diagonal {index}: {variance_unscaled:?}"
+            )));
+        }
+        let base = cov_scale * variance_unscaled;
+        let removed = removed_variance[index];
+        let variance = base - removed;
+        // #2705 group A. The dense branch assembles this quantity as a
+        // sum of squares and cannot produce a negative variance; here
+        // there is no dense `Σ` to factor, so the subtraction stands —
+        // and on a coordinate the constraint pins, `removed` cancels
+        // `base` to the last digit and the residue carries a sign.
+        //
+        // The resolution of that residue is a MEASURED quantity, not a
+        // chosen one: `base` and `removed` are each accurate to a
+        // relative rounding error, so their difference is accurate to
+        // `~ε·max(base, removed)` in ABSOLUTE terms — which is the whole
+        // of the answer once the removal is complete. A residue inside
+        // that band is the zero it is approximating (the λ → ∞ limit of
+        // the truncation, the only value it can be). A residue outside
+        // it is a real negative variance and is refused, with the
+        // decomposition attached so the next reader does not have to
+        // re-derive which producer overran.
+        let subtraction_resolution = 16.0 * f64::EPSILON * base.abs().max(removed.abs());
+        let variance = if variance < 0.0 && -variance <= subtraction_resolution {
+            0.0
+        } else {
+            variance
+        };
+        let valid = if zero_covariance_boundary {
+            variance == 0.0
+        } else {
+            variance.is_finite() && variance >= 0.0
+        };
+        if !valid {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "factorized posterior variance {index} is not positive and \
+                 representable: {variance:?} [#2705 attribution: base={base:.6e} \
+                 removed_variance_diag={removed:.6e} \
+                 subtraction_resolution={subtraction_resolution:.6e}]"
+            )));
+        }
+        se[index] = variance.sqrt();
+    }
+    Ok(se)
+}
+
+#[cfg(test)]
+mod factorized_standard_errors_2960_tests {
+    use super::*;
+    use ndarray::{Array1, Array2, array};
+
+    /// `I − 2vvᵀ/‖v‖²`, an orthogonal reparameterization.
+    fn householder(v: &Array1<f64>) -> Array2<f64> {
+        let p = v.len();
+        let norm_sq = v.dot(v);
+        let mut q = Array2::<f64>::eye(p);
+        for i in 0..p {
+            for j in 0..p {
+                q[[i, j]] -= 2.0 * v[i] * v[j] / norm_sq;
+            }
+        }
+        q
+    }
+
+    /// `sqrt(diag(M·Σ·Mᵀ))` from the dense `Σ = s·Qs·H_t⁻¹·Qsᵀ − G·Δ·Gᵀ`.
+    fn dense_standard_errors(
+        conditioning: &ParametricColumnConditioning,
+        qs: &Array2<f64>,
+        inverse_hessian: &Array2<f64>,
+        cov_scale: f64,
+        correction: Option<&crate::constrained_posterior::ConstrainedPosteriorCorrection>,
+    ) -> Array1<f64> {
+        let mut internal = qs.dot(inverse_hessian).dot(&qs.t()) * cov_scale;
+        if let Some(correction) = correction {
+            internal -= &correction
+                .lift
+                .dot(&correction.removed_normal_variance)
+                .dot(&correction.lift.t());
+        }
+        conditioning
+            .backtransform_covariance(&internal)
+            .diag()
+            .mapv(f64::sqrt)
+    }
+
+    /// #2960: on a column-conditioned design the factorized branch publishes
+    /// the standard errors of the dense back-transformed covariance, with and
+    /// without a constraint, across a chunk boundary.
+    #[test]
+    fn factorized_standard_errors_equal_the_dense_back_transformed_diagonal_2960() {
+        let unconditioned = ParametricColumnConditioning {
+            intercept_idx: None,
+            columns: Vec::new(),
+        };
+        let conditioned = ParametricColumnConditioning {
+            intercept_idx: Some(0),
+            columns: vec![(1, 2.5, 1.7), (3, -0.8, 0.6)],
+        };
+        let qs = householder(&array![0.3, -1.1, 0.7, 0.4, 0.9]);
+        let b = array![
+            [1.0, 0.2, -0.3, 0.1, 0.0],
+            [0.4, 1.3, 0.2, -0.2, 0.1],
+            [-0.1, 0.3, 0.9, 0.5, -0.4],
+            [0.2, -0.5, 0.1, 1.1, 0.3],
+            [0.0, 0.1, -0.2, 0.3, 0.8],
+        ];
+        let inverse_hessian = b.dot(&b.t()) + Array2::<f64>::eye(5) * 0.5;
+        let cov_scale = 1.3;
+        let correction = crate::constrained_posterior::ConstrainedPosteriorCorrection {
+            lift: array![[0.2], [-0.1], [0.3], [0.05], [0.1]],
+            removed_normal_variance: array![[0.2]],
+            normal_mean_shift: array![0.1],
+            rows: vec![0],
+            normal_upper_limits: vec![f64::INFINITY],
+        };
+
+        // The fixture moves the intercept row: its internal-coordinate
+        // standard error is not the published one.
+        let internal = dense_standard_errors(&unconditioned, &qs, &inverse_hessian, cov_scale, None);
+        let published = dense_standard_errors(&conditioned, &qs, &inverse_hessian, cov_scale, None);
+        assert!(
+            (internal[0] - published[0]).abs() > 1.0e-3 * published[0],
+            "the conditioning must move the intercept standard error: internal {} published {}",
+            internal[0],
+            published[0]
+        );
+
+        let solve = |rhs: &Array2<f64>, rows: std::ops::Range<usize>| {
+            assert_eq!(rhs.ncols(), rows.len(), "one right-hand-side column per row");
+            Ok::<_, EstimationError>(inverse_hessian.dot(rhs))
+        };
+        for (label, conditioning, constraint) in [
+            ("unconditioned", &unconditioned, None),
+            ("conditioned", &conditioned, None),
+            ("conditioned and constrained", &conditioned, Some(&correction)),
+        ] {
+            let expected =
+                dense_standard_errors(conditioning, &qs, &inverse_hessian, cov_scale, constraint);
+            let factorized =
+                factorized_standard_errors(conditioning, &qs, cov_scale, constraint, false, 3, solve)
+                    .expect("the factorized standard errors solve");
+            for (index, (&got, &want)) in factorized.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() <= 1.0e-12 * want.max(1.0),
+                    "{label}: factorized standard error {index} is {got:.17e}; the dense \
+                     back-transformed diagonal gives {want:.17e}"
+                );
+            }
+        }
     }
 }
 

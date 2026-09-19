@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::inference::predict_io::PredictInput;
+use crate::inference::predict_io::{FittedLatentScoreMap, LatentConditioningSpan, PredictInput};
 use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::utils::inf_norm;
 use gam_math::probability::standard_normal_quantile;
@@ -149,7 +149,51 @@ impl From<FittedModelError> for PredictInputError {
     }
 }
 
-fn build_marginal_slope_local_auxiliary_matrix(
+/// The residual repair block's prediction features (gam#2924), read by the
+/// column names the fit recorded. The columns are the caller's responsibility
+/// to centre on the same reference law as at fit time; a missing or non-finite
+/// column is refused rather than defaulted to zero, because a zero residual is
+/// a statement ("this person's genome carries nothing beyond the score") the
+/// predictor must not make on the caller's behalf.
+fn build_residual_repair_feature_matrix(
+    geometry: &crate::bms::ResidualRepairGeometry,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+) -> Result<Array2<f64>, PredictInputError> {
+    let n = data.nrows();
+    let width = geometry.width();
+    let mut out = Array2::<f64>::zeros((n, width));
+    for (local_col, name) in geometry.columns.iter().enumerate() {
+        let col = *col_map.get(name).ok_or_else(|| PredictInputError::InvalidInput {
+            reason: format!(
+                "residual repair prediction requires column '{name}', which the prediction table \
+                 does not carry"
+            ),
+        })?;
+        if col >= data.ncols() {
+            return Err(PredictInputError::DimensionMismatch {
+                reason: format!(
+                    "residual repair prediction column '{name}' resolves to index {col}, out of \
+                     bounds for {} columns",
+                    data.ncols()
+                ),
+            });
+        }
+        let column = data.column(col);
+        if let Some(row) = column.iter().position(|v| !v.is_finite()) {
+            return Err(PredictInputError::InvalidInput {
+                reason: format!("residual repair prediction column '{name}' is non-finite at row {row}"),
+            });
+        }
+        out.column_mut(local_col).assign(&column);
+    }
+    Ok(out)
+}
+
+/// The scaled context covariates a saved marginal-slope model's local latent
+/// law is replayed from, one row per prediction row; `None` for every other law.
+/// Shared by both marginal-slope families' predictors (gam#2926).
+pub fn build_marginal_slope_local_auxiliary_matrix(
     model: &FittedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
@@ -1442,8 +1486,20 @@ fn build_predict_input_for_model_inner(
                 .map_err(|error| PredictInputError::InvalidInput {
                     reason: error.to_string(),
                 })?;
-            let auxiliary_matrix =
-                build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
+            let local = build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
+            let auxiliary_matrix = match model.residual_repair.as_ref() {
+                None => local,
+                // Local-empirical conditioning columns first, the residual
+                // features after them; the predictor reads each block by width.
+                Some(geometry) => {
+                    let residual =
+                        build_residual_repair_feature_matrix(geometry, design_input, col_map)?;
+                    Some(match local {
+                        None => residual,
+                        Some(local) => ndarray::concatenate![ndarray::Axis(1), local, residual],
+                    })
+                }
+            };
             Ok(PredictInput {
                 design: design.design.clone(),
                 offset: mean_offset,
@@ -1538,6 +1594,75 @@ pub fn build_predict_input_for_model(
         noise_offset_supplied,
     )
     .map_err(Into::into)
+}
+
+impl FittedModel {
+    /// The declared conditional law's standardized residual `ζ = (z − m(a))/√v(a)`
+    /// of each row of `data`, through the map the fit applied to its latent score
+    /// and prediction applies again (gam#3016). `None` when the fit consumed no
+    /// conditional law.
+    ///
+    /// The conditional location-scale law is exact when ζ has the same law in every
+    /// context. Its held-out adequacy check within a stratum is therefore that
+    /// stratum's law of ζ against the training residual law. The raw score's law
+    /// against the pooled training law also counts the location and scale shifts
+    /// the conditional law absorbs.
+    ///
+    /// Both marginal-slope hosts read ζ from the same two pieces their predictors
+    /// read: the score column (`ctn::latent_scores`) and the
+    /// design of `resolved_termspec`. That design is the Bernoulli predictor's
+    /// primary design and the trailing covariate block of the survival predictor's
+    /// q-design, so no survival time column is needed.
+    pub fn latent_conditional_residual(
+        &self,
+        data: ndarray::ArrayView2<'_, f64>,
+        col_map: &HashMap<String, usize>,
+    ) -> Result<Option<Array1<f64>>, PredictInputError> {
+        let runtime = self.saved_prediction_runtime()?;
+        let Some(conditional) = runtime.latent_z_conditional_calibration.as_ref() else {
+            return Ok(None);
+        };
+        if self.survival_marginal_slope_joint_latent_law.is_some() {
+            return Err(PredictInputError::InvalidInput {
+                reason: "latent conditional residual: the model is anchored on the joint latent \
+                         law of K ≥ 2 scores, which one score's residual does not describe"
+                    .to_string(),
+            });
+        }
+        let normalization =
+            self.latent_z_normalization
+                .as_ref()
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "latent conditional residual requires the saved latent-z normalization"
+                        .to_string(),
+                })?;
+        let z_raw = crate::inference::ctn::latent_scores(self, data, col_map)
+            .map_err(|reason| PredictInputError::InvalidInput { reason })?;
+        let spec = resolve_termspec_for_prediction(
+            &self.resolved_termspec,
+            self.training_headers.as_ref(),
+            col_map,
+            "resolved_termspec",
+        )?;
+        let clipped = self.axis_clip_to_training_ranges(data, col_map);
+        let design_input = clipped.as_ref().map_or(data, |arr| arr.view());
+        let design = build_term_collection_design(design_input, &spec).map_err(|e| {
+            PredictInputError::InvalidInput {
+                reason: format!("failed to build the conditioning design: {e}"),
+            }
+        })?;
+        FittedLatentScoreMap {
+            normalization,
+            rank_int: runtime.latent_z_rank_int_calibration.as_ref(),
+            conditional: Some(conditional),
+            span: LatentConditioningSpan::PrimaryDesign,
+        }
+        .apply(&z_raw, &design.design, "latent conditional residual")
+        .map(Some)
+        .map_err(|error| PredictInputError::InvalidInput {
+            reason: error.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]

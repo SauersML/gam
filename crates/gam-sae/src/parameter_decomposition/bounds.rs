@@ -22,6 +22,42 @@
 //! second order at `z = 0 ∈ ℝ²`: `δ = (ε, −ε)` and `δ = (ε/√2, −ε/√2)` give `KL = log cosh a = a²/2 − O(a⁴)` with
 //! `a = ε` and `a = ε/√2`.
 //!
+//! # KL over logit boxes
+//!
+//! A divergence computed from executed logits `ℓ_p` and `ℓ_q`, each with a rigorous per-entry forward-error radius
+//! `r_p` and `r_q`, is the divergence of computed centers. The exact logits are `ℓ_p + a` and `ℓ_q + b` with
+//! `|a_i| ≤ r_p,i` and `|b_i| ≤ r_q,i`. Write `p = softmax ℓ_p`, `q = softmax ℓ_q`, `p̃` and `q̃` for the exact
+//! distributions, `α = 2·max r_p ≥ osc(a)` and `β = 2·max r_q ≥ osc(b)` (mpd-verify, #2951 comment 5728901366).
+//! Two exact steps give
+//!
+//! ```text
+//! KL(p̃‖q̃) − KL(p̃‖q) = −⟨p̃, b⟩ + lse(ℓ_q + b) − lse(ℓ_q)  ∈  [⟨q − p̃, b⟩, ⟨q − p̃, b⟩ + β²/8],
+//! KL(p̃‖q) − KL(p‖q) = Σ_i (p̃_i − p_i) log(p_i/q_i) + KL(p̃‖p),        0 ≤ KL(p̃‖p) ≤ α²/8.
+//! ```
+//!
+//! The first bracket is Jensen below and Hoeffding's lemma above. The second is an identity, with P15 for its last
+//! term. `log(p̃_i/p_i) = a_i − Δlse` with `Δlse ∈ [min a, max a]`, so `|p̃_i − p_i| ≤ p_i (e^α − 1)`. Hence
+//!
+//! ```text
+//! |KL(p̃‖q̃) − KL(p‖q)| ≤ Σ_i |q_i − p_i| r_q,i + (e^α − 1)(Σ_i p_i r_q,i + Σ_i p_i |log p_i − log q_i|) + (α² + β²)/8.
+//! ```
+//!
+//! [`kl_over_logit_boxes`] bounds the three sums without evaluating `p` or `q`, so it needs no `exp` or `log`:
+//! * `Σ p_i r_q,i ≤ R = max r_q`, since `p` sums to one;
+//! * `log p_i − log q_i = δ_i − c` with `δ = ℓ_p − ℓ_q` and `c = lse ℓ_p − lse ℓ_q = log Σ_i q_i e^{δ_i}`, which
+//!   lies in `[min δ, max δ]`. So `Σ p_i |log p_i − log q_i| ≤ O = osc(δ)`;
+//! * `Σ |q_i − p_i| ≤ √(2 KL(p‖q))` (Pinsker), and P15 gives `KL(p‖q) ≤ O²/8`, so
+//!   `Σ |q_i − p_i| r_q,i ≤ R·min(2, O/2)`. The term still vanishes as `q → p`.
+//!
+//! For `α ≤ 1`, `e^α − 1 = α + α²(1/2! + α/3! + …) ≤ α + α²`. So
+//!
+//! ```text
+//! |KL(p̃‖q̃) − KL(p‖q)| ≤ Δ = R·min(2, O/2) + (α + α²)(R + O) + (α² + β²)/8.
+//! ```
+//!
+//! The first-order derivative term alone is not a bound. Near a sufficient support `q ≈ p`, so it vanishes while the
+//! true change is of the order of the radii squared, which the last term carries.
+//!
 //! # P14, a KL certificate over a ball of inputs
 //!
 //! A [`Contract`] chain ending at the logits bounds `‖F_n(x) − G_n(x)‖` by its `total_defect`, but only at inputs whose
@@ -47,12 +83,13 @@
 use std::fmt;
 
 use gam_linalg::roundoff::accumulation_growth;
+use gam_math::categorical::categorical_kl_from_logits_with_error;
 use gam_solve::gaussian_marginal::{
     ExactConstraintPosterior, GaussianMarginalError, condition_on_exact_constraint,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use super::supports::{EvidenceStatus, EvidenceStatusError, Extremum};
+use super::supports::{EvidenceStatus, EvidenceStatusError, ExactBasis, Extremum};
 use crate::inference::contracts::{Contract, whole_set_containment};
 
 /// The norm a logit-gap bound is stated in, declared by the chart metric of the stage that outputs the logits.
@@ -82,6 +119,12 @@ pub enum KlBoundRegion {
     LogitPair,
     /// Every perturbed logit vector whose gap from the reference has norm at most `radius`.
     LogitGapBall { radius: f64, norm: LogitGapNorm },
+    /// Every pair of logit vectors within per-entry radii of two computed centers. The largest radius of each side is
+    /// kept here. This region bounds `KL(reference ‖ perturbed)` in that direction only.
+    LogitBoxes {
+        reference_radius: f64,
+        perturbed_radius: f64,
+    },
     /// Every chain input within `initial_radius` of the nominal input, whose native logits `G_n(x)` and realized logits
     /// `F_n(x)` a contained contract chain keeps within `total_defect` of each other in `norm`.
     ContractChainInputBall {
@@ -126,18 +169,22 @@ impl From<EvidenceStatusError> for BoundError {
     }
 }
 
-/// P15 for one pair of logit vectors: `KL ≤ osc(z′ − z)²/8`, a [`EvidenceStatus::UniformBound`] over
-/// [`KlBoundRegion::LogitPair`].
+/// The oscillation of the gap `perturbed − logits` from its rounded entries, and an upper bound on the exact one.
+struct GapOscillation {
+    computed: f64,
+    upper: f64,
+}
+
+/// The [`GapOscillation`] of `perturbed − logits`, refusing vectors of different lengths or a non-finite logit.
 ///
 /// Rounding: each computed gap `δ̂_i` is one correctly rounded subtraction, so `|δ̂_i − δ_i| ≤ u·|δ_i|`, and the exact
 /// oscillation exceeds `max δ̂ − min δ̂` by at most `2u′·max|δ̂|` (`u′ = u/(1 − u)`). Forming that difference rounds by
-/// `u` of its value. `γ_3·(osc + 2·max|δ̂|)` covers both and the rounding of the band itself, one `next_up` covers
-/// adding the band, and one more covers the square and the division by 8, which is exact above the subnormal range and
-/// adds at most half a unit in the last place below it.
-pub fn softmax_kl_oscillation_bound(
+/// `u` of its value. `γ_3·(osc + 2·max|δ̂|)` covers both and the rounding of the band itself, and one `next_up`
+/// covers adding the band.
+fn gap_oscillation(
     logits: ArrayView1<'_, f64>,
     perturbed: ArrayView1<'_, f64>,
-) -> Result<EvidenceStatus<(), KlBoundRegion>, BoundError> {
+) -> Result<GapOscillation, BoundError> {
     if logits.is_empty() || logits.len() != perturbed.len() {
         return Err(BoundError::InvalidInput(format!(
             "the KL oscillation bound needs two nonempty logit vectors of one length; got {} and {}",
@@ -159,13 +206,98 @@ pub fn softmax_kl_oscillation_bound(
     }
     let oscillation = largest - smallest;
     let band = accumulation_growth(3) * (oscillation + 2.0 * largest.abs().max(smallest.abs()));
-    let oscillation_upper = (oscillation + band).next_up();
-    let upper = (oscillation_upper * oscillation_upper / 8.0).next_up();
-    let nominal = oscillation * oscillation / 8.0;
+    Ok(GapOscillation {
+        computed: oscillation,
+        upper: (oscillation + band).next_up(),
+    })
+}
+
+/// P15 for one pair of logit vectors: `KL ≤ osc(z′ − z)²/8`, a [`EvidenceStatus::UniformBound`] over
+/// [`KlBoundRegion::LogitPair`].
+///
+/// Rounding: the oscillation is bounded above as in `gap_oscillation`, and one `next_up` covers the square and the
+/// division by 8, which is exact above the subnormal range and adds at most half a unit in the last place below it.
+pub fn softmax_kl_oscillation_bound(
+    logits: ArrayView1<'_, f64>,
+    perturbed: ArrayView1<'_, f64>,
+) -> Result<EvidenceStatus<(), KlBoundRegion>, BoundError> {
+    let oscillation = gap_oscillation(logits, perturbed)?;
+    let upper = (oscillation.upper * oscillation.upper / 8.0).next_up();
+    let nominal = oscillation.computed * oscillation.computed / 8.0;
     Ok(EvidenceStatus::uniform_bound(
         upper,
         upper - nominal,
         KlBoundRegion::LogitPair,
+    )?)
+}
+
+/// The divergence `KL(softmax(ℓ_p + a) ‖ softmax(ℓ_q + b))` at every `|a| ≤ reference_radius` and
+/// `|b| ≤ perturbed_radius`, entrywise, around the centers `ℓ_p = reference` and `ℓ_q = perturbed`. This is the
+/// module documentation's logit-box bound.
+///
+/// It is an [`EvidenceStatus::Exact`] over [`KlBoundRegion::LogitBoxes`] whose value is the centers' divergence, from
+/// gam-math's categorical owner. Its `numerical_error` is that evaluation's error plus `Δ`. It is
+/// [`EvidenceStatus::Unresolved`], with lower side `0` and no upper side, when `α = 2·max r_p > 1`, where the
+/// polynomial bound on `e^α − 1` is not claimed, or when the categorical owner does not bound the centers'
+/// evaluation.
+///
+/// Rounding: `R`, `α` and `β` are exact (a maximum and a doubling), and `O` is bounded above as in
+/// `gap_oscillation`. Every further operation is on non-negative operands and is followed by `next_up`, which lies
+/// at or above the exact result, so `Δ` is never rounded down. No `exp` or `log` is evaluated for `Δ`.
+pub fn kl_over_logit_boxes(
+    reference: ArrayView1<'_, f64>,
+    reference_radius: ArrayView1<'_, f64>,
+    perturbed: ArrayView1<'_, f64>,
+    perturbed_radius: ArrayView1<'_, f64>,
+) -> Result<EvidenceStatus<(), KlBoundRegion>, BoundError> {
+    let oscillation = gap_oscillation(reference, perturbed)?.upper;
+    for (side, radius) in [("reference", reference_radius), ("perturbed", perturbed_radius)] {
+        if radius.len() != reference.len() {
+            return Err(BoundError::InvalidInput(format!(
+                "the {side} radius has {} entries for {} logits",
+                radius.len(),
+                reference.len()
+            )));
+        }
+        if let Some(index) = radius.iter().position(|entry| !(entry.is_finite() && *entry >= 0.0)) {
+            return Err(BoundError::InvalidInput(format!(
+                "the {side} radius must be finite and non-negative; entry {index} is {}",
+                radius[index]
+            )));
+        }
+    }
+    let widest = |radius: ArrayView1<'_, f64>| radius.iter().copied().fold(0.0_f64, f64::max);
+    let (reference_widest, perturbed_widest) = (widest(reference_radius), widest(perturbed_radius));
+    let region = KlBoundRegion::LogitBoxes {
+        reference_radius: reference_widest,
+        perturbed_radius: perturbed_widest,
+    };
+    let (divergence, evaluation_error) =
+        categorical_kl_from_logits_with_error(&reference.to_vec(), &perturbed.to_vec())
+            .map_err(|error| BoundError::InvalidInput(format!("the centers' divergence: {error}")))?;
+    let alpha = 2.0 * reference_widest;
+    let beta = 2.0 * perturbed_widest;
+    if !(alpha <= 1.0 && divergence.is_finite() && evaluation_error.is_finite()) {
+        return Ok(EvidenceStatus::unresolved(
+            0.0,
+            f64::INFINITY,
+            Extremum::Supremum,
+            None,
+            region,
+        )?);
+    }
+    let up = f64::next_up;
+    let pinsker = up(perturbed_widest * up(oscillation / 2.0).min(2.0));
+    let growth = up(alpha + up(alpha * alpha));
+    let spread = up(perturbed_widest + oscillation);
+    let squares = up(up(up(alpha * alpha) + up(beta * beta)) / 8.0);
+    let shift = up(up(pinsker + up(growth * spread)) + squares);
+    Ok(EvidenceStatus::exact(
+        divergence,
+        up(evaluation_error + shift),
+        ExactBasis::Algebraic,
+        None,
+        region,
     )?)
 }
 
@@ -317,8 +449,10 @@ pub fn compare_conservation_evidence(
 mod tests {
     use super::*;
     use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_band};
-    use gam_math::categorical::categorical_kl_from_logits_with_error;
+    use gam_math::categorical::log_softmax;
     use ndarray::array;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
     use std::f64::consts::{LN_2, PI};
 
     fn contract(name: &str, domain_radius: f64, defect: f64, lipschitz: f64) -> Contract {
@@ -561,5 +695,160 @@ mod tests {
             ),
             "{refused}"
         );
+    }
+
+    /// The first-order term alone at the centers, `Σ_i |q_i − p_i| r_q,i`: the mutant a box bound must not reduce to.
+    fn first_order_term(reference: &[f64], perturbed: &[f64], perturbed_radius: &[f64]) -> f64 {
+        let log_p = log_softmax(reference).expect("finite logits");
+        let log_q = log_softmax(perturbed).expect("finite logits");
+        log_p
+            .iter()
+            .zip(&log_q)
+            .zip(perturbed_radius)
+            .map(|((log_p, log_q), radius)| (log_q.exp() - log_p.exp()).abs() * radius)
+            .sum()
+    }
+
+    /// The box point `center + (1 − 10⁻⁹)·s ∘ radius` for `|s_i| ≤ 1`. The shrink keeps the rounded entries inside the
+    /// box: `10⁻⁹·r_i` exceeds the rounding `u·|center_i + s_i r_i|` of every entry these fixtures draw.
+    fn box_point(center: &[f64], radius: &[f64], direction: &[f64]) -> Vec<f64> {
+        center
+            .iter()
+            .zip(radius)
+            .zip(direction)
+            .map(|((center, radius), direction)| center + direction * (1.0 - 1e-9) * radius)
+            .collect()
+    }
+
+    fn logit_boxes(
+        reference: &[f64],
+        reference_radius: &[f64],
+        perturbed: &[f64],
+        perturbed_radius: &[f64],
+    ) -> Result<EvidenceStatus<(), KlBoundRegion>, BoundError> {
+        kl_over_logit_boxes(
+            ArrayView1::from(reference),
+            ArrayView1::from(reference_radius),
+            ArrayView1::from(perturbed),
+            ArrayView1::from(perturbed_radius),
+        )
+    }
+
+    #[test]
+    fn the_logit_box_bound_encloses_the_divergence_at_sampled_points_and_the_first_order_term_alone_does_not() {
+        let mut rng = StdRng::seed_from_u64(2951);
+        let mut sampled = 0usize;
+        let mut caught = 0usize;
+        for case in 0..24usize {
+            let classes = 3 + case % 9;
+            let reference: Vec<f64> = std::iter::repeat_with(|| rng.random_range(-3.0..3.0)).take(classes).collect();
+            // Every fourth case has equal centers, the near-degenerate regime where the first-order term vanishes.
+            let perturbed: Vec<f64> = if case % 4 == 0 {
+                reference.clone()
+            } else {
+                reference.iter().map(|value| value + rng.random_range(-1.0..1.0)).collect()
+            };
+            let reference_radius: Vec<f64> =
+                std::iter::repeat_with(|| rng.random_range(0.0..0.45)).take(classes).collect();
+            let perturbed_radius: Vec<f64> =
+                std::iter::repeat_with(|| rng.random_range(0.0..0.3)).take(classes).collect();
+            let status = logit_boxes(&reference, &reference_radius, &perturbed, &perturbed_radius).expect("valid boxes");
+            assert!(matches!(status, EvidenceStatus::Exact { .. }), "case {case}: α < 0.9 must be resolved");
+            let lower = status.lower_bound().expect("an exact value has a lower side");
+            let upper = status.upper_bound().expect("an exact value has an upper side");
+            let (center, center_band) = divergence_with_band(&reference, &perturbed);
+            let mutant = center + center_band + first_order_term(&reference, &perturbed, &perturbed_radius);
+            for sample in 0..48usize {
+                // Sixteen corners of each box first, then interior points.
+                let direction = |rng: &mut StdRng| -> Vec<f64> {
+                    std::iter::repeat_with(|| {
+                        if sample < 16 {
+                            if rng.random_range(0..2u8) == 0 { -1.0 } else { 1.0 }
+                        } else {
+                            rng.random_range(-1.0..=1.0)
+                        }
+                    })
+                    .take(classes)
+                    .collect()
+                };
+                let reference_direction = direction(&mut rng);
+                let perturbed_direction = direction(&mut rng);
+                let point = box_point(&reference, &reference_radius, &reference_direction);
+                let moved = box_point(&perturbed, &perturbed_radius, &perturbed_direction);
+                let (divergence, band) = divergence_with_band(&point, &moved);
+                assert!(
+                    divergence + band >= lower && divergence - band <= upper,
+                    "case {case} sample {sample}: KL {divergence} ± {band} outside [{lower}, {upper}]"
+                );
+                sampled += 1;
+                if divergence - band > mutant {
+                    caught += 1;
+                }
+            }
+        }
+        assert_eq!(sampled, 24 * 48);
+        // The mutant that keeps only the first-order term misses sampled divergences the bound encloses.
+        assert!(caught > 0, "the first-order term alone enclosed every sample, so the fixtures cannot see the remainder");
+    }
+
+    #[test]
+    fn the_second_order_term_is_load_bearing_where_the_centers_coincide() {
+        let logits = [0.3, -1.0, 0.8, 0.0];
+        let reference_radius = [0.4; 4];
+        let perturbed_radius = [0.0; 4];
+        let status = logit_boxes(&logits, &reference_radius, &logits, &perturbed_radius).expect("valid boxes");
+        let upper = status.upper_bound().expect("α = 0.8 is resolved");
+        // Equal centers: KL(p‖q) = 0 exactly and q − p = 0, so the first-order term is zero.
+        assert_eq!(divergence_with_band(&logits, &logits), (0.0, 0.0));
+        assert_eq!(first_order_term(&logits, &logits, &perturbed_radius), 0.0);
+        // The alternating corner moves p̃ away from p = q, so the true change is positive and the mutant misses it.
+        let corner = box_point(&logits, &reference_radius, &[1.0, -1.0, 1.0, -1.0]);
+        let (divergence, band) = divergence_with_band(&corner, &logits);
+        assert!(divergence - band > 1e-3, "the corner must move the distribution; KL {divergence}");
+        assert!(divergence + band <= upper, "KL {divergence} above the bound {upper}");
+        // P15 alone already covers this corner: osc(a) ≤ 0.8, so KL(p̃‖p) ≤ 0.8²/8.
+        assert!(divergence - band <= 0.8 * 0.8 / 8.0, "KL {divergence}");
+    }
+
+    #[test]
+    fn a_reference_box_past_one_half_is_unresolved_a_degenerate_box_adds_nothing_and_malformed_boxes_are_refused() {
+        let logits = [0.0, 1.0, -1.0];
+        let moved = [0.2, 0.7, -1.4];
+        let zero = [0.0; 3];
+        let wide = logit_boxes(&logits, &[0.6, 0.0, 0.0], &moved, &zero).expect("valid boxes");
+        assert!(
+            matches!(wide, EvidenceStatus::Unresolved { lower, upper, .. } if lower == 0.0 && upper == f64::INFINITY),
+            "{wide:?}"
+        );
+        // Positive control for the cut: at radius one half, α = 1, the bound is claimed.
+        let edge = logit_boxes(&logits, &[0.5, 0.0, 0.0], &moved, &zero).expect("valid boxes");
+        assert!(matches!(edge, EvidenceStatus::Exact { .. }), "{edge:?}");
+        // Zero radii: the value is the centers' divergence, and Δ adds only subnormal next_up steps to its error.
+        let (center, center_band) = divergence_with_band(&logits, &moved);
+        match logit_boxes(&logits, &zero, &moved, &zero).expect("valid boxes") {
+            EvidenceStatus::Exact {
+                value,
+                numerical_error,
+                ..
+            } => {
+                assert_eq!(value, center);
+                assert!(numerical_error >= center_band, "error {numerical_error} below {center_band}");
+                assert!(numerical_error <= center_band.next_up().next_up(), "error {numerical_error}");
+            }
+            other => panic!("a degenerate box must be exact: {other:?}"),
+        }
+        for (reference_radius, perturbed_radius) in [
+            (&[0.1, -1e-3, 0.0][..], &zero[..]),
+            (&[0.1, f64::NAN, 0.0][..], &zero[..]),
+            (&zero[..], &[0.0, 0.0][..]),
+        ] {
+            assert!(
+                matches!(
+                    logit_boxes(&logits, reference_radius, &moved, perturbed_radius),
+                    Err(BoundError::InvalidInput(..))
+                ),
+                "radii {reference_radius:?} and {perturbed_radius:?} must be refused"
+            );
+        }
     }
 }

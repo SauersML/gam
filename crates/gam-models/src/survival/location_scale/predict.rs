@@ -132,14 +132,14 @@ pub(crate) fn survival_location_scale_response_from_predictors(
             .and(&predictors.inv_sigma)
             .and(etaw)
             .par_for_each(|q, &hh, &tt, &r, &w| {
-                *q = hh - tt * r + w;
+                *q = hh * r - tt * r + w;
             }),
         None => Zip::from(&mut eta)
             .and(&predictors.h)
             .and(&predictors.eta_t)
             .and(&predictors.inv_sigma)
             .par_for_each(|q, &hh, &tt, &r| {
-                *q = hh - tt * r;
+                *q = hh * r - tt * r;
             }),
     }
     let survival_values: Result<Vec<f64>, SurvivalLocationScaleError> = {
@@ -236,13 +236,14 @@ pub fn predict_survival_location_scalewith_uncertainty(
                 for (local_row, row_grad) in grad_chunk.chunks_mut(p_total).enumerate() {
                     let i = row_start + local_row;
                     for j in 0..p_time {
-                        row_grad[j] = predictors.time_jac[[i, j]];
+                        row_grad[j] = inv_sigma[i] * predictors.time_jac[[i, j]];
                     }
                     let scale = dq_dq0.map_or(1.0, |v| v[i]);
                     for j in 0..p_t {
                         row_grad[p_time + j] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
                     }
-                    let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
+                    let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i]
+                        - predictors.h[i] * inv_sigma[i];
                     for j in 0..p_ls {
                         row_grad[p_time + p_t + j] = coeff_ls * x_ls_dense[[i, j]];
                     }
@@ -256,13 +257,14 @@ pub fn predict_survival_location_scalewith_uncertainty(
     } else {
         for i in 0..n {
             for j in 0..p_time {
-                grad[[i, j]] = predictors.time_jac[[i, j]];
+                grad[[i, j]] = inv_sigma[i] * predictors.time_jac[[i, j]];
             }
             let scale = dq_dq0.map_or(1.0, |v| v[i]);
             for j in 0..p_t {
                 grad[[i, p_time + j]] = -scale * inv_sigma[i] * x_t_dense[[i, j]];
             }
-            let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i];
+            let coeff_ls = scale * predictors.eta_t[i] * inv_sigma[i]
+                - predictors.h[i] * inv_sigma[i];
             for j in 0..p_ls {
                 grad[[i, p_time + p_t + j]] = coeff_ls * x_ls_dense[[i, j]];
             }
@@ -338,11 +340,14 @@ pub(crate) fn validate_predict_inverse_link(
     inverse_link: &InverseLink,
 ) -> Result<(), SurvivalLocationScaleError> {
     match inverse_link {
-        InverseLink::Standard(StandardLink::Log) => {
-            Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: "prediction does not support Standard(Log) for survival models".to_string(),
-            })
-        }
+        InverseLink::Standard(
+            link @ (StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared),
+        ) => Err(SurvivalLocationScaleError::InvalidConfiguration {
+            reason: format!(
+                "prediction does not support the {} link for survival models",
+                link.name()
+            ),
+        }),
         InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
@@ -408,14 +413,17 @@ pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f
         InverseLink::Standard(StandardLink::LogLog) => -(-(-eta).exp()).exp_m1(),
         InverseLink::Standard(StandardLink::Cauchit) => 0.5 - eta.atan() / std::f64::consts::PI,
         InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
-        InverseLink::Standard(StandardLink::Log) => {
+        InverseLink::Standard(
+            StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared,
+        ) => {
             // SAFETY: survival families register only Probit/Logit/CLogLog/
             // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;
-            // `validate_predict_inverse_link` rejects `Standard(Log)` upstream
+            // `validate_predict_inverse_link` rejects the log and reciprocal
+            // links upstream
             // so this arm is unreachable on a validated survival model. A NaN
             // sentinel here would silently corrupt the survival probability,
             // so fail loudly on a contract violation instead.
-            panic!("state-less log inverse link is invalid for survival prediction")
+            panic!("the log and reciprocal inverse links are invalid for survival prediction")
         }
         InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)

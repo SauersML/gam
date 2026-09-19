@@ -96,7 +96,6 @@ fn fit_marginal_slope_model(n: usize, seed: u64) -> FittedModel {
         // pins the rigid latent law so the anchor is the closed-form
         // `c(b)·q`, the branch whose curvature this test is about.
         frozen_score: true,
-        precompute_conformal: Some(false),
         ..FitConfig::default()
     };
     let payload = fit_formula_to_payload("y ~ s(x, k=6)".to_string(), &ds, &cfg)
@@ -366,7 +365,7 @@ fn measure(
 /// A declared empirical latent law that is NOT standard normal: a 41-node
 /// discretisation of a scaled Student-t-like density (heavier tails, unit
 /// variance to first order), so the anchor `a(q, b)` is a genuine root solve.
-fn heavy_tailed_grid() -> EmpiricalZGrid {
+pub(crate) fn heavy_tailed_grid() -> EmpiricalZGrid {
     let nodes: Vec<f64> = (0..41).map(|i| -4.0 + 0.2 * i as f64).collect();
     let raw: Vec<f64> = nodes
         .iter()

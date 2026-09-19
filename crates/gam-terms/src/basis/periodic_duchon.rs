@@ -1597,6 +1597,77 @@ pub fn duchon_cubic_default(dim: usize) -> (DuchonNullspaceOrder, f64) {
     (DuchonNullspaceOrder::Linear, (dim as f64 - 1.0) / 2.0)
 }
 
+/// [`duchon_cubic_default`] for a basis that may have a periodic axis. The
+/// mixed-periodicity reproducing kernel is derived only for the pure
+/// polyharmonic spectrum (Sobolev tail `s = 0`): the periodic Bernoulli Green's
+/// function has no validated fractional-power generalization. A periodic
+/// request therefore keeps the cubic `Linear` null space and pins the power to
+/// 0.
+pub fn duchon_cubic_default_with_periodicity(
+    dim: usize,
+    any_periodic: bool,
+) -> (DuchonNullspaceOrder, f64) {
+    let (nullspace_order, power) = duchon_cubic_default(dim);
+    (nullspace_order, if any_periodic { 0.0 } else { power })
+}
+
+/// The single-λ function-norm penalty of the Duchon basis on `centers`: the
+/// native reproducing-norm Gram the basis builder emits as its
+/// `PenaltySource::Primary` block, from the mixed-periodicity (cylinder/torus
+/// chord-distance) builder when any axis is periodic and from the Euclidean
+/// builder otherwise.
+///
+/// `period_1d` is the explicit domain wrap of a 1-D periodic basis. It is
+/// honoured instead of being derived from the center span, which undershoots on
+/// a half-open grid and gave a non-PSD Gram (gam#580). A multi-D periodic basis
+/// derives its per-axis periods from the centers.
+pub fn duchon_function_norm_penalty(
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+    power: f64,
+    periodic_per_axis: &[bool],
+    period_1d: Option<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let spec = DuchonBasisSpec {
+        radial_reparam: None,
+        center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
+        length_scale,
+        power,
+        nullspace_order,
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic: None,
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let built = if periodic_per_axis.iter().any(|&periodic| periodic) {
+        let periods_1d = if centers.ncols() == 1 {
+            period_1d.map(|period| [period])
+        } else {
+            None
+        };
+        build_duchon_basis_mixed_periodicity_auto(
+            centers,
+            &spec,
+            periodic_per_axis,
+            periods_1d.as_ref().map(|periods| periods.as_slice()),
+        )?
+    } else {
+        build_duchon_basis(centers, &spec)?
+    };
+    built
+        .active_penalties
+        .into_iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .map(|penalty| penalty.matrix)
+        .ok_or_else(|| {
+            BasisError::InvalidInput(
+                "the Duchon builder emitted no Primary function-norm Gram".to_string(),
+            )
+        })
+}
+
 /// Build the **analytic** Duchon penalty for a non-periodic Euclidean Duchon
 /// basis: the native reproducing-norm Gram `ω = α²·Zᵀ K_CC Z` (the kernel
 /// evaluated at center pairs, projected through the polynomial-constraint null
@@ -2212,19 +2283,207 @@ pub(crate) fn duchon_operator_penalty_candidates(
         )?
     };
     if split_tension {
-        // `D1` rows are indexed `collocation_i · dim + axis`, so axis `a` owns
-        // the strided row set `a, a+dim, a+2·dim, …`. `fast_ata` of that slice
-        // is the density-blind support quadrature of `∫(∂f/∂x_a)²` in the final
-        // β-basis.
         for axis in 0..dim {
-            let d1_axis = ops.d1.slice(s![axis..; dim, ..]).to_owned();
-            candidates.push(normalize_penalty_candidate(
-                symmetrize(&fast_ata(&d1_axis)),
-                PenaltySource::OperatorRelevance { axis },
-            )?);
+            candidates.push(duchon_axis_relevance_candidate(&ops.d1, dim, axis)?);
         }
     }
     Ok(candidates)
+}
+
+/// Axis `a`'s relevance penalty `Σ(∂f/∂x_a)²`, emitted from its collocation
+/// factor.
+///
+/// `D1` rows are indexed `collocation_i · dim + axis`, so axis `a` owns the
+/// strided row set `a, a+dim, a+2·dim, …`. That slice `D_a` is the
+/// density-blind support quadrature factor of `∫(∂f/∂x_a)²` in the final
+/// β-basis, so the block is `D_aᵀD_a` by construction and its rank is the
+/// factor's.
+///
+/// Forming the Gram first and passing it through
+/// `ConstructiveQuadratic::try_from_dense_psd` dropped every mode below that
+/// bridge's `dim·1e-10·λ_max` cutoff, which is a topology decision relative to
+/// the spectrum. On the #2735 stress term (MSI 1244869) each axis's factor
+/// resolved 494 modes, and so did its Gram, but the bridge kept 488 or 483
+/// (axis 1: 484). The kept count then flipped 484 ↔ 483 as ℓ moved by 0.4%,
+/// because λ₄₈₃/λ_max went 5.057e-8 → 4.958e-8 across the 5.000e-8 cutoff, and
+/// every trial on the short side was refused at the frozen rank.
+fn duchon_axis_relevance_candidate(
+    d1: &Array2<f64>,
+    dim: usize,
+    axis: usize,
+) -> Result<PenaltyCandidate, BasisError> {
+    let d1_axis = d1.slice(s![axis..; dim, ..]).to_owned();
+    normalize_constructive_penalty_candidate(
+        ConstructiveQuadratic::from_energy_factor(
+            d1_axis,
+            "Duchon operator per-axis relevance penalty",
+        )?,
+        PenaltySource::OperatorRelevance { axis },
+    )
+}
+
+#[cfg(test)]
+mod axis_relevance_factor_rank_2735_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    /// The shipped relevance block keeps every mode its collocation factor
+    /// resolves, including one below the dense bridge's relative cutoff.
+    #[test]
+    fn axis_relevance_block_keeps_every_mode_its_factor_resolves_2735() {
+        // Axis 1 of a 2-axis D1 is `[diag(σ) Vᵀ; 0]`, with V a Householder
+        // reflection so the Gram is not diagonal. One mode sits at σ²/σ²_max =
+        // 1e-9: far above the Gram's rounding band (n·ε ≈ 2.7e-15) and below
+        // the bridge's cutoff n·1e-10 = 1.2e-9.
+        let n = 12usize;
+        let rows_per_axis = 20usize;
+        let sigma_sq: [f64; 12] = [1.0, 0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-9, 0.0, 0.0, 0.0];
+        let v: Vec<f64> = (0..n).map(|i| 1.0 + 0.37 * i as f64).collect();
+        let v_norm_sq: f64 = v.iter().map(|x| x * x).sum();
+        let mut factor = Array2::<f64>::zeros((rows_per_axis, n));
+        for (row, &s2) in sigma_sq.iter().enumerate() {
+            let sigma = s2.sqrt();
+            for col in 0..n {
+                let identity = if row == col { 1.0 } else { 0.0 };
+                let reflection = identity - 2.0 * v[row] * v[col] / v_norm_sq;
+                factor[[row, col]] = sigma * reflection;
+            }
+        }
+        let mut d1 = Array2::<f64>::zeros((2 * rows_per_axis, n));
+        for row in 0..rows_per_axis {
+            d1[[2 * row, row % n]] = 1.0;
+            d1.row_mut(2 * row + 1).assign(&factor.row(row));
+        }
+
+        let factor_rank = gam_linalg::roundoff::factor_rank_partition(&factor)
+            .expect("factor SVD")
+            .rank;
+        assert_eq!(factor_rank, 9, "the fixture's factor must resolve its 1e-9 mode");
+        // Negative control: the dense bridge drops that mode.
+        let bridged = ConstructiveQuadratic::try_from_dense_psd(
+            symmetrize(&fast_ata(&factor)),
+            "dense bridge control",
+        )
+        .expect("dense bridge");
+        assert_eq!(
+            bridged.factor().nrows(),
+            8,
+            "the dense bridge must truncate the 1e-9 mode, or this fixture cannot tell the routes apart"
+        );
+
+        let candidate = duchon_axis_relevance_candidate(&d1, 2, 1).expect("relevance candidate");
+        assert_eq!(candidate.source, PenaltySource::OperatorRelevance { axis: 1 });
+        let shipped = analyze_penalty_block(candidate.matrix.dense())
+            .expect("shipped block spectrum")
+            .eigenvalues
+            .to_vec();
+        assert_eq!(
+            gam_linalg::roundoff::resolved_eigenvalue_count(&shipped, 0.0),
+            factor_rank,
+            "the shipped relevance block must keep every mode its factor resolves"
+        );
+        let gram_frobenius = stable_euclidean_norm(fast_ata(&factor).iter().copied());
+        assert!(
+            (candidate.normalization_scale - gram_frobenius).abs() <= 1e-12 * gram_frobenius,
+            "the block is normalized by its own Gram's Frobenius norm: {} vs {gram_frobenius}",
+            candidate.normalization_scale
+        );
+    }
+
+    /// The rank flip #2735's seed 0 hit (MSI 1244869), rebuilt on a factor whose
+    /// spectrum is set instead of searched for. On the stress term's 500-column
+    /// relevance Gram of axis 1, `λ₄₈₃/λ_max` was 5.057e-8, 5.013e-8 and
+    /// 4.958e-8 at ℓ = 1.0004, 0.9970 and 0.9929 (builds 1, 6 and 7), across
+    /// the dense bridge's cutoff `500·1e-10 = 5.000e-8`. The bridge kept 484,
+    /// 484 and then 483 modes, and every trial on the short side was refused at
+    /// the frozen rank.
+    ///
+    /// Here `D = U·Σ·Vᵀ` has 500 columns and eight modes, and the eighth mode's
+    /// `σ²/σ²_max` takes the three measured ratios. The factor resolves all
+    /// eight modes at every ℓ, so the shipped rank must be eight at all three.
+    /// The dense bridge must keep 8, 8, 7, or the fixture cannot tell the
+    /// routes apart.
+    #[test]
+    fn axis_relevance_rank_is_continuous_across_the_seed0_length_scales_2735() {
+        let rows_per_axis = 12usize;
+        let columns = 500usize;
+        let steady_ratios: [f64; 7] = [1.0, 0.25, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6];
+        let crossing: [(f64, f64); 3] =
+            [(1.0004, 5.057e-8), (0.9970, 5.013e-8), (0.9929, 4.958e-8)];
+        // Householder reflections, so neither the factor nor its Gram is
+        // diagonal: U acts on the rows and V on the columns.
+        let householder = |n: usize, slope: f64| {
+            let v: Vec<f64> = (0..n).map(|i| 1.0 + slope * i as f64).collect();
+            let v_norm_sq: f64 = v.iter().map(|x| x * x).sum();
+            Array2::from_shape_fn((n, n), |(i, j)| {
+                let identity = if i == j { 1.0 } else { 0.0 };
+                identity - 2.0 * v[i] * v[j] / v_norm_sq
+            })
+        };
+        let u = householder(rows_per_axis, 0.37);
+        let v = householder(columns, 0.011);
+
+        let mut shipped_ranks = Vec::new();
+        let mut bridged_ranks = Vec::new();
+        for (length_scale, ratio) in crossing {
+            let mut sigma_sq = steady_ratios.to_vec();
+            sigma_sq.push(ratio);
+            let mut factor = Array2::<f64>::zeros((rows_per_axis, columns));
+            for (mode, &s2) in sigma_sq.iter().enumerate() {
+                let sigma = s2.sqrt();
+                for row in 0..rows_per_axis {
+                    for col in 0..columns {
+                        factor[[row, col]] += u[[row, mode]] * sigma * v[[col, mode]];
+                    }
+                }
+            }
+            // Axis 1 of a 2-axis D1 owns the odd rows.
+            let mut d1 = Array2::<f64>::zeros((2 * rows_per_axis, columns));
+            for row in 0..rows_per_axis {
+                d1[[2 * row, row]] = 1.0;
+                d1.row_mut(2 * row + 1).assign(&factor.row(row));
+            }
+
+            let factor_rank = gam_linalg::roundoff::factor_rank_partition(&factor)
+                .expect("factor SVD")
+                .rank;
+            assert_eq!(
+                factor_rank,
+                sigma_sq.len(),
+                "ℓ = {length_scale}: the fixture's factor must resolve every mode"
+            );
+            let candidate =
+                duchon_axis_relevance_candidate(&d1, 2, 1).expect("relevance candidate");
+            let shipped = analyze_penalty_block(candidate.matrix.dense())
+                .expect("shipped block spectrum")
+                .eigenvalues
+                .to_vec();
+            let shipped_rank = gam_linalg::roundoff::resolved_eigenvalue_count(&shipped, 0.0);
+            assert_eq!(
+                shipped_rank, factor_rank,
+                "ℓ = {length_scale}, axis 1: the shipped relevance block resolves \
+                 {shipped_rank} modes but its collocation factor resolves {factor_rank}"
+            );
+            let bridged = ConstructiveQuadratic::try_from_dense_psd(
+                symmetrize(&fast_ata(&factor)),
+                "dense bridge control",
+            )
+            .expect("dense bridge");
+            shipped_ranks.push(shipped_rank);
+            bridged_ranks.push(bridged.factor().nrows());
+        }
+        assert_eq!(
+            bridged_ranks,
+            vec![8, 8, 7],
+            "negative control: the dense bridge must keep the crossing mode at ℓ = 1.0004 and \
+             0.9970 and drop it at 0.9929, or this fixture cannot tell the routes apart"
+        );
+        assert!(
+            shipped_ranks.windows(2).all(|pair| pair[0] == pair[1]),
+            "the axis-1 relevance rank must be the same at ℓ = 1.0004, 0.9970 and 0.9929: \
+             {shipped_ranks:?}"
+        );
+    }
 }
 
 #[cfg(test)]

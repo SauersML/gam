@@ -305,7 +305,7 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>, p: usize) -> SaeManifol
 fn fit_via_engine(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> (SaeManifoldTerm, f64) {
     let k = term.atoms.len();
     let init_rho =
-        SaeManifoldRho::new(1.0_f64.ln(), 1.0_f64.ln(), vec![Array1::<f64>::zeros(0); k]);
+        SaeManifoldRho::new(1.0_f64.ln(), 1.0_f64.ln(), vec![Array1::<f64>::zeros(1); k]);
     let init_rho = init_rho.for_assignment(&term.assignment);
     let init_rho_flat = init_rho
         .to_flat(&term.assignment)
@@ -505,7 +505,7 @@ fn evidence_consistency_at_fixed_lambda() {
     // converged decoder. The only frame-dependent criterion term is the occam
     // normalizer's Grassmann-dimension contribution `½·grassmann_dim·log λ`,
     // which vanishes at log λ = 0.
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(0); k]);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
 
     let mut full = converged.clone();
     for atom in &mut full.atoms {

@@ -4,7 +4,7 @@
 // resolve through the parent namespace.
 use super::*;
 
-use gam_row_macros::row_program;
+use gam_row_macros::row_atom;
 
 pub(crate) struct BinomialLocationScaleCore {
     pub(crate) sigma: Array1<f64>,
@@ -503,53 +503,129 @@ pub(crate) fn binomial_location_scale_core(
 //
 //   q(δ) = −(η_t + δ_t)·e^{−(η_ls + δ_ls)} = (q0 − δ_t/σ)·e^{−δ_ls},  q0 = −η_t/σ,
 //
-// so the row core's `q0` and `1/σ` are the only map state the program reads,
-// and `q` at the expansion point is exactly the `q0` at which the q-space loss
-// stack `[−ℓ, m1, m2, m3, m4]` (`m_k = dᵏ(−ℓ)/dqᵏ`) was evaluated. Both
-// derivative stacks are supplied: the exponential's at `δ_ls = 0` is all ones,
-// and the loss stack comes from the row core. Every surface is valid at `δ = 0`
-// only, which is the only point production evaluates it at, so callers pass
-// literal zeros for both primaries.
+// so the row core's `q0` and `1/σ` are the only map state the declaration
+// reads, and `q` at the expansion point is exactly the `q0` at which the
+// q-space loss stack `[−ℓ, m1, m2, m3, m4]` (`m_k = dᵏ(−ℓ)/dqᵏ`) was evaluated.
+// Every surface is valid at `δ = 0` only, which is the only point production
+// evaluates it at.
 //
-// An all-zero loss stack is how a row says it contributes nothing (a zero
-// weight, a saturated compatible tail), and the program skips it instead of
-// composing it: composing a zero stack against a map whose `1/σ` overflowed
-// forms `0·∞` in the derivative channels. The condition is also what makes
-// every surface read every stack entry, so a caller passes zero for an entry a
-// surface does not need and the entry folds away after inlining.
-row_program! {
-    pub(crate) fn binomial_ls_row_program(
+// The loss enters only through that stack, so through fourth order at `δ = 0`
+// it is exactly its Taylor polynomial in `D = q(δ) − q0`, and the row is
+// declared that way. The whole row is then a polynomial in `(1/σ, q0, m_k)` at
+// the origin, which `row_atom!`'s at-zero lowerings collect with exact
+// coefficients and share across channels. The constants are declared in the
+// Horner order the lowering nests them in (#932): with `1/σ` and `q0` first,
+// BINOMIAL-LS-HAND-932 measured 1.025 (order2), 0.967 (third) and 1.066
+// (fourth) against the retired hand schedule, where the `row_program!` form of
+// the same row measured 0.663, 0.547 and 0.781 (lane jobs 1268450, 1256028).
+row_atom! {
+    pub(crate) fn binomial_ls_row [order2_at_zero, third_at_zero, fourth_at_zero](
         delta_eta_t,
         delta_eta_ls;
-        q0,
-        inv_sigma,
-        neg_ll,
-        m1,
-        m2,
-        m3,
-        m4
-    )
-    emit [order2, third, fourth];
-    leaves {
-        unit_exponential => supplied,
-        loss => supplied,
-    }
-    witnesses [];
-    {
-        let neg_delta_eta_ls = neg(delta_eta_ls);
-        let scale_ratio = compose(unit_exponential, neg_delta_eta_ls, 1.0, 1.0, 1.0, 1.0, 1.0);
-        let shifted_q = add_constant(scale(delta_eta_t, -inv_sigma), q0);
-        let q = mul(shifted_q, scale_ratio);
-        let mut nll = zero();
-        if (neg_ll != 0.0 || m1 != 0.0 || m2 != 0.0 || m3 != 0.0 || m4 != 0.0) {
-            nll = compose(loss, q, neg_ll, m1, m2, m3, m4);
-        }
-        return nll;
+        inv_sigma: f64,
+        q0: f64,
+        m1: f64,
+        m2: f64,
+        m3: f64,
+        m4: f64,
+        neg_ll: f64
+    ) {
+        neg_ll
+            + m1 * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+            + 0.5
+                * m2
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+            + m3 / 6.0
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+            + m4 / 24.0
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
+                * ((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)
     }
 }
 
+// An all-zero loss stack is how a row says it contributes nothing (a zero
+// weight, a saturated compatible tail), and each surface below returns zero for
+// it instead of evaluating the row: evaluating a zero stack against a map whose
+// `1/σ` overflowed forms `0·∞` in the derivative channels. Each reads only the
+// stack entries its order needs.
+
+/// Value, gradient and Hessian of the row at its expansion point.
+#[inline(always)]
+pub(crate) fn binomial_ls_row_order2(
+    q0: f64,
+    inv_sigma: f64,
+    neg_ll: f64,
+    m1: f64,
+    m2: f64,
+) -> (f64, [f64; 2], [[f64; 2]; 2], [f64; 0]) {
+    if neg_ll == 0.0 && m1 == 0.0 && m2 == 0.0 {
+        return (0.0, [0.0; 2], [[0.0; 2]; 2], []);
+    }
+    let row = binomial_ls_row_order2_at_zero(inv_sigma, q0, m1, m2, 0.0, 0.0, neg_ll);
+    (
+        row.value(),
+        row.gradient(),
+        [
+            [row.hessian_at(0, 0), row.hessian_at(0, 1)],
+            [row.hessian_at(1, 0), row.hessian_at(1, 1)],
+        ],
+        [],
+    )
+}
+
+/// The row's third derivative at its expansion point, contracted along
+/// `direction`.
+#[inline(always)]
+pub(crate) fn binomial_ls_row_third_contracted(
+    q0: f64,
+    inv_sigma: f64,
+    m1: f64,
+    m2: f64,
+    m3: f64,
+    direction: &[f64; 2],
+) -> [[f64; 2]; 2] {
+    if m1 == 0.0 && m2 == 0.0 && m3 == 0.0 {
+        return [[0.0; 2]; 2];
+    }
+    binomial_ls_row_third_contracted_at_zero(inv_sigma, q0, m1, m2, m3, 0.0, 0.0, direction)
+}
+
+/// The row's fourth derivative at its expansion point, contracted along
+/// `direction_u` and `direction_v`.
+#[inline(always)]
+pub(crate) fn binomial_ls_row_fourth_contracted(
+    q0: f64,
+    inv_sigma: f64,
+    m1: f64,
+    m2: f64,
+    m3: f64,
+    m4: f64,
+    direction_u: &[f64; 2],
+    direction_v: &[f64; 2],
+) -> [[f64; 2]; 2] {
+    if m1 == 0.0 && m2 == 0.0 && m3 == 0.0 && m4 == 0.0 {
+        return [[0.0; 2]; 2];
+    }
+    binomial_ls_row_fourth_contracted_at_zero(
+        inv_sigma,
+        q0,
+        m1,
+        m2,
+        m3,
+        m4,
+        0.0,
+        direction_u,
+        direction_v,
+    )
+}
+
 /// Score `∂(−ℓ)/∂(η_t, η_ls)` of one row: the gradient channel of the
-/// `binomial_ls_row_program` order-2 surface at the row's expansion point.
+/// `binomial_ls_row` order-2 surface at the row's expansion point.
 #[inline]
 pub(crate) fn binomial_location_scale_row_score(
     y: f64,
@@ -566,12 +642,12 @@ pub(crate) fn binomial_location_scale_row_score(
         y, weight, q0, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
     );
     let (_, score, _, []) =
-        binomial_ls_row_program_order2(0.0, 0.0, q0, inv_sigma, 0.0, m1, 0.0, 0.0, 0.0);
+        binomial_ls_row_order2(q0, inv_sigma, 0.0, m1, 0.0);
     score
 }
 
 /// Joint Hessian `∂²(−ℓ)/∂(η_t, η_ls)²` of one row: the Hessian channel of the
-/// `binomial_ls_row_program` order-2 surface at the row's expansion point.
+/// `binomial_ls_row` order-2 surface at the row's expansion point.
 #[inline]
 pub(crate) fn binomial_location_scale_row_hessian(
     y: f64,
@@ -588,12 +664,12 @@ pub(crate) fn binomial_location_scale_row_hessian(
         y, weight, q0, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
     );
     let (_, _, hessian, []) =
-        binomial_ls_row_program_order2(0.0, 0.0, q0, inv_sigma, 0.0, m1, m2, 0.0, 0.0);
+        binomial_ls_row_order2(q0, inv_sigma, 0.0, m1, m2);
     hessian
 }
 
 /// Row coefficients of the joint directional derivative `D_β H_L[u]`: the
-/// `binomial_ls_row_program` third surface contracted along the predictor
+/// `binomial_ls_row` third surface contracted along the predictor
 /// perturbation `(d_eta_t, d_eta_ls) = (X_t·u_t, X_ls·u_ls)`. Returns
 /// `(c_tt, c_tl, c_ll)` such that the resulting matrix is
 ///
@@ -627,16 +703,12 @@ pub(crate) fn binomial_location_scale_first_directional_coefficients(
                 core.d3mu_dq3[i],
                 link_kind,
             );
-            let third = binomial_ls_row_program_third_contracted(
-                0.0,
-                0.0,
+            let third = binomial_ls_row_third_contracted(
                 core.q0[i],
                 core.sigma[i].recip(),
-                0.0,
                 m1,
                 m2,
                 m3,
-                0.0,
                 &[d_eta_t[i], d_eta_ls[i]],
             );
             *c_tt = third[0][0];
@@ -651,7 +723,7 @@ pub(crate) fn binomial_location_scale_first_directional_coefficients(
 }
 
 /// Row coefficients of the joint second directional derivative
-/// `D²_β H_L[u, v]`: the `binomial_ls_row_program` fourth surface contracted
+/// `D²_β H_L[u, v]`: the `binomial_ls_row` fourth surface contracted
 /// along the predictor perturbations `(d_eta_t_u, d_eta_ls_u)` and
 /// `(d_eta_t_v, d_eta_ls_v)`. Returns `(c_tt, c_tl, c_ll)` analogous to the
 /// first-order builder.
@@ -695,12 +767,9 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
                 core.d3mu_dq3[i],
                 link_kind,
             )?;
-            let fourth = binomial_ls_row_program_fourth_contracted(
-                0.0,
-                0.0,
+            let fourth = binomial_ls_row_fourth_contracted(
                 core.q0[i],
                 core.sigma[i].recip(),
-                0.0,
                 m1,
                 m2,
                 m3,
@@ -723,7 +792,7 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
 #[cfg(test)]
 mod packed_scalar_oracle_tests {
     //! #932 oracle and speed gate for the score lowering of
-    //! `binomial_ls_row_program`: the emitted order-2 surface's gradient against
+    //! `binomial_ls_row`: the emitted order-2 surface's gradient against
     //! the dense `Tower4<2>` builder ([`binomial_location_scale_nll_tower`]),
     //! which spells the row NLL separately in predictor coordinates.
     use super::*;
@@ -815,7 +884,7 @@ mod packed_scalar_oracle_tests {
 }
 #[cfg(test)]
 mod row_program_oracle_tests {
-    //! #932: every surface of `binomial_ls_row_program` production reads — the
+    //! #932: every surface of `binomial_ls_row` production reads — the
     //! row score and Hessian and the first and second directional Hessian
     //! coefficients — against the dense `Tower4<2>` builder
     //! ([`binomial_location_scale_nll_tower`]), which spells the row NLL

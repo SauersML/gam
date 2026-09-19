@@ -126,7 +126,7 @@ The formula is invalid or unsupported. Common causes:
 ```python
 try:
     gamfit.fit(df, "y ~ s(x, k=10")
-except gamfit.FormulaError as e:
+except gamfit.errors.FormulaError as e:
     print(gamfit.explain_error(e))
 ```
 
@@ -175,12 +175,12 @@ and category after the unchanged engine message:
 
 ```python
 try:
-    model = gamfit.fit(df, "y ~ s(x)", family="bernoulli-marginal-slope", ...)
-except gamfit.FitSeedError as e:
+    model = gamfit.fit(df, "y ~ s(x)")
+except gamfit.errors.FitSeedError as e:
     print("no admissible start:", e.variant, e.causes[-1])
-except gamfit.FitConvergenceError as e:
+except gamfit.errors.FitConvergenceError as e:
     print("did not converge:", e.variant)
-except gamfit.FitError as e:
+except gamfit.errors.FitError as e:
     print(e.category, e.variant, str(e))
 ```
 
@@ -204,7 +204,7 @@ installing from source without a Rust toolchain.
 ```python
 try:
     gamfit.fit(df, "y ~ s(x)")
-except gamfit.RustExtensionUnavailableError as e:
+except gamfit.errors.RustExtensionUnavailableError as e:
     print(gamfit.explain_error(e))
 ```
 
@@ -253,7 +253,7 @@ formula = "y ~ s(x)"
 
 try:
     model = gamfit.fit(df, formula)
-except gamfit.GamError as e:
+except gamfit.errors.GamError as e:
     log.error("gamfit failed: %s — %s", type(e).__name__, gamfit.explain_error(e))
     raise
 ```

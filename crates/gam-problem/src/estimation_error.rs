@@ -163,6 +163,35 @@ impl std::fmt::Display for FitStationarityEvidence {
     }
 }
 
+/// Why a declined certified optimum left nothing to publish (#2953).
+///
+/// Decided at runtime from how the terminal certificate's continuation ended; it is not
+/// configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DominanceRefusalKind {
+    /// The checkpoint that beat the declined optimum is a strict saddle, first-order
+    /// stationary on inadmissible curvature, and its escape could not be taken: the escape
+    /// declined, certified descent did not admit it, or the search from it could not run.
+    IncumbentUnescapableSaddle,
+    /// The checkpoint that beat the declined optimum did not certify, and no strategy
+    /// change its certificate published moved it to a point that does.
+    DominanceUnresolved,
+}
+
+impl std::fmt::Display for DominanceRefusalKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::IncumbentUnescapableSaddle => {
+                "the checkpoint that beat it is a strict saddle whose escape could not be taken"
+            }
+            Self::DominanceUnresolved => {
+                "the checkpoint that beat it did not certify, and no strategy change moved it \
+                 to a point that does"
+            }
+        })
+    }
+}
+
 /// Fixed-lambda solver stage that owns a resumable coefficient checkpoint.
 ///
 /// The multinomial fitter has two distinct objectives: the ordinary softmax
@@ -572,7 +601,8 @@ pub enum EstimationError {
 
     #[error(
         "Pre-fit linear separation detected in the realized binomial inverse-link design: \
-        {num_unpenalized_columns} parametric columns (unpenalized, or penalized only by a one-column ridge) admit a separating direction \
+        {num_unpenalized_columns} directions no roughness penalty bounds (parametric columns, and a smooth's penalty null space, \
+        unpenalized or penalized only by a ridge) admit a separating direction \
         with minimum signed margin {min_signed_margin:.6e} (columns {column_indices:?}). \
         The likelihood has no finite maximizer along that direction; enable Firth/Jeffreys bias reduction or \
         remove/reparameterize the separating columns."
@@ -581,6 +611,21 @@ pub enum EstimationError {
         min_signed_margin: f64,
         num_unpenalized_columns: usize,
         column_indices: Vec<usize>,
+    },
+
+    #[error(
+        "Not enough observations to identify the model: {n_observations} positive-weight rows but \
+        {unpenalized_dim} unpenalized coefficient directions (intercept, parametric terms and the \
+        penalty null spaces, out of {total_columns} columns). REML/LAML estimate the smoothing \
+        parameters from the n − {unpenalized_dim} residual contrasts the unpenalized directions \
+        cannot absorb, so n must exceed {unpenalized_dim}; the total column count need not be below n. \
+        Add observations, drop parametric terms, or penalize the unpenalized directions \
+        (double-penalty smooths contribute none)."
+    )]
+    PrefitUnpenalizedSpaceExceedsObservations {
+        n_observations: usize,
+        unpenalized_dim: usize,
+        total_columns: usize,
     },
 
     #[error(
@@ -707,14 +752,17 @@ pub enum EstimationError {
     },
 
     /// A penalty block's trace `λ_k·tr(H⁻¹S_k)` came out of `[0, rank_k]` by more
-    /// than the rounding band of the solve that produced it (#2901).
+    /// than the rounding band of the solve that produced it, on a block whose
+    /// `EdfRankBound` makes both ends theorems, or came out non-finite (#2901).
     ///
-    /// With a positive-semidefinite data curvature, `H ⪰ λ_k S_k` bounds that
-    /// trace by `rank_k`, so a larger value means the Hessian and the penalty it
-    /// was contracted against are not one operator. Clamping such a trace to its
-    /// rank published a plausible effective dimension from an inconsistent
-    /// operator: on `y ~ s(x) + s(x, g, bs='fs')` a raw trace of 6.09e4 against a
-    /// rank of 22 became `edf = 7.322` where the operator's own value is 9.309.
+    /// A certified `H ⪰ λ_k S_k` with `H` nonsingular gives `H ≻ 0`, so its trace lies
+    /// in `[0, rank_k]`, and one outside by more than its band means the Hessian and
+    /// the penalty it was contracted against are not one operator. Clamping such a
+    /// trace to its rank published a plausible effective dimension from an
+    /// inconsistent operator: on `y ~ s(x) + s(x, g, bs='fs')` a raw trace of 6.09e4
+    /// against a rank of 22 became `edf = 7.322` where the operator's own value is
+    /// 9.309. A non-finite trace carries no value on any block. A block that is not
+    /// certified publishes its finite raw trace instead of refusing, below zero too.
     #[error(
         "penalty block {block}'s trace {trace:.6e} lies outside [0, {rank}] by more than the \
          rounding band {band:.4e} of the solve that produced it: the Hessian and this penalty \
@@ -761,6 +809,17 @@ pub enum EstimationError {
     #[error("{reason}")]
     TrialPointRefused { reason: String },
 
+    /// The #784 block-local quadrature correction refused at one of its typed stages.
+    ///
+    /// Five stages are statements about THIS trial point: the order search's verdict, the
+    /// admission rule's resolution, and the penalized Hessian's spectrum at this rho's mode.
+    /// They back the outer search off the point. The correction used to decline them with a
+    /// silent zero splice, so a rho where the correction could not be evaluated scored as though
+    /// it needed none. The sixth, a corrector that returns no gradient moments for a non-empty
+    /// block, breaks the corrector's contract at every rho and stays fatal.
+    #[error("#784 block-local quadrature correction refused: {stage}")]
+    BlockQuadratureCorrectionRefused { stage: BlockQuadratureCorrectionStage },
+
     #[error("Fatal outer-objective evaluation failure ({context}): {source}")]
     OuterObjectiveEvaluationFailed {
         context: String,
@@ -801,6 +860,54 @@ pub enum EstimationError {
         /// is work-preservation evidence for resume — it is NOT a fit and no
         /// fitted-model API is reachable from it.
         rho_checkpoint: Vec<f64>,
+    },
+
+    /// A certified optimum that an evaluated state of the same search beats beyond the
+    /// criterion's rounding envelope, with nothing certified in its place (#2953).
+    ///
+    /// The plan runner declines such an optimum and continues the search from the state
+    /// that beats it (#2596, #2627): a certificate says a point is stationary, not that it
+    /// is the best point the search measured. When no plan attempt and no continuation of
+    /// the terminal certificate certifies, no fit is published. The declined optimum is not
+    /// the best point measured and the better checkpoint is not stationary, so this refusal
+    /// carries both.
+    #[error(
+        "Outer smoothing-parameter optimization declined a certified optimum that an \
+         evaluated state beats, and certified nothing in its place ({context}): {kind}. The \
+         declined optimum has objective {plateau_value:.6e} at rho {plateau_rho:?}; a state \
+         {gap:.3e} below it, beyond the criterion's rounding envelope {band:.3e}, resumed the \
+         search, and that continuation {continuation}. The best checkpoint has objective \
+         {incumbent_value:.6e} and projected gradient norm {}; resume by seeding the outer \
+         search at rho_checkpoint = {incumbent_rho:?}. Its terminal certificate refused: \
+         {terminal_refusal}",
+        .incumbent_projected_grad_norm.map_or_else(|| "unmeasured".to_string(), |g| format!("{g:.3e}")),
+    )]
+    DominatedCertifiedPlateau {
+        /// Fit context label (the same string the outer runner logs under).
+        context: String,
+        /// Why nothing certified in the declined optimum's place.
+        kind: DominanceRefusalKind,
+        /// Where the declined certified optimum sits.
+        plateau_rho: Vec<f64>,
+        /// The declined optimum's objective.
+        plateau_value: f64,
+        /// The checkpoint the terminal certificate refused, and the resume point.
+        incumbent_rho: Vec<f64>,
+        /// The objective the terminal certificate evaluated at `incumbent_rho`.
+        incumbent_value: f64,
+        /// KKT-projected gradient norm at `incumbent_rho`, when the terminal
+        /// certificate measured one.
+        incumbent_projected_grad_norm: Option<f64>,
+        /// The declined optimum's objective minus the re-evaluated objective of the
+        /// state that beat it, measured when the optimum was declined.
+        gap: f64,
+        /// `outer_value_agreement_bound` of those two values: the resolution the gap
+        /// was judged against.
+        band: f64,
+        /// How the search from the state that beat the optimum ended.
+        continuation: String,
+        /// The terminal certificate's own refusal at `incumbent_rho`.
+        terminal_refusal: Box<EstimationError>,
     },
 
     #[error(
@@ -1058,6 +1165,8 @@ impl EstimationError {
             Self::CustomFamily(err) => err.is_trial_point_infeasible(),
             // The producer said so directly (#2531).
             Self::TrialPointRefused { .. } => true,
+            // The #784 correction's stage says whether it is a fact about this rho.
+            Self::BlockQuadratureCorrectionRefused { stage } => stage.is_trial_point_local(),
             // "The inner problem at THIS rho is too hard to evaluate, try a
             // different rho" — [`Self::is_inner_solve_retreat`]'s own words for
             // exactly these five, and verbatim this predicate's definition. The
@@ -1085,6 +1194,7 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
@@ -1096,6 +1206,7 @@ impl EstimationError {
             | Self::StartupSeedsRefused { .. }
             | Self::OuterObjectiveEvaluationFailed { .. }
             | Self::RemlDidNotConverge { .. }
+            | Self::DominatedCertifiedPlateau { .. }
             | Self::FitDidNotConverge { .. }
             | Self::GradientUnavailable { .. }
             | Self::LayoutError { .. }
@@ -1237,6 +1348,16 @@ impl EstimationError {
             Self::OuterObjectiveEvaluationFailed { source, .. } => source
                 .estimation_error()
                 .map_or(FailureCategory::Unclassified, Self::failure_category),
+            // A rho-local stage of the #784 correction is a refusal the outer search walks away
+            // from, like `TrialPointRefused`; a corrector that breaks its moment contract is an
+            // engine invariant.
+            Self::BlockQuadratureCorrectionRefused { stage } => {
+                if stage.is_trial_point_local() {
+                    FailureCategory::Convergence
+                } else {
+                    FailureCategory::Invariant
+                }
+            }
             Self::PirlsDidNotConverge { .. }
             | Self::FixedLambdaNewtonDidNotConverge { .. }
             | Self::BlockOrthogonalRemlDidNotConverge { .. }
@@ -1246,6 +1367,7 @@ impl EstimationError {
             | Self::RemlOptimizationFailed(_)
             | Self::TrialPointRefused { .. }
             | Self::RemlDidNotConverge { .. }
+            | Self::DominatedCertifiedPlateau { .. }
             | Self::FitDidNotConverge { .. }
             // The exact Tweedie series refusing its term budget is a
             // convergence-class refusal of the likelihood evaluation.
@@ -1262,6 +1384,7 @@ impl EstimationError {
             | Self::PerfectSeparationDetected { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
@@ -1327,6 +1450,9 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
             }
+            Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
+                "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
+            }
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"
             }
@@ -1348,10 +1474,16 @@ impl EstimationError {
             Self::RemlOptimizationFailed(_) => "EstimationError::RemlOptimizationFailed",
             Self::StartupSeedsRefused(_) => "EstimationError::StartupSeedsRefused",
             Self::TrialPointRefused { .. } => "EstimationError::TrialPointRefused",
+            Self::BlockQuadratureCorrectionRefused { .. } => {
+                "EstimationError::BlockQuadratureCorrectionRefused"
+            }
             Self::OuterObjectiveEvaluationFailed { .. } => {
                 "EstimationError::OuterObjectiveEvaluationFailed"
             }
             Self::RemlDidNotConverge { .. } => "EstimationError::RemlDidNotConverge",
+            Self::DominatedCertifiedPlateau { .. } => {
+                "EstimationError::DominatedCertifiedPlateau"
+            }
             Self::FitDidNotConverge { .. } => "EstimationError::FitDidNotConverge",
             Self::GradientUnavailable { .. } => "EstimationError::GradientUnavailable",
             Self::LayoutError(_) => "EstimationError::LayoutError",
@@ -1831,6 +1963,68 @@ mod tests {
             EstimationError::HessianNotPositiveDefinite { .. }
         ));
     }
+
+    #[test]
+    fn block_quadrature_correction_refusals_back_off_only_at_rho_local_stages_784() {
+        use crate::laplace_sampler_contract::{BlockQuadratureOrderRefusal, BlockQuadratureRefusal};
+        // The six stages that are facts about the trial point back the outer search off it,
+        // as a convergence-class refusal (#784 ruling A).
+        let rho_local = [
+            BlockQuadratureCorrectionStage::OrderSearchRefused(BlockQuadratureOrderRefusal {
+                axis: 0,
+                axis_orders: vec![5],
+                paired_error: 1e-2,
+                resolution_target: 1e-6,
+                cause: BlockQuadratureRefusal::Integration("scripted refusal".to_string()),
+            }),
+            BlockQuadratureCorrectionStage::UnresolvedAtAdmission {
+                quadrature_error: 1e-3,
+                resolution_target: 1e-6,
+                axis_orders: vec![4, 4],
+                node_count: 16,
+            },
+            BlockQuadratureCorrectionStage::NonPositivePenalizedCurvature {
+                min_eigenvalue: -1e-3,
+            },
+            BlockQuadratureCorrectionStage::EigenpairResolutionUnavailable {
+                reason: "residual bound not finite".to_string(),
+            },
+            BlockQuadratureCorrectionStage::EigenframeNearDegeneracy {
+                block_eigenvalue: 2.0,
+                other_eigenvalue: 2.0 + 1e-12,
+                gap: 1e-12,
+                tolerance: 1e-10,
+            },
+            BlockQuadratureCorrectionStage::AxisSplitWithoutExactCurvature { block_dim: 2 },
+        ];
+        for stage in rho_local {
+            let error = EstimationError::BlockQuadratureCorrectionRefused { stage };
+            assert!(
+                error.is_trial_point_infeasible() && error.is_inner_solve_retreat(),
+                "a rho-local correction stage must back the outer search off: {error}"
+            );
+            assert!(
+                matches!(error.failure_category(), FailureCategory::Convergence),
+                "a rho-local correction stage is a convergence-class refusal: {error}"
+            );
+        }
+        // A corrector that breaks its moment contract does so at every rho, so it stays fatal.
+        let contract = EstimationError::BlockQuadratureCorrectionRefused {
+            stage: BlockQuadratureCorrectionStage::CorrectorReturnedNoMoments { block_dim: 3 },
+        };
+        assert!(
+            !contract.is_trial_point_infeasible(),
+            "a corrector contract violation must stay fatal: {contract}"
+        );
+        assert!(
+            matches!(contract.failure_category(), FailureCategory::Invariant),
+            "a corrector contract violation is an invariant failure: {contract}"
+        );
+        assert_eq!(
+            contract.variant_name(),
+            "EstimationError::BlockQuadratureCorrectionRefused"
+        );
+    }
 }
 
 /// Honest failure text for [`EstimationError::HessianNotPositiveDefinite`].
@@ -1866,5 +2060,112 @@ fn unidentified_eigenvalue_motion(largest: Option<f64>, reachable: Option<f64>) 
             format!("; the largest unidentified eigenvalue {sigma:.4e} can rise to {reachable:.4e}")
         }
         _ => String::new(),
+    }
+}
+
+/// The stage at which the #784 block-local quadrature correction refused, with what that stage
+/// measured ([`EstimationError::BlockQuadratureCorrectionRefused`]).
+#[derive(Clone, Debug)]
+pub enum BlockQuadratureCorrectionStage {
+    /// The order search could not resolve every block axis at this rho.
+    OrderSearchRefused(crate::laplace_sampler_contract::BlockQuadratureOrderRefusal),
+    /// Before the admission latched, the selected rule's paired differences did not resolve
+    /// `min(|Δ_b|, 1/n_eff²)` at this rho.
+    UnresolvedAtAdmission {
+        quadrature_error: f64,
+        resolution_target: f64,
+        axis_orders: Vec<usize>,
+        node_count: usize,
+    },
+    /// The corrector returned no gradient-channel moments for a non-empty block. Its contract
+    /// reserves an absent moment set for the empty block, so this is the corrector's defect at
+    /// every rho, not a property of one.
+    CorrectorReturnedNoMoments { block_dim: usize },
+    /// The penalized Hessian at this rho's mode has a non-positive or non-finite eigenvalue, so
+    /// the implicit mode response the exact gradient channels contract against is undefined.
+    NonPositivePenalizedCurvature { min_eigenvalue: f64 },
+    /// The per-eigenpair residual bounds that decide whether an eigenvalue gap is measured could
+    /// not be computed at this rho.
+    EigenpairResolutionUnavailable { reason: String },
+    /// A block eigenvalue and another eigenvalue of the penalized Hessian lie within the sum of
+    /// their measured resolutions at this rho, where the eigenframe is not differentiable.
+    EigenframeNearDegeneracy {
+        block_eigenvalue: f64,
+        other_eigenvalue: f64,
+        gap: f64,
+        tolerance: f64,
+    },
+    /// The admission latched the axis-by-axis block marginal, whose analytic mixed-axis term
+    /// requires the Laplace Hessian weights to be the likelihood's own second derivative, and
+    /// this rho's inner solve converged under the expected-information surrogate instead.
+    AxisSplitWithoutExactCurvature { block_dim: usize },
+}
+
+impl BlockQuadratureCorrectionStage {
+    /// Whether this stage states a fact about the trial point it was evaluated at, which the
+    /// outer search can back away from. Exhaustive with no wildcard arm, for the reason
+    /// [`EstimationError::is_trial_point_infeasible`] is.
+    #[must_use]
+    pub fn is_trial_point_local(&self) -> bool {
+        match self {
+            Self::OrderSearchRefused(_)
+            | Self::UnresolvedAtAdmission { .. }
+            | Self::NonPositivePenalizedCurvature { .. }
+            | Self::EigenpairResolutionUnavailable { .. }
+            | Self::EigenframeNearDegeneracy { .. }
+            | Self::AxisSplitWithoutExactCurvature { .. } => true,
+            Self::CorrectorReturnedNoMoments { .. } => false,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockQuadratureCorrectionStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrderSearchRefused(refusal) => {
+                write!(f, "the order search refused at this rho: {refusal}")
+            }
+            Self::UnresolvedAtAdmission {
+                quadrature_error,
+                resolution_target,
+                axis_orders,
+                node_count,
+            } => write!(
+                f,
+                "at admission the paired Gauss-Hermite error {quadrature_error:.4e} does not \
+                 resolve min(|Δ_b|, 1/n_eff²)={resolution_target:.4e} (axis orders \
+                 {axis_orders:?}, {node_count} nodes)"
+            ),
+            Self::CorrectorReturnedNoMoments { block_dim } => write!(
+                f,
+                "the corrector returned no gradient moments for a {block_dim}-direction block; \
+                 its contract reserves absent moments for the empty block"
+            ),
+            Self::NonPositivePenalizedCurvature { min_eigenvalue } => write!(
+                f,
+                "the penalized Hessian at this rho's mode has the non-positive eigenvalue \
+                 {min_eigenvalue:.4e}, so the implicit mode response is undefined"
+            ),
+            Self::EigenpairResolutionUnavailable { reason } => {
+                write!(f, "the eigenpair residual bounds are unavailable at this rho: {reason}")
+            }
+            Self::EigenframeNearDegeneracy {
+                block_eigenvalue,
+                other_eigenvalue,
+                gap,
+                tolerance,
+            } => write!(
+                f,
+                "block eigenvalue {block_eigenvalue:.6e} and eigenvalue {other_eigenvalue:.6e} \
+                 differ by {gap:.3e}, within their summed resolution {tolerance:.3e}, where the \
+                 eigenframe is not differentiable"
+            ),
+            Self::AxisSplitWithoutExactCurvature { block_dim } => write!(
+                f,
+                "the {block_dim}-direction block was admitted axis by axis, whose mixed-axis term \
+                 needs the observed Hessian, and this rho's inner solve converged under the \
+                 expected-information surrogate"
+            ),
+        }
     }
 }

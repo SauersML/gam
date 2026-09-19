@@ -76,8 +76,6 @@ def wants_table(
 def shape_predict_response(
     raw: str,
     *,
-    headers: list[str],
-    rows: list[list[str]],
     table_kind: str | None,
     training_table_kind: str,
     interval: float | None,
@@ -121,7 +119,9 @@ def shape_predict_response(
     # encodes exactly those two per-class differences; the shared shaper
     # (`_shape_point_payload`) owns the identical "return the vector, or restore
     # a one-column table" tail that the three forked shapers used to duplicate.
-    point, table_columns = _point_payload_spec(point_shape, point_column, columns)
+    point, table_columns = _point_payload_spec(
+        point_shape, point_column, columns, parsed.get("point_columns")
+    )
     shaped = _shape_point_payload(
         point,
         table_columns,
@@ -139,8 +139,13 @@ def shape_predict_response(
     # #2296: a curved-link posterior-mean POINT integrates the conditional
     # posterior even when the band is smoothing-corrected — a separate,
     # result-owned fact carried under its own key.
-    return _attach_covariance_provenance(
+    shaped = _attach_covariance_provenance(
         shaped, "point_covariance_source", parsed.get("point_covariance_source")
+    )
+    # gam#2985: when the fit withheld its covariance, the posterior-mean point
+    # says what it is conditional on, under its own key.
+    return _attach_covariance_provenance(
+        shaped, "point_covariance_note", parsed.get("point_covariance_note")
     )
 
 
@@ -169,6 +174,7 @@ def _point_payload_spec(
     point_shape: str,
     point_column: str,
     columns: dict[str, list[Any]],
+    point_columns: list[str] | None = None,
 ) -> tuple[Any, dict[str, list[Any]]]:
     """Resolve a point-payload class to its ``(point_vector, table_columns)``.
 
@@ -192,6 +198,11 @@ def _point_payload_spec(
       the point ``mean``; ``std_error`` is the probability-scale posterior SE
       (the documented response-scale column, not the η-scale SE) and is left
       untouched.
+    * **joint expectile fit** — one curve per expectile level: an ``(n, K)``
+      array whose columns are the Rust ``point_columns`` (``expectile_{tau}``,
+      increasing level order); table form is the full payload, which carries
+      those curves beside the location-scale ``posterior_mean`` and
+      ``noise_scale``.
     * **standard GAM / GLM, including the location-scale classes** —
       ``posterior_mean`` as emitted; table form is the *full* Rust
       estimand-explicit payload (``linear_predictor_plugin``, ``mean_plugin``,
@@ -250,6 +261,12 @@ def _point_payload_spec(
                         [float(value) for value in columns[bound_key]]
                     )
         return probs, table_columns
+
+    if point_shape == "expectile_curves":
+        curves = rust_module().column_stack_f64(
+            [[float(value) for value in columns[name]] for name in point_columns]
+        )
+        return curves, columns
 
     posterior_mean = rust_module().vec_to_array1_f64(
         [float(value) for value in columns[point_column]]

@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 /// Stable identity of the serialized fit-request document.
 pub(crate) const FIT_REQUEST_SCHEMA: &str = "gam.fit-request";
@@ -91,8 +90,14 @@ pub struct FitRequestConfigDocument {
     pub frozen_ctn: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transformation_normal_config: Option<CtnStage1ConfigDocument>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expectile_tau: Option<f64>,
+    /// Expectile level(s): one level, or a strictly increasing list fitted
+    /// jointly without crossing. A bare number is the one-level spelling.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_expectile_levels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expectile_tau: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,29 +132,6 @@ pub struct FitRequestConfigDocument {
     pub analytic_penalties: Option<AnalyticPenaltiesDocument>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precision_hyperpriors: Option<BTreeMap<String, PrecisionHyperpriorDocument>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Whether to precompute the distribution-free conformal substrates (#942
-    /// jackknife+, #1098 exact full-conformal) at fit time and persist them on
-    /// the saved model. Omit to keep the default of precomputing whenever the
-    /// fit is eligible; `false` skips both.
-    ///
-    /// Measured on `y ~ s(x1,k=6) + s(x2,k=6)` (#2633): the two substrates are
-    /// 94% of a saved Gaussian model at n=20,000 (10.2 MB of 10.85 MB) and grow
-    /// linearly with the training rows. Rebuilding both costs ~5.6 ms, 0.3% of
-    /// the fit, and stays under half a second out to p=253. So turning this off
-    /// yields a ~16x smaller model (10.85 MB -> ~0.65 MB at n=20,000).
-    ///
-    /// It is opt-OUT because rebuilding needs the training design AND response
-    /// back, which a saved model deliberately does not carry: a model shipped to
-    /// a host that never sees the training data must keep them or it cannot
-    /// produce a conformal interval at all. Turn it off when the caller retains
-    /// its training data, fits in batch, or never asks for conformal intervals.
-    pub precompute_conformal: Option<bool>,
-    /// Explicit root for cross-process warm starts. Omit to disable on-disk
-    /// persistence. The path is used exactly as supplied; no temp/cache
-    /// discovery or environment fallback is performed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistent_warm_start_root: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scale_dimensions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,15 +182,23 @@ pub struct FitRequestConfigDocument {
     pub weights: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub z_column: Option<String>,
+    /// Residual genetic repair columns for the Bernoulli marginal-slope family
+    /// (gam#2924): conditionally centred genetic residual features entering the
+    /// genetic drive beside the score with ridge-shrunk constant coefficients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_columns: Option<Vec<String>>,
     /// The supplied z column is already transformed by a frozen external model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frozen_score: Option<bool>,
-    /// The latent measure a marginal-slope kernel integrates against:
-    /// `"auto"`, `"standard-normal"`, or `"global-empirical"` (gam#2923).
+    /// The latent law a marginal-slope fit anchors on (gam#2926): `"auto"` (the
+    /// default: the law of the score estimated on the marginal-index span, global
+    /// or local by context), `"gaussian"` (the closed form, refused when the
+    /// score fails the adequacy check), `"global-empirical"`, or
+    /// `"conditional-location-scale"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latent_measure: Option<String>,
-    /// A declared finite law of the latent score for a survival marginal-slope
-    /// fit (gam#2923): `{"nodes": [...], "weights": [...]}`.
+    /// A declared finite law of the latent score for a marginal-slope fit
+    /// (gam#2923, gam#2926): `{"nodes": [...], "weights": [...]}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declared_latent_law: Option<DeclaredLatentLawDocument>,
 }
@@ -357,9 +347,44 @@ pub struct CtnStage1ConfigDocument {
     pub double_penalty: Option<bool>,
 }
 
+/// `expectile_tau` accepts one level (`0.9`) or a list of levels (`[0.1, 0.9]`).
+fn deserialize_expectile_levels<'de, D>(deserializer: D) -> Result<Option<Vec<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Levels {
+        One(f64),
+        Many(Vec<f64>),
+    }
+    Ok(
+        Option::<Levels>::deserialize(deserializer)?.map(|levels| match levels {
+            Levels::One(tau) => vec![tau],
+            Levels::Many(levels) => levels,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expectile_tau_accepts_one_level_or_a_list() {
+        let parse = |value: &str| -> Option<Vec<f64>> {
+            let json = format!(
+                r#"{{"schema":"gam.fit-request","schema_version":1,"formula":"y ~ x","config":{{"expectile_tau":{value}}}}}"#
+            );
+            FitRequestDocument::from_json(&json)
+                .unwrap()
+                .config
+                .expectile_tau
+        };
+        assert_eq!(parse("0.9"), Some(vec![0.9]));
+        assert_eq!(parse("[0.1, 0.5, 0.9]"), Some(vec![0.1, 0.5, 0.9]));
+        assert_eq!(parse("null"), None);
+    }
 
     #[test]
     fn parser_rejects_another_schema_or_version() {

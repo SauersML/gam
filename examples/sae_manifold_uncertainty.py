@@ -24,14 +24,13 @@ def main() -> None:
     ])
     x += 0.18 * rng.standard_normal(x.shape)
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         x,
         K=1,
         d_atom=1,
         atom_topology="circle",
         assignment="softmax",
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=40,

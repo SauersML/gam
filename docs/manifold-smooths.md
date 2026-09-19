@@ -99,7 +99,7 @@ radial spike, fit via `gamfit.fit` directly) is in
 ## Torch-side: `gamfit.torch.ManifoldSAE`
 
 The Torch class is a frozen tensor adapter for the converged object returned by
-`gamfit.sae_manifold_fit`. All model mathematics, topology choices, assignment,
+`gamfit.sae.sae_manifold_fit`. All model mathematics, topology choices, assignment,
 smoothing selection, and out-of-sample latent inference remain in the native
 fit.
 
@@ -108,7 +108,7 @@ import torch
 import gamfit
 from gamfit.torch import ManifoldSAE
 
-fit = gamfit.sae_manifold_fit(
+fit = gamfit.sae.sae_manifold_fit(
     X=training_activations,
     K=F,
     d_atom=1,

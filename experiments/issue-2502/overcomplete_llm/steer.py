@@ -11,8 +11,13 @@ tokens the claim is read off:
   change on the target set against a frequency-matched control set, on
   *different* sequences. A direction that steers shows a monotone dose response
   on its targets and a flat one on the controls.
-* **ablation** — at positions where the block actually fires, remove its own
+* **ablation** — at every spliced position of half B, remove the block's own
   subspace component and read the same statistic.
+* **random-direction control** — the same discovery and confirmation for
+  directions drawn uniformly on the sphere at the block's own dose. Any vector
+  added to the residual stream moves some tokens' log-probabilities, so a
+  target/control gap means something about the dictionary only where the block's
+  own gap exceeds these.
 
 The dose is expressed in the block's own units: `alpha x mean_gate x u`, where
 `mean_gate` is the block's mean held-out `||z_g||` and `u` its unit mean firing
@@ -45,6 +50,9 @@ def parse_args():
     ap.add_argument("--angle-blocks", type=int, default=4,
                     help="b=2 blocks whose chart angle is swept causally")
     ap.add_argument("--angle-bins", type=int, default=24)
+    ap.add_argument("--random-directions", type=int, default=3,
+                    help="norm-matched random directions per steered block")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
     return ap.parse_args()
 
@@ -140,6 +148,42 @@ def main():
     vocab = clean_a.size
     base_counts = np.bincount(tokens, minlength=vocab)[:vocab].astype(np.float64)
 
+    order = np.argsort(base_counts)
+    rank = np.empty_like(order)
+    rank[order] = np.arange(order.size)
+
+    def discover(vec):
+        """Targets: the tokens `vec` boosts most on half A. Controls: for each
+        target, the non-target token with the closest held-out count."""
+        intervention["vec"] = vec.view(1, 1, p)
+        dlp_a = logprobs(seqs_a) - clean_a
+        intervention["vec"] = None
+        targets = np.argsort(-dlp_a)[: args.targets]
+        controls = []
+        used = set(int(t) for t in targets)
+        for t in targets:
+            r = rank[t]
+            for step in range(1, 400):
+                for cand_rank in (r + step, r - step):
+                    if 0 <= cand_rank < order.size:
+                        cand = int(order[cand_rank])
+                        if cand not in used:
+                            controls.append(cand)
+                            used.add(cand)
+                            break
+                else:
+                    continue
+                break
+        return targets, np.array(controls, dtype=np.int64)
+
+    def confirm(vec, targets, controls):
+        """Mean log-prob change on half B of the targets and of the controls."""
+        intervention["vec"] = None if vec is None else vec.view(1, 1, p)
+        dlp_b = logprobs(seqs_b) - clean_b
+        intervention["vec"] = None
+        return float(dlp_b[targets].mean()), float(dlp_b[controls].mean())
+
+    rng = np.random.default_rng(args.seed)
     report = {"layer": layer, "doses": doses, "blocks": []}
     for gid in chosen:
         gid = int(gid)
@@ -159,51 +203,33 @@ def main():
         frame_t = torch.from_numpy(np.ascontiguousarray(frame)).cuda()
 
         # Discovery on half A at unit dose.
-        intervention["vec"] = (mean_gate * unit_t).view(1, 1, p)
-        dlp_a = logprobs(seqs_a) - clean_a
-        intervention["vec"] = None
-        targets = np.argsort(-dlp_a)[: args.targets]
-        # Frequency-matched controls: for each target, the token with the closest
-        # held-out count that is not itself a target.
-        controls = []
-        used = set(int(t) for t in targets)
-        order = np.argsort(base_counts)
-        rank = np.empty_like(order)
-        rank[order] = np.arange(order.size)
-        for t in targets:
-            r = rank[t]
-            for step in range(1, 400):
-                for cand_rank in (r + step, r - step):
-                    if 0 <= cand_rank < order.size:
-                        cand = int(order[cand_rank])
-                        if cand not in used:
-                            controls.append(cand)
-                            used.add(cand)
-                            break
-                else:
-                    continue
-                break
-        controls = np.array(controls, dtype=np.int64)
+        targets, controls = discover(mean_gate * unit_t)
 
         curve = []
         for alpha in doses:
-            intervention["vec"] = (
-                None if alpha == 0.0 else (alpha * mean_gate * unit_t).view(1, 1, p)
+            target_dlp, control_dlp = confirm(
+                None if alpha == 0.0 else alpha * mean_gate * unit_t, targets, controls
             )
-            dlp_b = logprobs(seqs_b) - clean_b
             curve.append(
-                {
-                    "dose": alpha,
-                    "target_mean_dlogp": float(dlp_b[targets].mean()),
-                    "control_mean_dlogp": float(dlp_b[controls].mean()),
-                }
+                {"dose": alpha, "target_mean_dlogp": target_dlp, "control_mean_dlogp": control_dlp}
             )
-            intervention["vec"] = None
 
         # Ablation: remove the block's own subspace everywhere on half B.
         intervention["ablate"] = frame_t
         dlp_abl = logprobs(seqs_b) - clean_b
         intervention["ablate"] = None
+
+        # The same split-half statistic for random directions at the block's dose.
+        random_controls = []
+        for _ in range(args.random_directions):
+            direction = rng.standard_normal(p)
+            direction /= np.linalg.norm(direction)
+            vec = mean_gate * torch.from_numpy(direction.astype(np.float32)).cuda()
+            r_targets, r_controls = discover(vec)
+            target_dlp, control_dlp = confirm(vec, r_targets, r_controls)
+            random_controls.append(
+                {"target_mean_dlogp": target_dlp, "control_mean_dlogp": control_dlp}
+            )
 
         report["blocks"].append(
             {
@@ -217,13 +243,16 @@ def main():
                 "dose_curve": curve,
                 "ablation_target_mean_dlogp": float(dlp_abl[targets].mean()),
                 "ablation_control_mean_dlogp": float(dlp_abl[controls].mean()),
+                "random_direction_controls": random_controls,
             }
         )
+        gaps = [r["target_mean_dlogp"] - r["control_mean_dlogp"] for r in random_controls]
         print(
             f"[steer] block {gid}: targets={[tok.decode([int(t)]) for t in targets[:5]]} "
             f"dose+1 target={curve[doses.index(1.0)]['target_mean_dlogp']:.4f} "
             f"control={curve[doses.index(1.0)]['control_mean_dlogp']:.4f} "
-            f"ablate target={float(dlp_abl[targets].mean()):.4f}",
+            f"ablate target={float(dlp_abl[targets].mean()):.4f} "
+            f"random-direction gaps={[round(v, 4) for v in gaps]}",
             flush=True,
         )
 

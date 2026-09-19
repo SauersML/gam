@@ -158,6 +158,32 @@ pub fn resolvability_interval(gammas: &[f64]) -> Option<(f64, f64)> {
     (lower < upper).then_some((lower, upper))
 }
 
+/// Whether a term's unpenalized fit is identified by its own data (#2954): every
+/// generalized eigenvalue `γ_j` of its `p`-column Gram against its penalty, on
+/// the penalty's range, clears the band `p·ε·‖B‖_F` those eigenvalues carry.
+/// `B = D_r^(−1/2)·(A_rr − A_r0·A_00⁺·A_0r)·D_r^(−1/2)` is formed from `p`-term inner
+/// products, so its entries hold `p·ε·‖B‖` of rounding, and a symmetric
+/// eigensolver's backward error is of the same order; `‖B‖_F = √(Σγ_j²)` bounds
+/// both. Then `H_β` restricted to the term stays nonsingular as its `λ → 0`, and
+/// the lower resolvability edge is the unpenalized fit's limit model. Otherwise
+/// the penalty is what makes `H_β` positive definite there (a basis wider than
+/// the data support), and that edge is a representability face.
+pub fn unpenalized_fit_is_identified(gammas: &[f64], columns: usize) -> bool {
+    // Scaled by the largest `γ_j`, so `Σγ_j²` cannot overflow where every `γ_j`
+    // is finite.
+    let scale = gammas
+        .iter()
+        .fold(0.0_f64, |scale, gamma| scale.max(gamma.abs()));
+    let frobenius = scale
+        * gammas
+            .iter()
+            .map(|gamma| (gamma / scale).powi(2))
+            .sum::<f64>()
+            .sqrt();
+    let band = columns as f64 * f64::EPSILON * frobenius;
+    frobenius.is_finite() && frobenius > 0.0 && gammas.iter().all(|&gamma| gamma > band)
+}
+
 /// One coordinate's domain from its resolvability interval: intersected with
 /// the representable log-strength range, and with a family-declared floor when
 /// one is given (the multinomial's derived minimum strength).
@@ -195,7 +221,7 @@ fn shared_columns_companions<'a>(
 /// Orthonormal frame of the null space of a symmetric PSD matrix, classified at
 /// the pseudo-determinant's positive-eigenvalue threshold. `None` when the
 /// eigendecomposition fails.
-fn psd_null_frame(matrix: &Array2<f64>) -> Option<Array2<f64>> {
+pub(crate) fn psd_null_frame(matrix: &Array2<f64>) -> Option<Array2<f64>> {
     let (evals, evecs) = matrix.eigh(Side::Lower).ok()?;
     let threshold = positive_eigenvalue_threshold(evals.as_slice()?);
     let null_cols: Vec<usize> = evals
@@ -313,6 +339,32 @@ pub(crate) fn resolvability_domain_from_design(
     design: &DesignMatrix,
     penalties: &[CanonicalPenalty],
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
+    resolvability_domain_and_limit_faces_from_design(weights, design, penalties)
+        .map(|domain| (domain.lower, domain.upper))
+}
+
+/// The #2812 resolvability domain with the kind of each of its faces (#2954).
+///
+/// A coordinate's edge is its limit model when it comes from the term's own
+/// resolvability interval: past `ln(γ_max / √ε)` every direction's effective
+/// degrees of freedom `γ_j / (γ_j + λ)` are under the gradient's resolution, so
+/// the term is at its null-space fit, and below `ln(√ε γ_min)` it is at its
+/// unpenalized fit where its data identify that fit
+/// ([`unpenalized_fit_is_identified`]). An edge that is the precision box a term without penalty
+/// geometry falls back to, or that the representable log-strength range cut, is
+/// a literal and is not.
+pub(crate) struct ResolvabilityDomain {
+    pub(crate) lower: Array1<f64>,
+    pub(crate) upper: Array1<f64>,
+    pub(crate) lower_is_limit: Vec<bool>,
+    pub(crate) upper_is_limit: Vec<bool>,
+}
+
+pub(crate) fn resolvability_domain_and_limit_faces_from_design(
+    weights: ArrayView1<'_, f64>,
+    design: &DesignMatrix,
+    penalties: &[CanonicalPenalty],
+) -> Result<ResolvabilityDomain, String> {
     let n = design.nrows();
     let p = design.ncols();
     if weights.len() != n {
@@ -350,6 +402,8 @@ pub(crate) fn resolvability_domain_from_design(
     let (box_lo, box_hi) = coordinate_domain(None, None);
     let mut lower = Array1::<f64>::from_elem(penalties.len(), box_lo);
     let mut upper = Array1::<f64>::from_elem(penalties.len(), box_hi);
+    let mut lower_is_limit = vec![false; penalties.len()];
+    let mut upper_is_limit = vec![false; penalties.len()];
     for (k, penalty) in penalties.iter().enumerate() {
         let Some(index) = ranges.iter().position(|range| *range == penalty.col_range) else {
             continue;
@@ -371,9 +425,22 @@ pub(crate) fn resolvability_domain_from_design(
             let (lo, hi) = coordinate_domain(Some(interval), None);
             lower[k] = lo;
             upper[k] = hi;
+            // λ → ∞ is the null-space fit whatever the data. λ → 0 is a limit
+            // only where the unpenalized fit exists: the term's own data must
+            // identify its penalized range.
+            let columns = grams[index].nrows();
+            let identified = penalty_range_gammas_from_gram(&grams[index], &penalty.local)
+                .is_some_and(|gammas| unpenalized_fit_is_identified(&gammas, columns));
+            lower_is_limit[k] = lo == interval.0 && identified;
+            upper_is_limit[k] = hi == interval.1;
         }
     }
-    Ok((lower, upper))
+    Ok(ResolvabilityDomain {
+        lower,
+        upper,
+        lower_is_limit,
+        upper_is_limit,
+    })
 }
 
 #[cfg(test)]
@@ -432,6 +499,28 @@ mod tests {
             (upper[1] - expected).abs() <= 64.0 * f64::EPSILON * expected.abs(),
             "complementary ridge upper edge {} must stay the shared edge {expected}",
             upper[1]
+        );
+    }
+
+    /// #2954: λ → 0 is the unpenalized fit's limit only where the term's own data
+    /// identify its penalized range. A Gram with no curvature along one penalized
+    /// direction (a basis wider than the data support) leaves `γ = 0` there, so the
+    /// unpenalized fit is not identified and the lower edge is a representability
+    /// face; the full-rank Gram identifies it.
+    #[test]
+    fn a_rank_deficient_block_has_no_unpenalized_limit_2954() {
+        let penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let full = array![[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 1.0]];
+        let deficient = array![[2.0, 0.3, 0.0], [0.3, 1.5, 0.0], [0.0, 0.0, 0.0]];
+        let identified = penalty_range_gammas_from_gram(&full, &penalty).expect("spectrum");
+        assert!(
+            unpenalized_fit_is_identified(&identified, 3),
+            "full rank: {identified:?}"
+        );
+        let unidentified = penalty_range_gammas_from_gram(&deficient, &penalty).expect("spectrum");
+        assert!(
+            !unpenalized_fit_is_identified(&unidentified, 3),
+            "rank deficient: {unidentified:?}"
         );
     }
 }

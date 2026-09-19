@@ -98,6 +98,11 @@ pub struct ExactNewtonJointGradientEvaluation {
     pub gradient: Array1<f64>,
 }
 
+/// The absolute row summands behind a workspace's joint gradient (#2976), in flattened
+/// coefficient-block order. The type is the roundoff owner's, so a gradient assembled
+/// outside a custom family carries the same record (#2822).
+pub use gam_linalg::roundoff::GradientAccumulation;
+
 /// Batched per-θ_j contributions to the analytic outer gradient.
 ///
 /// Used by [`CustomFamily::batched_outer_gradient_terms`] to amortize the
@@ -249,6 +254,29 @@ pub trait JeffreysRotatedFirstDerivative {
     ) -> Result<Array2<f64>, String>;
 }
 
+/// A family's answer to a request for the hyperparameter motion of its Jeffreys information
+/// (gam#2922).
+#[derive(Clone, Debug)]
+pub enum JeffreysInformationMotion<T> {
+    /// The motion the family supplies.
+    Published(T),
+    /// The family supplies no such motion.
+    Unpublished {
+        /// The axis the family declines and the cause.
+        reason: String,
+    },
+}
+
+impl<T> JeffreysInformationMotion<T> {
+    /// The published motion, or the family's reason it supplies none.
+    pub fn published(self) -> Result<T, String> {
+        match self {
+            Self::Published(motion) => Ok(motion),
+            Self::Unpublished { reason } => Err(reason),
+        }
+    }
+}
+
 /// A family's third β-directional Jeffreys information derivative, the fifth likelihood
 /// derivative. An armed Jeffreys objective's exact outer Hessian consumes it twice: in the ρ-ρ
 /// mode-response completion and in the mixed `D²H_Φ` drift. A family exposes it through
@@ -314,6 +342,25 @@ pub trait JeffreysCompletionOuterDerivatives {
         d_beta_u_flat: &Array1<f64>,
         d_beta_w_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String>;
+}
+
+/// A family whose outer searches run as independent members of a parallel
+/// multistart (gnomon#2359): each seed searches on its own member, and the
+/// multistart starts a search only once the memory governor has granted its
+/// predicted working set (SPEC 10).
+pub trait IndependentOuterSearch<F> {
+    /// One outer search's predicted working set on `specs`, derived from what it
+    /// allocates, with its caches at the size they take when the search runs
+    /// alone on `serial_available_bytes`.
+    fn outer_search_working_set_bytes(
+        &self,
+        specs: &[ParameterBlockSpec],
+        serial_available_bytes: u64,
+    ) -> u64;
+
+    /// A member for one search: its per-fit state fresh, as a newly built family
+    /// has it, and its memory choices read from `lane`.
+    fn outer_search_member(&self, lane: Arc<gam_runtime::resource::SearchLaneBudget>) -> F;
 }
 
 /// User-defined family contract for multi-block generalized models.
@@ -562,6 +609,16 @@ pub trait CustomFamily {
         config.seed_budget = 1;
         config.screen_max_inner_iterations = 2;
         config
+    }
+
+    /// The family's members for a parallel multistart, when it has them
+    /// ([`IndependentOuterSearch`]). Without them every seed would share this
+    /// family's per-fit state, so a multistart runs only for a family that has.
+    fn independent_outer_search(&self) -> Option<&(dyn IndependentOuterSearch<Self> + Sync)>
+    where
+        Self: Sized,
+    {
+        None
     }
 
     /// Whether outer hyper-derivative evaluation must use a joint exact path.
@@ -2034,6 +2091,126 @@ pub trait CustomFamily {
     /// (Gaussian-identity, λ/ε penalty hyperparameters) returns `false`.
     fn joint_jeffreys_information_depends_on_psi(&self) -> bool {
         true
+    }
+
+    /// `∂_ψ H_info|_β` for a family whose Jeffreys information is NOT the observed joint
+    /// Hessian (gam#2922).
+    ///
+    /// The engine substitutes `hessian_psi`, the ψ-derivative of the observed joint Hessian,
+    /// only while [`Self::joint_jeffreys_information_matches_observed_hessian`] holds. A family
+    /// whose information is another matrix — the expected Fisher information of a
+    /// non-canonical Bernoulli likelihood — and depends on ψ supplies its motion here and in
+    /// the companions below, which the explicit-ψ Jeffreys value, β-coupling and curvature
+    /// terms read. `Unpublished` refuses those terms for such a family instead of substituting
+    /// the observed Hessian's motion.
+    fn joint_jeffreys_information_psi_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_index: usize,
+    ) -> Result<JeffreysInformationMotion<Array2<f64>>, String> {
+        assert_states_match_specs(block_states, specs, "Jeffreys information psi derivative");
+        assert_hyper_layout_matches_specs(hyper_layout, specs, "Jeffreys information psi derivative");
+        assert_psi_index_in_layout(hyper_layout, psi_index, "Jeffreys information psi derivative");
+        Ok(JeffreysInformationMotion::Unpublished {
+            reason: format!(
+                "the family supplies no derivative of its Jeffreys information along hyper axis {psi_index}"
+            ),
+        })
+    }
+
+    /// `{∂_ψ D_β H_info[e_a]|_β}` over every coefficient axis `a`, in axis order: the companion
+    /// of [`Self::joint_jeffreys_information_psi_derivative`] in place of
+    /// [`Self::exact_newton_joint_psihessian_directional_derivatives_all_beta_axes`].
+    /// `Unpublished` refuses the explicit-ψ Jeffreys terms for such a family.
+    fn joint_jeffreys_information_psi_derivative_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_index: usize,
+    ) -> Result<JeffreysInformationMotion<Vec<Array2<f64>>>, String> {
+        assert_states_match_specs(block_states, specs, "Jeffreys information psi drift");
+        assert_hyper_layout_matches_specs(hyper_layout, specs, "Jeffreys information psi drift");
+        assert_psi_index_in_layout(hyper_layout, psi_index, "Jeffreys information psi drift");
+        Ok(JeffreysInformationMotion::Unpublished {
+            reason: format!(
+                "the family supplies no coefficient-axis derivatives of its Jeffreys information along hyper axis {psi_index}"
+            ),
+        })
+    }
+
+    /// `∂_{ψ_i}∂_{ψ_j} H_info|_β` for a family whose information is NOT the observed joint
+    /// Hessian (gam#2922): the explicit ψψ motion the Jeffreys value's second derivative
+    /// reads. The engine substitutes `hessian_psi_psi` only while
+    /// [`Self::joint_jeffreys_information_matches_observed_hessian`] holds. `Unpublished` refuses
+    /// the explicit ψψ Jeffreys terms for such a family.
+    fn joint_jeffreys_information_psi_second_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<JeffreysInformationMotion<Array2<f64>>, String> {
+        assert_states_match_specs(block_states, specs, "Jeffreys information psi second derivative");
+        assert_hyper_layout_matches_specs(hyper_layout, specs, "Jeffreys information psi second derivative");
+        assert_psi_index_in_layout(hyper_layout, psi_i, "Jeffreys information psi second derivative");
+        assert_psi_index_in_layout(hyper_layout, psi_j, "Jeffreys information psi second derivative");
+        Ok(JeffreysInformationMotion::Unpublished {
+            reason: format!(
+                "the family supplies no second derivative of its Jeffreys information along hyper axes {psi_i} and {psi_j}"
+            ),
+        })
+    }
+
+    /// `{∂_{ψ_i}∂_{ψ_j} D_β H_info[e_a]|_β}` over every coefficient axis `a`, for a family whose
+    /// information is NOT the observed joint Hessian (gam#2922): what the explicit Jeffreys
+    /// curvature's ψ pair reads in place of
+    /// [`Self::exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes`].
+    /// `Unpublished` refuses that curvature for such a family.
+    fn joint_jeffreys_information_psi_second_derivative_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<JeffreysInformationMotion<Vec<Array2<f64>>>, String> {
+        assert_states_match_specs(block_states, specs, "Jeffreys information psi pair drift");
+        assert_hyper_layout_matches_specs(hyper_layout, specs, "Jeffreys information psi pair drift");
+        assert_psi_index_in_layout(hyper_layout, psi_i, "Jeffreys information psi pair drift");
+        assert_psi_index_in_layout(hyper_layout, psi_j, "Jeffreys information psi pair drift");
+        Ok(JeffreysInformationMotion::Unpublished {
+            reason: format!(
+                "the family supplies no coefficient-axis second derivatives of its Jeffreys information along hyper axes {psi_i} and {psi_j}"
+            ),
+        })
+    }
+
+    /// `{∂_ψ D²_β H_info[direction, e_a]|_β}` over every coefficient axis `a`, for a family whose
+    /// information is NOT the observed joint Hessian (gam#2922): what the explicit Jeffreys
+    /// curvature's ψ completion and β-ψ drift read in place of
+    /// [`Self::exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes`].
+    /// `Unpublished` refuses that curvature for such a family.
+    fn joint_jeffreys_information_psi_directional_second_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_index: usize,
+        direction: &Array1<f64>,
+    ) -> Result<JeffreysInformationMotion<Vec<Array2<f64>>>, String> {
+        assert_states_match_specs(block_states, specs, "Jeffreys information psi second drift");
+        assert_hyper_layout_matches_specs(hyper_layout, specs, "Jeffreys information psi second drift");
+        assert_psi_index_in_layout(hyper_layout, psi_index, "Jeffreys information psi second drift");
+        Ok(JeffreysInformationMotion::Unpublished {
+            reason: format!(
+                "the family supplies no second coefficient derivatives of its Jeffreys information along hyper axis {psi_index} and a direction of length {}",
+                direction.len()
+            ),
+        })
     }
 
     /// Whether the coupled-joint inner Newton should engage its self-vanishing

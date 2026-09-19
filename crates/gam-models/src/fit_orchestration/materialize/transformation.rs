@@ -34,7 +34,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
     }
 
     let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     let covariate_spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
@@ -58,13 +58,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
             offset,
             covariate_spec,
             config: config.transformation_normal_config.clone().unwrap_or_default(),
-            options: BlockwiseFitOptions {
-                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                // The default posterior-mean prediction reads this covariance
-                // (SPEC rule 3), so `None` means yes here as on every other route.
-                compute_covariance: config.compute_covariance.unwrap_or(true),
-                ..BlockwiseFitOptions::default()
-            },
+            options: blockwise_fit_options(config),
             kappa_options: config.spatial_optimization.clone(),
         }),
         inference_notes,

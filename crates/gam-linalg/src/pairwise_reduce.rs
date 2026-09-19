@@ -66,20 +66,45 @@ pub const BASE_CHUNK: usize = 128;
 /// balanced, length-only tree shape.
 #[inline]
 const fn left_split(len: usize) -> usize {
+    left_split_over_leaves(len, BASE_CHUNK)
+}
+
+/// Largest power-of-two multiple of `leaf` that is strictly less than `len`, for
+/// `len > leaf`: the size of the left subtree of a tree whose leaves hold at most
+/// `leaf` indices. A pure function of `(len, leaf)`.
+#[inline]
+const fn left_split_over_leaves(len: usize, leaf: usize) -> usize {
     assert!(
-        len > BASE_CHUNK,
-        "left_split: caller must guarantee len > BASE_CHUNK"
+        leaf >= 1 && len > leaf,
+        "left_split_over_leaves: caller must guarantee len > leaf >= 1"
     );
-    // Number of whole base blocks needed to cover `len`, rounded down to the
-    // span that fits in the left subtree. We want the largest `k = BASE_CHUNK *
-    // 2^p` with `k < len`.
-    let mut k = BASE_CHUNK;
-    // Double while the doubled span still leaves at least one element for the
-    // right subtree (i.e. stays strictly below `len`).
+    // We want the largest `k = leaf * 2^p` with `k < len`. Double while the
+    // doubled span still leaves at least one element for the right subtree
+    // (i.e. stays strictly below `len`).
+    let mut k = leaf;
     while k.saturating_mul(2) < len {
         k = k.saturating_mul(2);
     }
     k
+}
+
+/// Number of indices a deterministic block-fold leaf holds when each index carries
+/// `rows_per_index` rows of work: at most [`BASE_CHUNK`] rows, and never less than
+/// one index. A pure function of `rows_per_index`.
+///
+/// A fold over coarse indices (row chunks, tiles, span directions) splits on the
+/// work it declares, not on how many indices it has. With every index worth one
+/// row the leaf is [`BASE_CHUNK`] indices, which is the tree the unweighted folds
+/// build.
+#[inline]
+const fn leaf_indices_for_work(rows_per_index: usize) -> usize {
+    if rows_per_index >= BASE_CHUNK {
+        1
+    } else if rows_per_index == 0 {
+        BASE_CHUNK
+    } else {
+        BASE_CHUNK / rows_per_index
+    }
 }
 
 /// Reduce a contiguous run sequentially, left to right, starting from `acc`.
@@ -249,7 +274,7 @@ where
     if n == 0 {
         return None;
     }
-    Some(par_block_fold_range(0, n, &base, &combine))
+    Some(par_block_fold_range(0, n, BASE_CHUNK, &base, &combine))
 }
 
 /// Fallible variant of [`par_deterministic_block_fold`]: `base` and `combine`
@@ -273,10 +298,65 @@ where
     if n == 0 {
         return Ok(None);
     }
-    par_try_block_fold_range(0, n, &base, &combine).map(Some)
+    par_try_block_fold_range(0, n, BASE_CHUNK, &base, &combine).map(Some)
 }
 
-fn par_try_block_fold_range<T, E, B, F>(lo: usize, hi: usize, base: &B, combine: &F) -> Result<T, E>
+/// [`par_deterministic_block_fold`] over indices that each carry `rows_per_index`
+/// rows of work, such as row chunks or tiles.
+///
+/// The leaves hold at most [`BASE_CHUNK`] rows of work
+/// ([`leaf_indices_for_work`]), so a fold over a few heavy indices still fans across
+/// workers. Folding coarse indices through the unweighted fold keeps every fold of
+/// at most [`BASE_CHUNK`] indices in one sequential base block, whatever each index
+/// costs (#979). The association order is a pure function of `(n, rows_per_index)`,
+/// so the result never depends on thread count or scheduling, and at one row per
+/// index the tree is [`par_deterministic_block_fold`]'s.
+pub fn par_deterministic_block_fold_by_work<T, B, F>(
+    n: usize,
+    rows_per_index: usize,
+    base: B,
+    combine: F,
+) -> Option<T>
+where
+    T: Send,
+    B: Fn(core::ops::Range<usize>) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    if n == 0 {
+        return None;
+    }
+    let leaf = leaf_indices_for_work(rows_per_index);
+    Some(par_block_fold_range(0, n, leaf, &base, &combine))
+}
+
+/// Fallible variant of [`par_deterministic_block_fold_by_work`], on the same tree as
+/// its infallible twin, returning the first error in tree order.
+pub fn par_deterministic_try_block_fold_by_work<T, E, B, F>(
+    n: usize,
+    rows_per_index: usize,
+    base: B,
+    combine: F,
+) -> Result<Option<T>, E>
+where
+    T: Send,
+    E: Send,
+    B: Fn(core::ops::Range<usize>) -> Result<T, E> + Sync,
+    F: Fn(T, T) -> Result<T, E> + Sync,
+{
+    if n == 0 {
+        return Ok(None);
+    }
+    let leaf = leaf_indices_for_work(rows_per_index);
+    par_try_block_fold_range(0, n, leaf, &base, &combine).map(Some)
+}
+
+fn par_try_block_fold_range<T, E, B, F>(
+    lo: usize,
+    hi: usize,
+    leaf: usize,
+    base: &B,
+    combine: &F,
+) -> Result<T, E>
 where
     T: Send,
     E: Send,
@@ -284,31 +364,31 @@ where
     F: Fn(T, T) -> Result<T, E> + Sync,
 {
     let len = hi - lo;
-    if len <= BASE_CHUNK {
+    if len <= leaf {
         return base(lo..hi);
     }
-    let mid = lo + left_split(len);
+    let mid = lo + left_split_over_leaves(len, leaf);
     let (left, right) = rayon::join(
-        || par_try_block_fold_range(lo, mid, base, combine),
-        || par_try_block_fold_range(mid, hi, base, combine),
+        || par_try_block_fold_range(lo, mid, leaf, base, combine),
+        || par_try_block_fold_range(mid, hi, leaf, base, combine),
     );
     combine(left?, right?)
 }
 
-fn par_block_fold_range<T, B, F>(lo: usize, hi: usize, base: &B, combine: &F) -> T
+fn par_block_fold_range<T, B, F>(lo: usize, hi: usize, leaf: usize, base: &B, combine: &F) -> T
 where
     T: Send,
     B: Fn(core::ops::Range<usize>) -> T + Sync,
     F: Fn(T, T) -> T + Sync,
 {
     let len = hi - lo;
-    if len <= BASE_CHUNK {
+    if len <= leaf {
         return base(lo..hi);
     }
-    let mid = lo + left_split(len);
+    let mid = lo + left_split_over_leaves(len, leaf);
     let (left, right) = rayon::join(
-        || par_block_fold_range(lo, mid, base, combine),
-        || par_block_fold_range(mid, hi, base, combine),
+        || par_block_fold_range(lo, mid, leaf, base, combine),
+        || par_block_fold_range(mid, hi, leaf, base, combine),
     );
     combine(left, right)
 }
@@ -573,5 +653,96 @@ mod tests {
                 .expect("no error")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn leaf_indices_for_work_keeps_the_row_tree_and_bounds_coarse_leaves_979() {
+        assert_eq!(leaf_indices_for_work(1), BASE_CHUNK);
+        assert_eq!(leaf_indices_for_work(64), BASE_CHUNK / 64);
+        assert_eq!(leaf_indices_for_work(BASE_CHUNK), 1);
+        assert_eq!(leaf_indices_for_work(8192), 1);
+        assert_eq!(left_split_over_leaves(33, 2), 32);
+        assert_eq!(left_split_over_leaves(BASE_CHUNK + 1, BASE_CHUNK), left_split(BASE_CHUNK + 1));
+    }
+
+    /// The by-work fold at one row per index builds the unweighted fold's tree, so every
+    /// row-indexed consumer keeps its bits.
+    #[test]
+    fn the_by_work_fold_at_one_row_per_index_is_the_unweighted_fold_979() {
+        let n = 5 * BASE_CHUNK + 7;
+        let base = |range: core::ops::Range<usize>| -> f64 {
+            range.map(|i| ((i as f64) * 0.317).sin() / (1.0 + i as f64)).sum()
+        };
+        let unweighted = par_deterministic_block_fold(n, base, |a, b| a + b).expect("n > 0");
+        let by_work =
+            par_deterministic_block_fold_by_work(n, 1, base, |a, b| a + b).expect("n > 0");
+        assert_eq!(by_work.to_bits(), unweighted.to_bits());
+        let fallible = par_deterministic_try_block_fold_by_work(
+            n,
+            1,
+            |range| Ok::<f64, String>(base(range)),
+            |a, b| Ok(a + b),
+        )
+        .expect("no error")
+        .expect("n > 0");
+        assert_eq!(fallible.to_bits(), unweighted.to_bits());
+    }
+
+    /// A fold over a few heavy indices splits on the work it declares, and its result is
+    /// bit-identical across 1, 4 and 24 worker threads because the tree is a pure function
+    /// of `(n, rows_per_index)`.
+    #[test]
+    fn a_coarse_fold_splits_on_declared_work_and_is_bitwise_thread_invariant_979() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = 32usize;
+        let rows_per_index = 64usize;
+        let base_calls = AtomicUsize::new(0);
+        let run = |rows: usize| {
+            base_calls.store(0, Ordering::Relaxed);
+            let value = par_deterministic_try_block_fold_by_work(
+                n,
+                rows,
+                |range: core::ops::Range<usize>| -> Result<Vec<f64>, String> {
+                    base_calls.fetch_add(1, Ordering::Relaxed);
+                    let mut acc = vec![0.0f64; 3];
+                    for chunk in range {
+                        for row in 0..rows_per_index {
+                            let i = chunk * rows_per_index + row;
+                            for (d, slot) in acc.iter_mut().enumerate() {
+                                *slot += ((i * 3 + d) as f64).cos() / ((i + 1) as f64);
+                            }
+                        }
+                    }
+                    Ok(acc)
+                },
+                |mut a: Vec<f64>, b: Vec<f64>| -> Result<Vec<f64>, String> {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += *y;
+                    }
+                    Ok(a)
+                },
+            )
+            .expect("no error")
+            .expect("n > 0");
+            (value, base_calls.load(Ordering::Relaxed))
+        };
+        let (_, unweighted_calls) = run(1);
+        assert_eq!(unweighted_calls, 1, "32 indices at one row each fit one leaf");
+        let (reference, coarse_calls) = run(rows_per_index);
+        assert_eq!(
+            coarse_calls,
+            n / leaf_indices_for_work(rows_per_index),
+            "at 64 rows per index a leaf holds two indices"
+        );
+        for threads in [1usize, 4, 24] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let (got, _) = pool.install(|| run(rows_per_index));
+            for (g, r) in got.iter().zip(&reference) {
+                assert_eq!(g.to_bits(), r.to_bits(), "threads={threads}");
+            }
+        }
     }
 }

@@ -54,6 +54,7 @@ pub fn fit_required_columns(
         required.extend(formula_columns(&parsed_slope)?);
     }
     required.extend(config.z_column.iter().cloned());
+    required.extend(config.residual_columns.iter().cloned());
     required.extend(config.weight_column.iter().cloned());
     required.extend(config.offset_column.iter().cloned());
     required.extend(config.noise_offset_column.iter().cloned());
@@ -85,6 +86,37 @@ pub fn fit_required_columns(
         }
     }
     Ok(required)
+}
+
+/// Expand the automatic `.` term of `formula` against `data`.
+///
+/// The columns `.` stands for are those no other part of the fit reads:
+/// [`fit_required_columns`] of the formula without `.`, under `config`, are
+/// reserved. The per-column rule is
+/// [`gam_terms::inference::automatic_formula::expand_automatic_formula`], the
+/// one implementation behind every front door. A formula without `.` comes
+/// back unchanged with no notes.
+pub fn expand_automatic_fit_formula(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<gam_terms::inference::automatic_formula::AutomaticFormula, WorkflowError> {
+    use gam_terms::inference::automatic_formula::{
+        AutomaticFormula, expand_automatic_formula, formula_has_automatic_term,
+        formula_without_automatic_term,
+    };
+    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
+    if !formula_has_automatic_term(formula).map_err(invalid)? {
+        return Ok(AutomaticFormula {
+            formula: formula.to_string(),
+            notes: Vec::new(),
+        });
+    }
+    let explicit = gam_terms::inference::formula_dsl::parse_formula(
+        &formula_without_automatic_term(formula).map_err(invalid)?,
+    )?;
+    let reserved = fit_required_columns(&explicit, config)?;
+    expand_automatic_formula(formula, data, &reserved).map_err(invalid)
 }
 
 pub(crate) fn resolve_continuous_column(

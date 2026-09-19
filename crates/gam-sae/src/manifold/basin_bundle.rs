@@ -108,24 +108,30 @@ impl<S> BasinBundle<S> {
     /// explicitly and leaves every prior branch intact. Silent eviction cannot
     /// preserve the exact lower envelope because present value does not prove
     /// dominance at another rho.
+    ///
+    /// Returns the index of the member that now holds `state`, or `None` when a
+    /// better-valued duplicate kept its slot and `state` was dropped. The outer
+    /// objective keys the evaluation it priced `state` on by this slot (#2267).
     pub fn admit(
         &mut self,
         state: S,
         value: f64,
         mut is_same_basin: impl FnMut(&S, &S) -> bool,
-    ) -> Result<(), BasinAdmissionError> {
-        if let Some(existing) = self
+    ) -> Result<Option<usize>, BasinAdmissionError> {
+        if let Some((index, existing)) = self
             .members
             .iter_mut()
-            .find(|m| is_same_basin(&m.state, &state))
+            .enumerate()
+            .find(|(_, m)| is_same_basin(&m.state, &state))
         {
             if value < existing.last_value {
                 existing.state = state;
                 existing.last_value = value;
+                return Ok(Some(index));
             }
-            return Ok(());
+            return Ok(None);
         }
-        self.admit_distinct(state, value)
+        self.admit_distinct(state, value).map(Some)
     }
 
     /// Admit a state that is known to be distinct from every stored member,
@@ -135,8 +141,12 @@ impl<S> BasinBundle<S> {
     /// to compare against, so the duplicate branch of [`admit`](Self::admit)
     /// cannot fire and any predicate handed to it would be inert. Same capacity
     /// contract as `admit` — a distinct state beyond `member_capacity` is
-    /// refused explicitly.
-    pub(crate) fn admit_distinct(&mut self, state: S, value: f64) -> Result<(), BasinAdmissionError> {
+    /// refused explicitly. Returns the new member's index.
+    pub(crate) fn admit_distinct(
+        &mut self,
+        state: S,
+        value: f64,
+    ) -> Result<usize, BasinAdmissionError> {
         if self.members.len() >= self.member_capacity {
             return Err(BasinAdmissionError {
                 member_capacity: self.member_capacity,
@@ -147,10 +157,11 @@ impl<S> BasinBundle<S> {
             state,
             last_value: value,
         });
-        Ok(())
+        Ok(self.members.len() - 1)
     }
 
-    fn argmin_index(&self) -> Option<usize> {
+    /// Index of [`Self::argmin`]: the first member of least value.
+    pub(crate) fn argmin_index(&self) -> Option<usize> {
         self.members
             .iter()
             .enumerate()

@@ -17,11 +17,11 @@
 //! The issue's own acceptance note is the sharp one: agreement is not evidence
 //! unless the deflation-aware and deflation-blind operators provably separate on
 //! the fixture, because they coincide wherever the deflation is inactive.
-//! `zz_measure_deflation_correction_size_2712` measures exactly that separation
-//! on the tree's deflating fixtures, and the numbers are NOT interchangeable —
-//! on the ordered Beta–Bernoulli anchor the correction moves `Γ` by `8.5e-8`
-//! against `‖Γ‖∞ = 98.9`, because that fixture's deflated direction is a
-//! near-null the raw derivative barely touches. The gates below therefore state
+//! `zz_measure_deflation_correction_size_2712` (since removed) measured exactly
+//! that separation on the deflating fixtures of its time, and the numbers were
+//! NOT interchangeable — on the ordered Beta–Bernoulli anchor the correction
+//! moved `Γ` by `8.5e-8` against `‖Γ‖∞ = 98.9`, because that fixture's
+//! deflated direction was a near-null the raw derivative barely touched. The gates below therefore state
 //! non-vacuity as a RESOLUTION RATIO against the measured separation rather than
 //! as an absolute threshold copied from a sibling gate that was separating two
 //! entirely different operators.
@@ -30,7 +30,7 @@
 
 use super::tests::{gamma_fd_tiny_fixture, small_two_atom_periodic_term};
 use super::tests_recovery_split_780::{
-    FdAnchorRegime, certified_fd_anchor, rho_ladder_family, sparse_lift_ladder,
+    FdAnchorCandidate, FdAnchorRegime, certified_fd_anchor, rho_ladder_family, sparse_lift_ladder,
 };
 use super::*;
 
@@ -422,35 +422,115 @@ fn deflation_blind_cache(cache: &ArrowFactorCache) -> ArrowFactorCache {
     blind
 }
 
-/// The `log λ_sparse` ladder that reaches the deflating regime on the ordered
-/// Beta–Bernoulli tiny fixture.
+/// The `log λ_sparse` ladder the ordered Beta–Bernoulli deflating anchor walks.
 const DEFLATING_SPARSE_LIFTS: [f64; 10] = [2.4, 1.8, 1.3, 0.9, 0.5, 0.2, 0.0, -0.3, -0.6, -1.0];
 
-/// The ordered Beta–Bernoulli tiny fixture at its certified deflating anchor.
-fn obb_deflated_anchor(label: &str) -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>, ArrowFactorCache)
-{
-    let (mut term, target, rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
+/// The gate temperatures at which the logit slots of a converged state deflate
+/// by construction, deepest in the band first.
+///
+/// #2080: the gate-logit Jacobian (19ce8785f3) and the simplex Jacobian
+/// (55e5612704) give the gates a finite interior mode, so at their historical
+/// temperatures (0.7 ordered Beta–Bernoulli, 0.9 softmax) no state these
+/// families converge to deflates any row (job 1215763, across the lift,
+/// smoothness and ARD ladders and with an atom declared off). The deflating
+/// state has to exist by construction, and the temperature is the dial that
+/// builds it. Every logit-slot curvature of `z = σ(ℓ/τ)` carries `τ⁻²`: the
+/// data coupling through `z′`, the gate prior, and the Jacobian's `z″`. No
+/// coordinate-slot curvature depends on `τ`, so the chart the rows
+/// differentiate keeps the fixture's own curvature. With `f` the production
+/// relative deflation floor:
+///
+/// - `τ = 1/f` puts a logit eigenvalue at `f²` times its `τ = 1` value, a
+///   margin of `1/f` inside the band, so neither a finite-difference stencil
+///   nor a second evaluation route moves it across the band's edge.
+/// - `τ = f^{-1/2}` puts it at `f` times its `τ = 1` value, at the band's own
+///   scale. A row with two gate logits needs it: at `1/f` both collapse onto
+///   one `f²`-sized pair, an unresolved invariant-subspace block where the
+///   frozen log-determinant has no derivative, and every ordered
+///   Beta–Bernoulli lift is rejected (job 1244691). At `f^{-1/2}` their `τ = 1`
+///   ratio keeps them apart.
+pub(super) fn deflating_gate_temperatures() -> [f64; 2] {
+    let floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR;
+    [floor.recip(), floor.sqrt().recip()]
+}
+
+/// `family(τ)` at each of [`deflating_gate_temperatures`], deepest first, each
+/// member's description naming its temperature.
+fn across_deflating_gate_temperatures(
+    family: impl Fn(f64) -> Vec<FdAnchorCandidate>,
+) -> Vec<FdAnchorCandidate> {
+    deflating_gate_temperatures()
+        .into_iter()
+        .flat_map(|temperature| {
+            family(temperature).into_iter().map(move |mut candidate| {
+                candidate.description =
+                    format!("tau={temperature:.1e} {}", candidate.description);
+                candidate
+            })
+        })
+        .collect()
+}
+
+/// The number of rows `cache` deflates, printed and required positive.
+///
+/// A deflated-correction gate is vacuous on a cache with no deflated row, so a
+/// builder that hands one out must say how many it built before any row
+/// asserts on it.
+pub(super) fn deflated_row_count(label: &str, cache: &ArrowFactorCache) -> usize {
+    let rows = cache
+        .deflated_row_directions
+        .iter()
+        .filter(|directions| !directions.is_empty())
+        .count();
+    eprintln!(
+        "{label}: {rows} of {} rows deflate at the anchor ({} gauge-deflated directions)",
+        cache.deflated_row_directions.len(),
+        cache.gauge_deflated_directions
+    );
+    assert!(
+        rows > 0,
+        "{label}: the anchor deflates no row, so the Daleckii–Krein path this gate \
+         differentiates does not fire"
+    );
+    rows
+}
+
+/// The ordered Beta–Bernoulli tiny fixture at its certified deflating anchor,
+/// with its gates on the [`deflating_gate_temperatures`] ladder.
+///
+/// The deflated directions are the two logit slots of each row: the assignment
+/// channel is where this anchor's correction lives.
+pub(super) fn obb_deflated_anchor(
+    label: &str,
+) -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>, ArrowFactorCache) {
+    let (term, target, rho) = gamma_fd_tiny_fixture();
     let anchor = certified_fd_anchor(
         label,
         &target,
         FdAnchorRegime::deflated(),
-        rho_ladder_family(&term, sparse_lift_ladder(&rho, &DEFLATING_SPARSE_LIFTS), 5),
+        across_deflating_gate_temperatures(|temperature| {
+            let mut tempered = term.clone();
+            tempered.assignment.mode =
+                AssignmentMode::ordered_beta_bernoulli(temperature, 0.9, true);
+            rho_ladder_family(
+                &tempered,
+                sparse_lift_ladder(&rho, &DEFLATING_SPARSE_LIFTS),
+                5,
+            )
+        }),
     );
+    deflated_row_count(label, &anchor.cache);
     (anchor.term, anchor.rho, target, anchor.cache)
 }
 
-/// The #2330 residual-excited two-atom circle at a certified deflating anchor.
+/// The #2330 residual-excited two-atom circle at a certified deflating anchor,
+/// with its softmax on the [`deflating_gate_temperatures`] ladder.
 ///
-/// This is the SOFTMAX deflating fixture, and it is not interchangeable with the
-/// ordered Beta–Bernoulli one: there the deflated direction lives in the LOGIT
-/// subspace (the assignment penalty is what drives it), here it lives in the
-/// over-parametrized CHART — the coordinate slots. Which subspace it occupies
-/// decides which channel's deflation correction is non-zero at all, measured:
-/// the ARD log-precision correction contracts `D = hess·eₛeₛᵀ` at a COORDINATE
-/// slot `s`, so on the ordered Beta–Bernoulli anchor it evaluates to exactly
-/// zero (the deflated direction is orthogonal to every ARD slot) and no parity
-/// gate stated there can be non-vacuous.
+/// This is the SOFTMAX deflating fixture. Its deflated direction is the row's
+/// logit slot (slot 0), not a coordinate slot, so the ARD log-precision
+/// correction, which contracts `D = hess·eₛeₛᵀ` at a COORDINATE slot `s`, is at
+/// the rounding floor on the fixture's own deflation. The ARD gate states its
+/// non-vacuity on a deflation record redirected onto each slot for that reason.
 ///
 /// #2398 measured that the historical single evaluation lift lands on an
 /// exact-`A` saddle where the deflated-PD state does not exist, so the ladder
@@ -458,7 +538,7 @@ fn obb_deflated_anchor(label: &str) -> (SaeManifoldTerm, SaeManifoldRho, Array2<
 pub(super) fn residual_excited_deflated_anchor(
     label: &str,
 ) -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>, ArrowFactorCache) {
-    let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+    let (term, mut target, mut rho) = gamma_fd_tiny_fixture();
     let (n, p) = (target.nrows(), target.ncols());
     for row in 0..n {
         for col in 0..p {
@@ -476,16 +556,6 @@ pub(super) fn residual_excited_deflated_anchor(
             *value = -0.5;
         }
     }
-    term.penalized_quasi_laplace_criterion_with_cache(
-        target.view(),
-        &rho,
-        None,
-        40,
-        0.4,
-        1.0e-6,
-        1.0e-6,
-    )
-    .expect("off-manifold fixture converges with both atoms alive");
 
     let eval_rho_ladder: Vec<(String, SaeManifoldRho)> = [
         (0.5_f64, -2.0_f64, -1.2_f64, -1.0_f64),
@@ -514,8 +584,29 @@ pub(super) fn residual_excited_deflated_anchor(
         label,
         &target,
         FdAnchorRegime::deflated(),
-        rho_ladder_family(&term, eval_rho_ladder, 0),
+        across_deflating_gate_temperatures(|temperature| {
+            let mut tempered = term.clone();
+            tempered.assignment.mode = AssignmentMode::softmax(temperature);
+            // A temperature at which the off-manifold fixture has no converged state
+            // contributes no member, and says why.
+            match tempered.penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                40,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            ) {
+                Ok(..) => rho_ladder_family(&tempered, eval_rho_ladder.clone(), 0),
+                Err(error) => {
+                    eprintln!("{label}: tau={temperature:.1e} has no converged state: {error}");
+                    Vec::new()
+                }
+            }
+        }),
     );
+    deflated_row_count(label, &anchor.cache);
     (anchor.term, anchor.rho, target, anchor.cache)
 }
 

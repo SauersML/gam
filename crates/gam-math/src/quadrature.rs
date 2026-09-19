@@ -255,9 +255,90 @@ pub fn gauss_hermite_rule(node_count: usize) -> Result<GaussHermiteRule, Quadrat
     })
 }
 
+/// Gauss-Hermite rule for the standard normal weight, as `(node, weight)` pairs. The nodes
+/// are `√2·x_i` and the weights `w_i/√π` of the physicists' rule, so the weights sum to one
+/// and the rule integrates polynomials of degree `2n−1` exactly against `N(0,1)`.
+pub fn standard_normal_gauss_hermite_rule(
+    node_count: usize,
+) -> Result<Vec<(f64, f64)>, QuadratureError> {
+    let rule = gauss_hermite_rule(node_count)?;
+    let sqrt_pi = std::f64::consts::PI.sqrt();
+    Ok(rule
+        .nodes
+        .iter()
+        .zip(rule.weights.iter())
+        .map(|(&node, &weight)| (std::f64::consts::SQRT_2 * node, weight / sqrt_pi))
+        .collect())
+}
+
+/// The largest order whose [`standard_normal_gauss_hermite_rule`] builds with every weight
+/// positive, where every lower order does too (#784). A block quadrature refuses the next
+/// order, so an order search that raises one order at a time stops exactly here.
+///
+/// Measured once per process from this arithmetic and this rule builder, so no order
+/// ceiling is chosen. The scan ends because the extreme weight of an `n`-node rule decays
+/// like `e^{−2n}` and underflows at a few hundred nodes.
+pub fn max_representable_standard_normal_gauss_hermite_order() -> usize {
+    static MAX_REPRESENTABLE_ORDER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_REPRESENTABLE_ORDER.get_or_init(|| {
+        let representable = |order: usize| {
+            standard_normal_gauss_hermite_rule(order)
+                .is_ok_and(|rule| rule.iter().all(|&(_, weight)| weight > 0.0))
+        };
+        let mut order = 1usize;
+        while order
+            .checked_add(1)
+            .is_some_and(|next| representable(next))
+        {
+            order += 1;
+        }
+        order
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_normal_rule_integrates_normal_moments_through_degree_nine_784() {
+        // E[z^k] against N(0,1): 1, 0, 1, 0, 3, 0, 15, 0, 105, 0. A five-node rule is exact
+        // through degree nine, so every one of these moments must come back to roundoff.
+        let rule = standard_normal_gauss_hermite_rule(5).expect("five-node standard-normal rule");
+        let expected = [1.0, 0.0, 1.0, 0.0, 3.0, 0.0, 15.0, 0.0, 105.0, 0.0];
+        for (degree, &moment) in expected.iter().enumerate() {
+            let integrated: f64 = rule
+                .iter()
+                .map(|&(node, weight)| weight * node.powi(degree as i32))
+                .sum();
+            assert!(
+                (integrated - moment).abs() <= 1e-11 * (1.0 + moment),
+                "E[z^{degree}] by the five-node rule is {integrated}, expected {moment}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_representable_order_ceiling_is_where_a_weight_first_stops_being_positive_784() {
+        let ceiling = max_representable_standard_normal_gauss_hermite_order();
+        assert!(
+            ceiling > 4,
+            "the ceiling {ceiling} must sit above the order search's starting order four"
+        );
+        let at_ceiling = standard_normal_gauss_hermite_rule(ceiling).expect("rule at the ceiling");
+        assert!(
+            at_ceiling.iter().all(|&(_, weight)| weight > 0.0),
+            "every weight of the order-{ceiling} rule must be positive"
+        );
+        let past_ceiling = standard_normal_gauss_hermite_rule(ceiling + 1);
+        assert!(
+            past_ceiling
+                .as_ref()
+                .map_or(true, |rule| rule.iter().any(|&(_, weight)| !(weight > 0.0))),
+            "the order-{} rule must carry a non-positive weight or fail to build",
+            ceiling + 1
+        );
+    }
 
     #[test]
     fn seven_node_gauss_hermite_matches_reference_rule() {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Massive-K manifold SAE end-to-end validation harness (#1026).
 
-Drives ``gamfit.sae_manifold_fit`` directly (NOT the stale ``sae_ev_vs_k_frontier``
+Drives ``gamfit.sae.sae_manifold_fit`` directly (NOT the stale ``sae_ev_vs_k_frontier``
 helper) at a sweep of dictionary sizes K to verify the whole pipeline RUNS at
 scale and to capture the wall-time scaling curve.
 
@@ -91,7 +91,6 @@ def main() -> int:
     ap.add_argument("--smoothness-weight", type=float, default=0.01)
     ap.add_argument("--isometry-weight", type=float, default=0.0)
     ap.add_argument("--learning-rate", type=float, default=1.0)
-    ap.add_argument("--ard", action="store_true", help="enable per-atom ARD (off by default: known-good regime)")
     ap.add_argument("--allow-overcomplete", action="store_true",
                     help="permit N < K (overcomplete dictionary) — keeps the dense "
                          "n×K assignment logits small enough to fit a RAM-tight box")
@@ -131,7 +130,7 @@ def main() -> int:
         r2 = float("nan")
         try:
             tk = time.perf_counter()
-            model = gamfit.sae_manifold_fit(
+            model = gamfit.sae.sae_manifold_fit(
                 train,
                 K=k,
                 d_atom=args.d_atom,
@@ -144,7 +143,6 @@ def main() -> int:
                 smoothness_weight=args.smoothness_weight,
                 isometry_weight=args.isometry_weight,
                 learning_rate=args.learning_rate,
-                ard_per_atom=args.ard,
             )
             wall = time.perf_counter() - tk
             r2 = float(getattr(model, "reconstruction_r2", float("nan")))

@@ -29,18 +29,21 @@ impl crate::custom_family::JeffreysThirdInformationDerivative for SurvivalMargin
                 Ok(None)
             };
         }
-        if self.per_z_slope_active()
-            || self.influence_absorber.is_some()
-            || self.anchored_law_active()
-        {
+        if self.per_z_slope_active() || self.influence_absorber.is_some() {
             return Ok(None);
         }
+        // The flex program carries a declared latent law through its own
+        // anchored timepoints (gam#2948), so it serves either law; the rigid
+        // closed form below is the Gaussian lowering's only.
         if self.effective_flex_active(states)? {
             return self
                 .exact_newton_joint_hessian_third_directional_derivative_flex_no_wiggle_all_axes(
                     states, u, v,
                 )
                 .map(Some);
+        }
+        if self.anchored_law_active() {
+            return Ok(None);
         }
         in_slope_frame!(self, P, Frame, {
             let kernel =
@@ -881,13 +884,15 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
         // The closed-form fifth and sixth derivatives are the Gaussian
         // lowering's; a declared latent law (gam#2923) has no such closed form
-        // and opts out exactly as the per-score and absorber frames do.
+        // and opts out exactly as the per-score and absorber frames do, unless a
+        // flex block runs the row through the order-five flex contraction, which
+        // anchors on the law itself (gam#2948).
         let served = if self.flex_timewiggle_active() {
             self.timewiggle_zeta_available()
         } else {
             !self.per_z_slope_active()
                 && self.influence_absorber.is_none()
-                && !self.anchored_law_active()
+                && (self.flex_active() || !self.anchored_law_active())
         };
         if served { Some(self) } else { None }
     }

@@ -578,19 +578,19 @@ pub fn run_atom_shape_race(
     let candidates = vec![
         PredictiveRaceCandidate {
             kind: candidate_kinds[0],
-            negative_log_evidence: ring_bic_2d(reporting_coords.view())?,
+            bic_half: ring_bic_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: ring_provider_2d(raw_coords.clone()),
         },
         PredictiveRaceCandidate {
             kind: candidate_kinds[1],
-            negative_log_evidence: gaussian_bic_2d(reporting_coords.view())?,
+            bic_half: gaussian_bic_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian_provider_2d(raw_coords.clone()),
         },
         PredictiveRaceCandidate {
             kind: candidate_kinds[2],
-            negative_log_evidence: mixture_winner.bic,
+            bic_half: mixture_winner.bic,
             certification: EvidenceCertification::Exact,
             // The displayed/reported k is the full-data final fit. Its outer-CV
             // predictive column independently selects k on each training fold,
@@ -604,7 +604,7 @@ pub fn run_atom_shape_race(
         },
         PredictiveRaceCandidate {
             kind: candidate_kinds[3],
-            negative_log_evidence: ring_clusters.winner().bic,
+            bic_half: ring_clusters.winner().bic,
             certification: EvidenceCertification::Exact,
             density_provider: ring_cluster_rung_provider_2d(
                 raw_coords,
@@ -646,7 +646,7 @@ pub fn run_atom_shape_race(
         reporting_winner,
         candidate_names: verdict.candidate_names,
         stacking_weights,
-        bic: verdict.negative_log_evidence,
+        bic: verdict.bic_half,
         mixture_reporting_k,
         ring_clusters_reporting_k,
         mixture_fold_selected_k,

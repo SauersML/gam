@@ -50,7 +50,9 @@ pub struct AbsorptionPairReport {
     pub lift: f64,
     pub weight_correlation: f64,
     pub dependence: f64,
-    pub fusion_evidence: f64,
+    /// `dependence · |weight_correlation|`: a ranking score for fusion
+    /// candidates. It is not a likelihood, a Bayes factor or an evidence quantity.
+    pub fusion_score: f64,
     pub absorption_asymmetry: f64,
 }
 
@@ -615,7 +617,7 @@ fn absorption_audit(route: &AuditSparseRoute, max_pairs: usize) -> AbsorptionAud
                 lift,
                 weight_correlation,
                 dependence,
-                fusion_evidence: dependence * weight_correlation.abs(),
+                fusion_score: dependence * weight_correlation.abs(),
                 absorption_asymmetry: (p_a_given_b - p_b_given_a).abs(),
             }
         })

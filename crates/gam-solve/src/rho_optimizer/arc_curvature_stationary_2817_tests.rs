@@ -94,8 +94,25 @@ fn drive_arc_oracle_valued_2817(
     hessian: Array2<f64>,
     bounds: (Array1<f64>, Array1<f64>),
     floor: Option<f64>,
+    value: impl FnMut(&Array1<f64>) -> f64,
+) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
+    let points = vec![point; samples.len()];
+    drive_arc_oracle_at_points_2817(points, samples, hessian, bounds, floor, value)
+}
+
+/// [`drive_arc_oracle_valued_2817`] with evaluation `i` taken at `points[i]`
+/// instead of at one fixed point, so a fixture can say which trials a window
+/// evaluated.
+fn drive_arc_oracle_at_points_2817(
+    points: Vec<Array1<f64>>,
+    samples: Vec<(f64, Array1<f64>)>,
+    hessian: Array2<f64>,
+    bounds: (Array1<f64>, Array1<f64>),
+    floor: Option<f64>,
     mut value: impl FnMut(&Array1<f64>) -> f64,
 ) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
+    assert_eq!(points.len(), samples.len(), "one point per scripted sample");
+    let point = points[0].clone();
     let table = Arc::new(samples.clone());
     let calls = Arc::new(AtomicUsize::new(0));
     let problem = OuterProblem::new(point.len())
@@ -149,8 +166,8 @@ fn drive_arc_oracle_valued_2817(
         curvature_stationary_floor: floor,
     };
     let mut outcomes = Vec::new();
-    for _ in 0..samples.len() {
-        match SecondOrderObjective::eval_hessian(&mut bridge, &point) {
+    for trial in &points {
+        match SecondOrderObjective::eval_hessian(&mut bridge, trial) {
             Ok(sample) => outcomes.push(Ok(sample.value)),
             Err(err) => {
                 outcomes.push(Err(err.into_message()));
@@ -997,6 +1014,63 @@ fn a_strict_saddle_stall_escapes_then_stops_on_its_proven_replay_2817() {
     );
 }
 
+/// A strict-saddle escape whose window evaluated NEW trials is not a replay,
+/// even though the incumbent did not move; the same trials from the same
+/// incumbent are.
+///
+/// At a strict saddle every rejected ARC trial reaches the guard, and a rejected
+/// trial never moves the incumbent, so the incumbent alone cannot tell a replay
+/// from a search that is still exploring: ARC's regularization changes between
+/// windows and so do the points it proposes. The gaussian pure-noise fit with
+/// twenty `k = 10` smooths at `n = 100` stopped non-converged on exactly that
+/// misreading, at an incumbent of 21.85 whose second window had evaluated
+/// 105 → 40 → 22.3 on fresh points. Here window two evaluates three points
+/// window one never saw, so it earns a second escape; window three evaluates
+/// window two's points again from the same incumbent, and that is the replay
+/// the guard cuts.
+#[test]
+fn a_strict_saddle_window_on_new_trials_escapes_again_until_it_replays() {
+    let seed = array![0.5, 0.5];
+    let offset = |step: usize| array![0.5 + 0.01 * step as f64, 0.5];
+    let window = ARC_COST_STALL_WINDOW;
+    let first: Vec<_> = (1..=window).map(offset).collect();
+    let second: Vec<_> = (window + 1..=2 * window).map(offset).collect();
+    let points: Vec<Array1<f64>> = std::iter::once(seed)
+        .chain(first)
+        .chain(second.iter().cloned())
+        .chain(second.iter().cloned())
+        .collect();
+    let (outcomes, published) = drive_arc_oracle_at_points_2817(
+        points.clone(),
+        flatlined_2817(array![2.0, 0.0], points.len()),
+        array![[1.0, 0.0], [0.0, -1.0]],
+        wide_box_2817(2),
+        Some(FLOOR_2817),
+        |_| COST_2817,
+    );
+    let replay_window_end = 3 * window;
+    assert!(
+        outcomes[..replay_window_end].iter().all(|outcome| outcome.is_ok()),
+        "a window that evaluated trials the previous one never saw must earn another \
+         escape: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.len(),
+        replay_window_end + 1,
+        "re-evaluating the previous window's trials from the same incumbent is a proven \
+         replay and must stop the run at the evaluation that closes it: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.last().expect("ran").clone().err().as_deref(),
+        Some(ARC_UNPROGRESSING_STALL_SENTINEL),
+        "the stop at a proven replay is the unprogressing-stall sentinel: {outcomes:?}"
+    );
+    assert!(
+        published.is_some_and(|exit| !exit.converged),
+        "the stop must publish its incumbent, and a strict saddle is never converged"
+    );
+}
+
 // ─── an unprogressing fixed-point walk stops ─────────────────────────────────
 
 /// A fixed-point walk caught in a limit cycle stops when its second window
@@ -1197,6 +1271,8 @@ fn step_2817(iter: usize, step_norm: f64, radius: f64, actual: f64) -> StepInfo 
         predicted_decrease: actual,
         actual_decrease: actual,
         trust_radius: Some(radius),
+        regularization: None,
+        line_search_step: None,
     }
 }
 

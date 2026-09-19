@@ -24,9 +24,10 @@
 //! residual curvature `A = [[1, c], [c, 1]]` returned zero where the trace
 //! correction is `2/(1−c²) − 2`. The fixtures carry what that routine could not
 //! see: a two-dimensional torus chart (mixed coordinate curvature), two atoms on
-//! the same rows (cross-atom coupling), free gate logits, an atom with ARD
-//! disabled, and ARD rows on the concave side of a periodic axis.
+//! the same rows (cross-atom coupling), free gate logits, an ARD block on every
+//! atom, and ARD rows on the concave side of a periodic axis.
 
+use super::tests_fitted_response_frames_2933::rademacher_quadratic_form_variance;
 use super::*;
 use crate::basis::{AmbientSphereHarmonicEvaluator, TorusHarmonicEvaluator};
 use crate::manifold::arrow_solver::{SaeArrowVector, SaeLocalRowVar};
@@ -153,8 +154,10 @@ fn scientific(values: &[f64]) -> String {
         .join(", ")
 }
 
-/// The two functionals of the re-solved response Jacobian the fit prices.
+/// The re-solved response Jacobian and the two functionals of it the fit prices.
 struct ResolvedResponse {
+    /// `R` over the raw output scalars.
+    jacobian: Array2<f64>,
     /// `tr R`.
     trace: f64,
     /// `‖I − R‖²_F` over the raw output scalars.
@@ -207,6 +210,7 @@ fn resolved_response(
         })
         .sum();
     ResolvedResponse {
+        jacobian,
         trace,
         residual_dof,
     }
@@ -339,7 +343,7 @@ fn softmax_two_circle_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho, 
 /// independent free logits.
 fn obb_torus_and_circle_fitted() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 12usize;
-    let p = 3usize;
+    let p = 4usize;
     let torus = Arc::new(
         TorusHarmonicEvaluator::new(2, 1).expect("one harmonic per axis is a valid torus basis"),
     );
@@ -371,7 +375,7 @@ fn obb_torus_and_circle_fitted() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRh
     // circles, where a comparable ARD precision leaves live negative curvature on
     // each axis's concave half. A weak signal let the fit gather every row on the
     // convex half (job 1129926).
-    let mut target = torus_phi.dot(&torus_decoder) * 3.0 + circle_phi.dot(&circle_decoder) * 2.0;
+    let mut target = torus_phi.dot(&torus_decoder) * 3.0 + circle_phi.dot(&circle_decoder) * 4.0;
     for row in 0..n {
         for out in 0..p {
             target[[row, out]] += 0.05 * (1.7 * row as f64 + 2.3 * out as f64).sin();
@@ -417,9 +421,20 @@ fn obb_torus_and_circle_fitted() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRh
     .expect("assignment: one logit column and one coordinate block per atom");
     let mut term = SaeManifoldTerm::new(vec![torus_atom, circle_atom], assignment)
         .expect("term: every atom's basis width matches its assignment block");
-    // ARD on both torus axes, so the rows on the concave side of an axis carry a
-    // live negative prior curvature; ARD disabled on the circle atom.
-    let mut rho = SaeManifoldRho::new(0.0, -1.0, vec![array![1.0, 1.0], Array1::<f64>::zeros(0)]);
+    // ARD at one precision on every periodic axis, the torus's two and the circle's, so the
+    // rows on the concave side of each axis carry a live negative prior curvature. #2822 —
+    // the circle used to carry no ARD block. With the block it carries the torus's log α = 1,
+    // and two changes keep the fixture's two premises, measured on a grid (jobs 1255625,
+    // 1258829, 1262175): the root the exact-A re-solve reaches, and a response material
+    // enough to leave residual dof.
+    // - The circle's signal is four times its decoder, the same order as the torus's three.
+    //   At twice its decoder the circle's concave-side curvature dominated its rows, and the
+    //   re-solve stalled at ‖g‖ ≈ 0.19.
+    // - There are four outputs, not three. At three, ‖I − R‖²_F was 1.18 on main and 0.90 to
+    //   0.95 at circle log α −4, 0 and 0.5, under the premise's 1. At four it is 1.86.
+    // - The premises are asserted where they are used: the re-solve's root ceiling, and the
+    //   material-response check.
+    let mut rho = SaeManifoldRho::new(0.0, -1.0, vec![array![1.0, 1.0], array![1.0]]);
     term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 80, 1.0, 1.0e-7, 1.0e-7)
         .expect("the torus and circle fixture fits");
     let gates = term.collapse_prevention_gates();
@@ -461,7 +476,7 @@ fn softmax_divergence_matches_the_resolved_response_2933() {
 }
 
 #[test]
-fn torus_and_ard_free_divergence_prices_the_dispersion_2933() {
+fn torus_and_circle_divergence_prices_the_dispersion_2933() {
     let (term, target, rho, cache) = obb_torus_and_circle_state();
     let resolved = resolved_response(&term, &target, &rho);
     assert_prices_the_resolved_response("torus", &term, &target, &rho, &cache, &resolved);
@@ -470,17 +485,14 @@ fn torus_and_ard_free_divergence_prices_the_dispersion_2933() {
 #[test]
 fn hutchinson_divergence_brackets_the_resolved_response_2933() {
     let (mut term, target, rho, cache) = obb_torus_and_circle_state();
-    let resolved = resolved_response(&term, &target, &rho).trace;
+    let resolved = resolved_response(&term, &target, &rho);
     // No host memory admits the dense eigensystem, so the matrix-free estimator
     // must carry the divergence.
     term.host_available_bytes = 0;
     let response = term
         .fitted_response_divergence(target.view(), &rho, &cache)
         .expect("the matrix-free estimator solves where the dense route is refused");
-    let FittedResponseDivergenceEstimator::Hutchinson {
-        probes,
-        standard_error,
-    } = response.estimator
+    let FittedResponseDivergenceEstimator::Hutchinson { likelihood, .. } = response.estimator
     else {
         panic!(
             "without an admitted eigensystem the divergence must be the Hutchinson estimate, \
@@ -488,23 +500,51 @@ fn hutchinson_divergence_brackets_the_resolved_response_2933() {
             response.estimator
         );
     };
+    // The standard errors of the estimator at the probe count it chose, from the
+    // re-solved response itself, so the bracket is not read off the estimate's own
+    // sample spread.
+    let probes = likelihood.probes;
+    let complement = Array2::<f64>::eye(resolved.jacobian.nrows()) - &resolved.jacobian;
+    let gram = complement.t().dot(&complement);
+    let residual_dof_standard_error =
+        (rademacher_quadratic_form_variance(&gram) / probes as f64).sqrt();
+    let divergence_standard_error =
+        (rademacher_quadratic_form_variance(&resolved.jacobian) / probes as f64).sqrt();
     eprintln!(
-        "[#2933 F36 Hutchinson] divergence={:.9e} standard error={standard_error:.3e} \
-         probes={probes} resolved={resolved:.9e}",
-        response.divergence
+        "[#2933 F36 Hutchinson] probes={probes} divergence={:.9e} (sample se {:.3e}, resolved \
+         se {divergence_standard_error:.3e}) resolved tr R={:.9e}; residual dof {:.9e} (sample \
+         se {:.3e}, resolved se {residual_dof_standard_error:.3e}) resolved ‖I−R‖²={:.9e}",
+        response.divergence,
+        likelihood.divergence_standard_error,
+        resolved.trace,
+        response.likelihood_residual_dof,
+        likelihood.residual_dof_standard_error,
+        resolved.residual_dof
     );
     assert!(
-        standard_error.is_finite() && standard_error > 0.0 && standard_error < 0.5 * resolved,
-        "a Hutchinson estimate with standard error {standard_error} cannot resolve a trace of \
-         {resolved}"
+        probes >= 2
+            && likelihood.residual_dof_standard_error.powi(2) <= 2.0 * likelihood.residual_dof,
+        "the probes stopped at {probes} with a residual-dof Monte Carlo variance {:.3e} above \
+         the 2ν̂ = {:.3e} the dispersion carries",
+        likelihood.residual_dof_standard_error.powi(2),
+        2.0 * likelihood.residual_dof
     );
     // Four standard errors of a fixed-seed estimate: a deterministic bracket whose
     // width is the estimator's own sampling error, not a tuned band.
     assert!(
-        (response.divergence - resolved).abs() <= 4.0 * standard_error,
-        "the Hutchinson divergence {} is more than four standard errors ({standard_error:.3e}) \
-         from the re-solved response trace {resolved}",
-        response.divergence
+        (response.likelihood_residual_dof - resolved.residual_dof).abs()
+            <= 4.0 * residual_dof_standard_error,
+        "the Hutchinson residual dof {} is more than four standard errors \
+         ({residual_dof_standard_error:.3e}) from the re-solved ‖I − R‖²_F {}",
+        response.likelihood_residual_dof,
+        resolved.residual_dof
+    );
+    assert!(
+        (response.divergence - resolved.trace).abs() <= 4.0 * divergence_standard_error,
+        "the Hutchinson divergence {} is more than four standard errors \
+         ({divergence_standard_error:.3e}) from the re-solved response trace {}",
+        response.divergence,
+        resolved.trace
     );
 }
 
@@ -618,9 +658,9 @@ fn softmax_sphere_and_circle_fitted() -> (SaeManifoldTerm, Array2<f64>, SaeManif
     .expect("assignment: one logit column and one coordinate block per atom");
     let mut term = SaeManifoldTerm::new(vec![sphere_atom, circle_atom], assignment)
         .expect("term: every atom's basis width matches its assignment block");
-    // ARD disabled on the sphere, so no constrained-support prior enters; ARD on
+    // ARD on the sphere's ambient axes, so its constrained-support prior enters, and on
     // the circle axis.
-    let rho = SaeManifoldRho::new(0.0, -1.0, vec![Array1::<f64>::zeros(0), array![-1.0]]);
+    let rho = SaeManifoldRho::new(0.0, -1.0, vec![array![-1.0, -1.0, -1.0], array![-1.0]]);
     let (criterion, _, _) = term
         .penalized_quasi_laplace_criterion_with_cache(
             target.view(),

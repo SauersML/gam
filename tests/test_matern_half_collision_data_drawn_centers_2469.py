@@ -3,7 +3,7 @@
 ``4add3103e`` stopped flooring ``r`` at ``1e-12`` in the ν=1/2 radial ratio, so
 ``matern_input_location_hessian`` refuses on a center instead of returning
 ``−s·1e12`` as the diagonal. With centers drawn from the data, evaluation rows
-sit exactly on centers. These tests pin what ``gamfit.Matern`` does there.
+sit exactly on centers. These tests pin what ``gamfit.smooth.Matern`` does there.
 
 * d = 1, ν=1/2. ``evaluate`` and ``jacobian`` stay finite. At the coincident
   column the jet is exactly 0, which is the symmetric Clarke subgradient of
@@ -59,14 +59,14 @@ def _data_drawn_1d(offset: float = 0.0) -> tuple[Any, list[torch.Tensor]]:
     rng = np.random.default_rng(2469)
     x = np.sort(rng.uniform(-1.0, 1.0, size=12))
     # Rows 0, 3, 6 and 9 are the centers.
-    spec = gamfit.Matern(centers=x[::3].reshape(-1, 1).copy(), nu=0.5, length_scale=0.5)
+    spec = gamfit.smooth.Matern(centers=x[::3].reshape(-1, 1).copy(), nu=0.5, length_scale=0.5)
     return spec, [torch.tensor(x + offset, dtype=torch.float64)]
 
 
 def _data_drawn_2d(nu: float, offset: float = 0.0) -> tuple[Any, list[torch.Tensor]]:
     rng = np.random.default_rng(2469)
     pts = rng.uniform(-1.0, 1.0, size=(12, 2))
-    spec = gamfit.Matern(centers=pts[::3].copy(), nu=nu, length_scale=0.5)
+    spec = gamfit.smooth.Matern(centers=pts[::3].copy(), nu=nu, length_scale=0.5)
     shifted = pts + offset
     return spec, [
         torch.tensor(shifted[:, 0], dtype=torch.float64),
@@ -94,7 +94,7 @@ def test_matern_half_1d_forward_and_jacobian_on_data_drawn_centers_2469() -> Non
 
 def test_matern_half_1d_hessian_refuses_on_a_data_drawn_center_2469() -> None:
     spec, coords = _data_drawn_1d()
-    with pytest.raises(gamfit.GamError, match="cusp"):
+    with pytest.raises(gamfit.errors.GamError, match="cusp"):
         spec.hessian(*coords)
 
 
@@ -110,7 +110,7 @@ def test_matern_half_1d_hessian_is_finite_off_the_data_drawn_centers_2469() -> N
 
 def test_matern_half_2d_forward_refuses_collocation_on_its_own_centers_2469() -> None:
     spec, coords = _data_drawn_2d(0.5, offset=0.05)
-    with pytest.raises(gamfit.GamError, match="singular Laplacian at center collisions"):
+    with pytest.raises(gamfit.errors.GamError, match="singular Laplacian at center collisions"):
         spec.evaluate(*coords)
 
 

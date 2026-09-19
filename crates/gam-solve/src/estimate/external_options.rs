@@ -36,6 +36,11 @@ pub struct ExternalOptimResult {
     pub artifacts: FitArtifacts,
     pub geometry: Option<FitGeometry>,
     pub inference: Option<FitInference>,
+    /// Conditional coefficient covariance `Vb`, the only store of it (#2955):
+    /// the fit's standard errors derive from it.
+    pub covariance_conditional: Option<Array2<f64>>,
+    /// Smoothing-corrected coefficient covariance `Vp`, the only store of it.
+    pub covariance_corrected: Option<Array2<f64>>,
     /// Complete REML/LAML objective value used for smoothing selection, or
     /// `None` when the converged fit sits on the zero-dispersion Gaussian
     /// boundary and therefore has no finite criterion value at all. Same
@@ -71,7 +76,7 @@ pub struct ExternalOptimOptions {
     pub compute_inference: bool,
     /// Internal lifecycle knob for fits whose result will be immediately
     /// superseded. Keeps ordinary inference work but skips the live-objective
-    /// rho posterior certificate/escalation until the returned model is known.
+    /// rho posterior adequacy diagnostic/escalation until the returned model is known.
     pub skip_rho_posterior_inference: bool,
     pub max_iter: usize,
     pub tol: f64,
@@ -95,44 +100,22 @@ pub(crate) fn resolve_external_family(
     family: &gam_problem::LikelihoodSpec,
     firth_override: Option<bool>,
 ) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
-    let external_glm_supported = match (&family.response, family.link_function()) {
-        (ResponseFamily::Gaussian, LinkFunction::Identity)
-        | (ResponseFamily::Poisson, LinkFunction::Log)
-        | (ResponseFamily::Gamma, LinkFunction::Log)
-        | (ResponseFamily::Tweedie { .. }, LinkFunction::Log)
-        | (ResponseFamily::NegativeBinomial { .. }, LinkFunction::Log)
-        | (ResponseFamily::Binomial, LinkFunction::Logit)
-        | (ResponseFamily::Binomial, LinkFunction::Probit)
-        | (ResponseFamily::Binomial, LinkFunction::CLogLog)
-        // LogLog and Cauchit are ordinary state-less probability links: they
-        // narrow into `StandardLink` (gam-spec), carry a full 5-jet Fisher
-        // weight (`fisher_weight_jet5` → `component_fisher_weight_jet5` for
-        // LinkComponent::{LogLog,Cauchit}), and their inverse-link jets live
-        // in `mixture_link.rs` — the exact same external-design/P-IRLS
-        // machinery probit/cloglog ride. #2104 un-gated them at validation
-        // (`link_legal_for_family`); this is the fitting half of that wiring.
-        | (ResponseFamily::Binomial, LinkFunction::LogLog)
-        | (ResponseFamily::Binomial, LinkFunction::Cauchit)
-        | (ResponseFamily::Binomial, LinkFunction::Sas)
-        | (ResponseFamily::Binomial, LinkFunction::BetaLogistic) => true,
-        // Beta regression with a constant precision φ is a genuine-dispersion
-        // mean family on par with Gamma/Tweedie/Negative-Binomial: the inner
-        // P-IRLS carries its full fixed-φ Fisher information and the outer loop
-        // estimates φ by the Pearson moment estimator (`estimate_beta_phi_from_eta`,
-        // mirroring the Tweedie φ / Gamma shape / NegBin θ locks). A
-        // `noise_formula` upgrades it to a dispersion-location-scale model that
-        // smooths log φ; without one, the external GLM route fits the mean with
-        // a single estimated φ exactly as betareg does by default.
-        (ResponseFamily::Beta { .. }, LinkFunction::Logit) => true,
-        _ => false,
-    };
-    if !external_glm_supported {
+    // The external GLM route fits every legal cell of the one likelihood
+    // legality table (`LikelihoodSpec::is_legal_cell`) except the
+    // Royston-Parmar survival response, whose likelihood is the dedicated
+    // survival route's. No second whitelist: a cell the table admits is a cell
+    // the inner P-IRLS carries exact derivatives for.
+    if matches!(family.response, ResponseFamily::RoystonParmar) {
         crate::bail_invalid_estim!(
-            "the external-design route requires a supported standard GLM family/link; got {}. \
-             The external-design route supports Gaussian(identity), Binomial(logit/probit/cloglog/loglog/cauchit/SAS/Beta-Logistic), \
-             Beta(logit), and Poisson/Gamma/Tweedie/Negative-Binomial(log). For Beta precision modeling \
-             add a noise_formula to upgrade to the dispersion-location-scale route",
+            "the external-design GLM route does not fit a Royston-Parmar survival response; \
+             use the survival route"
+        );
+    }
+    if !gam_problem::LikelihoodSpec::is_legal_cell(&family.response, &family.link) {
+        crate::bail_invalid_estim!(
+            "the external-design route got the illegal family/link cell {}; {}",
             family.pretty_name(),
+            gam_problem::LikelihoodSpec::legal_links_clause(&family.response),
         );
     }
 

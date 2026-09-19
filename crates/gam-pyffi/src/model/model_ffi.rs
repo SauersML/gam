@@ -13,9 +13,10 @@ use manifold_pyclasses::{
 use sklearn_metadata::sklearn_fit_metadata;
 
 use gam::families::inference::saved_summary::{
-    prediction_model_class_label, saved_model_report_input, saved_model_summary,
-    scan_introspection, scan_smooth_label,
+    compare_saved_models, prediction_model_class_label, saved_model_report_input,
+    saved_model_summary, saved_models_log_evidence_ratio, scan_introspection, scan_smooth_label,
 };
+use gam::families::inference::summary_text::render_summary_text;
 
 use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
 
@@ -72,13 +73,124 @@ struct PyPredictOptions {
 
 /// Validated, typed fitted model retained by the Python `Model` shell.
 ///
-/// Persistence remains byte-based, but hot prediction calls share this
-/// immutable value instead of reparsing and revalidating the JSON archive on
-/// every batch. `Arc` makes detaching prediction from the GIL a constant-time
-/// ownership transfer without cloning the potentially large fitted payload.
-#[pyclass(name = "_FittedModel", frozen)]
+/// Persistence remains byte-based, but every accessor shares this immutable
+/// value instead of reparsing and revalidating the JSON archive per call. `Arc`
+/// makes detaching work from the GIL a constant-time ownership transfer without
+/// cloning the fitted payload. The summary is derived from the typed model on
+/// first use and retained, so summary-backed accessors never rebuild it.
+///
+/// The saved-model bytes it was compiled from are kept beside it (O(p²), no
+/// per-row data), so the handle is a value: two handles are equal when they
+/// were compiled from the same saved model, and it pickles and copies as those
+/// bytes, recompiled on load.
+#[pyclass(module = "gamfit._rust", name = "_FittedModel", frozen)]
 struct PyFittedModel {
     model: Arc<FittedModel>,
+    source: Arc<[u8]>,
+    summary: std::sync::OnceLock<serde_json::Value>,
+}
+
+impl PyFittedModel {
+    fn compile(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Self> {
+        let (model, source) = detach_py_result(py, "compile_model", move || {
+            load_model_impl(&model_bytes).map(|model| (model, model_bytes))
+        })?;
+        Ok(Self {
+            model: Arc::new(model),
+            source: source.into(),
+            summary: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn summary_value(&self) -> PyResult<&serde_json::Value> {
+        if let Some(summary) = self.summary.get() {
+            return Ok(summary);
+        }
+        let summary = summary_payload_value(&self.model).map_err(PyValueError::new_err)?;
+        Ok(self.summary.get_or_init(|| summary))
+    }
+}
+
+#[pymethods]
+impl PyFittedModel {
+    #[new]
+    fn py_new(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Self> {
+        Self::compile(py, model_bytes)
+    }
+
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> (Bound<'py, pyo3::types::PyType>, (Bound<'py, PyBytes>,)) {
+        let source = PyBytes::new(slf.py(), &slf.get().source);
+        (slf.get_type(), (source,))
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other
+            .cast::<Self>()
+            .is_ok_and(|other| *other.get().source == *self.source)
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.source.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[getter]
+    fn formula(&self) -> &str {
+        &self.model.payload().formula
+    }
+
+    #[getter]
+    fn family(&self) -> &str {
+        &self.model.payload().family
+    }
+
+    #[getter]
+    fn used_device(&self) -> bool {
+        self.model.payload().used_device
+    }
+
+    #[getter]
+    fn training_table_kind(&self) -> &str {
+        &self.model.training_table_kind
+    }
+
+    /// Human-readable inference advisories recorded while the model was fit —
+    /// the mgcv-style "k reduced to the data support" / basis-degradation notes
+    /// from the cr/cs/sz cap (#1541, #1542), and any other materialization
+    /// advisory. The CLI prints these; gamfit surfaces the SAME notes as
+    /// `GamInferenceWarning`s and via `model.notes` (#1543).
+    #[getter]
+    fn inference_notes(&self) -> Vec<String> {
+        self.model.payload().inference_notes.clone()
+    }
+
+    /// Informational notes recorded while the model was fit: defaults the
+    /// engine chose (the auto knot count of a default B-spline, per-margin
+    /// tensor sizes). gamfit exposes them via `model.notes` and the summary
+    /// but does not warn. Empty for payloads that predate the field.
+    #[getter]
+    fn informational_notes(&self) -> Vec<String> {
+        self.model.payload().informational_notes.clone()
+    }
+
+    /// The canonical fine-grained prediction class label — e.g. `"bernoulli
+    /// marginal-slope"`, `"survival marginal-slope"`, `"competing risks
+    /// survival"`, `"latent survival"`, `"gaussian location-scale"`,
+    /// `"transformation-normal"`, or `"standard"`.
+    ///
+    /// The persisted `model_kind` field is the *coarse* [`ModelKind`] enum,
+    /// which collapses distinct model classes onto a single tag, so gamfit's
+    /// introspection sets (`is_marginal_slope`, `is_survival`, …) read this
+    /// label, derived from the fitted family state — the same authority the
+    /// predict payloads and CLI use.
+    #[getter]
+    fn predict_class_name(&self) -> String {
+        prediction_model_class_label(&self.model)
+    }
 }
 
 /// Parse the public `covariance_mode` string into the engine enum. `None`
@@ -152,9 +264,14 @@ struct PredictionPayload {
     model_class: String,
     /// Response-scale point column of this class (`PredictModelClass::point_column`).
     point_column: &'static str,
-    /// Point-payload shape of this class (`PredictModelClass::point_shape`); the
-    /// Python shaper branches on it instead of the class label.
+    /// Point-payload shape of this model (`FittedModel::prediction_point_shape`);
+    /// the Python shaper branches on it instead of the class label.
     point_shape: &'static str,
+    /// Ordered point columns of a multi-curve point (`expectile_curves`: one
+    /// column per expectile level, in increasing level order). Omitted for
+    /// single-column points, which `point_column` names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_columns: Option<Vec<String>>,
     /// Inverse-link family kind tag (`identity`, `logit`, `probit`, `log`, ...).
     family: String,
     /// Provenance of the returned prediction interval (#942). Present only on
@@ -173,6 +290,11 @@ struct PredictionPayload {
     /// point is a plug-in that consulted no coefficient covariance.
     #[serde(skip_serializing_if = "Option::is_none")]
     point_covariance_source: Option<String>,
+    /// What a posterior-mean POINT is conditional on when the fit withheld its
+    /// covariance (gam#2985): `PointCovarianceProvenance::explain`. Omitted when
+    /// the point integrates the fit's own covariance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_covariance_note: Option<String>,
 }
 
 /// Typed wire payload for NUTS posterior draws.
@@ -205,11 +327,14 @@ struct SamplePayload {
     /// response-scale transforms (issue #1133).
     link_spec: String,
     /// The sampler that produced the draws, stamped by that sampler itself
-    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`, `"laplace"`,
-    /// `"truncated-laplace"`, or `"conjugate-gaussian"`. Callers use it to badge
-    /// the posterior or to warn when a class has fallen back to the approximate
-    /// path.
+    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`,
+    /// `"polya-gamma-jeffreys"`, `"laplace"`, `"truncated-laplace"`, or
+    /// `"conjugate-gaussian"`. Callers use it to badge the posterior or to warn
+    /// when a class has fallen back to the approximate path.
     method: String,
+    /// Metropolis acceptance rate of the draws (`PosteriorSampler::acceptance_rate`),
+    /// present only for a sampler with an accept/reject step.
+    acceptance_rate: Option<f64>,
     /// Whether `method` targets the model's exact posterior (the MCMC routes and
     /// the closed-form conjugate Gaussian route) rather than a Gaussian
     /// approximation of it (every Laplace form).
@@ -564,122 +689,155 @@ impl PyEncodedTable {
     }
 }
 
-fn validate_column_partition(
-    n_columns: usize,
-    numeric_positions: &[usize],
-    categorical_positions: &[usize],
-) -> Result<(), String> {
-    let mut seen = vec![false; n_columns];
-    for (kind, positions) in [
-        ("numeric", numeric_positions),
-        ("categorical", categorical_positions),
-    ] {
-        for &position in positions {
-            if position >= n_columns {
-                return Err(format!(
-                    "{kind} column position {position} is outside 0..{n_columns}"
-                ));
-            }
-            if std::mem::replace(&mut seen[position], true) {
-                return Err(format!("column position {position} is repeated"));
-            }
-        }
-    }
-    if let Some(position) = seen.iter().position(|present| !present) {
-        return Err(format!(
-            "column position {position} is missing from the numeric/categorical partition"
-        ));
-    }
-    Ok(())
+/// One table column crossing the Python boundary, in the layout its source
+/// declared. The Python adapter only reads that declaration (a NumPy dtype, a
+/// categorical dtype); every decision about what the values mean is made in
+/// gam-data.
+#[derive(FromPyObject)]
+enum PyTableColumn<'py> {
+    /// A numeric vector, already `float64`.
+    Numeric(PyReadonlyArray1<'py, f64>),
+    /// A declared categorical: codes (`-1` = missing) into the level values.
+    Categorical(PyReadonlyArray1<'py, i64>, Vec<Bound<'py, PyAny>>),
+    /// A sequence of Python values with no declared type.
+    Untyped(Bound<'py, PyAny>),
 }
 
-/// Construct an encoded table from one homogeneous numeric matrix plus the
-/// genuinely categorical string columns. Numeric cells cross through
-/// rust-numpy; only categorical labels are Python strings.
+fn py_display_text(value: &Bound<'_, PyAny>) -> Result<String, gam::data::DataError> {
+    value
+        .str()
+        .and_then(|text| text.to_str().map(str::to_owned))
+        .map_err(|error| gam::data::DataError::InvalidValue {
+            reason: format!("could not render a value as text: {error}"),
+        })
+}
+
+/// Classify one Python value for [`gam::data::encode_untyped_column`]: text,
+/// `None`, anything `float()` accepts (NaN is missing), or unsupported.
+fn untyped_cell<'a>(value: &'a Bound<'_, PyAny>) -> gam::data::UntypedCell<'a> {
+    use gam::data::UntypedCell;
+    use pyo3::types::PyString;
+
+    if let Ok(text) = value.cast::<PyString>() {
+        return match text.to_str() {
+            Ok(text) => UntypedCell::Text(text),
+            Err(_) => UntypedCell::Unsupported("str"),
+        };
+    }
+    if value.is_none() {
+        return UntypedCell::Missing;
+    }
+    match value.extract::<f64>() {
+        Ok(number) if number.is_nan() => UntypedCell::Missing,
+        Ok(number) => UntypedCell::Number(number),
+        Err(_) => UntypedCell::Unsupported(""),
+    }
+}
+
+fn encode_py_table_column(
+    name: &str,
+    column: &PyTableColumn<'_>,
+) -> Result<(SchemaColumn, Vec<f64>), gam::data::DataError> {
+    match column {
+        PyTableColumn::Numeric(values) => {
+            let values = values.as_array().to_vec();
+            let kind = gam::data::infer_numeric_column_kind(values.iter().copied());
+            Ok((
+                SchemaColumn {
+                    name: name.to_string(),
+                    kind,
+                    levels: Vec::new(),
+                },
+                values,
+            ))
+        }
+        PyTableColumn::Categorical(codes, levels) => {
+            let codes = codes.as_array().to_vec();
+            let levels = levels
+                .iter()
+                .map(py_display_text)
+                .collect::<Result<Vec<_>, _>>()?;
+            gam::data::encode_categorical_codes(name, &codes, &levels)
+        }
+        PyTableColumn::Untyped(source) => {
+            let objects = source
+                .try_iter()
+                .and_then(|values| values.collect::<PyResult<Vec<_>>>())
+                .map_err(|error| gam::data::DataError::InvalidValue {
+                    reason: format!("column '{name}' is not a sequence of values: {error}"),
+                })?;
+            // Only the first unsupported cell is reported, so only its type is named.
+            let unsupported_type: String;
+            let mut cells = objects.iter().map(untyped_cell).collect::<Vec<_>>();
+            if let Some(row) = cells
+                .iter()
+                .position(|cell| matches!(cell, gam::data::UntypedCell::Unsupported(_)))
+            {
+                unsupported_type = objects[row]
+                    .get_type()
+                    .fully_qualified_name()
+                    .and_then(|type_name| type_name.to_str().map(str::to_owned))
+                    .map_err(|error| gam::data::DataError::InvalidValue {
+                        reason: format!(
+                            "could not name the type of the value at row {}, column '{name}': {error}",
+                            row + 1
+                        ),
+                    })?;
+                cells[row] = gam::data::UntypedCell::Unsupported(&unsupported_type);
+            }
+            gam::data::encode_untyped_column(name, &cells, |row| py_display_text(&objects[row]))
+        }
+    }
+}
+
+/// Construct an encoded table from columns in their declared layouts: `float64`
+/// vectors and categorical codes cross through rust-numpy without Python
+/// objects, and untyped columns are classified cell by cell here and encoded by
+/// gam-data's single untyped-column rule.
 #[pyfunction]
 fn encoded_table_from_columns(
     headers: Vec<String>,
-    numeric_values: PyReadonlyArray2<'_, f64>,
-    numeric_positions: Vec<usize>,
-    categorical_values: Vec<Vec<Option<String>>>,
-    categorical_positions: Vec<usize>,
+    columns: Vec<PyTableColumn<'_>>,
 ) -> PyResult<PyEncodedTable> {
     ensure_unique_headers(&headers).map_err(py_value_error)?;
-    validate_column_partition(headers.len(), &numeric_positions, &categorical_positions)
-        .map_err(py_value_error)?;
-    let numeric = numeric_values.as_array();
-    if numeric.ncols() != numeric_positions.len() {
+    if columns.len() != headers.len() {
         return Err(py_value_error(format!(
-            "numeric matrix has {} columns but {} numeric positions were supplied",
-            numeric.ncols(),
-            numeric_positions.len()
+            "received {} columns for {} headers",
+            columns.len(),
+            headers.len()
         )));
     }
-    if categorical_values.len() != categorical_positions.len() {
-        return Err(py_value_error(format!(
-            "received {} categorical columns but {} categorical positions",
-            categorical_values.len(),
-            categorical_positions.len()
-        )));
-    }
-    let n_rows = if !numeric_positions.is_empty() {
-        numeric.nrows()
-    } else {
-        categorical_values.first().map(Vec::len).unwrap_or(0)
-    };
-    if n_rows == 0 {
-        return Err(py_value_error("table data cannot be empty".to_string()));
-    }
-    for (index, column) in categorical_values.iter().enumerate() {
-        if column.len() != n_rows {
-            return Err(py_value_error(format!(
-                "categorical column '{}' has {} rows but expected {n_rows}",
-                headers[categorical_positions[index]],
-                column.len()
-            )));
-        }
-    }
-
-    let mut values = Array2::<f64>::zeros((n_rows, headers.len()));
-    let mut schema_columns = vec![None::<SchemaColumn>; headers.len()];
-    let mut column_kinds = vec![ColumnKindTag::Continuous; headers.len()];
-    for (matrix_column, &table_column) in numeric_positions.iter().enumerate() {
-        let column = numeric.column(matrix_column);
-        let kind = gam::data::infer_numeric_column_kind(column.iter().copied());
-        for (row, value) in column.iter().enumerate() {
-            values[[row, table_column]] = *value;
-        }
-        column_kinds[table_column] = kind;
-        schema_columns[table_column] = Some(SchemaColumn {
-            name: headers[table_column].clone(),
-            kind,
-            levels: Vec::new(),
-        });
-    }
-    for (source_column, &table_column) in
-        categorical_values.iter().zip(categorical_positions.iter())
-    {
-        let labels = source_column
-            .iter()
-            .map(|value| value.as_deref())
-            .collect::<Vec<_>>();
-        let (schema, encoded) = gam::data::encode_optional_categorical_column(
-            &headers[table_column],
-            &labels,
-        )
-        .map_err(|error| py_value_error(error.to_string()))?;
-        values
-            .column_mut(table_column)
-            .assign(&ndarray::ArrayView1::from(&encoded));
-        column_kinds[table_column] = schema.kind;
-        schema_columns[table_column] = Some(schema);
-    }
-    let schema_columns = schema_columns
-        .into_iter()
-        .enumerate()
-        .map(|(column, schema)| schema.ok_or_else(|| format!("missing schema for column {column}")))
+    let encoded = headers
+        .iter()
+        .zip(&columns)
+        .map(|(name, column)| encode_py_table_column(name, column))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(py_value_error)?;
+        .map_err(data_error_to_pyerr)?;
+    let n_rows = encoded.first().map_or(0, |(_, values)| values.len());
+    if n_rows == 0 {
+        return Err(data_error_to_pyerr(gam::data::DataError::EmptyInput {
+            reason: "table data cannot be empty".to_string(),
+        }));
+    }
+    let mut values = Array2::<f64>::zeros((n_rows, headers.len()));
+    let mut schema_columns = Vec::with_capacity(headers.len());
+    let mut column_kinds = Vec::with_capacity(headers.len());
+    for (column, (schema, encoded_values)) in encoded.into_iter().enumerate() {
+        if encoded_values.len() != n_rows {
+            return Err(data_error_to_pyerr(gam::data::DataError::SchemaMismatch {
+                reason: format!(
+                    "column '{}' has {} rows but expected {n_rows}",
+                    schema.name,
+                    encoded_values.len()
+                ),
+            }));
+        }
+        values
+            .column_mut(column)
+            .assign(&ndarray::ArrayView1::from(&encoded_values));
+        column_kinds.push(schema.kind);
+        schema_columns.push(schema);
+    }
     Ok(PyEncodedTable {
         dataset: EncodedDataset {
             headers,
@@ -692,7 +850,7 @@ fn encoded_table_from_columns(
     })
 }
 
-/// Import a pandas/Polars/PyArrow provider through the Arrow C Stream
+/// Import a Polars/PyArrow provider through the Arrow C Stream
 /// PyCapsule protocol. The producer owns its buffers until arrow-rs consumes
 /// the stream; numeric primitives are read directly and only string columns
 /// allocate level labels.
@@ -716,11 +874,14 @@ fn encoded_table_from_arrow(
     // protocol guarantees a writable, initialized FFI_ArrowArrayStream. The
     // move nulls the capsule's release callback, so ownership is unique.
     let stream = unsafe { FFI_ArrowArrayStream::from_raw(stream_pointer) };
-    let mut reader = ArrowArrayStreamReader::try_new(stream)
-        .map_err(|error| py_value_error(format!("failed to import Arrow C stream: {error}")))?;
+    let mut reader = ArrowArrayStreamReader::try_new(stream).map_err(|error| {
+        data_error_to_pyerr(gam::data::DataError::ParseError {
+            reason: format!("failed to import Arrow C stream: {error}"),
+        })
+    })?;
     let dataset =
         gam::data::encode_arrow_record_batch_reader_with_inferred_schema(&mut reader, headers)
-            .map_err(|error| py_value_error(error.to_string()))?;
+            .map_err(data_error_to_pyerr)?;
     Ok(PyEncodedTable { dataset })
 }
 
@@ -1325,7 +1486,14 @@ fn default_survival_time_grid_from_model(
     )
 }
 
-#[pyfunction(signature = (headers, rows, formula, config_json = None, fisher_rao_w = None))]
+#[pyfunction(signature = (
+    headers,
+    rows,
+    formula,
+    config_json = None,
+    fisher_rao_w = None,
+    warm_start_model = None
+))]
 fn fit_table(
     py: Python<'_>,
     headers: Vec<String>,
@@ -1333,12 +1501,38 @@ fn fit_table(
     formula: String,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
+    warm_start_model: Option<Vec<u8>>,
 ) -> PyResult<Py<PyBytes>> {
     // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
     // SIGALRM handlers, etc.) can run while the Rust solver is in progress.
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
+    // The multinomial-logit family is a vector-response fit with its own
+    // driver and persistence envelope; route it here on the same predicate the
+    // CLI uses, so callers read the model kind off the returned bytes
+    // (`saved_model_kind`) instead of re-deriving it from the family name.
+    let fit_config = parse_fit_config(config_json.as_deref()).map_err(py_value_error)?;
+    if fit_config
+        .family
+        .as_deref()
+        .is_some_and(gam::families::fit_orchestration::is_multinomial_family_name)
+    {
+        if warm_start_model.is_some() {
+            return Err(py_value_error(
+                "warm_start_from is not supported for multinomial fits".to_string(),
+            ));
+        }
+        if fisher_rao_w.is_some() {
+            return Err(py_value_error(
+                "fisher_rao_w is not supported for multinomial fits".to_string(),
+            ));
+        }
+        let model_bytes = detach_pyresult(py, "fit_multinomial", move || {
+            fit_multinomial_dataset(&dataset, &formula, &fit_config)
+        })?;
+        return Ok(PyBytes::new(py, &model_bytes).unbind());
+    }
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
     let model_bytes = detach_workflow_result(py, "fit_table", move || {
         fit_dataset_impl(
@@ -1346,12 +1540,20 @@ fn fit_table(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
+            warm_start_model.as_deref(),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
 
-#[pyfunction(signature = (x, y, formula, config_json = None, fisher_rao_w = None))]
+#[pyfunction(signature = (
+    x,
+    y,
+    formula,
+    config_json = None,
+    fisher_rao_w = None,
+    warm_start_model = None
+))]
 fn fit_array(
     py: Python<'_>,
     x: PyReadonlyArray2<'_, f64>,
@@ -1359,6 +1561,7 @@ fn fit_array(
     formula: String,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
+    warm_start_model: Option<Vec<u8>>,
 ) -> PyResult<Py<PyBytes>> {
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
@@ -1370,6 +1573,7 @@ fn fit_array(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
+            warm_start_model.as_deref(),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
@@ -1377,100 +1581,50 @@ fn fit_array(
 
 #[pyfunction]
 fn compile_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyFittedModel> {
-    let model = detach_py_result(py, "compile_model", move || {
-        load_model_impl(&model_bytes)
-    })?;
-    Ok(PyFittedModel {
-        model: Arc::new(model),
-    })
+    PyFittedModel::compile(py, model_bytes)
 }
 
-/// Log Akaike evidence ratio of model A over model B: `−(AIC_A − AIC_B)/2`.
+/// Log Akaike evidence ratio of model A over model B on the smoothing-corrected
+/// AIC, `−(AIC_c(A) − AIC_c(B))/2`, formed by the same Rust comparison as
+/// `compare_models`.
 ///
 /// This is the relative likelihood of Burnham & Anderson, NOT a log Bayes
 /// factor (no prior is integrated over), and the Python surface names it
 /// `Model.evidence_ratio_vs` accordingly.
 #[pyfunction]
-fn log_evidence_ratio(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyResult<f64> {
-    let payload_a = summary_payload_from_model_bytes(&model_a_bytes)?;
-    let payload_b = summary_payload_from_model_bytes(&model_b_bytes)?;
-    // Rank on the SAME Occam-penalised conditional AIC that `compare_models`
-    // uses (`-2·loglik + 2·edf`, `ranking_score_from_summary_payload`), not the
-    // raw REML/LAML evidence headline. The raw headline fails to penalise a
-    // pure-noise smooth, so the pairwise ratio used to declare the augmented
-    // model better supported even though `compare_models` correctly picked the
-    // smaller one — the two contradicted each other (issue #2079).
-    let score_a = ranking_score_from_summary_payload(&payload_a)?;
-    let score_b = ranking_score_from_summary_payload(&payload_b)?;
-    // The ranking score is a minimised cost (lower = better), so the log ratio
-    // of A over B is `score_b - score_a`, not `score_a - score_b`. Route
-    // through the shared convention so this agrees with `compare_reml_fits`
-    // (issue #575: the raw subtraction was inverted, reporting overwhelming
-    // evidence for the worse-fitting model).
-    //
-    // The ranking score is the conditional AIC (`−2·loglik + 2·edf`), a −2·log /
-    // deviance-scale cost, so its gap is a ΔAIC. The Akaike evidence ratio for an
-    // AIC gap Δ is `exp(−½Δ)` (Burnham & Anderson), so the LOG ratio is HALF
-    // the raw score gap. `Model.evidence_ratio_vs` exponentiates this value
-    // directly; returning the un-halved gap made it report `exp(ΔAIC)`, the SQUARE
-    // of the intended ratio (issue #2124). Halve here, at the AIC-scale site, so
-    // no raw-REML consumer is affected.
-    Ok(0.5 * log_bayes_factor(score_a, score_b))
+fn log_evidence_ratio(
+    py: Python<'_>,
+    model_a: PyRef<'_, PyFittedModel>,
+    model_b: PyRef<'_, PyFittedModel>,
+) -> PyResult<f64> {
+    let model_a = Arc::clone(&model_a.model);
+    let model_b = Arc::clone(&model_b.model);
+    detach_py_result(py, "log_evidence_ratio", move || {
+        saved_models_log_evidence_ratio(&model_a, &model_b)
+    })
 }
 
+/// The LAML-estimated `(σ, ν)` of a scaled Student-t fit, read off the compiled
+/// model's likelihood; `None` for every other response family.
 #[pyfunction]
-fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Option<String>> {
-    let saved: serde_json::Value = serde_json::from_slice(&model_bytes)
-        .map_err(|err| PyValueError::new_err(format!("saved model payload must be JSON: {err}")))?;
-    let payload = saved
-        .get("payload")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            PyValueError::new_err("saved model payload is missing its payload object")
-        })?;
-    Ok(payload.get(key).map(|value| match value {
-        serde_json::Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }))
-}
-
-/// Human-readable inference advisories recorded while the model was fit — the
-/// mgcv-style "k reduced to the data support" / basis-degradation notes from the
-/// cr/cs/sz cap (#1541, #1542), and any other materialization advisory. The CLI
-/// prints these; this accessor lets gamfit surface the SAME notes as
-/// `GamInferenceWarning`s and via `model.notes` rather than dropping them at the
-/// FFI boundary (#1543). Returns an empty list for older payloads that predate
-/// the field (it deserializes via `#[serde(default)]`).
-#[pyfunction]
-fn inference_notes_from_model(model_bytes: Vec<u8>) -> PyResult<Vec<String>> {
-    let saved: serde_json::Value = serde_json::from_slice(&model_bytes)
-        .map_err(|err| PyValueError::new_err(format!("saved model payload must be JSON: {err}")))?;
-    let notes = saved
-        .get("payload")
-        .and_then(|payload| payload.get("inference_notes"))
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
-    Ok(notes)
-}
-
-fn required_saved_model_payload_string_value(model_bytes: &[u8], key: &str) -> PyResult<String> {
-    saved_model_payload_string(model_bytes.to_vec(), key)?
-        .ok_or_else(|| py_value_error(format!("saved model payload is missing {key}")))
-}
-
-#[pyfunction]
-fn required_saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<String> {
-    required_saved_model_payload_string_value(&model_bytes, key)
+fn student_t_parameters_from_model(model: PyRef<'_, PyFittedModel>) -> Option<(f64, f64)> {
+    match model_likelihood_spec(&model.model).response {
+        ResponseFamily::StudentT { sigma, nu } => Some((sigma, nu)),
+        _ => None,
+    }
 }
 
 /// Schema tag of the response-geometry saved-model container (#2114).
 pub(crate) const RESPONSE_GEOMETRY_SCHEMA: &str = "gamfit.ResponseGeometryModel/v1";
+
+/// Whether `family` names the multinomial-logit family, by the one engine
+/// predicate `fit_table` and the CLI route on. Python front ends that must
+/// choose before fitting (the sklearn classifier's binary/multi-class split)
+/// ask here instead of keeping their own spelling list.
+#[pyfunction]
+fn is_multinomial_family_name(family: &str) -> bool {
+    gam::families::fit_orchestration::is_multinomial_family_name(family)
+}
 
 /// The kind of a saved gamfit model payload, read from its JSON header. A
 /// `gamfit.ManifoldSAE` schema of any version is `"manifold_sae"`, so a stale
@@ -1510,27 +1664,6 @@ fn saved_model_kind(model_bytes: Vec<u8>) -> &'static str {
     "scalar"
 }
 
-/// The canonical fine-grained prediction class label for a saved model — e.g.
-/// `"bernoulli marginal-slope"`, `"survival marginal-slope"`, `"competing
-/// risks survival"`, `"latent survival"`, `"gaussian location-scale"`,
-/// `"transformation-normal"`, or `"standard"`.
-///
-/// The persisted `model_kind` field is the *coarse* [`ModelKind`] enum, which
-/// collapses distinct model classes onto a single tag: both bernoulli- and
-/// survival-marginal-slope serialize as `"marginal-slope"`, and every
-/// location-scale variant as `"location-scale"`. `gamfit`'s model-introspection
-/// sets (`is_marginal_slope`, `is_survival`, `is_transformation_normal`) are
-/// written against the fine-grained label, so reading the coarse `model_kind`
-/// for them silently misclassifies — e.g. a marginal-slope model reports
-/// `is_marginal_slope == False`. This accessor derives the label from the
-/// fitted family state, the same authority the predict payloads and CLI use.
-#[pyfunction]
-fn saved_model_predict_class_name(model_bytes: Vec<u8>) -> PyResult<String> {
-    let model: FittedModel = serde_json::from_slice(&model_bytes)
-        .map_err(|err| py_value_error(format!("saved model payload must be JSON: {err}")))?;
-    Ok(prediction_model_class_label(&model))
-}
-
 #[pyfunction]
 fn build_extend_group_payload_json(
     spec_json: &str,
@@ -1561,11 +1694,12 @@ fn build_extend_group_payload_json(
 #[pyfunction]
 fn extend_model_with_group(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     request_json: String,
 ) -> PyResult<Py<PyBytes>> {
+    let model = Arc::clone(&model.model);
     let out = detach_py_result(py, "extend_model_with_group", move || {
-        extend_model_with_group_impl(&model_bytes, &request_json)
+        extend_model_with_group_impl(&model, &request_json)
     })?;
     Ok(PyBytes::new(py, &out).unbind())
 }
@@ -1666,9 +1800,9 @@ fn build_predict_payload_json(
         .map_err(|err| py_value_error(format!("failed to serialize predict payload: {err}")))
 }
 
-#[pyfunction(signature = (model_bytes, headers, rows, interval, covariance_mode=None, observation_interval=None))]
+#[pyfunction(signature = (model, headers, rows, interval, covariance_mode=None, observation_interval=None))]
 fn build_model_predict_payload_json(
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     interval: Option<f64>,
@@ -1676,10 +1810,21 @@ fn build_model_predict_payload_json(
     observation_interval: Option<bool>,
 ) -> PyResult<String> {
     rows.require_headers(&headers).map_err(py_value_error)?;
-    let model_class = required_saved_model_payload_string_value(&model_bytes, "model_kind")?;
-    let formula = required_saved_model_payload_string_value(&model_bytes, "formula")?;
-    let time_grid =
-        default_survival_time_grid_impl(&model_class, &formula, &rows.dataset, Some(&model_bytes))?;
+    let time_grid = if matches!(
+        model.model.model_kind,
+        gam::inference::model::ModelKind::Survival
+    ) {
+        gam::families::survival::predict::default_survival_time_grid(
+            model.model.payload().formula.as_str(),
+            &rows.dataset,
+            gam::families::survival::predict::survival_training_time_upper_bound(
+                model.model.payload(),
+            ),
+        )
+        .map_err(py_value_error)?
+    } else {
+        None
+    };
     build_predict_payload_json(interval, time_grid, covariance_mode, observation_interval)
 }
 
@@ -1715,8 +1860,8 @@ fn ctn_required_fit_columns(formula: String, config_json: String) -> PyResult<Ve
 }
 
 #[pyfunction]
-fn required_model_columns(model_bytes: Vec<u8>, observed_score: bool) -> PyResult<Option<Vec<String>>> {
-    let mut model = load_model_impl(&model_bytes).map_err(|error| py_value_error(error.to_string()))?;
+fn required_model_columns(model: PyRef<'_, PyFittedModel>, observed_score: bool) -> PyResult<Option<Vec<String>>> {
+    let mut model = model.model.as_ref().clone();
     // Outcome models without an embedded CTN retain their existing table
     // ingestion contract, including intercept-only row-count inputs.
     if !observed_score && model.score_transform.is_none() {
@@ -1737,13 +1882,17 @@ fn required_model_columns(model_bytes: Vec<u8>, observed_score: bool) -> PyResul
 }
 
 fn transformation_score_encoded_table_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
 ) -> Result<Array1<f64>, String> {
-    let mut model = load_model_impl(model_bytes).map_err(|error| error.to_string())?;
-    if let Some(transform) = model.score_transform.as_ref() {
-        model = FittedModel::from_payload((**transform).clone());
-    }
+    let transformed;
+    let model = match model.score_transform.as_ref() {
+        Some(transform) => {
+            transformed = FittedModel::from_payload((**transform).clone());
+            &transformed
+        }
+        None => model,
+    };
     if model.predict_model_class() != PredictModelClass::TransformationNormal {
         return Err(format!(
             "transformation_score requires a transformation-normal model; got '{}'",
@@ -1785,16 +1934,41 @@ fn transformation_score_encoded_table_impl(
 #[pyfunction]
 fn transformation_score_table<'py>(
     py: Python<'py>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<Py<PyArray1<f64>>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let scores = detach_py_result(py, "transformation_score_table", move || {
-        transformation_score_encoded_table_impl(&model_bytes, dataset)
+        transformation_score_encoded_table_impl(&model, dataset)
     })?;
     Ok(scores.into_pyarray(py).unbind())
+}
+
+/// Per-row residuals of type `kind` (`response`, `working`, `deviance`,
+/// `pearson`) of a saved standard model on labeled rows; the rows must carry
+/// the response (and the weight/offset columns the model was fit with).
+#[pyfunction]
+fn residuals_table<'py>(
+    py: Python<'py>,
+    model: PyRef<'_, PyFittedModel>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+    kind: String,
+) -> PyResult<Py<PyArray1<f64>>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let kind = kind
+        .parse::<gam::solver::pirls::ResidualKind>()
+        .map_err(py_value_error)?;
+    let source = rows.dataset.clone();
+    let model = Arc::clone(&model.model);
+    let residuals = detach_py_result(py, "residuals_table", move || {
+        let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
+        gam::families::inference::saved_residuals::saved_model_residuals(&model, &dataset, kind)
+    })?;
+    Ok(residuals.into_pyarray(py).unbind())
 }
 
 /// Distribution-free conformal prediction intervals (issue #310 family path).
@@ -1805,10 +1979,10 @@ fn transformation_score_table<'py>(
 /// `(calibration_headers, calibration_rows)` fold — which must contain the
 /// response column. The returned interval carries finite-sample marginal
 /// coverage `≥ conformal_level` regardless of model misspecification.
-#[pyfunction(signature = (model_bytes, headers, rows, calibration_headers, calibration_rows, conformal_level, options_json=None))]
+#[pyfunction(signature = (model, headers, rows, calibration_headers, calibration_rows, conformal_level, options_json=None))]
 fn predict_table_conformal(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     calibration_headers: Vec<String>,
@@ -1816,6 +1990,7 @@ fn predict_table_conformal(
     conformal_level: f64,
     options_json: Option<String>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     calibration_rows
         .require_headers(&calibration_headers)
@@ -1824,7 +1999,7 @@ fn predict_table_conformal(
     let calibration_dataset = calibration_rows.dataset.clone();
     detach_py_result(py, "predict_table_conformal", move || {
         predict_encoded_table_conformal_impl(
-            &model_bytes,
+            &model,
             dataset,
             calibration_dataset,
             conformal_level,
@@ -1836,13 +2011,14 @@ fn predict_table_conformal(
 #[pyfunction]
 fn predict_array<'py>(
     py: Python<'py>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     x: PyReadonlyArray2<'py, f64>,
     options_json: Option<String>,
 ) -> PyResult<Py<PyArray2<f64>>> {
+    let model = Arc::clone(&model.model);
     let x_values = x.as_array().to_owned();
     let out = detach_py_result(py, "predict_array", move || {
-        predict_array_impl(&model_bytes, x_values.view(), options_json.as_deref())
+        predict_array_impl(&model, x_values.view(), options_json.as_deref())
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -1881,7 +2057,7 @@ fn competing_risks_cif_impl(
     let cumulative_hazard =
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
-    // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
+    // `Result<_, SurvivalError>`, dispatch to `gamfit.errors.SurvivalError`.
     let result =
         gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
             .map_err(survival_error_to_pyerr)?;
@@ -1961,7 +2137,7 @@ fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
 ) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
-    // Typed engine path: `SurvivalError` → `gamfit.SurvivalError` (issue
+    // Typed engine path: `SurvivalError` → `gamfit.errors.SurvivalError` (issue
     // #343), no string flattening.
     let result = gam::families::survival::assemble_competing_risks_cif_from_endpoints(
         times,
@@ -1988,15 +2164,16 @@ fn build_sample_payload_json(samples: Option<i64>, seed: Option<i64>) -> PyResul
 #[pyfunction]
 fn sample_table(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     options_json: Option<String>,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let payload = detach_py_result(py, "sample_table", move || {
-        sample_encoded_table_impl(&model_bytes, dataset, options_json.as_deref())
+        sample_encoded_table_impl(&model, dataset, options_json.as_deref())
     })?;
     let config = PyDict::new(py);
     config.set_item("n_samples", payload.config.n_samples)?;
@@ -2017,6 +2194,7 @@ fn sample_table(
     out.set_item("family_kind", payload.family_kind)?;
     out.set_item("link_spec", payload.link_spec)?;
     out.set_item("method", payload.method)?;
+    out.set_item("acceptance_rate", payload.acceptance_rate)?;
     out.set_item("exact", payload.exact)?;
     out.set_item("covariance_source", payload.covariance_source)?;
     Ok(out.unbind())
@@ -2067,14 +2245,15 @@ fn dense_affine_design_to_python(
 #[pyfunction]
 fn affine_design_table(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let affine = detach_py_result(py, "affine_design_table", move || {
-        affine_design_encoded_table_impl(&model_bytes, dataset)
+        affine_design_encoded_table_impl(&model, dataset)
     })?;
     dense_affine_design_to_python(py, affine)
 }
@@ -2082,12 +2261,13 @@ fn affine_design_table(
 #[pyfunction]
 fn affine_design_array<'py>(
     py: Python<'py>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     x: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     let x_values = x.as_array().to_owned();
     let affine = detach_py_result(py, "affine_design_array", move || {
-        affine_design_array_impl(&model_bytes, x_values.view())
+        affine_design_array_impl(&model, x_values.view())
     })?;
     dense_affine_design_to_python(py, affine)
 }
@@ -2924,35 +3104,35 @@ fn duchon_basis<'py>(
     Ok(built.design.to_dense().into_pyarray(py).unbind())
 }
 
-#[pyfunction(signature = (t, num_internal_knots, degree = 3))]
-fn auto_knots_1d<'py>(
+/// The knots or centers a 1-D basis-evaluation helper builds on `t`:
+/// `(locations, effective_order, shrunk)`. `knots_or_centers` is `None` (the
+/// formula front door's default for the kind on `t`), an integer size, or an
+/// explicit float64 vector; [`resolve_basis_locations_1d`] owns all three.
+#[pyfunction(signature = (t, basis_kind, knots_or_centers = None, order = 3, periodic = false))]
+fn resolve_basis_locations_1d<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
-    num_internal_knots: usize,
-    degree: usize,
-) -> PyResult<(Py<PyArray1<f64>>, usize, usize, bool)> {
-    // Issue #340: return the auto-shrunk effective `(degree, num_internal_knots)`
-    // alongside the knot vector so Python callers can observe when the engine
-    // had to downgrade their requested basis to fit small-n data.
-    let result = auto_knot_vector_1d_quantile(t.as_array(), num_internal_knots, degree)
-        .map_err(basis_error_to_pyerr)?;
+    basis_kind: &str,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    order: usize,
+    periodic: bool,
+) -> PyResult<(Py<PyArray1<f64>>, usize, bool)> {
+    let kind = PositionBasisKind::parse(basis_kind).map_err(py_value_error)?;
+    let request = position_basis_locations_arg(knots_or_centers)?;
+    let resolved =
+        gam::terms::basis::position_basis::resolve_basis_locations_1d(
+            t.as_array(),
+            kind,
+            request,
+            order,
+            periodic,
+        )
+        .map_err(py_value_error)?;
     Ok((
-        result.knots.into_pyarray(py).unbind(),
-        result.degree,
-        result.num_internal_knots,
-        result.shrunk,
+        resolved.locations.into_pyarray(py).unbind(),
+        resolved.order,
+        resolved.shrunk,
     ))
-}
-
-#[pyfunction(signature = (t, num_centers))]
-fn auto_centers_1d<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray1<'py, f64>,
-    num_centers: usize,
-) -> PyResult<Py<PyArray1<f64>>> {
-    let centers =
-        auto_centers_1d_equal_mass(t.as_array(), num_centers).map_err(basis_error_to_pyerr)?;
-    Ok(centers.into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (knots, degree = 3, order = 2))]
@@ -3077,87 +3257,15 @@ fn duchon_function_norm_penalty<'py>(
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
     };
-    // Any periodic axis (1D or multi-D) routes through the mixed-periodicity
-    // builder (cylinder/torus chord-distance polyharmonic).
-    if any_periodic {
-        let spec = DuchonBasisSpec {
-            radial_reparam: None,
-            center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-            length_scale: spec_length_scale,
-            power: spec_power,
-            nullspace_order: spec_nullspace,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: Default::default(),
-            periodic: None,
-            boundary: OneDimensionalBoundary::Open,
-        };
-        // Honor an explicit 1D `period` (the domain wrap) instead of
-        // auto-deriving it from the center span, which undershoots on a
-        // half-open grid and produced a non-PSD Gram (gam#580). For d>1 the
-        // per-axis periods are auto-derived in the core.
-        let periods_1d: Option<[f64; 1]> = if d == 1 { period.map(|p| [p]) } else { None };
-        let built = build_duchon_basis_mixed_periodicity_auto(
-            center_matrix.view(),
-            &spec,
-            &periodic_flags,
-            periods_1d.as_ref().map(|p| p.as_slice()),
-        )
-        .map_err(basis_error_to_pyerr)?;
-        // Mixed-periodicity builder emits a single Primary candidate (the
-        // function-norm Gram).
-        let penalty = built
-            .active_penalties
-            .iter()
-            .find(|penalty| {
-                matches!(
-                    penalty.info.source,
-                    gam::terms::basis::PenaltySource::Primary
-                )
-            })
-            .ok_or_else(|| {
-                py_value_error(
-                    "mixed-periodicity Duchon function-norm penalty was not built".to_string(),
-                )
-            })?
-            .matrix
-            .clone();
-        return Ok(penalty.into_pyarray(py).unbind());
-    }
-    let spec = DuchonBasisSpec {
-        radial_reparam: None,
-        center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-        length_scale: spec_length_scale,
-        power: spec_power,
-        nullspace_order: spec_nullspace,
-        identifiability: SpatialIdentifiability::None,
-        aniso_log_scales: None,
-        operator_penalties: Default::default(),
-        periodic: None,
-        boundary: OneDimensionalBoundary::Open,
-    };
-    let built = build_duchon_basis(center_matrix.view(), &spec).map_err(basis_error_to_pyerr)?;
-    // The redesigned non-periodic Euclidean path emits a single native
-    // reproducing-norm Gram as the `Primary` candidate (the function-norm
-    // penalty on the scale-free polyharmonic basis) plus a null-space shrinkage
-    // ridge; it no longer ships the mass/tension/stiffness operator triplet.
-    // The function norm is the Primary block.
-    let penalty = built
-        .active_penalties
-        .iter()
-        .find(|penalty| {
-            matches!(
-                penalty.info.source,
-                gam::terms::basis::PenaltySource::Primary
-            )
-        })
-        .ok_or_else(|| {
-            py_value_error(
-                "Duchon function-norm penalty (Primary native-norm Gram) was not built".to_string(),
-            )
-        })?
-        .matrix
-        .clone();
+    let penalty = core_duchon_function_norm_penalty(
+        center_matrix.view(),
+        spec_length_scale,
+        spec_nullspace,
+        spec_power,
+        &periodic_flags,
+        period,
+    )
+    .map_err(basis_error_to_pyerr)?;
     Ok(penalty.into_pyarray(py).unbind())
 }
 
@@ -4185,22 +4293,10 @@ fn no_criterion_error(payload: &serde_json::Value, surface: &str) -> pyo3::PyErr
     }
 }
 
-const EDF_KEYS: &[&str] = &["edf_total"];
-
-const LOG_LIK_KEYS: &[&str] = &["log_likelihood"];
-// Response-family tag, used only by the compare_models comparability guard (#1384).
-const FAMILY_KEYS: &[&str] = &["family_name"];
-// Observation count, used only by the compare_models comparability guard.
-const NUM_OBS_KEYS: &[&str] = &["n_obs"];
-
-const NULL_DIM_KEYS: &[&str] = &["null_dim"];
-
-const NULL_HESSIAN_LOGDET_KEYS: &[&str] = &["null_space_logdet"];
-
 enum RemlFitView<'py> {
     /// The `SummaryPayload` of a gamfit Model or its saved bytes.
     SavedSummary(serde_json::Value),
-    /// A summary mapping (a dict or `gamfit.Summary`) read through `.get`.
+    /// A summary mapping (a dict or `gamfit.results.Summary`) read through `.get`.
     Mapping(Bound<'py, PyAny>),
 }
 
@@ -4210,18 +4306,14 @@ fn extract_reml_score_raw(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
     extract_reml_score_raw_impl(fit)
 }
 
-#[pyfunction(signature = (fits, names = None, cv_scores = None))]
-fn compare_reml_fits(
+/// Rank fitted models on their smoothing-corrected AIC. The ranking is
+/// `compare_saved_models`, the same one `gam compare` prints.
+#[pyfunction(signature = (fits, names = None))]
+fn compare_models(
     py: Python<'_>,
     fits: Vec<Py<PyAny>>,
     names: Option<Vec<String>>,
-    cv_scores: Option<Vec<f64>>,
-) -> PyResult<Py<PyDict>> {
-    if fits.is_empty() {
-        return Err(PyValueError::new_err(
-            "compare_models requires at least one fit",
-        ));
-    }
+) -> PyResult<PyObject> {
     let labels = match names {
         Some(names) => {
             if names.len() != fits.len() {
@@ -4235,92 +4327,36 @@ fn compare_reml_fits(
         }
         None => (0..fits.len()).map(|idx| format!("fit_{idx}")).collect(),
     };
-    if let Some(scores) = cv_scores.as_ref() {
-        if scores.len() != fits.len() {
-            return Err(PyValueError::new_err(format!(
-                "len(cv_scores)={} does not match len(fits)={}",
-                scores.len(),
-                fits.len()
-            )));
-        }
-    }
-
-    // Python-specific work: extract raw diagnostic score plus the required
-    // conditional-AIC inputs (log-likelihood and EDF) from each PyAny
-    // fit (which may be a saved-summary dict, a Model object, or any
-    // object exposing .evidence). Then the ranking, delta, Bayes-factor,
-    // and evidence-summary logic is delegated to the pure-Rust core in
-    // `gam::solver::evidence`, which is identically callable from
-    // the CLI binary.
-    let mut candidates = Vec::with_capacity(fits.len());
-    for (index, (name, fit)) in labels.into_iter().zip(fits.iter()).enumerate() {
-        let fit = fit.bind(py);
-        let view = reml_fit_view(fit)?;
-        let score = extract_reml_score_from_view(&view)?;
-        let edf = extract_required_ranking_edf_from_view(&view, &name)?;
-        let log_lik = extract_required_ranking_log_lik_from_view(&view, &name)?;
-        candidates.push(RemlCandidate {
-            index,
-            name,
-            score,
-            edf,
-            log_lik,
-            family: extract_family_from_view(&view)?,
-            n_obs: extract_n_obs_from_view(&view)?,
-        });
-    }
-
-    let comparison = compare_reml_fits_core(candidates.clone()).map_err(PyValueError::new_err)?;
-
-    let ranking = PyList::empty(py);
-    for row in comparison.ranking.iter() {
-        ranking.append((
-            row.name.as_str(),
-            row.score,
-            row.delta,
-            row.evidence_ratio,
-            row.edf,
-        ))?;
-    }
-    let score_table = PyList::empty(py);
-    for row in comparison.score_table.iter() {
-        let table_row = PyDict::new(py);
-        table_row.set_item("name", row.name.as_str())?;
-        table_row.set_item("reml_score", row.reml_score)?;
-        table_row.set_item("delta_reml", row.delta_reml)?;
-        table_row.set_item(
-            "bayes_factor_best_over_model",
-            row.bayes_factor_best_over_model,
-        )?;
-        table_row.set_item("effective_dof", row.effective_dof)?;
-        score_table.append(table_row)?;
-    }
-
-    let out = PyDict::new(py);
-    out.set_item("ranking", ranking)?;
-    out.set_item("winner", &comparison.winner)?;
-    out.set_item("evidence_summary", &comparison.evidence_summary)?;
-    out.set_item("score_table", score_table)?;
-    if let Some(scores) = cv_scores {
-        // cv_optional walks the ranked order but uses the caller's
-        // original score indices — preserved via `RemlCandidate.index`.
-        let by_name: std::collections::HashMap<&str, usize> = candidates
+    let model_bytes = fits
+        .iter()
+        .map(|fit| {
+            let fit = fit.bind(py);
+            if let Ok(bytes) = fit.extract::<Vec<u8>>() {
+                return Ok(bytes);
+            }
+            if fit.hasattr("_model_bytes")? {
+                return fit.getattr("_model_bytes")?.extract::<Vec<u8>>();
+            }
+            Err(PyTypeError::new_err(format!(
+                "compare_models: expected a gamfit.Model or its saved bytes; got {}",
+                fit.get_type().name()?
+            )))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let comparison = detach_py_result(py, "compare_models", move || {
+        let models = model_bytes
             .iter()
-            .map(|c| (c.name.as_str(), c.index))
-            .collect();
-        let cv_optional = PyList::empty(py);
-        for row in comparison.ranking.iter() {
-            let original_index = by_name[row.name.as_str()];
-            cv_optional.append((row.name.as_str(), scores[original_index]))?;
-        }
-        out.set_item("cv_optional", cv_optional)?;
-    }
-    Ok(out.unbind())
-}
-
-fn extract_reml_score_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
-    let raw = extract_reml_score_raw_from_view(view)?;
-    with_tierney_kadane_normalizer_from_view(view, raw)
+            .map(|bytes| load_model_impl(bytes))
+            .collect::<Result<Vec<_>, String>>()?;
+        let named = labels
+            .into_iter()
+            .zip(models.iter())
+            .collect::<Vec<_>>();
+        let comparison = compare_saved_models(&named)?;
+        serde_json::to_value(comparison)
+            .map_err(|err| format!("failed to serialize model comparison: {err}"))
+    })?;
+    json_value_to_py(py, comparison)
 }
 
 fn extract_reml_score_raw_impl(fit: &Bound<'_, PyAny>) -> PyResult<f64> {
@@ -4345,148 +4381,6 @@ fn extract_reml_score_raw_from_view(view: &RemlFitView<'_>) -> PyResult<f64> {
     }
 }
 
-/// The comparable criterion of a fit view, or `None` when the view carries no
-/// null-space metadata: a raw criterion without the Tierney-Kadane normalizer is
-/// not comparable across fits (#2627).
-fn with_tierney_kadane_normalizer_from_view(
-    view: &RemlFitView<'_>,
-    score: f64,
-) -> PyResult<Option<f64>> {
-    let Some(null_dim) = extract_null_dim_from_view(view)? else {
-        return Ok(None);
-    };
-    gam::solver::topology_selector::comparable_reml_score(
-        score,
-        Some(null_dim),
-        extract_float_metadata_from_view(view, NULL_HESSIAN_LOGDET_KEYS)?,
-    )
-    .map_err(PyValueError::new_err)
-}
-
-/// Occam-penalised conditional-AIC ranking score for a saved-model summary
-/// payload, matching `gam::solver::evidence::RemlCandidate::ranking_score`
-/// exactly (`-2·loglik + 2·edf`) so `Model.evidence` and `Model.evidence_ratio_vs`
-/// pick the SAME winner as `gamfit.compare_models` (issue #2079).
-///
-/// Both inputs are required and finite. A raw REML/LAML criterion is a different
-/// estimand, so an incomplete summary is refused rather than ranked on another
-/// scale.
-fn ranking_score_from_summary_payload(payload: &serde_json::Value) -> PyResult<f64> {
-    let log_lik = required_summary_ranking_value(payload, "log_likelihood")?;
-    let edf = required_summary_ranking_value(payload, "edf_total")?;
-    if edf < 0.0 {
-        return Err(py_value_error(format!(
-            "model evidence requires non-negative edf_total, got {edf}"
-        )));
-    }
-    let score = -2.0 * log_lik + 2.0 * edf;
-    if !score.is_finite() {
-        return Err(py_value_error(
-            "model evidence conditional AIC is outside f64 range".to_string(),
-        ));
-    }
-    Ok(score)
-}
-
-fn required_summary_ranking_value(payload: &serde_json::Value, key: &str) -> PyResult<f64> {
-    if let Some(value) = payload.get(key).and_then(serde_json::Value::as_f64) {
-        if value.is_finite() {
-            return Ok(value);
-        }
-    }
-    if key == "log_likelihood" && json_lookup_str(payload, REML_UNAVAILABLE_KEYS).is_some() {
-        return Err(no_criterion_error(payload, "model evidence"));
-    }
-    Err(py_value_error(format!(
-        "model evidence requires a finite '{key}' in the current model summary; \
-         raw REML/LAML is not a substitute ranking estimand"
-    )))
-}
-
-fn extract_null_dim_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
-    extract_float_metadata_from_view(view, NULL_DIM_KEYS)
-}
-
-fn extract_edf_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
-    extract_float_metadata_from_view(view, EDF_KEYS)
-}
-
-fn extract_required_ranking_edf_from_view(
-    view: &RemlFitView<'_>,
-    name: &str,
-) -> PyResult<f64> {
-    let value = extract_edf_from_view(view)?;
-    match value {
-        Some(edf) if edf.is_finite() && edf >= 0.0 => Ok(edf),
-        _ => Err(py_value_error(format!(
-            "compare_models: candidate '{name}' requires finite non-negative edf_total; \
-             raw REML/LAML is not a substitute ranking estimand"
-        ))),
-    }
-}
-
-/// Required ordinary log-likelihood at the converged mode, used by
-/// `compare_models` to form the conditional AIC that decides the winner.
-fn extract_required_ranking_log_lik_from_view(
-    view: &RemlFitView<'_>,
-    name: &str,
-) -> PyResult<f64> {
-    match extract_float_metadata_from_view(view, LOG_LIK_KEYS)? {
-        Some(log_lik) if log_lik.is_finite() => Ok(log_lik),
-        _ => Err(py_value_error(format!(
-            "compare_models: candidate '{name}' requires finite log_likelihood; \
-             raw REML/LAML is not a substitute ranking estimand"
-        ))),
-    }
-}
-
-/// Response-family tag of a candidate fit, for the compare_models comparability
-/// guard (#1384). `None` when the fit does not expose one (legacy payloads),
-/// which the guard treats as unconstrained.
-fn extract_family_from_view(view: &RemlFitView<'_>) -> PyResult<Option<String>> {
-    extract_string_metadata_from_view(view, FAMILY_KEYS)
-}
-
-/// Observation count of a candidate fit, for the compare_models cross-`n`
-/// comparability guard. `None` when the fit does not expose one (legacy payloads
-/// / O(n) scan smoothers), which the guard treats as unconstrained. A
-/// non-finite or negative value is dropped to `None` rather than truncated.
-fn extract_n_obs_from_view(view: &RemlFitView<'_>) -> PyResult<Option<usize>> {
-    Ok(extract_float_metadata_from_view(view, NUM_OBS_KEYS)?
-        .filter(|value| value.is_finite() && *value >= 1.0)
-        .map(|value| value as usize))
-}
-
-/// String-valued metadata lookup over the same saved-summary JSON or summary
-/// mapping as [`extract_float_metadata_from_view`].
-fn extract_string_metadata_from_view(
-    view: &RemlFitView<'_>,
-    keys: &[&str],
-) -> PyResult<Option<String>> {
-    match view {
-        RemlFitView::SavedSummary(payload) => Ok(json_lookup_str(payload, keys)),
-        RemlFitView::Mapping(_) => {
-            let Some(value) = extract_py_metadata_value(view, keys)? else {
-                return Ok(None);
-            };
-            value.extract::<String>().map(Some)
-        }
-    }
-}
-
-/// First string value found under any of `keys` in a SavedSummary JSON payload.
-fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    let object = payload.as_object()?;
-    for key in keys {
-        if let Some(value) = object.get(*key) {
-            if let Some(s) = value.as_str() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn extract_float_metadata_from_view(
     view: &RemlFitView<'_>,
     keys: &[&str],
@@ -4502,17 +4396,30 @@ fn extract_float_metadata_from_view(
     }
 }
 
+fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = payload.as_object()?;
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            if let Some(s) = value.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
-        return Ok(RemlFitView::SavedSummary(summary_payload_from_model_bytes(
-            &model_bytes,
-        )?));
+        let model = load_model_impl(&model_bytes).map_err(PyValueError::new_err)?;
+        let summary = summary_payload_value(&model).map_err(PyValueError::new_err)?;
+        return Ok(RemlFitView::SavedSummary(summary));
     }
-    if fit.hasattr("_model_bytes")? {
-        let model_bytes: Vec<u8> = fit.getattr("_model_bytes")?.extract()?;
-        return Ok(RemlFitView::SavedSummary(summary_payload_from_model_bytes(
-            &model_bytes,
-        )?));
+    if fit.hasattr("_prediction_model")? {
+        let compiled = fit.getattr("_prediction_model")?;
+        let compiled = compiled.cast::<PyFittedModel>()?;
+        return Ok(RemlFitView::SavedSummary(
+            compiled.get().summary_value()?.clone(),
+        ));
     }
     if fit.hasattr("get")? && fit.getattr("get")?.is_callable() {
         return Ok(RemlFitView::Mapping(fit.clone()));
@@ -4521,10 +4428,6 @@ fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
         "compare_models: expected a gamfit.Model, its saved bytes, or a summary mapping; got {}",
         fit.get_type().name()?
     )))
-}
-
-fn summary_payload_from_model_bytes(model_bytes: &[u8]) -> PyResult<serde_json::Value> {
-    summary_payload_value_from_model_bytes(model_bytes).map_err(PyValueError::new_err)
 }
 
 fn extract_py_metadata_value<'py>(
@@ -5945,13 +5848,71 @@ fn gaussian_reml_fit_batched_backward<'py>(
     Ok(out.unbind())
 }
 
+/// Read a position fit's `knots_or_centers`: `None`, an integer basis size, or
+/// an explicit float64 vector. [`resolve_position_basis`] owns all three.
+fn position_basis_locations_arg(
+    value: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PositionBasisLocations> {
+    let Some(value) = value else {
+        return Ok(PositionBasisLocations::Default);
+    };
+    if value.is_instance_of::<PyInt>() && !value.is_instance_of::<PyBool>() {
+        let count: i64 = value.extract()?;
+        let count = usize::try_from(count).map_err(|_| {
+            py_value_error(format!(
+                "knots_or_centers: an integer basis size must be non-negative, got {count}"
+            ))
+        })?;
+        return Ok(PositionBasisLocations::Count(count));
+    }
+    if let Ok(given) = value.extract::<PyReadonlyArray1<'_, f64>>() {
+        return Ok(PositionBasisLocations::Given(given.as_array().to_owned()));
+    }
+    let given: Vec<f64> = value.extract().map_err(|_| {
+        PyTypeError::new_err(
+            "knots_or_centers must be None, an integer basis size, or a 1-D float vector",
+        )
+    })?;
+    Ok(PositionBasisLocations::Given(Array1::from_vec(given)))
+}
+
+/// Read a position fit's `penalty`: `None`, the name of the kind's canonical
+/// penalty, or an explicit float64 matrix.
+fn position_penalty_arg(value: Option<&Bound<'_, PyAny>>) -> PyResult<PositionPenaltyRequest> {
+    let Some(value) = value else {
+        return Ok(PositionPenaltyRequest::Canonical);
+    };
+    if value.is_instance_of::<PyString>() {
+        return Ok(PositionPenaltyRequest::Named(value.extract()?));
+    }
+    let given: PyReadonlyArray2<'_, f64> = value.extract()?;
+    Ok(PositionPenaltyRequest::Given(given.as_array().to_owned()))
+}
+
+/// The basis state a forward position fit ran on, returned so a caller can
+/// replay the same basis at predict time.
+fn set_position_basis_items(
+    py: Python<'_>,
+    out: &Bound<'_, PyDict>,
+    basis: ResolvedPositionBasis,
+    periodic: bool,
+) -> PyResult<()> {
+    out.set_item("knots_or_centers", basis.locations.into_pyarray(py))?;
+    out.set_item("penalty", basis.penalty.into_pyarray(py))?;
+    out.set_item("basis_kind", basis.display_kind)?;
+    out.set_item("basis_order", basis.order)?;
+    out.set_item("periodic", periodic)?;
+    out.set_item("period", basis.period)?;
+    Ok(())
+}
+
 #[pyfunction(signature = (
     t,
     y,
-    basis_kind,
-    knots_or_centers,
-    penalty,
-    basis_order = 3,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -5963,10 +5924,10 @@ fn gaussian_reml_fit_positions<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
-    basis_order: usize,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -5974,23 +5935,31 @@ fn gaussian_reml_fit_positions<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let n_rows = t_values.len();
     let n_outputs = y_values.ncols();
-    let n_coefficients = penalty_values.nrows();
-    let result = detach_py_result(py, "gaussian_reml_fit_positions", move || {
-        let x = position_basis_design(
+    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions", move || {
+        let basis = resolve_position_basis(
             t_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
+        )?;
+        let x = position_basis_design(
+            t_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
         )?;
         let gated_x =
             gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
@@ -6000,42 +5969,44 @@ fn gaussian_reml_fit_positions<'py>(
             by_values.as_ref().map(|b| b.view()),
             x.nrows(),
         )?;
-        match gaussian_reml_multi_closed_form_with_cache(
+        let fit = match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
-            penalty_values.view(),
+            basis.penalty.view(),
             gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
         ) {
-            Ok(fit) => Ok(Some(fit)),
-            Err(EstimationError::ModelIsIllConditioned { .. }) => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
+            Ok(fit) => Some(fit),
+            Err(EstimationError::ModelIsIllConditioned { .. }) => None,
+            Err(err) => return Err(err.to_string()),
+        };
+        Ok((fit, basis))
     })?;
     let out = PyDict::new(py);
     match result {
         Some(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
         None => {
-            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, n_coefficients)?;
+            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, basis.penalty.nrows())?;
         }
     }
+    set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }
 
 #[pyfunction(signature = (
     t,
     y,
-    basis_kind,
-    knots_or_centers,
-    penalty,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
     grad_lambda = 0.0,
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = 0.0,
     grad_edf = 0.0,
     forward_state = None,
-    basis_order = 3,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6047,16 +6018,16 @@ fn gaussian_reml_fit_positions_backward<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
     grad_lambda: f64,
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: f64,
     grad_edf: f64,
     forward_state: Option<&Bound<'py, PyDict>>,
-    basis_order: usize,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6068,24 +6039,33 @@ fn gaussian_reml_fit_positions_backward<'py>(
         .map(gaussian_reml_fit_state_from_pydict)
         .transpose()
         .map_err(py_value_error)?;
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
     let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let backward = detach_py_result(py, "gaussian_reml_fit_positions_backward", move || {
-        gaussian_reml_fit_positions_backward_impl(
+        let basis = resolve_position_basis(
             t_values.view(),
-            y_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
-            penalty_values.view(),
+        )?;
+        gaussian_reml_fit_positions_backward_impl(
+            t_values.view(),
+            y_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
+            basis.penalty.view(),
             weight_values.as_ref().map(|w| w.view()),
             init_lambda,
             grad_lambda,
@@ -6116,10 +6096,10 @@ fn gaussian_reml_fit_positions_backward<'py>(
     t,
     y,
     row_offsets,
-    basis_kind,
-    knots_or_centers,
-    penalty,
-    basis_order = 3,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6132,10 +6112,10 @@ fn gaussian_reml_fit_positions_batched<'py>(
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     row_offsets: PyReadonlyArray1<'py, usize>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
-    basis_order: usize,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6143,32 +6123,44 @@ fn gaussian_reml_fit_positions_batched<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let row_offset_values = row_offsets.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let result = detach_py_result(py, "gaussian_reml_fit_positions_batched", move || {
-        gaussian_reml_fit_positions_batched_impl(
+    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions_batched", move || {
+        // The basis locations are placed on the concatenated positions of every group.
+        let basis = resolve_position_basis(
             t_values.view(),
-            y_values.view(),
-            row_offset_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
-            penalty_values.view(),
+        )?;
+        let result = gaussian_reml_fit_positions_batched_impl(
+            t_values.view(),
+            y_values.view(),
+            row_offset_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
+            basis.penalty.view(),
             weight_values.as_ref().map(|w| w.view()),
             init_lambda,
             by_values.as_ref().map(|b| b.view()),
             by_start_col,
-        )
+        )?;
+        Ok((result, basis))
     })?;
     let out = PyDict::new(py);
     set_batched_gaussian_reml_dict_items(py, &out, result)?;
+    set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }
 
@@ -6176,16 +6168,16 @@ fn gaussian_reml_fit_positions_batched<'py>(
     t,
     y,
     row_offsets,
-    basis_kind,
-    knots_or_centers,
-    penalty,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
     grad_lambda = None,
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = None,
     grad_edf = None,
     forward_state = None,
-    basis_order = 3,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6198,16 +6190,16 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     row_offsets: PyReadonlyArray1<'py, usize>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
     grad_lambda: Option<PyReadonlyArray1<'py, f64>>,
     grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
     grad_edf: Option<PyReadonlyArray1<'py, f64>>,
     forward_state: Option<&Bound<'py, PyDict>>,
-    basis_order: usize,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6219,11 +6211,11 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         .map(|state| batched_gaussian_reml_fits_from_pydict(state, row_offsets.as_array()))
         .transpose()
         .map_err(py_value_error)?;
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let row_offset_values = row_offsets.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let grad_lambda_values = grad_lambda.as_ref().map(|g| g.as_array().to_owned());
     let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
@@ -6235,16 +6227,25 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         py,
         "gaussian_reml_fit_positions_batched_backward",
         move || {
+            let basis = resolve_position_basis(
+                t_values.view(),
+                basis_kind.as_deref(),
+                locations,
+                penalty_request,
+                basis_order,
+                periodic,
+                period,
+            )?;
             gaussian_reml_fit_positions_batched_backward_impl(
                 t_values.view(),
                 y_values.view(),
                 row_offset_values.view(),
-                knot_or_center_values.view(),
-                &basis_kind,
-                basis_order,
+                basis.locations.view(),
+                basis.kind.engine_name(),
+                basis.order,
                 periodic,
-                period,
-                penalty_values.view(),
+                basis.period,
+                basis.penalty.view(),
                 weight_values.as_ref().map(|w| w.view()),
                 init_lambda,
                 grad_lambda_values.as_ref().map(|g| g.view()),
@@ -6301,547 +6302,6 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
 // the inner solver. This is exactly the iVAE / ARD recasting from the
 // proposal §4(c), §4(d).
 
-fn build_latent_duchon_design(
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    periodic: Option<&[Option<f64>]>,
-) -> Result<(Array2<f64>, Array2<f64>), String> {
-    if t_flat.len() != n_obs * latent_dim {
-        return Err(format!(
-            "latent t length {} != n_obs * latent_dim = {}",
-            t_flat.len(),
-            n_obs * latent_dim
-        ));
-    }
-    if centers.ncols() != latent_dim {
-        return Err(format!(
-            "centers must have {latent_dim} columns to match latent_dim; got {}",
-            centers.ncols()
-        ));
-    }
-    if m == 0 {
-        return Err("LatentCoord Duchon m must be at least 1".into());
-    }
-    // Materialize t as a (n_obs, latent_dim) matrix.
-    let mut t_mat = Array2::<f64>::zeros((n_obs, latent_dim));
-    for n in 0..n_obs {
-        for a in 0..latent_dim {
-            t_mat[[n, a]] = t_flat[n * latent_dim + a];
-        }
-    }
-    let center_matrix = centers.to_owned();
-    // Resolve a fully admissible (nullspace_order, power) for THIS ambient
-    // latent dimension. The pure scale-free polyharmonic kernel exists only
-    // when 2(p + s) > d; with the requested null space alone (s = 0) this
-    // fails whenever 2p <= d — e.g. m = 2 (p = 2) at latent_dim >= 4, which is
-    // exactly issue #875. `resolve_duchon_orders` lifts the spectral power s
-    // (and, if pure-mode CPD requires it, the null-space order) until the
-    // kernel is well-posed for any d, including the even-d `r^{2m-d} log r`
-    // log case. The latent forward design assembles no operator penalties
-    // (`operator_penalties: Default::default()`), so `max_op = 0`: only the
-    // kernel-existence / CPD guards apply, matching every other Duchon entry
-    // point which routes through this same resolver.
-    let (resolved_nullspace, resolved_power) =
-        resolve_duchon_orders(latent_dim, duchon_nullspace_order_from_m(m), 0, None);
-    // When the optimizer retracts the latent coordinates on a PERIODIC manifold
-    // (circle / torus), the decoder MUST be a function on that manifold:
-    // Φ(θ) = Φ(θ + period) per circular axis, with the kernel distance measured
-    // across the seam. We mirror the POSITION periodic-Duchon path exactly —
-    // route through `build_duchon_basis_mixed_periodicity_auto`, which sends the
-    // 1-D circle to the Bernoulli Green's-function builder (the true PSD circle
-    // kernel, gam#580) and a multi-axis torus to the chord-distance polyharmonic
-    // builder. `periodic` carries a per-axis optional period (radians, the chart
-    // wrap = TAU for circle/torus); a `None` axis is a Euclidean (open) axis.
-    // When `periodic` is `None`/all-open the basis stays byte-identical to the
-    // open Euclidean construction (euclidean / sphere / matern latent fits).
-    let periodic_flags: Option<Vec<bool>> = periodic.and_then(|axes| {
-        if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) {
-            Some(axes.iter().map(|p| p.is_some()).collect())
-        } else {
-            None
-        }
-    });
-    // The caller's penalty and coefficient adjoints use a fixed coefficient
-    // frame. Re-estimating a data-metric radial chart here would silently move
-    // that frame with the whole latent batch, changing both the represented
-    // prior and the derivative (issue #2833). Freeze the canonical constrained
-    // kernel frame explicitly; its row-local jets then differentiate exactly
-    // the design used by Gaussian, GLM, and latent optimization entrypoints.
-    // Periodic builders already have a fixed frame and do not use this chart.
-    let radial_reparam = if periodic_flags.is_none() {
-        let effective_nullspace =
-            duchon_effective_nullspace_order(centers, resolved_nullspace);
-        let constraint = duchon_kernel_constraint_nullspace(centers, effective_nullspace)
-            .map_err(|err| err.to_string())?;
-        Some(Array2::eye(constraint.ncols()))
-    } else {
-        None
-    };
-    let spec = DuchonBasisSpec {
-        radial_reparam,
-        center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-        length_scale: None,
-        power: resolved_power as f64,
-        nullspace_order: resolved_nullspace,
-        identifiability: SpatialIdentifiability::None,
-        aniso_log_scales: None,
-        operator_penalties: Default::default(),
-        periodic: None,
-        boundary: OneDimensionalBoundary::Open,
-    };
-    let built = if let Some(flags) = periodic_flags {
-        // `periodic` is Some with the same arity (checked above). Each periodic
-        // axis carries an explicit chart period (TAU); non-periodic axes get a
-        // placeholder period (unused by the builder for `!periodic` axes).
-        let axes = periodic.expect("periodic_flags is only Some when periodic is Some");
-        let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
-        build_duchon_basis_mixed_periodicity_auto(t_mat.view(), &spec, &flags, Some(&periods))
-            .map_err(|err| {
-                format!("failed to evaluate periodic N-D Duchon basis for LatentCoord: {err}")
-            })?
-    } else {
-        build_duchon_basis(t_mat.view(), &spec)
-            .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?
-    };
-    let design = built
-        .design
-        .try_to_dense_by_chunks("latent_duchon_design")
-        .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
-    Ok((design, t_mat))
-}
-
-/// Input-location jet `∂Φ/∂t` of the PERIODIC latent Duchon design, matching the
-/// per-manifold forward `build_latent_duchon_design` builds: the 1-D circle
-/// routes through the Bernoulli Green's-function design (gam#580) and the
-/// multi-axis torus through the chord-distance polyharmonic design. Returns
-/// `Ok(None)` when no axis is periodic (the caller then uses the open Euclidean
-/// jet, which is correct for euclidean / sphere / matern latents).
-///
-/// The two branches differentiate the SAME kernel, with the SAME resolved orders
-/// and the SAME constraint nullspace `Z`, as the forward — so the returned jet is
-/// the exact derivative of the forward design column-for-column. Building the
-/// open Euclidean jet here instead (the issue #876 bug) gave a wrong gradient and
-/// a column-count mismatch that nulled the outer gradient and collapsed the
-/// latent.
-fn build_latent_duchon_periodic_jet(
-    t_mat: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    periodic: Option<&[Option<f64>]>,
-) -> Result<Option<Array3<f64>>, String> {
-    let latent_dim = t_mat.ncols();
-    // Mirror `build_latent_duchon_design`'s gate: a per-axis period descriptor of
-    // the right arity with at least one periodic axis.
-    let axes = match periodic {
-        Some(axes) if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) => axes,
-        _ => return Ok(None),
-    };
-    // Same resolved (nullspace_order, power) the forward design uses for this
-    // ambient latent dimension, so the kernel smoothness order and the Bernoulli
-    // order (`user_m = duchon_p_from_nullspace_order(resolved_nullspace)`) match.
-    let (resolved_nullspace, resolved_power) =
-        resolve_duchon_orders(latent_dim, duchon_nullspace_order_from_m(m), 0, None);
-
-    if latent_dim == 1 {
-        // 1-D circle: the forward routes to `build_periodic_duchon_basis_1d`
-        // (Bernoulli kernel). `create_duchon_basis_1d_derivative_dense` with
-        // `periodic = true, order = 1` differentiates that exact forward — same
-        // collapsed centers, same domain wrap, same constant-only constraint
-        // nullspace — and returns the dense `(n, kernel_cols + 1)` first
-        // derivative `∂Φ/∂t` (the trailing constant column's derivative is 0).
-        let period = axes.first().copied().flatten().ok_or_else(|| {
-            "periodic one-dimensional latent basis requires a period for its axis".to_string()
-        })?;
-        let dphi_dt = create_duchon_basis_1d_derivative_dense(
-            t_mat.column(0),
-            centers.column(0),
-            resolved_power as f64,
-            resolved_nullspace,
-            true,
-            Some(period),
-            1,
-        )
-        .map_err(|err| format!("failed to evaluate periodic latent Duchon jet: {err}"))?;
-        let n_rows = dphi_dt.nrows();
-        let n_cols = dphi_dt.ncols();
-        let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
-        jet.slice_mut(s![.., .., 0]).assign(&dphi_dt);
-        return Ok(Some(jet));
-    }
-
-    // Multi-axis torus: the forward routes to `build_duchon_basis_mixed_periodicity`
-    // (chord-distance polyharmonic, pure spectrum, constant-only nullspace). The
-    // `build_duchon_basis_design_and_jets` builder reproduces that SAME design and
-    // returns its exact chord-embedding jet, so we take its `J` block. The mixed
-    // periodicity path requires the pure polyharmonic spectrum (`power = 0`); the
-    // resolver returns `power = 0` for the periodic latent configurations, but
-    // assert it so a future order change fails loudly rather than silently
-    // diverging from the forward.
-    if resolved_power != 0 {
-        return Err(format!(
-            "periodic torus latent Duchon requires pure polyharmonic spectrum (power = 0); \
-             resolver returned power = {resolved_power}"
-        ));
-    }
-    let periodic_flags: Vec<bool> = axes.iter().map(|p| p.is_some()).collect();
-    let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
-    let (_phi, jet, _hess) = gam::terms::basis::build_duchon_basis_design_and_jets(
-        t_mat,
-        centers,
-        None,
-        0.0,
-        resolved_nullspace,
-        &periodic_flags,
-        &periods,
-    )
-    .map_err(|err| format!("failed to evaluate periodic torus latent Duchon jet: {err}"))?;
-    Ok(Some(jet))
-}
-
-fn t_matrix_from_flat(
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-) -> Result<Array2<f64>, String> {
-    if t_flat.len() != n_obs * latent_dim {
-        return Err(format!(
-            "latent t length {} != n_obs * latent_dim = {}",
-            t_flat.len(),
-            n_obs * latent_dim
-        ));
-    }
-    let mut t_mat = Array2::<f64>::zeros((n_obs, latent_dim));
-    for n in 0..n_obs {
-        for a in 0..latent_dim {
-            t_mat[[n, a]] = t_flat[n * latent_dim + a];
-        }
-    }
-    Ok(t_mat)
-}
-
-fn split_tensor_knots_owned(
-    knots_concat: ArrayView1<'_, f64>,
-    knot_offsets: &[usize],
-    n_axes: usize,
-) -> Result<Vec<Array1<f64>>, String> {
-    if knot_offsets.len() != n_axes + 1 {
-        return Err(format!(
-            "tensor B-spline knot_offsets must have length n_axes + 1 = {}, got {}",
-            n_axes + 1,
-            knot_offsets.len()
-        ));
-    }
-    let mut per_axis = Vec::with_capacity(n_axes);
-    for axis in 0..n_axes {
-        let lo = knot_offsets[axis];
-        let hi = knot_offsets[axis + 1];
-        if lo > hi || hi > knots_concat.len() {
-            return Err(format!(
-                "tensor B-spline knot_offsets axis {axis} out of range \
-                 (lo={lo}, hi={hi}, total={})",
-                knots_concat.len()
-            ));
-        }
-        per_axis.push(knots_concat.slice(s![lo..hi]).to_owned());
-    }
-    Ok(per_axis)
-}
-
-fn build_latent_tensor_bspline_design(
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    knots_concat: ArrayView1<'_, f64>,
-    knot_offsets: &[usize],
-    degrees: &[usize],
-) -> Result<(Array2<f64>, Array2<f64>), String> {
-    if degrees.len() != latent_dim {
-        return Err(format!(
-            "tensor B-spline degrees length {} must equal latent_dim {}",
-            degrees.len(),
-            latent_dim
-        ));
-    }
-    let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-    let knots_per_axis = split_tensor_knots_owned(knots_concat, knot_offsets, latent_dim)?;
-    let knot_views = knots_per_axis
-        .iter()
-        .map(|knots| knots.view())
-        .collect::<Vec<_>>();
-    let mut k_per_axis = Vec::<usize>::with_capacity(latent_dim);
-    let mut total_cols = 1usize;
-    for axis in 0..latent_dim {
-        let k = knot_views[axis]
-            .len()
-            .checked_sub(degrees[axis] + 1)
-            .ok_or_else(|| {
-                format!(
-                    "tensor B-spline axis {axis} knot vector too short for degree {}",
-                    degrees[axis]
-                )
-            })?;
-        k_per_axis.push(k);
-        total_cols = total_cols
-            .checked_mul(k)
-            .ok_or_else(|| "tensor B-spline basis size overflow".to_string())?;
-    }
-
-    let mut design = Array2::<f64>::zeros((n_obs, total_cols));
-    let mut values_per_axis: Vec<Vec<f64>> = k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
-    let mut scratch: Vec<SplineScratch> = (0..latent_dim)
-        .map(|axis| SplineScratch::new(degrees[axis]))
-        .collect();
-    let mut idx = vec![0usize; latent_dim];
-    for n in 0..n_obs {
-        for axis in 0..latent_dim {
-            evaluate_bspline_basis_scalar(
-                t_mat[[n, axis]],
-                knot_views[axis],
-                degrees[axis],
-                &mut values_per_axis[axis],
-                &mut scratch[axis],
-            )
-            .map_err(|err| {
-                format!("failed to evaluate tensor B-spline latent axis {axis}: {err}")
-            })?;
-        }
-        for col in 0..total_cols {
-            let mut rem = col;
-            for axis in (0..latent_dim).rev() {
-                idx[axis] = rem % k_per_axis[axis];
-                rem /= k_per_axis[axis];
-            }
-            let mut prod = 1.0_f64;
-            for axis in 0..latent_dim {
-                prod *= values_per_axis[axis][idx[axis]];
-            }
-            design[[n, col]] = prod;
-        }
-    }
-    Ok((design, t_mat))
-}
-
-fn latent_periodic_range_from_centers(centers: ArrayView2<'_, f64>) -> Result<(f64, f64), String> {
-    if centers.ncols() != 1 || centers.nrows() == 0 {
-        return Err("periodic B-spline latent design requires one-column centers".to_string());
-    }
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &value in centers.column(0).iter() {
-        lo = lo.min(value);
-        hi = hi.max(value);
-    }
-    if !(lo.is_finite() && hi.is_finite() && hi > lo) {
-        return Err("periodic B-spline centers must define a finite range".to_string());
-    }
-    Ok((lo, hi))
-}
-
-fn project_latent_jet_columns(
-    raw_jet: &Array3<f64>,
-    transform: ArrayView2<'_, f64>,
-) -> Result<Array3<f64>, String> {
-    let n_rows = raw_jet.shape()[0];
-    let raw_cols = raw_jet.shape()[1];
-    let latent_dim = raw_jet.shape()[2];
-    if transform.nrows() != raw_cols {
-        return Err(format!(
-            "latent jet transform row mismatch: jet has {raw_cols} columns, transform has {} rows",
-            transform.nrows()
-        ));
-    }
-    let mut out = Array3::<f64>::zeros((n_rows, transform.ncols(), latent_dim));
-    for n in 0..n_rows {
-        for j in 0..transform.ncols() {
-            for k in 0..raw_cols {
-                let z = transform[[k, j]];
-                if z == 0.0 {
-                    continue;
-                }
-                for a in 0..latent_dim {
-                    out[[n, j, a]] += raw_jet[[n, k, a]] * z;
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn build_latent_forward_design(
-    basis_kind: &str,
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    tensor_knots_concat: Option<ArrayView1<'_, f64>>,
-    tensor_knot_offsets: Option<&[usize]>,
-    tensor_degrees: Option<&[usize]>,
-    periodic: Option<&[Option<f64>]>,
-) -> Result<(Array2<f64>, Array2<f64>, Array3<f64>), String> {
-    let basis_kind = latent_basis_kind(basis_kind)?;
-    let (design, t_mat) = match basis_kind {
-        "duchon" => {
-            let (design, t_mat) =
-                build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, periodic)?;
-            // On a PERIODIC latent manifold (circle / torus) the forward design is
-            // the periodic Duchon basis (1-D Bernoulli Green's function or the
-            // multi-axis chord-distance polyharmonic) — a DIFFERENT kernel and
-            // column layout than the open Euclidean Duchon. Its input-location
-            // jet must differentiate that SAME periodic forward, not the open
-            // Euclidean basis the generic `latent_input_location_jet` builds.
-            // Routing the periodic forward through the open jet produced both a
-            // wrong gradient direction AND a column-count mismatch (the open jet
-            // carries `d+1` polynomial columns vs. the periodic design's single
-            // constant column), which made `value_and_grad` fail the
-            // design/jet shape check, return `(+∞, None)`, and hand the outer
-            // trust region a zero gradient — so the circle/torus optimizer read
-            // "stationary" at the start and collapsed every row to one latent
-            // coordinate (issue #876). Build the matching periodic jet here and
-            // return early, mirroring the per-manifold forward choice exactly.
-            if let Some(jet) = build_latent_duchon_periodic_jet(t_mat.view(), centers, m, periodic)?
-            {
-                if jet.shape()[1] != design.ncols() {
-                    return Err(format!(
-                        "periodic latent Duchon design/jet column mismatch: design has {}, jet has {}",
-                        design.ncols(),
-                        jet.shape()[1]
-                    ));
-                }
-                return Ok((design, t_mat, jet));
-            }
-            (design, t_mat)
-        }
-        "matern" => {
-            if centers.ncols() != latent_dim {
-                return Err(format!(
-                    "Matérn latent centers must have {latent_dim} columns; got {}",
-                    centers.ncols()
-                ));
-            }
-            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-            let spec = MaternBasisSpec {
-                center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-                length_scale: MaternLengthScale::fixed(1.0),
-                nu: MaternNu::ThreeHalves,
-                include_intercept: false,
-                double_penalty: false,
-                identifiability: MaternIdentifiability::None,
-                aniso_log_scales: None,
-                periodic: None,
-            };
-            let built = build_matern_basis(t_mat.view(), &spec)
-                .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
-            let design = built
-                .design
-                .try_to_dense_by_chunks("latent_matern_design")
-                .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
-            (design, t_mat)
-        }
-        "sphere" => {
-            if centers.ncols() != latent_dim {
-                return Err(format!(
-                    "sphere latent centers must have {latent_dim} columns; got {}",
-                    centers.ncols()
-                ));
-            }
-            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-            let spec = SphericalSplineBasisSpec {
-                center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-                penalty_order: m,
-                double_penalty: false,
-                radians: true,
-                method: SphereMethod::Wahba,
-                max_degree: None,
-                wahba_kernel: SphereWahbaKernel::Sobolev,
-                identifiability: SphericalSplineIdentifiability::CenterSumToZero,
-            };
-            let built = build_spherical_spline_basis(t_mat.view(), &spec)
-                .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
-            let constraint_transform = match &built.metadata {
-                gam::terms::basis::BasisMetadata::Sphere {
-                    constraint_transform,
-                    ..
-                } => constraint_transform.clone(),
-                _ => None,
-            };
-            let design = built
-                .design
-                .try_to_dense_by_chunks("latent_sphere_design")
-                .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
-            let raw_jet = latent_input_location_jet(
-                basis_kind,
-                t_mat.view(),
-                centers,
-                m,
-                tensor_knots_concat,
-                tensor_knot_offsets,
-                tensor_degrees,
-            )?;
-            let jet = match constraint_transform {
-                Some(z) => project_latent_jet_columns(&raw_jet, z.view())?,
-                _ => raw_jet,
-            };
-            if jet.shape()[1] != design.ncols() {
-                return Err(format!(
-                    "sphere latent design/jet column mismatch: design has {}, jet has {}",
-                    design.ncols(),
-                    jet.shape()[1]
-                ));
-            }
-            return Ok((design, t_mat, jet));
-        }
-        "bspline_tensor" => {
-            let knots = tensor_knots_concat
-                .as_ref()
-                .ok_or_else(|| "tensor B-spline latent design requires knots_concat".to_string())?
-                .clone();
-            let offsets = tensor_knot_offsets
-                .ok_or_else(|| "tensor B-spline latent design requires knot_offsets".to_string())?;
-            let degrees = tensor_degrees
-                .ok_or_else(|| "tensor B-spline latent design requires degrees".to_string())?;
-            build_latent_tensor_bspline_design(t_flat, n_obs, latent_dim, knots, offsets, degrees)?
-        }
-        "periodic_bspline" => {
-            if latent_dim != 1 {
-                return Err(format!(
-                    "periodic B-spline latent design requires latent_dim 1; got {latent_dim}"
-                ));
-            }
-            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-            let range = latent_periodic_range_from_centers(centers)?;
-            let design =
-                periodic_bspline_basis_dense_via_spec(t_mat.column(0), range, m, centers.nrows())?;
-            (design, t_mat)
-        }
-        other => {
-            return Err(format!(
-                "gaussian_reml_fit_latent does not support latent basis_kind {other:?}"
-            ));
-        }
-    };
-    let jet = latent_input_location_jet(
-        basis_kind,
-        t_mat.view(),
-        centers,
-        m,
-        tensor_knots_concat,
-        tensor_knot_offsets,
-        tensor_degrees,
-    )?;
-    if jet.shape()[1] != design.ncols() {
-        return Err(format!(
-            "latent design/jet column mismatch for {basis_kind:?}: design has {}, jet has {}",
-            design.ncols(),
-            jet.shape()[1]
-        ));
-    }
-    Ok((design, t_mat, jet))
-}
-
 #[cfg(test)]
 mod prediction_payload_tests {
     use super::{
@@ -6879,10 +6339,12 @@ mod prediction_payload_tests {
             model_class: "standard".to_string(),
             point_column: "posterior_mean",
             point_shape: "estimand_explicit",
+            point_columns: None,
             family: "identity".to_string(),
             interval_method: None,
             covariance_source: Some("smoothing-corrected".to_string()),
             point_covariance_source: Some("conditional".to_string()),
+            point_covariance_note: None,
         };
 
         let value = serde_json::to_value(payload).expect("serialize prediction payload");
@@ -6891,6 +6353,44 @@ mod prediction_payload_tests {
                 .get("covariance_source")
                 .and_then(|item| item.as_str()),
             Some("smoothing-corrected")
+        );
+        assert!(
+            value.get("point_covariance_note").is_none(),
+            "a point on the fit's own covariance carries no note"
+        );
+    }
+
+    /// gam#2985: a withheld fit's posterior-mean point reaches Python with the
+    /// typed provenance note beside its covariance source.
+    #[test]
+    fn a_withheld_fit_prediction_payload_carries_its_point_note_2985() {
+        let declined = gam::estimate::CovarianceDeclined::
+            BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                unavailable_channel: "the pin's missing channel".to_string(),
+            };
+        let note =
+            gam_predict::PointCovarianceProvenance::ConditionalOnFittedLatentLaw { declined }.explain();
+        let payload = PredictionPayload {
+            columns: BTreeMap::from([("posterior_mean".to_string(), vec![0.4])]),
+            model_class: "bernoulli marginal-slope".to_string(),
+            point_column: "posterior_mean",
+            point_shape: "estimand_explicit",
+            point_columns: None,
+            family: "probit".to_string(),
+            interval_method: None,
+            covariance_source: None,
+            point_covariance_source: Some("conditional".to_string()),
+            point_covariance_note: Some(note.clone()),
+        };
+        let value = serde_json::to_value(payload).expect("serialize prediction payload");
+        assert_eq!(
+            value.get("point_covariance_note").and_then(|item| item.as_str()),
+            Some(note.as_str())
+        );
+        assert!(
+            note.contains("conditional on the fitted latent law")
+                && note.contains("the pin's missing channel"),
+            "{note}"
         );
     }
 

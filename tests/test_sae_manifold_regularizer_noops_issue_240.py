@@ -1,6 +1,6 @@
 """Contract tests for issue #240.
 
-Every regularizer parameter `gamfit.sae_manifold_fit` accepts must change the
+Every regularizer parameter `gamfit.sae.sae_manifold_fit` accepts must change the
 fit. Each test fits twice with `random_state` fixed, once with the parameter
 off and once with a value that should visibly alter the fit, then asserts the
 resulting arrays differ. Accepting a parameter with no effect is the #240 bug.
@@ -63,11 +63,11 @@ def _fit_must_react(param_name: str, on_value, off_value=None, *, n: int = 32):
     off_kwargs = dict(base_kwargs)
     if off_value is not None:
         off_kwargs[param_name] = off_value
-    fit_off = gamfit.sae_manifold_fit(X=X, **off_kwargs)
+    fit_off = gamfit.sae.sae_manifold_fit(X=X, **off_kwargs)
 
     on_kwargs = dict(base_kwargs)
     on_kwargs[param_name] = on_value
-    fit_on = gamfit.sae_manifold_fit(X=X, **on_kwargs)
+    fit_on = gamfit.sae.sae_manifold_fit(X=X, **on_kwargs)
 
     differs_fitted = _differs(fit_on.fitted, fit_off.fitted)
     differs_assign = _differs(fit_on.assignments, fit_off.assignments)
@@ -83,8 +83,8 @@ def test_isometry_weight_is_not_a_silent_noop():
     — the SAE Isometry path is fully wired as of issue #250."""
     X = _data(seed=1, n=32)
     base_kwargs = _baseline()
-    fit_off = gamfit.sae_manifold_fit(X=X, **{**base_kwargs, "isometry_weight": 0.0})
-    fit_on = gamfit.sae_manifold_fit(X=X, **{**base_kwargs, "isometry_weight": 100.0})
+    fit_off = gamfit.sae.sae_manifold_fit(X=X, **{**base_kwargs, "isometry_weight": 0.0})
+    fit_on = gamfit.sae.sae_manifold_fit(X=X, **{**base_kwargs, "isometry_weight": 100.0})
     assert _differs(fit_on.fitted, fit_off.fitted) or _differs(
         fit_on.assignments, fit_off.assignments
     ), (
@@ -93,8 +93,14 @@ def test_isometry_weight_is_not_a_silent_noop():
     )
 
 
-def test_ard_per_atom_is_not_a_silent_noop():
-    _fit_must_react("ard_per_atom", on_value=False, off_value=True)
+def test_ard_per_atom_is_not_an_accepted_kwarg():
+    """``ard_per_atom=False`` removed the coordinate ARD prior, which is what makes
+    each row's coordinate posterior proper; without it the criterion has no lower
+    bound (#2822). The prior is now mandatory and the kwarg is deleted. Passing it
+    must raise ``TypeError``, so a caller does not silently lose configuration."""
+    X = _data(seed=3)
+    with pytest.raises(TypeError, match="ard_per_atom"):
+        gamfit.sae.sae_manifold_fit(X=X, **_baseline(), ard_per_atom=False)
 
 
 def test_block_orthogonality_weight_is_not_a_silent_noop():
@@ -120,8 +126,8 @@ def test_decoder_feature_sparsity_groups_produces_nontrivial_gradient():
     and the fit must visibly differ from the no-penalty baseline."""
     X = _data(seed=4, n=32)
     base = _baseline()
-    fit_off = gamfit.sae_manifold_fit(X=X, **base)
-    fit_on = gamfit.sae_manifold_fit(
+    fit_off = gamfit.sae.sae_manifold_fit(X=X, **base)
+    fit_on = gamfit.sae.sae_manifold_fit(
         X=X, **base, decoder_feature_sparsity_groups=[[0, 1], [2, 3]]
     )
     # Must not silently raise — the rename is a wiring change, not a deferral.
@@ -140,7 +146,7 @@ def test_topology_selector_is_not_an_accepted_kwarg():
     raise ``TypeError`` so callers don't silently lose configuration."""
     X = _data(seed=3)
     with pytest.raises(TypeError, match="topology_selector"):
-        gamfit.sae_manifold_fit(X=X, **_baseline(), topology_selector=object())
+        gamfit.sae.sae_manifold_fit(X=X, **_baseline(), topology_selector=object())
 
 
 def test_primitive_names_metadata_is_not_a_substitute_for_effect():
@@ -148,8 +154,8 @@ def test_primitive_names_metadata_is_not_a_substitute_for_effect():
     ``block_orthogonality_weight`` flipped the ``primitive_names`` list but
     left fit arrays bit-identical (silent acceptance of a no-op).
 
-    ``ard_per_atom`` is wired through to Rust (see
-    ``test_ard_per_atom_is_not_a_silent_noop``), and #249 wired Isometry,
+    The coordinate ARD prior is mandatory, with no kwarg to switch it off (see
+    ``test_ard_per_atom_is_not_an_accepted_kwarg``, #2822), and #249 wired Isometry,
     BlockOrthogonality and MechanismSparsity into the Rust SAE row-block
     driver. This test pins that ``isometry_weight=10.0`` with
     ``block_orthogonality_weight=10.0`` produces a fit that visibly differs
@@ -159,8 +165,8 @@ def test_primitive_names_metadata_is_not_a_substitute_for_effect():
     on_kwargs = dict(base_kwargs)
     on_kwargs["isometry_weight"] = 10.0
     on_kwargs["block_orthogonality_weight"] = 10.0
-    fit_on = gamfit.sae_manifold_fit(X=X, **on_kwargs)
-    fit_off = gamfit.sae_manifold_fit(X=X, **base_kwargs)
+    fit_on = gamfit.sae.sae_manifold_fit(X=X, **on_kwargs)
+    fit_off = gamfit.sae.sae_manifold_fit(X=X, **base_kwargs)
     differs = (
         _differs(fit_on.fitted, fit_off.fitted)
         or _differs(fit_on.assignments, fit_off.assignments)

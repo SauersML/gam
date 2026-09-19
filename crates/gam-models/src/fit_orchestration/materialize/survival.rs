@@ -1,4 +1,5 @@
 use super::*;
+use crate::fit_orchestration::FitFailure;
 
 pub(crate) fn materialize_survival<'a>(
     parsed: &ParsedFormula,
@@ -11,7 +12,7 @@ pub(crate) fn materialize_survival<'a>(
     interval_right_col: Option<&str>,
     structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     // Extract columns. `entry_col == None` is the right-censored shorthand
     // `Surv(time, event)`: every subject enters at time zero, so we
@@ -471,15 +472,18 @@ pub(crate) fn materialize_survival<'a>(
     } else {
         parse_link_choice(link_name, config.flexible_link)?
     };
-    // Only the location-scale likelihood fits the anchored link deviation a
-    // `flexible(...)` link asks for; another likelihood would drop it.
+    // Only the location-scale and marginal-slope likelihoods fit the anchored link
+    // deviation a `flexible(...)` link asks for, the one `linkwiggle(...)` gives them;
+    // another likelihood would drop it.
     if link_choice.as_ref().is_some_and(|choice| {
         matches!(choice.mode, gam_terms::inference::formula_dsl::LinkMode::Flexible)
-    }) && survival_mode != SurvivalLikelihoodMode::LocationScale
-    {
+    }) && !matches!(
+        survival_mode,
+        SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+    ) {
         return Err(WorkflowError::InvalidConfig {
             reason: format!(
-                "survival flexible(...) links are supported only with survival_likelihood='location-scale'; got '{}'",
+                "survival flexible(...) links are supported only with survival_likelihood='location-scale' or 'marginal-slope'; got '{}'",
                 config.resolved_survival_likelihood()
             ),
         });
@@ -579,6 +583,7 @@ pub(crate) fn materialize_survival<'a>(
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     };
     // Both supplied and CTN-generated scores have an explicit column here.
@@ -602,10 +607,16 @@ pub(crate) fn materialize_survival<'a>(
         marginal_slope_deviation_routing,
         marginal_slope_base_link,
     ) = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        let base_link = super::marginal_slope::resolve_marginal_slope_base_link(
+        let (base_link, link_choice) = super::marginal_slope::resolve_marginal_slope_link(
             parsed.linkspec.as_ref(),
+            config.link.as_deref(),
+            config.flexible_link,
             "survival marginal-slope",
         )?;
+        // A flexible link, however it was asked for, is the main formula's default link
+        // deviation, the one `linkwiggle()` gives; an explicit `linkwiggle(...)` wins.
+        let main_linkwiggle =
+            effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
         if let Some(ls_formula) = config.slope_formula.as_deref() {
             let default_z_column = marginal_z_column_name.expect("z column present when no recipe");
             let (_, ls_parsed) =
@@ -667,7 +678,7 @@ pub(crate) fn materialize_survival<'a>(
                 specs.first().cloned(),
                 Some(specs),
                 route_marginal_slope_deviation_blocks(
-                    parsed.linkwiggle.as_ref(),
+                    main_linkwiggle.as_ref(),
                     ls_parsed.linkwiggle.as_ref(),
                 )?,
                 Some(base_link),
@@ -687,7 +698,7 @@ pub(crate) fn materialize_survival<'a>(
                 Some(z),
                 Some(termspec.clone()),
                 Some(vec![termspec.clone()]),
-                route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)?,
+                route_marginal_slope_deviation_blocks(main_linkwiggle.as_ref(), None)?,
                 Some(base_link),
             )
         }
@@ -707,22 +718,22 @@ pub(crate) fn materialize_survival<'a>(
     let marginal_slope_link_dev = marginal_slope_deviation_routing.link_dev;
 
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        if parsed.linkwiggle.is_some() {
-            inference_notes.push(
-                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
+        if marginal_slope_link_dev.is_some() {
+            inference_notes.inform(
+                "survival marginal-slope routes its link deviation (formula-level linkwiggle(...) or a flexible link) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
             );
         }
         if marginal_slope_score_warp.is_some() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope routes slope_formula linkwiggle(...) into its anchored internal score-warp block while keeping the probit survival base link".to_string(),
             );
         }
         if marginal_slope_link_dev.is_none() && marginal_slope_score_warp.is_none() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
             );
         } else {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic transport cells with analytic value evaluation and calibrated survival normalization"
                     .to_string(),
             );
@@ -952,20 +963,7 @@ pub(crate) fn materialize_survival<'a>(
                 declared_latent_law: config.declared_latent_law_grid()?,
                 score_influence_jacobian: None,
             },
-            options: BlockwiseFitOptions {
-                // The same answer the CLI route gives (`run_survival.rs` sets it
-                // unconditionally): a fit computes its coefficient covariance
-                // unless the caller declined inference. This site hard-coded
-                // `false`, so a library-fitted survival marginal-slope model
-                // carried no covariance, could not be saved for posterior-mean
-                // prediction, and disagreed with the CLI's model of the same
-                // data (gam#2765).
-                compute_covariance: config.compute_covariance.unwrap_or(true),
-                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                // Robustness (Firth/Jeffreys stabilizer) is the unconditional
-                // default for survival marginal-slope — no flag to thread.
-                ..Default::default()
-            },
+            options: blockwise_fit_options(config),
             kappa_options: config.spatial_optimization.clone(),
         })
     };
@@ -1082,10 +1080,7 @@ pub(crate) fn materialize_survival<'a>(
                     baseline_config: candidate.clone(),
                 },
                 frailty: config.frailty.clone(),
-                options: BlockwiseFitOptions {
-                    persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                    ..BlockwiseFitOptions::default()
-                },
+                options: blockwise_fit_options(config),
             })
         };
 
@@ -1138,10 +1133,7 @@ pub(crate) fn materialize_survival<'a>(
                     baseline_config: candidate.clone(),
                 },
                 frailty: config.frailty.clone(),
-                options: BlockwiseFitOptions {
-                    persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                    ..BlockwiseFitOptions::default()
-                },
+                options: blockwise_fit_options(config),
             })
         };
 
@@ -1186,15 +1178,27 @@ pub(crate) fn materialize_survival<'a>(
         // typically converges in ≲10 outer evaluations.
         let probit_channel =
             location_scale_uses_probit_survival_baseline(Some(&survival_inverse_link));
+        // The search takes text, so a candidate's fit failure is kept typed here
+        // (#2937). The outer engine never retries a thrown objective error: it
+        // ends the search, so the kept failure is the one that stopped it.
+        let candidate_failure = std::cell::RefCell::new(None::<FitFailure>);
+        let stop_on = |failure: FitFailure| {
+            let reason = failure.to_string();
+            *candidate_failure.borrow_mut() = Some(failure);
+            reason
+        };
         let baseline_outcome = optimize_survival_baseline_config_with_gradient_only(
             &baseline_cfg,
             age_exit.view(),
             "workflow survival location-scale baseline",
             |candidate| {
-                let fit_result = fit_survival_location_scale_model(build_location_scale_request(
-                    candidate,
-                )?)
-                .map_err(|e| format!("survival location-scale fit failed: {e}"))?;
+                // A candidate spec that cannot be built is configuration.
+                let request = build_location_scale_request(candidate).map_err(|reason| {
+                    stop_on(FitFailure::from(WorkflowError::InvalidConfig { reason }))
+                })?;
+                let fit_result = fit_survival_location_scale_model(request).map_err(|failure| {
+                    stop_on(failure.context("survival location-scale fit failed"))
+                })?;
                 // Warm-start the next probe's threshold / log-σ smoothing parameters
                 // at the converged values for this probe.
                 let threshold_rho = fit_result.fit.fit.lambdas_threshold().mapv(f64::ln);
@@ -1208,7 +1212,8 @@ pub(crate) fn materialize_survival<'a>(
                         age_exit.view(),
                         candidate,
                         residuals,
-                    )?
+                    )
+                    .map_err(|reason| stop_on(FitFailure::unclassified(reason)))?
                 } else {
                     baseline_chain_rule_gradient(
                         age_entry.view(),
@@ -1218,11 +1223,13 @@ pub(crate) fn materialize_survival<'a>(
                         age_exit.view(),
                         candidate,
                         residuals,
-                    )?
+                    )
+                    .map_err(|reason| stop_on(FitFailure::unclassified(reason)))?
                 }
                 .ok_or_else(|| {
-                    "workflow survival location-scale baseline unexpectedly has no theta gradient"
-                        .to_string()
+                    stop_on(FitFailure::invariant(
+                        "workflow survival location-scale baseline unexpectedly has no theta gradient",
+                    ))
                 })?;
                 // The envelope-theorem residual contraction is the exact
                 // θ-gradient of the *profile penalized NLL* −ℓ + ½βᵀSβ at
@@ -1239,20 +1246,29 @@ pub(crate) fn materialize_survival<'a>(
                 let profile_cost =
                     -log_likelihood_at_mode + 0.5 * fit_result.fit.fit.stable_penalty_term;
                 if !profile_cost.is_finite() {
-                    return Err(format!(
+                    return Err(stop_on(FitFailure::numerical(format!(
                         "workflow survival location-scale baseline: non-finite profile cost \
                          (log_likelihood_at_mode={}, stable_penalty_term={}, cost={})",
                         log_likelihood_at_mode,
                         fit_result.fit.fit.stable_penalty_term,
                         profile_cost
-                    ));
+                    ))));
                 }
                 Ok((profile_cost, gradient))
             },
         );
         match baseline_outcome {
             Ok(baseline) => baseline,
-            Err(e) => return Err(e.into()),
+            Err(search) => {
+                return Err(match candidate_failure.take() {
+                    // A candidate's fit stopped the search: raise that failure
+                    // under its category.
+                    Some(failure) => WorkflowError::from(failure),
+                    // Otherwise the search's own typed verdict, or its
+                    // configuration refusal, stands.
+                    None => search,
+                });
+            }
         }
     } else {
         // A latent survival or binary fit selects its baseline chart together with

@@ -142,7 +142,7 @@ fn ridge_limit_fit(
 /// `‖Q‖_F` and the columns' own norms.
 fn relative_affine_energy(centers: &Array2<f64>, masses: &Array1<f64>, scales: usize) -> f64 {
     let band = measure_jet_band(centers.view(), scales).expect("band");
-    let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.0, 1.0, 1e-3)
+    let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.0, 1.0)
         .expect("energy form");
     let qnorm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
     let m = centers.nrows();

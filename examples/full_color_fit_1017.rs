@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gam::solver::arrow_schur::ArrowSolverMode;
+use gam::solver::arrow_schur::{ArrowSolveOptions, resolve_arrow_route};
 use gam::solver::rho_optimizer::OuterProblem;
 use gam::solver::seeding::SeedConfig;
 use gam::terms::{
@@ -220,7 +220,8 @@ fn run() -> Result<(), String> {
     let factored_border_dim = fitted_term.factored_border_dim();
     let assembled =
         fitted_term.assemble_arrow_schur(target.view(), &fitted.rho, Some(&registry))?;
-    let actual_mode = ArrowSolverMode::automatic(assembled.k);
+    // The route a Priced request resolves to on the assembled system (#2900 row 6.15).
+    let actual_mode = resolve_arrow_route(&assembled, &ArrowSolveOptions::priced()).mode;
 
     println!(
         "FULLCOLOR_1017 converged=true via={:?} plan={:?} outer_iterations={} \

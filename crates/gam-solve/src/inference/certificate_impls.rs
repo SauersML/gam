@@ -84,6 +84,41 @@ impl Certificate for OuterCriterionCertificate {
             put_finite(&mut e, "curvature_gradient_floor", clearance.gradient_floor);
         }
         e.insert("lambdas_railed_count", self.lambdas_railed.len().into());
+        // #2954: the Newton steps the mint took before judging, so a certified
+        // point that is not where the search stopped says so, and by how much.
+        if let Some(polish) = self.newton_polish.as_ref() {
+            e.insert("newton_polish_steps", polish.decreases.len().into());
+            e.insert("newton_polish_step_budget", polish.step_budget.into());
+            put_finite(
+                &mut e,
+                "newton_polish_lambda_sq_before",
+                polish.lambda_sq_before,
+            );
+            put_finite(
+                &mut e,
+                "newton_polish_lambda_sq_after",
+                polish.lambda_sq_after,
+            );
+            e.insert(
+                "newton_polish_decreases",
+                format!("{:?}", polish.decreases).into(),
+            );
+            e.insert("newton_polish_rails", polish.rails.len().into());
+            if !polish.rails.is_empty() {
+                e.insert(
+                    "newton_polish_railed_coordinates",
+                    format!(
+                        "{:?}",
+                        polish
+                            .rails
+                            .iter()
+                            .map(|rail| rail.index)
+                            .collect::<Vec<_>>()
+                    )
+                    .into(),
+                );
+            }
+        }
         e.insert("stationary", self.is_stationary().into());
         // Both, deliberately (#2578): the boolean is the published contract and
         // stays byte-compatible, and the verdict beside it says WHICH of the
@@ -210,6 +245,7 @@ mod tests {
             curvature: crate::model_types::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         };
         assert_eq!(clean.verdict(), Verdict::Certified);

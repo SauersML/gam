@@ -37,7 +37,7 @@ def main() -> None:
     x = torus_features @ low_rank_loading
     x += 0.04 * rng.standard_normal(x.shape)
 
-    baseline = gamfit.sae_manifold_fit(
+    baseline = gamfit.sae.sae_manifold_fit(
         x,
         K=1,
         d_atom=2,
@@ -47,7 +47,7 @@ def main() -> None:
         n_iter=18,
         random_state=672,
     )
-    ranked = gamfit.sae_manifold_fit(
+    ranked = gamfit.sae.sae_manifold_fit(
         x,
         K=1,
         d_atom=2,

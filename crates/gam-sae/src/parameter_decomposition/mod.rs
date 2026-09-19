@@ -69,15 +69,26 @@
 //! Lipschitz covering). Derivatives must be analytic; finite differences belong in
 //! tests only.
 
+// Shared planted-rotation fixtures with derived float-defect bounds.
+#[cfg(test)]
+mod test_support;
+
+// Blind re-derivation oracles for P7, P15 and P17 against the landed APIs.
+#[cfg(test)]
+mod oracle_tests;
+
 // Executed-stage receipts against the native lift.
 pub mod receipts;
+
+// Structured-edit coordinates from a declared single-cycle row action: closed-form planes, rotation edits, plane code.
+pub mod cyclic_action;
 
 // Planted-rotation teacher controls (test builds only).
 #[cfg(test)]
 mod teacher_tests;
 
 // Nonlinear separation over the moment zonotope: lower witnesses, derived upper bounds.
-// [unlanded: adversary]
+pub mod adversary;
 
 // Matrix-free structured edits applied to the current intervened input.
 pub mod apply;
@@ -87,6 +98,9 @@ pub mod attention;
 
 // A whole pre-norm transformer block under masks: norm, attention, residual, norm, MLP, residual.
 pub mod block;
+
+// Mechanism programs over attention-only layers, replayed bit for bit under component masks.
+pub mod block_program;
 
 // KL oscillation bound, whole-set composition containment, conservation conditioning.
 pub mod bounds;
@@ -113,10 +127,17 @@ pub mod lift;
 pub mod moments;
 
 // Global versus use-specific edits and occurrence scopes.
-// [unlanded: occurrence]
+pub mod occurrence;
+
+// Implementation-gauge families detected from native tensors, quotiented out of codes and intervention sets.
+pub mod gauge;
 
 // Gauge-covariant group masks, structured parameter paths, Sum and Compose accounting.
 pub mod operators;
+
+// Cross-module adversarial and null controls against the landed modules.
+#[cfg(test)]
+mod controls_tests;
 
 // Declared-precision real codes and decode-then-evaluate distortion.
 pub mod precision;
@@ -127,11 +148,17 @@ pub mod program;
 // Exact component-coordinate MLP program under masks.
 pub mod rewrite;
 
+// The component MLP block as a mechanism program, bound to its own tensors.
+pub mod rewrite_program;
+
 // Exact initial decomposition from native tensors through rank-revealing reads.
 pub mod seed;
 
 // Plane-rotation and response-projector recovery with derived eigengaps.
 pub mod spectral;
+
+// Invariant planes of non-orthogonal operators with Stewart subspace certificates.
+pub mod schur;
 
 // Sufficient-state quotient and realization contracts.
 pub mod state;
@@ -143,4 +170,4 @@ pub mod response_metric;
 pub mod supports;
 
 // Versioned request and report document shared by pyffi and the CLI.
-// [unlanded: surface]
+pub mod surface;

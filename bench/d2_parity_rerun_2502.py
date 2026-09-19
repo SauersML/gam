@@ -89,12 +89,11 @@ def fit(gamfit, x, k, arm, args):
         sparsity_weight=args.sparsity_weight,
         smoothness_weight=args.smoothness_weight,
         isometry_weight=0.0, learning_rate=args.learning_rate,
-        ard_per_atom=False,
     )
     if arm == "linear":
-        return gamfit.sae_manifold_fit(x, d_atom=1, atom_topology="linear", **kw)
+        return gamfit.sae.sae_manifold_fit(x, d_atom=1, atom_topology="linear", **kw)
     bases, dims = portfolio(k)
-    return gamfit.sae_manifold_fit(x, d_atom=dims, atom_basis=bases, **kw)
+    return gamfit.sae.sae_manifold_fit(x, d_atom=dims, atom_basis=bases, **kw)
 
 
 def main():
@@ -118,7 +117,6 @@ def main():
     args = ap.parse_args()
 
     import gamfit
-    gamfit.set_log_level("warn")
 
     print("# 2502 d>=2 re-run at MEASURED parity, real ambient sphere")
     print(f"# n_train={args.n_train} n_test={args.n_test} p={args.p} "

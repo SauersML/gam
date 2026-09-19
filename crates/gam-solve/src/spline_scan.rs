@@ -78,6 +78,10 @@ struct PooledNode {
 /// has none, `m = 2` has node 0, `m = 3` has {0, 1}. Order 3 (the quintic
 /// smoothing spline, #1044) is the current cap; bumping it further only needs a
 /// wider `mat_inv` branch and the (already order-general) leading-block solve.
+///
+/// Structural (#2469): the capacity of the fixed-size matrix buffers below and the
+/// largest order `mat_inv` inverts. It is a supported-order limit, not a tolerance,
+/// and no result depends on it beyond which orders are accepted.
 const MAX_ORDER: usize = 3;
 
 /// Row-major `m × m` matrix stored in a fixed `MAX_ORDER`-capacity buffer; only
@@ -1100,15 +1104,6 @@ fn ball_cholesky(covariance: &BallMat, order: usize) -> Option<BallMat> {
     Some(factor)
 }
 
-/// How many accumulators the per-node divergence check scans.
-///
-/// The second- and third-order accumulators are ordered last and left OUT of
-/// the scan: each has a closed-form global bound the certificate substitutes
-/// (see [`BoundSource`]), so neither can justify discarding a value and slope
-/// that are finite. Divergence in the VALUE or in the FIRST derivative still
-/// refuses, at the node it happened — those have no substitute.
-const GLOBALLY_BOUNDED_FROM: usize = 4;
-
 /// Number of columns in the prediction prearray `[F·L, L_Q]`.
 const PREARRAY_COLUMNS: usize = 2 * MAX_ORDER;
 
@@ -2020,10 +2015,6 @@ const COVARIANCE_D1_DIM: usize = MAX_ORDER * MAX_ORDER;
 /// which a box loses the least signed correlation; it never assumes that age
 /// alone implies contraction.
 const ZONOTOPE_GENERATOR_CAP: usize = 240;
-/// `γ_{dim+2}` with room to spare: `2·(d+2)·u` with `u = ε/2` is `11ε` at
-/// `d = 9`, and this charges `32ε` for every floating-point dot product a
-/// zonotope forms.
-const ZONOTOPE_ROUNDOFF: f64 = 32.0 * f64::EPSILON;
 
 /// Radius of a ball ABOUT ITS REPRESENTATIVE, which is what a zonotope centred
 /// on that representative must absorb. Not `(hi−lo)/2`: the representative is
@@ -2203,9 +2194,24 @@ impl<const N: usize> Zonotope<N> {
             }
             next_center[i] = center;
             next_shared_q[i] = shared_q;
-            fresh_radius[i] = next_up_ball(
-                (radius + ZONOTOPE_ROUNDOFF * magnitude) * (1.0 + 64.0 * f64::EPSILON),
-            );
+            // The centre and shared-q accumulations each sum `dim + 1` terms (the
+            // constant and `dim` products), and a generator coordinate sums `dim`.
+            // Each summand passes its product and at most `dim` additions, so each
+            // accumulation's rounding is at most `γ_{dim+1}` of the magnitudes
+            // summed into `magnitude` (Higham, ASNA Lemma 3.1).
+            //
+            // After `radius` and `magnitude` are formed, their sum passes four rounded
+            // operations: `1 − n·u` and the division that form `γ`, the product with
+            // `magnitude`, and the addition to `radius`. Each term is at least `(1 − u)`
+            // of its exact value per operation, so the exact sum is at most the computed
+            // one times `(1 − u)^−4`. The owner `gam_math::roundoff::inflated(_, 4)`
+            // returns that bound, with the forming of its own factor and product
+            // counted, and the outward step keeps the enclosure's rounding
+            // convention (#2469).
+            fresh_radius[i] = next_up_ball(gam_math::roundoff::inflated(
+                radius + gam_math::roundoff::accumulation_growth(dim + 1) * magnitude,
+                4,
+            ));
         }
 
         for generator in self.generators.iter_mut() {
@@ -3166,24 +3172,19 @@ fn run_filter_ball_traced(
             // non-finite and nothing more, which is what made #2614 expensive:
             // two exact repairs were aimed at the wrong term because the
             // refusal could not say WHICH accumulator went, WHERE, or how wide
-            // it was. Checking here costs eight `is_finite` calls per proper
+            // it was. Checking here costs four `is_finite` calls per proper
             // node and turns the refusal into the measurement.
             if let Some((accumulator, ball, contribution)) = [
                 ("sum_log_f", sum_log_f, f_star.ln_positive()),
                 ("sum_log_f_d1", sum_log_f_d1, logf_d1),
                 ("sum_v2_over_f", sum_v2_over_f, t0),
                 ("sum_v2_over_f_d1", sum_v2_over_f_d1, t1),
-                // Second and third order last, and deliberately outside the
-                // scan below: each has a closed-form global bound the
-                // certificate substitutes, so neither can justify discarding a
-                // value and slope that are finite.
-                ("sum_log_f_d2", sum_log_f_d2, logf_d2),
-                ("sum_v2_over_f_d2", sum_v2_over_f_d2, t2),
-                ("sum_log_f_d3", sum_log_f_d3, logf_d3),
-                ("sum_v2_over_f_d3", sum_v2_over_f_d3, t3),
+                // The second- and third-order accumulators are deliberately
+                // not scanned: each has a closed-form global bound the
+                // certificate substitutes (see [`BoundSource`]), so neither can
+                // justify discarding a value and slope that are finite.
             ]
             .into_iter()
-            .take(GLOBALLY_BOUNDED_FROM)
             .find(|(_, ball, _)| !ball.is_finite())
             {
                 return Err(SplineScoreProofError::AccumulatorDiverged {
@@ -4039,7 +4040,7 @@ fn concentrated_criterion_enclosure(
         ("right", right_certificate.weakened_anchor()),
     ] {
         if let Some((curvature_source, third_source)) = weakened {
-            log::debug!(
+            log::trace!(
                 "spline scan enclosure: {side} endpoint curvature anchored by \
                  {curvature_source:?}, third order by {third_source:?}. A global-bound \
                  anchor keeps the search CERTIFIED and widens its tail cells -- half rate \
@@ -4921,7 +4922,7 @@ pub fn fit_spline_scan(
                 })
                 .flatten();
                 match boundary_flat {
-                    Some(region) => log::debug!(
+                    Some(region) => log::trace!(
                         "spline scan: boundary KKT sign is below the evaluator's derivative \
                          resolution ({:?}); accepting the certified resolution-flat optimum on \
                          {:?} (maximum score excess {:e} <= comparison resolution {:e})",
@@ -4946,7 +4947,7 @@ pub fn fit_spline_scan(
             max_score_gap,
             score_resolution,
         } => {
-            log::debug!(
+            log::trace!(
                 "spline scan: accepting certified resolution-flat REML optimum on \
                  {bracket:?}; maximum score excess {max_score_gap:e} <= comparison \
                  resolution {score_resolution:e}"
@@ -5433,6 +5434,32 @@ mod tests {
                 .any(|generator| *generator == [1.0, -1.0]),
             "compaction discarded the only signed correlation direction"
         );
+    }
+
+    /// #2469: one `x ← Mx + b` step charges its accumulations' own rounding band.
+    /// Under the exact identity on a 9-coordinate zonotope centred at ones, each
+    /// coordinate sums a magnitude of one (and a few outward ulps), so its fresh
+    /// axis radius lies in `[γ₁₀, 2·γ₁₀)`. The `32·ε·(1 + 64ε)` charge this replaced
+    /// was about 3.2× that upper bound.
+    #[test]
+    fn zonotope_step_charges_its_accumulations_rounding_band_2469() {
+        let dim = COVARIANCE_D1_DIM;
+        let mut state = Zonotope::<COVARIANCE_D1_DIM>::zeroed(dim);
+        state.center = [1.0; COVARIANCE_D1_DIM];
+        let identity = zonotope_identity_map::<COVARIANCE_D1_DIM>(dim);
+        let constant = [Ball::exact(0.0); COVARIANCE_D1_DIM];
+        assert!(state.apply(&identity, &constant));
+        assert_eq!(state.center, [1.0; COVARIANCE_D1_DIM]);
+        assert_eq!(state.generators.len(), dim);
+        let band = gam_math::roundoff::accumulation_growth(dim + 1);
+        for (i, generator) in state.generators.iter().enumerate() {
+            assert!(
+                generator[i] >= band && generator[i] < 2.0 * band,
+                "coordinate {i}: fresh radius {:.3e} outside [{band:.3e}, {:.3e})",
+                generator[i],
+                2.0 * band
+            );
+        }
     }
 
     /// Two occurrences of `qQ` contain ONE uncertain `q`, not two independent

@@ -130,6 +130,7 @@ use gam_terms::inference::formula_dsl::{
     validate_marginal_slope_z_column_exclusion,
 };
 
+pub use gam_terms::{FitNoteSink, FitNotes};
 use gam_terms::term_builder::{
     SECONDARY_CENTER_CAP_OPTION, build_termspec, column_map_with_alias, enable_scale_dimensions,
     has_explicit_countwith_basis_alias, resolve_role_col, resolve_smooth_type_name,
@@ -152,6 +153,7 @@ mod fit;
 mod fit_config;
 mod materialize;
 mod request;
+mod warm_start_from;
 
 #[cfg(test)]
 mod gaussian_high_edf_observation_interval_tests;
@@ -186,3 +188,4 @@ pub(crate) use fit::*;
 pub use fit_config::*;
 pub use materialize::*;
 pub use request::*;
+pub use warm_start_from::*;

@@ -469,7 +469,7 @@ pub(crate) fn dense_spectral_trace_logdet_operators_batched(
     if operators.is_empty() {
         return Vec::new();
     }
-    if log::log_enabled!(log::Level::Info) {
+    if log::log_enabled!(log::Level::Debug) {
         let start = std::time::Instant::now();
         let out =
             trace_projected_factors_batched(operators, &ds.g_factor, &ds.projected_factor_cache);
@@ -1470,12 +1470,109 @@ impl HyperOperator for GlmCurvatureCorrectionOperator {
         self.x_design.transpose_vector_multiply(&weighted)
     }
 
+    /// `C · F = Xᵀ (d ⊙ X F)` as two row-chunked GEMMs instead of `2·rank`
+    /// design matvecs; the association (and so the #901 stability) is the
+    /// per-column one.
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        assert_eq!(factor.nrows(), self.p);
+        let mut out = Array2::<f64>::zeros((self.p, factor.ncols()));
+        self.for_each_projected_row_chunk(factor, |rows, xf, start| {
+            let mut weighted = xf;
+            for (mut row, &d) in weighted
+                .rows_mut()
+                .into_iter()
+                .zip(self.neg_c_xv.slice(ndarray::s![start..]).iter())
+            {
+                row *= d;
+            }
+            out += &gam_linalg::faer_ndarray::fast_atb(&rows, &weighted);
+        });
+        out
+    }
+
+    /// `tr(Fᵀ C F) = Σ_i d_i ‖(X F)_i‖²`: the same squared `X u` probes the
+    /// per-column trace sums (see the type docs), contracted against `d`.
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        self.neg_c_xv.dot(&self.projected_row_energy(factor))
+    }
+
+    /// The row energies `‖(X F)_i‖²` depend only on the design and the factor,
+    /// not on `d`, so every coordinate's correction built on one design shares
+    /// them: one `X · F` pass per outer evaluation, then an `O(n)` contraction
+    /// per coordinate instead of an `O(n · p · rank)` projection each.
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        factor_cache: &ProjectedFactorCache,
+    ) -> f64 {
+        let key = ProjectedFactorKey::from_factor_view(self.row_energy_cache_id(), factor.view());
+        let energy = factor_cache.get_or_insert_with(key, || {
+            self.projected_row_energy(factor).insert_axis(ndarray::Axis(1))
+        });
+        self.neg_c_xv.dot(&energy.column(0))
+    }
+
     fn as_any(&self) -> &(dyn std::any::Any + 'static) {
         self
     }
 
     fn is_implicit(&self) -> bool {
         false
+    }
+}
+
+impl GlmCurvatureCorrectionOperator {
+    /// Stream `X · F` in byte-balanced row chunks, handing each chunk's design
+    /// rows, `X_c F` and first row index to `visit`.
+    fn for_each_projected_row_chunk(
+        &self,
+        factor: &Array2<f64>,
+        mut visit: impl FnMut(Array2<f64>, Array2<f64>, usize),
+    ) {
+        let n_obs = self.x_design.nrows();
+        assert_eq!(self.neg_c_xv.len(), n_obs);
+        let chunk_rows = byte_balanced_row_chunk(self.p + factor.ncols(), n_obs);
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let rows = self
+                .x_design
+                .try_row_chunk(start..end)
+                // SAFETY: `start..end` is a sub-range of `0..x_design.nrows()`;
+                // a failure means the design broke its row-chunk contract.
+                .unwrap_or_else(|err| {
+                    reml_contract_panic(format!(
+                        "GlmCurvatureCorrectionOperator row chunk failed: {err}"
+                    ))
+                });
+            let xf = gam_linalg::faer_ndarray::fast_ab(&rows, factor);
+            visit(rows, xf, start);
+            start = end;
+        }
+    }
+
+    /// Row energies `e_i = ‖(X F)_i‖²`.
+    fn projected_row_energy(&self, factor: &Array2<f64>) -> Array1<f64> {
+        assert_eq!(factor.nrows(), self.p);
+        let mut energy = Array1::<f64>::zeros(self.x_design.nrows());
+        self.for_each_projected_row_chunk(factor, |_, xf, start| {
+            for (local, row) in xf.rows().into_iter().enumerate() {
+                energy[start + local] = row.dot(&row);
+            }
+        });
+        energy
+    }
+
+    /// Cache id of the row energies: a function of the design alone, so every
+    /// correction built on a clone of one design resolves to the same slot.
+    fn row_energy_cache_id(&self) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "GlmCurvatureCorrectionOperator::projected_row_energy".hash(&mut hasher);
+        self.x_design.cache_token().hash(&mut hasher);
+        self.x_design.nrows().hash(&mut hasher);
+        self.p.hash(&mut hasher);
+        hasher.finish() as usize
     }
 }
 

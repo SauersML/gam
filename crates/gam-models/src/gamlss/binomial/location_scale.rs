@@ -699,7 +699,7 @@ impl BinomialLocationScaleFamily {
 
     /// Compute the rowwise joint curvature coefficients (D_tt, D_tl, D_ll)
     /// shared by the dense joint Hessian path and the matrix-free workspace:
-    /// the Hessian channel of the emitted `binomial_ls_row_program` surface.
+    /// the Hessian channel of the emitted `binomial_ls_row` surface.
     pub(crate) fn exact_newton_joint_hessian_row_coefficients(
         &self,
         block_states: &[ParameterBlockState],
@@ -1183,7 +1183,7 @@ impl BinomialLocationScaleFamily {
         //   q_psi = -r .* z_t - q .* z_ls.
         //
         // Every rowwise object below is a surface of the one declared row
-        // program `binomial_ls_row_program`, evaluated with the row's q-space
+        // program `binomial_ls_row`, evaluated with the row's q-space
         // loss derivatives `a = dF/dq, b = d²F/dq², c = d³F/dq³`:
         //
         //   r = (r_t, r_ls)          = the score channel,
@@ -1295,9 +1295,14 @@ impl BinomialLocationScaleFamily {
                 );
                 let z = [z_t_p[i], z_ls_p[i]];
                 let (_, score, hessian, []) =
-                    binomial_ls_row_program_order2(0.0, 0.0, q, inv_sigma, 0.0, a, b, 0.0, 0.0);
-                let drift = binomial_ls_row_program_third_contracted(
-                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z,
+                    binomial_ls_row_order2(q, inv_sigma, 0.0, a, b);
+                let drift = binomial_ls_row_third_contracted(
+                    q,
+                    inv_sigma,
+                    a,
+                    b,
+                    c,
+                    &z,
                 );
                 PsiTermsRow {
                     r_t: score[0],
@@ -1531,7 +1536,7 @@ impl BinomialLocationScaleFamily {
         //            X_{ls,ab}^T r_ls + X_{ls,a}^T d_b r_ls + X_{ls,b}^T d_a r_ls + X_ls^T d_ab r_ls ],
         //
         // where every rowwise object is a surface of the one declared row
-        // program `binomial_ls_row_program`, with `z_a = (z_t,a, z_ls,a)` and
+        // program `binomial_ls_row`, with `z_a = (z_t,a, z_ls,a)` and
         // likewise `z_b`, `z_ab`:
         //
         //   r = (r_t, r_ls)  = the score channel,
@@ -1695,18 +1700,40 @@ impl BinomialLocationScaleFamily {
                 let z_j = [z_t_j[row], z_ls_j[row]];
                 let z_ab = [z_t_ab[row], z_ls_ab[row]];
                 let (_, score, hessian, []) =
-                    binomial_ls_row_program_order2(0.0, 0.0, q, inv_sigma, 0.0, a, b, 0.0, 0.0);
-                let drift_i = binomial_ls_row_program_third_contracted(
-                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z_i,
+                    binomial_ls_row_order2(q, inv_sigma, 0.0, a, b);
+                let drift_i = binomial_ls_row_third_contracted(
+                    q,
+                    inv_sigma,
+                    a,
+                    b,
+                    c,
+                    &z_i,
                 );
-                let drift_j = binomial_ls_row_program_third_contracted(
-                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z_j,
+                let drift_j = binomial_ls_row_third_contracted(
+                    q,
+                    inv_sigma,
+                    a,
+                    b,
+                    c,
+                    &z_j,
                 );
-                let drift_ab = binomial_ls_row_program_third_contracted(
-                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z_ab,
+                let drift_ab = binomial_ls_row_third_contracted(
+                    q,
+                    inv_sigma,
+                    a,
+                    b,
+                    c,
+                    &z_ab,
                 );
-                let drift_ij = binomial_ls_row_program_fourth_contracted(
-                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, d, &z_i, &z_j,
+                let drift_ij = binomial_ls_row_fourth_contracted(
+                    q,
+                    inv_sigma,
+                    a,
+                    b,
+                    c,
+                    d,
+                    &z_i,
+                    &z_j,
                 );
                 let apply = |matrix: &[[f64; 2]; 2], vector: &[f64; 2]| {
                     [
@@ -1955,7 +1982,7 @@ impl BinomialLocationScaleFamily {
         //
         // The directional derivatives of the first-order Hessian-drift
         // coefficients are surfaces of the one declared row program
-        // `binomial_ls_row_program`: its third contraction along `u`'s
+        // `binomial_ls_row`: its third contraction along `u`'s
         // predictor perturbation `xi = (X_t u_t, X_ls u_ls)` moves `h`, and its
         // fourth contraction along `(xi, z_a)` moves `d_a h`, where
         // `z_a = (z_t,a, z_ls,a)` is psi_a's realized predictor drift at fixed
@@ -1994,11 +2021,23 @@ impl BinomialLocationScaleFamily {
             )?;
             let xi = [xi_t[row], xi_ls[row]];
             let z_a = [dir_a.z_primary_psi[row], dir_a.z_ls_psi[row]];
-            let hessian_u = binomial_ls_row_program_third_contracted(
-                0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &xi,
+            let hessian_u = binomial_ls_row_third_contracted(
+                q,
+                inv_sigma,
+                a,
+                b,
+                c,
+                &xi,
             );
-            let drift_u = binomial_ls_row_program_fourth_contracted(
-                0.0, 0.0, q, inv_sigma, 0.0, a, b, c, d, &xi, &z_a,
+            let drift_u = binomial_ls_row_fourth_contracted(
+                q,
+                inv_sigma,
+                a,
+                b,
+                c,
+                d,
+                &xi,
+                &z_a,
             );
             h_tt_u[row] = hessian_u[0][0];
             h_tl_u[row] = hessian_u[0][1];

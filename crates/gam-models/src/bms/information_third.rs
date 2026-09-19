@@ -179,7 +179,7 @@ impl BernoulliMarginalSlopeFamily {
             let slope = states[1].eta[row];
             let t3 = self.rigid_row_third_full(row, marginal, slope)?;
             let t4 = self.rigid_row_fourth_full(row, marginal, slope)?;
-            let t5 = match self.latent_measure.empirical_grid_for_training_row(row)? {
+            let t5 = match self.training_row_grid(row)? {
                 None => rigid_standard_normal_fifth_full(
                     marginal,
                     slope,

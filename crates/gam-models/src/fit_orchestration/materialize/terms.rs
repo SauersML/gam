@@ -13,7 +13,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     terms: &[ParsedTerm],
     data: &Dataset,
     col_map: &HashMap<String, usize>,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut FitNotes,
     scale_dimensions: bool,
     smooth_overrides: Option<&JsonValue>,
     spatial_center_counts: Option<&[Option<usize>]>,
@@ -43,14 +43,17 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     Ok(spec)
 }
 
-/// Apply the standard workflow's per-term adaptive spatial resolution plan.
+/// Apply the standard workflow's per-term adaptive resolution plan.
 ///
 /// Eligibility (never clobber a pinned basis):
 /// * spatial radial families with a validated saturation contract (thin-plate /
 ///   Duchon / constant-curvature / measure-jet); Matérn has a separately learned
 ///   kernel range whose basin and numerical rank both move with the center count,
 ///   so it retains its established full/default count until a Matérn-specific
-///   saturation proof exists; ordinary 1-D `s(x)` P-splines are also untouched;
+///   saturation proof exists;
+/// * the formula-default 1-D `s(x)` B-spline, whose knot count nobody chose
+///   (`BSplineKnotSpec::Automatic { adaptive: true, .. }`); an explicit `k=` /
+///   `knots=` is a fixed spec and is untouched;
 /// * the current strategy must retain [`CenterStrategy::Auto`] provenance;
 ///   every explicit formula/programmatic strategy is therefore left alone;
 /// Python `smooths={...}` overrides are applied by the caller AFTER this, so they
@@ -68,6 +71,28 @@ fn apply_adaptive_spatial_center_counts(
         return Ok(());
     }
     for (term_index, term) in spec.smooth_terms.iter_mut().enumerate() {
+        if let gam_terms::smooth::SmoothBasisSpec::BSpline1D {
+            spec:
+                gam_terms::basis::BSplineBasisSpec {
+                    knotspec:
+                        gam_terms::basis::BSplineKnotSpec::Automatic {
+                            num_internal_knots: Some(num_internal_knots),
+                            adaptive: true,
+                            ..
+                        },
+                    ..
+                },
+            ..
+        } = &mut term.basis
+        {
+            // The formula default `s(x)` keeps its `adaptive` provenance while
+            // taking the knot count this loop proposed, so every refit is still
+            // owned (and measured) by the same loop.
+            if let Some(proposed) = requested_counts.get(term_index).copied().flatten() {
+                *num_internal_knots = proposed;
+            }
+            continue;
+        }
         let structural_minimum = gam_terms::smooth::spatial_term_min_center_count(term)
             .saturating_add(1)
             .min(n);
@@ -251,7 +276,7 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     spec: &mut TermCollectionSpec,
     data: &Dataset,
     label: &str,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut FitNotes,
 ) -> Result<Vec<UnidentifiedScalarTerm>, WorkflowError> {
     if spec.linear_terms.is_empty() {
         return Ok(Vec::new());
@@ -322,7 +347,7 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     }
 
     if !dropped.is_empty() {
-        inference_notes.push(format!(
+        inference_notes.advise(format!(
             "{label}: removed {} scalar term(s) that add no identifiable \
              direction beyond the implicit intercept and earlier scalar terms: {}",
             dropped.len(),

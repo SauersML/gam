@@ -108,6 +108,11 @@ pub(crate) const fn sae_exact_stationarity_block_bytes(dim: usize) -> usize {
 /// eigensolver/BLAS workspace remains additional to these named Rust allocations.
 /// Update this enumeration when the allocating code in
 /// `construction_exact_hessian.rs` changes (#2933 F07).
+///
+/// #2267 — the outer objective keeps one priced evaluation, its blocks 1–3, while the basin
+/// envelope prices the next member's VALUE at the same ρ, and hands it to the gradient lane.
+/// Those three blocks and a value's live set coexist below the differential's peak. The
+/// differential then reads that evaluation as its own 1–3, so the count is unchanged.
 pub(crate) const SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS: usize = 17;
 
 /// Resident bytes of the exact stationarity route at its peak.
@@ -473,9 +478,11 @@ impl SaeStreamingPlan {
         }
     }
 
-    pub(crate) fn solve_options_for_border_dim(self, border_dim: usize) -> ArrowSolveOptions {
+    pub(crate) fn solve_options(self) -> ArrowSolveOptions {
+        // Where the plan admits the dense route, the step prices Direct against
+        // InexactPCG from the system at solve time (#2900 row 6.15).
         let mut options = if self.direct_admitted {
-            ArrowSolveOptions::automatic(border_dim)
+            ArrowSolveOptions::priced()
         } else {
             ArrowSolveOptions::inexact_pcg()
         };

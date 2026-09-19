@@ -1218,6 +1218,8 @@ pub(crate) const REDUCTION_THREADS: u32 = 256;
 /// internal batching width, not a matrix-width limit: wider dense matrices are
 /// materialised in consecutive batches. The CUDA source has four scalar
 /// shared arrays of this length; primary directions are derived on demand.
+/// Structural (#2469): the length of those arrays, `MAX_MULTI_RHS` in
+/// `HVP_KERNEL_SOURCE`.
 #[cfg(target_os = "linux")]
 pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
 
@@ -3058,6 +3060,8 @@ pub(crate) fn launch_bms_flex_row_diagonal(
 /// bytes. V100 default per-block shared cap is 48 KiB, so the largest
 /// safe `p_total` here is `sqrt(48 KiB / 8) = 78`. We round down to a
 /// power-of-two-ish multiple of 8 for predictable launch geometry.
+/// Structural (#2469): the largest multiple of 8 not above `sqrt(48 KiB / 8 B) = 78`,
+/// the per-CTA shared-memory accumulator bound.
 #[cfg(target_os = "linux")]
 pub(crate) const DENSE_BLOCK_MAX_P: usize = 72;
 
@@ -3311,6 +3315,8 @@ mod row_kernel_tests {
 
             let family = BernoulliMarginalSlopeFamily {
                 jeffreys_armed: true,
+                residual: None,
+                search: None,
                 y: Arc::new(y),
                 weights: Arc::new(weights),
                 z: Arc::new(z.clone()),
@@ -3387,6 +3393,196 @@ mod row_kernel_tests {
                 cache.row_cell_moments.is_some(),
                 "the production full-FLEX fixture must materialize its exact row-cell cache"
             );
+        }
+
+        /// Every host field of a packing by name, as bit patterns. The
+        /// destructuring names every field, so a field added to the kernel's
+        /// input schema fails to compile here until it is compared too.
+        fn packed_bits(
+            inputs: &crate::bms::gpu::row::BmsFlexRowKernelInputsOwned,
+        ) -> Vec<(&'static str, Vec<u64>)> {
+            let crate::bms::gpu::row::BmsFlexRowKernelInputsOwned {
+                n_rows,
+                r,
+                p_h,
+                p_w,
+                s_f,
+                q,
+                b,
+                mu_1,
+                mu_2,
+                z_obs,
+                y,
+                w,
+                e_obs,
+                crossing,
+                cell_c0,
+                cell_c1,
+                cell_c2,
+                cell_c3,
+                cell_a,
+                cell_aa,
+                cell_r,
+                cell_ar,
+                cell_sbb,
+                cell_sbh,
+                cell_sbw,
+                chi_obs,
+                xi_obs,
+                rho_u,
+                tau_u,
+                r_uv,
+                cell_offsets,
+                cell_moments,
+                // Device moments exist only once a device built them; the
+                // host fields above are what the packer itself derives.
+                #[cfg(target_os = "linux")]
+                    cell_moments_device: _,
+            } = inputs;
+            let bits = |values: &[f64]| -> Vec<u64> {
+                values.iter().map(|value| value.to_bits()).collect()
+            };
+            vec![
+                (
+                    "shape",
+                    [*n_rows, *r, *p_h, *p_w]
+                        .iter()
+                        .map(|&v| v as u64)
+                        .collect(),
+                ),
+                ("s_f", vec![s_f.to_bits()]),
+                ("q", bits(q)),
+                ("b", bits(b)),
+                ("mu_1", bits(mu_1)),
+                ("mu_2", bits(mu_2)),
+                ("z_obs", bits(z_obs)),
+                ("y", bits(y)),
+                ("w", bits(w)),
+                ("e_obs", bits(e_obs)),
+                ("crossing", bits(crossing)),
+                ("cell_c0", bits(cell_c0)),
+                ("cell_c1", bits(cell_c1)),
+                ("cell_c2", bits(cell_c2)),
+                ("cell_c3", bits(cell_c3)),
+                ("cell_a", bits(cell_a)),
+                ("cell_aa", bits(cell_aa)),
+                ("cell_r", bits(cell_r)),
+                ("cell_ar", bits(cell_ar)),
+                ("cell_sbb", bits(cell_sbb)),
+                ("cell_sbh", bits(cell_sbh)),
+                ("cell_sbw", bits(cell_sbw)),
+                ("chi_obs", bits(chi_obs)),
+                ("xi_obs", bits(xi_obs)),
+                ("rho_u", bits(rho_u)),
+                ("tau_u", bits(tau_u)),
+                ("r_uv", bits(r_uv)),
+                (
+                    "cell_offsets",
+                    cell_offsets.iter().map(|&v| u64::from(v)).collect(),
+                ),
+                ("cell_moments", bits(cell_moments)),
+            ]
+        }
+
+        fn assert_same_packing(
+            expected: &crate::bms::gpu::row::BmsFlexRowKernelInputsOwned,
+            observed: &crate::bms::gpu::row::BmsFlexRowKernelInputsOwned,
+            coverage: &str,
+        ) {
+            for ((name, expected_bits), (_, observed_bits)) in
+                packed_bits(expected).into_iter().zip(packed_bits(observed))
+            {
+                assert!(
+                    expected_bits == observed_bits,
+                    "{coverage}: packed {name} differs from the fully memoized packing"
+                );
+            }
+        }
+
+        /// gam#3000: the row-kernel packer is total over the models the kernel
+        /// declares. The row-cell-moments bundle is a memo of
+        /// `denested_partition_cells` and its degree-9 moments, so a bundle
+        /// that covers only some rows (an outer-score subsample) or none (a
+        /// byte-budget refusal) must give the packing the full bundle gives,
+        /// bit for bit, instead of an unsupported-input refusal.
+        #[test]
+        fn row_kernel_packing_does_not_depend_on_bundle_coverage_3000() {
+            let (family, states) = make_flex_parity_family(48, 4, 3);
+            let mut cache = family
+                .build_exact_eval_cache(&states)
+                .expect("the full-FLEX fixture's exact cache");
+            let full_bundle = cache
+                .row_cell_moments
+                .clone()
+                .expect("the fixture's bundle fits its byte budget");
+            let full = family
+                .pack_bms_flex_row_kernel_inputs(&states, &cache)
+                .expect("packing with every row memoized");
+
+            let mut half = full_bundle.clone();
+            for row in (0..half.rows.len()).step_by(2) {
+                half.rows[row] = None;
+            }
+            cache.row_cell_moments = Some(half);
+            let masked = family
+                .pack_bms_flex_row_kernel_inputs(&states, &cache)
+                .expect("packing with every other row memoized");
+            assert_same_packing(&full, &masked, "half-covered bundle");
+
+            cache.row_cell_moments = None;
+            let absent = family
+                .pack_bms_flex_row_kernel_inputs(&states, &cache)
+                .expect("packing with no bundle");
+            assert_same_packing(&full, &absent, "absent bundle");
+        }
+
+        /// gam#3000: a family's row model carries its law's integral form,
+        /// the same form that sends the CPU row lowering down its grid or its
+        /// cell-moment branch, and an empirical-law family is refused by the
+        /// device row kernel's declaration at every row count.
+        #[test]
+        fn empirical_law_family_is_outside_the_row_kernel_capability_3000() {
+            use crate::bms::LatentIntegral;
+            use crate::bms::gpu::flex::BMS_FLEX_ROW_KERNEL_CAPABILITY;
+
+            let (mut family, states) = make_flex_parity_family(48, 4, 3);
+            let cache = family
+                .build_exact_eval_cache(&states)
+                .expect("the full-FLEX fixture's exact cache");
+            let model = family.flex_row_model();
+            assert_eq!(model.latent_integral, LatentIntegral::GaussianCellMoments);
+            assert!(model.score_warp && model.link_deviation && !model.residual_repair);
+            assert!(family.training_row_grid(0).expect("row grid").is_none());
+            assert_eq!(BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(&model), None);
+
+            family.latent_measure = LatentMeasureKind::GlobalEmpirical {
+                grid: crate::bms::EmpiricalZGrid::new(
+                    vec![-1.5, -0.5, 0.25, 1.0, 2.0],
+                    vec![0.1, 0.25, 0.3, 0.25, 0.1],
+                    "gam#3000 fixture",
+                )
+                .expect("valid empirical grid"),
+            };
+            let model = family.flex_row_model();
+            assert_eq!(model.latent_integral, LatentIntegral::DiscreteGrid);
+            assert!(family.training_row_grid(0).expect("row grid").is_some());
+            assert_eq!(
+                BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(&model),
+                Some(LatentIntegral::DiscreteGrid.capability())
+            );
+            let decision = family
+                .flex_row_kernel_decision()
+                .expect("auto and off refuse no model; required is never set in this binary");
+            assert!(!decision.use_gpu, "{decision:?}");
+            assert_eq!(
+                decision.missing_capability,
+                Some(LatentIntegral::DiscreteGrid.capability())
+            );
+            // The packer reads the same declaration before any input.
+            let Err(refusal) = family.pack_bms_flex_row_kernel_inputs(&states, &cache) else {
+                panic!("the packer must refuse a model outside the row kernel's declaration");
+            };
+            assert!(refusal.contains("discrete-grid"), "{refusal}");
         }
 
     }

@@ -25,7 +25,7 @@ def _duplicated_center_2d() -> tuple[Any, list[torch.Tensor], int]:
     centers = rng.uniform(-1.0, 1.0, size=(5, 2))
     # Center 4 repeats center 1: the realized kernel block has two equal columns.
     centers[4] = centers[1]
-    spec = gamfit.Matern(centers=centers, nu=1.5, length_scale=0.6)
+    spec = gamfit.smooth.Matern(centers=centers, nu=1.5, length_scale=0.6)
     pts = rng.uniform(-1.0, 1.0, size=(9, 2))
     coords = [
         torch.tensor(pts[:, 0], dtype=torch.float64),

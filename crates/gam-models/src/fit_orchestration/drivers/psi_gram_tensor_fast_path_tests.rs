@@ -106,9 +106,10 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                 // `Some(vec![1.0])` pin was a gamed gate that masked the open gap.
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let design = build_term_collection_design(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
@@ -125,8 +126,12 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         SpatialLogKappaCoords::upper_bounds_from_data(data.view(), &frozen, &spatial_terms)
             .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+    let (rho_lower, rho_upper) =
+        joint_rho_resolvability_domain(&frozen_design.design, &frozen_design.penalties, rho_dim);
     let setup = ExactJointHyperSetup::new(
         Array1::<f64>::zeros(rho_dim),
+        rho_lower,
+        rho_upper,
         log_kappa0.clone(),
         log_kappa_lower.clone(),
         log_kappa_upper.clone(),

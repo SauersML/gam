@@ -5,10 +5,12 @@ import math
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, overload
 
-from ._binding import RustExtensionUnavailableError, extension_status, rust_module
-from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
+from ._binding import RustExtensionUnavailableError, extension_status
+from ._binding import rust_module as rust_module
+from ._calibrated_slope import CtnStage1 as CtnStage1
+from ._calibrated_slope import normalize_ctn_stage1
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
 from ._cuda import cuda_subprocess_env as _cuda_subprocess_env
 from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
@@ -20,6 +22,28 @@ from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
+
+if TYPE_CHECKING:
+    from ._model import MultinomialModel
+    from ._rust import ManifoldSAESupport
+    from ._sae_manifold import ManifoldSAE
+
+# ``family`` spellings that route ``fit`` to the multinomial-logit solver; the
+# runtime check also folds case and ``_``/``-``, which a Literal cannot express.
+MultinomialFamily: TypeAlias = Literal[
+    "multinomial",
+    "multinomial-logit",
+    "multinomial_logit",
+    "categorical",
+    "categorical-logit",
+    "categorical_logit",
+    "softmax",
+]
+# Every class ``load``/``loads`` can return; the payload header selects one.
+LoadedModel: TypeAlias = (
+    "Model | MultinomialModel | ResponseGeometryModel | ManifoldSAE | ManifoldSAESupport"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SharedPrecisionGroup:
@@ -159,7 +183,7 @@ def cross_fit_shared_precision_groups(
     model_payloads: list[dict[str, Any]] = []
     for key, model in model_items:
         try:
-            state_json = rust.coefficient_state_json(model._model_bytes)
+            state_json = rust.coefficient_state_json(model._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
         model_payloads.append({"key": key, "state_json": state_json})
@@ -181,7 +205,8 @@ def cross_fit_shared_precision_groups(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return json.loads(raw)
+    fitted: dict[str, dict[str, Any]] = json.loads(raw)
+    return fitted
 
 
 def build_info() -> dict[str, Any]:
@@ -248,10 +273,9 @@ def _build_fit_payload(
     *,
     family: str,
     negative_binomial_theta: float | None,
-    expectile_tau: float | None,
+    expectile_tau: float | Sequence[float] | None,
     offset: str | None,
     weights: str | None,
-    persistent_warm_start_root: str | Path | None,
     transformation_normal: bool | None,
     transformation_normal_stage1: Any | None = None,
     survival_likelihood: str | None,
@@ -277,6 +301,7 @@ def _build_fit_payload(
     penalties: Sequence[Any] | None,
     smooths: Mapping[Any, Any] | None,
     config: dict[str, Any] | None,
+    residual_columns: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     normalized_latents = _normalize_latents(latents)
     payload: dict[str, Any] = {
@@ -292,7 +317,13 @@ def _build_fit_payload(
             payload["ctn_stage1"] = recipe.native_document()
     kwarg_items: dict[str, Any] = {
         "negative_binomial_theta": negative_binomial_theta,
-        "expectile_tau": expectile_tau,
+        # One level, or a strictly increasing sequence fitted jointly; a
+        # sequence rides the JSON document as a list.
+        "expectile_tau": (
+            expectile_tau
+            if expectile_tau is None or isinstance(expectile_tau, (int, float))
+            else [float(tau) for tau in expectile_tau]
+        ),
         "transformation_normal": transformation_normal,
         "survival_likelihood": survival_likelihood,
         "survival_time_anchor": survival_time_anchor,
@@ -302,16 +333,14 @@ def _build_fit_payload(
         "baseline_rate": baseline_rate,
         "baseline_makeham": baseline_makeham,
         "z_column": z_column,
+        "residual_columns": (
+            None if residual_columns is None else [str(name) for name in residual_columns]
+        ),
         "link": link,
         "slope_formula": slope_formula,
         "frailty_kind": frailty_kind,
         "frailty_sd": frailty_sd,
         "hazard_loading": hazard_loading,
-        "persistent_warm_start_root": (
-            None
-            if persistent_warm_start_root is None
-            else str(persistent_warm_start_root)
-        ),
         "scale_dimensions": scale_dimensions,
         "firth": firth,
         "noise_formula": noise_formula,
@@ -359,6 +388,18 @@ def _build_fit_payload(
                 )
             payload[key] = _jsonable_array(value)
     return payload
+
+
+def _warm_start_model_bytes(warm_start_from: Any) -> bytes | None:
+    """The saved bytes of the fitted model a new fit resumes from, or ``None``."""
+    if warm_start_from is None:
+        return None
+    if not isinstance(warm_start_from, Model):
+        raise TypeError(
+            "warm_start_from takes a fitted gamfit.Model; got "
+            f"{type(warm_start_from).__name__}"
+        )
+    return bytes(warm_start_from._model_bytes)
 
 
 def _jsonable_array(value: Any) -> Any:
@@ -446,7 +487,7 @@ def _normalize_smooths(
             # On the formula `smooths={}` descriptor path the gating variable
             # is named by data-frame column (resolved to a `by_col` in the Rust
             # merge, identical to `s(x, by=g)`). A raw per-row `by` *array* is
-            # the contract of the primitive numpy API (`gamfit.duchon_basis`,
+            # the contract of the primitive numpy API (`gamfit.basis.duchon_basis`,
             # ... — `crates/gam-pyffi/src/model_ffi.rs`), which has no data
             # frame to name. Reject it loudly here rather than mis-serialize.
             raise ValueError(
@@ -561,17 +602,27 @@ def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
         raise map_exception(exc) from exc
 
 
+def is_multinomial_family(family: str | None) -> bool:
+    """Whether ``family`` names the softmax (multinomial-logit) likelihood.
+
+    The spelling list lives in the engine (the predicate ``fit`` and the CLI
+    route on); this only forwards to it.
+    """
+    if family is None:
+        return False
+    return bool(rust_module().is_multinomial_family_name(str(family)))
+
+
 @overload
 def fit(
     data: Any,
     formula: str,
     *,
-    family: str = ...,
+    family: MultinomialFamily,
     negative_binomial_theta: float | None = ...,
     expectile_tau: float | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
-    persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
@@ -582,6 +633,7 @@ def fit(
     baseline_rate: float | None = ...,
     baseline_makeham: float | None = ...,
     z_column: str | None = ...,
+    residual_columns: Sequence[str] | None = ...,
     link: str | None = ...,
     slope_formula: str | None = ...,
     frailty_kind: str | None = ...,
@@ -592,6 +644,53 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
+    warm_start_from: None = ...,
+    precision_hyperpriors: Any | None = ...,
+    constraints: Mapping[str, Any] | None = ...,
+    response_geometry: None = ...,
+    response_columns: list[str] | tuple[str, ...] | None = ...,
+    response_coordinates: str | None = ...,
+    response_reference: int | None = ...,
+    fisher_rao_w: Any | None = ...,
+    latents: Mapping[str, Any] | None = ...,
+    penalties: Sequence[Any] | None = ...,
+    smooths: Mapping[Any, Any] | None = ...,
+    config: dict[str, Any] | None = ...,
+) -> MultinomialModel: ...
+
+
+@overload
+def fit(
+    data: Any,
+    formula: str,
+    *,
+    family: str = ...,
+    negative_binomial_theta: float | None = ...,
+    expectile_tau: float | Sequence[float] | None = ...,
+    offset: str | None = ...,
+    weights: str | None = ...,
+    transformation_normal: bool | None = ...,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
+    survival_likelihood: str | None = ...,
+    survival_time_anchor: float | None = ...,
+    baseline_target: str | None = ...,
+    baseline_scale: float | None = ...,
+    baseline_shape: float | None = ...,
+    baseline_rate: float | None = ...,
+    baseline_makeham: float | None = ...,
+    z_column: str | None = ...,
+    residual_columns: Sequence[str] | None = ...,
+    link: str | None = ...,
+    slope_formula: str | None = ...,
+    frailty_kind: str | None = ...,
+    frailty_sd: float | None = ...,
+    hazard_loading: str | None = ...,
+    scale_dimensions: bool | None = ...,
+    firth: bool | None = ...,
+    noise_formula: str | None = ...,
+    noise_offset: str | None = ...,
+    flexible_link: bool | None = ...,
+    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: None = ...,
@@ -613,10 +712,9 @@ def fit(
     *,
     family: str = ...,
     negative_binomial_theta: float | None = ...,
-    expectile_tau: float | None = ...,
+    expectile_tau: float | Sequence[float] | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
-    persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
@@ -627,6 +725,7 @@ def fit(
     baseline_rate: float | None = ...,
     baseline_makeham: float | None = ...,
     z_column: str | None = ...,
+    residual_columns: Sequence[str] | None = ...,
     link: str | None = ...,
     slope_formula: str | None = ...,
     frailty_kind: str | None = ...,
@@ -637,6 +736,7 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
+    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: str,
@@ -657,10 +757,9 @@ def fit(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
-    persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
@@ -671,6 +770,7 @@ def fit(
     baseline_rate: float | None = None,
     baseline_makeham: float | None = None,
     z_column: str | None = None,
+    residual_columns: Sequence[str] | None = None,
     link: str | None = None,
     slope_formula: str | None = None,
     frailty_kind: str | None = None,
@@ -681,6 +781,7 @@ def fit(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     constraints: Mapping[str, Any] | None = None,
     response_geometry: str | None = None,
@@ -692,11 +793,11 @@ def fit(
     penalties: Sequence[Any] | None = None,
     smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
-) -> Model | ResponseGeometryModel:
+) -> Model | MultinomialModel | ResponseGeometryModel:
     """Fit a GAM model from a formula and tabular data.
 
     Manifold sparse autoencoders have their own explicit
-    :func:`gamfit.sae_manifold_fit` front door.  Keeping the two fit contracts
+    :func:`gamfit.sae.sae_manifold_fit` front door.  Keeping the two fit contracts
     separate prevents a missing formula from silently selecting an unrelated
     model family.
 
@@ -711,8 +812,12 @@ def fit(
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
-        ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
-        ``"negbin"`` / ``"nb"``. Binomial/Bernoulli link spellings accept
+        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
+        ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
+        ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
+        estimated by LAML jointly with the smoothing parameters; the fitted
+        values are reported as ``student_t_sigma`` / ``student_t_nu``).
+        Binomial/Bernoulli link spellings accept
         ``"-logit"``, ``"-probit"``, ``"-cloglog"``, or mgcv-style
         parentheses such as ``"bernoulli(probit)"``. Specialized values include
         ``"gaussian-location-scale"`` when ``noise_formula`` is supplied,
@@ -732,17 +837,17 @@ def fit(
         This is the Python spelling of CLI ``--negative-binomial-theta`` and
         the shared request field ``negative_binomial_theta``.
     expectile_tau:
-        Optional target in the open interval ``(0, 1)`` for
-        ``family="expectile"``. This is the Python spelling of CLI
-        ``--expectile-tau`` and the shared request field ``expectile_tau``.
+        Optional expectile level in the open interval ``(0, 1)`` for
+        ``family="expectile"``, or a strictly increasing sequence of levels.
+        A sequence is fitted jointly as one location-scale model whose level
+        curves ``mu(x) + c_tau * E[sigma(x)]`` never cross; ``predict`` then
+        returns an ``(n, K)`` array with one column per level. This is the
+        Python spelling of CLI ``--expectile-tau`` (comma-separated) and the
+        shared request field ``expectile_tau``.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:
         Name of the observation-weight column. Corresponds to ``--weights-column``.
-    persistent_warm_start_root:
-        Explicit directory for cross-process solver warm starts. Persistence is
-        disabled when omitted. The directory is used exactly as supplied; no
-        environment or platform cache directory is consulted.
     transformation_normal:
         Fit a conditional transformation-normal model (``h(Y|x) ~ N(0,1))``).
         Corresponds to ``--transformation-normal``.
@@ -788,6 +893,15 @@ def fit(
     z_column:
         Name of the latent/observed z-score column used by score-warp families
         and latent transformation models. Corresponds to ``--z-column``.
+    residual_columns:
+        Residual genetic repair block for ``family="bernoulli-marginal-slope"``:
+        names of conditionally centred genetic residual features
+        ``r = φ − E_ref[φ | S, A]`` (block partial scores, local-ancestry
+        contrasts, selected dosages) that enter the genetic drive beside the
+        score with one ridge-shrunk constant coefficient each. The marginal
+        anchor integrates the joint law of ``(z, r)``. The fit checks that
+        every column is centred on the marginal-index span and refuses one
+        that is not. Corresponds to repeated ``--residual-column``.
     link:
         Override the default link function. Corresponds to ``--link``.
     slope_formula:
@@ -861,19 +975,38 @@ def fit(
         link fixed at its canonical/parametric form, letting the data shape
         the response transformation. Corresponds to the CLI flexible-link path
         (``FitConfig.flexible_link``).
+    warm_start_from:
+        A fitted :class:`Model` of the same formula to resume from. The model
+        records its certified outer point (smoothing parameters, any
+        length-scale and auxiliary coordinates, and the coefficient mode), the
+        criterion value certified there, and a fingerprint of the inputs. On
+        the same formula, data and settings, the search that certified the
+        point accepts it with no outer iterations where it is still certified,
+        and every other search of the fit runs as it runs cold. On other data
+        or settings the point cannot change which optimum is reported: a
+        search that takes the best of several independent seeds adds it to the
+        seed set, and a search that certifies its first certifiable seed does
+        not use it. The model notes say which. A model of another formula, or
+        one recording no point (fitted before this version: refit it), is
+        refused by name.
     constraints:
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
-        ``"s(x)"`` or ``"s(x, type=duchon, centers=8)"``; whitespace
-        differences are ignored). Values are one of ``"monotone_increasing"``,
-        ``"monotone_decreasing"``, ``"convex"``, ``"concave"``, or
-        ``"none"`` / ``None`` for the default unconstrained fit. Shape
-        constraints are enforced by the inner solver as joint linear
-        inequalities ``A·β ≥ b`` on the coefficient vector; when active at
-        convergence the outer REML score uses the tangent-projected LAML
-        formulation. This is the same functionality exposed by mgcv's
-        ``scop=...`` argument and the ``scam`` R library. Currently restricted
-        to univariate 1D B-spline / thin-plate / Duchon smooths.
+        ``"s(x)"`` or ``"s(x, k=12)"``; whitespace differences are ignored).
+        Values take the same forms as ``shape=`` in the formula: one of
+        ``"monotone_increasing"``, ``"monotone_decreasing"``, ``"convex"``,
+        ``"concave"``, or ``"none"`` / ``None`` for the default
+        unconstrained fit; a list of atoms that must all hold
+        (``["monotone_increasing", "concave"]``); or, for a ``te()`` term,
+        one entry per margin (``["monotone_increasing", None]``). The
+        mapping is rewritten into the formula option ``shape=...``. The
+        constraint is exact on the B-spline control polygon (``β = C·γ``
+        with ``γ ≥ 0`` for one shape, inequality rows ``A·β ≥ 0`` for a list
+        or a tensor margin), so it holds everywhere on the knot range, and
+        the term stays centred like an unconstrained smooth. Supported on
+        open 1-D B-spline ``s(x)`` smooths, ``te()`` tensor products of
+        them, and either of those with ``by=``; see ``docs/formulas.md``
+        (Shape-constrained smooths) and ``Smooth.shape_constraint``.
 
         Example::
 
@@ -881,24 +1014,24 @@ def fit(
                        constraints={"s(x)": "monotone_increasing"})
     config:
         Request fields that have no dedicated keyword, such as
-        ``group_metadata`` or ``precompute_conformal``. A key that
+        ``group_metadata``. A key that
         duplicates a dedicated keyword is refused.
     latents:
-        Mapping from formula symbol to :class:`gamfit.LatentCoord`. This is
+        Mapping from formula symbol to :class:`gamfit.smooth.LatentCoord`. This is
         the standard fit API surface for per-row latent coordinates. The Rust
         standard workflow maps the named formula smooth onto the latent
         coordinate matrix and optimizes it jointly with the REML parameters.
     penalties:
-        Analytic penalty wrappers such as :class:`gamfit.OrthogonalityPenalty`
-        or :class:`gamfit.ARDPenalty`, targeted at latent block names declared
+        Analytic penalty wrappers such as :class:`gamfit.penalties.OrthogonalityPenalty`
+        or :class:`gamfit.penalties.ARDPenalty`, targeted at latent block names declared
         in ``latents``. The Rust-backed public wrappers also
         include the SAE/assignment family
-        (:class:`gamfit.SoftmaxAssignmentSparsityPenalty`,
-        :class:`gamfit.OrderedBetaBernoulliPenalty`,
-        :class:`gamfit.TopKActivationPenalty`,
-        :class:`gamfit.SmoothThresholdPenalty`) and newer structured penalties such
-        as :class:`gamfit.ScadMcpPenalty` and
-        :class:`gamfit.NuclearNormPenalty`. ``penalties=`` is not for smooth
+        (:class:`gamfit.penalties.SoftmaxAssignmentSparsityPenalty`,
+        :class:`gamfit.penalties.OrderedBetaBernoulliPenalty`,
+        :class:`gamfit.penalties.TopKActivationPenalty`,
+        :class:`gamfit.penalties.SmoothThresholdPenalty`) and newer structured penalties such
+        as :class:`gamfit.penalties.ScadMcpPenalty` and
+        :class:`gamfit.penalties.NuclearNormPenalty`. ``penalties=`` is not for smooth
         basis descriptors; pass those through ``smooths=``.
     smooths:
         Optional mapping from formula symbol to :class:`gamfit.smooth.Smooth`
@@ -953,9 +1086,12 @@ def fit(
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
         # Python only marshals the mapping across the FFI.
+        from .smooth import shape_constraint_text
+
         try:
             formula = rust_module().apply_shape_constraints_to_formula(
-                formula, [(str(k), str(v)) for k, v in constraints.items()]
+                formula,
+                [(str(k), shape_constraint_text(v)) for k, v in constraints.items()],
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -978,6 +1114,7 @@ def fit(
             ("baseline_rate", baseline_rate),
             ("baseline_makeham", baseline_makeham),
             ("z_column", z_column),
+            ("residual_columns", residual_columns),
             ("link", link),
             ("slope_formula", slope_formula),
             ("frailty_kind", frailty_kind),
@@ -986,6 +1123,7 @@ def fit(
             ("noise_formula", noise_formula),
             ("noise_offset", noise_offset),
             ("flexible_link", flexible_link),
+            ("warm_start_from", warm_start_from),
         ]:
             if arg_val is not None:
                 raise ValueError(f"{arg_name} is not supported with response_geometry")
@@ -999,7 +1137,6 @@ def fit(
             coordinates=response_coordinates,
             reference=-1 if response_reference is None else int(response_reference),
             weights=weights,
-            persistent_warm_start_root=persistent_warm_start_root,
             fisher_rao_w=fisher_rao_w,
             scale_dimensions=scale_dimensions,
             firth=firth,
@@ -1011,6 +1148,7 @@ def fit(
             config=config,
         )
 
+    warm_start_bytes = _warm_start_model_bytes(warm_start_from)
     rust_config = dict(config or {})
     payload = _build_fit_payload(
         family=family,
@@ -1018,7 +1156,6 @@ def fit(
         expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
-        persistent_warm_start_root=persistent_warm_start_root,
         transformation_normal=transformation_normal,
         transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
@@ -1029,6 +1166,7 @@ def fit(
         baseline_rate=baseline_rate,
         baseline_makeham=baseline_makeham,
         z_column=z_column,
+        residual_columns=residual_columns,
         link=link,
         slope_formula=slope_formula,
         frailty_kind=frailty_kind,
@@ -1056,57 +1194,29 @@ def fit(
     headers, rows, table_kind = normalize_table(data, required_columns=required_columns)
     payload["training_table_kind"] = table_kind
 
-    # ── Vector-response (multinomial-logit) dispatch (#328). ──────────────
-    # The scalar `fit_table` payload pipeline is parameterised by a single
-    # `ResponseFamily × InverseLink` likelihood spec; multinomial-logit
-    # carries K-1 active linear predictors and a per-row dense Fisher block,
-    # which the scalar pipeline cannot represent. Routing here keeps the
-    # high-level Python API uniform — `gamfit.fit(data, formula,
-    # family='multinomial')` returns a `MultinomialModel` — while the
-    # underlying Rust entry is a dedicated formula→design→REML path that
-    # bypasses the workflow.rs `FitRequest::Standard` materialiser. The Rust
-    # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
-    # to select an independent smoothing parameter per (class, term), from the
-    # same `MultinomialFitRequest::new` defaults the CLI uses.
-    family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
-    if family_canonical in {
-        "multinomial",
-        "multinomial-logit",
-        "categorical",
-        "categorical-logit",
-        "softmax",
-    }:
-        try:
-            model_bytes = bytes(
-                rust_module().fit_multinomial_formula_pyfunc(
-                    headers,
-                    rows,
-                    formula,
-                    json.dumps(payload),
-                )
-            )
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        from ._model import MultinomialModel
-        return MultinomialModel(
-            _model_bytes=model_bytes,
-            _training_table_kind=table_kind,
-        )
-
     fisher_w = None
     if fisher_rao_w is not None:
         fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
     try:
         model_bytes = bytes(
-            rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
+            rust_module().fit_table(
+                headers, rows, formula, json.dumps(payload), fisher_w, warm_start_bytes
+            )
         )
     except Exception as exc:
         raise map_exception(exc) from exc
+    # `fit_table` routes the multinomial-logit family (every spelling the
+    # engine accepts) to its vector-response driver; the payload header names
+    # which model it built.
+    if rust_module().saved_model_kind(model_bytes) == "multinomial":
+        from ._model import MultinomialModel
+
+        return MultinomialModel(_model_bytes=model_bytes, _training_table_kind=table_kind)
     model = Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
     # Surface any materialization advisories (e.g. an mgcv-style "k reduced to
     # the data support" note when a cr/cs/sz basis is capped) as warnings, so a
     # basis the fit silently adjusted is never silent to the caller (#1543).
-    emit_inference_warnings(model.notes)
+    emit_inference_warnings(model._fit_notes()[0])
     return model
 
 
@@ -1117,10 +1227,9 @@ def fit_array(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
-    persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
@@ -1131,6 +1240,7 @@ def fit_array(
     baseline_rate: float | None = None,
     baseline_makeham: float | None = None,
     z_column: str | None = None,
+    residual_columns: Sequence[str] | None = None,
     link: str | None = None,
     slope_formula: str | None = None,
     frailty_kind: str | None = None,
@@ -1141,6 +1251,7 @@ def fit_array(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
@@ -1185,7 +1296,6 @@ def fit_array(
         expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
-        persistent_warm_start_root=persistent_warm_start_root,
         transformation_normal=transformation_normal,
         transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
@@ -1196,6 +1306,7 @@ def fit_array(
         baseline_rate=baseline_rate,
         baseline_makeham=baseline_makeham,
         z_column=z_column,
+        residual_columns=residual_columns,
         link=link,
         slope_formula=slope_formula,
         frailty_kind=frailty_kind,
@@ -1212,21 +1323,24 @@ def fit_array(
         smooths=smooths,
         config=rust_config or None,
     )
+    warm_start_bytes = _warm_start_model_bytes(warm_start_from)
     try:
         model_bytes = bytes(
-            rust_module().fit_array(X_arr, Y_arr, formula, json.dumps(payload))
+            rust_module().fit_array(
+                X_arr, Y_arr, formula, json.dumps(payload), None, warm_start_bytes
+            )
         )
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
-    emit_inference_warnings(model.notes)  # see fit(): never silently adjust a basis (#1543)
+    emit_inference_warnings(model._fit_notes()[0])  # see fit(): never silently adjust a basis (#1543)
     return model
 
 
 SUPPORT_SAE_SCHEMA = "gamfit.ManifoldSAE/support-v2"
 
 
-def model_from_dict(payload: Any) -> Any:
+def model_from_dict(payload: Any) -> ManifoldSAE | ManifoldSAESupport:
     """Rebuild a manifold-SAE from an already-decoded ``to_dict()`` payload.
 
     :func:`load` owns the on-disk case, where the schema tag is read out of the
@@ -1234,7 +1348,7 @@ def model_from_dict(payload: Any) -> Any:
     it in a pickle, a npz, or over a wire -- need the same tag dispatch without
     the sniff, and this is it. Reaching past this into a concrete class is what
     #2567 filed: an overcomplete (``K > P``) fit serializes under the support
-    tag, so ``ManifoldSAE.from_dict``, which is pinned to ``/v6``, rejects it.
+    tag, so ``ManifoldSAE.from_dict``, which is pinned to ``/v9``, rejects it.
 
     Parameters
     ----------
@@ -1257,8 +1371,8 @@ def model_from_dict(payload: Any) -> Any:
     return ManifoldSAE.from_dict(payload)
 
 
-def load(path: str | Path) -> Any:
-    """Load a fitted model previously written with :func:`gamfit.save`.
+def load(path: str | Path) -> LoadedModel:
+    """Load a fitted model previously written with its ``save(path)`` method.
 
     Reads the file and dispatches through :func:`loads`.
 
@@ -1280,22 +1394,7 @@ def load(path: str | Path) -> Any:
     return loads(Path(path).read_bytes())
 
 
-def save(model: Any, path: str | Path) -> None:
-    """Write a fitted model to ``path``. Symmetric with :func:`gamfit.load`.
-
-    Dispatches to ``model.save(path)`` for any object that exposes the method
-    (covers :class:`Model` binary archives and :class:`ManifoldSAE` JSON
-    payloads alike).
-    """
-    saver = getattr(model, "save", None)
-    if not callable(saver):
-        raise TypeError(
-            f"gamfit.save: {type(model).__name__} has no .save(path) method"
-        )
-    saver(path)
-
-
-def loads(model_bytes: bytes) -> Any:
+def loads(model_bytes: bytes) -> LoadedModel:
     """Load a fitted model from an in-memory bytes payload.
 
     The Rust ``saved_model_kind`` reads the payload header and selects the
@@ -1339,13 +1438,7 @@ def loads(model_bytes: bytes) -> Any:
             _model_bytes=model_bytes,
             _training_table_kind=str(metadata["training_table_kind"]),
         )
-    try:
-        training_table_kind = rust_module().required_saved_model_payload_string(
-            model_bytes, "training_table_kind"
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes, _training_table_kind=training_table_kind)
+    return Model(_model_bytes=model_bytes)
 
 
 def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeometryModel:
@@ -1363,7 +1456,13 @@ def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeomet
     from ._response_geometry import SharedGaussianRemlTangentFit
 
     def _model_from_b64(encoded: str) -> Model:
-        return loads(base64.b64decode(encoded.encode("ascii")))
+        model = loads(base64.b64decode(encoded.encode("ascii")))
+        if not isinstance(model, Model):
+            raise ValueError(
+                "response-geometry coordinate archive does not hold a scalar Model; "
+                f"got {type(model).__name__}"
+            )
+        return model
 
     models = tuple(
         _model_from_b64(encoded) for encoded in payload.get("coordinate_models_b64", [])
@@ -1405,10 +1504,9 @@ def validate_formula(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
-    persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
     transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
@@ -1419,6 +1517,7 @@ def validate_formula(
     baseline_rate: float | None = None,
     baseline_makeham: float | None = None,
     z_column: str | None = None,
+    residual_columns: Sequence[str] | None = None,
     link: str | None = None,
     slope_formula: str | None = None,
     frailty_kind: str | None = None,
@@ -1451,7 +1550,6 @@ def validate_formula(
         expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
-        persistent_warm_start_root=persistent_warm_start_root,
         transformation_normal=transformation_normal,
         transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
@@ -1462,6 +1560,7 @@ def validate_formula(
         baseline_rate=baseline_rate,
         baseline_makeham=baseline_makeham,
         z_column=z_column,
+        residual_columns=residual_columns,
         link=link,
         slope_formula=slope_formula,
         frailty_kind=frailty_kind,
@@ -1517,7 +1616,7 @@ def explain_error(exc: BaseException) -> str:
     --------
     >>> try:
     ...     gamfit.fit(df, "y ~ s(nope)")
-    ... except gamfit.GamError as exc:
+    ... except gamfit.errors.GamError as exc:
     ...     print(gamfit.explain_error(exc))
     Check the formula syntax and confirm every referenced column exists.
     """
@@ -1582,7 +1681,8 @@ def bspline_basis(
     ``knots`` may be:
 
     * ``None`` — auto-derive a clamped knot vector with quantile-spaced
-      interior knots inferred from ``t`` (10 interior knots).
+      interior knots, sized by the formula default, so the basis has the
+      columns ``s(x)`` builds on the same ``t``.
     * an ``int`` ``K`` — auto-derive with ``K`` interior knots.
     * an array-like — used verbatim (must be a valid clamped knot vector).
 
@@ -1675,8 +1775,9 @@ def duchon_basis(
     ----------
     points : array-like of shape (N, d) — N evaluation points in d-dim.
         For 1D, pass shape (N, 1) or a 1D array (auto-promoted).
-    centers : array-like of shape (K, d), or ``None`` (auto: K=10 quantile
-        centers for d=1), or an ``int`` K (auto-quantile centers, d=1 only).
+    centers : array-like of shape (K, d), or ``None`` (auto: the formula
+        ``duchon(x)`` default center count for d=1), or an ``int`` K
+        (auto-quantile centers, d=1 only).
     m : int, default 2 — spline order.
     periodic_per_axis : sequence of bool of length d, optional. For ``d=1``
         the Bernoulli-Green builder is used (true Green's function on the
@@ -2363,114 +2464,23 @@ def gaussian_reml_fit_batched_backward(
     return coerce_grad_payload(out)
 
 
-def _resolve_position_basis_inputs(
-    t: Any,
-    basis_kind: str | None,
-    knots_or_centers: Any,
-    penalty: Any | None,
-    *,
-    basis_order: int | None,
-    periodic: bool,
-    period: float | None = None,
-) -> tuple[str, str, int, Any, Any, Any, float | None]:
-    """Resolve the shared position-basis FFI inputs for every positions face.
-
-    All four position-based Gaussian REML entrypoints (forward / backward /
-    batched / batched-backward) opened with this identical preamble. Returns
-    ``(display_kind, effective_kind, order, t_np, knots_np, penalty_np,
-    eff_period)``. ``eff_period`` is the domain-wrap period the basis and penalty
-    must share: the explicit ``period`` when given, else (for periodic Duchon) a
-    value auto-derived from the resolved knots so the half-open grid wraps
-    cleanly (gam#580). The caller passes ``eff_period`` to the FFI basis build so
-    basis and penalty stay consistent.
-    """
-    import numpy as np
-
-    display_kind = str(basis_kind if basis_kind is not None else "bspline")
-    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
-    t_np = _numeric_vector(t, "t")
-    kind_norm = str(display_kind).strip().lower().replace("_", "").replace("-", "")
-    if periodic and effective_kind == "bspline" and (
-        knots_or_centers is None
-        or (isinstance(knots_or_centers, int) and not isinstance(knots_or_centers, bool))
+def _position_locations_arg(knots_or_centers: Any) -> Any:
+    """Marshal ``knots_or_centers``: ``None`` and an integer basis size pass
+    through, anything else becomes a float64 vector. The Rust owner resolves the
+    basis from it."""
+    if knots_or_centers is None or (
+        isinstance(knots_or_centers, int) and not isinstance(knots_or_centers, bool)
     ):
-        knots_np = _resolve_periodic_position_bspline_knots(
-            knots_or_centers,
-            t_np,
-            degree=order,
-            period=period,
-        )
-        eff_order = order
-    else:
-        knots_np, eff_order, _shrunk = _resolve_basis_locations(
-            knots_or_centers,
-            t_np,
-            basis_kind=effective_kind,
-            label="knots_or_centers",
-            degree=order,
-        )
-    # Resolve the effective wrap period for periodic Duchon. The period is the
-    # domain wrap, not the knot span: on a half-open grid the knots span only
-    # (period − one_spacing). When the caller gives no explicit period, derive it
-    # as span + one mean knot spacing so points near the two ends are a single
-    # spacing apart across the wrap (an undersized period gave a non-PSD Gram —
-    # gam#580). Non-periodic / non-Duchon bases ignore this.
-    eff_period = period
-    if periodic and period is None and kind_norm in {"duchon", "duchonspline", "thinplate", "thinplatespline", "tps"}:
-        k = np.asarray(knots_np, dtype=float)
-        if k.size >= 2:
-            span = float(k.max() - k.min())
-            mean_spacing = span / max(k.size - 1, 1)
-            eff_period = span + mean_spacing
-    # Auto-knot derivation may downgrade the degree for small n (#340); the
-    # resolved knot vector is clamped for ``eff_order``, so the penalty and the
-    # downstream FFI basis build must both use the effective order to stay
-    # consistent with it.
-    penalty_np = _resolve_position_penalty(
-        penalty,
-        knots_np,
-        basis_kind=display_kind,
-        basis_order=eff_order,
-        periodic=periodic,
-        period=eff_period,
-    )
-    return display_kind, effective_kind, eff_order, t_np, knots_np, penalty_np, eff_period
+        return knots_or_centers
+    return _numeric_vector(knots_or_centers, "knots_or_centers")
 
 
-def _resolve_periodic_position_bspline_knots(
-    count: Any,
-    t_arr: Any,
-    *,
-    degree: int,
-    period: float | None,
-) -> Any:
-    """Resolve count-based periodic position B-splines to K cyclic controls.
-
-    ``gaussian_reml_fit_positions(..., periodic=True)`` documents integer
-    ``knots_or_centers`` as a basis count. The Rust position kernel accepts an
-    explicit half-open knot/control grid and derives ``num_basis = len(grid)-1``.
-    Therefore the public count K must become K+1 grid endpoints, not the open
-    B-spline auto-knot vector used by non-periodic fits.
-    """
-    import numpy as np
-
-    degree_i = int(degree)
-    k = int(_DEFAULT_BASIS_K if count is None else count)
-    if k < degree_i + 1:
-        raise ValueError(
-            "periodic B-spline position basis count must be at least "
-            f"degree + 1 (got {k} for degree {degree_i})"
-        )
-    if period is None:
-        raise ValueError("periodic B-spline position fits require a finite positive period")
-    period_f = float(period)
-    if not np.isfinite(period_f) or period_f <= 0.0:
-        raise ValueError(f"period must be finite and positive, got {period}")
-    t_np = np.asarray(t_arr, dtype=float)
-    if t_np.size == 0:
-        raise ValueError("t must contain at least one value")
-    origin = float(np.min(t_np))
-    return np.linspace(origin, origin + period_f, k + 1, dtype=float)
+def _position_penalty_arg(penalty: Any | None) -> Any:
+    """Marshal ``penalty``: ``None`` and a penalty name pass through, anything
+    else becomes a float64 matrix."""
+    if penalty is None or isinstance(penalty, str):
+        return penalty
+    return _numeric_matrix(penalty, "penalty")
 
 
 def gaussian_reml_fit_positions(
@@ -2490,34 +2500,26 @@ def gaussian_reml_fit_positions(
 ) -> dict[str, Any]:
     """Fit closed-form Gaussian REML from 1D positions and an internal basis.
 
-    ``knots_or_centers`` may be ``None``, an ``int`` (basis count), or an
-    array; the basis-location vector is auto-derived from ``t`` when not
-    supplied. ``penalty`` may be ``None`` for a neutral identity ridge of
-    matching size.
+    ``knots_or_centers`` may be ``None``, an ``int`` (basis size), or an
+    array; an omitted size takes the formula front door's default for the
+    same basis on ``t``. ``penalty`` may be ``None`` (the basis's canonical
+    single-λ penalty), its name, or an explicit matrix. The Rust engine
+    resolves the basis, and the result carries the resolved
+    ``knots_or_centers``, ``penalty``, ``basis_kind``, ``basis_order``,
+    ``periodic`` and ``period`` so the same basis can be replayed.
     """
     import numpy as np
 
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
-            str(effective_kind),
-            knots_np,
-            penalty_np,
-            order,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2525,15 +2527,7 @@ def gaussian_reml_fit_positions(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return _attach_basis_state(
-        _coerce_gaussian_reml_payload(out, np),
-        knots_or_centers=knots_np,
-        penalty=penalty_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
-        period=period,
-    )
+    return _coerce_gaussian_reml_payload(out, np)
 
 
 def gaussian_reml_fit_positions_backward(
@@ -2559,27 +2553,16 @@ def gaussian_reml_fit_positions_backward(
 ) -> dict[str, Any]:
     """Run the analytic VJP for ``gaussian_reml_fit_positions`` outputs.
 
-    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
-    defaults as :func:`gaussian_reml_fit_positions`.
+    ``knots_or_centers`` and ``penalty`` accept the same forms and defaults
+    as :func:`gaussian_reml_fit_positions`.
     """
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions_backward(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
-            str(effective_kind),
-            knots_np,
-            penalty_np,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
             float(grad_lambda),
             None
             if grad_coefficients is None
@@ -2588,9 +2571,9 @@ def gaussian_reml_fit_positions_backward(
             float(grad_reml_score),
             float(grad_edf),
             forward_state,
-            order,
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2619,34 +2602,23 @@ def gaussian_reml_fit_positions_batched(
 ) -> dict[str, Any]:
     """Fit packed ragged closed-form Gaussian REML problems from positions.
 
-    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
-    defaults as :func:`gaussian_reml_fit_positions`. The basis locations
-    are inferred from the concatenated positions across all groups.
+    ``knots_or_centers`` and ``penalty`` accept the same forms and defaults
+    as :func:`gaussian_reml_fit_positions`. The basis locations are placed on
+    the concatenated positions across all groups.
     """
     import numpy as np
 
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
             _index_vector(row_offsets, "row_offsets"),
-            str(effective_kind),
-            knots_np,
-            penalty_np,
-            order,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2654,15 +2626,7 @@ def gaussian_reml_fit_positions_batched(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return _attach_basis_state(
-        _coerce_gaussian_reml_payload(out, np),
-        knots_or_centers=knots_np,
-        penalty=penalty_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
-        period=period,
-    )
+    return _coerce_gaussian_reml_payload(out, np)
 
 
 def gaussian_reml_fit_positions_batched_backward(
@@ -2689,30 +2653,19 @@ def gaussian_reml_fit_positions_batched_backward(
 ) -> dict[str, Any]:
     """Run the analytic VJP for packed position-based Gaussian REML fits.
 
-    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
-    defaults as :func:`gaussian_reml_fit_positions_batched`.
+    ``knots_or_centers`` and ``penalty`` accept the same forms and defaults
+    as :func:`gaussian_reml_fit_positions_batched`.
     """
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
-        _resolve_position_basis_inputs(
-            t,
-            basis_kind,
-            knots_or_centers,
-            penalty,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-        )
-    )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched_backward(
-            t_np,
+            _numeric_vector(t, "t"),
             _numeric_matrix(y, "y"),
             offsets,
-            str(effective_kind),
-            knots_np,
-            penalty_np,
+            basis_kind,
+            _position_locations_arg(knots_or_centers),
+            _position_penalty_arg(penalty),
             _optional_batch_vector(grad_lambda, batch, "grad_lambda"),
             None
             if grad_coefficients is None
@@ -2721,9 +2674,9 @@ def gaussian_reml_fit_positions_batched_backward(
             _optional_batch_vector(grad_reml_score, batch, "grad_reml_score"),
             _optional_batch_vector(grad_edf, batch, "grad_edf"),
             forward_state,
-            order,
+            basis_order,
             bool(periodic),
-            None if eff_period is None else float(eff_period),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2766,7 +2719,7 @@ def gaussian_reml_fit_latent(
     :func:`gaussian_reml_optimize_latent`, which wraps this solve in a
     spectral-seeded outer optimization over ``t``.
 
-    This is the low-level array API behind :class:`gamfit.LatentCoord`: each
+    This is the low-level array API behind :class:`gamfit.smooth.LatentCoord`: each
     row has a latent coordinate ``t_n ∈ R^d`` and the fitted mean is
 
     .. math::
@@ -3023,7 +2976,7 @@ def gaussian_reml_optimize_latent(
 
     A fit is only ever returned from a *converged* optimization (SPEC rule 20).
     If the relative stationarity measure does not reach ``grad_tol`` within the
-    iteration budget, this raises :class:`gamfit.RemlConvergenceError` instead
+    iteration budget, this raises :class:`gamfit.errors.RemlConvergenceError` instead
     of returning a degraded payload. The exception carries the evidence as
     attributes (``grad_t_norm``, ``grad_t_norm_init``, ``grad_t_norm_scaled``,
     ``grad_tol``, ``latent_t_std``, ``objective_value``, ``max_iter``,
@@ -3661,17 +3614,6 @@ def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
     return out
 
 
-def _position_basis_order(basis_kind: str, basis_order: int | None) -> int:
-    if basis_order is not None:
-        order = int(basis_order)
-    else:
-        normalized = basis_kind.strip().lower().replace("_", "").replace("-", "")
-        order = 2 if normalized in {"duchon", "duchonspline"} else 3
-    if order < 1:
-        raise ValueError("basis_order must be at least 1")
-    return order
-
-
 def _optional_batch_vector(values: Any | None, batch: int, label: str) -> Any | None:
     import numpy as np
 
@@ -3774,48 +3716,31 @@ def _numeric_array(values: Any, label: str) -> Any:
     return arr
 
 
-# Default number of basis functions when the caller does not pin centers /
-# knots themselves. Matches mgcv's ``k = 10`` convention. The actual
-# placement (quantile knots, equal-mass centers, boundary clamping, ...)
-# is performed by the Rust engine; Python only forwards the request.
-_DEFAULT_BASIS_K = 10
-
-
 def _resolve_centers(centers: Any, t_arr: Any, *, label: str = "centers") -> Any:
-    """Coerce ``centers`` (None / int / array) into a 1D float64 array.
+    """Resolve ``centers`` (None / int / array) into a 1D float64 center vector.
 
-    Auto-derivation delegates to the Rust ``auto_centers_1d`` FFI export so
-    Python never reimplements basis-placement logic.
+    ``None`` takes the formula front door's 1-D Duchon default on ``t``; the
+    Rust ``resolve_basis_locations_1d`` export owns the placement.
     """
-    if centers is None:
-        return _numpy_module().asarray(
-            rust_module().auto_centers_1d(t_arr, int(_DEFAULT_BASIS_K)),
-            dtype=float,
+    try:
+        locations, _order, _shrunk = rust_module().resolve_basis_locations_1d(
+            t_arr, "duchon", centers
         )
-    if isinstance(centers, int) and not isinstance(centers, bool):
-        if centers < 2:
-            raise ValueError(f"{label}: integer count must be >= 2, got {centers}")
-        return _numpy_module().asarray(
-            rust_module().auto_centers_1d(t_arr, int(centers)),
-            dtype=float,
-        )
-    return _numeric_vector(centers, label)
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _numpy_module().asarray(locations, dtype=float)
 
 
 class _ResolvedBasisLocations(NamedTuple):
     """Outcome of resolving a basis-location argument (knots or centers).
 
-    ``order`` is the spline *degree* (B-spline) or *m*-order (Duchon) that the
-    ``locations`` vector was actually built for. For auto-derived B-spline
-    knots it can differ from the requested degree: the Rust engine auto-shrinks
-    cubic → quadratic → linear when ``n`` is too small (issue #340), and the
-    clamped knot vector then carries boundary multiplicity ``order + 1``.
-    Evaluating it with any other degree fails ("insufficient knots") or breaks
-    the partition-of-unity, so callers MUST use this effective ``order`` for
-    every downstream basis/penalty build rather than the requested one.
+    ``order`` is the spline *degree* the ``locations`` vector was actually
+    built for. For auto-derived open knots it can be lower than the requested
+    degree: the Rust engine auto-shrinks cubic → quadratic → linear when ``n``
+    is too small (issue #340), and callers MUST use this effective ``order``
+    for every downstream basis/penalty build rather than the requested one.
 
-    ``shrunk`` is ``True`` iff the auto-shrink reduced the requested
-    ``(degree, num_internal_knots)``.
+    ``shrunk`` is ``True`` iff the auto-shrink reduced the request.
     """
 
     locations: Any
@@ -3831,74 +3756,24 @@ def _resolve_knots(
     degree: int = 3,
     periodic: bool = False,
 ) -> _ResolvedBasisLocations:
-    """Coerce ``knots`` (None / int / array) into a resolved knot vector.
+    """Resolve ``knots`` (None / int / array) into a knot vector or cyclic grid.
 
-    Open (``periodic=False``) auto-derivation delegates to the Rust
-    ``auto_knots_1d`` FFI export, which returns ``(knots, effective_degree,
-    num_internal_knots, shrunk)`` (issue #340). We surface the knot vector
-    together with the **effective** degree so the auto-shrink decision stays
-    consistent with downstream evaluation; the explicit-array path passes the
-    requested degree straight through unshrunk.
-
-    Periodic auto-derivation builds the uniform cyclic grid the Rust periodic
-    evaluator consumes — ``num_basis + 1`` equally spaced points over
-    ``[min(t), max(t)]``, one cyclic control per interval — with ``num_basis =
-    K + degree + 1`` for an integer ``K`` (the ``cyclic(x, knots=K)`` formula
-    convention, so ``K`` names the same dimension it does for an open basis).
-    It used to hand the periodic evaluator the CLAMPED OPEN vector, whose
-    ``2 * (degree + 1)`` repeated endpoints were then counted as ``2 * degree
-    + 1`` extra cyclic controls: ``knots=8, degree=3`` silently became a
-    15-function basis.
+    The Rust ``resolve_basis_locations_1d`` export owns the placement: ``None``
+    takes the formula front door's default for ``s(x)`` / ``cyclic(x)`` on
+    ``t``, an integer ``K`` names the interior-knot count (``K + degree + 1``
+    functions, open or cyclic), and an explicit array is used as given.
     """
-    degree_i = int(degree)
-    if degree_i < 0:
+    if int(degree) < 0:
         raise ValueError(f"{label}: degree must be non-negative, got {degree}")
-    if knots is None or (isinstance(knots, int) and not isinstance(knots, bool)):
-        if knots is None:
-            requested_internal = int(_DEFAULT_BASIS_K)
-        else:
-            if knots < 0:
-                raise ValueError(
-                    f"{label}: integer interior-knot count must be >= 0, got {knots}"
-                )
-            requested_internal = int(knots)
-        if periodic:
-            grid = _periodic_uniform_grid(
-                t_arr, requested_internal + degree_i + 1, label=label
-            )
-            return _ResolvedBasisLocations(grid, degree_i, False)
-        knot_vec, eff_degree, _eff_internal, shrunk = rust_module().auto_knots_1d(
-            t_arr, requested_internal, degree_i
+    try:
+        locations, order, shrunk = rust_module().resolve_basis_locations_1d(
+            t_arr, "bspline", knots, int(degree), bool(periodic)
         )
-        return _ResolvedBasisLocations(
-            _numpy_module().asarray(knot_vec, dtype=float),
-            int(eff_degree),
-            bool(shrunk),
-        )
-    return _ResolvedBasisLocations(_numeric_vector(knots, label), degree_i, False)
-
-
-def _periodic_uniform_grid(t_arr: Any, num_basis: int, *, label: str) -> Any:
-    """``num_basis + 1`` equally spaced grid points spanning ``[min(t), max(t)]``.
-
-    The Rust periodic B-spline evaluator (``bspline_basis(..., periodic=True)``)
-    reads a knot vector as a cyclic lattice: ``len(knots) - 1`` uniform
-    intervals of the closed domain, one cyclic control per interval. The domain
-    is the evaluated range, as it always was for the auto-derived periodic
-    path; pass an explicit grid to fix a different period.
-    """
-    np = _numpy_module()
-    t_np = np.asarray(t_arr, dtype=float).reshape(-1)
-    if t_np.size == 0:
-        raise ValueError(f"{label}: cannot derive a periodic domain from empty t")
-    lo = float(np.min(t_np))
-    hi = float(np.max(t_np))
-    if not (np.isfinite(lo) and np.isfinite(hi)) or not hi > lo:
-        raise ValueError(
-            f"{label}: periodic auto-knots need a positive finite range of t, "
-            f"got [{lo}, {hi}]"
-        )
-    return np.linspace(lo, hi, int(num_basis) + 1, dtype=float)
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _ResolvedBasisLocations(
+        _numpy_module().asarray(locations, dtype=float), int(order), bool(shrunk)
+    )
 
 
 def _numpy_module() -> Any:
@@ -3906,202 +3781,6 @@ def _numpy_module() -> Any:
     import numpy as np
 
     return np
-
-
-def _resolve_basis_locations(
-    arg: Any,
-    t_arr: Any,
-    *,
-    basis_kind: str,
-    label: str = "knots_or_centers",
-    degree: int = 3,
-) -> _ResolvedBasisLocations:
-    """Resolve the basis-location argument for kind-dispatched primitives.
-
-    Mirrors :func:`_resolve_centers` for ``basis_kind == "duchon"`` and
-    :func:`_resolve_knots` for B-spline-like kinds.
-    """
-    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
-    if kind in {"duchon", "duchonspline"}:
-        # Duchon centers carry no degree concept and are never auto-shrunk, so
-        # the requested order passes straight through.
-        return _ResolvedBasisLocations(
-            _resolve_centers(arg, t_arr, label=label), int(degree), False
-        )
-    return _resolve_knots(arg, t_arr, label=label, degree=degree)
-
-
-def _attach_basis_state(
-    payload: dict[str, Any],
-    *,
-    knots_or_centers: Any,
-    penalty: Any,
-    basis_kind: str,
-    basis_order: int,
-    periodic: bool,
-    period: float | None,
-) -> dict[str, Any]:
-    """Embed the resolved basis state in a REML position-fit payload.
-
-    The keys ``knots_or_centers``, ``penalty``, ``basis_kind``,
-    ``basis_order``, ``periodic``, and ``period`` are added so a caller
-    can replay the exact same basis at predict time without recomputing
-    anything — pass them straight back into ``duchon_basis`` or
-    ``bspline_basis``.
-    """
-    payload["knots_or_centers"] = knots_or_centers
-    payload["penalty"] = penalty
-    payload["basis_kind"] = str(basis_kind)
-    payload["basis_order"] = int(basis_order)
-    payload["periodic"] = bool(periodic)
-    payload["period"] = None if period is None else float(period)
-    return payload
-
-
-def _resolve_position_penalty(
-    penalty: Any | None,
-    knots_or_centers: Any,
-    *,
-    basis_kind: str,
-    basis_order: int,
-    periodic: bool,
-    period: float | None = None,
-) -> Any:
-    """Resolve the canonical single-λ penalty for position-based REML helpers.
-
-    These helpers fit ONE smoothing ``λ`` against a position-indexed design,
-    so each basis maps to a single SPD penalty matrix. Power users can
-    override with an explicit matrix in ``penalty``; the string form selects
-    a non-default canonical penalty for the same basis.
-
-    Basis → default single-λ penalty:
-
-    * ``"duchon"``  → single-λ smoothness penalty for the cubic basis
-      (:func:`duchon_function_norm_penalty`). This is the convenience single-λ
-      object, **not** the multi-λ structural smoother. For the amplitude/slope/
-      curvature smoother with three separate REML ``λ``s — the object the
-      formula API and :class:`gamfit.smooth.Duchon` fit — use the formula
-      smooth; there is no way to express three independent ``λ``s through this
-      single-penalty position helper.
-    * ``"thinplate"`` (1D ``t``) → 1D thin-plate ≡ cubic smoothing spline,
-      routed through the cubic-basis single-λ penalty at ``m=2``.
-    * ``"bspline"``  → exact integrated second-derivative roughness of the
-      represented B-spline basis (open or periodic).
-    """
-    import numpy as np
-
-    if isinstance(penalty, str):
-        penalty_kind = str(penalty).strip().lower().replace("_", "-")
-    else:
-        penalty_kind = None
-
-    if isinstance(penalty, str) or penalty is None:
-        kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
-        if kind in {"duchon", "duchonspline"}:
-            if penalty_kind in {None, "function-norm", "functionnorm", "rkhs", "smoothness"}:
-                return duchon_function_norm_penalty(
-                    np.asarray(knots_or_centers, dtype=float).reshape(-1, 1),
-                    m=int(basis_order),
-                    periodic_per_axis=[True] if periodic else None,
-                    # Honor the explicit domain-wrap period so the periodic Gram
-                    # matches the basis (both now use the same period). Passing
-                    # None here auto-derived the center span and produced a
-                    # non-PSD penalty (gam#580).
-                    period=period,
-                )
-            if penalty_kind in {"triple-operator", "tripleoperator", "operator"}:
-                raise ValueError(
-                    "the triple-operator (amplitude + slope + curvature) penalty has THREE "
-                    "independent REML smoothing parameters and cannot be collapsed into the "
-                    "single-λ position helper. Fit it through the formula API "
-                    "(gamfit.smooth.Duchon / basis_kind='duchon'), which routes each operator "
-                    "to its own λ."
-                )
-            raise ValueError(f"unsupported Duchon penalty {penalty!r}")
-        if kind in {"duchonmultipenalty", "duchontripleoperator"}:
-            # The amplitude/slope/curvature smoother has THREE independent REML
-            # smoothing parameters; summing the three operators into one matrix
-            # here would force them to share a single λ, which is a different
-            # (and weaker) object than the structural smoother. The position
-            # helper only carries one λ, so there is no faithful single-matrix
-            # representation — route the user to the formula smooth instead.
-            raise ValueError(
-                "basis_kind='duchon_multipenalty' is the multi-λ amplitude/slope/curvature "
-                "smoother and cannot be expressed as a single position-helper penalty. Fit it "
-                "through the formula API (gamfit.smooth.Duchon / basis_kind='duchon'), which "
-                "gives each operator its own REML λ."
-            )
-        if kind in {"bspline", "spline"}:
-            if penalty_kind not in {
-                None,
-                "roughness",
-                "bending-energy",
-                "bendingenergy",
-            }:
-                raise ValueError(f"unsupported B-spline penalty {penalty!r}")
-            if periodic:
-                knots = np.asarray(knots_or_centers, dtype=float)
-                k = int(knots.size - 1)
-                effective_period = (
-                    float(period)
-                    if period is not None
-                    else float(knots[-1] - knots[0])
-                )
-                return np.asarray(
-                    rust_module().cyclic_bspline_roughness_penalty(
-                        k,
-                        int(basis_order),
-                        effective_period,
-                        2,
-                    ),
-                    dtype=float,
-                )
-            s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
-            return s
-        if kind in {"thinplate", "thinplatespline", "tps"}:
-            # 1D thin-plate spline = cubic smoothing spline = Duchon m=2 with
-            # bending-energy ``∫(f'')² dx``. Position-API positions are 1D,
-            # so route the bending-energy penalty through the Duchon m=2
-            # function-norm helper rather than the multi-dimensional thin-plate
-            # path (which expects 2D centers and a different kernel).
-            if penalty_kind not in {None, "function-norm", "functionnorm", "bending-energy", "bendingenergy"}:
-                raise ValueError(f"unsupported thin-plate penalty {penalty!r}")
-            return duchon_function_norm_penalty(
-                np.asarray(knots_or_centers, dtype=float).reshape(-1, 1),
-                m=2,
-                periodic_per_axis=[True] if periodic else None,
-                period=None,
-            )
-    return _numeric_matrix(penalty, "penalty")
-
-
-def _normalize_position_basis(
-    basis_kind: str,
-    basis_order: int | None,
-) -> tuple[str, int, str]:
-    """Resolve user-facing basis names to the engine's basis kind + order.
-
-    Returns ``(effective_kind, effective_order, display_kind)``.
-
-    * ``thinplate`` (1D positions): an alias for Duchon ``m=2`` — the cubic
-      smoothing spline is the canonical 1D thin-plate spline.
-
-    ``duchon_multipenalty`` is rejected here: the amplitude/slope/curvature
-    smoother carries three independent REML ``λ``s and has no single-λ
-    position-helper form — fit it through the formula API instead.
-    """
-    raw = str(basis_kind)
-    kind = raw.strip().lower().replace("_", "").replace("-", "")
-    if kind in {"thinplate", "thinplatespline", "tps"}:
-        order = 2 if basis_order is None else int(basis_order)
-        return ("duchon", order, raw)
-    if kind in {"duchonmultipenalty", "duchontripleoperator"}:
-        raise ValueError(
-            "basis_kind='duchon_multipenalty' is the multi-λ amplitude/slope/curvature "
-            "smoother and has no single-λ position-helper representation. Fit it through the "
-            "formula API (gamfit.smooth.Duchon / basis_kind='duchon')."
-        )
-    return (raw, _position_basis_order(raw, basis_order), raw)
 
 
 def _numeric_tensor3(values: Any, label: str) -> Any:

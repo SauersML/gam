@@ -280,9 +280,9 @@ fn assert_selected_fit_keeps_smoothing_corrected_covariance(inverse_link: Invers
         .as_ref()
         .expect("penalized survival fit must publish an inference block");
     assert!(
-        inference.beta_covariance_corrected.is_some(),
-        "#2677: the CLI saved-model path reads `beta_covariance_corrected`; a fit that has \
-         `covariance_corrected` but no inference copy still refuses `--covariance-mode corrected`"
+        fit.covariance_corrected.is_some(),
+        "#2677: the CLI saved-model path reads the corrected covariance; a fit that selected \
+         lambda without publishing it refuses `--covariance-mode corrected`"
     );
     assert!(
         inference.smoothing_correction.is_some()
@@ -290,7 +290,7 @@ fn assert_selected_fit_keeps_smoothing_corrected_covariance(inverse_link: Invers
         "the correction term and its typed provenance must survive finalization together"
     );
     assert!(
-        inference.beta_standard_errors_corrected.is_some(),
+        fit.beta_standard_errors_corrected().is_some(),
         "corrected marginal SEs must be published alongside the corrected covariance"
     );
 }

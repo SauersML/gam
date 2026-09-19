@@ -110,6 +110,23 @@ pub struct PenaltySubspaceTrace {
 }
 
 impl PenaltySubspaceTrace {
+    /// The forward error of the `log|H|` a criterion built on `operator_bound`'s
+    /// factor and this kernel carries (#2954). Where the kernel replaces the
+    /// operator's determinant (`logdet_correction ≠ 0`) the criterion's `log|H|`
+    /// is the kernel's pseudo-determinant, which carries no derived bound, so
+    /// there is none and a certificate takes no Newton-decrement verdict: the
+    /// operator's bound prices a determinant the criterion does not read.
+    /// Otherwise the operator's bound stands.
+    pub fn determinant_forward_error(&self, operator_bound: Option<f64>) -> Option<f64> {
+        if self.logdet_correction != 0.0 {
+            None
+        } else {
+            operator_bound
+        }
+    }
+}
+
+impl PenaltySubspaceTrace {
     /// Compute `tr(K · A)` where `K = U_S · h_proj_inverse · U_Sᵀ` — the
     /// pseudo-logdet trace kernel (see the struct doc for the two producer
     /// forms and their exactness domains).
@@ -354,7 +371,7 @@ impl PenaltySubspaceTrace {
         // NumPy/LAPACK convention and exactly what Codex flagged as
         // necessary in the math review.
         let (evals, evecs) = m.eigh(faer::Side::Lower).unwrap_or_else(|err| {
-            log::debug!(
+            log::trace!(
                 "penalty coordinate: {k_active}x{k_active} eigendecomposition failed ({err}); \
                      falling back to a zero spectrum in the identity basis"
             );
@@ -378,7 +395,7 @@ impl PenaltySubspaceTrace {
             }
         }
         if dropped > 0 {
-            log::debug!(
+            log::trace!(
                 "[constrained-subspace kernel] dropped {} of {} active-constraint directions \
                  (rank-deficient on range(S₊)); pseudo-inverse threshold = {:.3e}",
                 dropped,
@@ -557,6 +574,19 @@ impl<'s> ThetaModeResponseKernel<'s> {
         }
     }
 
+    /// The span this kernel inverts its operator over and the eigenvalues it divides by there
+    /// (gam#2765). The lifted constrained arm inverts `U_Sᵀ M U_S` over the penalty subspace;
+    /// `K_T` only projects that further, so its spectrum is read there. The full-solve arm asks its
+    /// operator ([`HessianFactorization::inverted_span`]); on an active face that is the
+    /// tangent-projected operator the evaluation recursed onto. `None` for an operator that names
+    /// no span.
+    pub(crate) fn inverted_span(&self) -> Option<InvertedSpan> {
+        match self.constrained.as_ref() {
+            Some(ck) => InvertedSpan::from_reduced_inverse(&ck.kernel.u_s, &ck.kernel.h_proj_inverse),
+            None => self.hop.inverted_span(),
+        }
+    }
+
     /// Per-atom certify body (#934 FD-self-audit pattern, applied as an
     /// exact structural invariant): every constrained emission must lie in
     /// `ker(A_act)` — `A_act · v = 0` is the defining property of `K_T`'s
@@ -580,7 +610,7 @@ impl<'s> ThetaModeResponseKernel<'s> {
                 .map(|(a, x)| (a * x).abs())
                 .sum();
             if r.abs() > THETA_MODE_RESPONSE_TANGENCY_GATE * (scale + f64::EPSILON) {
-                log::warn!(
+                log::debug!(
                     "[CERTIFICATE warning] atom \"theta_mode_response\": constrained IFT \
                      mode response left ker(A_act) — active row {row} residual {:.3e} \
                      exceeds gate {:.1e}·{:.3e}; the lifted kernel K_T and its emission \
@@ -592,6 +622,146 @@ impl<'s> ThetaModeResponseKernel<'s> {
             }
         }
     }
+}
+
+/// An orthonormal `p × r` basis `B` and the eigenvalues `σ` a mode-response kernel divides by on
+/// it, `K = B · diag(1/σ) · Bᵀ` (gam#2765).
+pub struct InvertedSpan {
+    pub(crate) basis: Array2<f64>,
+    pub(crate) eigenvalues: Vec<f64>,
+}
+
+impl InvertedSpan {
+    /// The active eigenpairs of an exact dense spectral operator, with the regularized eigenvalues
+    /// its `solve` divides by.
+    pub(crate) fn from_dense_spectral(op: &DenseSpectralOperator) -> Option<Self> {
+        let active: Vec<usize> = (0..op.n_dim).filter(|&j| op.active_mask[j]).collect();
+        if active.is_empty() {
+            return None;
+        }
+        Some(Self {
+            basis: op.eigenvectors.select(ndarray::Axis(1), &active),
+            eigenvalues: active.iter().map(|&j| op.reg_eigenvalues[j]).collect(),
+        })
+    }
+
+    /// From the dense matrix a factorization inverts: its full eigendecomposition.
+    pub(crate) fn from_symmetric(matrix: &Array2<f64>) -> Option<Self> {
+        match matrix.eigh(faer::Side::Lower) {
+            Ok((values, vectors)) if !values.is_empty() => Some(Self {
+                basis: vectors,
+                eigenvalues: values.to_vec(),
+            }),
+            Ok(_) => None,
+            Err(err) => {
+                log::debug!(
+                    "[inner-mode fold] the mode-response operator's dense form does not decompose \
+                     ({err}); this mode is not graded for a fold"
+                );
+                None
+            }
+        }
+    }
+
+    /// From a reduced kernel `U · H⁻¹ · Uᵀ`: the eigenvalues divided by are the reciprocals of
+    /// `H⁻¹`'s. A reduced inverse that does not decompose names no span.
+    fn from_reduced_inverse(u: &Array2<f64>, reduced_inverse: &Array2<f64>) -> Option<Self> {
+        match reduced_inverse.eigh(faer::Side::Lower) {
+            Ok((inverse_values, inverse_vectors)) if !inverse_values.is_empty() => Some(Self {
+                basis: u.dot(&inverse_vectors),
+                eigenvalues: inverse_values.iter().map(|value| value.recip()).collect(),
+            }),
+            Ok(_) => None,
+            Err(err) => {
+                log::debug!(
+                    "[inner-mode fold] the reduced kernel does not decompose ({err}); this mode is \
+                     not graded for a fold"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// `t₃ = vᵀ D_β M[v] v` along a unit `v`, at the provider's curvature scale, where `M` is the complete
+/// operator the mode response inverts (gam#2765). A provider that declares no corrections has a
+/// curvature that does not move with `β`, so its drift is zero and is not requested. Otherwise
+/// `hessian_derivative_correction(v) = −D_β M_logdet[v]` is applied along `v` without materializing
+/// it, and `mode_response_rhs_correction` adds the motion `D_β C[−v]·v` of the stationarity
+/// operator's difference `C` from the log-determinant operator, with the same sign and scale; with
+/// no outer coordinate named it carries no explicit partial. When that difference moves but the
+/// provider declares its motion not supplied, `t₃` is the log-determinant operator's share alone
+/// and says so ([`CompletionShare::NotSupplied`]).
+pub fn inner_mode_third_derivative(
+    provider: &dyn HessianDerivativeProvider,
+    direction: &Array1<f64>,
+) -> Result<(f64, CompletionShare), String> {
+    let mut image = Array1::<f64>::zeros(direction.len());
+    if provider.has_corrections()
+        && let Some(correction) = provider.hessian_derivative_correction_result(direction)?
+    {
+        image += &correction.apply(direction);
+    }
+    let completion = match provider.mode_response_rhs_correction() {
+        None => CompletionShare::Priced,
+        Some(_) if !provider.mode_response_rhs_correction_supplied() => CompletionShare::NotSupplied,
+        Some(correction) => {
+            image += &correction(None, None, direction, direction)?;
+            CompletionShare::Priced
+        }
+    };
+    Ok((-direction.dot(&image), completion))
+}
+
+/// The inner mode's Laplace validity along its softest direction ([`InnerModeFold`], gam#2765,
+/// gam#979). `span` is what the mode response inverts; `curvature_scale` is the uniform scale that
+/// operator and `third_along` both carry (`InnerSolution::rho_curvature_scale`); `third_along(v)`
+/// returns `vᵀ D_β M[v] v` at that scale for a unit `v`. The softest eigenpair is the smallest
+/// signed eigenvalue, so a span that is not positive definite is refused by the rounding band
+/// before any derivative is priced.
+///
+/// The verdict reads `σ` against the band alone. `t₃` and its cubic share are priced only when
+/// `third_along` is given; without it a resolved curvature is admitted with no record of them. The
+/// unified evaluator passes `None`: `t₃` is one directional drift of the log-determinant operator,
+/// a full row pass on every evaluation, and no consumer of an evaluation reads it (#979).
+pub(crate) fn grade_inner_mode_fold(
+    span: &InvertedSpan,
+    curvature_scale: f64,
+    third_along: Option<&dyn Fn(&Array1<f64>) -> Result<(f64, CompletionShare), String>>,
+) -> Result<InnerModeFold, String> {
+    let softest = span
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+        .ok_or_else(|| "the span the mode response inverts is empty".to_string())?;
+    let sigma = span.eigenvalues[softest] / curvature_scale;
+    let rounding_band =
+        gam_linalg::roundoff::symmetric_spectrum_rounding_band(&span.eigenvalues) / curvature_scale;
+    let third_along = match third_along {
+        Some(third_along) if sigma > rounding_band => third_along,
+        _ => {
+            return Ok(InnerModeFold {
+                sigma,
+                rounding_band,
+                third_derivative: None,
+                cubic_correction: None,
+                quartic_correction: QuarticShare::NotPriced,
+                completion: None,
+            });
+        }
+    };
+    let (third, completion) = third_along(&span.basis.column(softest).to_owned())?;
+    let third = third / curvature_scale;
+    Ok(InnerModeFold {
+        sigma,
+        rounding_band,
+        third_derivative: Some(third),
+        cubic_correction: Some(5.0 * third * third / (24.0 * sigma.powi(3))),
+        quartic_correction: QuarticShare::NotPriced,
+        completion: Some(completion),
+    })
 }
 
 impl ProjectedKktResidual {

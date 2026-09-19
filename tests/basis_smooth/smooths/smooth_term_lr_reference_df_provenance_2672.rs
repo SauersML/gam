@@ -144,12 +144,21 @@ fn report(formula: &str, data: &gam::data::EncodedDataset) -> gam::smooth::Smoot
 ///
 /// Run with a THREE-column parametric block so the overshoot is 4, not 1, and
 /// with the smooth both null and signal-bearing so the identity is exercised at
-/// both ends of the shrinkage range.
+/// both ends of the shrinkage range. Since b7b874a2a1 a bare `x` carries the
+/// null-recovery ridge and spends less than one degree of freedom, so the block
+/// opts out with `double_penalty=false` to stay unpenalized.
 #[test]
 fn per_term_edf_plus_unpenalized_columns_equals_edf_total_2672() {
     init_parallelism();
     // (formula, unpenalized column count = intercept + parametric columns)
-    let shapes = [("y ~ s(z)", 1usize), ("y ~ x + w + v + s(z)", 4usize)];
+    let shapes = [
+        ("y ~ s(z)", 1usize),
+        (
+            "y ~ linear(x, double_penalty=false) + linear(w, double_penalty=false) \
+             + linear(v, double_penalty=false) + s(z)",
+            4usize,
+        ),
+    ];
     for amplitude in [0.0_f64, 0.9] {
         for seed in 0..2u64 {
             let data = dataset(180, 4400 + seed, amplitude);

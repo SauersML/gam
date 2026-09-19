@@ -240,7 +240,7 @@ def matched_curved_blocks(flat_blocks: int, block_size: int, chart_basis: int, r
 
 
 def fit_block_dictionary(x: np.ndarray, n_blocks: int, args: Any) -> Any:
-    return gamfit.block_sparse_dictionary_fit(
+    return gamfit.sae.block_sparse_dictionary_fit(
         np.ascontiguousarray(x, dtype=np.float32),
         int(n_blocks),
         block_size=int(args.block_size),
