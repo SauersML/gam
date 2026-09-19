@@ -10,6 +10,7 @@ pub mod continuation_path;
 // reach it as `gam_custom_family::*` (via the gam-models facade).
 pub mod estimate;
 pub mod evidence;
+pub mod exact_jet_objective;
 pub mod gauge;
 pub mod gaussian_marginal;
 pub mod gaussian_reml;

@@ -18,7 +18,7 @@ use crate::basis::{
     OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
-    default_spatial_center_strategy, default_spherical_harmonic_degree,
+    default_spatial_center_strategy, default_spherical_harmonic_degree, low_rank_center_resolution,
     select_r_uniform_subsample_centers, thin_plate_penalty_order,
 };
 use crate::fit_notes::FitNoteSink;
@@ -200,6 +200,9 @@ impl From<DataError> for TermBuilderError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
+            cell @ DataError::InvalidCell { .. } => Self::MissingColumn {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },
@@ -535,8 +538,6 @@ pub fn build_termspec(
                             random_terms.push(RandomEffectTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
-                                drop_first_level: false,
-                                penalized: true,
                                 frozen_levels: None,
                                 // A BARE categorical main effect (`+ g`) is a FIXED
                                 // parametric factor. Although it is auto-promoted to
@@ -592,8 +593,6 @@ pub fn build_termspec(
                 random_terms.push(RandomEffectTermSpec {
                     name: name.clone(),
                     feature_col: col,
-                    drop_first_level: false,
-                    penalized: true,
                     frozen_levels: None,
                     // Unseen-level policy is fixed by the wrapper the user wrote
                     // (`formula_dsl`): a genuine random effect
@@ -697,12 +696,11 @@ pub fn build_termspec(
                             // `+ factor` does — the latter is auto-promoted to a
                             // penalized random-effect block (see the
                             // `ParsedTerm::Linear` / `ColumnKindTag::Categorical`
-                            // arm above, `penalized: true`). Both representations
-                            // carry the same per-level offsets, so #1457: the
-                            // `by=` branch must NOT additionally add its own
-                            // unpenalized treatment-coded main effect, which would
-                            // double-represent the factor (two `g` design blocks +
-                            // a spurious extra smoothing parameter).
+                            // arm above). Both representations carry the same
+                            // per-level offsets, so #1457: the `by=` branch must
+                            // NOT additionally add its own main effect, which
+                            // would double-represent the factor (two `g` design
+                            // blocks + a spurious extra smoothing parameter).
                             let penalized_group_owner_present =
                                 terms.iter().any(|other| match other {
                                     ParsedTerm::RandomEffect { name, .. } => name == &by_name,
@@ -733,12 +731,10 @@ pub fn build_termspec(
                                 random_terms.push(RandomEffectTermSpec {
                                     name: by_name.clone(),
                                     feature_col: by_col,
-                                    drop_first_level: false,
-                                    penalized: true,
                                     frozen_levels: None,
-                                    // A FIXED factor main effect, like a bare `+ g`:
-                                    // an unseen level is out of contract and must
-                                    // raise, not center (#2102).
+                                    // Strict like a bare `+ g`: an unseen level is
+                                    // out of contract and must raise, not center
+                                    // (#2102).
                                     lenient_unseen: false,
                                 });
                             }
@@ -1983,11 +1979,12 @@ fn is_tensor_k_axis_option_key(key: &str) -> bool {
 
 /// Parse a per-margin basis dimension list (`k=<scalar>`, `k=[k0, k1, ...]`,
 /// or axis aliases like `k_x=...` / `k_0=...`). A scalar is broadcast across
-/// all axes; `None` returns the heuristic from the data column.
+/// all axes; `None` returns the default sizes for `sizing_rows` rows.
 fn parse_tensor_k_list(
     options: &BTreeMap<String, String>,
     cols: &[usize],
     ds: &Dataset,
+    sizing_rows: usize,
 ) -> Result<(Vec<usize>, bool), String> {
     let mut axis_values = vec![None; cols.len()];
     let mut saw_axis_alias = false;
@@ -2035,7 +2032,7 @@ fn parse_tensor_k_list(
         ));
     }
     let Some(raw) = raw else {
-        let inferred = heuristic_tensor_margin_knots(cols, ds);
+        let inferred = heuristic_tensor_margin_knots(cols, ds, sizing_rows);
         return Ok((inferred, true));
     };
     let entries = split_list_option(raw);
@@ -3196,7 +3193,7 @@ pub(crate) fn build_smooth_basis(
                 cap_default_spatial_centers(options, default_centers)?,
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3433,7 +3430,7 @@ pub(crate) fn build_smooth_basis(
                 return Err("curvature smooth requires at least 2 centers".to_string());
             }
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3501,7 +3498,7 @@ pub(crate) fn build_smooth_basis(
                 return Err("measurejet smooth requires at least 3 centers".to_string());
             }
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3568,7 +3565,7 @@ pub(crate) fn build_smooth_basis(
                 )?,
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3885,7 +3882,7 @@ pub(crate) fn build_smooth_basis(
                 CenterStrategy::UserProvided(sampled)
             } else if is_periodic {
                 if centers_explicit {
-                    spatial_center_strategy_for_dimension(centers, cols.len())
+                    default_spatial_center_strategy(centers, cols.len())
                 } else {
                     auto_spatial_center_strategy(centers, cols.len())
                 }
@@ -4012,7 +4009,7 @@ pub(crate) fn build_smooth_basis(
             for axis in 0..dim {
                 validate_spline_degree(&format!("degree[{axis}]"), axis_degree(axis))?;
             }
-            let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds)?;
+            let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds, sizing_rows)?;
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 for (axis, k) in k_list.iter_mut().enumerate() {
                     *k = (*k).min(axis_degree(axis) + 2);
@@ -4021,10 +4018,10 @@ pub(crate) fn build_smooth_basis(
             if k_inferred {
                 inference_notes.inform(format!(
                     "Automatically set per-margin basis sizes {:?} for tensor smooth '{}' \
-                     (dimension-aware tensor budget: total ∏k kept near the mgcv-te default \
-                     and within the data support, distributed geometrically across margins and \
-                     capped per margin by each column's resolution). \
-                     Override with k=<int> or k=[k0,k1,...].",
+                     (the default basis dimension of a smooth of this many covariates on \
+                     this many rows, distributed geometrically across margins and capped per \
+                     margin by each column's distinct values; the penalty sets the \
+                     smoothness). Override with k=<int> or k=[k0,k1,...].",
                     k_list,
                     vars.join(",")
                 ));
@@ -4506,23 +4503,6 @@ fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
 // Data-aware helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn spatial_center_strategy_for_dimension(
-    num_centers: usize,
-    d: usize,
-) -> CenterStrategy {
-    if d <= 3 {
-        // In low-dimensional spatial smooths, an explicit `k` is a resolution
-        // request rather than a request for marginal quantile-midpoint centers.
-        // Use deterministic maximin geometry so Matérn/GP and Duchon REML see a
-        // well-resolved native kernel block with small fill distance instead of
-        // compensating for holes or endpoint under-resolution by over-smoothing
-        // low-noise signals (#504).
-        CenterStrategy::FarthestPoint { num_centers }
-    } else {
-        default_spatial_center_strategy(num_centers, d)
-    }
-}
-
 /// Center geometry for a non-periodic Duchon smooth.
 ///
 /// In one dimension the represented domain is the interval between the observed
@@ -4538,13 +4518,17 @@ pub(crate) fn spatial_center_strategy_for_dimension(
 /// equal-mass strategies, where there is no canonical coordinate-aligned grid.
 /// The `Auto` wrapper is retained for inferred 1-D counts so adaptive resolution
 /// can still resize the interval grid before freezing its realized centers.
-fn duchon_center_strategy(num_centers: usize, d: usize, automatic: bool) -> CenterStrategy {
+pub(crate) fn duchon_center_strategy(
+    num_centers: usize,
+    d: usize,
+    automatic: bool,
+) -> CenterStrategy {
     let realized = if d == 1 {
         CenterStrategy::UniformGrid {
             points_per_dim: num_centers,
         }
     } else {
-        spatial_center_strategy_for_dimension(num_centers, d)
+        default_spatial_center_strategy(num_centers, d)
     };
     if automatic {
         CenterStrategy::Auto(Box::new(realized))
@@ -4745,83 +4729,77 @@ pub(crate) fn default_cyclic_basis_dim(default_internal: usize, degree: usize) -
     (default_internal + degree + 1).min(CYCLIC_DEFAULT_BASIS_DIM.max(degree + 1))
 }
 
-/// Per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
+/// Default per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
 ///
-/// The 1-D heuristic [`heuristic_knots_for_column`] is calibrated for an
-/// *additive* margin: a well-resolved column asks for the lean univariate
-/// default (≈12 basis functions, the mgcv-like cap of 8 internal knots; see
-/// gam#1680), which is sensible for a single `s(x)` term.
-/// A tensor product, however, multiplies the per-margin sizes:
-/// `p = ∏_d k_d`. Reusing the 1-D rule per margin makes `p` explode with the
-/// tensor dimension — a 3-D `te(x,y,z)` at the 1-D ceiling of 12/margin is
-/// `12³ ≈ 1728` columns, and every REML evaluation pays an O(p³) dense
-/// penalty reparameterization (the full-tensor sum-to-zero constraint is not
-/// Kronecker-factorable), turning model selection over tensor candidates into
-/// a multi-minute single-threaded stall (gam#813). It also requests far more
-/// coefficients than the data can identify whenever `p ≫ n`.
+/// A tensor smooth of `d` covariates is a `d`-dimensional smooth, so its total
+/// column count `p = ∏_d k_d` is the same default basis dimension every other
+/// `d`-covariate smooth on these rows receives ([`default_num_centers`]); the
+/// roughness penalty, not the basis size, then sets the smoothness. The budget
+/// is split geometrically across the margins by [`tensor_margin_sizes`], each
+/// margin capped by the distinct values of its covariate
+/// ([`tensor_margin_support`]), so a low-cardinality margin hands its unused
+/// share to the margins that can resolve more. The product never exceeds the
+/// distinct coordinate rows: a tensor surface is identified only at the
+/// locations the data occupy, so repeated rows sharpen those values without
+/// adding columns the data can pin down.
+fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset, sizing_rows: usize) -> Vec<usize> {
+    let caps: Vec<usize> = cols
+        .iter()
+        .map(|&c| tensor_margin_support(ds.values.column(c)))
+        .collect();
+    let budget = default_num_centers(sizing_rows, cols.len().max(1))
+        .min(count_unique_coordinate_rows(ds.values.view(), cols));
+    tensor_margin_sizes(&caps, budget)
+}
+
+/// Smallest default tensor margin that carries a roughness penalty beyond its
+/// null space: a cubic margin with one interior degree of freedom.
+fn tensor_margin_min_k() -> usize {
+    DEFAULT_BSPLINE_DEGREE + 2
+}
+
+/// The largest basis a default tensor margin on `col` can identify: one
+/// function per distinct covariate value (a cr margin places one value-knot per
+/// function, and a function observed at `u` distinct values has at most `u`
+/// identifiable values), floored at the 2-function linear margin every tensor
+/// axis carries.
+pub(crate) fn tensor_margin_support(col: ArrayView1<'_, f64>) -> usize {
+    unique_count_column(col).max(2)
+}
+
+/// Per-margin basis sizes `k_d` whose product stays within `budget`, each
+/// margin inside `[min(min_k, cap_d), cap_d]` (`cap_d` is the margin's
+/// identifiable support, [`tensor_margin_support`]).
 ///
-/// mgcv's `te(...)` uses a small per-margin default (`k = 5`, i.e. `5^d`).
-/// We match that spirit while staying data-adaptive: budget the *total* tensor
-/// column count `p_target` and distribute it geometrically across the margins
-/// so `∏ k_d ≈ p_target`, never asking a margin for more functions than its
-/// own unique values (and the data set) can support.
-fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
-    let d = cols.len().max(1);
-    let degree = DEFAULT_BSPLINE_DEGREE;
-    let min_k = degree + 2; // smallest margin that carries a roughness penalty
-    let n = ds.values.nrows();
-
-    // Per-margin 1-D ceiling: never request more basis functions than the
-    // margin's own resolution (unique values) supports. This caps each axis
-    // independently before the joint budget is applied.
-    let per_margin_cap: Vec<usize> = cols
+/// The budget is split geometrically (the integer `d`-th root), then any
+/// headroom left by a margin whose support is below the geometric share goes
+/// to the margins that can still grow, one function at a time toward the axis
+/// with the most remaining support, while `∏ k_d ≤ budget`. The only way the
+/// product exceeds the budget is the per-margin floor, which a tensor margin
+/// cannot go below.
+pub(crate) fn tensor_margin_sizes(caps: &[usize], budget: usize) -> Vec<usize> {
+    let d = caps.len().max(1);
+    let min_k = tensor_margin_min_k();
+    let product = |k: &[usize]| -> usize { k.iter().fold(1usize, |p, &k| p.saturating_mul(k)) };
+    let mut geo = ((budget.max(1) as f64).powf(1.0 / d as f64).round() as usize).max(1);
+    while geo > 1 && geo.saturating_pow(d as u32) > budget {
+        geo -= 1;
+    }
+    while (geo + 1).saturating_pow(d as u32) <= budget {
+        geo += 1;
+    }
+    let mut k_list: Vec<usize> = caps
         .iter()
-        .map(|&c| heuristic_knots_for_column(ds.values.column(c)).max(min_k))
+        .map(|&cap| geo.min(cap).max(min_k.min(cap)))
         .collect();
-
-    // Total-basis budget. A tensor with ∏k ≫ n coefficients is rank-deficient
-    // and pure REML cost; cap the product at a generous fraction of n while
-    // honoring mgcv's small default for the common small-d case. The budget
-    // grows with n but the geometric split below keeps each margin modest.
-    //   d=2 → up to ~7²=49 (mgcv-`te`-like), d=3 → ~5³=125, larger d shrinks
-    // per-margin further so the product never blows past the data support.
-    let mgcv_like_per_margin = match d {
-        2 => 7usize,
-        3 => 5usize,
-        _ => 4usize,
-    };
-    let mgcv_like_total = (mgcv_like_per_margin as f64).powi(d as i32);
-    let data_budget = (n as f64) * 0.8;
-    let p_target = mgcv_like_total
-        .max(min_k.pow(d as u32) as f64)
-        .min(data_budget);
-
-    // Geometric per-margin target so ∏k ≈ p_target, then clamp each margin to
-    // its own 1-D resolution cap and the difference-penalty floor.
-    let geo_per_margin = p_target.powf(1.0 / d as f64).round() as usize;
-    let unclamped: Vec<usize> = per_margin_cap
-        .iter()
-        .map(|&cap| geo_per_margin.clamp(min_k, cap))
-        .collect();
-
-    // The per-margin clamps can pull some axes below `geo_per_margin` (a
-    // low-resolution column), leaving headroom in the joint budget. Redistribute
-    // that headroom to the margins that can still grow, so the realized ∏k stays
-    // close to p_target instead of systematically under-shooting it.
-    let mut k_list = unclamped;
     loop {
-        let product: f64 = k_list.iter().map(|&k| k as f64).product();
-        if product >= p_target {
-            break;
-        }
-        // Grow the axis with the most remaining headroom (cap − current),
-        // breaking ties toward the largest cap. Stop when none can grow.
+        let current = product(&k_list);
         let Some(idx) = k_list
             .iter()
-            .zip(per_margin_cap.iter())
+            .zip(caps.iter())
             .enumerate()
-            .filter(|&(_, (k, cap))| k < cap)
-            .max_by_key(|&(_, (k, cap))| (cap - k, *cap))
+            .filter(|&(_, (&k, &cap))| k < cap && current / k * (k + 1) <= budget)
+            .max_by_key(|&(_, (&k, &cap))| (cap - k, cap))
             .map(|(i, _)| i)
         else {
             break;
@@ -5271,7 +5249,7 @@ fn resolve_nonperiodic_bspline_knotspec(
                 .map_err(|e| e.to_string())?;
         }
         return Ok(BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(n_knots),
+            num_internal_knots: n_knots,
             placement,
             adaptive: true,
         });
@@ -5769,7 +5747,7 @@ pub(crate) fn default_duchon_center_count(
     // implicit low-rank cap while preserving the user's explicit `centers=`/`k=`
     // request above.  The polynomial null space must still fit, so tiny
     // high-order bases are raised to the smallest admissible count.
-    let mgcv_default = 10usize.saturating_mul(3usize.saturating_pow(d.saturating_sub(1) as u32));
+    let mgcv_default = low_rank_center_resolution(d);
     let low_n_floor = (polynomial_cols + 1).min(n).max(1);
     // #1867: at small n the generic conditioning cap (`n / COND_N_DIVISOR`) in
     // `default_num_centers` starves `planned_count` below the univariate spline
@@ -6131,7 +6109,7 @@ fn quantile_bspline_knotspec(
         .map_err(|e| e.to_string())?;
     let Some(domain) = domain else {
         return Ok(BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(num_internal_knots),
+            num_internal_knots,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         });

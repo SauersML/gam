@@ -233,7 +233,9 @@ pub fn fit_attention_kernel(
         .reml_score_roundoff
         .zip(separable.evidence.reml_score_roundoff)
         .map(|(stationary_bound, separable_bound)| {
-            stationary_bound + separable_bound + 0.5 * f64::EPSILON * log_evidence_margin.abs()
+            stationary_bound
+                + separable_bound
+                + gam_linalg::roundoff::UNIT_ROUNDOFF * log_evidence_margin.abs()
         });
     let is_stationary =
         !log_evidence_resolution.is_some_and(|resolution| log_evidence_margin > resolution);

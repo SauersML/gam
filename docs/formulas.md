@@ -30,7 +30,7 @@ hyphen, a leading digit, or non-ASCII letters — is written in backticks,
 anywhere a column name is accepted, the response included:
 
 ```
-`body mass` ~ s(`flipper.length`) + `2nd dose` + C(`site id`)
+`body mass` ~ s(`flipper.length`) + `2nd dose` + factor(`site id`)
 ```
 
 Everything between the backticks is the column name, verbatim. Plain
@@ -167,7 +167,7 @@ Removing the intercept therefore removes the constant only when no term
 could represent it. A term that spans the constant keeps the intercept, and
 the model is exactly the one written with it:
 
-- **A fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main effect of a
+- **A fixed factor** — `+ g`, `factor(g)`, or the main effect of a
   factor `by=` smooth. `0 + g` is `g`: every level keeps its column and its
   REML-estimated ridge. Beside the free intercept that ridge shrinks only the
   contrasts between levels, so the overall level is free and the level
@@ -201,7 +201,6 @@ support shrinkage.
 y ~ x + group(site)                      # random intercept per level
 y ~ x + re(site)                         # random-intercept alias of group()
 y ~ x + factor(site)                     # same penalized block as bare `+ site`; forces categorical encoding
-y ~ x + C(site)                          # alias of factor(), as in patsy/formulaic
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -218,7 +217,7 @@ random intercepts.
 
 ### How categorical terms are estimated {#factor-terms}
 
-A bare string column (`+ site`), `factor(site)` (alias `C(site)`) and `group(site)` all build
+A bare string column (`+ site`), `factor(site)` and `group(site)` all build
 the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing
@@ -238,9 +237,11 @@ So `factor(year)` treats `year` as levels rather than as a slope, and a
 held-out level is a schema mismatch for `+ site` and `factor(site)` but an
 expected new group for `group(site)`.
 
-`factor()`, `C()`, `group()` and `re()` take no options: the penalty
+`factor()`, `group()` and `re()` take no options: the penalty
 strength is always estimated, so `factor(site, k=3)` is rejected as an
-unknown option instead of being ignored. A categorical column is also
+unknown option instead of being ignored. `factor(site)` is the only
+spelling of the level effect: `C(site)` is rejected with an error that
+points to `factor(site)`. A categorical column is also
 refused inside a term that treats its inputs as numeric axes (`linear()`,
 `s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
 non-factor bases): the error points to `factor(site)` or `group(site)` for
@@ -365,31 +366,56 @@ does, so `cyclic(x, period=2*pi)` and `cyclic(x, period_start=0,
 period_end=2*pi)` describe the same `[0, 2π)` smooth. An unparseable
 endpoint or an unknown option is rejected rather than silently dropped.
 
-Default interior knots: `clamp(unique_values / 4, 4, 8)` — a lean default
-of about twelve cubic basis functions, close to mgcv's `k = 10`; the cap is
-flat in `n`, so a wigglier fit is an explicit `k=` away rather than the
-default (#1680). With 32 or fewer rows and five or more smooth coordinates
-the inferred count is further reduced to at most 1. The basis dimension is
-then `k = internal_knots + degree + 1`, and an explicit `k` is honoured
-exactly down to `k = degree + 1` (zero interior knots). Passing both `k`
-and `knots` is an error. The fit's inference note prints the rule it
-applied.
+Default basis of a 1-D `s(x)`: the data size it. The fit starts from a
+pilot of `clamp(unique_values / 4, 4, 8)` interior knots (at most twelve
+cubic basis functions). With 32 or fewer rows and five or more smooth
+coordinates the pilot is reduced to at most 1 interior knot. After the fit
+converges, the basis is checked for two signs that it is too small: an edf
+pressed against the basis dimension, and a rejection by the residual
+lack-of-fit test that
+[`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
+reports, at a family-wise level of `1e-3` Bonferroni-corrected over the
+tested smooths. If either appears, the knot count doubles and the model is
+refit, until neither does. Only the data bound the growth:
+
+- a smooth never gets more coefficients than its covariate has distinct
+  values, which is the interpolating limit;
+- the whole model keeps at least one residual degree of freedom.
+
+A null or linear truth passes at the pilot, and REML shrinks it to about 0
+or 1 edf. The larger basis is built only where the fit shows it is needed.
+
+The basis dimension is `k = internal_knots + degree + 1`. Setting `k=` or
+`knots=` fixes the size: an explicit `k` is honoured exactly, down to
+`k = degree + 1` (zero interior knots), and never grows. Passing both `k`
+and `knots` is an error. A Python smooth override (`smooths=`) also keeps
+its size. So do a `by=` smooth (only the rows its gate selects support it)
+and the cyclic, factor-smooth and tensor-product bases, which take the
+pilot count as a fixed default. Thin-plate, Duchon and the other radial
+smooths with automatic centers grow their center count by the same
+adequacy loop. Matérn is the exception and keeps its default count.
 
 ### Choosing `k` {#choosing-k}
 
-`k` is an upper bound on how flexible a smooth can be, not the flexibility
-itself. REML chooses the smoothing parameter, and so how much of the basis
-the fit uses: the smooth's effective degrees of freedom (edf) can sit
-anywhere from its unpenalized null space up to the basis dimension. Raising
-`k` above what the data need changes the fit very little, because the
-penalty holds the extra basis functions back. It costs time, not accuracy.
+For a default `s(x)` there is nothing to choose. Leave `k` unset and the
+fit sizes the basis from the data, as described above.
 
-The one failure `k` can cause is a basis too small for the truth. An edf
+Setting `k` fixes the basis dimension. That is an upper bound on how
+flexible the smooth can be, not the flexibility itself. REML chooses the
+smoothing parameter, and so how much of the basis the fit uses: the
+smooth's effective degrees of freedom (edf) can sit anywhere from its
+unpenalized null space up to the basis dimension. A `k` above what the data
+need changes the fit very little, because the penalty holds the extra basis
+functions back. It costs time, not accuracy.
+
+A fixed basis can fail in one way: it can be too small for the truth. An edf
 close to the basis dimension is the symptom, and
 [`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
 is the test: it looks for structure left in the residuals along the
-covariate. A small p-value means the basis ran out; refit with a larger
-`k`.
+covariate. A small p-value means the basis ran out. For `s(x)`, drop the
+`k=` and let the default grow. A basis that never grows by itself (a `by=`
+smooth, or a tensor-product, cyclic, factor-smooth or Matérn smooth) needs a
+larger `k`.
 
 ```python
 import numpy as np
@@ -401,7 +427,7 @@ x = np.sort(rng.uniform(0, 1, 1000))
 truth = np.sin(12 * np.pi * x)
 data = pd.DataFrame({"x": x, "y": truth + rng.normal(0, 0.3, x.size)})
 
-for formula in ["y ~ s(x)", "y ~ s(x, k=40)"]:
+for formula in ["y ~ s(x, k=12)", "y ~ s(x)"]:
     model = gamfit.fit(data, formula)
     check = model.basis_check(data)[0]
     error = np.sqrt(np.mean((model.predict(data) - truth) ** 2))
@@ -409,12 +435,15 @@ for formula in ["y ~ s(x)", "y ~ s(x, k=40)"]:
           f"basis check p={check['p_value']:.2g}  RMSE vs truth={error:.3f}")
 ```
 
-Six full periods of a sine need more than the default dozen basis
-functions. With the default basis the edf (10.4) presses against the basis
+Six full periods of a sine need more than a dozen basis functions. The
+fixed `k=12` basis runs out: its edf (10.4) presses against the basis
 dimension (11 after centering), the basis check's p-value is about
-`1e-99`, and the error against the truth is 0.63. With `k=40` the check
-passes (p ≈ 0.67) and the error drops to 0.06. REML used about 33 of the 39
-available dimensions; it did not need to be told how many.
+`1e-309`, and the error against the truth is 0.63. The default `s(x)`
+starts from the same dozen functions, sees the same rejection, and doubles
+its knots until the check's p-value clears the engine's basis-adequacy
+level (`1e-3`, Bonferroni-corrected over the tested smooths). Here it
+stops at 19 dimensions with an edf of 17.8, a basis check p of about
+0.007, and an error of 0.07. Nobody had to tell it how many.
 
 ### Shape-constrained smooths {#shape-constrained-smooths}
 
@@ -712,7 +741,7 @@ value are broadcast across all margins.
 
 ### What the default margin is, and when it changes {#tensor-default-margin}
 
-Following mgcv, an unset `bs=` gives each margin a **natural cubic regression
+An unset `bs=` gives each margin a **natural cubic regression
 spline**: `k` value-knots at data quantiles, penalized by the exact integrated
 squared second derivative. `degree` and `penalty_order` are not adjustable
 properties of that basis — a cubic regression spline *is* cubic and *is*
@@ -732,6 +761,17 @@ so naming an option never changes a fit by itself.
 Examples:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+space, time, x, z, h = (rng.uniform(0, 1, n) for _ in range(5))
+theta, u, v = (rng.uniform(0, 2 * np.pi, n) for _ in range(3))
+df = {"space": space, "time": time, "x": x, "z": z, "h": h, "theta": theta, "u": u, "v": v,
+      "y": np.sin(2 * np.pi * space) * time + np.sin(theta) * h + np.cos(u) + np.sin(v)
+           + x * z + rng.normal(0, 0.3, n)}
+
 gamfit.fit(df, "y ~ te(space, time, k=[12, 8])")
 gamfit.fit(df, "y ~ te(space, time, k=(12, 8))")
 gamfit.fit(df, "y ~ te(space, time, k_space=12, k_time=8)")
@@ -786,6 +826,14 @@ per-axis shrinkage. Setting `scale_dimensions=True` on `fit()`
 enables it globally across compatible spatial smooths.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+pc = rng.normal(0, 1, (400, 4))
+df = {"pc1": pc[:, 0], "pc2": pc[:, 1], "pc3": pc[:, 2], "pc4": pc[:, 3],
+      "y": np.sin(pc[:, 0]) + 0.5 * pc[:, 1] ** 2 + rng.normal(0, 0.3, 400)}
+
 gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
@@ -836,6 +884,13 @@ y ~ x + link(type=flexible(probit))
 The formula value wins if both are set.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age = rng.uniform(30, 80, 400)
+df = {"age": age, "case": (rng.uniform(size=age.size) < 1 / (1 + np.exp(-(age - 55) / 8))).astype(float)}
+
 gamfit.fit(df, "case ~ s(age)", link="logit")
 ```
 

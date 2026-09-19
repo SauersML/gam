@@ -1095,24 +1095,41 @@ impl GaussianRemlMultiPenaltyProblem {
         }
         let (observations, coefficients) = (self.observations, self.coefficients);
         let (lower, upper) = (self.rho_lower.clone(), self.rho_upper.clone());
-        let mut seed_config = gam_problem::SeedConfig::default();
-        seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
-        let mut problem = OuterProblem::new(penalty_count)
+        // One start: the caller's ρ, else each penalty's commensurate-curvature
+        // start (`XᵀX = RᵀR` over the penalty's support against `tr S_k`),
+        // clamped into the ρ domain. The certified outer search refines it.
+        let start_rho = match initial_rho {
+            Some(rho) => rho.to_owned(),
+            None => {
+                let gram_diag = self.design_upper.map_axis(ndarray::Axis(0), |column| {
+                    column.iter().map(|value| value * value).sum::<f64>()
+                });
+                Array1::from_iter(self.penalties.iter().map(|penalty| {
+                    let diagonal = penalty.diag();
+                    crate::seeding::commensurate_curvature_rho(
+                        gram_diag.view(),
+                        (0..diagonal.len()).filter(|&c| diagonal[c] > 0.0),
+                        diagonal.sum(),
+                    )
+                    .unwrap_or(0.0)
+                }))
+            }
+        };
+        let start_rho = Array1::from_iter(
+            start_rho
+                .iter()
+                .zip(lower.iter().zip(upper.iter()))
+                .map(|(value, (lo, hi))| value.max(*lo).min(*hi)),
+        );
+        let problem = OuterProblem::new(penalty_count)
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Dense)
             .with_prefer_gradient_only(false)
             .with_disable_fixed_point(true)
             .with_bounds(lower.clone(), upper.clone())
-            .with_seed_config(seed_config)
             .with_fallback_policy(FallbackPolicy::Disabled)
-            .with_problem_size(observations, coefficients);
-        if let Some(rho) = initial_rho {
-            problem = problem.with_initial_rho(Array1::from_iter(
-                rho.iter()
-                    .zip(lower.iter().zip(upper.iter()))
-                    .map(|(value, (lo, hi))| value.max(*lo).min(*hi)),
-            ));
-        }
+            .with_problem_size(observations, coefficients)
+            .with_initial_rho(start_rho);
         let mut objective = problem.build_objective(
             self.clone(),
             multi_penalty_cost,

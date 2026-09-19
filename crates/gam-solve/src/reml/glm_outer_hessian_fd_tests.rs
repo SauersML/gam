@@ -167,10 +167,20 @@ fn assert_hessian_matches_fd(name: &str, likelihood: GlmLikelihoodSpec) {
         other => panic!("{name}: non-standard link {other:?}"),
     };
     let (y, x, penalties) = simulate(&family, link);
+    assert_hessian_matches_fd_on(name, likelihood, &y, &x, &penalties);
+}
+
+fn assert_hessian_matches_fd_on(
+    name: &str,
+    likelihood: GlmLikelihoodSpec,
+    y: &Array1<f64>,
+    x: &Array2<f64>,
+    penalties: &[Array2<f64>],
+) {
     let w = Array1::<f64>::ones(N);
     let offset = Array1::<f64>::zeros(N);
     let cfg = RemlConfig::external(likelihood, 1e-10, false).with_max_iterations(500);
-    let reml = state(&y, &w, &offset, &x, &penalties, &cfg);
+    let reml = state(y, &w, &offset, x, penalties, &cfg);
     assert!(
         reml.analytic_outer_hessian_enabled(),
         "{name}: the analytic outer Hessian must be available"
@@ -188,6 +198,31 @@ fn assert_hessian_matches_fd(name: &str, likelihood: GlmLikelihoodSpec) {
         };
         let scale = h.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         let delta = 1e-4;
+        let gradient_scale = eval.gradient.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+        for col in 0..rho.len() {
+            // The analytic gradient against the central difference of the
+            // cost it is the derivative of.
+            let mut rp = rho.clone();
+            let mut rm = rho.clone();
+            rp[col] += delta;
+            rm[col] -= delta;
+            let vp = reml
+                .compute_outer_eval_with_order(&rp, OuterEvalOrder::Value)
+                .expect("plus value")
+                .cost;
+            let vm = reml
+                .compute_outer_eval_with_order(&rm, OuterEvalOrder::Value)
+                .expect("minus value")
+                .cost;
+            let fd = (vp - vm) / (2.0 * delta);
+            let an = eval.gradient[col];
+            let err = (fd - an).abs() / gradient_scale;
+            assert!(
+                err < 1e-5,
+                "{name} rho={rho:?} g[{col}]: analytic={an:.10e} fd={fd:.10e} \
+                 err/max(1,‖g‖∞)={err:.3e}"
+            );
+        }
         for col in 0..rho.len() {
             let mut rp = rho.clone();
             let mut rm = rho.clone();
@@ -313,4 +348,159 @@ fn a_latched_block_correction_declares_no_outer_hessian_784() {
         ),
         "{refusal}"
     );
+}
+
+/// Linear predictor of a generic variance × link cell as a function of the
+/// fixture's signal `s ∈ [-1.5, 1.5]`, kept strictly inside the cell's
+/// feasibility set so the truth is an interior point.
+fn generic_cell_eta(family: &ResponseFamily, link: StandardLink, signal: f64) -> f64 {
+    match (family, link) {
+        (ResponseFamily::Gaussian, StandardLink::Log) => 0.5 + 0.3 * signal,
+        (ResponseFamily::Gaussian | ResponseFamily::Gamma, StandardLink::Sqrt) => {
+            1.5 + 0.3 * signal
+        }
+        (
+            ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+            StandardLink::InverseSquared | StandardLink::Inverse,
+        ) => 1.0 + 0.3 * signal,
+        (ResponseFamily::Poisson, StandardLink::Identity) => 4.0 + 1.5 * signal,
+        (ResponseFamily::Poisson, StandardLink::Sqrt) => 2.0 + 0.5 * signal,
+        (ResponseFamily::Poisson, StandardLink::Inverse) => 0.3 + 0.1 * signal,
+        (ResponseFamily::Poisson, StandardLink::InverseSquared) => 0.1 + 0.03 * signal,
+        (ResponseFamily::Gamma, StandardLink::Identity) => 2.0 + 0.8 * signal,
+        (ResponseFamily::InverseGaussian, StandardLink::Identity) => 1.5 + 0.5 * signal,
+        (ResponseFamily::InverseGaussian, StandardLink::Sqrt) => 1.2 + 0.25 * signal,
+        (ResponseFamily::Binomial, StandardLink::Log) => -1.2 + 0.4 * signal,
+        other => panic!("{other:?} is not a generic cell of this fixture"),
+    }
+}
+
+fn generic_cell_mean(link: StandardLink, eta: f64) -> f64 {
+    match link {
+        StandardLink::Identity => eta,
+        StandardLink::Log => eta.exp(),
+        StandardLink::Sqrt => eta * eta,
+        StandardLink::Inverse => 1.0 / eta,
+        StandardLink::InverseSquared => eta.powf(-0.5),
+        other => panic!("link {other:?} is not a generic-cell link of this fixture"),
+    }
+}
+
+/// Inverse-Gaussian dispersion of the generic-cell fixture (`V = φμ³`).
+const GENERIC_IG_PHI: f64 = 0.3;
+/// Gaussian standard deviation of the generic-cell fixture, relative to the mean.
+const GENERIC_GAUSSIAN_SD: f64 = 0.05;
+
+fn simulate_generic(
+    family: &ResponseFamily,
+    link: StandardLink,
+) -> (Array1<f64>, Array2<f64>, Vec<Array2<f64>>) {
+    let mut rng = Lcg(0x6e_e71c_ce11);
+    let x1: Vec<f64> = (0..N).map(|_| rng.uniform()).collect();
+    let x2: Vec<f64> = (0..N).map(|_| rng.uniform()).collect();
+    let (x, penalties) = design_and_penalties(&x1, &x2);
+    let normal = |rng: &mut Lcg| {
+        let (u1, u2) = (rng.uniform(), rng.uniform());
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    };
+    let y = (0..N)
+        .map(|i| {
+            let signal = (2.0 * std::f64::consts::PI * x1[i]).sin() * 0.9 + (x2[i] - 0.5) * 1.2;
+            let mu = generic_cell_mean(link, generic_cell_eta(family, link, signal));
+            match family {
+                ResponseFamily::Gaussian => mu * (1.0 + GENERIC_GAUSSIAN_SD * normal(&mut rng)),
+                ResponseFamily::Poisson => {
+                    let u = rng.uniform();
+                    let mut k = 0.0;
+                    let mut pk = (-mu).exp();
+                    let mut cdf = pk;
+                    while u > cdf {
+                        k += 1.0;
+                        pk *= mu / k;
+                        cdf += pk;
+                    }
+                    k
+                }
+                ResponseFamily::Gamma => {
+                    let e = -rng.uniform().ln() - rng.uniform().ln();
+                    0.5 * mu * e
+                }
+                ResponseFamily::InverseGaussian => {
+                    // Michael–Schucany–Haas transformation with λ = 1/φ.
+                    let lambda = 1.0 / GENERIC_IG_PHI;
+                    let v = normal(&mut rng).powi(2);
+                    let root = mu + mu * mu * v / (2.0 * lambda)
+                        - mu / (2.0 * lambda)
+                            * (4.0 * mu * lambda * v + mu * mu * v * v).sqrt();
+                    if rng.uniform() <= mu / (mu + root) {
+                        root
+                    } else {
+                        mu * mu / root
+                    }
+                }
+                ResponseFamily::Binomial => f64::from(u8::from(rng.uniform() < mu)),
+                other => panic!("family {other:?} not in this fixture"),
+            }
+        })
+        .collect();
+    (y, x, penalties)
+}
+
+/// The generic variance × link kernel's outer LAML gradient is the derivative
+/// of its cost and its analytic outer Hessian the derivative of its gradient,
+/// both through the exact third and fourth η-derivatives of the composed
+/// `V ∘ μ(η)` row program. Dispersions are pinned for the λ search as the
+/// production search pins them.
+fn assert_generic_cell_matches_fd(family: ResponseFamily, link: StandardLink) {
+    let name = format!("{}-{}", family.name(), link.name());
+    let base = spec(family.clone(), link);
+    assert!(
+        base.spec.generic_edm_cell().is_some(),
+        "{name} must route through the generic variance × link kernel"
+    );
+    let likelihood = match family {
+        ResponseFamily::Gamma => base.with_gamma_shape_frozen_for_search(2.0),
+        ResponseFamily::InverseGaussian => {
+            base.with_dispersion_phi_frozen_for_search(GENERIC_IG_PHI)
+        }
+        ResponseFamily::Gaussian => {
+            base.with_dispersion_phi_frozen_for_search(GENERIC_GAUSSIAN_SD * GENERIC_GAUSSIAN_SD)
+        }
+        _ => base,
+    };
+    let (y, x, penalties) = simulate_generic(&family, link);
+    assert_hessian_matches_fd_on(&name, likelihood, &y, &x, &penalties);
+}
+
+macro_rules! generic_cell_fd_tests {
+    ($($test:ident => ($family:expr, $link:expr);)*) => {$(
+        #[test]
+        fn $test() {
+            assert_generic_cell_matches_fd($family, $link);
+        }
+    )*};
+}
+
+generic_cell_fd_tests! {
+    gaussian_log_outer_derivatives_match_fd => (ResponseFamily::Gaussian, StandardLink::Log);
+    gaussian_sqrt_outer_derivatives_match_fd => (ResponseFamily::Gaussian, StandardLink::Sqrt);
+    gaussian_inverse_squared_outer_derivatives_match_fd =>
+        (ResponseFamily::Gaussian, StandardLink::InverseSquared);
+    poisson_identity_outer_derivatives_match_fd =>
+        (ResponseFamily::Poisson, StandardLink::Identity);
+    poisson_sqrt_outer_derivatives_match_fd => (ResponseFamily::Poisson, StandardLink::Sqrt);
+    poisson_inverse_outer_derivatives_match_fd => (ResponseFamily::Poisson, StandardLink::Inverse);
+    poisson_inverse_squared_outer_derivatives_match_fd =>
+        (ResponseFamily::Poisson, StandardLink::InverseSquared);
+    gamma_identity_outer_derivatives_match_fd => (ResponseFamily::Gamma, StandardLink::Identity);
+    gamma_sqrt_outer_derivatives_match_fd => (ResponseFamily::Gamma, StandardLink::Sqrt);
+    gamma_inverse_squared_outer_derivatives_match_fd =>
+        (ResponseFamily::Gamma, StandardLink::InverseSquared);
+    inverse_gaussian_identity_outer_derivatives_match_fd =>
+        (ResponseFamily::InverseGaussian, StandardLink::Identity);
+    inverse_gaussian_sqrt_outer_derivatives_match_fd =>
+        (ResponseFamily::InverseGaussian, StandardLink::Sqrt);
+    inverse_gaussian_inverse_outer_derivatives_match_fd =>
+        (ResponseFamily::InverseGaussian, StandardLink::Inverse);
+    binomial_log_outer_derivatives_match_fd => (ResponseFamily::Binomial, StandardLink::Log);
 }

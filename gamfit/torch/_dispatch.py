@@ -70,7 +70,7 @@ def validate_smooths_arg(smooths: Sequence[Smooth]) -> list[Smooth]:
 def validate_points_list_length(points_len: int, smooths_len: int) -> None:
     """Validate that a per-smooth points list matches the smooth count."""
     if points_len != smooths_len:
-        raise ValueError(f"got {points_len} points tensors but {smooths_len} smooths")
+        raise ValueError(f"got {points_len} points tensors for {smooths_len} smooths")
 
 
 def resolve_fit_mode(mode: FitMode, F: int, D: int) -> FitMode:

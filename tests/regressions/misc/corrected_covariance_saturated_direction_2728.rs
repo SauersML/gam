@@ -1,46 +1,37 @@
 //! #2728 — the two published coefficient covariances must not disagree by
-//! orders of magnitude, and the sigma-point nodes that build the corrected one
-//! must sit where the posterior actually has mass.
+//! orders of magnitude at a saturated smoothing direction.
 //!
 //! # What went wrong
 //!
-//! `beta_covariance_corrected()` (`Vp`) is assembled by the sigma-point
-//! cubature branch as `φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂(ρ)]`, a two-point quadrature
-//! for `ρ ~ N(ρ̂, V_ρ)` with each node one posterior sd out along a ρ-Hessian
-//! eigendirection. The step was taken from the QUADRATIC model of the
-//! criterion, `σ_j^{-1/2}`, and never checked against the criterion it was
-//! sampling.
+//! `beta_covariance_corrected()` (`Vp`) used to be assembled on this fixture by
+//! a sigma-point cubature, `φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂(ρ)]`, with each node one
+//! posterior sd out along a ρ-Hessian eigendirection. The step was taken from
+//! the QUADRATIC model of the criterion, `σ_j^{-1/2}`, and never checked
+//! against the criterion it was sampling.
 //!
-//! At a SATURATED smoothing direction that check fails catastrophically. By the
+//! At a SATURATED smoothing direction that fails catastrophically. By the
 //! exact reparameterisation identity `H_ρ = diag(λ)·H_λ·diag(λ) + diag(g_ρ)`,
 //! the ρ-curvature at `λ = 7.2e-9` is ~0 because `λ²` multiplies it, not
 //! because the profile is flat. So `σ⁻¹ = 9.5e4`, the step was **308 in
 //! log-λ**, and the node landed at a criterion **3309 nats** above the optimum
-//! — posterior weight `e^-3309` — while carrying weight ½. On the fixture
-//! below that inflated the reported SE by 8.1× over the conditional `Vb` and
-//! 11.1× over the estimator's own Monte-Carlo sampling spread.
+//! while carrying weight ½. On the fixture below that inflated the reported SE
+//! by 8.1× over the conditional `Vb` and 11.1× over the estimator's own
+//! Monte-Carlo sampling spread.
+//!
+//! The cubature is gone: `Vp = Vb + J·V_ρ·Jᵀ` is the analytic first-order
+//! correction for every smoothing dimension, with `V_ρ` the certified inverse
+//! on the identified outer-Hessian subspace; no node is placed anywhere.
 //!
 //! # What is asserted here
 //!
-//! Three independent angles on the same root cause, so a regression cannot slip
-//! through by satisfying one of them:
-//!
-//! 1. **The node placement itself.** Every node the correction was built from
-//!    sits at a criterion rise of order `PROFILE_SIGMA_RISE = 1/2`, which is
-//!    the level a one-sigma node is *asserted* to occupy. This is exact, needs
-//!    no Monte Carlo, and is the defect stated in its own terms: the number was
-//!    3309.
-//! 2. **The two published objects agree in magnitude.** The cubature
-//!    correction is `E_ρ[φ̂·H(ρ)⁻¹] − φ̂·H(ρ̂)⁻¹ + Cov_ρ[β̂(ρ)]`, and the
-//!    first-order `J·V_ρ·Jᵀ` is the leading term of `Cov_ρ[β̂(ρ)]`. The first
-//!    difference is `½·A″:V_ρ` to the same order and carries no sign, so the
-//!    cubature trace may be negative. A refinement cannot differ from what it
-//!    refines by orders of MAGNITUDE, though: the measured ratio of traces was
-//!    9993 before the fix.
-//! 3. **Calibration against the truth.** With `X` held fixed and only the
+//! 1. **The method.** The fit publishes the first-order correction, and the
+//!    retained first-order pair is the same matrix.
+//! 2. **Calibration against the truth.** With `X` held fixed and only the
 //!    Gaussian noise redrawn, the Monte-Carlo spread of `x'β̂` over refits is
 //!    exactly what the covariance claims to be, with no misspecification in the
 //!    comparison. `Vp` must be within a bounded factor of it.
+//! 3. **Ordering.** `J·V_ρ·Jᵀ` is a Gram, so no corrected SE falls below the
+//!    conditional one.
 
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
@@ -78,31 +69,6 @@ const SEED_NOISE: u64 = 0x51E5_0000_0000_0000;
 /// per-point sampling SD alone: 16 refits leaves the ratio's own noise well
 /// inside the window below, while keeping the test's fits to ~16 x 1.7 s.
 const N_REPLICATES: usize = 16;
-
-/// The criterion level a one-sigma sigma-point node is asserted to sit at,
-/// mirrored from `crates/gam-solve/src/reml/eval.rs`. Under the quadratic model
-/// that defines `V_ρ`, `V(ρ̂ + σ^{-1/2}u) − V(ρ̂) = ½·σ·(σ^{-1/2})² = 1/2`
-/// exactly.
-const PROFILE_SIGMA_RISE: f64 = 0.5;
-
-/// Ceiling on the worst node's criterion rise, as a multiple of
-/// `PROFILE_SIGMA_RISE`.
-///
-/// The production search accepts a node whose rise is within a factor of 1.5 of
-/// the target, so a correctly calibrated node cannot exceed `1.5 × 1/2 = 0.75`.
-/// The factor 4 here leaves room for the one case the search cannot fix — a
-/// criterion so steep that even the smallest bracketed step overshoots — while
-/// still failing by three orders of magnitude on the 3309 this issue is about.
-const MAX_NODE_RISE_MULTIPLE: f64 = 4.0;
-
-/// Window on `tr(cubature correction) / tr(first-order correction)`.
-///
-/// Both estimate `Cov_ρ[β̂]` plus, for the cubature, the second-order
-/// `E_ρ[H⁻¹] − H(ρ̂)⁻¹` term. They differ by the curvature of `β̂(ρ)` over one
-/// posterior sigma and by that second-order term — a factor, not an order of
-/// magnitude. Measured on this fixture: 0.63 after the fix, 9993 before it.
-const CORRECTION_TRACE_RATIO_LO: f64 = 1.0 / 16.0;
-const CORRECTION_TRACE_RATIO_HI: f64 = 16.0;
 
 /// Window on `RMS(se from Vp) / RMS(mc_sd)`.
 ///
@@ -246,7 +212,7 @@ fn trace(matrix: &Array2<f64>) -> f64 {
 }
 
 #[test]
-fn corrected_covariance_nodes_are_criterion_calibrated_2728() {
+fn corrected_covariance_is_calibrated_at_a_saturated_direction_2728() {
     let spec = duchon_aniso_pc_spec();
     let (x_eval, _) = simulate_design(N_EVAL, SEED_EVAL);
     let (x_train, y_true) = simulate_design(N_TRAIN, SEED_DESIGN);
@@ -289,70 +255,32 @@ fn corrected_covariance_nodes_are_criterion_calibrated_2728() {
     let design = eval_design.expect("held-out design");
     let fit = first_fit.expect("at least one fit");
 
-    // ── Angle 1: the nodes sit where the posterior has mass ──────────────
-    //
-    // This is the defect stated in its own terms and it involves no estimate:
-    // the number the fit reports here was 3309, against a target of 1/2.
+    // ── Angle 1: the analytic first-order correction is what ships ───────
     let method = fit
         .smoothing_correction_method()
         .expect("a fit with smoothing parameters must publish a correction method");
-    let SmoothingCorrectionMethod::SigmaPointCubature {
-        rank,
-        n_points,
-        max_node_criterion_rise,
+    let SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+        active_rank,
+        rho_dimension,
     } = method
     else {
-        panic!(
-            "this fixture is the #2728 configuration and must exercise the sigma-point \
-             cubature branch, so the calibration assertion below is not vacuous; got {method:?}"
-        );
+        panic!("the corrected covariance must be the analytic first-order one; got {method:?}");
     };
-    assert_eq!(
-        n_points,
-        2 * rank,
-        "the rule places one (+, −) pair per upgraded direction"
-    );
-    assert!(
-        max_node_criterion_rise.is_finite(),
-        "the worst node's criterion rise must be measured, not absent: \
-         {max_node_criterion_rise}"
-    );
-    assert!(
-        max_node_criterion_rise <= MAX_NODE_RISE_MULTIPLE * PROFILE_SIGMA_RISE,
-        "a sigma-point node sits at criterion rise {max_node_criterion_rise:.6e} against a \
-         one-sigma level of {PROFILE_SIGMA_RISE}; its posterior weight is \
-         exp(-{max_node_criterion_rise:.3e}) and it carries weight 1/2 in the quadrature \
-         (#2728 measured 3.309e3 here)",
-    );
-
-    // ── Angle 2: the two published corrections agree in magnitude ────────
-    let cubature = fit
+    assert!(active_rank <= rho_dimension);
+    let correction = fit
         .smoothing_correction()
-        .expect("the cubature branch publishes its correction");
+        .expect("the first-order correction is published");
     let first_order = fit
         .smoothing_correction_first_order()
-        .expect("the first-order correction is retained alongside the cubature one");
-    let (tr_cubature, tr_first_order) = (trace(cubature), trace(first_order));
-    // `J·V_ρ·Jᵀ` is a Gram, so its trace is positive. The cubature adds
-    // `E_ρ[φ̂·H(ρ)⁻¹] − φ̂·H(ρ̂)⁻¹`, which has no sign: on this fixture the node
-    // traces average 9.915 against 9.994 at ρ̂, so that term is −0.079 and the
-    // cubature trace is −0.0749 (sw4l lane probe 1255647 at 95115c8a1f). Only
-    // the MAGNITUDE of the refinement is bounded against what it refines.
+        .expect("the first-order correction is retained");
+    assert_eq!(correction, first_order);
     assert!(
-        tr_first_order > 0.0 && tr_cubature.is_finite(),
-        "the first-order correction must carry positive variance and the cubature one must be \
-         finite: cubature={tr_cubature:.6e}, first_order={tr_first_order:.6e}"
-    );
-    let trace_ratio = tr_cubature.abs() / tr_first_order;
-    assert!(
-        (CORRECTION_TRACE_RATIO_LO..=CORRECTION_TRACE_RATIO_HI).contains(&trace_ratio),
-        "the cubature correction refines the first-order one, so their traces cannot differ \
-         by orders of magnitude: tr(cubature)={tr_cubature:.6e}, \
-         tr(first_order)={tr_first_order:.6e}, ratio={trace_ratio:.6e} \
-         (#2728 measured 9.99e3 here)",
+        trace(correction) >= 0.0,
+        "J V_rho J^T is a Gram and carries non-negative variance: {:.6e}",
+        trace(correction)
     );
 
-    // ── Angle 3: calibration against the estimator's own sampling spread ──
+    // ── Angle 2: calibration against the estimator's own sampling spread ──
     //
     // `X` was held fixed across replicates and only the noise redrawn, so the
     // basis, the centers, and the held-out design are identical in every refit
@@ -385,9 +313,9 @@ fn corrected_covariance_nodes_are_criterion_calibrated_2728() {
     );
     let se_ratio = rms_corr / rms_mc;
     println!(
-        "[#2728] rank={rank} points={n_points} max_node_rise={max_node_criterion_rise:.4e} \
-         tr(cub)/tr(fo)={trace_ratio:.4} RMS(se_cond)={rms_cond:.5} RMS(se_corr)={rms_corr:.5} \
-         RMS(mc_sd)={rms_mc:.5} se_corr/mc_sd={se_ratio:.4}"
+        "[#2728] active_rank={active_rank} rho_dimension={rho_dimension} \
+         RMS(se_cond)={rms_cond:.5} RMS(se_corr)={rms_corr:.5} RMS(mc_sd)={rms_mc:.5} \
+         se_corr/mc_sd={se_ratio:.4}"
     );
     assert!(
         (SE_VS_MC_LO..=SE_VS_MC_HI).contains(&se_ratio),
@@ -398,13 +326,14 @@ fn corrected_covariance_nodes_are_criterion_calibrated_2728() {
         rms_cond / rms_mc,
     );
 
-    // The corrected covariance must remain a covariance. The cubature assembles
-    // it as a mean of PSD inverse-Hessian blocks plus a sum of rank-one Grams,
-    // so every quadratic form is non-negative by construction; a negative one
-    // would mean the telescoping against `φ̂·H(ρ̂)⁻¹` had gone wrong.
+    // ── Angle 3: the correction only adds variance ───────────────────────
+    let se_cond = row_se(design.view(), vb);
     let se_corr = row_se(design.view(), vp);
-    assert!(
-        se_corr.iter().all(|v| v.is_finite() && *v >= 0.0),
-        "every corrected standard error must be finite and non-negative"
-    );
+    for (i, (&corr, &cond)) in se_corr.iter().zip(se_cond.iter()).enumerate() {
+        assert!(
+            corr.is_finite() && corr >= cond * (1.0 - 1e-12),
+            "row {i}: corrected SE {corr:.6e} must be finite and at least the conditional \
+             SE {cond:.6e}"
+        );
+    }
 }

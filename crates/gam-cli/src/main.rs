@@ -302,10 +302,11 @@ fn run() -> CliResult<()> {
         Command::ParameterDecomposition(args) => run_parameter_decomposition_cli(args),
         Command::Report(args) => run_report(args).map_err(CliError::from),
         Command::Summary(args) => run_summary(args).map_err(CliError::from),
-        Command::Predict(args) => run_predict(args).map_err(CliError::from),
+        Command::Predict(args) => run_predict(args),
         Command::TransformationScore(args) => {
             run_transformation_score(args).map_err(CliError::from)
         }
+        Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
         Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),

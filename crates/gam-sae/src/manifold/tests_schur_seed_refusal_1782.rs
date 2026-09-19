@@ -95,7 +95,6 @@ pub(crate) fn non_pd_schur_seed_refusal_is_recoverable_1782() {
 #[test]
 pub(crate) fn planted_circle_multi_atom_threshold_gate_clears_startup_validation_1782() {
     use gam_solve::rho_optimizer::OuterProblem;
-    use gam_solve::seeding::SeedConfig;
     // #2267 — surface the solver's own phase and progress lines; a timeout of this
     // fixture otherwise records nothing about where the time went.
     gam_runtime::test_support::install_diagnostic_logger();
@@ -157,11 +156,6 @@ pub(crate) fn planted_circle_multi_atom_threshold_gate_clears_startup_validation
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let result = OuterProblem::new(n_params)
         .with_initial_rho(init_rho_flat)
-        .with_seed_config(SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold");
     if let Err(err) = &result {
         let msg = err.to_string();

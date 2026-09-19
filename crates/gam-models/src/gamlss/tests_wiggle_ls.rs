@@ -440,7 +440,6 @@ pub(crate) fn binomial_mean_wiggle_operator_fixture() -> (
         wiggle_degree: degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
     let basis = family.wiggle_design(eta.view()).expect("wiggle basis");
     let beta_w = Array1::from_iter((0..basis.ncols()).map(|j| 0.015 * (j as f64 + 1.0)));
@@ -1142,7 +1141,6 @@ pub(crate) fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
         wiggle_degree: 3,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
     let specs = vec![
         ParameterBlockSpec {
@@ -2354,6 +2352,7 @@ pub(crate) fn gaussian_location_scale_joint_hessian_is_observed_and_psi_layers_m
                     gam_linalg::matrix::DenseDesignMatrix::from(xmu_t.clone()),
                 )),
                 log_sigma_design: family.log_sigma_design.clone(),
+                sigma_floor: TEST_SIGMA_FLOOR,
                 policy: gam_runtime::resource::ResourcePolicy::default_library(),
                 cached_row_scalars: std::sync::RwLock::new(None),
             };
@@ -2499,6 +2498,7 @@ pub(crate) fn gaussian_location_scale_joint_hessian_is_observed_and_psi_layers_m
                     gam_linalg::matrix::DenseDesignMatrix::from(xmu_t.clone()),
                 )),
                 log_sigma_design: family.log_sigma_design.clone(),
+                sigma_floor: TEST_SIGMA_FLOOR,
                 wiggle_knots: family.wiggle_knots.clone(),
                 wiggle_degree: family.wiggle_degree,
                 policy: gam_runtime::resource::ResourcePolicy::default_library(),
@@ -2823,7 +2823,7 @@ pub(crate) fn gls_wiggle_joint_loglik_gradient_matches_finite_difference_and_leg
 /// `gls_wiggle_second_directional_coeffs` and the dense `_from_designs` blocks. Nothing
 /// compared that pullback with the likelihood it differentiates. This test takes exact
 /// nested num-dual derivatives in β of
-/// `f(β) = Σ_i w_i (½ (y_i − q_i)² / σ_i² + log σ_i)`, `σ = LOGB_SIGMA_FLOOR + e^{η_ls}`,
+/// `f(β) = Σ_i w_i (½ (y_i − q_i)² / σ_i² + log σ_i)`, `σ = TEST_SIGMA_FLOOR + e^{η_ls}`,
 /// and requires the dense observed Hessian and its first and second directional
 /// derivatives to match to rounding.
 ///
@@ -2879,7 +2879,7 @@ pub(crate) fn gaussian_wiggle_joint_hessian_and_directional_derivatives_match_ex
             for j in 0..p_ls {
                 eta_ls += D::from(xls[[i, j]]) * coefficients[p_mu + j];
             }
-            let sigma = D::from(crate::sigma_link::LOGB_SIGMA_FLOOR) + eta_ls.exp();
+            let sigma = D::from(TEST_SIGMA_FLOOR) + eta_ls.exp();
             let residual = D::from(family.y[i]) - q;
             total += D::from(family.weights[i])
                 * (half * residual * residual / (sigma * sigma) + sigma.ln());

@@ -277,17 +277,23 @@ pub(crate) fn gaussian_location_scalewarm_start(
             "gaussian location-scale warm start could not estimate residual scale".to_string(),
         );
     }
-    // Warm-start σ̂ must clear the logb floor so the inverse link
-    //   η = log(σ − b)
-    // is finite. Use a relative cushion above b so the warm-start is in the
-    // smooth interior of the link domain.
-    let sigma_hat = (weighted_ss / weight_sum)
-        .sqrt()
-        .max(LOGB_SIGMA_FLOOR * 1.5);
+    // The warm start targets η = ln σ̂, i.e. σ₀ = b + σ̂ under σ = b + e^η. The
+    // floor b is the recording-grid bound δ/√12 (see `sigma_link`), which for a
+    // correctly specified model sits below the residual scale, so σ₀ exceeds σ̂
+    // by at most that quantization term; no clamp against b is needed. A zero
+    // residual scale means the mean interpolates every row, and there is no
+    // noise level to start the scale block from.
+    let sigma_hat = (weighted_ss / weight_sum).sqrt();
+    if !(sigma_hat > 0.0) {
+        return Err(format!(
+            "gaussian location-scale warm start: the penalized mean fit leaves no residual \
+             spread (σ̂ = {sigma_hat:.3e}), so there is no noise scale to start from"
+        ));
+    }
     let beta_log_sigma = if let Some(beta) = noise_beta_hint {
         beta.clone()
     } else {
-        let eta_sigma = (sigma_hat - LOGB_SIGMA_FLOOR).ln();
+        let eta_sigma = sigma_hat.ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
         solve_penalizedweighted_projection(
             &log_sigma_block.design,
@@ -1159,33 +1165,30 @@ pub struct GaussianLocationScaleFitResult {
     pub beta_link_wiggle: Option<Vec<f64>>,
     /// Response standardization factor applied internally during fitting.
     ///
-    /// The Gaussian location-scale path fits on `y / response_scale` so the
-    /// fixed log-σ soft floor `LOGB_SIGMA_FLOOR = 0.01` is *operationally*
-    /// scale-relative (1 % of the response spread) rather than absolute,
-    /// keeping κ = dlogσ/dη ≈ 1 across the realistic σ range and informing the
-    /// scale block like gamlss. The returned coefficient `blocks`, `beta`, and
-    /// link-wiggle knots/coefficients are already mapped back to **raw response
-    /// units** (the Location/Mean block scaled by `response_scale`, the Scale
-    /// block intercept shifted by `+ln(response_scale)`), so downstream
-    /// reconstruction `μ = X_mean·β` comes out in raw units with no further
-    /// rescaling.
+    /// The Gaussian location-scale path fits on `y / response_scale`. The
+    /// returned coefficient `blocks`, `beta`, and link-wiggle knots/coefficients
+    /// are already mapped back to **raw response units** (the Location/Mean
+    /// block scaled by `response_scale`, the Scale block intercept shifted by
+    /// `+ln(response_scale)`), so downstream reconstruction `μ = X_mean·β` comes
+    /// out in raw units with no further rescaling.
     ///
-    /// The σ reconstruction, however, **must scale the floor too** to stay
+    /// The σ reconstruction must scale the floor too to stay
     /// response-scale-equivariant (#884):
     ///
     /// ```text
-    /// σ = response_scale·LOGB_SIGMA_FLOOR + exp(X_scale·β)
-    ///   = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal)).
+    /// σ = response_scale·sigma_floor + exp(X_scale·β)
+    ///   = response_scale·(sigma_floor + exp(η_internal)).
     /// ```
     ///
-    /// The intercept shift carries only the `exp(η)` term; reconstructing with a
-    /// raw `LOGB_SIGMA_FLOOR` instead of `response_scale·LOGB_SIGMA_FLOOR` leaves
-    /// the non-equivariant residual `LOGB_SIGMA_FLOOR·(1 − response_scale)`.
-    ///
-    /// This field records the factor that was applied for transparency,
-    /// covariance bookkeeping, and the equivariant σ-floor reconstruction; it is
-    /// `1.0` when no standardization was needed (degenerate constant response).
+    /// The intercept shift carries only the `exp(η)` term; the floor sits
+    /// outside the exponential, so it is carried by this factor instead.
     pub response_scale: f64,
+    /// The σ floor `b` of the link σ = b + exp(η), in standardized response
+    /// units: the recording-grid bound δ/√12 of the standardized response
+    /// (`sigma_link::gaussian_resolution_sigma_floor`). It is a property of the
+    /// data, so the raw-unit floor `response_scale·sigma_floor` is exactly the
+    /// raw grid bound δ_raw/√12.
+    pub sigma_floor: f64,
 }
 
 /// Exact coefficient-frame map for the frozen-basis binomial mean-wiggle
@@ -2541,7 +2544,6 @@ pub(crate) fn fit_binomial_mean_wiggle(
         wiggle_degree: spec.wiggle_degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
 
     // Build the de-aliased warp block at a frozen index.  The identifiable
@@ -2703,19 +2705,11 @@ pub(crate) fn fit_binomial_mean_wiggle(
         // and it is not reconstructible from the saved-frame states (#2748).
         let accepted_frozen_warp_design = std::sync::Arc::clone(&bda);
         fam.frozen_warp_design = Some(bda);
-        // Every pass after the first is a CONTINUATION of the previous pass's
-        // solve: one seed (the warm ρ the blocks carry) and no screening
-        // cascade, so the frozen-index map is single-valued. See the
-        // `continuation` field for the n=1000 basin flip this removes (#2748).
-        fam.continuation = _outer > 0;
-        let pass_options = if _outer > 0 {
-            let mut continuation_options = options.clone();
-            continuation_options.screen_initial_rho = false;
-            continuation_options
-        } else {
-            options.clone()
-        };
-        let fit = fit_custom_family(&fam, &blocks, &pass_options).map_err(|e| e.to_string())?;
+        // Every pass after the first continues from the warm ρ the blocks carry.
+        // The outer search enters from that one start, so the frozen-index map
+        // is single-valued: no multi-start winner can flip between two inner
+        // optima as the index moves (the n=1000 basin flip of #2748).
+        let fit = fit_custom_family(&fam, &blocks, options).map_err(|e| e.to_string())?;
         let mean_state = fit
             .block_states
             .get(BinomialMeanWiggleFamily::BLOCK_ETA)
@@ -3026,10 +3020,6 @@ pub(crate) trait LocationScaleFamilyBuilder {
         false
     }
 
-    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::GeneralizedLinear
-    }
-
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         Ok(Array1::zeros(0))
     }
@@ -3210,11 +3200,9 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 &[mean_terms, noise_terms],
                 kappa_options,
                 &joint_setup,
-                builder.exact_spatial_seed_risk_profile(),
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
                 gamlss_disable_fixed_point,
-                None,
                 None,
                 outer_policy,
                 // The final coefficient fit: the solver's error is carried whole
@@ -3509,6 +3497,8 @@ pub(crate) fn wiggle_basis_failure(reason: String) -> FitFailure {
 pub(crate) struct GaussianLocationScaleTermBuilder {
     pub(crate) y: Array1<f64>,
     pub(crate) weights: Array1<f64>,
+    /// σ floor of the fitted response, `gaussian_resolution_sigma_floor(y, weights)`.
+    pub(crate) sigma_floor: f64,
     pub(crate) meanspec: TermCollectionSpec,
     pub(crate) noisespec: TermCollectionSpec,
     pub(crate) mean_offset: Array1<f64>,
@@ -3528,10 +3518,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 
     fn exact_spatial_joint_supported(&self) -> bool {
         true
-    }
-
-    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::GaussianLocationScale
     }
 
     fn build_blocks(
@@ -3576,6 +3562,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(preparednoise_design),
+            sigma_floor: self.sigma_floor,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
@@ -3621,6 +3608,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
     pub(crate) y: Array1<f64>,
     pub(crate) weights: Array1<f64>,
+    /// σ floor of the fitted response, `gaussian_resolution_sigma_floor(y, weights)`.
+    pub(crate) sigma_floor: f64,
     pub(crate) meanspec: TermCollectionSpec,
     pub(crate) noisespec: TermCollectionSpec,
     pub(crate) mean_offset: Array1<f64>,
@@ -3653,10 +3642,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
 
     fn exact_spatial_joint_supported(&self) -> bool {
         true
-    }
-
-    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::GaussianLocationScale
     }
 
     fn require_exact_spatial_joint(&self) -> bool {
@@ -3729,6 +3714,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(preparednoise_design),
+            sigma_floor: self.sigma_floor,
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
@@ -4084,11 +4070,14 @@ pub(crate) fn fit_gaussian_location_scale_terms(
 ) -> Result<BlockwiseTermFitResult, FitFailure> {
     validate_gaussian_location_scale_termspec(data, &spec, "fit_gaussian_location_scale_terms")
         .map_err(input_failure)?;
+    let sigma_floor = gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleTermBuilder {
             y: spec.y,
             weights: spec.weights,
+            sigma_floor,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
             mean_offset: spec.mean_offset,
@@ -4111,11 +4100,14 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
         "fit_gaussian_location_scalewiggle_terms",
     )
     .map_err(input_failure)?;
+    let sigma_floor = gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleWiggleTermBuilder {
             y: spec.y,
             weights: spec.weights,
+            sigma_floor,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
             mean_offset: spec.mean_offset,
@@ -4657,11 +4649,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         // (#2748): the two are different functions, only this one is convex, and
         // only this one makes the declared ψ-derivative layout complete.
         frozen_warp_design: Some(std::sync::Arc::clone(&frozen_warp_basis)),
-        continuation: false,
     };
-    let screening_cap = Arc::new(AtomicUsize::new(0));
-    let mut outer_options = options.clone();
-    outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
+    let outer_options = options.clone();
     struct MeanWiggleOuterState {
         pub(crate) warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
         pub(crate) last_eval: Option<(
@@ -4818,6 +4807,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // they rebuild the spatial basis and penalties at each outer proposal.
     let analytic_outer_hessian_available = true;
     let problem = gam_solve::rho_optimizer::OuterProblem::new(theta_dim)
+        .with_problem_size(
+            y.len(),
+            baseline_design.design.ncols() + frozen_warp_basis.ncols(),
+        )
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
             DeclaredHessianForm::Either
@@ -4832,17 +4825,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .with_max_iter(options.outer_max_iter)
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
-        .with_seed_config(crate::seeding::SeedConfig {
-            max_seeds: 4,
-            seed_budget: 2,
-            risk_profile: crate::seeding::SeedRiskProfile::GeneralizedLinear,
-            num_auxiliary_trailing: theta_dim - rho_dim,
-            ..Default::default()
-        })
-        .with_screening_cap(Arc::clone(&screening_cap))
-        // The seed lattice reads its anchor in the outer coordinate, log λ
-        // (#1340); an exp(ρ₀) anchor clamps to the domain's upper face (#2902
-        // row 9).
+        // The start is read in the outer coordinate, log λ (#1340); an exp(ρ₀)
+        // anchor clamps to the domain's upper face (#2902 row 9).
         .with_heuristic_log_lambdas(theta0.to_vec());
 
     let eval_outer = |state: &mut MeanWiggleOuterState,
@@ -4898,7 +4882,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         })
     };
 
-    let mut obj = problem.build_objective_with_screening_proxy(
+    let mut obj = problem.build_objective_with_eval_order(
         MeanWiggleOuterState {
             warm_cache: None,
             last_eval: None,
@@ -4953,27 +4937,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.efs_eval)
         }),
-        // Seed-screening ranking proxy (#969). The cost closure above
-        // hard-errors on a non-converged inner solve — correct for
-        // line-search costs, but under the screening cap (wired into the
-        // outer options and installed by the cascade) the inner solve is
-        // truncated BY DESIGN, so screening through it rejects every seed
-        // — the all-seeds-rejected front-door genus. Screening only RANKS
-        // candidates: the truncated solve's penalized objective is the
-        // ranking signal; convergence is demanded of the selected seed's
-        // full-budget fit, not of capped probes.
-        |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
-            if let Some((cached_theta, cached_cost, _, _, cached_warm)) = &state.last_eval
-                && cached_theta == theta
-            {
-                state.warm_cache = Some(cached_warm.clone());
-                return Ok(*cached_cost);
-            }
-            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), false)
-                .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
-            state.warm_cache = Some(eval.warm_start);
-            Ok(eval.objective)
-        },
     );
 
     let outer = problem

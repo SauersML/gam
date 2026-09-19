@@ -76,7 +76,7 @@ fn apply_adaptive_spatial_center_counts(
                 gam_terms::basis::BSplineBasisSpec {
                     knotspec:
                         gam_terms::basis::BSplineKnotSpec::Automatic {
-                            num_internal_knots: Some(num_internal_knots),
+                            num_internal_knots,
                             adaptive: true,
                             ..
                         },

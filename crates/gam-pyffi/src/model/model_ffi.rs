@@ -471,6 +471,16 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     info.set_item("python_module", "gam._rust")?;
     info.set_item("abi3", "cp310+")?;
     info.set_item("version", env!("CARGO_PKG_VERSION"))?;
+    // The version is shared by every commit between releases, so the commit
+    // and the saved-model payload version are what tell two engines apart
+    // (gam#3007, gam#3157). Both identity keys are None for a build that had no
+    // gam git tree to read.
+    info.set_item("commit", gam_build_identity::COMMIT)?;
+    info.set_item("dirty", gam_build_identity::DIRTY)?;
+    info.set_item(
+        "model_payload_version",
+        gam::inference::model::MODEL_PAYLOAD_VERSION,
+    )?;
     info.set_item(
         "capabilities",
         vec![
@@ -481,6 +491,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "torch_from_fitted",
             "predict",
             "transformation_score",
+            "latent_conditional_residual",
             "predict_array",
             "predict_conformal",
             "build_predict_payload_json",
@@ -893,11 +904,17 @@ fn encoded_table_from_arrow(
 /// [`gam::data::project_encoded_to_schema`], the projection `gam predict` applies
 /// to a Parquet file: labels map onto training levels, a random-effect group's
 /// unseen or missing label takes the unknown-level code, and a missing or
-/// non-finite numeric cell is refused naming its column.
+/// non-finite numeric cell is refused naming its column. A numeric-coded fixed
+/// `factor(g)` has no categorical schema, so its unseen levels are refused by
+/// [`FittedModel::unseen_numeric_factor_levels`], the check `gam predict` runs.
+///
+/// A refused cell is [`PredictError::Input`] and a missing column or a column
+/// of the wrong kind is [`PredictError::SchemaMismatch`], so each reaches Python
+/// as its own class.
 fn dataset_with_model_schema_from_encoded(
     model: &FittedModel,
     source: &EncodedDataset,
-) -> Result<EncodedDataset, String> {
+) -> Result<EncodedDataset, PredictError> {
     let required = required_prediction_columns(model)?;
     let present = source.headers.iter().cloned().collect::<BTreeSet<_>>();
     let missing = required
@@ -905,7 +922,7 @@ fn dataset_with_model_schema_from_encoded(
         .map(|name| format!("missing required column '{name}'"))
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        return Err(missing.join(" "));
+        return Err(PredictError::SchemaMismatch(missing.join(" ")));
     }
     let consumable = prediction_consumable_columns(model)?;
     let keep = source
@@ -942,8 +959,24 @@ fn dataset_with_model_schema_from_encoded(
     let policy = gam::data::UnseenCategoryPolicy::encode_unknown_for_columns(
         model.random_effect_group_columns(),
     );
-    gam::data::project_encoded_to_schema(selected, model.require_data_schema()?, &policy)
-        .map_err(|error| error.to_string())
+    let schema = model
+        .require_data_schema()
+        .map_err(|error| PredictError::Other(error.to_string()))?;
+    let dataset = gam::data::project_encoded_to_schema(selected, schema, &policy).map_err(
+        |error| match error {
+            gam::data::DataError::InvalidCell { .. } => PredictError::Input(error),
+            gam::data::DataError::SchemaMismatch { reason } => PredictError::SchemaMismatch(reason),
+            other => PredictError::Other(other.to_string()),
+        },
+    )?;
+    if let Some(unseen) = model
+        .unseen_numeric_factor_levels(&dataset.headers, dataset.values.view())
+        .into_iter()
+        .next()
+    {
+        return Err(PredictError::Input(unseen));
+    }
+    Ok(dataset)
 }
 
 fn schema_check_encoded(
@@ -982,33 +1015,21 @@ fn schema_check_encoded(
         }
     }
     if issues.is_empty()
-        && let Err(message) = dataset_with_model_schema_from_encoded(model, source)
+        && let Err(error) = dataset_with_model_schema_from_encoded(model, source)
     {
+        let column = match &error {
+            PredictError::Input(gam::data::DataError::InvalidCell { column, .. }) => {
+                Some(column.clone())
+            }
+            PredictError::Input(_) | PredictError::SchemaMismatch(_) | PredictError::Other(_) => {
+                None
+            }
+        };
         issues.push(SchemaIssue {
             kind: "schema_error".to_string(),
-            message,
-            column: None,
+            message: String::from(error),
+            column,
         });
-    }
-    if issues.is_empty() {
-        for (column, vocabulary) in model.numeric_fixed_factor_vocabularies() {
-            let Some(index) = source.headers.iter().position(|header| header == &column) else {
-                continue;
-            };
-            for value in source.values.column(index) {
-                if !vocabulary.contains(&gam::data::canonical_level_bits(*value)) {
-                    issues.push(SchemaIssue {
-                        kind: "schema_error".to_string(),
-                        message: format!(
-                            "unseen level '{value}' in fixed factor column '{column}'; \
-                             the factor's levels were fixed at fit time"
-                        ),
-                        column: Some(column.clone()),
-                    });
-                    break;
-                }
-            }
-        }
     }
     Ok(SchemaCheckPayload {
         ok: issues.is_empty(),
@@ -2001,6 +2022,40 @@ fn transformation_score_table<'py>(
         transformation_score_encoded_table_impl(&model, dataset)
     })?;
     Ok(scores.into_pyarray(py).unbind())
+}
+
+/// The declared conditional latent law's standardized residual
+/// `ζ = (z − m(a))/√v(a)` of a saved marginal-slope model on new rows, through
+/// the map its fit applied (gam#3016). `None` when the fit consumed no
+/// conditional law. The frame needs the score and the conditioning covariates,
+/// not a survival model's time columns.
+#[pyfunction]
+fn latent_conditional_residual_table<'py>(
+    py: Python<'py>,
+    model: PyRef<'_, PyFittedModel>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+) -> PyResult<Option<Py<PyArray1<f64>>>> {
+    let model = Arc::clone(&model.model);
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let residual = detach_pyresult(py, "latent_conditional_residual_table", move || {
+        let required = model
+            .latent_conditional_residual_columns()
+            .map_err(py_value_error)?;
+        let present = dataset.headers.iter().cloned().collect::<BTreeSet<_>>();
+        let missing = required
+            .difference(&present)
+            .map(|name| format!("missing required column '{name}'"))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(SchemaMismatchError::new_err(missing.join(" ")));
+        }
+        model
+            .latent_conditional_residual(dataset.values.view(), &dataset.column_map())
+            .map_err(|error| PredictInputError::new_err(error.to_string()))
+    })?;
+    Ok(residual.map(|values| values.into_pyarray(py).unbind()))
 }
 
 /// Per-row residuals of type `kind` (`response`, `working`, `deviance`,

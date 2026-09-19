@@ -1280,6 +1280,17 @@ impl SaeBasisSecondJet for SnapshotLinearSecondJet2521 {
         }
         Ok(Array4::<f64>::zeros((coords.nrows(), 2, 1, 1)))
     }
+
+    fn jet_ball_bound(
+        &self,
+        center: ndarray::ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<crate::basis::SaeBasisJetBallCapability, String> {
+        Ok(crate::basis::SaeBasisJetBallCapability::Unavailable(format!(
+            "SnapshotLinearSecondJet2521 is a snapshot test basis and declares no bound \
+             on the ball of radius {radius} around {center}"
+        )))
+    }
 }
 
 fn structural_restore_fixture_2521() -> SaeManifoldTerm {

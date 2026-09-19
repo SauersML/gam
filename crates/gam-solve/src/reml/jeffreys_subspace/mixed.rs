@@ -6,6 +6,9 @@ use super::*;
 /// Divided differences of the capped inverse and its first two floor partials.
 /// Same-piece rational identities avoid subtraction at repeated/nearby nodes.
 pub(super) fn inverse_difference(nodes: &[f64], floor: f64, floor_order: usize) -> f64 {
+    if nodes.iter().all(|&x| x < floor) && nodes.iter().any(|&x| x < 0.0) {
+        return below_floor_difference(nodes, floor, floor_order);
+    }
     let cap = floor.max(CONDITIONING_GATE_ABSOLUTE_CLEAR);
     let piece = |x: f64| inverse_kernel_piece(x, floor, cap);
     let branch = piece(nodes[0]);
@@ -29,7 +32,8 @@ pub(super) fn inverse_difference(nodes: &[f64], floor: f64, floor_order: usize) 
                     0.0
                 }
             }
-            1 => {
+            // The floor plateau; a node set holding a negative node left above.
+            _ => {
                 if nodes.len() == 1 {
                     match floor_order {
                         0 => floor.recip(),
@@ -38,28 +42,6 @@ pub(super) fn inverse_difference(nodes: &[f64], floor: f64, floor_order: usize) 
                     }
                 } else {
                     0.0
-                }
-            }
-            _ => {
-                let mut product = 1.0;
-                let mut s1 = 0.0;
-                let mut s2 = 0.0;
-                let mut s3 = 0.0;
-                for &x in nodes {
-                    let z = (floor - x).recip();
-                    product *= z;
-                    s1 += z;
-                    s2 += z * z;
-                    s3 += z * z * z;
-                }
-                match floor_order {
-                    0 => floor * product * s1,
-                    1 => product * (s1 - floor * (s1 * s1 + s2)),
-                    _ => {
-                        product
-                            * (-2.0 * (s1 * s1 + s2)
-                                + floor * (s1 * s1 * s1 + 3.0 * s1 * s2 + 2.0 * s3))
-                    }
                 }
             }
         };
@@ -72,6 +54,217 @@ pub(super) fn inverse_difference(nodes: &[f64], floor: f64, floor_order: usize) 
     (inverse_difference(&sorted[1..], floor, floor_order)
         - inverse_difference(&sorted[..last], floor, floor_order))
         / (sorted[last] - sorted[0])
+}
+
+/// [`inverse_difference`] on nodes below the floor, at least one of them on the
+/// bottom saturation `d = w(λ/floor)/floor`, `w(t) = 1/(1 + t⁴)` (gam#2982).
+///
+/// Below the floor `∂ʲ_floor d` is its plateau value `(−1)ʲ j!/floor^{j+1}` plus a
+/// remainder `ρ_j` that vanishes on the plateau and is `O(t⁴)` below zero. A
+/// divided difference of two or more nodes does not see the constant, so it is
+/// the divided difference of `ρ_j`, formed without subtracting two plateau-sized
+/// values: [`bottom_saturation_difference`] when every node is negative, and the
+/// recursion on `ρ_j` otherwise.
+fn below_floor_difference(nodes: &[f64], floor: f64, floor_order: usize) -> f64 {
+    if let [lam] = nodes {
+        return match floor_order {
+            0 => floored_inverse(*lam, floor),
+            1 => floored_inverse_floor_sensitivity(*lam, floor),
+            _ => floored_inverse_floor_second_sensitivity(*lam, floor),
+        };
+    }
+    bottom_remainder_difference(nodes, floor, floor_order)
+}
+
+/// The divided difference of the remainder `ρ_j` of [`below_floor_difference`].
+fn bottom_remainder_difference(nodes: &[f64], floor: f64, floor_order: usize) -> f64 {
+    if let [lam] = nodes {
+        if *lam >= 0.0 {
+            return 0.0;
+        }
+        // With τ = t⁴w = 1 − w: ρ₀ = −τ/f, ρ₁ = (τ − t·w')/f², ρ₂ = (−2τ + 4t·w' + t²·w'')/f³.
+        let profile = BottomProfile::new(*lam, floor);
+        let tau = profile.monomial(4, 0);
+        return match floor_order {
+            0 => -tau / floor,
+            1 => (tau - profile.monomial(1, 1)) / (floor * floor),
+            _ => {
+                (-2.0 * tau + 4.0 * profile.monomial(1, 1) + profile.monomial(2, 2))
+                    / (floor * floor * floor)
+            }
+        };
+    }
+    if nodes.iter().all(|&x| x < 0.0) {
+        return bottom_saturation_difference(nodes, floor, floor_order);
+    }
+    if nodes.iter().all(|&x| x >= 0.0) {
+        return 0.0;
+    }
+    let mut storage = [0.0; 4];
+    let sorted = &mut storage[..nodes.len()];
+    sorted.copy_from_slice(nodes);
+    sorted.sort_by(f64::total_cmp);
+    let last = sorted.len() - 1;
+    (bottom_remainder_difference(&sorted[1..], floor, floor_order)
+        - bottom_remainder_difference(&sorted[..last], floor, floor_order))
+        / (sorted[last] - sorted[0])
+}
+
+/// A complex number, for the partial fractions of the bottom profile.
+#[derive(Clone, Copy)]
+struct Complex {
+    re: f64,
+    im: f64,
+}
+
+impl Complex {
+    fn add(self, other: Self) -> Self {
+        Self { re: self.re + other.re, im: self.im + other.im }
+    }
+
+    fn mul(self, other: Self) -> Self {
+        Self {
+            re: self.re * other.re - self.im * other.im,
+            im: self.re * other.im + self.im * other.re,
+        }
+    }
+
+    fn scale(self, factor: f64) -> Self {
+        Self { re: self.re * factor, im: self.im * factor }
+    }
+
+    fn recip(self) -> Self {
+        let norm = self.re.hypot(self.im);
+        let (re, im) = (self.re / norm, self.im / norm);
+        Self { re: re / norm, im: -im / norm }
+    }
+}
+
+/// Complete homogeneous symmetric polynomials `h_k` of the nodes, advanced one
+/// degree at a time: `h_k(x₀..x_l) = h_k(x₀..x_{l−1}) + x_l·h_{k−1}(x₀..x_l)`.
+struct CompleteHomogeneous {
+    nodes: [f64; 4],
+    len: usize,
+    /// `values[l] = h_k(x₀..x_l)` at the current degree `k`.
+    values: [f64; 4],
+}
+
+impl CompleteHomogeneous {
+    fn new(nodes: &[f64]) -> Self {
+        let mut stored = [0.0; 4];
+        stored[..nodes.len()].copy_from_slice(nodes);
+        Self { nodes: stored, len: nodes.len(), values: [1.0; 4] }
+    }
+
+    fn advance(&mut self, degrees: usize) {
+        for _ in 0..degrees {
+            let mut previous = 0.0;
+            for l in 0..self.len {
+                previous += self.nodes[l] * self.values[l];
+                self.values[l] = previous;
+            }
+        }
+    }
+
+    fn value(&self) -> f64 {
+        self.values[self.len - 1]
+    }
+}
+
+/// `Σ_{m≥1} term(m)` for a series whose terms fall geometrically, summed until a
+/// term neither changes the sum nor exceeds its predecessor.
+fn geometric_series_sum(mut term: impl FnMut(usize) -> f64) -> f64 {
+    let mut sum = term(1);
+    let mut previous = sum.abs();
+    for m in 2.. {
+        let next = term(m);
+        let settled = sum + next == sum && next.abs() <= previous;
+        sum += next;
+        previous = next.abs();
+        if settled {
+            break;
+        }
+    }
+    sum
+}
+
+/// Divided difference of `∂ʲ_floor d`, `d(λ) = w(λ/floor)/floor`, over two to four
+/// negative nodes, `t_i = λ_i/floor`, with the floor partial taken at fixed `λ`.
+///
+/// `w = Σ_p a_p/(t − p)` over the roots of `p⁴ = −1`, `a_p = −p/4`, so the
+/// difference is `2 Re Σ_{p = e^{iπ/4}, e^{3iπ/4}} (−1)ⁿ a_p pʲ Πζ · P_j/floor^{n+1+j}`
+/// with `ζ_i = 1/(t_i − p)` and `P₀ = 1`, `P₁ = Σζ`, `P₂ = (Σζ)² + Σζ²`. That form
+/// is exact at repeated nodes, but its two conjugate pairs cancel to the true
+/// `O(t^{4−n})` when every `|t| ≪ 1` and to `O(|t|^{−n−4})` when every `|t| ≫ 1`, so
+/// there the difference is the Taylor series of `w` about `0`, respectively `∞`:
+///
+/// * `max |t| ≤ ½`: `Σ_{m≥1} (−1)ᵐ ∏_{i<j}(−4m − 1 − i) h_{4m−n}(t)/floor^{n+1+j}`;
+/// * `min |t| ≥ 2`: `(−1)ⁿ Π(1/t) Σ_{m≥1} (−1)^{m+1} ∏_{i<j}(4m − 1 − i) h_{4m−1}(1/t)/floor^{n+1+j}`.
+///
+/// The thresholds `½` and `2` are this method's choice of where to change forms:
+/// they bound each series' term ratio by `2⁻⁴` up to its polynomial factors, and
+/// the product form's cancellation between them by a fixed power of two.
+fn bottom_saturation_difference(nodes: &[f64], floor: f64, floor_order: usize) -> f64 {
+    let n = nodes.len() - 1;
+    let mut storage = [0.0; 4];
+    let t = &mut storage[..nodes.len()];
+    for (slot, &lam) in t.iter_mut().zip(nodes) {
+        *slot = lam / floor;
+    }
+    let scale = floor.powi(-((n + 1 + floor_order) as i32));
+    let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+    let falling = |start: f64, step: f64| (0..floor_order).map(|i| start + step * i as f64).product::<f64>();
+    if t.iter().all(|x| x.abs() <= 0.5) {
+        let mut h = CompleteHomogeneous::new(t);
+        let mut degree = 0;
+        return scale
+            * geometric_series_sum(|m| {
+                let target = 4 * m - n;
+                h.advance(target - degree);
+                degree = target;
+                let alternating = if m % 2 == 0 { 1.0 } else { -1.0 };
+                alternating * falling(-((4 * m + 1) as f64), -1.0) * h.value()
+            });
+    }
+    if t.iter().all(|x| x.abs() >= 2.0) {
+        let mut inverse = [0.0; 4];
+        for (slot, &x) in inverse.iter_mut().zip(t.iter()) {
+            *slot = x.recip();
+        }
+        let inverse = &inverse[..nodes.len()];
+        let mut h = CompleteHomogeneous::new(inverse);
+        let mut degree = 0;
+        let prefactor = sign * inverse.iter().product::<f64>();
+        return scale
+            * prefactor
+            * geometric_series_sum(|m| {
+                let target = 4 * m - 1;
+                h.advance(target - degree);
+                degree = target;
+                let alternating = if m % 2 == 0 { -1.0 } else { 1.0 };
+                alternating * falling((4 * m - 1) as f64, -1.0) * h.value()
+            });
+    }
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let mut total = 0.0;
+    for root in [Complex { re: half, im: half }, Complex { re: -half, im: half }] {
+        let mut product = Complex { re: 1.0, im: 0.0 };
+        let mut s1 = Complex { re: 0.0, im: 0.0 };
+        let mut s2 = Complex { re: 0.0, im: 0.0 };
+        for &x in t.iter() {
+            let zeta = Complex { re: x - root.re, im: -root.im }.recip();
+            product = product.mul(zeta);
+            s1 = s1.add(zeta);
+            s2 = s2.add(zeta.mul(zeta));
+        }
+        let (power, polynomial) = match floor_order {
+            0 => (Complex { re: 1.0, im: 0.0 }, Complex { re: 1.0, im: 0.0 }),
+            1 => (root, s1),
+            _ => (root.mul(root), s1.mul(s1).add(s2)),
+        };
+        total += root.scale(-0.25).mul(power).mul(product).mul(polynomial).re;
+    }
+    2.0 * sign * scale * total
 }
 
 /// Which smooth piece of the capped inverse holds `x`: saturated below zero,
@@ -111,8 +304,6 @@ pub(super) struct InverseDividedDifferences {
     triples: [Vec<f64>; 3],
     /// `λ_i⁻¹`, the factors of a four-node value on one branch above the floor.
     recips: Vec<f64>,
-    /// `(floor − λ_i)⁻¹`, the factors of a four-node value below the floor.
-    gap_recips: Vec<f64>,
 }
 
 impl InverseDividedDifferences {
@@ -145,7 +336,6 @@ impl InverseDividedDifferences {
             table
         });
         let recips = values.iter().map(|&x| x.recip()).collect();
-        let gap_recips = values.iter().map(|&x| (floor - x).recip()).collect();
         Self {
             m,
             floor,
@@ -155,7 +345,6 @@ impl InverseDividedDifferences {
             pairs,
             triples,
             recips,
-            gap_recips,
         }
     }
 
@@ -165,34 +354,24 @@ impl InverseDividedDifferences {
 
     /// When every eigenvalue sits in one piece of the capped inverse, `quadruple([i, k, l, j])`
     /// is `scale · d_i d_k d_l d_j · τ`: `τ = 1` on the floored inverse, and
-    /// `τ = t_i + t_k + t_l + t_j` with `t = d` on the capped inverse and below zero. These
-    /// are the same closed forms `quadruple` evaluates. `None` when the spectrum spans pieces.
+    /// `τ = t_i + t_k + t_l + t_j` with `t = d` on the capped inverse. These are the same
+    /// closed forms `quadruple` evaluates. `None` when the spectrum spans pieces, and on the
+    /// bottom saturation, whose differences do not factor node by node (gam#2982).
     fn separable_quadruple(&self) -> Option<SeparableQuadruple> {
         let branch = *self.pieces.first()?;
         if self.pieces.iter().any(|&piece| piece != branch) {
             return None;
         }
-        Some(match branch {
-            3 => SeparableQuadruple {
-                scale: -self.cap,
-                factors: self.recips.clone(),
-                tilted: true,
-            },
-            2 => SeparableQuadruple {
-                scale: -1.0,
-                factors: self.recips.clone(),
-                tilted: false,
-            },
-            1 => SeparableQuadruple {
-                scale: 0.0,
-                factors: vec![0.0; self.m],
-                tilted: false,
-            },
-            _ => SeparableQuadruple {
-                scale: self.floor,
-                factors: self.gap_recips.clone(),
-                tilted: true,
-            },
+        let (scale, factors, tilted) = match branch {
+            3 => (-self.cap, self.recips.clone(), true),
+            2 => (-1.0, self.recips.clone(), false),
+            1 => (0.0, vec![0.0; self.m], false),
+            _ => return None,
+        };
+        Some(SeparableQuadruple {
+            scale,
+            factors,
+            tilted,
         })
     }
 
@@ -213,15 +392,7 @@ impl InverseDividedDifferences {
                     sign * (a * b * c * d)
                 }
                 1 => 0.0,
-                _ => {
-                    let mut product = 1.0;
-                    let mut s1 = 0.0;
-                    for z in nodes.map(|index| self.gap_recips[index]) {
-                        product *= z;
-                        s1 += z;
-                    }
-                    self.floor * product * s1
-                }
+                _ => inverse_difference(&nodes.map(|index| self.evals[index]), self.floor, 0),
             };
         }
         let mut sorted = nodes;
@@ -245,7 +416,7 @@ impl InverseDividedDifferences {
 struct SeparableQuadruple {
     scale: f64,
     factors: Vec<f64>,
-    /// Whether `τ = Σ` of the four node factors (capped inverse, below zero) rather than 1.
+    /// Whether `τ = Σ` of the four node factors (capped inverse) rather than 1.
     tilted: bool,
 }
 
@@ -291,7 +462,7 @@ fn loewner_second_rows(
 /// [`loewner_second_rows`] on a spectrum inside one piece. With `D = diag(d)` and the node
 /// factors of `τ` on each of the four slots, row `r` is
 /// `scale · D · Σ_σ X_σ D Y_σ D Z_σ · D` over the six orderings `(X, Y, Z)` of `(E, F, A_r)`
-/// on the floored inverse, and `scale · D · (T S + S T + S₁ + S₂) · D` on the tilted pieces,
+/// on the floored inverse, and `scale · D · (T S + S T + S₁ + S₂) · D` on the tilted capped inverse,
 /// where `S₁`, `S₂` carry `D T` in the first and second interior slot. With
 /// `P = E D F + F D E` formed once per call, the untilted row costs six `m × m` products.
 /// No symmetry of `E`, `F` or `A` is assumed.
@@ -1646,8 +1817,9 @@ impl JeffreysHphiDriftBase {
 
     fn refuse_inverse_kernel_branch_boundary(&self) -> Result<(), String> {
         let cap = self.floor.max(CONDITIONING_GATE_ABSOLUTE_CLEAR);
+        // `λ = 0` is no knot: the bottom saturation joins the plateau C⁴ (gam#2982).
         for &value in &self.evals {
-            for knot in [0.0, self.floor, cap] {
+            for knot in [self.floor, cap] {
                 let resolution = 16.0 * f64::EPSILON * value.abs().max(knot.abs());
                 if (value - knot).abs() <= resolution {
                     return Err(format!(
@@ -1755,6 +1927,93 @@ mod tests {
         }
     }
 
+    /// gam#2982: divided differences on the bottom saturation `d = w(λ/floor)/floor` keep
+    /// their relative accuracy at tied nodes, near `0` where `d` leaves the plateau as
+    /// `O(t⁴)`, far below it where `d = O(t⁻⁴)`, across the series/partial-fraction
+    /// thresholds, and on node sets that straddle `0`.
+    #[test]
+    fn bottom_saturation_divided_differences_are_accurate_2982() {
+        let relative = |actual: f64, expected: f64| {
+            if actual == expected { 0.0 } else { (actual - expected).abs() / expected.abs() }
+        };
+        let floor = 2.0;
+        // Tied nodes: the confluent value `d⁽ⁿ⁾/n!` and its floor partials, from the
+        // pointwise profile.
+        let mut worst_tied = 0.0_f64;
+        for t in [-1e-5, -1e-3, -0.3, -0.5, -0.500001, -0.8, -1.0, -1.999999, -2.0, -30.0, -1e4] {
+            let lam = t * floor;
+            let profile = BottomProfile::new(lam, floor);
+            let m = |p, q| profile.monomial(p, q);
+            let f = floor;
+            let cases = [
+                (vec![lam, lam], 0, m(0, 1) / (f * f)),
+                (vec![lam, lam], 1, floored_inverse_lambda_floor_sensitivity(lam, f)),
+                (vec![lam, lam], 2, (6.0 * m(0, 1) + 6.0 * m(1, 2) + m(2, 3)) / f.powi(4)),
+                (vec![lam, lam, lam], 0, m(0, 2) / (2.0 * f.powi(3))),
+                (vec![lam, lam, lam, lam], 0, m(0, 3) / (6.0 * f.powi(4))),
+            ];
+            for (nodes, order, expected) in cases {
+                let actual = inverse_difference(&nodes, floor, order);
+                let error = relative(actual, expected);
+                worst_tied = worst_tied.max(error);
+                assert!(
+                    error < 1e-12,
+                    "t={t}, {} tied nodes, floor order {order}: {actual:e} vs {expected:e} \
+                     (relative {error:e})",
+                    nodes.len()
+                );
+            }
+        }
+        // Separated nodes: the recursion on pointwise floor partials, which is accurate
+        // when every node gap is O(floor) and the values do not cancel.
+        let pointwise = |lam: f64, order: usize| match order {
+            0 => floored_inverse(lam, floor),
+            1 => floored_inverse_floor_sensitivity(lam, floor),
+            _ => floored_inverse_floor_second_sensitivity(lam, floor),
+        };
+        fn naive(nodes: &[f64], order: usize, pointwise: &dyn Fn(f64, usize) -> f64) -> f64 {
+            if let [lam] = nodes {
+                return pointwise(*lam, order);
+            }
+            let last = nodes.len() - 1;
+            (naive(&nodes[1..], order, pointwise) - naive(&nodes[..last], order, pointwise))
+                / (nodes[last] - nodes[0])
+        }
+        let mut worst_separated = 0.0_f64;
+        for (region, t_nodes) in [
+            ("near", [-0.5, -0.4, -0.3, -0.2]),
+            ("product", [-1.9, -1.4, -1.0, -0.6]),
+            ("across regions", [-8.0, -3.0, -1.0, -0.2]),
+            ("far", [-12.0, -7.0, -4.0, -2.5]),
+            ("plateau and bottom", [-1.2, -0.7, 0.3, 0.8]),
+        ] {
+            let nodes = t_nodes.map(|t| t * floor);
+            for len in 2..=4 {
+                for order in 0..3 {
+                    let actual = inverse_difference(&nodes[..len], floor, order);
+                    let expected = naive(&nodes[..len], order, &pointwise);
+                    let error = relative(actual, expected);
+                    worst_separated = worst_separated.max(error);
+                    assert!(
+                        error < 1e-9,
+                        "{region}, {len} nodes, floor order {order}: {actual:e} vs {expected:e} \
+                         (relative {error:e})"
+                    );
+                }
+            }
+        }
+        // A pair straddling 0 that the plateau-sized recursion rounds to zero.
+        let t0 = -1e-6;
+        let pair = [t0 * floor, 3e-7 * floor];
+        let expected = t0.powi(4) / (1.0 + t0.powi(4)) / floor / (pair[1] - pair[0]);
+        let straddling = relative(inverse_difference(&pair, floor, 0), expected);
+        assert!(straddling < 1e-14, "straddling pair: relative {straddling:e}");
+        eprintln!(
+            "[2982] worst relative error: tied {worst_tied:e}, separated {worst_separated:e}, \
+             straddling {straddling:e}"
+        );
+    }
+
     #[test]
     fn mixed_jeffreys_drift_matches_first_drift_difference_979() {
         // Gate transition, repeated interior spectrum, moving relative floor,
@@ -1855,7 +2114,8 @@ mod tests {
     }
 
     /// #1082: on a spectrum inside one piece of the capped inverse, the factored map equals the
-    /// coefficient loop on every piece; a spectrum that spans pieces is never factored.
+    /// coefficient loop on every piece; a spectrum that spans pieces, or sits on the bottom
+    /// saturation (gam#2982), is never factored.
     #[test]
     fn separable_second_frechet_rows_match_the_coefficient_loop_1082() {
         let floor = 1e-3;
@@ -1865,7 +2125,6 @@ mod tests {
         for spectrum in [
             array![0.3, 1.7, 5.0, 11.0],
             array![18.0, 25.0, 40.0, 90.0],
-            array![-0.4, -1.1, -2.5, -6.0],
             array![0.0, 2e-4, 5e-4, 9e-4],
         ] {
             let table = InverseDividedDifferences::new(&spectrum, floor);
@@ -1910,10 +2169,16 @@ mod tests {
                 );
             }
         }
-        for spectrum in [array![0.3, 20.0], array![-0.2, 0.5], array![5e-4, 3.0]] {
+        for spectrum in [
+            array![0.3, 20.0],
+            array![-0.2, 0.5],
+            array![5e-4, 3.0],
+            array![-0.4, -1.1, -2.5, -6.0],
+        ] {
             assert!(
                 InverseDividedDifferences::new(&spectrum, floor).separable_quadruple().is_none(),
-                "a spectrum spanning pieces must keep the coefficient loop: {spectrum:?}"
+                "a spectrum spanning pieces or on the bottom saturation must keep the coefficient \
+                 loop: {spectrum:?}"
             );
         }
     }

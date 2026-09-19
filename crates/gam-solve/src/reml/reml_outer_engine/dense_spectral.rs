@@ -854,6 +854,51 @@ impl DenseSpectralOperator {
         }
         result
     }
+
+    /// Every pairwise [`Self::trace_logdet_hessian_cross_rotated`] over the
+    /// rotated drifts `R_0 … R_{m−1}`, as the symmetric `m × m` matrix whose
+    /// `(i, j)` entry (`i ≤ j`, mirrored below the diagonal) is
+    /// `Σ_{a,b} K[a,b] · R_i[a,b] · R_j[b,a]`.
+    ///
+    /// Pair by pair that is `m(m+1)/2` sweeps over `p²` entries, each reading
+    /// `R_j` down its columns. Slicing the double sum by the row index `a`
+    /// instead gives, for every pair at once,
+    ///
+    /// ```text
+    ///   T += W_a · C_aᵀ,   W_a[i, b] = K[a,b] · R_i[a,b],   C_a[j, b] = R_j[b,a],
+    /// ```
+    ///
+    /// one `m × p × m` GEMM per row: the same `m² p²` products, contracted
+    /// on contiguous operands, with `O(m p)` scratch.
+    pub(crate) fn trace_logdet_hessian_crosses_rotated(
+        &self,
+        rotated: &[Array2<f64>],
+    ) -> Array2<f64> {
+        let m = rotated.len();
+        let p = self.n_dim;
+        let mut out = Array2::<f64>::zeros((m, m));
+        if m == 0 || p == 0 {
+            return out;
+        }
+        let mut weighted = Array2::<f64>::zeros((m, p));
+        let mut columns = Array2::<f64>::zeros((m, p));
+        for (a, kernel_row) in self.logdet_hessian_kernel.rows().into_iter().enumerate() {
+            for (i, r) in rotated.iter().enumerate() {
+                ndarray::Zip::from(weighted.row_mut(i))
+                    .and(&kernel_row)
+                    .and(r.row(a))
+                    .for_each(|w, &k, &h| *w = k * h);
+                columns.row_mut(i).assign(&r.column(a));
+            }
+            ndarray::linalg::general_mat_mul(1.0, &weighted, &columns.t(), 1.0, &mut out);
+        }
+        for i in 0..m {
+            for j in 0..i {
+                out[[i, j]] = out[[j, i]];
+            }
+        }
+        out
+    }
 }
 
 /// Coalesce repeated identical `[STAGE]` log lines from `DenseSpectralOperator`

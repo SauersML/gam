@@ -3500,6 +3500,11 @@ fn test_payload(
     payload
 }
 
+/// Standardized-units σ floor saved with the intercept-only Gaussian
+/// location-scale fixture (a fitted model derives it from the response's
+/// recording grid; the fixture has no training response, so it pins one).
+const INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR: f64 = 0.01;
+
 fn intercept_only_gaussian_location_scale_model(
     beta_mu: f64,
     beta_log_sigma: f64,
@@ -3543,6 +3548,7 @@ fn intercept_only_gaussian_location_scale_model(
     payload.formula_noise = Some("1".to_string());
     payload.beta_noise = Some(vec![beta_log_sigma]);
     payload.gaussian_response_scale = Some(response_scale);
+    payload.gaussian_sigma_floor = Some(INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR);
     payload.set_training_feature_metadata(vec![], vec![]);
     payload.resolved_termspec = Some(empty_termspec());
     payload.resolved_termspec_noise = Some(empty_termspec());
@@ -5813,8 +5819,8 @@ fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
     // that shift, so it is the only piece still standardized and the only piece
     // multiplied here:
     //
-    //   σ_raw = response_scale·LOGB_SIGMA_FLOOR + exp(η_ls)
-    //         = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal))
+    //   σ_raw = response_scale·sigma_floor + exp(η_ls)
+    //         = response_scale·(sigma_floor + exp(η_internal))
     //
     // Scaling the whole `(floor + exp(η_ls))` instead would apply
     // `response_scale` twice on the exp term and break σ's response-scale
@@ -5822,7 +5828,7 @@ fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
     // fixture used to assert. See `GaussianLocationScalePredictor::compute_sigma`.
     //
     // Pick the input so σ exits at 2.0 exactly under the real convention:
-    // exp(η_ls) = 2.0 − 8·0.01 = 1.92.
+    // exp(η_ls) = 2.0 − 8·INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR = 1.92.
     let model = intercept_only_gaussian_location_scale_model(-3.0, (1.92f64).ln(), 8.0);
     let data = ndarray::Array2::<f64>::zeros((2, 0));
     let headers = vec![];

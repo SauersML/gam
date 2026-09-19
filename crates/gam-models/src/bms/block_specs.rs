@@ -8,6 +8,8 @@ use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cach
 use super::install_flex::validate_spec;
 use super::*;
 use crate::fit_orchestration::FitFailure;
+use crate::inference::model::SavedLatentZNormalization;
+use crate::inference::predict_io::{FittedLatentScoreMap, LatentConditioningSpan};
 use crate::marginal_slope_orthogonal::influence_absorber_log_lambda;
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_xt_diag_x};
@@ -2078,7 +2080,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
         &spec.latent_z_policy,
     )
     .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-    spec.z = z_standardized;
+    // The raw score is kept for the training score below, which is computed from
+    // it through the map prediction applies (gam#3016).
+    let z_raw = std::mem::replace(&mut spec.z, z_standardized);
     // #2750/#2754/#2761: resolve every AUTO measure-jet representer range
     // against the response before any design is built here.
     //
@@ -2308,23 +2312,41 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // term-collection designs, the family's PIRLS loops) sees it; every other
     // law is anchored on the score as given. The calibration is persisted on the
     // fit result so prediction applies the identical map.
-    let z = match &latent_z_calibration {
-        LatentMeasureCalibration::None => Arc::new(spec.z.clone()),
-        LatentMeasureCalibration::ConditionalLocationScale(cal) => {
-            // ζ = (z − m(C))/√v(C) on the marginal-index span. The conditioning
-            // block was built above (raw-z path only), so it is present here.
-            let a_block = conditioning_dense.as_ref().ok_or_else(|| {
-                FitFailure::raised(
-                    FailureCategory::Invariant,
-                    "conditional latent calibration requires the marginal conditioning block",
-                )
-            })?;
-            Arc::new(
-                cal.apply(spec.z.view(), a_block.view())
-                    .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?,
-            )
-        }
+    //
+    // gam#3016: the training score is the raw score through the one fitted
+    // score map, the saved normalisation and then ζ = (z − m(C))/√v(C) on the
+    // marginal-index span, which prediction and
+    // `FittedModel::latent_conditional_residual` apply to their rows as well.
+    let conditional_calibration = match &latent_z_calibration {
+        LatentMeasureCalibration::None => None,
+        LatentMeasureCalibration::ConditionalLocationScale(cal) => Some(cal),
     };
+    // The conditioning block was built above (raw-z path only), so it is
+    // present whenever the conditional law was consumed.
+    if conditional_calibration.is_some() && conditioning_dense.is_none() {
+        return Err(FitFailure::raised(
+            FailureCategory::Invariant,
+            "conditional latent calibration requires the marginal conditioning block",
+        ));
+    }
+    let saved_normalization = SavedLatentZNormalization {
+        mean: z_normalization.mean,
+        sd: z_normalization.sd,
+    };
+    let z = Arc::new(
+        FittedLatentScoreMap {
+            normalization: &saved_normalization,
+            rank_int: None,
+            conditional: conditional_calibration,
+            span: LatentConditioningSpan::PrimaryDesign,
+        }
+        .apply_on_span(
+            &z_raw,
+            conditioning_dense.as_ref().map(|design| design.view()),
+            "bernoulli marginal-slope training rows",
+        )
+        .map_err(|error| FitFailure::raised(FailureCategory::Invariant, error.to_string()))?,
+    );
     let z_train = z.as_ref();
     // gam#2924: the residual repair block, gated and bound to the calibrated
     // score on the marginal-index span. Every unsupported combination is a
@@ -3068,11 +3090,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
         &[marginal_terms.clone(), slope_terms.clone()],
         kappa_options_ref,
         &setup,
-        gam_solve::seeding::SeedRiskProfile::GeneralizedLinear,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         Some(walk_signals),
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
@@ -3944,6 +3964,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         cross_block_warnings,
         latent_law_consumed,
         latent_z_conditional_calibration,
+        latent_score: z.as_ref().clone(),
         residual_repair: residual_runtime
             .as_ref()
             .map(|runtime| runtime.geometry.clone()),
