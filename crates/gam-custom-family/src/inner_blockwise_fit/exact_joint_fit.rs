@@ -476,7 +476,7 @@ mod rounding_tests {
 fn clear_stall_evidence_collected_under_the_previous_model(
     best_residual_seen: &mut f64,
     cycles_since_residual_improved: &mut usize,
-    tr_clamped_during_stall: &mut bool,
+    tr_clamped_steps_during_stall: &mut usize,
     residual_descent_history: &mut std::collections::VecDeque<f64>,
     residual_rate_history: &mut std::collections::VecDeque<f64>,
     merit_window: &mut std::collections::VecDeque<f64>,
@@ -484,7 +484,7 @@ fn clear_stall_evidence_collected_under_the_previous_model(
 ) {
     *best_residual_seen = f64::INFINITY;
     *cycles_since_residual_improved = 0;
-    *tr_clamped_during_stall = false;
+    *tr_clamped_steps_during_stall = 0;
     residual_descent_history.clear();
     residual_rate_history.clear();
     merit_window.clear();
@@ -510,7 +510,7 @@ fn arm_jeffreys_completion_endgame(
     jeffreys_completion_endgame: &mut bool,
     best_residual_seen: &mut f64,
     cycles_since_residual_improved: &mut usize,
-    tr_clamped_during_stall: &mut bool,
+    tr_clamped_steps_during_stall: &mut usize,
     residual_descent_history: &mut std::collections::VecDeque<f64>,
     residual_rate_history: &mut std::collections::VecDeque<f64>,
     merit_window: &mut std::collections::VecDeque<f64>,
@@ -523,7 +523,7 @@ fn arm_jeffreys_completion_endgame(
     clear_stall_evidence_collected_under_the_previous_model(
         best_residual_seen,
         cycles_since_residual_improved,
-        tr_clamped_during_stall,
+        tr_clamped_steps_during_stall,
         residual_descent_history,
         residual_rate_history,
         merit_window,
@@ -543,7 +543,7 @@ mod jeffreys_endgame_arming_tests {
         let mut armed = false;
         let mut best_residual_seen = 1.499e1_f64;
         let mut cycles_since_residual_improved = 3_usize;
-        let mut tr_clamped_during_stall = true;
+        let mut tr_clamped_steps_during_stall = 3_usize;
         let mut residual_descent_history = std::collections::VecDeque::from(vec![1.499e1_f64, 1.904e1]);
         let mut residual_rate_history = std::collections::VecDeque::from(vec![1.499e1_f64]);
         let mut merit_window = std::collections::VecDeque::from(vec![5.603273e2_f64]);
@@ -553,7 +553,7 @@ mod jeffreys_endgame_arming_tests {
             &mut armed,
             &mut best_residual_seen,
             &mut cycles_since_residual_improved,
-            &mut tr_clamped_during_stall,
+            &mut tr_clamped_steps_during_stall,
             &mut residual_descent_history,
             &mut residual_rate_history,
             &mut merit_window,
@@ -562,7 +562,7 @@ mod jeffreys_endgame_arming_tests {
         assert!(armed);
         assert_eq!(best_residual_seen, f64::INFINITY);
         assert_eq!(cycles_since_residual_improved, 0);
-        assert!(!tr_clamped_during_stall);
+        assert_eq!(tr_clamped_steps_during_stall, 0);
         assert!(residual_descent_history.is_empty());
         assert!(residual_rate_history.is_empty());
         assert!(merit_window.is_empty());
@@ -570,13 +570,13 @@ mod jeffreys_endgame_arming_tests {
 
         best_residual_seen = 6.311e1;
         cycles_since_residual_improved = 29;
-        tr_clamped_during_stall = true;
+        tr_clamped_steps_during_stall = 3;
         merit_window.push_back(5.417023e2);
         arm_jeffreys_completion_endgame(
             &mut armed,
             &mut best_residual_seen,
             &mut cycles_since_residual_improved,
-            &mut tr_clamped_during_stall,
+            &mut tr_clamped_steps_during_stall,
             &mut residual_descent_history,
             &mut residual_rate_history,
             &mut merit_window,
@@ -585,7 +585,7 @@ mod jeffreys_endgame_arming_tests {
         assert!(armed);
         assert_eq!(best_residual_seen, 6.311e1);
         assert_eq!(cycles_since_residual_improved, 29);
-        assert!(tr_clamped_during_stall);
+        assert_eq!(tr_clamped_steps_during_stall, 3);
         assert_eq!(merit_window.len(), 1);
     }
 }
@@ -937,7 +937,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     const RESIDUAL_DESCENT_WINDOW: usize = 3;
     let mut residual_descent_history: std::collections::VecDeque<f64> =
         std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
-    let mut tr_clamped_during_stall: bool = false;
+    let mut tr_clamped_steps_during_stall: usize = 0;
     // Deterministic slow-geometric-rate stall guard (gam#979 survival
     // marginal-slope). The flat-residual guard below resets its no-improve
     // counter whenever the residual drops ≥10% versus the running best, and
@@ -1315,7 +1315,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &mut jeffreys_completion_endgame,
                             &mut best_residual_seen,
                             &mut cycles_since_residual_improved,
-                            &mut tr_clamped_during_stall,
+                            &mut tr_clamped_steps_during_stall,
                             &mut residual_descent_history,
                             &mut residual_rate_history,
                             &mut merit_window,
@@ -1400,7 +1400,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     best_residual_seen = f64::INFINITY;
                     cycles_since_residual_improved = 0;
                     residual_descent_history.clear();
-                    tr_clamped_during_stall = false;
+                    tr_clamped_steps_during_stall = 0;
                     residual_rate_history.clear();
                     merit_window.clear();
                     prev_fully_rejected_cycle_signature = None;
@@ -3200,7 +3200,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &mut jeffreys_completion_endgame,
                         &mut best_residual_seen,
                         &mut cycles_since_residual_improved,
-                        &mut tr_clamped_during_stall,
+                        &mut tr_clamped_steps_during_stall,
                         &mut residual_descent_history,
                         &mut residual_rate_history,
                         &mut merit_window,
@@ -3237,7 +3237,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 best_residual_seen = f64::INFINITY;
                 cycles_since_residual_improved = 0;
                 residual_descent_history.clear();
-                tr_clamped_during_stall = false;
+                tr_clamped_steps_during_stall = 0;
                 residual_rate_history.clear();
                 merit_window.clear();
                 prev_fully_rejected_cycle_signature = None;
@@ -4590,6 +4590,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 old_objective,
                 objective_tol,
                 measured_objective_resolution,
+                accumulation.roundoff_ceiling(),
                 current_stationarity_residual > residual_tol,
             );
             trust_ratio_witness.observe(step_norm, trust_update.rho, predicted_reduction);
@@ -4669,6 +4670,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             old_objective,
                             objective_tol,
                             measured_objective_resolution,
+                            accumulation.roundoff_ceiling(),
                             current_stationarity_residual > residual_tol,
                         );
                         if block_update.radius >= *block_radius
@@ -5215,7 +5217,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &mut jeffreys_completion_endgame,
                         &mut best_residual_seen,
                         &mut cycles_since_residual_improved,
-                        &mut tr_clamped_during_stall,
+                        &mut tr_clamped_steps_during_stall,
                         &mut residual_descent_history,
                         &mut residual_rate_history,
                         &mut merit_window,
@@ -5551,7 +5553,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             best_residual_seen = f64::INFINITY;
             cycles_since_residual_improved = 0;
             residual_descent_history.clear();
-            tr_clamped_during_stall = false;
+            tr_clamped_steps_during_stall = 0;
             residual_rate_history.clear();
             merit_window.clear();
             geometric_tail_history.clear();
@@ -5670,7 +5672,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &mut jeffreys_completion_endgame,
                 &mut best_residual_seen,
                 &mut cycles_since_residual_improved,
-                &mut tr_clamped_during_stall,
+                &mut tr_clamped_steps_during_stall,
                 &mut residual_descent_history,
                 &mut residual_rate_history,
                 &mut merit_window,
@@ -6020,7 +6022,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &mut jeffreys_completion_endgame,
                 &mut best_residual_seen,
                 &mut cycles_since_residual_improved,
-                &mut tr_clamped_during_stall,
+                &mut tr_clamped_steps_during_stall,
                 &mut residual_descent_history,
                 &mut residual_rate_history,
                 &mut merit_window,
@@ -6794,11 +6796,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             if residual < RESIDUAL_STALL_IMPROVEMENT_FACTOR * best_residual_seen {
                 best_residual_seen = residual;
                 cycles_since_residual_improved = 0;
-                tr_clamped_during_stall = false;
+                tr_clamped_steps_during_stall = 0;
             } else {
                 cycles_since_residual_improved = cycles_since_residual_improved.saturating_add(1);
                 if last_accepted_hit_joint_trust_boundary {
-                    tr_clamped_during_stall = true;
+                    tr_clamped_steps_during_stall += 1;
                 }
             }
             // Trailing window of post-step residuals for the deterministic
@@ -6848,7 +6850,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             clear_stall_evidence_collected_under_the_previous_model(
                 &mut best_residual_seen,
                 &mut cycles_since_residual_improved,
-                &mut tr_clamped_during_stall,
+                &mut tr_clamped_steps_during_stall,
                 &mut residual_descent_history,
                 &mut residual_rate_history,
                 &mut merit_window,
@@ -6947,7 +6949,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
             && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
-            && tr_clamped_during_stall
+            && tr_clamped_steps_during_stall > 0
             && !residual_tol_reachable_within_cap
         {
             // gam#2612: a stall verdict taken on the divided-difference
@@ -6958,7 +6960,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 clear_stall_evidence_collected_under_the_previous_model(
                     &mut best_residual_seen,
                     &mut cycles_since_residual_improved,
-                    &mut tr_clamped_during_stall,
+                    &mut tr_clamped_steps_during_stall,
                     &mut residual_descent_history,
                     &mut residual_rate_history,
                     &mut merit_window,
@@ -7071,6 +7073,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         residual_tol,
                         best_residual: best_residual_seen,
                         cycles_without_improvement: cycles_since_residual_improved,
+                        clipped_steps: tr_clamped_steps_during_stall,
                         accepted_step_inf,
                         trust_radius: joint_trust_radius,
                     },
@@ -7123,13 +7126,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
 
         // Flat-residual stall early-exit (gam#1040/#979/#370/#859).
         //
-        // The `tr_clamped_during_stall` residual-stall exit above only fires
+        // The `tr_clamped_steps_during_stall` residual-stall exit above only fires
         // when the accepted step kept hitting the trust-region boundary. A
         // distinct but equally terminal stall reaches neither it nor any
         // acceptance certificate: the KKT residual stops improving (no ≥10%
         // drop for the full `RESIDUAL_STALL_NO_IMPROVE_CYCLES` window) while
         // the accepted steps stay strictly INSIDE the trust region (so
-        // `tr_clamped_during_stall` never latches) and the objective keeps
+        // `tr_clamped_steps_during_stall` never counts one) and the objective keeps
         // drifting just above `objective_tol` (so the relative-objective
         // plateau exit's flat streak never completes). This is the measured
         // "[joint-newton-tr] cycles 1000+" wall on the binomial location-scale
@@ -7161,13 +7164,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 || cycles_since_residual_improved >= RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES)
         {
             log::debug!(
-                "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040/#979): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with steps inside the trust region (tr_clamped={}) and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
+                "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040/#979): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with {} of them clipped by the trust region and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
                 cycle,
                 residual,
                 residual_tol,
                 best_residual_seen,
                 cycles_since_residual_improved,
-                tr_clamped_during_stall,
+                tr_clamped_steps_during_stall,
                 inner_max_cycles,
             );
             cycles_done = cycle + 1;
@@ -7267,7 +7270,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     clear_stall_evidence_collected_under_the_previous_model(
                         &mut best_residual_seen,
                         &mut cycles_since_residual_improved,
-                        &mut tr_clamped_during_stall,
+                        &mut tr_clamped_steps_during_stall,
                         &mut residual_descent_history,
                         &mut residual_rate_history,
                         &mut merit_window,

@@ -220,12 +220,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         spec.age_entry
             .mapv(|entry| entry <= crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD),
     );
-    install_time_nullspace_shrinkage_penalty(
-        &mut spec.time_block,
-        spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
-        &entry_at_origin,
-    )
-    .map_err(FitFailure::invariant)?;
     let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
@@ -292,9 +286,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // step drops it #1082 while the certificate requires it #1449) — the
     // survival marginal-slope hang. Applied before the build so the flag is
     // frozen into `joint_specs` and honoured by every subsequent probe / frozen
-    // / kappa rebuild. Mirrors the time block's
-    // `install_time_nullspace_shrinkage_penalty`, via the ordinary builder so
-    // the layered penalty representation stays self-consistent.
+    // / kappa rebuild. Applied via the ordinary builder so the layered penalty
+    // representation stays self-consistent. The time block's affine null space
+    // is deliberately left unpenalized (gam#3003): it is the baseline's level
+    // and log-time slope, identified by `O(n_events)` curvature (gam#1076).
     for surface_spec in design_specs.iter_mut() {
         enable_surface_identifiability_double_penalty(surface_spec);
     }

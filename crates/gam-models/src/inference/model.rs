@@ -6164,6 +6164,17 @@ impl FittedModel {
                 ),
             });
         }
+        // A converged constrained fit whose posterior moments were declined is
+        // persisted as its optimizer mode under that typed decline (#979 ruling
+        // (c)): the decline is the saved statement of why no posterior mean
+        // exists, and every posterior-mean consumer refuses by it through
+        // `require_posterior_mean`. The penalized precision of such a fit is
+        // not positive definite by construction — that is what was declined —
+        // so factoring it here would only re-derive the decline as an untyped
+        // "corrupt payload" and lose the certified fit (gam#3008).
+        if fit.posterior_moment_decline().is_some() {
+            return Ok(());
+        }
 
         if fit
             .geometry
@@ -7160,6 +7171,62 @@ mod tests {
             .expect_err("active-frame precision cannot be paired with raw prediction rows");
         assert!(error.to_string().contains("active gauge"));
         assert!(error.to_string().contains("lifted"));
+    }
+
+    /// gam#3008: a curved-link fit that converged on a constraint boundary and
+    /// declined its posterior moments (indefinite precision) persists as its
+    /// mode under the typed decline. Save/load validation accepts it, and the
+    /// posterior-mean refusal is the decline's own reason, never a strict
+    /// Cholesky of the declined precision reported as a corrupt payload.
+    #[test]
+    fn curved_link_persistence_keeps_a_declined_boundary_mode_3008() {
+        use gam_solve::constrained_posterior::{
+            ConePosteriorMomentDecline, ConePropernessEvidence, ConstrainedPosteriorGeometry,
+        };
+        let mut fit = saved_fit(vec![FittedBlock {
+            beta: array![0.0, 0.5],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        fit.covariance_conditional = None;
+        fit.covariance_corrected = None;
+        fit.geometry = Some(gam_solve::estimate::FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[2]),
+            penalized_hessian: array![[1.0, 0.0], [0.0, -2.0]].into(),
+            constrained_posterior: Some(ConstrainedPosteriorGeometry::with_decline(
+                gam_problem::LinearInequalityConstraints::new(array![[1.0, 0.0]], array![0.0])
+                    .expect("a 1x2 inequality system with a matching bound is well formed"),
+                array![0.0, 0.5],
+                ConePosteriorMomentDecline {
+                    ambient_precision_failure: "fixture: the ambient precision is indefinite"
+                        .to_string(),
+                    properness: ConePropernessEvidence::CertificationFailed {
+                        reason: "fixture: the cone-truncated posterior is improper".to_string(),
+                    },
+                    active_rows: vec![0],
+                    boundary_approximation_refusal: None,
+                },
+            )),
+            working: None,
+        });
+        let model = standard_binomial_model(fit);
+        model
+            .validate_required_posterior_mean_state()
+            .expect("a declined boundary mode is a persistable converged fit");
+        let refusal = model
+            .payload()
+            .fit_result
+            .as_ref()
+            .expect("the model carries its fit")
+            .require_posterior_mean("posterior-mean prediction")
+            .expect_err("a declined fit has no posterior mean")
+            .to_string();
+        assert!(
+            refusal.contains("the ambient precision is indefinite"),
+            "the refusal must carry the decline's reason, got: {refusal}"
+        );
+        assert!(!refusal.contains("Cholesky"), "got: {refusal}");
     }
 
     fn marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {

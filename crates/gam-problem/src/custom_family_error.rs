@@ -90,14 +90,17 @@ pub enum JointNewtonTerminalReason {
     KktCertificateRefused {
         diagnosis: crate::diagnostics::KktRefusalDiagnosis,
     },
-    /// The residual stopped improving while the accepted steps were clipped by
-    /// the trust region, and the accepted step descended no ray a penalty
-    /// strength could close.
+    /// The residual stopped improving while at least one accepted step was
+    /// clipped by the trust region, and the accepted step descended no ray a
+    /// penalty strength could close.
     ResidualStall {
         residual: f64,
         residual_tol: f64,
         best_residual: f64,
         cycles_without_improvement: usize,
+        /// How many of those cycles' accepted steps the trust region clipped; the
+        /// others were taken strictly inside it (gam#2977).
+        clipped_steps: usize,
         accepted_step_inf: f64,
         trust_radius: f64,
     },
@@ -313,13 +316,14 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                 residual_tol,
                 best_residual,
                 cycles_without_improvement,
+                clipped_steps,
                 accepted_step_inf,
                 trust_radius,
             } => write!(
                 f,
                 "residual {residual:.6e} (tol {residual_tol:.6e}) stopped improving for \
-                 {cycles_without_improvement} cycles with the accepted steps clipped by the \
-                 trust region (accepted_step_inf={accepted_step_inf:.3e}, \
+                 {cycles_without_improvement} cycles, {clipped_steps} of whose accepted steps \
+                 the trust region clipped (last accepted_step_inf={accepted_step_inf:.3e}, \
                  trust_radius={trust_radius:.3e}); best residual {best_residual:.6e}"
             ),
             Self::FlatResidualStall {
@@ -1418,10 +1422,11 @@ mod tests {
                     residual_tol: 5.427e-4,
                     best_residual: 1.499e1,
                     cycles_without_improvement: 78,
+                    clipped_steps: 5,
                     accepted_step_inf: 2.601e-3,
                     trust_radius: 1.314e-2,
                 },
-                "stopped improving for 78 cycles with the accepted steps clipped by the trust region",
+                "stopped improving for 78 cycles, 5 of whose accepted steps the trust region clipped",
             ),
             (
                 JointNewtonTerminalReason::FlatResidualStall {
