@@ -44,7 +44,7 @@ def _circle_chain(noise, seed=3, n=400):
 
 
 def _two_hop(chain, topology="circle"):
-    return gamfit.layer_transport_ladder(chain, topology=topology)["two_hop"][0]
+    return gamfit.sae.layer_transport_ladder(chain, topology=topology)["two_hop"][0]
 
 
 def test_noiseless_composable_chain_is_accepted():
@@ -106,7 +106,7 @@ def test_interval_topology_noiseless_is_accepted():
     a = np.sort(rng.uniform(0.03, 0.97, n))
     b = a + 0.02 * np.sin(2 * np.pi * a)
     c = b + 0.015 * np.sin(4 * np.pi * b)
-    r = gamfit.layer_transport_ladder([a, b, c], topology="interval")["two_hop"][0]
+    r = gamfit.sae.layer_transport_ladder([a, b, c], topology="interval")["two_hop"][0]
     assert r["composition_p_value"] > 0.05, (
         f"noiseless composable interval chain rejected: "
         f"p={r['composition_p_value']:.3e}, defect={r['composition_defect']:.3e}"

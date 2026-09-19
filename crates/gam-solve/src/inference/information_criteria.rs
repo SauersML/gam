@@ -247,16 +247,22 @@ fn wps_correction_term(
 /// Number of estimated dispersion / scale parameters a family contributes to the
 /// AIC degrees of freedom (`2·(edf + scale_dof)`, #1583).
 ///
-/// Gaussian profiles σ̂² (one extra dof) unless φ was user-fixed; Gamma / Beta /
-/// Tweedie / Negative-Binomial add one only when their dispersion is *estimated*
-/// from data; Poisson and Binomial carry φ ≡ 1 and add none.
+/// Gaussian profiles σ̂² (one extra dof) unless φ was user-fixed; Gamma / inverse
+/// Gaussian / Beta / Tweedie / Negative-Binomial add one only when their
+/// dispersion is *estimated* from data; Poisson and Binomial carry φ ≡ 1 and add
+/// none. Student-t always estimates both its scale σ and its degrees of freedom
+/// ν, so it adds two.
 pub fn scale_parameter_count(spec: &LikelihoodSpec, scale: &LikelihoodScaleMetadata) -> f64 {
     let estimated = match spec.response {
+        ResponseFamily::StudentT { .. } => return 2.0,
         ResponseFamily::Gaussian => {
             !matches!(scale, LikelihoodScaleMetadata::FixedDispersion { .. })
         }
         ResponseFamily::Gamma => {
             matches!(scale, LikelihoodScaleMetadata::EstimatedGammaShape { .. })
+        }
+        ResponseFamily::InverseGaussian => {
+            matches!(scale, LikelihoodScaleMetadata::EstimatedDispersion { .. })
         }
         ResponseFamily::Beta { .. } => {
             matches!(scale, LikelihoodScaleMetadata::EstimatedBetaPhi { .. })

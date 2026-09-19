@@ -395,9 +395,10 @@ fn build_iso_kappa_fixture(
             frozen_parametric_residualization: None,
             name: "variant_1d".to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
     let frozen = freeze_term_collection_from_design(&spec, &design).unwrap_or_else(|e| panic!("{} failed: {:?}", "freeze", e));
@@ -1082,9 +1083,10 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let fit_opts = FitOptions {
         compute_inference: false,
@@ -1439,9 +1441,10 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
     let frozen = freeze_term_collection_from_design(&spec, &design).unwrap_or_else(|e| panic!("{} failed: {:?}", "freeze", e));
@@ -1968,9 +1971,10 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec_orig).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
     let frozen = freeze_term_collection_from_design(&spec_orig, &design).unwrap_or_else(|e| panic!("{} failed: {:?}", "freeze", e));
@@ -2229,9 +2233,10 @@ fn zz_measure_monotone_fixture_through_checkable_evaluator_2454() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let fit_opts = FitOptions {
         compute_inference: false,
@@ -2508,9 +2513,10 @@ fn rho_gradient_part_ladder_family_2454(
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let fit_opts = FitOptions {
         compute_inference: false,
@@ -3286,9 +3292,10 @@ fn a_root_priced_rho_gradient_matches_its_value_2959() {
                     boundary_conditions: gam_terms::basis::BSplineBoundaryConditions::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let weights = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
@@ -3454,9 +3461,10 @@ fn assert_production_kappa_route_psi_gradient_matches_its_value(
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let fit_opts = FitOptions {
         max_iter: 40,

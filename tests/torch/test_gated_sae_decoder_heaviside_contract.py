@@ -23,7 +23,7 @@ def _heaviside_reference(x: np.ndarray, w_gate: np.ndarray, w_amp: np.ndarray) -
 
 
 def test_python_decode_matches_heaviside_reference() -> None:
-    from gamfit import GatedSAEDecoder
+    from gamfit.penalties import GatedSAEDecoder
 
     rng = np.random.default_rng(11)
     w_gate = rng.standard_normal((5, 5))
@@ -67,7 +67,7 @@ def test_rust_decode_zero_logit_is_inactive() -> None:
 
 def test_python_rust_parity_random_inputs() -> None:
     """Cross-implementation parity at random inputs that exercise both signs."""
-    from gamfit import GatedSAEDecoder
+    from gamfit.penalties import GatedSAEDecoder
     from gamfit._binding import rust_module
 
     rng = np.random.default_rng(7)
@@ -82,7 +82,7 @@ def test_python_rust_parity_random_inputs() -> None:
 
 def test_python_rust_parity_float32_inputs() -> None:
     """Parity must also hold when inputs arrive as float32 (FFI must upcast)."""
-    from gamfit import GatedSAEDecoder
+    from gamfit.penalties import GatedSAEDecoder
     from gamfit._binding import rust_module
 
     rng = np.random.default_rng(19)

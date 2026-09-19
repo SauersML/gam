@@ -50,7 +50,7 @@ def identifiability_report(model: Any) -> CompositeIdentifiabilityReport:
 
     * If ``model`` exposes an ``aux`` plus latent attributes (e.g. the
       ``IdentifiableFactorFitResult`` returned by
-      :func:`gamfit.identifiable_factor_fit`), :func:`check_aux_richness`
+      :func:`gamfit.identifiability.identifiable_factor_fit`), :func:`check_aux_richness`
       is run.
     * If ``model`` exposes a ``decoder`` (linear) or ``decoder_blocks``
       attribute, :func:`check_jacobian_sparsity` is run.

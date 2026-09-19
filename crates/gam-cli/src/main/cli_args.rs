@@ -9,17 +9,11 @@ pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 
-    /// Solver log verbosity: `off|error|warn|info|debug|trace`. Defaults to the
-    /// quiet `warn` level (#1688) — pass `--log-level info` to opt back into the
-    /// full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`, etc.).
-    /// Unrecognized levels are rejected by the argument parser.
-    #[arg(
-        long,
-        global = true,
-        value_name = "LEVEL",
-        value_parser = parse_log_level_cli
-    )]
-    pub(crate) log_level: Option<log::LevelFilter>,
+    /// Show solver diagnostics on stderr: `-v` for the per-iteration solver
+    /// trace (`[OUTER …]`, `[PIRLS …]`, …), `-vv` for the finer trace-level
+    /// records as well. Without it a run writes only its results and errors.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
 }
 
 #[derive(Args, Debug)]
@@ -95,6 +89,9 @@ pub(crate) enum Command {
     ParameterDecomposition(ParameterDecompositionArgs),
     /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
+    /// Print the text summary of a fitted model (the text gamfit's
+    /// `Model.summary()` prints).
+    Summary(SummaryArgs),
     /// Predict on a new dataset using a fitted model.
     Predict(PredictArgs),
     /// Evaluate a fitted conditional transformation model at observed responses.
@@ -103,6 +100,8 @@ pub(crate) enum Command {
     Diagnose(DiagnoseArgs),
     /// Evaluate one term's partial effect with pointwise and simultaneous bands.
     PartialEffect(PartialEffectArgs),
+    /// Print a fitted model's per-row residuals on a labeled dataset as JSON.
+    Residuals(ResidualsArgs),
     /// Rank fitted models on their smoothing-corrected AIC and print the
     /// comparison as JSON.
     Compare(CompareArgs),
@@ -246,7 +245,7 @@ pub(crate) struct CrosscoderArgs {
 #[derive(Args, Debug)]
 pub(crate) struct ParameterDecompositionArgs {
     /// Versioned `gam.mpd-request` JSON document: the same bytes
-    /// `gamfit.run_parameter_decomposition` sends.
+    /// `gamfit.sae.run_parameter_decomposition` sends.
     #[arg(long, value_name = "REQUEST.json")]
     pub(crate) request: PathBuf,
 
@@ -302,8 +301,6 @@ pub(crate) struct FitArgs {
             "sigma_time_k",
             "slope_time_k",
             "scale_dimensions",
-            "precompute_conformal",
-            "persistent_warm_start_root"
         ]
     )]
     pub(crate) request: Option<PathBuf>,
@@ -376,11 +373,17 @@ pub(crate) struct FitArgs {
     /// Fixed size/overdispersion parameter for `--family negative-binomial`.
     #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     pub(crate) negative_binomial_theta: Option<f64>,
-    /// Expectile asymmetry `τ ∈ (0, 1)` for `--family expectile` (default 0.5,
+    /// Expectile level(s) `τ ∈ (0, 1)` for `--family expectile` (default 0.5,
     /// the ordinary mean). `τ > 0.5` fits an upper expectile, `τ < 0.5` a lower
-    /// one — the smooth analogue of a quantile.
-    #[arg(long = "expectile-tau", value_parser = parse_probability_open_cli)]
-    pub(crate) expectile_tau: Option<f64>,
+    /// one — the smooth analogue of a quantile. A comma-separated, strictly
+    /// increasing list (`0.1,0.5,0.9`) fits all levels jointly as one
+    /// location-scale model whose curves never cross.
+    #[arg(
+        long = "expectile-tau",
+        value_parser = parse_probability_open_cli,
+        value_delimiter = ','
+    )]
+    pub(crate) expectile_tau: Option<Vec<f64>>,
     /// Survival likelihood mode for Surv(...) formulas; defaults to
     /// transformation for Surv() formulas.
     #[arg(long = "survival-likelihood", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
@@ -433,28 +436,6 @@ pub(crate) struct FitArgs {
     /// `scale_dims=true` / `scale_dims=false`, which overrides this global flag.
     #[arg(long = "scale-dimensions", default_value_t = false)]
     pub(crate) scale_dimensions: bool,
-    /// Whether to precompute the distribution-free conformal substrates (#942
-    /// jackknife+, #1098 exact full-conformal) at fit time and persist them on
-    /// the saved model. Omit to keep the default of precomputing whenever the
-    /// fit is eligible; `false` skips both.
-    ///
-    /// Measured on `y ~ s(x1,k=6) + s(x2,k=6)` (#2633): the two substrates are
-    /// 94% of a saved Gaussian model at n=20,000 (10.2 MB of 10.85 MB) and grow
-    /// linearly with the training rows. Rebuilding both costs ~5.6 ms, 0.3% of
-    /// the fit, and stays under half a second out to p=253. So turning this off
-    /// yields a ~16x smaller model (10.85 MB -> ~0.65 MB at n=20,000).
-    ///
-    /// It is opt-OUT because rebuilding needs the training design AND response
-    /// back, which a saved model deliberately does not carry: a model shipped to
-    /// a host that never sees the training data must keep them or it cannot
-    /// produce a conformal interval at all. Turn it off when the caller retains
-    /// its training data, fits in batch, or never asks for conformal intervals.
-    #[arg(long = "precompute-conformal", action = ArgAction::Set, default_value_t = true)]
-    pub(crate) precompute_conformal: bool,
-    /// Opt in to cross-process warm starts at this exact root. Omit to keep the
-    /// fit disk-silent; no ambient temp/cache path is used.
-    #[arg(long = "persistent-warm-start-root", value_name = "DIR")]
-    pub(crate) persistent_warm_start_root: Option<PathBuf>,
     #[arg(long = "out", required = true)]
     pub(crate) out: Option<PathBuf>,
 }
@@ -487,15 +468,21 @@ pub(crate) struct PredictArgs {
     #[arg(long = "covariance-mode", value_parser = parse_covariance_mode_arg)]
     pub(crate) covariance_mode: Option<InferenceCovarianceMode>,
     /// Replace the posterior band with a distribution-free conformal band at
-    /// `--level`: the exact full-conformal set of a Gaussian-identity fit that
-    /// precomputed its substrate, or with `--calibration` the split-conformal
-    /// band calibrated on a held-out labeled table.
+    /// `--level`: with `--training-data` the exact full-conformal set of a
+    /// Gaussian-identity fit, or with `--calibration` the split-conformal band
+    /// calibrated on a held-out labeled table.
     #[arg(long = "conformal", default_value_t = false, conflicts_with = "uncertainty")]
     pub(crate) conformal: bool,
     /// Held-out labeled table (CSV or parquet, including the response column)
     /// that calibrates the split-conformal band.
     #[arg(long = "calibration", requires = "conformal")]
     pub(crate) calibration: Option<PathBuf>,
+    /// The labeled table the model was fit on (CSV or parquet, including the
+    /// response column). The saved model keeps only the p x p frozen penalty,
+    /// never per-row training data, so the exact full-conformal set re-reads
+    /// its labeled rows from here.
+    #[arg(long = "training-data", requires = "conformal", conflicts_with = "calibration")]
+    pub(crate) training_data: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -564,6 +551,23 @@ pub(crate) struct PartialEffectArgs {
         help = "Output path: .csv writes one row per grid point, .json the full record; default: JSON on stdout"
     )]
     pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ResidualsArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Labeled dataset (CSV or parquet) carrying the response; the training data for in-sample residuals"
+    )]
+    pub(crate) data: PathBuf,
+    #[arg(
+        long = "type",
+        value_name = "TYPE",
+        help = "Residual type: response, working, deviance or pearson"
+    )]
+    pub(crate) kind: gam::solver::pirls::ResidualKind,
 }
 
 #[derive(Args, Debug)]
@@ -640,6 +644,17 @@ pub(crate) struct GenerateArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct SummaryArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+    #[arg(
+        long = "json",
+        help = "Print the summary payload (coefficients, EDF, smoothing parameters, scale, log-likelihood, deviance, convergence) as JSON, the document gamfit's `Model.summary()` reads"
+    )]
+    pub(crate) json: bool,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct ReportArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     pub(crate) model: PathBuf,
@@ -666,8 +681,15 @@ pub(crate) enum FamilyArg {
     PoissonLog,
     NegativeBinomial,
     GammaLog,
+    /// Inverse-Gaussian (`V(μ) = φμ³`) with its canonical `1/μ²` link; the
+    /// log link is selected in the formula with `link(type=log)`.
+    InverseGaussian,
     Tweedie,
     Beta,
+    /// Robust scaled Student-t response on the identity link; its scale and
+    /// degrees of freedom are estimated jointly with the smoothing parameters.
+    #[value(alias = "student_t", alias = "t")]
+    StudentT,
     RoystonParmar,
     Expectile,
     /// Penalized multinomial-logit GAM: a categorical response with K classes
@@ -767,17 +789,13 @@ pub(crate) fn parse_finite_f64_cli(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-pub(crate) fn parse_log_level_cli(raw: &str) -> Result<log::LevelFilter, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "off" => Ok(log::LevelFilter::Off),
-        "error" => Ok(log::LevelFilter::Error),
-        "warn" => Ok(log::LevelFilter::Warn),
-        "info" => Ok(log::LevelFilter::Info),
-        "debug" => Ok(log::LevelFilter::Debug),
-        "trace" => Ok(log::LevelFilter::Trace),
-        other => Err(format!(
-            "unsupported --log-level '{other}'; accepted values: off, error, warn, info, debug, trace"
-        )),
+/// The stderr log filter a `-v` count asks for. Library diagnostics are all
+/// `debug`/`trace` records, so the unflagged level shows none of them.
+pub(crate) fn log_level_for_verbosity(verbose: u8) -> log::LevelFilter {
+    match verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
     }
 }
 

@@ -179,7 +179,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[t1] gamfit {gamfit.__version__} G={args.n_blocks} b={args.block_size} "
           f"n_obs={n_obs} seed_rows={seed_sample.shape[0]} smoke={args.smoke}", flush=True)
 
-    stream = gamfit.block_sparse_dictionary_fit_begin(
+    stream = gamfit.sae.block_sparse_dictionary_fit_begin(
         seed_sample, args.n_blocks, block_size=args.block_size, block_topk=args.block_topk,
         max_epochs=args.max_epochs, block_tile=1024, aux_k=args.aux_k,
     )
@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> None:
     # counts: margin-kept AND FDR-controlled (e-BH on per-BLOCK log-e-values)
     kept_atoms = [r for r in recs if r["kept"]]
     block_loges = [float(raw_ledger["margin"][i]) for i in range(len(raw_ledger["block"]))]
-    cert_blocks = gamfit.e_bh_dictionary_certificate(block_loges, args.fdr_alpha)
+    cert_blocks = gamfit.sae.e_bh_dictionary_certificate(block_loges, args.fdr_alpha)
     n_cert_atoms = len(cert_blocks) * args.block_size
 
     report = {

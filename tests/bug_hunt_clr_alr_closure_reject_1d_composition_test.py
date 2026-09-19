@@ -1,4 +1,4 @@
-"""Bug hunt: the compositional primitives ``gamfit.clr`` / ``alr`` / ``closure``
+"""Bug hunt: the compositional primitives ``gamfit.response_geometry.clr`` / ``alr`` / ``closure``
 fail with an opaque ``TypeError`` when handed a single composition as a 1-D
 array — the most natural way to call them.
 
@@ -9,7 +9,7 @@ reshape, and the Rust ``#[pyfunction]`` signatures take ``PyReadonlyArray2``
 (2-D only — see ``crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs``
 ``response_geometry_clr`` / ``response_geometry_alr`` /
 ``response_geometry_closure``, ~lines 6344-6378). When a user passes a single
-composition as a 1-D vector — ``gamfit.clr([0.2, 0.3, 0.5])`` — the pyo3/numpy
+composition as a 1-D vector — ``gamfit.response_geometry.clr([0.2, 0.3, 0.5])`` — the pyo3/numpy
 downcast to a 2-D array fails and surfaces as
 
     TypeError: 'ndarray' object is not an instance of 'ndarray'
@@ -19,7 +19,7 @@ is required.
 
 The mathematics of clr/alr/closure is defined on a single composition, and the
 rest of the NumPy-facing surface accepts a 1-D vector of points
-(``gamfit.bspline_basis``, ``gamfit.sphere_basis``, ...). The natural,
+(``gamfit.basis.bspline_basis``, ``gamfit.basis.sphere_basis``, ...). The natural,
 useful behaviour is to accept a 1-D composition and return its 1-D coordinates,
 consistent with the 2-D batch row.
 
@@ -49,7 +49,7 @@ _COMPOSITION = [0.2, 0.3, 0.5]
 
 @pytest.mark.parametrize("fn_name", ["clr", "alr", "closure"])
 def test_compositional_primitive_accepts_1d_composition(fn_name: str) -> None:
-    fn = getattr(gamfit, fn_name)
+    fn = getattr(gamfit.response_geometry, fn_name)
 
     # Batch (2-D) call is the known-good reference.
     batch = np.asarray(fn(np.array([_COMPOSITION], dtype=float)))

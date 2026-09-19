@@ -30,7 +30,7 @@ effect.simultaneous_lower     # 95% simultaneous band over the whole grid
 effect.simultaneous_upper
 ```
 
-The result is a [`gamfit.PartialEffect`](api-reference.md#gamfit.PartialEffect).
+The result is a [`gamfit.results.PartialEffect`](api-reference.md#gamfit.results.PartialEffect).
 The term names are those of `model.term_blocks`.
 
 The curve is the term's own contribution to the linear predictor,
@@ -160,7 +160,7 @@ gam partial-effect model.gam --term education --grid levels.csv --out edu.json
 | `--grid FILE` | A CSV grid whose columns are exactly the term's axes, in any order. It has numbers for numeric axes and level labels for factor axes. |
 | `--out FILE` | Write `.json` (the full record, as below) or `.csv` (one row per grid point: the axes, then `fit,se,lower,upper,simultaneous_lower,simultaneous_upper`). Without it, JSON goes to stdout. |
 
-The JSON record has the same fields as `gamfit.PartialEffect`. Both come from one
+The JSON record has the same fields as `gamfit.results.PartialEffect`. Both come from one
 Rust function, `gam_predict::partial_effect::partial_effect`, so the CLI and
 Python return the same numbers.
 

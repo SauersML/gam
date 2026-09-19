@@ -13,7 +13,7 @@ distance / dimension), not fittable latent smooths. The tests here lock in:
   known case and is zero for identical points.
 
 They require the compiled ``gamfit._rust`` extension; without it every
-primitive raises :class:`gamfit.RustExtensionUnavailableError` and the module
+primitive raises :class:`gamfit.errors.RustExtensionUnavailableError` and the module
 is skipped.
 """
 
@@ -24,7 +24,7 @@ import math
 import numpy as np
 import pytest
 
-from gamfit import RustExtensionUnavailableError
+from gamfit.errors import RustExtensionUnavailableError
 from gamfit import manifolds
 
 

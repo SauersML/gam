@@ -395,6 +395,7 @@ mod tests {
             linear_terms: Vec::new(),
             smooth_terms: Vec::new(),
             random_effect_terms: Vec::new(),
+            level: Default::default(),
         };
         let beta = Array1::from_vec(vec![0.0, 1.5]);
         let covariance = array![[0.1, 0.0], [0.0, 0.1]];

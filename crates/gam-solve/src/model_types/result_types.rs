@@ -80,7 +80,7 @@ pub fn dispersion_from_likelihood(
                 known(phi.value())
             }
         }
-        Scale::Tweedie { phi, estimated } => {
+        Scale::Tweedie { phi, estimated } | Scale::Dispersion { phi, estimated } => {
             if estimated {
                 estimated_dispersion(phi.value())
             } else {
@@ -3411,6 +3411,13 @@ pub struct FitGeometry {
     /// statement that the terminal solver geometry has no single diagonal
     /// row representation; it is never represented by empty or zero-filled
     /// placeholder vectors.
+    ///
+    /// It is in-memory fit evidence only and is never serialized: both vectors
+    /// have one entry per training row, and a saved model carries no per-row
+    /// training data (speed F6). A loaded fit therefore reads `None`, and a
+    /// payload written at payload version 28 or earlier, which serialized it, has its
+    /// `working` key read past.
+    #[serde(skip)]
     pub working: Option<WorkingGeometry>,
 }
 
@@ -4504,7 +4511,9 @@ pub struct UnifiedFitResult {
     /// Solver artifacts (e.g. cached PIRLS result for ALO).
     #[serde(default)]
     pub artifacts: FitArtifacts,
-    /// Inner cycle count (blockwise path).
+    /// Inner iterations of the final certified inner solve at the reported
+    /// smoothing parameters: P-IRLS iterations on the standard path, blockwise
+    /// cycles on the custom-family path.
     #[serde(default)]
     pub inner_cycles: usize,
     /// Number of outer REML cost-only evaluations the fit executed (each
@@ -4535,7 +4544,8 @@ fn validate_likelihood_scale_estimation(
         LikelihoodScaleMetadata::FixedDispersion { phi }
         | LikelihoodScaleMetadata::EstimatedBetaPhi { phi }
         | LikelihoodScaleMetadata::FixedBetaPhi { phi }
-        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi } => {
+        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi }
+        | LikelihoodScaleMetadata::EstimatedDispersion { phi } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
             if phi > 0.0 {
                 Ok(())
@@ -6091,7 +6101,9 @@ impl UnifiedFitResult {
         family: &gam_problem::LikelihoodSpec,
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
-            (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
+            (ResponseFamily::Gaussian, _) | (ResponseFamily::StudentT { .. }, _) => {
+                Ok(FittedLinkState::Standard(None))
+            }
             // Every state-less binomial probability link decodes to the bare
             // `Standard(None)` payload — the concrete `StandardLink` lives on the
             // family/spec, not in the fitted-link record. LogLog and Cauchit
@@ -6156,7 +6168,8 @@ impl UnifiedFitResult {
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => Ok(FittedLinkState::Standard(None)),
+            | (ResponseFamily::Gamma, _)
+            | (ResponseFamily::InverseGaussian, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::Beta { .. }, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::RoystonParmar, _) => Ok(FittedLinkState::Standard(None)),
         }

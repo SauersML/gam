@@ -5,31 +5,13 @@
 [![Docs](https://img.shields.io/readthedocs/gamfit.svg)](https://gamfit.readthedocs.io/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](https://github.com/SauersML/gam/blob/main/LICENSE)
 
-Formula-based generalized additive models for Python, backed by a Rust
-engine.
-
-`gamfit` fits Gaussian, binomial (including Bernoulli marginal-slope),
-Poisson, negative-binomial, Gamma, Beta, Tweedie, and multinomial GLMs
-with smooth terms, random effects,
-bounded/constrained coefficients, location-scale extensions, survival
-likelihoods, and flexible/learnable links. Smoothing parameters are
-selected by REML or LAML. Posterior sampling uses NUTS where supported,
-and a Gaussian Laplace approximation otherwise.
-
-Manifold smooths handle predictor spaces that wrap or close: circles,
-cylinders, tori, and the sphere (intrinsic Wahba and spherical-harmonic
-kernels), plus periodic tensor products and boundary-conditioned
-B-splines. The Möbius example in the gallery is a 4π-periodic
-double-cover parameterization, not a twisted Möbius-strip basis.
-
-![rotating recovery of a trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, and Möbius double-cover from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
-
-Docs: <https://gamfit.readthedocs.io/>.
-
-## Install
+gamfit fits generalized additive models from a formula, chooses every
+smoothing parameter by REML/LAML in one converged optimization, and returns
+posterior-mean predictions with credible bands and observation intervals,
+from a Rust engine.
 
 ```bash
-uv add gamfit
+uv add gamfit   # or: pip install gamfit
 ```
 
 Wheels are published for Linux (x86_64, aarch64), macOS (x86_64, Apple
@@ -38,29 +20,55 @@ silicon), and Windows. No Rust toolchain is required.
 ## Example
 
 ```python
+import pandas as pd
 import gamfit
 
-# Smooth fits need enough rows for the basis to be identified; ~20 rows
-# is the minimum the default `s(x)` basis (cubic B-spline) is well-posed
-# on. Use more rows when the signal is noisier.
-train = [
-    {"y": 1.05, "x": 0.0}, {"y": 1.32, "x": 0.5}, {"y": 1.78, "x": 1.0},
-    {"y": 2.41, "x": 1.5}, {"y": 3.10, "x": 2.0}, {"y": 3.95, "x": 2.5},
-    {"y": 4.80, "x": 3.0}, {"y": 5.62, "x": 3.5}, {"y": 6.25, "x": 4.0},
-    {"y": 6.71, "x": 4.5}, {"y": 6.94, "x": 5.0}, {"y": 6.88, "x": 5.5},
-    {"y": 6.55, "x": 6.0}, {"y": 5.99, "x": 6.5}, {"y": 5.20, "x": 7.0},
-    {"y": 4.30, "x": 7.5}, {"y": 3.42, "x": 8.0}, {"y": 2.65, "x": 8.5},
-    {"y": 2.10, "x": 9.0}, {"y": 1.82, "x": 9.5},
-]
+# 133 rows: head acceleration of a crash-test dummy, milliseconds after impact.
+mcycle = pd.read_csv("https://vincentarelbundock.github.io/Rdatasets/csv/MASS/mcycle.csv")
 
-model = gamfit.fit(train, "y ~ s(x)")
-print(model.predict([{"x": 1.5}, {"x": 5.0}], interval=0.95))
-print(model.summary())
-model.save("model.gam")
+# The mean and the noise level are both smooth functions of time.
+model = gamfit.fit(mcycle, "accel ~ s(times)", noise_formula="s(times)")
+
+bands = model.predict(mcycle, interval=0.95, observation_interval=True)
+print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
+             "observation_lower", "observation_upper"]].head())
 ```
 
-pandas, polars, pyarrow, numpy, dict-of-columns, and list-of-records
-inputs are all accepted without conversion.
+![mcycle location-scale fit: posterior mean, credible band and observation interval](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/mcycle_location_scale.png)
+
+## Coming from pyGAM
+
+- **Smoothness is estimated, not searched.** REML/LAML picks every
+  smoothing parameter, so there is no `gridsearch()` and no GCV. Against
+  pyGAM's defaults gamfit wins 8, ties 28 and loses 13 of 49 held-out
+  comparisons; the [benchmarks](https://gamfit.readthedocs.io/en/latest/benchmarks/) list every loss.
+- **Predictions carry their uncertainty.** One `predict` call returns the
+  posterior mean, a credible band for it and an observation interval
+  ([predictions](https://gamfit.readthedocs.io/en/latest/predictions/)).
+- **The noise can be modelled too.** `noise_formula=` fits a
+  location-scale model like the one above, which pyGAM cannot express; on
+  `mcycle` its 95% observation interval covers 97% of the data
+  ([tour](https://gamfit.readthedocs.io/en/latest/tour/#heteroscedastic-noise-mcycle)).
+
+The [migration guide](https://gamfit.readthedocs.io/en/latest/migrating-from-pygam/) maps pyGAM calls to
+gamfit. Docs: <https://gamfit.readthedocs.io/>.
+
+## Scope
+
+`gamfit` fits Gaussian, binomial (including Bernoulli marginal-slope),
+Poisson, negative-binomial, Gamma, Beta, Tweedie, and multinomial GLMs
+with smooth terms, random effects,
+bounded/constrained coefficients, location-scale extensions, survival
+likelihoods, and flexible/learnable links. Posterior sampling uses NUTS
+where supported, and a Gaussian Laplace approximation otherwise.
+
+Manifold smooths handle predictor spaces that wrap or close: circles,
+cylinders, tori, and the sphere (intrinsic Wahba and spherical-harmonic
+kernels), plus periodic tensor products and boundary-conditioned
+B-splines. The Möbius example in the gallery is a 4π-periodic
+double-cover parameterization, not a twisted Möbius-strip basis.
+
+![rotating recovery of a trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, and Möbius double-cover from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
 
 ## Features
 
@@ -136,13 +144,13 @@ model.report("report.html")
 | `gamfit.load(path)` / `gamfit.loads(bytes)` | Reload a saved model. |
 | `gamfit.validate_formula(data, formula, ...)` | Type-check a formula without fitting. |
 | `gamfit.build_info()` | Native extension build metadata. |
-| `gamfit.cuda_diagnostics()` / `gamfit.format_cuda_diagnostics()` | CUDA probe results. |
+| `gamfit.cuda.cuda_diagnostics()` / `gamfit.cuda.format_cuda_diagnostics()` | CUDA probe results. |
 | `gamfit.explain_error(exc)` | Human-readable hint for a gamfit exception. |
 | `gamfit.Model` | Fitted model: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `sample`, `save`. |
-| `gamfit.SurvivalPrediction` | Per-row hazard / survival surface. |
-| `gamfit.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
+| `gamfit.results.SurvivalPrediction` | Per-row hazard / survival surface. |
+| `gamfit.results.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
 | `gamfit.MultinomialModel` | Multinomial-logit / softmax model. |
-| `gamfit.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
+| `gamfit.results.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
 | `gamfit.ResponseGeometryModel`, `sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`, `closure` | Response-geometry utilities. |
 | `gamfit.smooth.Duchon`, `Matern`, `BSpline`, `TensorBSpline`, `MeasureJet`, `Sphere` | Smooth descriptors for `smooths=` and torch. |
 | `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |
@@ -170,7 +178,7 @@ thresholds are derived at probe time from measured GPU FP64 throughput,
 CPU FP64 throughput, and PCIe bandwidth, so small kernels stay on the
 CPU. Inspect the calibrated thresholds with
 `gamfit.build_info()["cuda_diagnostics"]` or
-`gamfit.format_cuda_diagnostics()`.
+`gamfit.cuda.format_cuda_diagnostics()`.
 
 The wheel uses the CUDA 12 ABI. If PyTorch has already mapped a complete CUDA
 stack, gamfit continues that same stack rather than preloading a second system

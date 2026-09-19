@@ -1,7 +1,7 @@
 """``Model.plot_terms``: draw each term's partial effect with matplotlib.
 
 Drawing only. Every curve, standard error and band is a field of the
-:class:`~gamfit.PartialEffect` the Rust core returns.
+:class:`~gamfit.results.PartialEffect` the Rust core returns.
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def plot_terms(
 
 
 def draw_partial_effect(effect: PartialEffect, ax: Any) -> Any:
-    """Draw one :class:`~gamfit.PartialEffect` on ``ax``."""
+    """Draw one :class:`~gamfit.results.PartialEffect` on ``ax``."""
     factor_axes = [index for index, levels in enumerate(effect.axis_levels) if levels is not None]
     numeric_axes = [index for index, levels in enumerate(effect.axis_levels) if levels is None]
     if len(effect.axes) == 1 and factor_axes:

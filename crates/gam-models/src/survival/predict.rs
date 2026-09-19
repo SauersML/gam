@@ -4462,7 +4462,7 @@ fn evaluate_rp_row_with_beta(
         let dtime = row_time.x_derivative_time.to_dense();
         let dmin = dtime.iter().copied().fold(f64::INFINITY, f64::min);
         let dmax = dtime.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        log::info!(
+        log::debug!(
             "[rp-predict/eta_t-refusal] eta_t={eta_derivative:.12e} = offset({offset_derivative_component:.12e}) + time({time_derivative_component:.12e}) + wiggle({wiggle_derivative_component:.12e}); p_time={p_time} p_timewiggle={p_timewiggle} p_cov={p_cov} time_beta=[{beta_min:.6e},{beta_max:.6e}] x_derivative_time=[{dmin:.6e},{dmax:.6e}] has_wiggle={}",
             saved_timewiggle.is_some(),
         );

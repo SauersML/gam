@@ -277,7 +277,7 @@ pub fn build_bspline_basis_1d(
         let auto_chunk = auto_streaming_chunk_size_for_dense(data.len(), num_basis);
         let (design, transformed_candidates, identifiability_transform) =
             if let Some(chunk) = auto_chunk {
-                log::info!(
+                log::debug!(
                     "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
                     data.len(),
                     num_basis,
@@ -400,7 +400,7 @@ pub fn build_bspline_basis_1d(
             "streaming B-spline roughness",
         )?;
         let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
-        log::info!(
+        log::debug!(
             "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.len(),
             p_raw,
@@ -1268,8 +1268,7 @@ fn compute_geometric_constraint_transform_in_chart(
         }
         Ok(z)
     } else {
-        let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
-        Ok(z)
+        compute_geometric_constraint_transform(knots, degree)
     }
 }
 
@@ -1433,7 +1432,7 @@ pub(crate) fn build_streaming_bspline_design_and_candidates(
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::RemoveLinearTrend => {
-            let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
+            let z = compute_geometric_constraint_transform(knots, degree)?;
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
@@ -2101,7 +2100,7 @@ pub fn filter_penalty_candidates(
         let kronecker_factors =
             validated_kronecker_factors(kronecker_factors, &analysis.sym_penalty);
         if let Some(reason) = dropped_reason {
-            log::debug!(
+            log::trace!(
                 "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
                 source,
                 original_index,
@@ -2115,7 +2114,7 @@ pub fn filter_penalty_candidates(
             });
         } else {
             let null_basis = nullspace_basis_from_block(&analysis);
-            log::debug!(
+            log::trace!(
                 "Retained penalty block source={:?} original_index={} rank={} nullity={} has_op={} has_null_basis={}",
                 source,
                 original_index,
@@ -3405,7 +3404,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
                 eff_deg = eff_degree,
                 eff_ki = eff_interior,
             );
-            log::info!("B-spline {note} on Generate knotspec");
+            log::debug!("B-spline {note} on Generate knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Generate {
@@ -3437,7 +3436,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
                 eff_deg = eff_degree,
                 eff_ki = eff_interior,
             );
-            log::info!("B-spline {note} on Automatic knotspec");
+            log::debug!("B-spline {note} on Automatic knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Automatic {
