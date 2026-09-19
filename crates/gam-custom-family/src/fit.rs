@@ -3040,7 +3040,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             } else {
                 outer.warm_start_for(rho)
             };
-            return match outerobjectivegradienthessian_labeled(
+            return match evaluate_on_branch(
                 family,
                 specs,
                 &outer_options,
@@ -3133,7 +3133,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         } else {
             outer.warm_start_for(rho)
         };
-        let eval_result = match outerobjectivegradienthessian_labeled(
+        let eval_result = match evaluate_on_branch(
             family,
             specs,
             &outer_options,
@@ -3291,7 +3291,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             } else {
                 outer.warm_start_for(rho)
             };
-            match outerobjectivegradienthessian_labeled(
+            match evaluate_on_branch(
                 family,
                 specs,
                 &outer_options,
