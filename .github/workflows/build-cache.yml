@@ -1,0 +1,320 @@
+name: Build cache (session warm start)
+
+# Produces `session-build-cache`: an sccache local-disk cache filled by the same
+# builds a cloud session runs (./build.sh), plus the pinned sccache binary and a
+# manifest. A cold session downloads it through the GitHub MCP tools and starts
+# from warm dependency (and, at the cached commit, workspace) object files:
+#
+#   1. actions_list  list_workflow_runs  resource_id=build-cache.yml
+#        (branch main, status completed) -> newest run id;
+#      actions_list  list_workflow_run_artifacts  resource_id=<run id>
+#        -> id of artifact "session-build-cache"
+#   2. actions_get   download_workflow_run_artifact  resource_id=<artifact id>
+#        -> signed URL (expires in about a minute)
+#   3. scripts/fetch_build_cache.sh '<url>'   then export the lines it prints
+#
+# CACHE-KEY FIDELITY. sccache keys a Rust compile on its full argument list
+# (minus --extern/-L/--out-dir/...), source and extern-rlib contents, env-deps
+# such as OUT_DIR, every CARGO_* variable in rustc's environment, the working
+# directory and the compiler. So this job reproduces a session exactly:
+#   * the repo is at /home/user/gam (bind mount) and its target dir is
+#     /home/user/gam/target (build.sh forces that path; OUT_DIR embeds it);
+#   * CARGO_HOME=/root/.cargo and RUSTUP_HOME=/root/.rustup, so registry/git
+#     sources sit at the same absolute paths and CARGO= points at the same
+#     toolchain path;
+#   * the rust-toolchain.toml toolchain (official dist, profile default);
+#   * no RUSTFLAGS, no CARGO_TERM_COLOR, no profile overrides;
+#   * RUSTC_WRAPPER=scripts/sccache-rustc-wrapper.sh on both sides, which drops
+#     cargo-configuration CARGO_* vars (CARGO_HTTP_CAINFO from the session
+#     proxy, CARGO_TARGET_DIR/CARGO_INCREMENTAL from build.sh, ...) that sccache
+#     would otherwise hash.
+#
+# WHAT SCCACHE CANNOT CACHE (always compiled locally): proc-macro, bin, dylib
+# and cdylib crates (only rlib/staticlib are cacheable), build scripts, test
+# harnesses (`--test` units), and any unit compiled with `-C incremental` —
+# i.e. the workspace crates under build.sh's default CARGO_INCREMENTAL=1. This
+# job builds with GAM_USE_SCCACHE=1 (CARGO_INCREMENTAL=0), so the workspace rlibs
+# ARE in the cache too; a session that exports GAM_USE_SCCACHE=1 gets them.
+# Registry/git dependencies never use incremental, so they hit either way.
+#
+# CROSS-COMMIT HITS. Dependency entries only change when Cargo.lock, a profile or
+# the toolchain changes, so they hit for every later commit. Each run seeds from
+# the previous run's artifact (fast: mostly hits) and, if every build step was
+# green, prunes entries that this commit's builds never touched (sccache bumps an
+# entry's mtime on every hit), so the artifact tracks current main instead of
+# growing without bound.
+#
+# CONCURRENCY. `cancel-in-progress: false`, deliberately: main takes a push every
+# few minutes and a cold build takes far longer, so cancelling superseded runs
+# would mean no run ever finishes (the failure recorded in wheel-nightly.yml:
+# 19 of 20 runs cancelled). With false, GitHub keeps the running build and
+# coalesces every pending push down to the newest one: at most one running and
+# one waiting.
+#
+# This workflow never publishes anything; it only uploads a 7-day run artifact.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'bench/gha_results/**'
+  workflow_dispatch:
+
+concurrency:
+  group: build-cache-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read   # to download the previous run's artifact as the seed
+
+jobs:
+  cache:
+    name: Build and upload session build cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      CARGO_HOME: /root/.cargo
+      RUSTUP_HOME: /root/.rustup
+      RUSTC_WRAPPER: /home/user/gam/scripts/sccache-rustc-wrapper.sh
+      SCCACHE_VERSION: v0.18.0
+      SCCACHE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
+      SCCACHE_CACHE_SIZE: 40G
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_CACHE_ZSTD_LEVEL: "10"
+      GAM_USE_SCCACHE: "1"
+      GAM_BUILD_TIMEOUT: "14400"
+      GAM_MEM_WAIT_MAX: "30"
+      # A green `build --lib` would otherwise let build.sh short-circuit the
+      # `check --workspace --lib` step (lib-compile subsumption marker).
+      GAM_FORCE: "1"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -uo pipefail
+          df -h / /mnt || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/nonexistent}" || true
+          df -h / /mnt || true
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          path: gam-src
+          # build.rs's SPEC HEAD-diff check needs a parent commit.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Mirror the session layout (/home/user/gam, /root/.cargo)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Scratch space for target/ and the cache: the bigger of /mnt and /.
+          mnt_free=$(df -Pk /mnt 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+          root_free=$(df -Pk / | awk 'NR==2{print $4}')
+          if [[ -n "$mnt_free" && "$mnt_free" -gt "$root_free" ]]; then BC=/mnt/bc; else BC="$RUNNER_TEMP/bc"; fi
+          sudo mkdir -p "$BC" && sudo chown "$(id -u):$(id -g)" "$BC"
+          mkdir -p "$BC/target" "$BC/sccache" "$BC/out" "$BC/seed"
+          sudo mkdir -p /home/user/gam
+          sudo mount --bind "$GITHUB_WORKSPACE/gam-src" /home/user/gam
+          mkdir -p /home/user/gam/target
+          sudo mount --bind "$BC/target" /home/user/gam/target
+          sudo chmod 755 /root
+          sudo mkdir -p /root/.cargo /root/.rustup /root/.local/bin
+          sudo chown -R "$(id -u):$(id -g)" /root/.cargo /root/.rustup /root/.local
+          {
+            echo "BC=$BC"
+            echo "SCCACHE_DIR=$BC/sccache"
+          } >> "$GITHUB_ENV"
+          { echo /root/.local/bin; echo /root/.cargo/bin; } >> "$GITHUB_PATH"
+          git -C /home/user/gam log -1 --format='%H %s'
+          df -h "$BC"
+
+      - name: Install the pinned toolchain into /root/.rustup
+        shell: bash
+        working-directory: /home/user/gam
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile default --default-toolchain none
+          channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          rustup toolchain install "$channel" --profile default
+          which cargo rustc
+          rustc -vV
+          cargo -V
+
+      - name: Install pinned sccache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          name="sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/sccache.tgz" \
+            "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/${name}.tar.gz"
+          echo "${SCCACHE_SHA256}  $RUNNER_TEMP/sccache.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/sccache.tgz" -C "$RUNNER_TEMP" "${name}/sccache"
+          install -m 0755 "$RUNNER_TEMP/${name}/sccache" /root/.local/bin/sccache
+          sccache --version
+
+      - name: Seed from the previous cache artifact
+        id: seed
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow build-cache.yml \
+            --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [[ -z "$run_id" ]]; then echo "No previous successful run: cold build."; echo "seeded=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "Seeding from run $run_id"
+          if gh run download "$run_id" -R "$GITHUB_REPOSITORY" -n session-build-cache -D "$BC/seed" \
+             && tar -x -C "$SCCACHE_DIR" -f "$BC/seed/sccache-cache.tar"; then
+            echo "seeded=true" >> "$GITHUB_OUTPUT"
+            echo "seed_run=$run_id" >> "$GITHUB_OUTPUT"
+            du -sh "$SCCACHE_DIR"
+          else
+            echo "::warning::Could not seed from run $run_id; building cold."
+            rm -rf "$SCCACHE_DIR" && mkdir -p "$SCCACHE_DIR"
+            echo "seeded=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -rf "$BC/seed"
+          # Anything not touched after this marker was not used by this commit.
+          touch "$BC/prune.marker"
+          sleep 2
+
+      - name: Start sccache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          [[ -f "$BC/prune.marker" ]] || touch "$BC/prune.marker"
+          sccache --start-server
+          sccache --show-stats
+
+      # The builds sessions run, through build.sh itself so the cargo invocation,
+      # target dir and exported env match byte for byte. Each step keeps going on
+      # failure so a red commit still refreshes every dependency entry.
+      - name: "./build.sh  (cargo build --lib, dev profile)"
+        id: b_lib
+        continue-on-error: true
+        shell: bash
+        working-directory: /home/user/gam
+        run: |
+          set -uo pipefail
+          start=$(date +%s); rc=0
+          ./build.sh || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"; echo "secs=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          sccache --show-stats | tee "$BC/out/stats-build-lib.txt"
+          exit "$rc"
+
+      - name: "./build.sh check --workspace --lib  (the `changed` / `crate` lanes)"
+        id: b_check
+        continue-on-error: true
+        shell: bash
+        working-directory: /home/user/gam
+        run: |
+          set -uo pipefail
+          start=$(date +%s); rc=0
+          ./build.sh check --workspace --lib || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"; echo "secs=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          sccache --show-stats | tee "$BC/out/stats-check.txt"
+          exit "$rc"
+
+      - name: "./build.sh test --no-run  (test profile, as nextest builds it)"
+        id: b_test
+        continue-on-error: true
+        shell: bash
+        working-directory: /home/user/gam
+        run: |
+          set -uo pipefail
+          start=$(date +%s); rc=0
+          ./build.sh test --no-run || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"; echo "secs=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          sccache --show-stats | tee "$BC/out/stats-test.txt"
+          df -h "$BC"
+          exit "$rc"
+
+      - name: Package the cache
+        id: pack
+        if: ${{ always() }}
+        shell: bash
+        working-directory: /home/user/gam
+        env:
+          SEEDED: ${{ steps.seed.outputs.seeded }}
+          SEED_RUN: ${{ steps.seed.outputs.seed_run }}
+          RC_LIB: ${{ steps.b_lib.outputs.rc }}
+          RC_CHECK: ${{ steps.b_check.outputs.rc }}
+          RC_TEST: ${{ steps.b_test.outputs.rc }}
+          S_LIB: ${{ steps.b_lib.outputs.secs }}
+          S_CHECK: ${{ steps.b_check.outputs.secs }}
+          S_TEST: ${{ steps.b_test.outputs.secs }}
+        run: |
+          set -euo pipefail
+          sccache --show-stats > "$BC/out/stats-final.txt" || true
+          sccache --stop-server || true
+          before=$(du -sh "$SCCACHE_DIR" | cut -f1)
+          # Prune only when every build was green: a failed step never reached
+          # some entries, and those are still wanted by the next commit.
+          pruned=no
+          if [[ "$SEEDED" == "true" && "$RC_LIB" == "0" && "$RC_CHECK" == "0" && "$RC_TEST" == "0" ]]; then
+            find "$SCCACHE_DIR" -mindepth 3 -type f ! -newer "$BC/prune.marker" -print -delete | wc -l > "$BC/out/pruned.count"
+            find "$SCCACHE_DIR" -mindepth 1 -type d -empty -delete || true
+            pruned="yes ($(cat "$BC/out/pruned.count") entries)"
+          fi
+          after=$(du -sh "$SCCACHE_DIR" | cut -f1)
+          # Plain tar: every entry is already zstd-compressed by sccache, and
+          # sessions have no zstd binary.
+          tar -c -f "$BC/out/sccache-cache.tar" -C "$SCCACHE_DIR" .
+          cp /root/.local/bin/sccache "$BC/out/sccache"
+          cp scripts/sccache-rustc-wrapper.sh "$BC/out/sccache-rustc-wrapper"
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "rustc_release=$(rustc -vV | sed -n 's/^release: //p')"
+            echo "rustc_commit=$(rustc -vV | sed -n 's/^commit-hash: //p')"
+            echo "sccache_version=$(sccache --version)"
+            echo "repo_path=/home/user/gam"
+            echo "target_dir=/home/user/gam/target"
+            echo "cargo_home=${CARGO_HOME}"
+            echo "rustup_home=${RUSTUP_HOME}"
+            echo "seeded_from_run=${SEED_RUN:-none}"
+            echo "pruned=${pruned}"
+            echo "cache_size_before_prune=${before}"
+            echo "cache_size=${after}"
+            echo "step_build_lib=rc:${RC_LIB:-skipped} secs:${S_LIB:-}"
+            echo "step_check_workspace_lib=rc:${RC_CHECK:-skipped} secs:${S_CHECK:-}"
+            echo "step_test_no_run=rc:${RC_TEST:-skipped} secs:${S_TEST:-}"
+            echo
+            echo "## rustc -vV"
+            rustc -vV
+            echo
+            echo "## sccache --show-stats (end of run)"
+            cat "$BC/out/stats-final.txt"
+          } > "$BC/out/manifest.txt"
+          cat "$BC/out/manifest.txt"
+          ls -la "$BC/out"
+          {
+            echo "### Session build cache"
+            echo ""
+            echo '```'
+            head -n 17 "$BC/out/manifest.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload session-build-cache
+        if: ${{ always() && steps.pack.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-build-cache
+          path: |
+            ${{ env.BC }}/out/sccache-cache.tar
+            ${{ env.BC }}/out/sccache
+            ${{ env.BC }}/out/sccache-rustc-wrapper
+            ${{ env.BC }}/out/manifest.txt
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error

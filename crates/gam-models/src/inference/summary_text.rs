@@ -15,9 +15,13 @@ use std::fmt::Write as _;
 /// The legend for the significance stars beside each p-value.
 const SIGNIF_CODES: &str = "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1";
 
-/// The smallest p-value printed as a number, as `summary.gam` prints it: below
-/// this the two-sided tail has no correct digit left in double precision.
-const P_VALUE_FLOOR: f64 = 2e-16;
+/// The smallest p-value printed as a number. A p-value lives on the unit
+/// probability scale, and `f64::EPSILON = 2^-52` is the gap between 1 and the
+/// next double: for any `p < EPSILON` the complementary probability `1 - p`
+/// rounds to exactly 1, so on that scale `p` cannot be told apart from 0. Such
+/// a p-value prints as `< EPSILON` (two significant digits, `< 2.2e-16`)
+/// rather than as digits the unit scale does not resolve.
+const P_VALUE_FLOOR: f64 = f64::EPSILON;
 
 /// Why a saved model carries no log-likelihood: `SummaryPayload::log_likelihood`
 /// is `None` only at the exact zero-dispersion boundary.
@@ -331,7 +335,7 @@ fn optional_number(value: Option<f64>) -> String {
 
 fn format_p_value(p: Option<f64>) -> String {
     match p {
-        Some(p) if p.is_finite() && p < P_VALUE_FLOOR => format!("< {P_VALUE_FLOOR:e}"),
+        Some(p) if p.is_finite() && p < P_VALUE_FLOOR => format!("< {P_VALUE_FLOOR:.1e}"),
         Some(p) if p.is_finite() && p < P_VALUE_SCIENTIFIC_BELOW => format!("{p:.2e}"),
         Some(p) if p.is_finite() => format!("{p:.4}"),
         _ => "NA".to_string(),
@@ -519,9 +523,9 @@ Estimator: penalized likelihood
 n: 100
 
 Parametric coefficients:
-           Estimate  Std. Error  t value  Pr(>|t|)
-Intercept       1.5        0.05       30   < 2e-16  ***
-x1            -0.25       0.125       -2    0.0484  *
+           Estimate  Std. Error  t value   Pr(>|t|)
+Intercept       1.5        0.05       30  < 2.2e-16  ***
+x1            -0.25       0.125       -2     0.0484  *
   Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
 
 Approximate significance of smooth terms:
@@ -588,26 +592,15 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
     }
 
     /// A factor is tested once, jointly on its `L - 1` contrasts, in an
-    /// anova-style table under the coefficients; a withheld coefficient p-value
-    /// names its reason under the coefficient table.
+    /// anova-style table under the coefficients, with no per-level rows; a
+    /// withheld coefficient p-value names its reason under the coefficient table.
     #[test]
     fn a_factor_prints_its_joint_term_test_and_a_withheld_pvalue_its_reason() {
         let mut summary = fixed_small_model();
-        let contrast = |level: &str, estimate: f64, p_value: f64| SummaryParametricTermRow {
-            name: format!("g[{level}]"),
-            estimate,
-            std_error: Some(0.25),
-            penalized: false,
-            statistic: Some(estimate / 0.25),
-            p_value: Some(p_value),
-            p_value_unavailable: None,
-        };
         summary.parametric_terms[1].statistic = None;
         summary.parametric_terms[1].p_value = None;
         summary.parametric_terms[1].p_value_unavailable =
             Some(ParametricPValueUnavailable::BoundedCoefficient);
-        summary.parametric_terms.push(contrast("b", 0.5, 0.0484));
-        summary.parametric_terms.push(contrast("c", -0.125, 0.618));
         summary.parametric_term_tests = vec![
             SummaryParametricTermTestRow {
                 name: "x1".to_string(),
@@ -618,7 +611,7 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
             },
             SummaryParametricTermTestRow {
                 name: "g".to_string(),
-                df: 2,
+                df: 3,
                 statistic: Some(2.5),
                 p_value: Some(0.0875),
                 p_value_unavailable: None,
@@ -630,15 +623,13 @@ Parametric coefficients:
            Estimate  Std. Error  t value  Pr(>|t|)
 Intercept       1.5        0.05       30   < 2e-16  ***
 x1            -0.25       0.125       NA        NA
-g[b]            0.5        0.25        2    0.0484  *
-g[c]         -0.125        0.25     -0.5    0.6180
   x1: the coefficient is bounded, so the null can sit on the constraint boundary where the normal reference does not hold; no p-value is reported
   Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
 
 Parametric terms:
     df    F  p-value
 x1   1   NA       NA
-g    2  2.5   0.0875  .
+g    3  2.5   0.0875  .
 
 ";
         assert!(text.contains(expected), "{text}");

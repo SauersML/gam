@@ -1192,6 +1192,30 @@ impl FittedModelPayload {
             });
     }
 
+    /// Offsets and prior weights are real-valued by role, whatever values the
+    /// training rows happened to hold: an all-zero or 0/1 offset column infers
+    /// as `Binary` at load time, and that kind must not refuse a prediction
+    /// with any other offset. Role columns are stored as `Continuous`, here and
+    /// on the frozen score transform.
+    fn synchronize_role_column_kinds(&mut self) {
+        if let Some(schema) = self.data_schema.as_mut() {
+            let roles = [
+                self.offset_column.as_deref(),
+                self.noise_offset_column.as_deref(),
+                self.weight_column.as_deref(),
+            ];
+            for column in &mut schema.columns {
+                if column.kind == ColumnKindTag::Binary && roles.contains(&Some(column.name.as_str()))
+                {
+                    column.kind = ColumnKindTag::Continuous;
+                }
+            }
+        }
+        if let Some(transform) = self.score_transform.as_mut() {
+            transform.synchronize_role_column_kinds();
+        }
+    }
+
     /// Write the persistable time-basis snapshot for a survival model.
     ///
     /// This is the only path that should populate the `survival_time_*`
@@ -3603,6 +3627,7 @@ impl FittedModel {
             .or(payload.unified.as_ref())
             .is_some_and(|fit| fit.used_device);
         payload.synchronize_empty_feature_contract();
+        payload.synchronize_role_column_kinds();
         let Some(fit) = payload.fit_result.as_ref().or(payload.unified.as_ref()) else {
             return;
         };
