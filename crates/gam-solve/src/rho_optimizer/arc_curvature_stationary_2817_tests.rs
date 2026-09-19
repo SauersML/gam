@@ -852,7 +852,7 @@ fn a_descending_search_stops_at_the_first_point_its_verdict_certifies_2954() {
         samples,
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         |_| COST_2817,
         Some((&config, evidence)),
     );
@@ -879,7 +879,7 @@ fn where_no_verdict_is_taken_a_descending_search_is_not_halted_2954() {
         samples,
         array![[1.0]],
         wide_box_2817(1),
-        Some(FLOOR_2817),
+        Some(RESOLUTION_2817),
         |_| COST_2817,
         Some((&config, evidence)),
     );
