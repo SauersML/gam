@@ -17,7 +17,7 @@ from sklearn.utils.validation import (
 from ._binding import rust_module
 from ._api import fit as fit_model
 from ._api import is_multinomial_family
-from ._model import Model
+from ._model import Model, MultinomialModel
 from ._tables import (
     _table_column_views,
     drop_columns,
@@ -64,6 +64,8 @@ def _input_column_names(X: Any) -> list[str] | None:
 
 
 class _BaseGAMEstimator(BaseEstimator):
+    feature_names_in_: np.ndarray
+
     def __init__(
         self,
         formula: str | None = None,
@@ -267,7 +269,9 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
     """
 
     def __sklearn_tags__(self) -> Any:
-        tags = super().__sklearn_tags__()
+        # scikit-learn-stubs does not declare the tags protocol (scikit-learn
+        # >= 1.6) on its mixins.
+        tags = super().__sklearn_tags__()  # type: ignore[misc]
         # The formula fixes which columns the model reads, so an informative
         # column the formula does not name is invisible to it by construction;
         # scikit-learn's fixed-width scoring dataset (one informative column of
@@ -368,6 +372,15 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
     (100, 3)
     """
 
+    def __sklearn_tags__(self) -> Any:
+        tags = super().__sklearn_tags__()  # type: ignore[misc]
+        # Any family other than "auto" and the multinomial names a binary
+        # likelihood, which refuses a third class.
+        tags.classifier_tags.multi_class = self.family == "auto" or is_multinomial_family(
+            self.family
+        )
+        return tags
+
     def fit(self, X: Any, y: Any = None, sample_weight: Any = None) -> "GAMClassifier":
         """Fit the GAM classifier and return ``self``.
 
@@ -393,7 +406,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         """
         self._fit_model(X, y, sample_weight)
         self._multinomial_columns_: np.ndarray | None = None
-        if self._is_multinomial(self.classes_.size):
+        if isinstance(self.model_, MultinomialModel):
             # The multinomial response is categorical and the engine orders its
             # levels by label text. Each row carries its class INDEX as the
             # label, and the engine's level order is mapped back to index
@@ -412,7 +425,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         if classes.size < 2:
             raise ValueError(
                 "GAMClassifier requires at least two observed classes; "
-                f"got {classes.size}: {classes!r}"
+                f"got {classes.size} class{'' if classes.size == 1 else 'es'}: {classes!r}"
             )
         self.classes_ = classes
         if not self._is_multinomial(classes.size):
@@ -421,9 +434,10 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
             return (class_index == 1).astype(np.float64), self.family
         if self.family != "auto" and not is_multinomial_family(self.family):
             raise ValueError(
-                f"GAMClassifier: family={self.family!r} is a binary likelihood but "
-                f"y has {classes.size} classes; use family='auto' or "
-                "family='multinomial' for a joint multinomial-logit GAM"
+                "Only binary classification is supported by "
+                f"GAMClassifier(family={self.family!r}); y has {classes.size} classes. "
+                "Use family='auto' or family='multinomial' for a joint "
+                "multinomial-logit GAM."
             )
         encoded = np.asarray([str(index) for index in class_index], dtype=object)
         return encoded, "multinomial"

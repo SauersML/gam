@@ -31,6 +31,10 @@ CONTRACT_FORMULA = "x0 + x1"
 @parametrize_with_checks(
     [
         GAMRegressor(formula=CONTRACT_FORMULA),
+        # The default family fits two classes as binomial and more as one
+        # joint multinomial GAM; an explicit binary family declares itself
+        # binary-only through `classifier_tags.multi_class`.
+        GAMClassifier(formula=CONTRACT_FORMULA),
         GAMClassifier(formula=CONTRACT_FORMULA, family="binomial"),
     ]
 )
@@ -95,6 +99,32 @@ def test_classifier_integer_sample_weight_equals_repeated_rows():
     # each outer search stops inside its certified-stationary band.
     np.testing.assert_allclose(weighted.predict_proba(X), repeated.predict_proba(X), atol=1e-5)
     assert not np.allclose(weighted.predict_proba(X), unweighted.predict_proba(X))
+
+
+def test_multiclass_integer_sample_weight_equals_repeated_rows():
+    # The multinomial likelihood is a sum over rows with no scale, so a
+    # weight-k row is k copies of it, as for the binomial.
+    rng = np.random.default_rng(4)
+    X = rng.uniform(-1.0, 1.0, size=(300, 2))
+    eta = np.column_stack([np.zeros(300), 2.0 * X[:, 0], -2.0 * X[:, 1]])
+    probabilities = np.exp(eta) / np.exp(eta).sum(axis=1, keepdims=True)
+    y = np.array(["a", "b", "c"])[(rng.uniform(size=(300, 1)) > probabilities.cumsum(1)).sum(1)]
+    w = rng.integers(0, 3, size=y.size)
+    weighted = GAMClassifier(formula=CONTRACT_FORMULA).fit(X, y, sample_weight=w.astype(float))
+    repeated = GAMClassifier(formula=CONTRACT_FORMULA).fit(
+        np.repeat(X, w, axis=0), np.repeat(y, w)
+    )
+    np.testing.assert_array_equal(weighted.classes_, ["a", "b", "c"])
+    # Same REML problem; the fits differ only inside the outer search's
+    # certified-stationary band.
+    np.testing.assert_allclose(weighted.predict_proba(X), repeated.predict_proba(X), atol=1e-4)
+
+
+def test_automatic_formula_does_not_read_the_sample_weight_column():
+    X, y = _regression_data()
+    w = np.random.default_rng(2).uniform(0.5, 2.0, size=y.size)
+    reg = GAMRegressor().fit(X, y, sample_weight=w)
+    assert reg.formula_ == "y ~ s(x0) + s(x1)"
 
 
 def test_sample_weight_routes_through_cross_val_score_params():
