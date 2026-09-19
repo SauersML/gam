@@ -906,8 +906,9 @@ pub fn survival_fit_from_parts(
             // point `warm_start_from` could resume.
             outer_warm_start: None,
             coefficient_mode_selection,
-            // Survival location-scale designs carry no random-effect block.
-            random_effect_tests: Vec::new(),
+            // This route does not run the variance-component test; its smooth
+            // rows keep the Wald test.
+            variance_component_tests: None,
         },
         inner_cycles: 0,
     })

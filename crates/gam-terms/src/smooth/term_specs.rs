@@ -944,6 +944,38 @@ impl SmoothTerm {
     pub fn wald_unpenalized_dim(&self) -> usize {
         joint_unpenalized_dim(self.coeff_range.len(), &self.active_penalties)
     }
+
+    /// The local penalty blocks of a term whose significance is a
+    /// variance-component boundary test
+    /// ([`crate::inference::variance_component_test`]): every coefficient
+    /// direction is penalized, so "no effect" is every smoothing variance at
+    /// zero — on the boundary of the parameter space, where the Wald reference
+    /// law does not hold.
+    ///
+    /// `None` when the term is outside that model: a shape constraint, lower
+    /// bound or inequality constraint (the null is then a cone, not a variance
+    /// boundary), a penalty that is not materialized as a full
+    /// `p_local × p_local` block, or a direction no penalty reaches (an
+    /// unpenalized fixed part, tested by the Wald test's full-rank branch).
+    pub fn variance_component_penalties(&self) -> Option<Vec<Array2<f64>>> {
+        let p_local = self.coeff_range.len();
+        let unconstrained = matches!(self.shape, ShapeSpec::None)
+            && self.lower_bounds_local.is_none()
+            && self.linear_constraints_local.is_none();
+        let materialized = !self.active_penalties.is_empty()
+            && self
+                .active_penalties
+                .iter()
+                .all(|penalty| penalty.matrix.dim() == (p_local, p_local));
+        (p_local > 0 && unconstrained && materialized && self.wald_unpenalized_dim() == 0).then(
+            || {
+                self.active_penalties
+                    .iter()
+                    .map(|penalty| penalty.matrix.clone())
+                    .collect()
+            },
+        )
+    }
 }
 
 /// Numeric core of [`SmoothTerm::wald_unpenalized_dim`]: the dimension of the
@@ -2396,6 +2428,42 @@ impl TermCollectionDesign {
             crate::bail_invalid_basis!("term-collection affine offset must be finite");
         }
         Ok(self.design.apply(&beta.to_owned()) + &self.affine_offset)
+    }
+
+    /// The GLOBAL coefficient range of one of this design's smooth terms. The
+    /// layout is `[intercept | linear | random | smooth]` and a term's
+    /// `coeff_range` is local to the smooth block.
+    pub fn smooth_global_range(&self, term: &SmoothTerm) -> Range<usize> {
+        let smooth_start = self
+            .design
+            .ncols()
+            .saturating_sub(self.smooth.total_smooth_cols());
+        (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end)
+    }
+
+    /// The local penalties of a smooth whose significance is the
+    /// variance-component boundary test: the term qualifies by
+    /// [`SmoothTerm::variance_component_penalties`], and every penalty the
+    /// design realized on its coefficients is centered at zero, so "no effect"
+    /// is the prior's own centre. The fit-time test and the summary both
+    /// route a smooth through this one predicate.
+    pub fn smooth_variance_component_penalties(
+        &self,
+        term: &SmoothTerm,
+    ) -> Option<Vec<Array2<f64>>> {
+        let range = self.smooth_global_range(term);
+        let zero_centered = self
+            .penalties
+            .iter()
+            .filter(|penalty| {
+                penalty.col_range.start < range.end && range.start < penalty.col_range.end
+            })
+            .all(|penalty| matches!(penalty.prior_mean, gam_problem::CoefficientPriorMean::Zero));
+        if zero_centered {
+            term.variance_component_penalties()
+        } else {
+            None
+        }
     }
 
     /// Number of global penalty blocks that precede the smooth-term penalty

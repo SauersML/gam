@@ -5,15 +5,20 @@ b_g ~ N(0, sd_re²) (sd_re = 0 is the null). g has L levels, balanced
 (round-robin) or unbalanced (Dirichlet(0.5) level shares, every level seen at
 least once).
 
-Double-penalty cell ("dp"): y ~ s(x1) + s(x2) with a null s(x2); the smooth's
-null space is penalized by the default double penalty, so the variance
-component of the whole term sits on the boundary under the null.
+Double-penalty cells ("dp", "dp2"): y ~ s(x1) + s(x2), with
+s(x2) = EFFECT·sin(2π·c·x2) for c = 1 ("dp") or c = 2 ("dp2"); EFFECT = 0 is
+the null. The smooth's null space is penalized by the default double penalty,
+so the variance components of the whole term sit on the boundary under the
+null.
 
 Output: one JSON line per replicate.
 
 Usage:
   python null_calibration.py re FAMILIES LEVELS REPS SD_RE OUT
-  python null_calibration.py dp FAMILIES N REPS EFFECT OUT
+  python null_calibration.py dp|dp2 FAMILIES N REPS EFFECT OUT
+
+REPS is a count (replicates 0..REPS-1) or a half-open range FIRST:END; each
+replicate's seed is a function of its index, so a range draws fresh data.
 """
 import json
 import os
@@ -60,11 +65,11 @@ def simulate_re(family, levels, balanced, seed, sd_re):
     return {"y": y, "x1": x1, "g": np.array([f"L{v}" for v in g])}
 
 
-def simulate_dp(family, n, seed, effect):
+def simulate_dp(family, n, seed, effect, cycles):
     rng = np.random.default_rng(seed)
     x1 = rng.uniform(0, 1, n)
     x2 = rng.uniform(0, 1, n)
-    eta = np.sin(2 * np.pi * x1) + effect * np.sin(2 * np.pi * x2)
+    eta = np.sin(2 * np.pi * x1) + effect * np.sin(2 * np.pi * cycles * x2)
     return {"y": response(family, eta, rng), "x1": x1, "x2": x2}
 
 
@@ -106,12 +111,13 @@ def one_re(task):
 
 
 def one_dp(task):
-    family, n, rep, effect = task
+    family, n, rep, effect, cycles = task
     seed = 13_000_000 + 1_000_000 * FAMILIES.index(family) + 10 * n + rep
-    base = {"cell": "dp", "family": family, "levels": 0, "balanced": True,
-            "rep": rep, "effect": effect, "n": n}
+    base = {"cell": "dp" if cycles == 1 else f"dp{cycles}", "family": family, "levels": 0,
+            "balanced": True, "rep": rep, "effect": effect, "n": n}
     try:
-        rows = quiet_fit(simulate_dp(family, n, seed, effect), "y ~ s(x1) + s(x2)", family)
+        rows = quiet_fit(simulate_dp(family, n, seed, effect, cycles), "y ~ s(x1) + s(x2)",
+                         family)
         return record([r for r in rows if r["name"].endswith("x2)")][0], base)
     except Exception as exc:
         return {**base, "error": str(exc)[:300]}
@@ -121,16 +127,19 @@ if __name__ == "__main__":
     kind = sys.argv[1]
     families = sys.argv[2].split(",")
     sizes = [int(v) for v in sys.argv[3].split(",")]
-    reps = int(sys.argv[4])
+    first, _, end = sys.argv[4].rpartition(":")
+    reps = range(int(first or 0), int(end))
     effect = float(sys.argv[5])
     out = sys.argv[6] if len(sys.argv) > 6 else "/dev/stdout"
     if kind == "re":
         worker = one_re
         tasks = [(f, L, bal, r, effect) for f in families for L in sizes
-                 for bal in (True, False) for r in range(reps)]
+                 for bal in (True, False) for r in reps]
     else:
         worker = one_dp
-        tasks = [(f, n, r, effect) for f in families for n in sizes for r in range(reps)]
+        cycles = 2 if kind == "dp2" else 1
+        tasks = [(f, n, r, effect, cycles) for f in families for n in sizes
+                 for r in reps]
     with Pool(int(os.environ.get("NPROC", "4"))) as pool, open(out, "a") as fh:
         for res in pool.imap_unordered(worker, tasks, chunksize=4):
             fh.write(json.dumps(res) + "\n")

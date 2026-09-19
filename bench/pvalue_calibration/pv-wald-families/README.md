@@ -223,11 +223,14 @@ not (below).
 
 ## Regression test
 
-`tests/inference/misc/sbc_wood_smooth_test_family_size_curve.rs`: one test
-per family, n = 200, 200 seeded replications (rayon-parallel; the 500-rep
-run above is the bench, and 500 reps × 7 families overruns the per-test CI
-kill), gate
-`size ≤ α + 2·√(α(1−α)/m)` at α ∈ {.10, .05, .01}; also `ref_df ≥ 1` and
+Superseded: the default `s()` is double-penalized, so its row is now the
+variance-component score test (`bench/pvalue_calibration/pv-random-effects/`).
+The family gate this lane added lives on as
+`tests/inference/misc/sbc_double_penalty_smooth_family_size_curve.rs`, with a
+two-sided size gate `|size − α| ≤ 2·√(α(1−α)/m)` at α ∈ {.10, .05, .01}, a
+two-sided KS test and a power control. As written here it was one test
+per family, n = 200, 200 seeded replications, gate
+`size ≤ α + 2·√(α(1−α)/m)`; also `ref_df ≥ 1` and
 finite for every replicate and `p > .5` for edf < 0.01. It uses the Rust
 simulator (same DGPs, different RNG stream from the Python bench).
 
@@ -270,5 +273,5 @@ python analyze.py results/null60.jsonl results/null2000.jsonl results/power200.j
 NPROC=4 python covariance_ablation.py run gaussian,poisson,binomial,gamma 200 500 results/vc200.jsonl
 python covariance_ablation.py analyze results/vc200.jsonl
 python boundary_toy.py
-./build.sh test --test inference sbc_wood_smooth_test_family_size_curve -- --nocapture
+./build.sh test --test inference sbc_double_penalty_smooth_family_size_curve -- --nocapture
 ```

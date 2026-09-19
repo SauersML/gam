@@ -2715,16 +2715,21 @@ pub struct FitArtifacts {
     /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
     #[serde(default)]
     pub coefficient_mode_selection: CoefficientModeSelection,
-    /// The variance-component score test of every random-effect term, computed
-    /// once on the training fit's own IRLS row state
-    /// (`gam_terms::inference::random_effect_test`). The summary's random-effect
-    /// rows read their p-value (or its typed absence) from here, so the CLI,
-    /// Rust and persisted-model surfaces report the same number. Empty on a
-    /// model with no random-effect term and on a payload written before the
-    /// test existed; a summary treats a term missing from it as not recorded.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub random_effect_tests:
-        Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
+    /// The variance-component score test of every random-effect term and of
+    /// every smooth whose penalties cover all of its directions, computed once
+    /// on the training fit's own IRLS row state
+    /// (`gam_terms::inference::variance_component_test`). The summary rows of
+    /// those terms read their p-value (or its typed absence) from here, so the
+    /// CLI, Rust and persisted-model surfaces report the same number.
+    ///
+    /// `Some(records)` when the fit's route runs the test (empty on a model
+    /// with no such term); a summary then treats a term missing from it as not
+    /// recorded. `None` when the route does not run it, and on a payload
+    /// written before the test existed: those smooth rows keep the Wood Wald
+    /// test, and random-effect rows report the test as not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variance_component_tests:
+        Option<Vec<gam_terms::inference::variance_component_test::VarianceComponentTestRecord>>,
 }
 
 /// A certified outer point (gam#3002): `theta`, the outer coordinates in the order
@@ -2878,7 +2883,7 @@ impl std::fmt::Debug for FitArtifacts {
                     .as_ref()
                     .map(|seed| (seed.theta.len(), seed.beta.len())),
             )
-            .field("random_effect_tests", &self.random_effect_tests)
+            .field("variance_component_tests", &self.variance_component_tests)
             .finish()
     }
 }

@@ -11,6 +11,6 @@ pub mod basis_adequacy;
 pub mod formula_dsl;
 pub mod higher_order;
 pub mod lawley;
-pub mod random_effect_test;
 pub mod smooth_test;
 pub mod structure_evidence;
+pub mod variance_component_test;

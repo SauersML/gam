@@ -118,6 +118,14 @@ failure-output = "immediate-final"
 [profile.issue-1082.junit]
 path = "issue-1082.xml"
 
+# The Gaussian location-scale null gate of the variance-component smooth test
+# fits 1000 seeded location-scale models (`n = 200`), so its band at
+# `α = 0.01` is narrow enough to catch a σ̂-driven excess in the tail. That run
+# measured 800s on 4 cores, past the default 600s SIGKILL.
+[[profile.default.overrides]]
+filter = 'test(/gaussian_location_scale_null_mean_smooth_size_is_within_monte_carlo_error/)'
+slow-timeout = { period = "600s", terminate-after = 3 }
+
 # #1082: the two high-frequency 2D tensor recovery probes
 # (`hifreq_tensor_k8`/`hifreq_tensor_k10` in the `quality` binary) fit a
 # `te(theta, h, bc=['periodic','natural'], k=2k+4)` of coefficient dimension

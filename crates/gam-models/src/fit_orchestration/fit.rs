@@ -1544,14 +1544,76 @@ pub(crate) fn fit_gaussian_location_scale_model(
             .mapv_inplace(|v| v / response_scale);
     }
 
+    let y = request.spec.y.clone();
+    let prior_weights = request.spec.weights.clone();
+    let mean_offset = request.spec.mean_offset.clone();
+    let log_sigma_offset = request.spec.log_sigma_offset.clone();
     let mut result =
         fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;
+    // Scored in the standardized units the fit ran in; the score test is
+    // invariant to rescaling the response, so the raw remap below leaves it
+    // as is.
+    result.fit.fit.artifacts.variance_component_tests =
+        gaussian_location_scale_variance_component_tests(
+            &result,
+            y.view(),
+            prior_weights.view(),
+            mean_offset.view(),
+            log_sigma_offset.view(),
+        );
 
     // The raw-unit remap rewrites a fitted result the engine assembled, so its
     // refusals are shape disagreements inside that result (#2937).
     rescale_gaussian_location_scale_to_raw(&mut result, response_scale)
         .map_err(crate::gamlss::assembly_failure)?;
     Ok(result)
+}
+
+/// The mean block's variance-component tests of a Gaussian location-scale fit
+/// in standardized units, `σ = LOGB_SIGMA_FLOOR + exp(η_σ)`.
+///
+/// `None` (the route does not run the test, so those smooth rows keep the Wald
+/// test) when the mean is composed with a link wiggle, whose mean is not
+/// linear in the mean block's coefficients.
+fn gaussian_location_scale_variance_component_tests(
+    result: &GaussianLocationScaleFitResult,
+    y: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    mean_offset: ArrayView1<'_, f64>,
+    log_sigma_offset: ArrayView1<'_, f64>,
+) -> Option<Vec<gam_terms::inference::variance_component_test::VarianceComponentTestRecord>> {
+    use crate::fit_orchestration::drivers::{
+        GaussianLocationScaleMeanFit, gaussian_location_scale_variance_component_test_records,
+    };
+    use gam_problem::BlockRole;
+
+    if result.wiggle_knots.is_some() || result.beta_link_wiggle.is_some() {
+        return None;
+    }
+    let fit = &result.fit;
+    let evaluated = (|| {
+        let beta_mu = crate::inference::model::gaussian_location_scale_mean_beta(&fit.fit)?;
+        let beta_sigma = fit.fit.block_by_role(BlockRole::Scale)?.beta.clone();
+        let mu = fit.mean_design.apply(beta_mu.view()).ok()? + &mean_offset;
+        let eta_sigma = fit.noise_design.apply(beta_sigma.view()).ok()? + &log_sigma_offset;
+        let sigma =
+            eta_sigma.mapv(|eta| gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR + eta.exp());
+        Some((beta_mu, mu, sigma))
+    })();
+    // A fit with no evaluable mean or scale block gives every tested term the
+    // missing row state as its reason.
+    Some(gaussian_location_scale_variance_component_test_records(
+        &fit.mean_design,
+        evaluated
+            .as_ref()
+            .map(|(beta_mu, mu, sigma)| GaussianLocationScaleMeanFit {
+                beta_mu: beta_mu.view(),
+                y,
+                prior_weights,
+                mu: mu.view(),
+                sigma: sigma.view(),
+            }),
+    ))
 }
 
 pub(crate) fn fit_dispersion_location_scale_model(
