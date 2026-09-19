@@ -48,18 +48,6 @@ pub(crate) const MONOTONE_CONE_FEASIBILITY_GATE_TOL: f64 =
 /// near-degenerate constraint set and keeps the warm-start best-effort.
 pub(crate) const DYKSTRA_PROJECTION_MAX_SWEEPS: usize = 100;
 
-/// Levenberg damping schedule for the direct parametric-AFT Newton solve. When
-/// the Hessian is not Cholesky-factorizable, damping starts at
-/// `INITIAL × max(1, ‖diag H‖∞)`, grows by `GROWTH` per failed factorization,
-/// and the solve aborts once it would exceed `MAX × max(1, ‖diag H‖∞)` (the
-/// Hessian is then numerically unsalvageable). All three scale with the
-/// Hessian's diagonal magnitude so the schedule is units-invariant.
-pub(crate) const LEVENBERG_INITIAL_DAMPING_REL: f64 = 1e-8;
-
-pub(crate) const LEVENBERG_DAMPING_GROWTH: f64 = 10.0;
-
-pub(crate) const LEVENBERG_MAX_DAMPING_REL: f64 = 1e8;
-
 /// Relative floor for the coupled-survival SCALE-COUPLED block trust-region
 /// metric (issue #1569). The free scale predictor `η_σ` enters the likelihood
 /// through the standardized index `u = inv_sigma·(h − η_t)` with
@@ -92,7 +80,7 @@ pub(crate) const BLOCKWISE_OUTER_MAX_ITER: usize = 60;
 pub(crate) const BLOCKWISE_OUTER_TOL: f64 = 1e-5;
 
 /// Near-stationary acceptance tolerance for a stalled line search in the reduced
-/// parametric-AFT direct MLE. When the damped-Newton ascent direction admits no
+/// parametric-AFT direct MLE. When the Newton ascent direction admits no
 /// Armijo-sufficient step — i.e. `ℓ` can no longer be increased to numerical
 /// precision — AND the half-Newton-decrement `½·gᵀH⁻¹g` is below this bound, the
 /// iterate IS the numerical MLE and is accepted rather than reported as a

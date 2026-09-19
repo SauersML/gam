@@ -641,8 +641,11 @@ pub(crate) fn certificate_curvature_verdict_resolution(
 ///
 /// `hessian` is the matrix the certificate judged and `invariance` the
 /// criterion's exact invariance at the same ρ. The block is taken by the owners
-/// the adjudication used, off the certificate's railed face. Every other verdict
-/// publishes nothing here.
+/// the adjudication used, off the certificate's railed face. A verdict withdrawn
+/// as `CriterionUnresolvable` (#3036) publishes the same `|λ_min|`: its claim
+/// predicts no decrease the criterion resolves at any step the adjudication may
+/// take, so the matrix is unconfirmed along `v` by that much. Every other
+/// verdict publishes nothing here.
 pub(crate) fn certificate_contradicted_curvature_error(
     certificate: Option<&crate::model_types::OuterCriterionCertificate>,
     hessian: Option<&Array2<f64>>,
@@ -650,12 +653,8 @@ pub(crate) fn certificate_contradicted_curvature_error(
 ) -> Option<f64> {
     use gam_linalg::faer_ndarray::FaerEigh;
 
-    let certificate = certificate.filter(|certificate| {
-        matches!(
-            certificate.curvature,
-            crate::rho_optimizer::CurvatureEvidence::CriterionContradicted
-        )
-    })?;
+    let certificate =
+        certificate.filter(|certificate| certificate.curvature.withdrawn_by_criterion())?;
     let hessian = hessian?;
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || hessian.iter().any(|value| !value.is_finite()) {
@@ -3704,12 +3703,8 @@ where
             let contradicted_curvature_error = if outer_result
                 .criterion_certificate
                 .as_ref()
-                .is_some_and(|certificate| {
-                    matches!(
-                        certificate.curvature,
-                        crate::rho_optimizer::CurvatureEvidence::CriterionContradicted
-                    )
-                }) {
+                .is_some_and(|certificate| certificate.curvature.withdrawn_by_criterion())
+            {
                 certificate_contradicted_curvature_error(
                     outer_result.criterion_certificate.as_ref(),
                     outer_result.final_hessian.as_ref(),

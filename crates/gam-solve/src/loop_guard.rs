@@ -221,6 +221,11 @@ impl IterationBound {
 /// reweight.rs schedule, now owned here.
 pub(crate) const MADSEN_INITIAL_REJECT_FACTOR: f64 = 2.0;
 
+/// Moré's (1978, §4; MINPACK `lmder`) lower safeguard on the interpolated
+/// step fraction after a rejection: one rejection shrinks the trust radius
+/// by at most ×10, so a single wild trial cannot over-damp the iteration.
+pub(crate) const MORE_REJECT_INTERPOLATION_FLOOR: f64 = 0.1;
+
 /// Geometric damping escalator for one reject chain
 /// (Madsen–Nielsen–Tingleff eq 3.16: the multiplier starts at 2 and
 /// doubles on every rejection, so successive bumps are ×2, ×4, ×8, …).
@@ -255,6 +260,67 @@ impl RejectEscalator {
         *damping *= self.factor;
         self.factor *= 2.0;
         self.rejects += 1;
+    }
+
+    /// Record a rejection whose trial objective was evaluated: the damping
+    /// jumps to the value the rejected trial itself indicates, never less
+    /// than the geometric schedule's bump (which advances as in
+    /// [`Self::escalate`], so the exhaustion guarantees are unchanged).
+    ///
+    /// Moré (1978, "The Levenberg–Marquardt algorithm: implementation and
+    /// theory", §4; MINPACK `lmder`) shrinks the trust region after a
+    /// rejected step by minimising the quadratic through `f(0)`, `f'(0)` and
+    /// the observed `f(1)` along the step:
+    ///
+    /// ```text
+    ///   φ(t) = f + t·g'δ + t²·(−ared − g'δ),   φ(1) = f − ared
+    ///   t*   = argmin φ = ½·g'δ / (g'δ + ared)
+    /// ```
+    ///
+    /// with `ared = f(β) − f(β+δ) ≤ 0` and `g'δ < 0`, so `t* ≤ ½`; Moré's
+    /// safeguard keeps `t* ≥ 1/10`. That fixes the new radius `t*·‖δ‖_D`.
+    /// In the damping parametrisation the step length along δ behaves as
+    /// `1/(σ + λ)` where `σ = δᵀHδ / δᵀD²δ` is the Rayleigh quotient of the
+    /// bare curvature in the damping metric, so the radius `t*·‖δ‖_D` is
+    /// reached at `λ' = (σ + λ)/t* − σ`. `σ + λ = δᵀ(H+λD²)δ / δᵀD²δ > 0`
+    /// for any solvable damped system, so `λ' > λ`.
+    ///
+    /// This is what lets an iteration whose undamped Newton step overshoots
+    /// by orders of magnitude (the rare-event binomial cold start, where the
+    /// damping must cross from `u` to `O(1)`) reach the right damping in one
+    /// or two trials instead of the ~log₂-many doublings of the geometric
+    /// schedule, each of which re-solves an unchanged step.
+    ///
+    /// Falls back to [`Self::escalate`] when the trial carries no usable
+    /// interpolation information (non-finite inputs, a non-descent step, or
+    /// a non-negative actual reduction — e.g. a rejection for non-finite
+    /// gradient arithmetic).
+    pub(crate) fn escalate_from_rejected_trial(
+        &mut self,
+        damping: &mut f64,
+        directional_derivative: f64,
+        actual_reduction: f64,
+        rayleigh_curvature: f64,
+    ) {
+        let lambda = *damping;
+        let shifted = rayleigh_curvature + lambda;
+        let informative = directional_derivative.is_finite()
+            && directional_derivative < 0.0
+            && actual_reduction.is_finite()
+            && actual_reduction < 0.0
+            && shifted.is_finite()
+            && shifted > 0.0;
+        self.escalate(damping);
+        if !informative {
+            return;
+        }
+        let t_star = (0.5 * directional_derivative
+            / (directional_derivative + actual_reduction))
+            .max(MORE_REJECT_INTERPOLATION_FLOOR);
+        let interpolated = shifted / t_star - rayleigh_curvature;
+        if interpolated.is_finite() && interpolated > *damping {
+            *damping = interpolated;
+        }
     }
 
     /// Restart the schedule — the problem changed under the chain (e.g. a
@@ -396,6 +462,62 @@ mod tests {
         assert_eq!(bound.used(), 1);
         assert_eq!(esc.rejects(), 3);
         assert!(!bound.count_exhausted());
+    }
+
+    /// A 1-D quadratic model `f(β) = ½σβ²` with gradient `σβ₀` has exact
+    /// damped steps `δ(λ) = −σβ₀/(σ+λ)` (D² = 1). When the observed trial
+    /// is a much stronger overshoot than the model predicts, the
+    /// interpolated damping must land where the step shrinks to Moré's
+    /// `t*` fraction — `(σ+λ)/t* − σ` — in one rejection, far beyond the
+    /// geometric bump, while the schedule still advances.
+    #[test]
+    fn rejected_trial_interpolation_jumps_to_mores_radius() {
+        let sigma = 1.0;
+        let mut esc = RejectEscalator::new();
+        let mut damping = MADSEN_DAMPING_FLOOR;
+        // g'δ = −1; observed f(1) − f(0) = +3 ⇒ ared = −3 ⇒ t* = ½·1/4 = 1/8.
+        esc.escalate_from_rejected_trial(&mut damping, -1.0, -3.0, sigma);
+        let expected = (sigma + MADSEN_DAMPING_FLOOR) / 0.125 - sigma;
+        assert!((damping - expected).abs() <= 1e-12 * expected);
+        assert_eq!(esc.rejects(), 1);
+        // The step length ratio δ(λ')/δ(λ) equals t*.
+        let ratio = (sigma + MADSEN_DAMPING_FLOOR) / (sigma + damping);
+        assert!((ratio - 0.125).abs() < 1e-12);
+    }
+
+    /// A catastrophic overshoot is bounded by Moré's ×10 radius safeguard.
+    #[test]
+    fn rejected_trial_interpolation_respects_mores_safeguard() {
+        let mut esc = RejectEscalator::new();
+        let mut damping = 1.0;
+        esc.escalate_from_rejected_trial(&mut damping, -1.0, -1.0e12, 2.0);
+        assert!((damping - ((2.0 + 1.0) / MORE_REJECT_INTERPOLATION_FLOOR - 2.0)).abs() < 1e-9);
+    }
+
+    /// Mild rejections never escalate slower than the geometric schedule,
+    /// and uninformative trials fall back to it exactly.
+    #[test]
+    fn rejected_trial_interpolation_never_undercuts_the_schedule() {
+        // Tiny curvature: interpolation suggests (σ+λ)/t*−σ ≈ 2λ + σ, but the
+        // schedule's ×2 bump must still be honoured (max of the two).
+        let mut esc = RejectEscalator::new();
+        let mut damping = 1.0;
+        esc.escalate_from_rejected_trial(&mut damping, -1.0, -1.0e-9, 0.0);
+        assert!(damping >= 2.0);
+        for (lin, ared, sigma) in [
+            (1.0, -1.0, 1.0),           // ascent direction
+            (-1.0, 0.5, 1.0),           // positive actual reduction
+            (-1.0, f64::INFINITY, 1.0), // non-finite trial
+            (-1.0, f64::NAN, 1.0),
+            (-1.0, -1.0, f64::NAN),
+            (-1.0, -1.0, -2.0), // σ + λ ≤ 0: no solvable damped model
+        ] {
+            let mut esc = RejectEscalator::new();
+            let mut damping = 1.0;
+            esc.escalate_from_rejected_trial(&mut damping, lin, ared, sigma);
+            assert_eq!(damping, MADSEN_INITIAL_REJECT_FACTOR);
+            assert_eq!(esc.rejects(), 1);
+        }
     }
 
     #[test]
