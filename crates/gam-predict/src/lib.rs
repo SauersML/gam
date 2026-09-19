@@ -4069,7 +4069,8 @@ mod tests {
     fn gaussian_location_scale_posterior_mean_sigma_integrates_log_sigma_posterior() {
         // Scale-block variance 0.4 on the single log-σ coefficient: the
         // posterior mean of σ = f + exp(η_s) is f + exp(m + v/2), strictly
-        // above the plug-in σ(m); without covariance it is the plug-in.
+        // above the plug-in σ(m). Without covariance the posterior moment
+        // does not exist, so it is refused, never degraded to the plug-in.
         let floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
         let mut predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
@@ -4094,15 +4095,12 @@ mod tests {
         let expected = 2.0 * floor + (0.3_f64 + 0.2).exp();
         assert!((integrated[0] / expected - 1.0).abs() < 1e-14);
         predictor.covariance = None;
-        let plugin = predictor
-            .predict_noise_scale(&input)
-            .expect("plug-in sigma")
-            .expect("gaussian location-scale reports sigma");
-        let degraded = predictor
-            .predict_posterior_mean_noise_scale(&input)
-            .expect("posterior-mean sigma")
-            .expect("gaussian location-scale reports sigma");
-        assert_eq!(plugin, degraded);
+        match predictor.predict_posterior_mean_noise_scale(&input) {
+            Err(EstimationError::InvalidInput(reason)) => {
+                assert!(reason.contains("no coefficient covariance"), "{reason}")
+            }
+            other => panic!("posterior-mean sigma without covariance must be refused: {other:?}"),
+        }
     }
 
     #[test]
