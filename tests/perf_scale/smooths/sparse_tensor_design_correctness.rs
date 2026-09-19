@@ -191,6 +191,7 @@ fn build_non_periodic_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     // Identifiability=None gates the new sparse path on.
                     identifiability: TensorBSplineIdentifiability::None,
                     penalty_decomposition: Default::default(),
+                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),
@@ -261,6 +262,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
         knotspec: BSplineKnotSpec::PeriodicUniform {
             data_range: (0.0, TAU),
             num_basis: 9,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -297,6 +299,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     // dense.
                     identifiability: TensorBSplineIdentifiability::SumToZero,
                     penalty_decomposition: Default::default(),
+                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),

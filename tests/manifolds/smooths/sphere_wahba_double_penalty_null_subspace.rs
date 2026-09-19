@@ -49,6 +49,7 @@ fn wahba_sphere_double_penalty_ridge_shrinks_primary_null_space() {
         max_degree: None,
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
+        adaptive_degree: false,
     };
 
     let built = build_spherical_spline_basis(data.view(), &spec).expect("Wahba sphere basis");
