@@ -19,25 +19,9 @@ use crate::latent_anchor::{
     AnchorGridOwned, AnchorTaylor, anchor_derivatives_in_slot, anchor_taylor_in_slot, solve_anchor,
 };
 use gam_math::jet_scalar::{
-    DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeedBatch,
-    FixedRuntimeJet, OneSeed, TwoSeed,
+    DynamicOneSeedBatch, DynamicTwoSeedBatch, FixedRuntimeJet, OneSeed, TwoSeed,
 };
-use gam_math::jet_trace::{DynamicTraceJet, TraceJetWorkspace};
-
-thread_local! {
-    /// Per-worker empirical FLEX third-order workspace. The largest batch is
-    /// retained across rows, so a warmed worker does not revisit the global
-    /// allocator for the runtime-sized jet tape.
-    static EMPIRICAL_BMS_THIRD_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
-        std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
-    /// Per-worker empirical FLEX fourth-order pair workspace. A caller may
-    /// evaluate several `(u,v)` contractions in one row-plan traversal.
-    static EMPIRICAL_BMS_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
-        std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
-    /// Per-worker empirical FLEX third-trace workspace (gam#2998).
-    static EMPIRICAL_BMS_TRACE_WORKSPACE: std::cell::RefCell<TraceJetWorkspace> =
-        std::cell::RefCell::new(TraceJetWorkspace::new(1));
-}
+use gam_math::jet_trace::DynamicTraceJet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EmpiricalBmsThirdJetSchedule {
@@ -1303,9 +1287,10 @@ impl BernoulliMarginalSlopeFamily {
             EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
             }
-            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => EMPIRICAL_BMS_THIRD_WORKSPACE
+            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => self
+                .jet_scratch
+                .batch
                 .with(|workspace| {
-                    let mut workspace = workspace.borrow_mut();
                     let mut contracted = Vec::with_capacity(row_dirs.len());
                     for directions in row_dirs.chunks(lanes) {
                         workspace.reset(directions.len());
@@ -1389,8 +1374,7 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        EMPIRICAL_BMS_TRACE_WORKSPACE.with(|workspace| {
-            let mut workspace = workspace.borrow_mut();
+        self.jet_scratch.trace.with(|workspace| {
             workspace.reset(lanes.len());
             let vars = workspace.alloc_slice_fill_with(r, |axis| {
                 DynamicTraceJet::seed_directions(point[axis], axis, r, &workspace, |lane| {
@@ -1569,6 +1553,7 @@ impl BernoulliMarginalSlopeFamily {
                     direction_pairs,
                     primary,
                     lanes,
+                    &self.jet_scratch.batch,
                 )
             }
         }
@@ -1582,11 +1567,11 @@ impl BernoulliMarginalSlopeFamily {
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
         primary: &PrimarySlices,
         lanes: usize,
+        scratch: &super::hessian_paths::JetScratchPool,
     ) -> Result<Vec<Array2<f64>>, String> {
         let r = primary.total;
         let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
-        EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
-            let mut workspace = workspace.borrow_mut();
+        scratch.with(|workspace| {
             let mut contracted = Vec::with_capacity(direction_pairs.len());
             for pairs in direction_pairs.chunks(lanes) {
                 workspace.reset(pairs.len());
@@ -3719,6 +3704,7 @@ mod empirical_rigid_jet_oracle_tests {
             policy: policy.clone(),
             cell_moment_lru: new_cell_moment_lru_cache(&policy),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
+            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -4547,6 +4533,7 @@ mod empirical_flex_jet_oracle_tests {
             policy: policy.clone(),
             cell_moment_lru: new_cell_moment_lru_cache(&policy),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
+            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
