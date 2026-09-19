@@ -4803,19 +4803,16 @@ fn two_factor_dataset() -> Dataset {
     }
 }
 
-/// For a built no-intercept model, the distance of the constant function from
-/// the unpenalized part of the design: the span of `X N`, with `N` the joint
-/// null space of every penalty. A zero distance means the fit is translation
-/// invariant: shifting `y` by `c` is absorbed exactly by coefficients that
-/// reproduce `c` at no penalty, so no penalty can pull the level toward zero.
-fn unpenalized_constant_residual(ds: &Dataset, spec: &TermCollectionSpec) -> f64 {
+/// The unpenalized part of a built design: the span of `X N`, with `N` the
+/// joint null space of every penalty. Returns its rank and the distance of the
+/// constant function from it. Rank one at zero distance is the default the
+/// intercept rule promises: the constant is the one direction no penalty
+/// shrinks, so a shift of `y` is absorbed at no cost while every other effect
+/// can still be shrunk to zero.
+fn unpenalized_span(ds: &Dataset, spec: &TermCollectionSpec) -> (usize, f64) {
     use gam_linalg::faer_ndarray::FaerEigh;
     let design = crate::smooth::build_term_collection_design(ds.values.view(), spec)
         .expect("design builds");
-    assert!(
-        design.intercept_range.is_empty(),
-        "a no-intercept model must not carry the all-ones column"
-    );
     let x = design.design.to_dense();
     let p = x.ncols();
     let mut penalty_sum = Array2::<f64>::zeros((p, p));
@@ -4838,6 +4835,7 @@ fn unpenalized_constant_residual(ds: &Dataset, spec: &TermCollectionSpec) -> f64
     let normal = unpenalized.t().dot(&unpenalized);
     let (evals, evecs) = FaerEigh::eigh(&normal, faer::Side::Lower).expect("normal eigh");
     let cutoff = evals.iter().fold(0.0_f64, |m, v| m.max(v.abs())) * 1e-10;
+    let rank = evals.iter().filter(|e| **e > cutoff).count();
     let projected = evecs.t().dot(&unpenalized.t().dot(&ones));
     let scaled = Array1::from_iter(
         projected
@@ -4846,151 +4844,108 @@ fn unpenalized_constant_residual(ds: &Dataset, spec: &TermCollectionSpec) -> f64
             .map(|(p, e)| if *e > cutoff { p / e } else { 0.0 }),
     );
     let fitted = unpenalized.dot(&evecs.dot(&scaled));
-    (&fitted - &ones).iter().map(|v| v * v).sum::<f64>().sqrt()
+    let residual = (&fitted - &ones).iter().map(|v| v * v).sum::<f64>().sqrt();
+    (rank, residual)
 }
 
-/// `0 + g` (and `- 1`, and every spelling of the fixed factor) is the
-/// cell-means model: every level keeps its column, the block is unpenalized,
-/// and the constant is spanned at no penalty. With an intercept the same
-/// factor stays the penalized full-level block it has always been.
+/// Removing the intercept from a formula in which `spanning` spans the
+/// constant keeps it: the spec is exactly the intercept formula's, and the
+/// constant is the design's only unpenalized direction.
+fn assert_keeps_only_the_constant_free(ds: &Dataset, formula: &str, with_intercept: &str) {
+    let spec = build_formula(formula, ds);
+    assert_eq!(spec.level, ModelLevel::Intercept, "`{formula}` keeps the intercept");
+    assert_eq!(
+        format!("{spec:?}"),
+        format!("{:?}", build_formula(with_intercept, ds)),
+        "`{formula}` builds exactly `{with_intercept}`"
+    );
+    let (rank, residual) = unpenalized_span(ds, &spec);
+    assert_eq!(rank, 1, "`{formula}`: only the constant is unpenalized");
+    assert!(residual < 1e-8, "`{formula}`: the constant is unpenalized ({residual})");
+}
+
+/// `0 + g` (and `- 1`, and every spelling of the fixed factor) spans the
+/// constant, so it keeps the intercept and is `g`: the full-level block keeps
+/// its ridge, which beside the free intercept shrinks only the level
+/// contrasts.
 #[test]
-fn no_intercept_factor_is_the_unpenalized_cell_means_model() {
+fn no_intercept_factor_keeps_its_ridge_and_frees_only_the_constant() {
     let ds = two_factor_dataset();
     for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)", "y ~ 0 + C(f)"] {
         let spec = build_formula(formula, &ds);
-        assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
         let re = &spec.random_effect_terms[0];
         assert!(!re.drop_first_level, "`{formula}` keeps every level");
-        assert!(!re.penalized, "`{formula}`: the level carrier is unpenalized");
-        let residual = unpenalized_constant_residual(&ds, &spec);
-        assert!(residual < 1e-8, "`{formula}`: {residual}");
+        assert!(re.penalized, "`{formula}`: the level contrasts keep their ridge");
+        assert_keeps_only_the_constant_free(&ds, formula, "y ~ f");
     }
-
-    let with_intercept = build_formula("y ~ f", &ds);
-    assert_eq!(with_intercept.level, ModelLevel::Intercept);
-    assert!(with_intercept.random_effect_terms[0].penalized);
-
-    // Only the FIRST fixed factor carries the level; a second one stays the
-    // penalized block whose offsets shrink toward zero.
-    let two = build_formula("y ~ 0 + f + g", &ds);
-    assert!(!two.random_effect_terms[0].penalized);
-    assert!(two.random_effect_terms[1].penalized);
-    let residual = unpenalized_constant_residual(&ds, &two);
-    assert!(residual < 1e-8, "`0 + f + g`: {residual}");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f + g", "y ~ f + g");
 }
 
-/// A genuine random effect never carries the level: its levels are mean-zero
-/// deviations, so `0 + group(g) + s(x)` hands the constant to the smooth and
-/// keeps the random effect penalized.
+/// A genuine random effect never spans the constant: its levels are mean-zero
+/// deviations. `0 + group(f) + s(x)` keeps the intercept through the smooth,
+/// and with nothing else spanning it the model has no constant at all.
 #[test]
-fn no_intercept_genuine_random_effect_does_not_carry_the_level() {
+fn no_intercept_genuine_random_effect_does_not_span_the_constant() {
     let ds = two_factor_dataset();
-    let spec = build_formula("y ~ 0 + group(f) + s(x)", &ds);
-    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
-    assert!(spec.random_effect_terms[0].penalized);
-    let residual = unpenalized_constant_residual(&ds, &spec);
-    assert!(residual < 1e-8, "{residual}");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + group(f) + s(x)", "y ~ group(f) + s(x)");
 
-    // With nothing else able to carry it, the model has no level at all.
     let spec = build_formula("y ~ 0 + x + group(f)", &ds);
-    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
+    assert_eq!(spec.level, ModelLevel::NoIntercept);
     assert!(spec.random_effect_terms[0].penalized);
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+        .expect("design builds");
+    assert!(design.intercept_range.is_empty(), "no all-ones column without a spanning term");
 }
 
-/// Without a factor block, a pure-indicator interaction keeps every cell (its
-/// reference cell included): the saturated cell-means model.
+/// A pure-indicator interaction over the full level cross spans the constant:
+/// `0 + f:g` is `f:g`, one reference cell absorbed by the intercept and every
+/// other cell keeping its ridge.
 #[test]
-fn no_intercept_indicator_interaction_keeps_every_cell() {
+fn no_intercept_indicator_interaction_keeps_the_cell_ridge() {
     let ds = two_factor_dataset();
-    let cells = |formula: &str| {
-        build_formula(formula, &ds)
-            .linear_terms
-            .iter()
-            .filter(|t| !t.categorical_levels.is_empty())
-            .count()
-    };
-    assert_eq!(cells("y ~ f:g"), 5, "with an intercept one reference cell drops");
-    assert_eq!(cells("y ~ 0 + f:g"), 6, "without one every cell stays");
     let spec = build_formula("y ~ 0 + f:g", &ds);
-    let residual = unpenalized_constant_residual(&ds, &spec);
-    assert!(residual < 1e-8, "the saturated cells span the constant: {residual}");
-    // A factor block present elsewhere already carries the level, so the
-    // interaction keeps exactly the coding it has beside an intercept.
-    assert_eq!(cells("y ~ 0 + f + f:g"), cells("y ~ f + f:g"));
+    let cells = spec
+        .linear_terms
+        .iter()
+        .filter(|t| !t.categorical_levels.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(cells.len(), 5, "one reference cell drops against the intercept");
+    assert!(cells.iter().all(|cell| cell.double_penalty), "every cell keeps its ridge");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f:g", "y ~ f:g");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f + f:g", "y ~ f + f:g");
 }
 
-/// With no factor, the first plain B-spline / tensor smooth carries the level:
-/// its sum-to-zero centring is released and its null-space ridge dropped, so
-/// the constant is free. An explicit `double_penalty=true` keeps the ridge (the
-/// user asked for the whole null space to be shrunk), and a smooth whose
-/// explicit `identifiability=` keeps the constant already carries it.
+/// A B-spline / tensor smooth spans the constant before its centring removes
+/// it, so `0 + s(x)` is `s(x)`: the centred smooth keeps its null-space ridge
+/// on the linear slope, and the constant is the intercept's alone.
 #[test]
-fn no_intercept_releases_the_first_default_smooth_to_carry_the_level() {
+fn no_intercept_smooth_keeps_its_null_space_ridge() {
     let ds = smooth_option_dataset();
-
-    let centred = build_formula("y ~ s(x)", &ds);
-    assert_eq!(centred.level, ModelLevel::Intercept);
-    assert!(matches!(
-        bspline_spec(&centred, 0).identifiability,
-        BSplineIdentifiability::WeightedSumToZero { .. }
-    ));
-    assert!(bspline_spec(&centred, 0).double_penalty);
-
-    for formula in ["y ~ 0 + s(x)", "y ~ s(x) - 1", "y ~ 0 + s(x) + s(z)"] {
+    for formula in ["y ~ 0 + s(x)", "y ~ s(x) - 1"] {
         let spec = build_formula(formula, &ds);
-        assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
-        let carrier = bspline_spec(&spec, 0);
-        assert!(matches!(carrier.identifiability, BSplineIdentifiability::None));
-        assert!(!carrier.double_penalty, "`{formula}`: the carrier's constant is unpenalized");
-        let residual = unpenalized_constant_residual(&ds, &spec);
-        assert!(residual < 1e-8, "`{formula}`: {residual}");
+        let smooth = bspline_spec(&spec, 0);
+        assert!(matches!(
+            smooth.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
+        ));
+        assert!(smooth.double_penalty, "`{formula}`: the slope keeps its null-space ridge");
+        assert_keeps_only_the_constant_free(&ds, formula, "y ~ s(x)");
     }
-    // Only the first smooth is released.
-    let two = build_formula("y ~ 0 + s(x) + s(z)", &ds);
-    assert!(matches!(
-        bspline_spec(&two, 1).identifiability,
-        BSplineIdentifiability::WeightedSumToZero { .. }
-    ));
-    assert!(bspline_spec(&two, 1).double_penalty);
-
-    let ridged = build_formula("y ~ 0 + s(x, double_penalty=true)", &ds);
-    assert_eq!(ridged.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
-    assert!(bspline_spec(&ridged, 0).double_penalty);
-
-    // An explicit gauge that keeps the constant is preferred over the default
-    // one, wherever it sits in the formula.
-    let explicit = build_formula("y ~ 0 + s(z) + s(x, identifiability=none)", &ds);
-    assert_eq!(explicit.level, ModelLevel::NoIntercept { level_smooth: Some(1) });
-    assert!(matches!(
-        bspline_spec(&explicit, 0).identifiability,
-        BSplineIdentifiability::WeightedSumToZero { .. }
-    ));
-    assert!(!bspline_spec(&explicit, 1).double_penalty);
-    let residual = unpenalized_constant_residual(&ds, &explicit);
-    assert!(residual < 1e-8, "explicit gauge: {residual}");
-
-    let tensor = build_formula("y ~ 0 + te(x, z)", &ds);
-    assert_eq!(tensor.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
-    let SmoothBasisSpec::TensorBSpline { spec, .. } = &tensor.smooth_terms[0].basis else {
-        panic!("te(x, z) lowers to a tensor B-spline");
-    };
-    assert!(matches!(spec.identifiability, TensorBSplineIdentifiability::None));
-    assert!(!spec.double_penalty);
-    let residual = unpenalized_constant_residual(&ds, &tensor);
-    assert!(residual < 1e-8, "te: {residual}");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + s(x) + s(z)", "y ~ s(x) + s(z)");
+    assert_keeps_only_the_constant_free(
+        &ds,
+        "y ~ 0 + s(z) + s(x, identifiability=none)",
+        "y ~ s(z) + s(x, identifiability=none)",
+    );
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + te(x, z)", "y ~ te(x, z)");
 }
 
-/// A factor `by=` smooth's main effect is a fixed factor block, so without an
-/// intercept it is the unpenalized level carrier.
+/// A factor `by=` smooth's main effect is a fixed factor block, so it spans
+/// the constant and keeps the intercept.
 #[test]
-fn no_intercept_factor_by_main_effect_carries_the_level() {
+fn no_intercept_factor_by_main_effect_spans_the_constant() {
     let ds = factor_dataset();
-    let spec = build_formula("y ~ 0 + s(x, by=g)", &ds);
-    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
-    assert_eq!(spec.random_effect_terms.len(), 1);
-    assert!(!spec.random_effect_terms[0].penalized);
-    let residual = unpenalized_constant_residual(&ds, &spec);
-    assert!(residual < 1e-8, "{residual}");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + s(x, by=g)", "y ~ s(x, by=g)");
 }
 
 /// A parametric no-intercept model has no constant anywhere: `0 + x` is the
@@ -4999,7 +4954,7 @@ fn no_intercept_factor_by_main_effect_carries_the_level() {
 fn no_intercept_parametric_model_passes_through_the_origin() {
     let ds = smooth_option_dataset();
     let spec = build_formula("y ~ 0 + x", &ds);
-    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
+    assert_eq!(spec.level, ModelLevel::NoIntercept);
     let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
         .expect("design builds");
     let dense = design.design.to_dense();
@@ -5154,5 +5109,51 @@ fn domain_is_validated_against_the_data_and_its_own_shape() {
         assert!(err.contains("in term"), "`{term}`: {err}");
         assert!(err.contains("domain"), "`{term}`: {err}");
         assert!(err.contains(needle), "`{term}`: expected {needle:?} in {err}");
+    }
+}
+
+/// pyGAM audit F2: a categorical column in a term that reads its inputs as
+/// numeric axes must be a typed error pointing at `factor()`/`group()`,
+/// instead of fitting the level codes as positions on a line.
+#[test]
+fn categorical_column_in_a_numeric_axis_term_is_rejected() {
+    let ds = factor_dataset_l3();
+    let col_map = ds.column_map();
+    for formula in [
+        "y ~ s(g)",
+        "y ~ linear(g)",
+        "y ~ te(x, g)",
+        "y ~ s(g, bs=\"cc\")",
+        "y ~ thinplate(x, g)",
+        "y ~ matern(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse numeric-axis formula");
+        let mut notes = Vec::new();
+        let err = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .expect_err(&format!("`{formula}` must reject the categorical column"));
+        assert!(
+            matches!(err, TermBuilderError::IncompatibleConfig { .. }),
+            "`{formula}` must raise a typed IncompatibleConfig, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'g' is categorical") && msg.contains("factor(g)") && msg.contains("group(g)"),
+            "`{formula}` must name the column and point at factor()/group(): {msg}"
+        );
+    }
+    // The factor-smooth family consumes the categorical as its grouping
+    // factor, and the categorical wrappers are its level effects, so none of
+    // these is a numeric axis.
+    for formula in [
+        "y ~ s(x, g, bs=\"fs\", k=5)",
+        "y ~ s(x, by=g, k=5)",
+        "y ~ x + g",
+        "y ~ x + factor(g)",
+        "y ~ x + group(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse categorical formula");
+        let mut notes = Vec::new();
+        build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .unwrap_or_else(|err| panic!("`{formula}` must still build, got: {err:?}"));
     }
 }

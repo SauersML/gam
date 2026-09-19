@@ -313,6 +313,24 @@ impl<'a> RemlState<'a> {
             );
             return Ok(zero());
         }
+        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
+        // remainder of the PLAIN penalized likelihood about its mode, but under
+        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
+        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
+        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
+        // scaled by `h_total`, which carries −H_Φ. On separated data that
+        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
+        // criterion off the certified Laplace surface, so the outer search it
+        // is spliced into cannot certify. Decline — value and gradient
+        // together — until the Jeffreys term is integrated.
+        if reml_robust_jeffreys_link(&self.config).is_some() {
+            log::debug!(
+                "[#784] block-local fallback declined before the skewness diagnostic: \
+                 Firth/Jeffreys bias reduction is active and the block target \
+                 integrates the plain penalized likelihood, not the Jeffreys-penalized one"
+            );
+            return Ok(zero());
+        }
 
         // Resolve the injected gam-inference corrector. When the inference tier
         // is not linked / registered, decline the correction (zero contribution) —
@@ -322,9 +340,85 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         };
 
-        // Step 1: per-direction skewness diagnostic γ_r.
+        // The eigensystem every step below reads: the block's directions `v_r`,
+        // their curvatures `λ_r`, and the resolvent the mode and gap terms are
+        // built from. It is the criterion's own spectral operator for this ρ
+        // whenever the criterion priced one on the full frame. An `eigh` of the
+        // assembled `H` resolves each eigenvalue only to `O(ε·‖H‖)`; with one λ
+        // railed, `‖H‖` is many orders above the soft modes this block lives
+        // on, so that error is a visible fraction of `λ_r` and of `v_r`, and it
+        // changes with the last bits of `H` from one inner solve to the next.
+        // `Δ_b` then differs between two evaluations at the same ρ by far more
+        // than the outer line search can resolve, and the BFGS continuation
+        // stalls on noise. The criterion's operator is priced from the root
+        // `B` with `H = BᵀB` when the assembled spectrum cannot resolve
+        // `log|H|` (#2644), which prices each soft mode to its own scale — the
+        // same eigenpairs the Laplace term was priced on.
+        //
+        // The decision is published by the spectral assembly. A value-only
+        // probe on the transformed route prices a Cholesky factor and publishes
+        // none, so the assembly is run once at a derivative order to obtain it,
+        // exactly as `criterion_rank_decision_at` does: `Δ_b` must be one
+        // function of ρ whether the evaluation carries a gradient or not.
+        // Only a sparse-exact backend, or a spectral operator priced on an
+        // active-constraint face's free basis, leaves no full-frame decision;
+        // the criterion priced no spectrum of this frame's `H` there, so the
+        // assembled matrix's own is the only one.
+        if bundle.criterion_rank_decision().is_none()
+            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
+        {
+            self.build_auto_assembly(
+                rho,
+                bundle,
+                super::reml_outer_engine::EvalMode::ValueAndGradient,
+                false,
+                false,
+            )?;
+        }
+        let sym_h = (h_total + &h_total.t()) * 0.5;
+        let (evals, evecs) = match bundle.criterion_rank_decision() {
+            Some(decision) => {
+                let evals = Array1::from(decision.operator.raw_eigenvalues.clone());
+                let evecs = match decision.frame {
+                    CriterionFrame::Transformed => decision.operator.eigenvectors.clone(),
+                    // `H_orig = Qs·H·Qsᵀ` with `Qs` orthogonal, so the transformed
+                    // frame's eigenvectors are `Qsᵀ·V_orig` with the same eigenvalues.
+                    CriterionFrame::Original => match pirls_result.coordinate_frame {
+                        pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
+                            .reparam_result
+                            .qs
+                            .t()
+                            .dot(&decision.operator.eigenvectors),
+                        pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                            decision.operator.eigenvectors.clone()
+                        }
+                    },
+                };
+                log::trace!(
+                    "[#784] block eigensystem from the criterion's {:?} operator ({:?} frame)",
+                    decision.predicate,
+                    decision.frame,
+                );
+                (evals, evecs)
+            }
+            None => sym_h.eigh(Side::Lower).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "#784 block-local fallback eigendecomposition failed: {e}"
+                ))
+            })?,
+        };
+        if evals.len() != p || evecs.dim() != (p, p) {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 block eigensystem has {} eigenvalues and {}x{} eigenvectors for p={p}",
+                evals.len(),
+                evecs.nrows(),
+                evecs.ncols()
+            )));
+        }
+
+        // Step 1: per-direction skewness diagnostic γ_r, aligned to those pairs.
         let (max_abs, directional) = corrector
-            .directional_cubic_diagnostic(h_total, x_design, c_weights, false)
+            .directional_cubic_diagnostic(&evals, &evecs, x_design, c_weights, false)
             .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
             return Ok(zero());
@@ -366,12 +460,6 @@ impl<'a> RemlState<'a> {
         // extension of the same rule — it agrees with it exactly wherever the
         // flagged set has the latched size, which is every ρ the pre-#2748 fit
         // was already stable on.
-        let sym_h = (h_total + &h_total.t()) * 0.5;
-        let (evals, evecs) = sym_h.eigh(Side::Lower).map_err(|e| {
-            EstimationError::InvalidInput(format!(
-                "#784 block-local fallback eigendecomposition failed: {e}"
-            ))
-        })?;
         let mut admissible: Vec<usize> = (0..evals.len().min(directional.len()))
             .filter(|&r| evals[r] > 0.0 && directional[r].is_finite())
             .collect();

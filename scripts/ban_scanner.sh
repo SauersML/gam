@@ -17,8 +17,14 @@
 # re-implementation of its rules — compiled from the tree under test, which is
 # what makes "scanner verified" mean anything.
 #
+# It then runs scripts/spec_ban_ratchet.py, which checks the SPEC bans that live
+# in the shape of code (grid search, hand boxes, jitter, unconverged successes,
+# magic thresholds, finite differences, GCV, Python-side math) against the
+# shrink-only ledger scripts/spec_ban_ledger.tsv.
+#
 # Usage:  scripts/ban_scanner.sh [repo-root]
-# Exit:   0 clean, 1 violations (each printed as `error: <file>:<line>: <src>`).
+# Exit:   0 clean, 1 violations (each printed as `error: <file>:<line>: <src>`),
+#         2 either scanner could not run.
 
 set -uo pipefail
 
@@ -46,4 +52,16 @@ OUT_DIR="${work}/out" CARGO_MANIFEST_DIR="${root}" \
 status=$?
 
 cat "${work}/report" >&2
-exit "${status}"
+
+python3 "${root}/scripts/spec_ban_ratchet.py" --root "${root}"
+ratchet_status=$?
+
+# 2 (could not measure) outranks 1 (violations): a scanner that did not run
+# has certified nothing, whatever the other one found.
+if [ "${status}" -eq 2 ] || [ "${ratchet_status}" -eq 2 ]; then
+  exit 2
+fi
+if [ "${status}" -ne 0 ] || [ "${ratchet_status}" -ne 0 ]; then
+  exit 1
+fi
+exit 0

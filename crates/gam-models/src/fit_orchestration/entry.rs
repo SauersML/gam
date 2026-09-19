@@ -205,77 +205,16 @@ pub(crate) fn resolved_resource_policy(
 /// Parse, materialize, and fit a model in one call.
 /// Resolve the expectile levels requested by `config`, if any.
 ///
-/// Returns `Ok(Some(levels))` when `config.family` is `"expectile"` (optionally
-/// with inline levels, `"expectile(0.9)"` or `"expectile(0.1, 0.9)"`),
-/// `Ok(None)` for every other family, and `Err` when an expectile request is
-/// malformed: a level outside `(0, 1)`, levels that are not strictly
-/// increasing, or inline levels that contradict [`FitConfig::expectile_tau`].
-/// When neither spelling pins the levels, the single median level `[0.5]` (the
-/// ordinary mean fit) is the default.
+/// Thin typed-error wrapper over [`FitConfig::resolved_expectile_levels`],
+/// the one rule [`FitConfig::resolve`] also enforces: `Some(levels)` for the
+/// expectile family, `None` for every other family, and `Err` for a malformed
+/// expectile request or an `expectile_tau` given with a non-expectile family.
 pub fn expectile_levels_for_config(
     config: &FitConfig,
 ) -> Result<Option<Vec<f64>>, WorkflowError> {
-    let Some(raw) = config.family.as_deref() else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower == "expectile" || lower.starts_with("expectile(")) {
-        return Ok(None);
-    }
-    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    // Optional inline levels: `expectile(0.9)` or `expectile(0.1, 0.5, 0.9)`.
-    let inline_levels = if let Some(rest) = lower.strip_prefix("expectile(") {
-        let inner = rest.strip_suffix(')').ok_or_else(|| {
-            invalid(format!(
-                "expectile family levels must be written as `expectile(τ)` or \
-                 `expectile(τ₁, τ₂, …)`; got `{trimmed}`"
-            ))
-        })?;
-        let levels = inner
-            .split(',')
-            .map(|item| {
-                item.trim().parse::<f64>().map_err(|_| {
-                    invalid(format!(
-                        "expectile level `{}` is not a finite number",
-                        item.trim()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<f64>, _>>()?;
-        Some(levels)
-    } else {
-        None
-    };
-    let levels = match (inline_levels, config.expectile_tau.clone()) {
-        (Some(a), Some(b)) if a != b => {
-            return Err(invalid(format!(
-                "expectile levels given both inline (`{trimmed}`) and via expectile_tau \
-                 ({b:?}); supply exactly one"
-            )));
-        }
-        (Some(a), _) => a,
-        (None, Some(b)) => b,
-        (None, None) => vec![0.5],
-    };
-    if levels.is_empty() {
-        return Err(invalid(
-            "expectile_tau must name at least one expectile level".to_string(),
-        ));
-    }
-    for &tau in &levels {
-        if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
-            return Err(invalid(format!(
-                "expectile level τ must be finite and strictly in (0, 1); got {tau}"
-            )));
-        }
-    }
-    if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(invalid(format!(
-            "expectile levels must be strictly increasing with no duplicates; got {levels:?}"
-        )));
-    }
-    Ok(Some(levels))
+    config
+        .resolved_expectile_levels()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })
 }
 
 /// Prior-weighted empirical `τ`-expectile of `z` in closed form.
@@ -1698,6 +1637,44 @@ fn try_deterministic_gaussian_standard_fit(
     deterministic_gaussian_standard_fit(request, Some(boundary))
 }
 
+/// The training table with every zero-weight row removed.
+///
+/// A prior weight of zero removes the row from the likelihood, and it must
+/// remove it from everything else the fit derives from the rows as well —
+/// knots, covariate ranges, identifiability constraints, standardization,
+/// factor levels, column kinds — so that weight zero is exactly row deletion.
+/// Every fitting entry point runs its data through this one seam. The table
+/// is borrowed unchanged when no weight column is configured or no weight is
+/// exactly zero; rows with a missing or negative weight are kept so the weight
+/// validator still reports them.
+pub fn drop_zero_weight_rows<'a>(
+    data: &'a Dataset,
+    config: &FitConfig,
+) -> Result<std::borrow::Cow<'a, Dataset>, WorkflowError> {
+    use std::borrow::Cow;
+    let Some(name) = config.weight_column.as_deref().map(str::trim) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let Some(column) = data.headers.iter().position(|header| header == name) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let weights = data.values.column(column);
+    let keep: Vec<usize> = (0..weights.len()).filter(|&row| weights[row] != 0.0).collect();
+    if keep.len() == weights.len() {
+        return Ok(Cow::Borrowed(data));
+    }
+    if keep.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
+        });
+    }
+    data.select_rows(&keep)
+        .map(Cow::Owned)
+        .map_err(|error| WorkflowError::InvalidConfig {
+            reason: error.to_string(),
+        })
+}
+
 pub fn fit_from_formula(
     formula: &str,
     data: &Dataset,
@@ -1726,6 +1703,7 @@ pub fn fit_from_formula_with_notes(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    let data = &*drop_zero_weight_rows(data, config)?;
     let automatic = expand_automatic_fit_formula(formula, data, config)?;
     if automatic.notes.is_empty() {
         return fit_expanded_formula_with_notes(formula, data, config);
@@ -2361,6 +2339,14 @@ fn attach_basis_adequacy(
             unidentified_scalar_terms,
         };
     };
+    // The random-effect test needs only the design and the converged fit, so
+    // it runs whether or not the covariate frame is available.
+    standard.fit.artifacts.random_effect_tests =
+        crate::fit_orchestration::drivers::random_effect_test_records(
+            &standard.design,
+            &standard.resolvedspec,
+            &standard.fit,
+        );
     if let Some(inputs) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
             inputs.frame.view(),
@@ -2488,9 +2474,6 @@ fn fit_expectile_location_scale(
     config: &FitConfig,
     levels: Vec<f64>,
 ) -> Result<ExpectileLocationScaleFitResult, WorkflowError> {
-    use gam_linalg::matrix::DenseDesignOperator;
-    use gam_problem::BlockRole;
-
     if config.frailty.is_active() {
         return Err(WorkflowError::InvalidConfig {
             reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"
@@ -2533,8 +2516,46 @@ fn fit_expectile_location_scale(
         ));
     };
 
+    let standardized_expectiles = joint_expectile_standardized_expectiles(
+        &location_scale,
+        y.view(),
+        prior_weights.view(),
+        mean_offset.view(),
+        log_sigma_offset.view(),
+        &levels,
+    )?;
+    Ok(ExpectileLocationScaleFitResult {
+        location_scale,
+        levels,
+        standardized_expectiles,
+    })
+}
+
+/// The level constants `c_τ` of a joint expectile fit: the prior-weighted
+/// empirical `τ`-expectiles of the standardized residuals `(yᵢ − μᵢ)/E[σᵢ]`,
+/// with `E[σᵢ] = f + exp(mᵢ + vᵢ/2)` under the log-σ block's conditional
+/// Gaussian posterior `N(mᵢ, vᵢ)`.
+///
+/// `vᵢ` comes from the Scale block of the fit's joint conditional covariance
+/// (coefficient layout `[mean | scale]`). That covariance is part of the
+/// estimand, so a fit without it is refused with a typed error instead of
+/// being standardized by the plug-in σ.
+fn joint_expectile_standardized_expectiles(
+    location_scale: &GaussianLocationScaleFitResult,
+    y: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    mean_offset: ArrayView1<'_, f64>,
+    log_sigma_offset: ArrayView1<'_, f64>,
+    levels: &[f64],
+) -> Result<Vec<f64>, WorkflowError> {
+    use gam_linalg::matrix::DenseDesignOperator;
+    use gam_problem::BlockRole;
+
     let invariant = |reason: String| {
-        raised_fit_failure(FailureCategory::Invariant, format!("joint expectile: {reason}"))
+        raised_fit_failure(
+            FailureCategory::Invariant,
+            format!("joint expectile: {reason}"),
+        )
     };
     let fit = &location_scale.fit;
     let beta_mu = crate::inference::model::gaussian_location_scale_mean_beta(&fit.fit)
@@ -2564,29 +2585,41 @@ fn fit_expectile_location_scale(
         )));
     }
     // Posterior variance of η_σ per row from the Scale block of the joint
-    // conditional covariance (coefficient layout `[mean | scale]`).
+    // conditional covariance (coefficient layout `[mean | scale]`). `c_τ`
+    // integrates σ over this posterior, so a fit without it has no `c_τ`:
+    // a typed constrained-posterior decline is refused with its reason, and a
+    // missing covariance with no decline breaks the location-scale fit contract.
+    // Neither is ever read as zero posterior variance (the plug-in σ).
     let p_mu = beta_mu.len();
     let p_sigma = beta_sigma.len();
-    let log_sigma_variance = match fit.fit.beta_covariance() {
-        Some(covariance) => {
-            if covariance.nrows() < p_mu + p_sigma || covariance.ncols() < p_mu + p_sigma {
-                return Err(invariant(format!(
-                    "covariance is {}x{}, smaller than the {} location-scale coefficients",
-                    covariance.nrows(),
-                    covariance.ncols(),
-                    p_mu + p_sigma
-                )));
-            }
-            let scale_block = covariance
-                .slice(ndarray::s![p_mu..p_mu + p_sigma, p_mu..p_mu + p_sigma])
-                .to_owned();
-            fit.noise_design
-                .design
-                .quadratic_form_diag(&scale_block)
-                .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?
-        }
-        None => Array1::zeros(n),
-    };
+    fit.fit
+        .require_posterior_mean("joint expectile c_τ")
+        .map_err(|error| {
+            raised_fit_failure(FailureCategory::Input, format!("joint expectile: {error}"))
+        })?;
+    let covariance = fit.fit.beta_covariance().ok_or_else(|| {
+        invariant(
+            "c_τ integrates σ over the log-σ posterior, but the location-scale fit carries \
+             neither its joint posterior covariance nor a typed posterior-moment decline"
+                .to_string(),
+        )
+    })?;
+    if covariance.nrows() < p_mu + p_sigma || covariance.ncols() < p_mu + p_sigma {
+        return Err(invariant(format!(
+            "covariance is {}x{}, smaller than the {} location-scale coefficients",
+            covariance.nrows(),
+            covariance.ncols(),
+            p_mu + p_sigma
+        )));
+    }
+    let scale_block = covariance
+        .slice(ndarray::s![p_mu..p_mu + p_sigma, p_mu..p_mu + p_sigma])
+        .to_owned();
+    let log_sigma_variance = fit
+        .noise_design
+        .design
+        .quadratic_form_diag(&scale_block)
+        .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?;
     let sigma_floor =
         location_scale.response_scale * gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
     let standardized: Vec<f64> = (0..n)
@@ -2620,11 +2653,7 @@ fn fit_expectile_location_scale(
             ),
         ));
     }
-    Ok(ExpectileLocationScaleFitResult {
-        location_scale,
-        levels,
-        standardized_expectiles,
-    })
+    Ok(standardized_expectiles)
 }
 
 /// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
@@ -3770,4 +3799,93 @@ pub fn fit_spline_scan_from_formula(
     gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
         .map(Some)
         .map_err(spline_scan_failure)
+}
+
+#[cfg(test)]
+mod joint_expectile_scale_posterior_tests {
+    use super::*;
+
+    const LEVELS: [f64; 3] = [0.1, 0.5, 0.9];
+
+    /// Heteroscedastic `y = sin(3x) + (0.3 + 0.6x)·ε`, `ε ~ N(0, 1)` from a
+    /// fixed LCG with Box–Muller, so the fixture is reproducible.
+    fn heteroscedastic_dataset(n: usize) -> Dataset {
+        let mut state: u64 = 0x3056_2026_0919_0001;
+        let mut unif = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let rows = (0..n)
+            .map(|i| {
+                let x = i as f64 / (n as f64 - 1.0);
+                let u1 = 1.0 - unif();
+                let u2 = unif();
+                let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let y = (3.0 * x).sin() + (0.3 + 0.6 * x) * z;
+                csv::StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        let headers = ["x", "y"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    /// `c_τ` standardizes each residual by the posterior mean of σ, which needs
+    /// the Scale block of the joint covariance. The fitted `c_τ` is exactly the
+    /// covariance-integrated value, and the same fit with its covariance
+    /// removed is refused with a typed error — never standardized by the
+    /// plug-in σ as if the log-σ posterior variance were zero (#3056).
+    #[test]
+    fn joint_expectile_c_tau_requires_the_scale_block_posterior() {
+        let n = 200;
+        let data = heteroscedastic_dataset(n);
+        let config = FitConfig {
+            family: Some("expectile".to_string()),
+            expectile_tau: Some(LEVELS.to_vec()),
+            ..FitConfig::default()
+        };
+        let mut result = fit_expectile_location_scale("y ~ s(x)", &data, &config, LEVELS.to_vec())
+            .expect("joint expectile fit");
+        let y_index = data
+            .headers
+            .iter()
+            .position(|h| h == "y")
+            .expect("response column");
+        let y = data.values.column(y_index).to_owned();
+        let ones = Array1::<f64>::ones(n);
+        let zeros = Array1::<f64>::zeros(n);
+        let c_tau = |location_scale: &GaussianLocationScaleFitResult| {
+            joint_expectile_standardized_expectiles(
+                location_scale,
+                y.view(),
+                ones.view(),
+                zeros.view(),
+                zeros.view(),
+                &LEVELS,
+            )
+        };
+
+        assert!(
+            result.location_scale.fit.fit.beta_covariance().is_some(),
+            "a joint expectile fit carries its joint posterior covariance"
+        );
+        let integrated = c_tau(&result.location_scale).expect("c_τ with covariance");
+        assert_eq!(integrated, result.standardized_expectiles);
+
+        result.location_scale.fit.fit.covariance_conditional = None;
+        match c_tau(&result.location_scale) {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("joint posterior covariance"),
+                    "refusal must name the missing covariance: {message}"
+                );
+            }
+            Ok(plug_in) => panic!(
+                "c_τ without the scale-block covariance must be refused, got the plug-in \
+                 {plug_in:?} (integrated {integrated:?})"
+            ),
+        }
+    }
 }

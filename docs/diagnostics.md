@@ -354,7 +354,7 @@ These are read-only properties.
 
 | Symptom | Try this |
 | --- | --- |
-| `diag.metrics["r_squared"]` low on training | The basis may be too small for the function. `k` is an upper bound on each smooth's flexibility, and REML chooses how much of it to use. Run `basis_check(data)` and raise `k` where it reports the basis is inadequate, or add interactions via `te(...)` / multi-d smooths. See [Choosing k](formulas.md#choosing-k). |
+| `diag.metrics["r_squared"]` low on training | A fixed basis may be too small for the function. A default `s(x)` grows its own basis, but an explicit `k`, a `by=` smooth and the tensor-product, cyclic, factor-smooth and Matérn bases do not. Run `basis_check(data)`; where it reports a fixed basis is inadequate, drop the `k=` on an `s(x)` or give the other bases a larger `k`. Or add interactions via `te(...)` / multi-d smooths. See [Choosing k](formulas.md#choosing-k). |
 | `rmse` low on training, high on test | Lowering `k` is not the fix: REML already penalizes wiggliness the data do not support. Check for leakage between training and test rows, for a shift between them, and for terms that should not be in the model. |
 | `diagnose()` raises about the response column | Pass `y="column_name"` explicitly. |
 | `check()` reports `missing_column` | The prediction data is missing a required feature. |

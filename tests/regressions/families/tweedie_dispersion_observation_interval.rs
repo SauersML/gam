@@ -131,7 +131,6 @@ fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> TweedieFit {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )

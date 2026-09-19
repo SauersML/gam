@@ -68,6 +68,14 @@ pub(super) fn calculate_edfwithworkspace_from_factor(
 /// Mirrors `calculate_edf_with_penalty` but accepts the `SparseExactFactor`
 /// that PLS already produced, eliminating the redundant second sparse
 /// factorization inside every PIRLS outer iteration.
+///
+/// `tr(H⁻¹ S_λ) = tr(H⁻¹ EᵀE)` is exact either way it is formed: as
+/// `Σ_r e_r H⁻¹ e_rᵀ` against the Takahashi selected inverse (every pair inside
+/// a row's support is a nonzero of `S_λ ⊆ H`, so on the selected pattern), or by
+/// solving `H X = Eᵀ` for all `r` columns. The first costs the recurrence
+/// `Σ_j c_j²` over `L`'s column counts, the second `4·nnz(L)·r`; the cheaper one
+/// is taken. For a many-level random effect `r` is the level count and the
+/// recurrence is linear in it, where the solves are quadratic.
 pub(super) fn calculate_edf_from_sparse_factor(
     factor: &gam_linalg::sparse_exact::SparseExactFactor,
     penalty: &PirlsPenalty,
@@ -80,20 +88,27 @@ pub(super) fn calculate_edf_from_sparse_factor(
     if r == 0 {
         return Ok(p as f64);
     }
-    let rhs_arr = e_transformed.t().to_owned();
-    let sol = gam_linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+    let ill_conditioned = || EstimationError::ModelIsIllConditioned {
+        condition_number: f64::INFINITY,
+    };
+    let solve_flops = 4usize.saturating_mul(factor.factor_nnz()).saturating_mul(r);
+    if factor.selected_inverse_flops() < solve_flops {
+        let taka = factor.selected_inverse().map_err(|_| ill_conditioned())?;
+        let tr = taka.trace_root_gram(e_transformed.view(), 0);
+        if tr.is_finite() {
+            return Ok((p as f64 - tr).clamp(mp, p as f64));
         }
-    })?;
+        return Err(ill_conditioned());
+    }
+    let rhs_arr = e_transformed.t().to_owned();
+    let sol = gam_linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr)
+        .map_err(|_| ill_conditioned())?;
     if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
         return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
             sol[[i, j]]
         }));
     }
-    Err(EstimationError::ModelIsIllConditioned {
-        condition_number: f64::INFINITY,
-    })
+    Err(ill_conditioned())
 }
 
 pub(super) fn calculate_edf(
@@ -254,6 +269,81 @@ mod tests {
         assert!(
             (0.0..=p as f64).contains(&edf),
             "EDF must lie in [0, {p}] for r > p penalty, got {edf}"
+        );
+    }
+
+    /// The sparse-factor EDF, in both of its exact forms (selected-inverse
+    /// contraction and multi-RHS solve), equals the dense-solve EDF on a
+    /// random-effect-shaped system: a ridge root over `levels` indicator
+    /// columns next to a dense smooth block.
+    #[test]
+    fn sparse_factor_edf_matches_dense_edf() {
+        use faer::sparse::{SparseColMat, Triplet};
+        use gam_linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spdmulti};
+        use ndarray::Array1;
+
+        let levels = 9usize;
+        let smooth = 3usize;
+        let p = levels + smooth;
+        let n = 60usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            x[[i, i % levels]] = 1.0;
+            let t = i as f64 / n as f64;
+            x[[i, levels]] = t;
+            x[[i, levels + 1]] = (3.0 * t).sin();
+            x[[i, levels + 2]] = t * t - 0.3;
+        }
+        // Ridge root on the levels, second-difference-like root on the smooth.
+        let r = levels + 2;
+        let mut e = Array2::<f64>::zeros((r, p));
+        for l in 0..levels {
+            e[[l, l]] = 0.7 + 0.1 * l as f64;
+        }
+        e[[levels, levels]] = 1.3;
+        e[[levels, levels + 1]] = -2.6;
+        e[[levels, levels + 2]] = 1.3;
+        e[[levels + 1, levels + 1]] = 0.9;
+        e[[levels + 1, levels + 2]] = -0.9;
+        let s = e.t().dot(&e);
+        let h = x.t().dot(&x) + &s;
+
+        let triplets: Vec<Triplet<usize, usize, f64>> = (0..p)
+            .flat_map(|j| (0..=j).map(move |i| (i, j)))
+            .filter(|&(i, j)| h[[i, j]] != 0.0)
+            .map(|(i, j)| Triplet::new(i, j, h[[i, j]]))
+            .collect();
+        let h_sparse = SparseColMat::try_new_from_triplets(p, p, &triplets).unwrap();
+        let factor = factorize_sparse_spd(&h_sparse).unwrap();
+
+        let dense_edf = calculate_edf(&SymmetricMatrix::Dense(h.clone()), &e).unwrap();
+        let penalty = PirlsPenalty::Dense {
+            s_transformed: s,
+            e_transformed: e.clone(),
+            linear_shift: Array1::zeros(p),
+            constant_shift: 0.0,
+        };
+        let sparse_edf = calculate_edf_from_sparse_factor(&factor, &penalty).unwrap();
+        let tol = 1e-12 * p as f64;
+        assert!(
+            (sparse_edf - dense_edf).abs() <= tol,
+            "sparse-factor EDF {sparse_edf} vs dense {dense_edf}"
+        );
+
+        let taka = factor.selected_inverse().unwrap();
+        let trace_selected = taka.trace_root_gram(e.view(), 0);
+        let sol = solve_sparse_spdmulti(&factor, &e.t().to_owned()).unwrap();
+        let trace_solved: f64 = (0..r)
+            .map(|k| (0..p).map(|i| sol[[i, k]] * e[[k, i]]).sum::<f64>())
+            .sum();
+        assert!(
+            (trace_selected - trace_solved).abs() <= tol,
+            "selected-inverse trace {trace_selected} vs solved {trace_solved}"
+        );
+        assert!(
+            (p as f64 - trace_selected - dense_edf).abs() <= tol,
+            "selected-inverse EDF {} vs dense {dense_edf}",
+            p as f64 - trace_selected
         );
     }
 }

@@ -61,23 +61,26 @@ struct QuadraticCoefficientProbe;
 impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
     fn directional_cubic_diagnostic(
         &self,
-        hessian: &Array2<f64>,
+        eigenvalues: &Array1<f64>,
+        eigenvectors: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
         refine_supremum: bool,
     ) -> Result<(f64, Array1<f64>), String> {
-        if design.ncols() != hessian.nrows() || c_weights.len() != design.nrows() {
+        let p = eigenvalues.len();
+        if eigenvectors.dim() != (p, p) || design.ncols() != p || c_weights.len() != design.nrows()
+        {
             return Err(format!(
-                "the probe's diagnostic (refine_supremum={refine_supremum}) got a {}x{} Hessian, a \
-                 {}x{} design and {} curvature weights",
-                hessian.nrows(),
-                hessian.ncols(),
+                "the probe's diagnostic (refine_supremum={refine_supremum}) got {p} eigenvalues, \
+                 {}x{} eigenvectors, a {}x{} design and {} curvature weights",
+                eigenvectors.nrows(),
+                eigenvectors.ncols(),
                 design.nrows(),
                 design.ncols(),
                 c_weights.len()
             ));
         }
-        Ok((1.0, Array1::from_elem(hessian.nrows(), 1.0)))
+        Ok((1.0, Array1::from_elem(p, 1.0)))
     }
 
     fn block_quadrature_marginal_correction(
@@ -149,12 +152,12 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
         );
     }
 
-    /// The production ceiling, measured by the rule builder the standard corrector integrates
+    /// The production predicate, from the rule builder the standard corrector integrates
     /// with. The probe reports every axis resolved at the first rule it is asked for (order
-    /// four), so the order search's stop predicate never judges an axis and the ceiling is
-    /// only compared against. The pin asserts order four.
-    fn max_representable_order(&self) -> usize {
-        gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+    /// four), so the order search raises no axis and never asks it. The pin asserts order
+    /// four.
+    fn is_representable_order(&self, order: usize) -> bool {
+        gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
     }
 }
 

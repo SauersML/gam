@@ -153,33 +153,39 @@ mutually exclusive.
 y ~ 0 + x                 # regression through the origin (penalized slope)
 y ~ x - 1                 # the same model
 y ~ 0 + linear(x, double_penalty=false)   # unpenalized: OLS through the origin
-y ~ 0 + g                 # cell means: one unpenalized coefficient per level of g
-y ~ 0 + s(x) + s(z)       # s(x) carries the level; s(z) stays centred
+y ~ 0 + g                 # g spans the constant: the same model as y ~ g
+y ~ 0 + s(x) + s(z)       # s(x) spans the constant: the same model as y ~ s(x) + s(z)
 ```
 
 `0 + …`, `… + 0` and `… - 1` remove the global intercept; `1 + …` (or
-`+ 1`) keeps it, which is the default. The constant level of the model is
-always carried at most once, and always in an unpenalized direction, so
-shifting the response shifts the fit and nothing else. With the intercept
-it is the all-ones column and every other term is centred against it.
-Without it the level moves to one term, chosen by this rule:
+`+ 1`) keeps it, which is the default. The constant is never penalized: a
+shift of the response shifts the fit and nothing else. Every other
+direction keeps its penalty, so a term with no support in the data can
+still be shrunk to zero.
 
-1. **The first fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main
-   effect of a factor `by=` smooth. It is dummy-coded with every level kept
-   (no reference level) and made unpenalized, so `0 + g` is exactly the
-   cell-means model. A second factor keeps its usual coding.
-2. **Else the first pure-indicator interaction** (`g:h`), which keeps every
-   cell, its reference cell included.
-3. **Else the first B-spline or tensor smooth** (`s(x)`, `te(x, z)`, …). A
-   smooth with an explicit `identifiability=none` is preferred; otherwise
-   the first default-centred one has its sum-to-zero centring released.
-   Either way its null-space ridge is dropped so the constant it now spans
-   is unpenalized — unless `double_penalty=true` was written, in which case
-   the whole null space, the level included, stays shrunk as asked. Every
-   other smooth stays centred.
+Removing the intercept therefore removes the constant only when no term
+could represent it. A term that spans the constant keeps the intercept, and
+the model is exactly the one written with it:
 
-A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never carries the
-level: its levels are mean-zero deviations. When no term can carry it, the
+- **A fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main effect of a
+  factor `by=` smooth. `0 + g` is `g`: every level keeps its column and its
+  REML-estimated ridge. Beside the free intercept that ridge shrinks only the
+  contrasts between levels, so the overall level is free and the level
+  differences shrink toward zero when the data do not support them.
+- **A pure-indicator interaction over every level** (`g:h` with no `g` or
+  `h` main effect). `0 + g:h` is `g:h`: one reference cell is absorbed by the
+  intercept and every other cell keeps its ridge.
+- **A B-spline or tensor smooth** (`s(x)`, `te(x, z)`, …) with the default
+  centring or `identifiability=none`. `0 + s(x)` is `s(x)`: the smooth stays
+  centred and keeps its null-space ridge, so its linear part is shrunk like
+  any other and only the constant is free.
+
+The column space is the one the formula wrote; the coefficients are
+parametrized as the intercept plus centred effects, and the fit reports an
+inference note naming the term that kept the intercept.
+
+A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never spans the
+constant: its levels are mean-zero deviations. When no term spans it, the
 model has no constant at all and every effect passes through the origin,
 exactly as a parametric no-intercept fit does. `y ~ 0 + linear(x,
 double_penalty=false)` is ordinary least squares through the origin, to
@@ -217,9 +223,8 @@ the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing
 parameter and give the same predictions for every level seen in training.
-In a model with an intercept, no spelling fits an unpenalized fixed effect;
-without one, the first factor carries the level unpenalized (see
-[Removing the intercept](#removing-the-intercept)).
+No spelling fits an unpenalized fixed effect, with or without an intercept
+in the formula (see [Removing the intercept](#removing-the-intercept)).
 
 They differ in two ways only:
 
@@ -232,6 +237,15 @@ They differ in two ways only:
 So `factor(year)` treats `year` as levels rather than as a slope, and a
 held-out level is a schema mismatch for `+ site` and `factor(site)` but an
 expected new group for `group(site)`.
+
+`factor()`, `C()`, `group()` and `re()` take no options: the penalty
+strength is always estimated, so `factor(site, k=3)` is rejected as an
+unknown option instead of being ignored. A categorical column is also
+refused inside a term that treats its inputs as numeric axes (`linear()`,
+`s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
+non-factor bases): the error points to `factor(site)` or `group(site)` for
+the level effect, or `s(x, site, bs="fs")` for a per-level smooth of a
+numeric `x`.
 
 Why estimate the penalty rather than leave the levels unpenalized? The
 penalized estimate is the random-effect (partial-pooling) estimate, and
@@ -351,31 +365,56 @@ does, so `cyclic(x, period=2*pi)` and `cyclic(x, period_start=0,
 period_end=2*pi)` describe the same `[0, 2π)` smooth. An unparseable
 endpoint or an unknown option is rejected rather than silently dropped.
 
-Default interior knots: `clamp(unique_values / 4, 4, 8)` — a lean default
-of about twelve cubic basis functions, close to mgcv's `k = 10`; the cap is
-flat in `n`, so a wigglier fit is an explicit `k=` away rather than the
-default (#1680). With 32 or fewer rows and five or more smooth coordinates
-the inferred count is further reduced to at most 1. The basis dimension is
-then `k = internal_knots + degree + 1`, and an explicit `k` is honoured
-exactly down to `k = degree + 1` (zero interior knots). Passing both `k`
-and `knots` is an error. The fit's inference note prints the rule it
-applied.
+Default basis of a 1-D `s(x)`: the data size it. The fit starts from a
+pilot of `clamp(unique_values / 4, 4, 8)` interior knots (at most twelve
+cubic basis functions). With 32 or fewer rows and five or more smooth
+coordinates the pilot is reduced to at most 1 interior knot. After the fit
+converges, the basis is checked for two signs that it is too small: an edf
+pressed against the basis dimension, and a rejection by the residual
+lack-of-fit test that
+[`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
+reports, at a family-wise level of `1e-3` Bonferroni-corrected over the
+tested smooths. If either appears, the knot count doubles and the model is
+refit, until neither does. Only the data bound the growth:
+
+- a smooth never gets more coefficients than its covariate has distinct
+  values, which is the interpolating limit;
+- the whole model keeps at least one residual degree of freedom.
+
+A null or linear truth passes at the pilot, and REML shrinks it to about 0
+or 1 edf. The larger basis is built only where the fit shows it is needed.
+
+The basis dimension is `k = internal_knots + degree + 1`. Setting `k=` or
+`knots=` fixes the size: an explicit `k` is honoured exactly, down to
+`k = degree + 1` (zero interior knots), and never grows. Passing both `k`
+and `knots` is an error. A Python smooth override (`smooths=`) also keeps
+its size. So do a `by=` smooth (only the rows its gate selects support it)
+and the cyclic, factor-smooth and tensor-product bases, which take the
+pilot count as a fixed default. Thin-plate, Duchon and the other radial
+smooths with automatic centers grow their center count by the same
+adequacy loop. Matérn is the exception and keeps its default count.
 
 ### Choosing `k` {#choosing-k}
 
-`k` is an upper bound on how flexible a smooth can be, not the flexibility
-itself. REML chooses the smoothing parameter, and so how much of the basis
-the fit uses: the smooth's effective degrees of freedom (edf) can sit
-anywhere from its unpenalized null space up to the basis dimension. Raising
-`k` above what the data need changes the fit very little, because the
-penalty holds the extra basis functions back. It costs time, not accuracy.
+For a default `s(x)` there is nothing to choose. Leave `k` unset and the
+fit sizes the basis from the data, as described above.
 
-The one failure `k` can cause is a basis too small for the truth. An edf
+Setting `k` fixes the basis dimension. That is an upper bound on how
+flexible the smooth can be, not the flexibility itself. REML chooses the
+smoothing parameter, and so how much of the basis the fit uses: the
+smooth's effective degrees of freedom (edf) can sit anywhere from its
+unpenalized null space up to the basis dimension. A `k` above what the data
+need changes the fit very little, because the penalty holds the extra basis
+functions back. It costs time, not accuracy.
+
+A fixed basis can fail in one way: it can be too small for the truth. An edf
 close to the basis dimension is the symptom, and
 [`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
 is the test: it looks for structure left in the residuals along the
-covariate. A small p-value means the basis ran out; refit with a larger
-`k`.
+covariate. A small p-value means the basis ran out. For `s(x)`, drop the
+`k=` and let the default grow. A basis that never grows by itself (a `by=`
+smooth, or a tensor-product, cyclic, factor-smooth or Matérn smooth) needs a
+larger `k`.
 
 ```python
 import numpy as np
@@ -387,7 +426,7 @@ x = np.sort(rng.uniform(0, 1, 1000))
 truth = np.sin(12 * np.pi * x)
 data = pd.DataFrame({"x": x, "y": truth + rng.normal(0, 0.3, x.size)})
 
-for formula in ["y ~ s(x)", "y ~ s(x, k=40)"]:
+for formula in ["y ~ s(x, k=12)", "y ~ s(x)"]:
     model = gamfit.fit(data, formula)
     check = model.basis_check(data)[0]
     error = np.sqrt(np.mean((model.predict(data) - truth) ** 2))
@@ -395,12 +434,15 @@ for formula in ["y ~ s(x)", "y ~ s(x, k=40)"]:
           f"basis check p={check['p_value']:.2g}  RMSE vs truth={error:.3f}")
 ```
 
-Six full periods of a sine need more than the default dozen basis
-functions. With the default basis the edf (10.4) presses against the basis
+Six full periods of a sine need more than a dozen basis functions. The
+fixed `k=12` basis runs out: its edf (10.4) presses against the basis
 dimension (11 after centering), the basis check's p-value is about
-`1e-99`, and the error against the truth is 0.63. With `k=40` the check
-passes (p ≈ 0.67) and the error drops to 0.06. REML used about 33 of the 39
-available dimensions; it did not need to be told how many.
+`1e-309`, and the error against the truth is 0.63. The default `s(x)`
+starts from the same dozen functions, sees the same rejection, and doubles
+its knots until the check's p-value clears the engine's basis-adequacy
+level (`1e-3`, Bonferroni-corrected over the tested smooths). Here it
+stops at 19 dimensions with an edf of 17.8, a basis check p of about
+0.007, and an error of 0.07. Nobody had to tell it how many.
 
 ### Shape-constrained smooths {#shape-constrained-smooths}
 
@@ -698,7 +740,7 @@ value are broadcast across all margins.
 
 ### What the default margin is, and when it changes {#tensor-default-margin}
 
-Following mgcv, an unset `bs=` gives each margin a **natural cubic regression
+An unset `bs=` gives each margin a **natural cubic regression
 spline**: `k` value-knots at data quantiles, penalized by the exact integrated
 squared second derivative. `degree` and `penalty_order` are not adjustable
 properties of that basis — a cubic regression spline *is* cubic and *is*
