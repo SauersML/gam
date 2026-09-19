@@ -4996,6 +4996,7 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         | ResponseFamily::NegativeBinomial { .. }
         | ResponseFamily::Beta { .. }
         | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
         | ResponseFamily::StudentT { .. } => gam_problem::SeedRiskProfile::GeneralizedLinear,
     }
 }

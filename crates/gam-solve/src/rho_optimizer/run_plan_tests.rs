@@ -264,7 +264,7 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
 }
 
 #[test]
-fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
+fn terminal_certification_does_not_change_outer_solution() {
     let center = array![0.25];
     let seed_config = gam_problem::SeedConfig {
         max_seeds: 1,
@@ -279,7 +279,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         .with_problem_size(8, 3);
     let config = problem.config();
 
-    let mut without_diagnostic = problem.build_objective(
+    let mut uncertified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -303,7 +303,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let mut with_diagnostic = problem.build_objective(
+    let mut certified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -328,11 +328,10 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline =
-        run_outer_uncertified(&mut without_diagnostic, &config, "rho-diagnostic-baseline")
-            .expect("baseline outer run");
-    let diagnosed = run_outer(&mut with_diagnostic, &config, "rho-diagnostic-run")
-        .expect("diagnostic outer run");
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "terminal-baseline")
+        .expect("baseline outer run");
+    let diagnosed =
+        run_outer(&mut certified, &config, "terminal-certified").expect("certified outer run");
 
     assert_eq!(baseline.rho, diagnosed.rho);
     assert_eq!(
@@ -341,7 +340,6 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
     );
     assert_eq!(baseline.iterations, diagnosed.iterations);
     assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
-    assert!(diagnosed.rho_uncertainty_diagnostic.is_some());
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
@@ -3096,6 +3094,82 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
         published.rho, settled_rho,
         "the certified checkpoint must be the PSD best, not the saddle or the oscillation point"
     );
+}
+
+/// F4 (pyGAM audit, SAS link): ARC rejecting trials from a strict-saddle
+/// incumbent is not a replay while the trials move.
+///
+/// Each rejection leaves the incumbent bit-identical and raises ARC's
+/// regularization weight, so the next trial is a shorter step to a new point.
+/// The SAS-link probe (seed 1) did exactly this from `V = 935.29` with
+/// `λ_min(H) = −1.5e-3`: six rejected trials whose steps shrank from 3.77 to
+/// 0.58. The replay cut keyed on the incumbent alone and stopped the run after
+/// the second window, so the certificate judged a saddle at `|g| = 0.297` and
+/// the fit failed with `RemlDidNotConverge`. A window proves a replay only when
+/// it revisits the previous window's trials from the same incumbent.
+#[test]
+fn rejected_trials_that_move_do_not_prove_a_replay_at_a_strict_saddle() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let incumbent = array![-2.6, 4.8];
+    guard.observe_second_order_seed(&incumbent, 935.29, 0.297, Some(false));
+
+    // Shrinking trials toward the incumbent, each one above it (rejected).
+    let mut step = 3.77;
+    let mut shrinking_window = |guard: &mut CostStallGuard| {
+        let mut verdicts = Vec::new();
+        for _ in 0..3 {
+            let trial = array![-2.6 - step, 4.8];
+            verdicts.push(guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)));
+            step *= 0.7;
+        }
+        verdicts
+    };
+    for window in 0..4 {
+        let verdicts = shrinking_window(&mut guard);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, CostStallVerdict::Continue)),
+            "window {window}: rejected trials that move are not a replay, so the strict-saddle \
+             escape must be granted again"
+        );
+        assert!(
+            guard.license_continuation(),
+            "window {window}: an unreplayed window at a strict saddle is licensed"
+        );
+    }
+    assert_eq!(guard.stuck_escapes, 4, "each moving window earns its escape");
+
+    // A window that revisits the previous window's trials from the same
+    // incumbent is a proven replay and is cut.
+    let revisited = [0.3, 0.2, 0.1];
+    for trial_step in revisited {
+        let trial = array![-2.6 - trial_step, 4.8];
+        assert!(
+            matches!(
+                guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)),
+                CostStallVerdict::Continue
+            ),
+            "the first pass over a fresh window is not yet a replay"
+        );
+    }
+    let mut last = CostStallVerdict::Continue;
+    for trial_step in revisited {
+        let trial = array![-2.6 - trial_step, 4.8];
+        last = guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false));
+    }
+    assert!(
+        matches!(last, CostStallVerdict::FlatValleyStall { .. }),
+        "a window that revisits the same trials from the same incumbent replays it and must halt"
+    );
+    assert!(
+        !guard.license_continuation(),
+        "no licence reopens a proven replay"
+    );
+    let published = exit.lock().unwrap().take().expect("halt publishes the incumbent");
+    assert!(!published.converged, "a strict saddle is never converged");
+    assert_eq!(published.rho, incumbent);
 }
 
 /// #1237 — On a near-separable multinomial fit the outer REML criterion

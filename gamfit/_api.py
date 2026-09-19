@@ -183,7 +183,7 @@ def cross_fit_shared_precision_groups(
     model_payloads: list[dict[str, Any]] = []
     for key, model in model_items:
         try:
-            state_json = rust.coefficient_state_json(model._model_bytes)
+            state_json = rust.coefficient_state_json(model._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
         model_payloads.append({"key": key, "state_json": state_json})
@@ -812,7 +812,7 @@ def fit(
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
-        ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
+        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
         ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
         ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
         estimated by LAML jointly with the smoothing parameters; the fitted
@@ -1014,7 +1014,7 @@ def fit(
                        constraints={"s(x)": "monotone_increasing"})
     config:
         Request fields that have no dedicated keyword, such as
-        ``group_metadata`` or ``precompute_conformal``. A key that
+        ``group_metadata``. A key that
         duplicates a dedicated keyword is refused.
     latents:
         Mapping from formula symbol to :class:`gamfit.smooth.LatentCoord`. This is
@@ -1438,13 +1438,7 @@ def loads(model_bytes: bytes) -> LoadedModel:
             _model_bytes=model_bytes,
             _training_table_kind=str(metadata["training_table_kind"]),
         )
-    try:
-        training_table_kind = rust_module().required_saved_model_payload_string(
-            model_bytes, "training_table_kind"
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes, _training_table_kind=training_table_kind)
+    return Model(_model_bytes=model_bytes)
 
 
 def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeometryModel:

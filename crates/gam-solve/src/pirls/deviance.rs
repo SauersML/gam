@@ -168,7 +168,7 @@ fn cauchit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
 /// the SAME `eta` used to evaluate the value.  Keeping the pair inseparable is
 /// important: the block-local REML correction consumes both and must never
 /// differentiate a projected/floored surrogate of the objective it sampled.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DevianceEtaRow {
     pub half_deviance: f64,
     pub eta_score: f64,
@@ -598,6 +598,114 @@ pub(crate) fn beta_fitted_loglikelihood_unit_from_eta(
     )
 }
 
+/// Half-deviance and `∂(half-deviance)/∂η` of one row under a reciprocal-power
+/// link `μ = η^(−a)` (the inverse link `a = 1`, the inverse-squared link
+/// `a = ½`).
+///
+/// Every quantity is assembled in log space from `ln μ = −a ln η`, so the row
+/// stays representable when `μ` itself would overflow or underflow. The score is
+/// the exponential-dispersion identity `w (μ − y) μ′ / V(μ)` with
+/// `μ′ = −a μ / η`. The link is only defined on `η > 0`; outside it the jet
+/// reports [`EstimationError::InverseLinkDomainViolation`], which the inner
+/// solver treats as an infeasible trial step and damps (step-halving to
+/// feasibility) instead of projecting `η`.
+fn reciprocal_link_edm_row(
+    row: usize,
+    family: PowerVarianceEdm,
+    link: StandardLink,
+    exponent: f64,
+    y: f64,
+    eta: f64,
+    log_weight: f64,
+) -> Result<(f64, f64), EstimationError> {
+    require_reciprocal_link_domain(link, eta)?;
+    let log_eta = eta.ln();
+    let log_mu = -exponent * log_eta;
+    let log_score_link = exponent.ln() - log_eta;
+    match family {
+        PowerVarianceEdm::Gaussian => {
+            if !y.is_finite() {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gaussian response", eta, y));
+            }
+            let mu = log_mu.exp();
+            if !mu.is_finite() {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gaussian mean", eta, mu));
+            }
+            let (sign, log_abs_residual) = signed_log_difference(y, mu);
+            let half = finite_signed_from_log(
+                row,
+                "Gaussian half-deviance",
+                eta,
+                1.0,
+                log_weight + 2.0 * log_abs_residual - std::f64::consts::LN_2,
+            )?;
+            // w (μ − y) μ′ = w a μ (y − μ) / η.
+            let score = finite_signed_from_log(
+                row,
+                "Gaussian eta score",
+                eta,
+                sign,
+                log_weight + log_score_link + log_mu + log_abs_residual,
+            )?;
+            Ok((half, score))
+        }
+        PowerVarianceEdm::Gamma => {
+            if !(y.is_finite() && y > 0.0) {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gamma response", eta, y));
+            }
+            let log_r = y.ln() - log_mu;
+            let half = finite_signed_from_log(
+                row,
+                "Gamma half-deviance",
+                eta,
+                1.0,
+                log_weight + log_gamma_ratio_deviance(log_r),
+            )?;
+            // w (μ − y) μ′ / μ² = w a (r − 1) / η.
+            let score_sign = if log_r > 0.0 { 1.0 } else { -1.0 };
+            let score = finite_signed_from_log(
+                row,
+                "Gamma eta score",
+                eta,
+                score_sign,
+                log_weight + log_score_link + log_abs_one_minus_exp(log_r),
+            )?;
+            Ok((half, score))
+        }
+        PowerVarianceEdm::InverseGaussian => {
+            if !(y.is_finite() && y > 0.0) {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                    row,
+                    "inverse-Gaussian response",
+                    eta,
+                    y,
+                ));
+            }
+            let log_y = y.ln();
+            let (sign, log_abs_residual) = signed_log_exp_difference(log_y, log_mu);
+            let half = finite_signed_from_log(
+                row,
+                "inverse-Gaussian half-deviance",
+                eta,
+                1.0,
+                log_weight + 2.0 * log_abs_residual
+                    - std::f64::consts::LN_2
+                    - log_y
+                    - 2.0 * log_mu,
+            )?;
+            // w (μ − y) μ′ / μ³ = w a (y − μ) / (η μ²).
+            let score = finite_signed_from_log(
+                row,
+                "inverse-Gaussian eta score",
+                eta,
+                sign,
+                log_weight + log_score_link + log_abs_residual - 2.0 * log_mu,
+            )?;
+            Ok((half, score))
+        }
+    }
+}
+
 /// The `eta`-independent factors of one row's likelihood measure: the prior
 /// weight, the log-measure scale, and the weight `w·e^{scale}` and log weight
 /// `ln w + scale` every family branch of the row oracle is assembled from.
@@ -762,7 +870,59 @@ pub fn deviance_eta_row_on_measure(
     // name its half-deviance as a plain product of finite factors, take the
     // product — one rounding instead of three. `weight` is `log_weight`'s
     // exponentiated twin, the first of those factors.
+    let reciprocal_link = reciprocal_power_link(inverse_link);
     let (half_deviance, eta_score) = match &likelihood.spec.response {
+        ResponseFamily::Gaussian if reciprocal_link.is_some() => {
+            let (link, exponent) = reciprocal_link.expect("guarded by is_some");
+            reciprocal_link_edm_row(row, PowerVarianceEdm::Gaussian, link, exponent, y, eta, log_weight)?
+        }
+        ResponseFamily::Gamma if reciprocal_link.is_some() => {
+            let (link, exponent) = reciprocal_link.expect("guarded by is_some");
+            reciprocal_link_edm_row(row, PowerVarianceEdm::Gamma, link, exponent, y, eta, log_weight)?
+        }
+        ResponseFamily::InverseGaussian => match reciprocal_link {
+            Some((link, exponent)) => reciprocal_link_edm_row(
+                row,
+                PowerVarianceEdm::InverseGaussian,
+                link,
+                exponent,
+                y,
+                eta,
+                log_weight,
+            )?,
+            None => {
+                // Log link: μ = e^η, so ½d = (y − μ)²/(2yμ²) and the score is
+                // w (μ − y) μ / μ³ = w (1 − y/μ) / μ.
+                if !(y.is_finite() && y > 0.0) {
+                    return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                        row,
+                        "inverse-Gaussian response",
+                        eta,
+                        y,
+                    ));
+                }
+                let log_y = y.ln();
+                let (sign, log_abs_residual) = signed_log_exp_difference(log_y, eta);
+                let half = finite_signed_from_log(
+                    row,
+                    "inverse-Gaussian half-deviance",
+                    eta,
+                    1.0,
+                    log_weight + 2.0 * log_abs_residual
+                        - std::f64::consts::LN_2
+                        - log_y
+                        - 2.0 * eta,
+                )?;
+                let score = finite_signed_from_log(
+                    row,
+                    "inverse-Gaussian eta score",
+                    eta,
+                    -sign,
+                    log_weight + log_abs_residual - 2.0 * eta,
+                )?;
+                (half, score)
+            }
+        },
         ResponseFamily::Gaussian => {
             if !y.is_finite() {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gaussian response", eta, y));
@@ -1301,24 +1461,12 @@ pub fn deviance_eta_row_on_measure(
     })
 }
 
-pub(crate) fn deviance_eta_rows(
+fn validate_deviance_row_inputs(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     likelihood: &GlmLikelihoodSpec,
-    inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
-) -> Result<Vec<DevianceEtaRow>, EstimationError> {
-    deviance_eta_rows_with_log_measure_scale(y, eta, likelihood, inverse_link, priorweights, 0.0)
-}
-
-pub(crate) fn deviance_eta_rows_with_log_measure_scale(
-    y: ArrayView1<f64>,
-    eta: &Array1<f64>,
-    likelihood: &GlmLikelihoodSpec,
-    inverse_link: &InverseLink,
-    priorweights: ArrayView1<f64>,
-    log_measure_scale: f64,
-) -> Result<Vec<DevianceEtaRow>, EstimationError> {
+) -> Result<(), EstimationError> {
     if y.len() != eta.len() || priorweights.len() != eta.len() {
         crate::bail_invalid_estim!(
             "deviance row length mismatch: y={}, eta={}, prior_weights={}",
@@ -1333,23 +1481,31 @@ pub(crate) fn deviance_eta_rows_with_log_measure_scale(
             likelihood.spec.response.name()
         ))
     })?;
-    let rows: Vec<Result<DevianceEtaRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            deviance_eta_row_with_log_measure_scale(
-                i,
-                y[i],
-                eta[i],
-                likelihood,
-                inverse_link,
-                priorweights[i],
-                log_measure_scale,
-            )
-        })
-        .collect();
+    Ok(())
+}
+
+pub(crate) fn deviance_eta_rows_with_log_measure_scale(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+    log_measure_scale: f64,
+) -> Result<Vec<DevianceEtaRow>, EstimationError> {
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
     // Parallel evaluation, ordered certification: the smallest invalid row is
     // deterministic, and no caller-visible output exists until all rows pass.
-    rows.into_iter().collect()
+    super::par_certified_rows(eta.len(), |i| {
+        deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            log_measure_scale,
+        )
+    })
 }
 
 pub fn calculate_deviance_from_eta(
@@ -1359,8 +1515,21 @@ pub fn calculate_deviance_from_eta(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    let rows = deviance_eta_rows(y, eta, likelihood, inverse_link, priorweights)?;
-    let half_values: Vec<f64> = rows.iter().map(|row| row.half_deviance).collect();
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
+    // Only the half-deviance summands are needed; the eta score is never
+    // materialized, so the transient is one n-vector.
+    let half_values = super::par_certified_rows(eta.len(), |i| {
+        deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            0.0,
+        )
+        .map(|row| row.half_deviance)
+    })?;
     let half = stable_finite_signed_sum(&half_values, "deviance half-sum")?;
     let value = 2.0 * half;
     if value.is_finite() {
@@ -1393,67 +1562,63 @@ pub(crate) fn binomial_deviance_and_log_kernel_from_mean(
             priorweights.len()
         )));
     }
-    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..y.len())
-        .into_par_iter()
-        .map(|row| {
-            let weight = priorweights[row];
-            if !(weight.is_finite() && weight >= 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial prior weight at row {row} must be finite and non-negative; got {weight}"
-                )));
-            }
-            if weight == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            let yi = y[row];
-            let mui = mu[row];
-            if !(yi.is_finite() && (0.0..=1.0).contains(&yi)) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial response at row {row} must lie in [0, 1]; got {yi}"
-                )));
-            }
-            if !(mui.is_finite() && (0.0..=1.0).contains(&mui)) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial mean at row {row} must lie in [0, 1]; got {mui}"
-                )));
-            }
+    let rows: Vec<(f64, f64)> = super::par_certified_rows(y.len(), |row| {
+        let weight = priorweights[row];
+        if !(weight.is_finite() && weight >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial prior weight at row {row} must be finite and non-negative; got {weight}"
+            )));
+        }
+        if weight == 0.0 {
+            return Ok((0.0, 0.0));
+        }
+        let yi = y[row];
+        let mui = mu[row];
+        if !(yi.is_finite() && (0.0..=1.0).contains(&yi)) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial response at row {row} must lie in [0, 1]; got {yi}"
+            )));
+        }
+        if !(mui.is_finite() && (0.0..=1.0).contains(&mui)) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial mean at row {row} must lie in [0, 1]; got {mui}"
+            )));
+        }
 
-            let half_unit = bd0(yi, mui) + bd0(1.0 - yi, 1.0 - mui);
-            if !(half_unit.is_finite() && half_unit >= 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial half-deviance at row {row} is not representable for y={yi}, mu={mui}: {half_unit}"
-                )));
-            }
-            let half_deviance = if half_unit == 0.0 {
-                0.0
-            } else {
-                match representable_half(weight * half_unit) {
-                    Some(value) => value,
-                    None => finite_signed_from_log(
-                        row,
-                        "integrated binomial half-deviance",
-                        mui,
-                        1.0,
-                        weight.ln() + half_unit.ln(),
-                    )?,
-                }
-            };
-            let saturated_unit = xlogy(yi, yi) + xlogy(1.0 - yi, 1.0 - yi);
-            let saturated_log_kernel = if saturated_unit == 0.0 {
-                0.0
-            } else {
-                finite_signed_from_log(
+        let half_unit = bd0(yi, mui) + bd0(1.0 - yi, 1.0 - mui);
+        if !(half_unit.is_finite() && half_unit >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial half-deviance at row {row} is not representable for y={yi}, mu={mui}: {half_unit}"
+            )));
+        }
+        let half_deviance = if half_unit == 0.0 {
+            0.0
+        } else {
+            match representable_half(weight * half_unit) {
+                Some(value) => value,
+                None => finite_signed_from_log(
                     row,
-                    "integrated binomial saturated log-kernel",
+                    "integrated binomial half-deviance",
                     mui,
-                    -1.0,
-                    weight.ln() + (-saturated_unit).ln(),
-                )?
-            };
-            Ok((half_deviance, saturated_log_kernel))
-        })
-        .collect();
-    let rows: Vec<(f64, f64)> = rows.into_iter().collect::<Result<_, _>>()?;
+                    1.0,
+                    weight.ln() + half_unit.ln(),
+                )?,
+            }
+        };
+        let saturated_unit = xlogy(yi, yi) + xlogy(1.0 - yi, 1.0 - yi);
+        let saturated_log_kernel = if saturated_unit == 0.0 {
+            0.0
+        } else {
+            finite_signed_from_log(
+                row,
+                "integrated binomial saturated log-kernel",
+                mui,
+                -1.0,
+                weight.ln() + (-saturated_unit).ln(),
+            )?
+        };
+        Ok((half_deviance, saturated_log_kernel))
+    })?;
     let half_values: Vec<f64> = rows.iter().map(|row| row.0).collect();
     let saturated_values: Vec<f64> = rows.iter().map(|row| row.1).collect();
     let half_deviance =
@@ -1827,8 +1992,13 @@ pub fn calculate_null_deviance(
                 },
             )
         }
-        ResponseFamily::Gamma => {
-            let mean = response_mean("Gamma null model", |value| value.is_finite() && value > 0.0)?;
+        // The intercept-only score `Σ w (y − μ) μ′/V(μ) = 0` has the weighted
+        // response mean as its root under every link, so the null deviance is
+        // evaluated through the log link whatever link the fit uses.
+        ResponseFamily::Gamma | ResponseFamily::InverseGaussian => {
+            let mean = response_mean("positive-response null model", |value| {
+                value.is_finite() && value > 0.0
+            })?;
             let inverse_link = InverseLink::Standard(StandardLink::Log);
             (
                 mean.ln(),
@@ -1875,6 +2045,10 @@ fn eta_log_measure_scale(likelihood: &GlmLikelihoodSpec) -> Result<f64, Estimati
             .tweedie_log_phi()
             .map(|log_phi| -log_phi)
             .map_err(scale_error),
+        ResponseFamily::InverseGaussian => scale
+            .dispersion_log_phi()
+            .map(|log_phi| -log_phi)
+            .map_err(scale_error),
         _ => Ok(0.0),
     }
 }
@@ -1906,9 +2080,10 @@ fn omitted_log_likelihood_row(
         }
     };
     match response {
-        ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::Tweedie { .. } => {
-            Ok(-deviance.half_deviance)
-        }
+        ResponseFamily::Gaussian
+        | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
+        | ResponseFamily::Tweedie { .. } => Ok(-deviance.half_deviance),
         ResponseFamily::Poisson => {
             if y == 0.0 {
                 finite_signed_from_log(row, "Poisson log-likelihood", eta, -1.0, log_weight + eta)
@@ -2013,20 +2188,16 @@ fn eta_log_likelihood_geometry_omitting_constants(
         priorweights.view(),
         log_measure_scale,
     )?;
-    let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
-        .into_par_iter()
-        .map(|i| {
-            omitted_log_likelihood_row(
-                i,
-                y[i],
-                eta[i],
-                priorweights[i],
-                &likelihood.spec.response,
-                deviance_rows[i],
-            )
-        })
-        .collect();
-    let log_likelihood_rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
+    let log_likelihood_rows = super::par_certified_rows(y.len(), |i| {
+        omitted_log_likelihood_row(
+            i,
+            y[i],
+            eta[i],
+            priorweights[i],
+            &likelihood.spec.response,
+            deviance_rows[i],
+        )
+    })?;
     let value = stable_finite_signed_sum(&log_likelihood_rows, "log-likelihood reduction")?;
     Ok((value, deviance_rows))
 }
@@ -2064,8 +2235,10 @@ pub fn eta_log_likelihood_value_and_score_into(
         inverse_link,
         priorweights,
     )?;
-    let score = Array1::from_iter(rows.into_iter().map(|row| -row.eta_score));
-    eta_score.assign(&score);
+    eta_score
+        .iter_mut()
+        .zip(rows.iter())
+        .for_each(|(out, row)| *out = -row.eta_score);
     Ok(value)
 }
 
@@ -2076,8 +2249,30 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    eta_log_likelihood_geometry_omitting_constants(y, eta, likelihood, inverse_link, priorweights)
-        .map(|(value, _)| value)
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
+    let log_measure_scale = eta_log_measure_scale(likelihood)?;
+    // The value alone needs only its summands: each row's deviance geometry is
+    // consumed in place instead of being retained for a score.
+    let log_likelihood_rows = super::par_certified_rows(y.len(), |i| {
+        let deviance_row = deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            log_measure_scale,
+        )?;
+        omitted_log_likelihood_row(
+            i,
+            y[i],
+            eta[i],
+            priorweights[i],
+            &likelihood.spec.response,
+            deviance_row,
+        )
+    })?;
+    stable_finite_signed_sum(&log_likelihood_rows, "log-likelihood reduction")
 }
 
 /// Return the data log-kernel carried by a P-IRLS working state.
@@ -2339,6 +2534,7 @@ fn full_log_likelihood_row(
         // instead of silently skipping the check.
         ResponseFamily::Gaussian
         | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
         | ResponseFamily::Tweedie { .. }
         | ResponseFamily::StudentT { .. }
         | ResponseFamily::RoystonParmar => {}
@@ -2400,6 +2596,10 @@ fn full_log_likelihood_row(
             }
             value
         }
+        // `−½ ln(2π φ y³ / w)`, with `log_measure_scale = −ln φ`.
+        ResponseFamily::InverseGaussian => {
+            -0.5 * (LN_2PI - log_measure_scale + 3.0 * y.ln() - weight.ln())
+        }
         // The Student-t omitted row already carries its full normalizer:
         // `(σ, ν)` are hyperparameters, so the LAML surface needs it too.
         ResponseFamily::Tweedie { .. }
@@ -2439,30 +2639,27 @@ pub fn evaluate_full_log_likelihood_from_eta(
         );
     }
     let log_measure_scale = eta_log_measure_scale(likelihood)?;
-    let rows: Vec<Result<f64, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|row| {
-            let geometry = deviance_eta_row_with_log_measure_scale(
-                row,
-                y[row],
-                eta[row],
-                likelihood,
-                &likelihood.spec.link,
-                priorweights[row],
-                log_measure_scale,
-            )?;
-            full_log_likelihood_row(
-                row,
-                y[row],
-                eta[row],
-                priorweights[row],
-                likelihood,
-                log_measure_scale,
-                geometry,
-            )
-        })
-        .collect();
-    let pointwise = Array1::from_vec(rows.into_iter().collect::<Result<Vec<_>, _>>()?);
+    let rows: Vec<f64> = super::par_certified_rows(eta.len(), |row| {
+        let geometry = deviance_eta_row_with_log_measure_scale(
+            row,
+            y[row],
+            eta[row],
+            likelihood,
+            &likelihood.spec.link,
+            priorweights[row],
+            log_measure_scale,
+        )?;
+        full_log_likelihood_row(
+            row,
+            y[row],
+            eta[row],
+            priorweights[row],
+            likelihood,
+            log_measure_scale,
+            geometry,
+        )
+    })?;
+    let pointwise = Array1::from_vec(rows);
     let total = stable_finite_signed_sum(
         pointwise.as_slice().ok_or_else(|| {
             EstimationError::InvalidInput(

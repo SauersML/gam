@@ -67,6 +67,14 @@ use ndarray::{ArcArray1, Array1, Array2, ArrayView1, ArrayView2, s};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Converged-η dispersion refreshes (Tweedie Pearson φ, Gaussian / inverse
+/// Gaussian φ MLE) allowed after the reported solve. The φ map is a strong
+/// contraction, so cold starts settle in 1–2 re-solves and warm starts in zero.
+const MAX_PHI_REFRESH: usize = 5;
+/// Relative φ change below which a re-solve cannot move any reported quantity
+/// meaningfully (far under statistical resolution).
+const PHI_REFRESH_REL_TOL: f64 = 1e-4;
+
 /// #1868 deterministic n-independence instrument.
 ///
 /// Process-global accumulator of the number of length-`n` row-element touches
@@ -254,9 +262,10 @@ pub(super) fn default_beta_guess_external(
                     // Outer arm guard already filtered out Log/Identity; fall
                     // back to the canonical logit transform for defensive safety
                     // if these are ever reached unexpectedly.
-                    LinkFunction::Log | LinkFunction::Identity => {
-                        (prevalence / (1.0 - prevalence)).ln()
-                    }
+                    LinkFunction::Log
+                    | LinkFunction::Identity
+                    | LinkFunction::Inverse
+                    | LinkFunction::InverseSquared => (prevalence / (1.0 - prevalence)).ln(),
                 };
                 if mixture_link_state.is_some() {
                     beta[intercept_col] = solve_intercept_for_prevalence(
@@ -296,6 +305,29 @@ pub(super) fn default_beta_guess_external(
                 // of an invented floor (#2469).
                 if mean_y > 0.0 {
                     beta[intercept_col] = mean_y.ln();
+                }
+            }
+        }
+        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+            // The intercept-only root of every power-variance score under
+            // `μ = η^(−a)` is `μ = ȳ` (weighted), i.e. `η = ȳ^(−1/a)`: `1/ȳ` for
+            // the inverse link and `1/ȳ²` for the inverse-squared link. That
+            // seed lies inside the link's domain `η > 0` on every row. A
+            // non-positive mean has no such root; the intercept keeps its zero
+            // seed and the solve reports the domain violation itself.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                let mean_y = weighted_sum / totalweight;
+                if mean_y > 0.0 {
+                    beta[intercept_col] = match link_function {
+                        LinkFunction::Inverse => mean_y.recip(),
+                        _ => (mean_y * mean_y).recip(),
+                    };
                 }
             }
         }
@@ -1687,10 +1719,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // The converged-η Pearson map is a strong contraction (β̂ scale-free
             // here), so cold starts settle in 1–2 re-solves and warm starts in
             // zero.
-            const MAX_PHI_REFRESH: usize = 5;
-            // Relative φ tolerance below which a re-solve cannot move any reported
-            // quantity meaningfully (far under statistical resolution).
-            const PHI_REFRESH_REL_TOL: f64 = 1e-4;
             for refresh_iter in 0..MAX_PHI_REFRESH {
                 let refreshed_phi = super::estimate_tweedie_phi_from_eta(
                     y,
@@ -1735,6 +1763,62 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     Some(&mut iteration_logger),
                 )?;
             }
+        }
+    }
+
+    // ── Gaussian (non-identity link) / inverse Gaussian dispersion φ ─────────
+    //
+    // The same converged-η refresh as the Tweedie φ above, with the exact MLE
+    // `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` in place of the Pearson moment. Unlike the Tweedie
+    // pass, a φ still moving on the last allowed pass is a failed fit, not a
+    // reported one: the reported φ must be the MLE at the reported η.
+    if refine_dispersion_at_converged_eta
+        && matches!(
+            working_model
+                .likelihood
+                .resolved_scale()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+            ResolvedLikelihoodScale::Dispersion {
+                estimated: true,
+                ..
+            }
+        )
+    {
+        let mut converged = false;
+        for _ in 0..MAX_PHI_REFRESH {
+            let refreshed_phi = super::estimate_dispersion_phi_from_eta(
+                &working_model.likelihood.spec.response,
+                &working_model.likelihood.spec.link,
+                y,
+                working_summary.state.eta.as_ref(),
+                priorweights,
+            )?;
+            let prior_phi = working_model
+                .likelihood
+                .resolved_dispersion_phi()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            let rel_change = (refreshed_phi - prior_phi).abs() / prior_phi;
+            working_model.likelihood = working_model
+                .likelihood
+                .clone()
+                .with_dispersion_phi(refreshed_phi);
+            working_model.dispersion_phi_locked = true;
+            if rel_change <= PHI_REFRESH_REL_TOL {
+                converged = true;
+                break;
+            }
+            working_summary = runworking_model_pirls(
+                &mut working_model,
+                working_summary.beta.clone(),
+                &options,
+                Some(&mut iteration_logger),
+            )?;
+        }
+        if !converged {
+            crate::bail_invalid_estim!(
+                "dispersion φ did not reach its converged-η fixed point within {MAX_PHI_REFRESH} \
+                 re-solves (relative tolerance {PHI_REFRESH_REL_TOL:e})"
+            );
         }
     }
 

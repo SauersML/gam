@@ -221,7 +221,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         e_for_logdet: &Array2<f64>,
         penalty_roots: &[Array2<f64>],
-        penalty_subspace: Option<&PenaltySubspace>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
         free_basis: Option<&Array2<f64>>,
@@ -386,14 +385,11 @@ impl<'a> RemlState<'a> {
             // a zero gradient. Fail loud instead of silently mis-optimizing ρ if a
             // future penalty configuration ever lands a penalized fit here without
             // a per-component representation.
-            let owned_subspace;
-            let subspace = if let Some(penalty_subspace) = penalty_subspace {
-                penalty_subspace
-            } else {
-                owned_subspace = self.compute_penalty_subspace(e_for_logdet)?;
-                &owned_subspace
-            };
-            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace);
+            //
+            // This branch is the only consumer of the `EᵀE` eigensystem, so it
+            // is formed here rather than by the callers on every evaluation.
+            let subspace = self.compute_penalty_subspace(e_for_logdet)?;
+            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(&subspace);
             if !rho.is_empty() {
                 crate::bail_invalid_estim!(
                     "penalty log|Σλ S|₊ ρ-derivatives unavailable: rho_dim={} but no canonical \
@@ -3937,6 +3933,7 @@ impl<'a> RemlState<'a> {
 
         let runtime_mixture_link_state = config.link_kind.mixture_state().cloned();
         let runtime_sas_link_state = config.link_kind.sas_state().copied();
+        let pirls_cache_budget = pirls_cache_byte_budget(&x);
 
         Ok(Self {
             y,
@@ -3955,7 +3952,7 @@ impl<'a> RemlState<'a> {
             coefficient_lower_bounds,
             linear_constraints,
             rho_prior: RhoPrior::Flat,
-            cache_manager: EvalCacheManager::new(),
+            cache_manager: EvalCacheManager::new(pirls_cache_budget),
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_rho: RwLock::new(None),
@@ -3980,6 +3977,7 @@ impl<'a> RemlState<'a> {
             frozen_tweedie_phi: Arc::new(AtomicU64::new(0)),
             frozen_gamma_shape: Arc::new(AtomicU64::new(0)),
             frozen_beta_phi: Arc::new(AtomicU64::new(0)),
+            frozen_dispersion_phi: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
@@ -4000,6 +3998,7 @@ impl<'a> RemlState<'a> {
             gaussian_dp_floor_scale_cache: std::sync::OnceLock::new(),
             positive_weight_observation_count_cache: std::sync::OnceLock::new(),
             rho_weight_anchor_cache: std::sync::OnceLock::new(),
+            data_root_cache: Default::default(),
         })
     }
 
@@ -4071,6 +4070,8 @@ impl<'a> RemlState<'a> {
             .flat_glm_first_step_gram
             .write()
             .expect("flat-GLM first-step Gram cache lock poisoned") = None;
+        // The root-scale operator's data root is keyed to the same design.
+        self.data_root_cache.clear();
         *self
             .persistent_warm_start_key
             .write()
@@ -6882,6 +6883,21 @@ impl<'a> RemlState<'a> {
                 "frozen Beta precision",
                 |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
             )?;
+            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+            // same λ-search freeze as the Tweedie φ.
+            apply_frozen_search_scale(
+                &mut pirls_config.likelihood,
+                matches!(
+                    resolved_likelihood_scale,
+                    gam_problem::ResolvedLikelihoodScale::Dispersion {
+                        estimated: true,
+                        ..
+                    }
+                ),
+                self.frozen_dispersion_phi.load(Ordering::Relaxed),
+                "frozen dispersion",
+                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
+            )?;
             // Levenberg-Marquardt damping warm-start: the λ the previous
             // successful PIRLS solve at this surface ended on (0 = no hint).
             // It encodes the curvature regime that solve settled into; PIRLS
@@ -7335,6 +7351,38 @@ impl<'a> RemlState<'a> {
                  measured at the converged η); outer REML criterion now stationary in ρ"
             );
         }
+        // Capture the Gaussian (non-identity link) / inverse Gaussian dispersion
+        // MLE at the first converged non-screening solve's η and hold it for the
+        // rest of the search, exactly as the Tweedie φ above.
+        if !in_screening
+            && matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            )
+            && self.frozen_dispersion_phi.load(Ordering::Relaxed) == 0
+            && matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            )
+        {
+            let spec = reml_spec(&self.config.likelihood);
+            let phi = pirls::estimate_dispersion_phi_from_eta(
+                &spec.response,
+                &spec.link,
+                self.y,
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?;
+            self.frozen_dispersion_phi
+                .store(phi.to_bits(), Ordering::Relaxed);
+            log::info!(
+                "[OUTER] dispersion λ-search φ frozen at {phi:.6e} (measured at the \
+                 converged η); outer REML criterion now stationary in ρ"
+            );
+        }
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
@@ -7731,6 +7779,21 @@ impl<'a> RemlState<'a> {
             self.frozen_beta_phi.load(Ordering::Relaxed),
             "frozen Beta precision",
             |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
+        )?;
+        // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+        // same λ-search freeze as the Tweedie φ.
+        apply_frozen_search_scale(
+            &mut pirls_config.likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_dispersion_phi.load(Ordering::Relaxed),
+            "frozen dispersion",
+            |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
         )?;
 
         // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
