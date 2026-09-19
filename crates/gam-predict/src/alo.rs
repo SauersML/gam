@@ -195,6 +195,9 @@ impl SavedSurvivalAffineBlockAloInput {
 /// retained in observed row curvature.
 pub struct SavedLocationScaleSurvivalAloInput {
     event: Array1<f64>,
+    /// Whether each row entered after the origin; a row entering at the origin
+    /// carries no `S(entry)` factor in the fitted likelihood (#2695).
+    entry_active: Vec<bool>,
     derivative_guard: f64,
     time_base: SavedSurvivalAffineBlockAloInput,
     threshold: SavedSurvivalAffineBlockAloInput,
@@ -348,6 +351,7 @@ impl SavedLatentBinaryAloInput {
 impl SavedLocationScaleSurvivalAloInput {
     pub fn new(
         event: Array1<f64>,
+        entry_active: Vec<bool>,
         derivative_guard: f64,
         time_base: SavedSurvivalAffineBlockAloInput,
         threshold: SavedSurvivalAffineBlockAloInput,
@@ -364,6 +368,12 @@ impl SavedLocationScaleSurvivalAloInput {
                 time_base.design_exit.nrows(),
                 threshold.design_exit.nrows(),
                 log_sigma.design_exit.nrows(),
+            ));
+        }
+        if entry_active.len() != n {
+            return Err(format!(
+                "saved survival location-scale ALO entry activity has {} rows; expected {n}",
+                entry_active.len()
             ));
         }
         if !derivative_guard.is_finite() || derivative_guard <= 0.0 {
@@ -383,6 +393,7 @@ impl SavedLocationScaleSurvivalAloInput {
         }
         Ok(Self {
             event,
+            entry_active,
             derivative_guard,
             time_base,
             threshold,
@@ -1484,6 +1495,7 @@ fn compute_saved_bernoulli_marginal_slope_alo(
     let slope_dimension = predictor.beta_slope.len();
     let parameter_dimension = marginal_dimension
         + slope_dimension
+        + replay.residual_dimension
         + replay.score_warp_dimension
         + replay.link_deviation_dimension;
     let geometry = require_saved_geometry(model, class, parameter_dimension)?;
@@ -1505,8 +1517,11 @@ fn compute_saved_bernoulli_marginal_slope_alo(
         .design_noise
         .as_ref()
         .expect("validated marginal-slope design");
-    let mut coordinate_designs =
-        Vec::with_capacity(2 + replay.score_warp_dimension + replay.link_deviation_dimension);
+    let mut coordinate_designs = Vec::with_capacity(
+        2 + replay.residual_dimension
+            + replay.score_warp_dimension
+            + replay.link_deviation_dimension,
+    );
     let mut coordinate_ranges = Vec::with_capacity(coordinate_designs.capacity());
     let mut coordinate_names = Vec::with_capacity(coordinate_designs.capacity());
     coordinate_designs.push(input.design.clone());
@@ -1516,6 +1531,14 @@ fn compute_saved_bernoulli_marginal_slope_alo(
     coordinate_ranges.push(marginal_dimension..marginal_dimension + slope_dimension);
     coordinate_names.push("slope".to_string());
     let mut coefficient = marginal_dimension + slope_dimension;
+    for coordinate in 0..replay.residual_dimension {
+        // gam#2924: each residual coefficient is its own row primary with a
+        // unit design, exactly like the flex coordinates below.
+        coordinate_designs.push(constant_scalar_design(n));
+        coordinate_ranges.push(coefficient..coefficient + 1);
+        coordinate_names.push(format!("residual-repair[{coordinate}]"));
+        coefficient += 1;
+    }
     for coordinate in 0..replay.score_warp_dimension {
         coordinate_designs.push(constant_scalar_design(n));
         coordinate_ranges.push(coefficient..coefficient + 1);
@@ -2603,6 +2626,7 @@ fn compute_saved_location_scale_survival_alo(
                 eta_log_sigma_exit: eta_log_sigma_exit[row],
                 eta_log_sigma_entry: eta_log_sigma_entry[row],
                 eta_log_sigma_derivative_exit: eta_log_sigma_derivative_exit[row],
+                entry_active: input.entry_active[row],
                 time_wiggle: time_wiggle_row,
                 link_wiggle: link_wiggle_row,
             })

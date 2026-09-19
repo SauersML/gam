@@ -72,11 +72,13 @@
 //! every eigen/SVD is faer's deterministic solver. No hashing, no parallel reduction,
 //! no float-order ambiguity: same input ⇒ bit-identical atlas run-to-run.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use faer::sparse::{SparseColMat, Triplet};
 use gam_linalg::faer_ndarray::FaerSvd;
+use gam_linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spd};
 
 use super::intrinsic_seed::{intrinsic_geodesic_embedding_on_graph, intrinsic_knn_graph};
 use super::{AtlasOrientability, GraphCompressionKind};
@@ -98,6 +100,13 @@ struct DevelopingMap {
 /// and whether `M` reverses orientation (see `LocalAtlas::holonomy_quotient_coordinates`).
 struct DevelopedHolonomy {
     translation: Array1<f64>,
+    reversing: bool,
+}
+
+/// A non-tree transition's mean seam displacement in the developed frame, and whether its
+/// holonomy reverses orientation (see `LocalAtlas::seam_displacements`).
+struct SeamDisplacement {
+    displacement: Array1<f64>,
     reversing: bool,
 }
 
@@ -715,6 +724,9 @@ pub struct LocalAtlas {
     rejected_centers: Vec<RejectedCenter>,
     intrinsic_cover_multiplicity: (usize, f64),
     intrinsic_coordinates: Array2<f64>,
+    /// The deterministic kNN graph `build` grew patch membership through, symmetric and
+    /// bridged to one component, row-aligned with the rows the atlas was built on.
+    neighbourhood: Vec<Vec<(usize, f64)>>,
 }
 
 impl LocalAtlas {
@@ -870,6 +882,7 @@ impl LocalAtlas {
             rejected_centers,
             intrinsic_cover_multiplicity: (intrinsic_max, intrinsic_mean),
             intrinsic_coordinates: membership_coords,
+            neighbourhood: neighbours,
         })
     }
 
@@ -927,6 +940,13 @@ impl LocalAtlas {
     /// `build` audited its cover against, row-aligned with the rows it was built on.
     pub(crate) fn intrinsic_coordinates(&self) -> &Array2<f64> {
         &self.intrinsic_coordinates
+    }
+
+    /// The neighbourhood graph patch membership grew through: `neighbourhood()[i]` lists
+    /// row `i`'s neighbours with their ambient distances, symmetric and bridged to one
+    /// component.
+    pub(crate) fn neighbourhood(&self) -> &[Vec<(usize, f64)>] {
+        &self.neighbourhood
     }
 
     /// The developing map (#2280): one `d`-coordinate realization of the rows `z` the
@@ -989,13 +1009,15 @@ impl LocalAtlas {
     ///
     /// Both reads project onto a straight line, so they need the loop to develop straight: a
     /// 1-manifold always does, and a cylinder does when its loop is a geodesic of the surface.
-    /// No such read is offered for a Möbius band. On the standard embedding the centerline
+    /// A Möbius band's loop does not. On the standard embedding the centerline
     /// `(2 cos u, 2 sin u, 0)` has geodesic curvature `−cos(u/2)/2` against the width ruling,
     /// so its developed tangent turns by `−2 sin(u/2)`, two radians at `u = π`, and the
     /// developed centerline ends `4π·(J₀(2), −H₀(2)) ≈ (2.81, −9.94)` from its start in the
     /// seam tangent's frame. The reversing holonomy reflects across that tangent, and the
     /// centerline's projection onto it runs backwards wherever `sin(u/2) > π/4`, so no
-    /// projection onto the glide axis is a loop coordinate.
+    /// projection onto the glide axis is a loop coordinate. The band (chart rank 2) is read on
+    /// the rows' neighbourhood graph instead, through the charts' handedness; see
+    /// [`Self::mobius_quotient_coordinates`].
     ///
     /// Refused for any other manifold or chart rank, for a cover with no holonomy of the
     /// class the read needs, and for a degenerate period or height.
@@ -1028,7 +1050,12 @@ impl LocalAtlas {
                 Ok(coords)
             }
             (GraphCompressionKind::Cylinder, 2) => {
-                let displacements = self.seam_displacements(z, &map);
+                let displacements: Vec<Array1<f64>> = self
+                    .seam_displacements(z, &map)
+                    .into_iter()
+                    .filter(|seam| !seam.reversing)
+                    .map(|seam| seam.displacement)
+                    .collect();
                 let reference = displacements
                     .iter()
                     .max_by(|left, right| left.dot(*left).total_cmp(&right.dot(*right)))
@@ -1091,10 +1118,242 @@ impl LocalAtlas {
                 }
                 Ok(coords)
             }
+            (GraphCompressionKind::MobiusStrip, 2) => {
+                self.mobius_quotient_coordinates(z, &map, &developed)
+            }
             (other, rank) => Err(format!(
-                "holonomy_quotient_coordinates: no flat quotient read for {other:?} at chart rank {rank}"
+                "holonomy_quotient_coordinates: no quotient read for {other:?} at chart rank {rank}"
             )),
         }
+    }
+
+    /// A Möbius band's quotient coordinates (#2906): the loop fraction `s ∈ [0, 1)` and the
+    /// signed width `w ∈ [−1, 1]` on the period-two double cover the Möbius seed races on, whose
+    /// deck twin of `(s, w)` is `(s + 1, −w)`.
+    ///
+    /// Both coordinates are solved on the atlas's neighbourhood graph, and the width is carried
+    /// through the charts' handedness, so the read exists only where the cover is twisted:
+    ///
+    /// 1. A graph edge `(i, j)` whose rows' home charts `a`, `b` resolve a handedness carries
+    ///    `τ_ij = sgn det(F_bᵀF_a)` ([`frame_handedness`], the sign the transitions carry), and
+    ///    `+1` inside one chart. When `τ` is a coboundary on the graph, a coherent row
+    ///    orientation exists, the cover carries no orientation-reversing holonomy, and the read
+    ///    is refused.
+    /// 2. The loop generator is the longest mean seam displacement over the well-conditioned
+    ///    non-tree transitions, either orientation. An edge's winding `k_ij` is the nearest
+    ///    integer to its developed gap's coefficient along that generator: `0` inside one sheet
+    ///    of the development, `±1` across a seam.
+    /// 3. The loop coordinate `θ` minimizes `Σ (θ_j − θ_i − k_ij)²` with row `0` pinned, and
+    ///    `s = θ − ⌊θ⌋`.
+    /// 4. The width increment along a resolved edge is its chart displacement across the loop,
+    ///    `η_ij = ⟨n_a, φ_a(x_j) − φ_a(x_i)⟩`, with `n_a` the unit normal to chart `a`'s gradient
+    ///    of `θ`. Carrying the width through the handedness gives `w_j = τ_ij·(w_i + η_ij)`. The
+    ///    least-squares system of those equations has matrix `D − τ∘A`, which is positive
+    ///    definite exactly when `τ` is not a coboundary, the twist step 1 found.
+    /// 5. The width is oriented over the band cut at `s = 0`, propagated along the resolved edges
+    ///    that do not cross that cut, so rows on either side of the cut are each other's deck
+    ///    twins. It is scaled by its largest magnitude.
+    ///
+    /// Refused for an orientable cover, for a cover with no non-tree seam, for a chart whose
+    /// rows resolve no gradient of `θ`, for a width system that does not factor, and for rows
+    /// the cut band does not reach.
+    fn mobius_quotient_coordinates(
+        &self,
+        z: ArrayView2<'_, f64>,
+        map: &DevelopingMap,
+        developed: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = developed.nrows();
+        if self.neighbourhood.len() != n {
+            return Err(format!(
+                "holonomy_quotient_coordinates: the atlas's neighbourhood graph has {} rows but {n} were supplied",
+                self.neighbourhood.len()
+            ));
+        }
+        let home = self.home_charts(z)?;
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for (i, neighbours) in self.neighbourhood.iter().enumerate() {
+            for &(j, _) in neighbours {
+                if j > i {
+                    edges.push((i, j));
+                }
+            }
+        }
+
+        // (1) The handedness of every edge whose home charts resolve one, and whether it is a
+        // coboundary.
+        let mut chart_pair_sign: BTreeMap<(usize, usize), Option<i8>> = BTreeMap::new();
+        let mut signed: Vec<(usize, usize, i8)> = Vec::with_capacity(edges.len());
+        for &(i, j) in &edges {
+            let (a, b) = (home[i].min(home[j]), home[i].max(home[j]));
+            let sign = if a == b {
+                Some(1)
+            } else {
+                *chart_pair_sign.entry((a, b)).or_insert_with(|| {
+                    frame_handedness(&self.charts[a], &self.charts[b]).resolved_sign()
+                })
+            };
+            if let Some(sign) = sign {
+                signed.push((i, j, sign));
+            }
+        }
+        let mut signed_adjacency: Vec<Vec<(usize, i8)>> = vec![Vec::new(); n];
+        for &(i, j, sign) in &signed {
+            signed_adjacency[i].push((j, sign));
+            signed_adjacency[j].push((i, sign));
+        }
+        let mut orientation = vec![0i8; n];
+        let mut contradicted = false;
+        for root in 0..n {
+            if orientation[root] != 0 {
+                continue;
+            }
+            orientation[root] = 1;
+            let mut queue = std::collections::VecDeque::from([root]);
+            while let Some(row) = queue.pop_front() {
+                for &(next, sign) in &signed_adjacency[row] {
+                    let required = orientation[row] * sign;
+                    if orientation[next] == 0 {
+                        orientation[next] = required;
+                        queue.push_back(next);
+                    } else if orientation[next] != required {
+                        contradicted = true;
+                    }
+                }
+            }
+        }
+        if !contradicted {
+            return Err(
+                "holonomy_quotient_coordinates: the charts' handedness is a coboundary on the rows' neighbourhood graph, so the cover carries no orientation-reversing holonomy and there is no band twist to read"
+                    .to_string(),
+            );
+        }
+
+        // (2) The loop generator.
+        let generator = self
+            .seam_displacements(z, map)
+            .into_iter()
+            .map(|seam| seam.displacement)
+            .max_by(|left, right| left.dot(left).total_cmp(&right.dot(right)))
+            .ok_or_else(|| {
+                "holonomy_quotient_coordinates: no well-conditioned non-tree transition, so no loop translation to read"
+                    .to_string()
+            })?;
+        let generator_sq = generator.dot(&generator);
+        if !(generator_sq > 0.0 && generator_sq.is_finite()) {
+            return Err(format!(
+                "holonomy_quotient_coordinates: the loop translation has no length (squared {generator_sq:.3e})"
+            ));
+        }
+
+        // (3) The harmonic loop coordinate, row 0 pinned.
+        let mut laplacian: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+        let mut loop_rhs = Array1::<f64>::zeros(n);
+        for &(i, j) in &edges {
+            let gap = &developed.row(j) - &developed.row(i);
+            let winding = (gap.dot(&generator) / generator_sq).round();
+            loop_rhs[j] += winding;
+            loop_rhs[i] -= winding;
+            *laplacian.entry((i, i)).or_insert(0.0) += 1.0;
+            *laplacian.entry((j, j)).or_insert(0.0) += 1.0;
+            *laplacian.entry((i, j)).or_insert(0.0) -= 1.0;
+        }
+        let mut theta = Array1::<f64>::zeros(n);
+        if n > 1 {
+            let pinned: BTreeMap<(usize, usize), f64> = laplacian
+                .iter()
+                .filter(|&(&(row, col), _)| row > 0 && col > 0)
+                .map(|(&(row, col), &value)| ((row - 1, col - 1), value))
+                .collect();
+            let solved = solve_sparse_symmetric(n - 1, &pinned, loop_rhs.slice(s![1..]))
+                .map_err(|error| {
+                    format!("holonomy_quotient_coordinates: the loop Laplacian did not factor: {error}")
+                })?;
+            theta.slice_mut(s![1..]).assign(&solved);
+        }
+        let loop_fraction = theta.mapv(|value| value - value.floor());
+
+        // (4) Each chart's unit normal to its gradient of θ, then the twisted width system.
+        let mut normals: Vec<[f64; 2]> = Vec::with_capacity(self.charts.len());
+        for (chart_index, (chart, patch)) in self.charts.iter().zip(self.patches.iter()).enumerate()
+        {
+            let center = chart.project(z.row(patch.center));
+            let mut gram = [[0.0_f64; 2]; 2];
+            let mut moment = [0.0_f64; 2];
+            for &member in &patch.members {
+                let image = chart.project(z.row(member));
+                let offset = [image[0] - center[0], image[1] - center[1]];
+                let lift = theta[member] - theta[patch.center];
+                let lift = lift - lift.round();
+                for r in 0..2 {
+                    moment[r] += offset[r] * lift;
+                    for c in 0..2 {
+                        gram[r][c] += offset[r] * offset[c];
+                    }
+                }
+            }
+            let det = gram[0][0] * gram[1][1] - gram[0][1] * gram[1][0];
+            let gradient = [
+                (gram[1][1] * moment[0] - gram[0][1] * moment[1]) / det,
+                (gram[0][0] * moment[1] - gram[1][0] * moment[0]) / det,
+            ];
+            let norm = gradient[0].hypot(gradient[1]);
+            if !(det > 0.0 && norm > 0.0 && norm.is_finite()) {
+                return Err(format!(
+                    "holonomy_quotient_coordinates: chart {chart_index} resolves no gradient of the loop coordinate (determinant {det:.3e}, gradient norm {norm:.3e})"
+                ));
+            }
+            normals.push([-gradient[1] / norm, gradient[0] / norm]);
+        }
+        let mut twisted: BTreeMap<(usize, usize), f64> = BTreeMap::new();
+        let mut width_rhs = Array1::<f64>::zeros(n);
+        for &(i, j, sign) in &signed {
+            let chart = home[i];
+            let from = self.charts[chart].project(z.row(i));
+            let to = self.charts[chart].project(z.row(j));
+            let increment =
+                normals[chart][0] * (to[0] - from[0]) + normals[chart][1] * (to[1] - from[1]);
+            let tau = f64::from(sign);
+            *twisted.entry((i, i)).or_insert(0.0) += 1.0;
+            *twisted.entry((j, j)).or_insert(0.0) += 1.0;
+            *twisted.entry((i, j)).or_insert(0.0) -= tau;
+            width_rhs[j] += tau * increment;
+            width_rhs[i] -= increment;
+        }
+        let width = solve_sparse_symmetric(n, &twisted, width_rhs.view()).map_err(|error| {
+            format!("holonomy_quotient_coordinates: the twisted width system did not factor: {error}")
+        })?;
+
+        // (5) Orient the width over the band cut at s = 0.
+        let mut sheet = vec![0i8; n];
+        sheet[0] = 1;
+        let mut queue = std::collections::VecDeque::from([0usize]);
+        while let Some(row) = queue.pop_front() {
+            for &(next, sign) in &signed_adjacency[row] {
+                if sheet[next] == 0 && (loop_fraction[next] - loop_fraction[row]).abs() <= 0.5 {
+                    sheet[next] = sheet[row] * sign;
+                    queue.push_back(next);
+                }
+            }
+        }
+        let unreached = sheet.iter().filter(|&&side| side == 0).count();
+        if unreached > 0 {
+            return Err(format!(
+                "holonomy_quotient_coordinates: {unreached} rows are not reached across the band cut at s = 0, so their width has no orientation"
+            ));
+        }
+        let scale = width.iter().fold(0.0_f64, |largest, value| largest.max(value.abs()));
+        if !(scale > 0.0 && scale.is_finite()) {
+            return Err(format!(
+                "holonomy_quotient_coordinates: the band width is degenerate (largest magnitude {scale:.3e})"
+            ));
+        }
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            coords[[row, 0]] = loop_fraction[row];
+            coords[[row, 1]] = f64::from(sheet[row]) * width[row] / scale;
+        }
+        Ok(coords)
     }
 
     /// The developing map's placement (#2280): each chart's rigid motion
@@ -1198,6 +1457,19 @@ impl LocalAtlas {
         z: ArrayView2<'_, f64>,
         map: &DevelopingMap,
     ) -> Result<Array2<f64>, String> {
+        let home = self.home_charts(z)?;
+        let mut coords = Array2::<f64>::zeros((z.nrows(), self.intrinsic_dim));
+        for (row, &chart) in home.iter().enumerate() {
+            let image = map.rotation[chart].dot(&self.charts[chart].project(z.row(row)))
+                + &map.offset[chart];
+            coords.row_mut(row).assign(&image);
+        }
+        Ok(coords)
+    }
+
+    /// Each row's home chart: the patch that contains it with the nearest center (lowest index
+    /// on a tie), or for a row no patch contains, the nearest center's chart.
+    fn home_charts(&self, z: ArrayView2<'_, f64>) -> Result<Vec<usize>, String> {
         let (n, p) = z.dim();
         if p != self.ambient_dim {
             return Err(format!(
@@ -1229,9 +1501,10 @@ impl LocalAtlas {
                 }
             }
         }
-        let mut coords = Array2::<f64>::zeros((n, self.intrinsic_dim));
-        for (row, owner) in home.into_iter().enumerate() {
-            let chart = match owner {
+        Ok(home
+            .into_iter()
+            .enumerate()
+            .map(|(row, owner)| match owner {
                 Some((chart, _)) => chart,
                 None => {
                     let mut nearest_chart = 0usize;
@@ -1245,12 +1518,8 @@ impl LocalAtlas {
                     }
                     nearest_chart
                 }
-            };
-            let image = map.rotation[chart].dot(&self.charts[chart].project(z.row(row)))
-                + &map.offset[chart];
-            coords.row_mut(row).assign(&image);
-        }
-        Ok(coords)
+            })
+            .collect())
     }
 
     /// The holonomy of every well-conditioned transition the spanning tree did not use, in
@@ -1281,11 +1550,16 @@ impl LocalAtlas {
         holonomies
     }
 
-    /// For every well-conditioned, orientation-preserving transition the spanning tree did not
-    /// use, the mean over its shared rows of a row's image through the `to` chart's placement
-    /// minus its image through the `from` chart's placement: the holonomy's translation where
-    /// the two sheets of the development meet (see `holonomy_quotient_coordinates`).
-    fn seam_displacements(&self, z: ArrayView2<'_, f64>, map: &DevelopingMap) -> Vec<Array1<f64>> {
+    /// For every well-conditioned transition the spanning tree did not use, the mean over its
+    /// shared rows of a row's image through the `to` chart's placement minus its image through
+    /// the `from` chart's placement: the holonomy's translation where the two sheets of the
+    /// development meet, and whether that holonomy reverses orientation (see
+    /// `holonomy_quotient_coordinates`).
+    fn seam_displacements(
+        &self,
+        z: ArrayView2<'_, f64>,
+        map: &DevelopingMap,
+    ) -> Vec<SeamDisplacement> {
         let mut displacements = Vec::new();
         for (index, transition) in self.transitions.iter().enumerate() {
             if map.in_tree[index]
@@ -1300,9 +1574,7 @@ impl LocalAtlas {
             let linear = map.rotation[to]
                 .dot(&transition.rotation)
                 .dot(&map.rotation[from].t());
-            if determinant(&linear) < 0.0 {
-                continue;
-            }
+            let reversing = determinant(&linear) < 0.0;
             let shared =
                 sorted_intersection(&self.patches[from].members, &self.patches[to].members);
             if shared.is_empty() {
@@ -1317,7 +1589,10 @@ impl LocalAtlas {
                 displacement += &(through_to - through_from);
             }
             displacement /= shared.len() as f64;
-            displacements.push(displacement);
+            displacements.push(SeamDisplacement {
+                displacement,
+                reversing,
+            });
         }
         displacements
     }
@@ -1690,48 +1965,9 @@ fn build_transition(
         }
     }
 
-    // ORIENTATION: the exact transition Jacobian. On the overlap the chart change is
-    //     c_to = F_toᵀ(μ_from − μ_to) + A · c_from + O(curvature),   A = F_toᵀ F_from,
-    // so the handedness relation of the two charts is sgn det A, with
-    // |det A| = ∏_k cos θ_k over the principal angles between the tangent planes.
-    // This is a property of the two FRAMES: unlike a Procrustes fit to the shared
-    // point cloud, it does not degrade when the overlap is small or elongated (where
-    // a reflection fits the points exactly as well as a rotation, at the same
-    // residual, and the fitted det is a coin flip).
-    let a_mat = frame_overlap(&chart_j.frame, &chart_i.frame);
-    let det_a = determinant(&a_mat);
-    let sign: i8 = if det_a >= 0.0 { 1 } else { -1 };
-
-    // RESOLVABILITY of that sign. The singular values of `A` are the cosines of the
-    // principal angles, so `det A` changes sign exactly when some `θ_k` crosses
-    // `π/2` — the handedness is a fact about the manifold only while every
-    // `cos θ_k` clears what the two frames' own estimation error could manufacture.
-    // `σ_min(A) = min_k cos θ_k` is the sharp quantity: `|det A| = ∏_k cos θ_k ≤
-    // σ_min(A)`, so gating the DETERMINANT against the same budget is the
-    // conservative relaxation, and at `d > 1` it refuses edges whose every angle is
-    // individually well resolved merely because the product of several cosines is
-    // small. The budget itself is derived from the two charts' certificates
-    // ([`frame_angular_resolution`]) rather than being a numerical floor: a floor
-    // asks "is this determinant distinguishable from zero in f64", which is a
-    // question about arithmetic, and the question the sign needs answered is
-    // whether it is distinguishable from zero given how well the two local PCAs
-    // pinned their tangent planes.
-    let sign_resolution_budget = combined_frame_resolution(
-        frame_angular_resolution(&chart_i.certificate),
-        frame_angular_resolution(&chart_j.certificate),
-    );
-    let smallest_principal_cosine = match a_mat.svd(false, false) {
-        Ok((_, sv, _)) => sv.iter().copied().fold(f64::INFINITY, f64::min),
-        // An unresolved SVD leaves the principal angles unknown, so the edge carries
-        // no handedness rather than a guessed one.
-        Err(_) => 0.0,
-    };
-    let smallest_principal_cosine = if smallest_principal_cosine.is_finite() {
-        smallest_principal_cosine
-    } else {
-        0.0
-    };
-    let frame_nondegenerate = smallest_principal_cosine > sign_resolution_budget;
+    let handedness = frame_handedness(chart_i, chart_j);
+    let sign = handedness.sign;
+    let frame_nondegenerate = handedness.resolved_sign().is_some();
 
     // ALIGNMENT: orthogonal Procrustes, minimize ‖C_to − R C_from‖_F over the
     // handedness class {R ∈ O(d) : det R = sign}. M = C_to C_fromᵀ (d × d);
@@ -1810,10 +2046,95 @@ fn build_transition(
         translation,
         sign,
         residual,
-        smallest_principal_cosine,
-        sign_resolution_budget,
+        smallest_principal_cosine: handedness.smallest_principal_cosine,
+        sign_resolution_budget: handedness.sign_resolution_budget,
         conditioning,
     }
+}
+
+/// The handedness of the chart change between two charts, with what it rests on.
+struct FrameHandedness {
+    /// `sgn det(F_toᵀ F_from)`.
+    sign: i8,
+    /// `σ_min(F_toᵀ F_from)`, the cosine of the largest principal angle between the planes.
+    smallest_principal_cosine: f64,
+    /// The two frames' combined angular resolution ([`combined_frame_resolution`]).
+    sign_resolution_budget: f64,
+}
+
+impl FrameHandedness {
+    /// The sign, while the smallest principal cosine clears the frames' combined resolution.
+    fn resolved_sign(&self) -> Option<i8> {
+        (self.smallest_principal_cosine > self.sign_resolution_budget).then_some(self.sign)
+    }
+}
+
+/// The handedness of the chart change `from → to` (#2280), read off the two frames.
+///
+/// ORIENTATION: the exact transition Jacobian. On an overlap the chart change is
+///     c_to = F_toᵀ(μ_from − μ_to) + A · c_from + O(curvature),   A = F_toᵀ F_from,
+/// so the handedness relation of the two charts is sgn det A, with
+/// |det A| = ∏_k cos θ_k over the principal angles between the tangent planes.
+/// This is a property of the two FRAMES: unlike a Procrustes fit to the shared
+/// point cloud, it does not degrade when the overlap is small or elongated (where
+/// a reflection fits the points exactly as well as a rotation, at the same
+/// residual, and the fitted det is a coin flip). `det A = det Aᵀ`, so the sign does
+/// not depend on which chart is `from`.
+///
+/// RESOLVABILITY of that sign. The singular values of `A` are the cosines of the
+/// principal angles, so `det A` changes sign exactly when some `θ_k` crosses
+/// `π/2` — the handedness is a fact about the manifold only while every
+/// `cos θ_k` clears what the two frames' own estimation error could manufacture.
+/// `σ_min(A) = min_k cos θ_k` is the sharp quantity: `|det A| = ∏_k cos θ_k ≤
+/// σ_min(A)`, so gating the DETERMINANT against the same budget is the
+/// conservative relaxation, and at `d > 1` it refuses edges whose every angle is
+/// individually well resolved merely because the product of several cosines is
+/// small. The budget itself is derived from the two charts' certificates
+/// ([`frame_angular_resolution`]) rather than being a numerical floor: a floor
+/// asks "is this determinant distinguishable from zero in f64", which is a
+/// question about arithmetic, and the question the sign needs answered is
+/// whether it is distinguishable from zero given how well the two local PCAs
+/// pinned their tangent planes.
+fn frame_handedness(from: &LocalChart, to: &LocalChart) -> FrameHandedness {
+    let a_mat = frame_overlap(&to.frame, &from.frame);
+    let sign: i8 = if determinant(&a_mat) >= 0.0 { 1 } else { -1 };
+    let sign_resolution_budget = combined_frame_resolution(
+        frame_angular_resolution(&from.certificate),
+        frame_angular_resolution(&to.certificate),
+    );
+    let smallest_principal_cosine = match a_mat.svd(false, false) {
+        Ok((_, sv, _)) => sv.iter().copied().fold(f64::INFINITY, f64::min),
+        // An unresolved SVD leaves the principal angles unknown, so the edge carries
+        // no handedness rather than a guessed one.
+        Err(_) => 0.0,
+    };
+    let smallest_principal_cosine = if smallest_principal_cosine.is_finite() {
+        smallest_principal_cosine
+    } else {
+        0.0
+    };
+    FrameHandedness {
+        sign,
+        smallest_principal_cosine,
+        sign_resolution_budget,
+    }
+}
+
+/// Solve `H·x = rhs` for a symmetric positive definite `H` given by its upper-triangle
+/// entries, through one sparse Cholesky factor.
+fn solve_sparse_symmetric(
+    dim: usize,
+    upper: &BTreeMap<(usize, usize), f64>,
+    rhs: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let triplets: Vec<Triplet<usize, usize, f64>> = upper
+        .iter()
+        .map(|(&(row, col), &value)| Triplet::new(row, col, value))
+        .collect();
+    let matrix = SparseColMat::try_new_from_triplets(dim, dim, &triplets)
+        .map_err(|error| format!("the sparse system did not assemble: {error:?}"))?;
+    let factor = factorize_sparse_spd(&matrix).map_err(|error| error.to_string())?;
+    solve_sparse_spd(&factor, &rhs).map_err(|error| error.to_string())
 }
 
 /// The `d × d` frame overlap `F_toᵀ F_from` — the Jacobian of the fitted chart
@@ -2500,9 +2821,8 @@ mod tests {
     /// same fixture. Recovery is the fraction of rows whose loop coordinate lands within half a
     /// lattice step of its planted position after the best rotation and reflection. The
     /// principal seeds are the ones discovery races: the leading pair's phase, and the
-    /// cylinder's phase with the third component as height. The Möbius band keeps its
-    /// principal double-cover seed, because its developed centerline curls
-    /// (`LocalAtlas::holonomy_quotient_coordinates`).
+    /// cylinder's phase with the third component as height. The Möbius band's read is pinned by
+    /// `holonomy_seeded_mobius_band_reads_its_twist_2906`.
     #[test]
     fn holonomy_seeded_loops_recover_their_planted_parameter_2906() {
         let mut shortfalls: Vec<String> = Vec::new();
@@ -2555,6 +2875,88 @@ mod tests {
             shortfalls.is_empty(),
             "holonomy-seeded loops must recover their planted parameter at least as well as the principal seed:\n{}",
             shortfalls.join("\n")
+        );
+    }
+
+    /// #2906 — a Möbius band seeded from the atlas reads its twist through the charts'
+    /// handedness, not only its base.
+    ///
+    /// On `mobius_strip(60, 14)` the loop coordinate must recover the planted base at least as
+    /// well as the principal double-cover seed discovery races, measured as in
+    /// `holonomy_seeded_loops_recover_their_planted_parameter_2906`. Within every loop column the
+    /// signed width must be monotone in the planted width, read on one sheet of the double
+    /// cover. The seed's coordinates identify `(s, w)` with its deck twin `(s + 1, −w)`, so a row
+    /// the cut at `s = 0` separates from its column's first row carries the other
+    /// representative, and its width is read negated. Job 1198326 measured column 0 of this band
+    /// straddling the cut: row 0 at `(0, 0.5595)`, its neighbours at `s ≈ 0.99` with the
+    /// opposite sign. The same read on
+    /// `cylinder_strip(60, 14)`, whose handedness is a coboundary, must refuse. A seed that read
+    /// only the base would accept the cylinder, since its loop reads exactly.
+    #[test]
+    fn holonomy_seeded_mobius_band_reads_its_twist_2906() {
+        let (n_u, n_v) = (60usize, 14usize);
+        let band = crate::manifold::tests_topology_fixtures::mobius_strip(n_u, n_v);
+        let atlas = LocalAtlas::build(band.view(), LocalAtlasConfig::balanced(band.nrows(), 2))
+            .expect("the planted band's atlas builds");
+        let quotient = atlas
+            .holonomy_quotient_coordinates(band.view(), GraphCompressionKind::MobiusStrip)
+            .expect("the planted band's handedness reads a twist");
+        let planted: Vec<f64> = (0..band.nrows())
+            .map(|row| (row / n_v) as f64 / n_u as f64)
+            .collect();
+        let step = 1.0 / n_u as f64;
+        let rows: Vec<usize> = (0..band.nrows()).collect();
+        let principal = crate::manifold::mobius_double_cover_coords_from_projection(
+            principal_projection(&band, 3).view(),
+            &rows,
+        )
+        .expect("the principal double cover reads the planted band");
+        let atlas_rate = loop_recovery_rate(quotient.column(0), &planted, step);
+        let principal_rate = loop_recovery_rate(principal.column(0), &planted, step);
+        let mut unordered = Vec::new();
+        for column in 0..n_u {
+            let reference = quotient[[column * n_v, 0]];
+            let widths: Vec<f64> = (0..n_v)
+                .map(|iv| {
+                    let row = column * n_v + iv;
+                    if (quotient[[row, 0]] - reference).abs() > 0.5 {
+                        -quotient[[row, 1]]
+                    } else {
+                        quotient[[row, 1]]
+                    }
+                })
+                .collect();
+            let rising = widths.windows(2).all(|pair| pair[1] > pair[0]);
+            let falling = widths.windows(2).all(|pair| pair[1] < pair[0]);
+            if !(rising || falling) {
+                unordered.push(format!("column {column}: {widths:?}"));
+            }
+        }
+        let cylinder = cylinder_strip(n_u, n_v);
+        let refusal =
+            LocalAtlas::build(cylinder.view(), LocalAtlasConfig::balanced(cylinder.nrows(), 2))
+                .expect("the planted cylinder's atlas builds")
+                .holonomy_quotient_coordinates(cylinder.view(), GraphCompressionKind::MobiusStrip)
+                .expect_err("an orientable cover has no twist to read");
+        eprintln!(
+            "[2906-mobius] base: holonomy seed {atlas_rate:.4}, principal double cover \
+             {principal_rate:.4}; width columns out of order {}/{n_u}; cylinder: {refusal}",
+            unordered.len()
+        );
+        assert!(
+            atlas_rate >= principal_rate,
+            "the band's holonomy seed must recover its base at least as well as the principal \
+             double cover: {atlas_rate:.4} against {principal_rate:.4}"
+        );
+        assert!(
+            unordered.is_empty(),
+            "the band's signed width must be monotone in the planted width in every loop \
+             column:\n{}",
+            unordered.join("\n")
+        );
+        assert!(
+            refusal.contains("coboundary"),
+            "the cylinder must be refused for carrying no twist, not for another reason: {refusal}"
         );
     }
 }

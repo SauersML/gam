@@ -35,10 +35,39 @@ pub(crate) enum FittedResponseDivergenceEstimator {
     /// eigensystem: the trace itself, to the arithmetic of one symmetric
     /// eigendecomposition.
     ExactSpectral,
-    /// The Rademacher average of `zᵀ A⁺ G z`, one Krylov `A⁺` solve per probe,
-    /// where the dense eigensystem is not admitted. `standard_error` is the
-    /// sample standard deviation of the probe values over `√probes`.
-    Hutchinson { probes: usize, standard_error: f64 },
+    /// Rademacher output-space probes where the dense eigensystem is not
+    /// admitted, one Krylov `A⁺` solve per probe ([`FittedResponseProbeEstimate`]).
+    /// `raw` is the raw frame's own estimate under a whitening metric, and `None`
+    /// where the raw frame is the likelihood frame. The divergence is the
+    /// likelihood frame's.
+    Hutchinson {
+        likelihood: FittedResponseProbeEstimate,
+        raw: Option<FittedResponseProbeEstimate>,
+    },
+}
+
+/// One frame's Rademacher estimate of its residual dof `ν = ‖I − R‖²_F` and of
+/// `tr R`, from output-space probes `z` with `E zzᵀ = I`. Each probe reads both
+/// `‖z − Rz‖²` and `zᵀRz` off one solve.
+///
+/// The probe count is derived from the consumer of `ν`. Under the noise model of
+/// [`SaeManifoldTerm::reconstruction_dispersion`], `RSS/φ` has variance `2ν`, so
+/// `φ̂ = RSS/ν` carries a relative sampling error `√(2/ν)` however `ν` is
+/// computed. The probes stop at the least count whose upper confidence bound on
+/// the variance of `‖z − Rz‖²`, over the count, is within `2ν̂`
+/// ([`hutchinson_residual_dof_resolved`]): there the Monte Carlo relative error of
+/// `ν̂` is within that sampling error. With `C = (I − R)ᵀ(I − R)`,
+/// `Var(zᵀCz) = 2(‖C‖²_F − Σᵢ Cᵢᵢ²) ≤ 2‖I − R‖²₂·ν`, so the count settles near
+/// `‖I − R‖²₂`. That norm is not known before probing: bounding it needs the
+/// smallest retained pencil eigenvalue, which no matrix-free route certifies.
+/// Each standard error is a sample standard deviation over `√probes`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FittedResponseProbeEstimate {
+    pub(crate) probes: usize,
+    pub(crate) residual_dof: f64,
+    pub(crate) residual_dof_standard_error: f64,
+    pub(crate) divergence: f64,
+    pub(crate) divergence_standard_error: f64,
 }
 
 /// The within-basin Stein degrees of freedom of the fitted reconstruction.
@@ -83,11 +112,142 @@ enum ResponseOutputGram {
 
 /// The frame a residual degree-of-freedom count is taken in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FittedResponseFrame {
+pub(crate) enum FittedResponseFrame {
     /// The likelihood scalars, with noise covariance `φ·Ω⁻¹`.
     Likelihood,
     /// The raw output scalars, with noise covariance `φ·I`.
     Raw,
+}
+
+/// Base seed of the fitted-response Rademacher probes. Any fixed stream gives
+/// unbiased probes. One fixed stream keeps every estimate bit-reproducible across
+/// runs, hosts and outer iterations. Each frame draws on its own stream.
+const FITTED_RESPONSE_HUTCHINSON_SEED: u64 = 0x5AED_A3D0_1ACE_9C01;
+
+/// A stationarity operator the caller already holds, which the fitted-response
+/// divergence reads instead of forming its own (#2933 F33).
+#[derive(Clone, Copy)]
+pub(crate) enum HeldResponseGeometry<'a> {
+    /// The fixed-frame exact stationarity eigensystem.
+    FixedFrame(&'a ExactHessianSpectralBlock),
+    /// A shape report's frame-integrated information (#2933 F35).
+    FrameMarginal(&'a FrameMarginalInformation),
+}
+
+/// How the frame-integrated fitted response is computed at a state's size.
+enum FrameIntegratedRoute {
+    /// The joint `(t, ξ)` pencil's dense eigensystem
+    /// ([`SaeManifoldTerm::frame_marginal_information`]).
+    Dense,
+    /// Output-space probes through the lifted evidence factor
+    /// ([`FrameIntegratedResponseOperator`]).
+    MatrixFree,
+    /// The unframed evidence factor the tangent operator is built on is not
+    /// admitted, so no route integrates the frames on this host.
+    Unavailable,
+}
+
+/// What a response probe reads off a term at one evidence factor: every atom's
+/// second jet, the border channels of that factor's layout, and the sphere
+/// blocks whose tangent projector the contraction and the read-out pass through.
+struct FittedResponseProbeRows {
+    second_jets: Vec<Array4<f64>>,
+    border: Vec<SaeBorderChannel>,
+    sphere_tangents: Vec<SphereTangentBlock>,
+}
+
+/// The frame-integrated fitted response applied through the lifted evidence
+/// factor, where the dense operator of
+/// [`SaeManifoldTerm::frame_marginal_information`] is not admitted (#2933 F39).
+///
+/// With `vec B = T·ξ`, the joint `(t, ξ)` layout's operators are the unframed ones
+/// pulled back: `A_ξ = diag(I, Tᵀ)·A·diag(I, T) + E` and
+/// `Φ_ξ = diag(I, Tᵀ)·Φ·diag(I, T)`. A probe's contraction and read-out pass
+/// through `diag(I, T)`, so `R = J·diag(I, T)·A_ξ⁺·diag(I, T)ᵀ·JᵀΩ`, the response the
+/// dense route decomposes. `A` and `Φ` are applied through the unframed evidence
+/// factor, as the dense route's probes and metric apply them, so nothing
+/// `(t + ξ)²` is formed.
+pub(crate) struct FrameIntegratedResponseOperator {
+    rho: SaeManifoldRho,
+    unframed: SaeManifoldTerm,
+    cache: ArrowFactorCache,
+    tangent: LearnedFrameTangentMap,
+    prepared: PreparedDecoderPriorBetaCurvature,
+    residual: PreparedResidualCurvatureRows,
+    rows: FittedResponseProbeRows,
+}
+
+impl FrameIntegratedResponseOperator {
+    /// `(‖z − Rz‖², zᵀRz)` for one output-space probe `z` of `frame`, given per row
+    /// and empty on a row of zero weight
+    /// ([`SaeManifoldTerm::fitted_response_probe`]).
+    pub(crate) fn probe(
+        &self,
+        frame: FittedResponseFrame,
+        z: &[Vec<f64>],
+    ) -> Result<(f64, f64), String> {
+        self.unframed
+            .fitted_response_probe(&self.cache, &self.rows, frame, z, &|rhs| self.solve(rhs))
+    }
+
+    /// `A_ξ⁺` on a contraction in the unframed `(t, vec B)` layout, returned in that
+    /// layout: pull the border back through `Tᵀ`, solve on the pencil
+    /// `(A_ξ, Φ_ξ)`, and lift the border through `T`.
+    fn solve(&self, rhs: &SaeArrowVector) -> Result<SaeArrowVector, String> {
+        let lift = &self.tangent.lift;
+        let lifted = |vector: &SaeArrowVector| SaeArrowVector {
+            t: vector.t.clone(),
+            beta: lift.dot(&vector.beta),
+        };
+        let pulled_back = |image: SaeArrowVector| SaeArrowVector {
+            beta: lift.t().dot(&image.beta),
+            t: image.t,
+        };
+        let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            let image = self.unframed.apply_exact_hessian_prepared(
+                &self.rho,
+                &self.cache,
+                &lifted(vector),
+                &self.prepared,
+                &self.residual,
+            )?;
+            let mut pulled = pulled_back(image);
+            pulled.beta += &self.tangent.cross_curvature.dot(&vector.beta);
+            Ok(pulled)
+        };
+        let apply_b = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            let direction = lifted(vector);
+            let image = crate::manifold::arrow_solver::apply_cached_arrow_hessian(
+                &self.cache,
+                direction.t.view(),
+                direction.beta.view(),
+            )?;
+            Ok(pulled_back(image))
+        };
+        let apply_b_raw = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            let direction = lifted(vector);
+            let image = apply_raw_cached_arrow_hessian(
+                &self.cache,
+                direction.t.view(),
+                direction.beta.view(),
+            )?;
+            Ok(pulled_back(image))
+        };
+        // An image sums `ξ` terms in the lift, is applied in the unframed `t + k_u`
+        // coordinates, sums `k_u` more in the pull-back, and on `A_ξ` adds `E·ξ`, so an
+        // entry accumulates at most `t + k_u` plus both lifts' inner dimensions plus one.
+        let (unframed_border, tangent_dim) = lift.dim();
+        let operator_terms =
+            self.cache.delta_t_len() + 2 * unframed_border + tangent_dim + 1;
+        let solved = solve_exact_stationarity_krylov_with_rounding(
+            &pulled_back(rhs.clone()),
+            &apply_a,
+            &apply_b,
+            &apply_b_raw,
+            operator_terms,
+        )?;
+        Ok(lifted(&solved))
+    }
 }
 
 /// Group border channels by output vector. A channel's reconstruction jet is a
@@ -111,6 +271,58 @@ fn border_output_classes(border: &[SaeBorderChannel]) -> (Vec<usize>, Vec<Vec<f6
         class_of.push(class);
     }
     (class_of, outputs)
+}
+
+/// The mean and the unbiased sample variance of at least two values.
+fn sample_mean_and_variance(values: &[f64]) -> (f64, f64) {
+    let count = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / count;
+    let spread = values
+        .iter()
+        .map(|value| (value - mean) * (value - mean))
+        .sum::<f64>();
+    (mean, spread / (count - 1.0))
+}
+
+/// One-sided level of the fitted-response probe count's variance bound
+/// ([`hutchinson_residual_dof_resolved`]): the rule stops early, with the
+/// residual dof's Monte Carlo variance still above the dispersion's sampling
+/// variance, at most this often for normal probe values. A declared level, not a
+/// derived one.
+const FITTED_RESPONSE_PROBE_VARIANCE_BOUND_LEVEL: f64 = 0.05;
+
+/// Whether the probe values `residuals`, each `‖z − Rz‖²`, resolve their mean
+/// `ν̂` to the sampling error the dispersion already carries
+/// ([`FittedResponseProbeEstimate`]).
+///
+/// The sample variance `σ̂²` of `s` normal values has `(s − 1)σ̂²/σ² ~ χ²_{s−1}`,
+/// so `σ²_U = (s − 1)σ̂²/χ²_{s−1}(α)`, with `χ²_{s−1}(α)` the lower `α` quantile,
+/// bounds the probe variance from above at level `1 − α`. The rule is
+/// `σ²_U/s ≤ 2ν̂`. A small sample under-reads the variance of the term it probes,
+/// and the bound's `(s − 1)/χ²_{s−1}(α)` inflation, about 254 at `s = 2` for
+/// `α = 0.05`, is what keeps two values that happen to sit close from stopping
+/// the probes. One value has no variance degrees of freedom and bounds nothing,
+/// so the least count follows from the quantile's domain.
+pub(crate) fn hutchinson_residual_dof_resolved(residuals: &[f64]) -> Result<bool, String> {
+    use statrs::distribution::ContinuousCDF;
+    let degrees_of_freedom = residuals.len().saturating_sub(1);
+    if degrees_of_freedom == 0 {
+        return Ok(false);
+    }
+    let (residual_dof, variance) = sample_mean_and_variance(residuals);
+    let quantile = statrs::distribution::ChiSquared::new(degrees_of_freedom as f64)
+        .map_err(|error| {
+            format!("Hutchinson probe count: χ² with {degrees_of_freedom} degrees of freedom: {error}")
+        })?
+        .inverse_cdf(FITTED_RESPONSE_PROBE_VARIANCE_BOUND_LEVEL);
+    if !(quantile.is_finite() && quantile > 0.0) {
+        return Err(format!(
+            "Hutchinson probe count: the lower {FITTED_RESPONSE_PROBE_VARIANCE_BOUND_LEVEL} quantile \
+             of χ² with {degrees_of_freedom} degrees of freedom is {quantile}"
+        ));
+    }
+    let variance_bound = degrees_of_freedom as f64 * variance / quantile;
+    Ok(variance_bound / residuals.len() as f64 <= 2.0 * residual_dof)
 }
 
 impl SaeManifoldTerm {
@@ -139,13 +351,18 @@ impl SaeManifoldTerm {
     /// through the one operator, never as a sum of separately inverted diagonal
     /// entries.
     ///
-    /// A learned decoder frame is estimated from the data, so where its tangent
-    /// operator is admitted the response integrates it
-    /// ([`Self::frame_integrated_fitted_response_divergence`], #2933 F39). Where
-    /// [`Self::frame_marginal_admission`] refuses, the frames are held at their
-    /// fitted orientation and the divergence is conditional on them, tagged with
-    /// the refusal. The TopK support and the converged basin are always held fixed,
-    /// so the trace carries no selection degrees of freedom (#2933 F37).
+    /// A learned decoder frame is estimated from the data, so wherever every framed
+    /// decoder has its frame's rank, and the fixed-rank manifold has a tangent
+    /// space, the response integrates the frames
+    /// ([`Self::frame_integrated_fitted_response_divergence`], #2933 F39). The
+    /// host's memory picks how: the dense joint eigensystem or output-space probes.
+    /// Both read the unframed evidence factor, so a host that cannot hold it holds
+    /// the frames at their fitted orientation, tagged
+    /// `UnframedObservedInformationNotAdmitted`. A rank-deficient frame has no
+    /// tangent space, so there too the frames are held fixed and the divergence is
+    /// conditional on them, tagged with that reason. The TopK support and the
+    /// converged basin are always held fixed, so the trace carries no selection
+    /// degrees of freedom (#2933 F37).
     pub(crate) fn fitted_response_divergence(
         &self,
         target: ArrayView2<'_, f64>,
@@ -156,125 +373,250 @@ impl SaeManifoldTerm {
         self.admit_fitted_response_divergence(target)?;
         let frame_conditioning = self.fitted_response_frame_conditioning().map_err(numerical)?;
         if frame_conditioning == SaeFrameConditioning::MarginalOverLearnedFrames {
-            return self.frame_integrated_fitted_response_divergence(rho, target);
+            return self.frame_integrated_fitted_response_divergence(rho, target, cache, None);
         }
+        self.fixed_frame_fitted_response_divergence(rho, target, cache, frame_conditioning)
+    }
+
+    /// The divergence over the coordinates of `cache` itself, with no learned frame
+    /// integrated: the exact spectral trace where the dense eigensystem is
+    /// admitted, output-space probes through the cached evidence factor otherwise.
+    fn fixed_frame_fitted_response_divergence(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        frame_conditioning: SaeFrameConditioning,
+    ) -> Result<FittedResponseDivergence, FittedResponseDivergenceRefusal> {
+        let numerical = |reason: String| FittedResponseDivergenceRefusal::Numerical { reason };
         let dim = sae_exact_stationarity_dim(cache.delta_t_len(), cache.k);
         if sae_exact_stationarity_admitted(dim, self.host_available_bytes) {
             let geometry = self
                 .materialize_exact_stationarity_geometry(rho, target, cache)
                 .map_err(numerical)?;
-            self.fitted_response_divergence_exact_spectral(&geometry, cache, frame_conditioning)
-        } else {
-            // The divergence shares the ARD trace lane's probe budget and seed: both
-            // are grouped Hutchinson traces of an arrow inverse at the same scale.
-            let probes = Self::ARD_TRACE_HUTCHINSON_PROBES;
-            let (divergence, standard_error) = self
-                .hutchinson_fitted_response_divergence(
-                    rho,
-                    target,
-                    cache,
-                    probes,
-                    Self::ARD_TRACE_HUTCHINSON_SEED,
-                )
-                .map_err(numerical)?;
-            // The residual dofs are probed in output space, where each probe's
-            // `‖z − Rz‖²` is non-negative, on streams disjoint from the divergence's.
-            let likelihood_residual_dof = self
-                .hutchinson_fitted_response_residual_dof(
-                    rho,
-                    target,
-                    cache,
-                    probes,
-                    Self::ARD_TRACE_HUTCHINSON_SEED.wrapping_add(1 << 32),
-                    FittedResponseFrame::Likelihood,
-                )
-                .map_err(numerical)?;
-            let raw_residual_dof = if self.data_curvature_metric().map_err(numerical)?.is_some() {
-                self.hutchinson_fitted_response_residual_dof(
-                    rho,
-                    target,
-                    cache,
-                    probes,
-                    Self::ARD_TRACE_HUTCHINSON_SEED.wrapping_add(2 << 32),
-                    FittedResponseFrame::Raw,
-                )
-                .map_err(numerical)?
-            } else {
-                likelihood_residual_dof
-            };
-            Ok(FittedResponseDivergence {
-                divergence,
-                likelihood_residual_dof,
-                raw_residual_dof,
-                estimator: FittedResponseDivergenceEstimator::Hutchinson {
-                    probes,
-                    standard_error,
-                },
+            return self.fitted_response_divergence_exact_spectral(
+                &geometry,
+                cache,
                 frame_conditioning,
-            })
+            );
         }
+        let rows = self.fitted_response_probe_rows(cache).map_err(numerical)?;
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+        let residual = self
+            .prepare_residual_curvature_rows(target, cache)
+            .map_err(numerical)?;
+        let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            self.apply_exact_hessian_prepared(rho, cache, vector, &prepared, &residual)
+        };
+        let apply_b = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            crate::manifold::arrow_solver::apply_cached_arrow_hessian(
+                cache,
+                vector.t.view(),
+                vector.beta.view(),
+            )
+        };
+        let apply_b_raw = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            apply_raw_cached_arrow_hessian(cache, vector.t.view(), vector.beta.view())
+        };
+        let solve = |rhs: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            solve_exact_stationarity_krylov(rhs, &apply_a, &apply_b, &apply_b_raw)
+        };
+        let (likelihood, raw) = self
+            .hutchinson_fitted_response(&|frame, z| {
+                self.fitted_response_probe(cache, &rows, frame, z, &solve)
+            })
+            .map_err(numerical)?;
+        Ok(Self::hutchinson_fitted_response_divergence(
+            likelihood,
+            raw,
+            frame_conditioning,
+        ))
     }
 
-    /// [`Self::fitted_response_divergence`] off a fixed-frame exact stationarity
-    /// geometry the caller already holds, so one shape report forms `A`'s
-    /// eigensystem once for the divergence and the covariance (#2933 F33). The
-    /// estimator is the exact spectral trace, whatever the admission would have
-    /// routed, because the eigensystem is already paid for. Resolved negative
-    /// modes are inverted exactly as on the admission-routed path. Where the learned
-    /// frames admit integration, the fixed-frame geometry describes a different
-    /// response, and the frame-integrated operator is formed instead.
+    /// [`Self::fitted_response_divergence`] off a stationarity operator the caller
+    /// already holds, so one shape report or criterion evaluation decomposes it
+    /// once for the divergence and its other consumers (#2933 F33). A fixed-frame
+    /// eigensystem is read with the exact spectral trace, whatever the admission
+    /// would have routed, because it is already paid for, and resolved negative
+    /// modes are inverted exactly as on the admission-routed path. Where the
+    /// learned frames are integrated, a fixed-frame geometry describes a different
+    /// response, so the frame-integrated one is formed instead, unless the caller
+    /// holds it.
     pub(crate) fn fitted_response_divergence_from_geometry(
         &self,
-        geometry: &ExactHessianSpectralBlock,
+        geometry: HeldResponseGeometry<'_>,
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,
         cache: &ArrowFactorCache,
     ) -> Result<FittedResponseDivergence, FittedResponseDivergenceRefusal> {
+        let numerical = |reason: String| FittedResponseDivergenceRefusal::Numerical { reason };
         self.admit_fitted_response_divergence(target)?;
-        let frame_conditioning = self
-            .fitted_response_frame_conditioning()
-            .map_err(|reason| FittedResponseDivergenceRefusal::Numerical { reason })?;
-        if frame_conditioning == SaeFrameConditioning::MarginalOverLearnedFrames {
-            return self.frame_integrated_fitted_response_divergence(rho, target);
+        let frame_conditioning = self.fitted_response_frame_conditioning().map_err(numerical)?;
+        match (frame_conditioning, geometry) {
+            (
+                SaeFrameConditioning::MarginalOverLearnedFrames,
+                HeldResponseGeometry::FrameMarginal(information),
+            ) => self.fitted_response_divergence_from_frame_marginal(information),
+            (
+                SaeFrameConditioning::MarginalOverLearnedFrames,
+                HeldResponseGeometry::FixedFrame(geometry),
+            ) => self.frame_integrated_fitted_response_divergence(rho, target, cache, Some(geometry)),
+            (frame_conditioning, HeldResponseGeometry::FixedFrame(geometry)) => {
+                self.fitted_response_divergence_exact_spectral(geometry, cache, frame_conditioning)
+            }
+            (frame_conditioning, HeldResponseGeometry::FrameMarginal(_)) => Err(numerical(format!(
+                "a frame-integrated information was held for a state whose fitted response is \
+                 {frame_conditioning:?}"
+            ))),
         }
-        self.fitted_response_divergence_exact_spectral(geometry, cache, frame_conditioning)
     }
 
     /// Which frame conditioning the fitted response takes at this state: none
-    /// without learned frames, integrated where [`Self::frame_marginal_admission`]
-    /// admits the tangent operator, conditional on the fitted frames otherwise.
+    /// without learned frames, integrated wherever every framed decoder has its
+    /// frame's rank, and conditional on the fitted frames where one does not,
+    /// because the fixed-rank manifold has no tangent space there. The host's
+    /// memory does not enter here: [`Self::frame_integrated_route`] reads it to pick
+    /// the route.
     fn fitted_response_frame_conditioning(&self) -> Result<SaeFrameConditioning, String> {
         if !self.frames_active() {
             return Ok(SaeFrameConditioning::NoLearnedFrames);
         }
-        Ok(match self.frame_marginal_admission()? {
-            None => SaeFrameConditioning::MarginalOverLearnedFrames,
-            Some(reason) => SaeFrameConditioning::ConditionalOnFittedFrames(reason),
-        })
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let Some(frame) = atom.decoder_frame.as_ref() else {
+                continue;
+            };
+            if atom.decoder_numerical_rank()? < frame.rank() {
+                return Ok(SaeFrameConditioning::ConditionalOnFittedFrames(
+                    SaeFrameMarginalUnavailable::FrameCoordinatesRankDeficient { atom: atom_idx },
+                ));
+            }
+        }
+        Ok(SaeFrameConditioning::MarginalOverLearnedFrames)
+    }
+
+    /// Which route computes the frame-integrated response at this state's size,
+    /// with `total_t` the coordinate block of the fitted cache, which dropping the
+    /// frames leaves unchanged.
+    ///
+    /// Both routes read the unframed evidence factor, whose reduced Schur is dense
+    /// in the unframed border `k_u = Σ M_k·p`. The dense route also materializes
+    /// `A` and `G` at `t + k_u` and decomposes the joint pencil at `t + ξ`, and
+    /// `ξ ≤ k_u` because each frame's rank is at most its basis size, so it is
+    /// admitted by [`sae_exact_stationarity_admitted`] at `t + k_u`, the predicate
+    /// the fixed-frame route asks at its own dimensions. The matrix-free route keeps
+    /// only the factor, the lift `T` (`k_u × ξ`) and `E` (`ξ × ξ`), each within the
+    /// factor's `k_u²`.
+    fn frame_integrated_route(&self, total_t: usize) -> Result<FrameIntegratedRoute, String> {
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        let total_basis: usize = self.atoms.iter().map(|atom| atom.basis_size()).sum();
+        let d_max = self
+            .atoms
+            .iter()
+            .map(SaeManifoldAtom::latent_dim)
+            .max()
+            .unwrap_or(0);
+        let unframed_border = self.beta_dim();
+        let Ok(plan) = sae_streaming_plan_for_shape_with_available(
+            n,
+            total_basis,
+            k_atoms,
+            d_max,
+            unframed_border,
+            self.gpu_policy,
+            self.host_available_bytes,
+        )?
+        .admitted_or_error(n, self.output_dim(), k_atoms) else {
+            return Ok(FrameIntegratedRoute::Unavailable);
+        };
+        if !plan.direct_admitted {
+            return Ok(FrameIntegratedRoute::Unavailable);
+        }
+        let dense_dim = sae_exact_stationarity_dim(total_t, unframed_border);
+        Ok(
+            if plan.direct_logdet_admitted()
+                && sae_exact_stationarity_admitted(dense_dim, self.host_available_bytes)
+            {
+                FrameIntegratedRoute::Dense
+            } else {
+                FrameIntegratedRoute::MatrixFree
+            },
+        )
     }
 
     /// The fitted-response divergence integrated over every learned frame (#2933
-    /// F39).
+    /// F39), on the route [`Self::frame_integrated_route`] admits.
     ///
     /// A framed decoder moves along `vec B = T·ξ`, `ξ = (vec δC, vec W)`, and its
     /// stationarity in `(t, ξ)` has Jacobian
     /// `A_ξ = [[A_tt, A_tB·T], [Tᵀ·A_Bt, Tᵀ·A_BB·T + E]]`
     /// ([`Self::frame_marginal_information`]). The data reach that stationarity
     /// through `∂F_ξ/∂y = −diag(I, T)ᵀ·JᵀΩ` at `ξ = 0`, with no `E`, so
-    /// `R = J·diag(I, T)·A_ξ⁺·diag(I, T)ᵀ·JᵀΩ` and every trace of
-    /// [`Self::spectral_fitted_response_traces`] reads the lifted curvature
-    /// `G_ξ = diag(I, T)ᵀ·G·diag(I, T)` of the unframed `(t, vec B)` data curvature,
-    /// over the retained directions of `A_ξ`. The frame orientations then carry
+    /// `R = J·diag(I, T)·A_ξ⁺·diag(I, T)ᵀ·JᵀΩ`. The frame orientations then carry
     /// their actual response instead of a count of fully determined directions.
+    ///
+    /// Where neither route is admitted, the frames are held at their fitted
+    /// orientation on the fitted `cache`, tagged
+    /// `UnframedObservedInformationNotAdmitted`: `fixed_frame` is the caller's
+    /// eigensystem of that cache when it holds one.
     fn frame_integrated_fitted_response_divergence(
         &self,
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        fixed_frame: Option<&ExactHessianSpectralBlock>,
     ) -> Result<FittedResponseDivergence, FittedResponseDivergenceRefusal> {
         let numerical = |reason: String| FittedResponseDivergenceRefusal::Numerical { reason };
-        let information = self
-            .frame_marginal_information(rho, target, None)
-            .map_err(numerical)?;
+        match self.frame_integrated_route(cache.delta_t_len()).map_err(numerical)? {
+            FrameIntegratedRoute::Dense => {
+                let information = self
+                    .frame_marginal_information(rho, target, None)
+                    .map_err(numerical)?;
+                self.fitted_response_divergence_from_frame_marginal(&information)
+            }
+            FrameIntegratedRoute::MatrixFree => {
+                let operator = self
+                    .frame_integrated_response_operator(rho, target, None)
+                    .map_err(numerical)?;
+                let (likelihood, raw) = self
+                    .hutchinson_fitted_response(&|frame, z| operator.probe(frame, z))
+                    .map_err(numerical)?;
+                Ok(Self::hutchinson_fitted_response_divergence(
+                    likelihood,
+                    raw,
+                    SaeFrameConditioning::MarginalOverLearnedFrames,
+                ))
+            }
+            FrameIntegratedRoute::Unavailable => {
+                let frame_conditioning = SaeFrameConditioning::ConditionalOnFittedFrames(
+                    SaeFrameMarginalUnavailable::UnframedObservedInformationNotAdmitted,
+                );
+                match fixed_frame {
+                    Some(geometry) => self.fitted_response_divergence_exact_spectral(
+                        geometry,
+                        cache,
+                        frame_conditioning,
+                    ),
+                    None => self.fixed_frame_fitted_response_divergence(
+                        rho,
+                        target,
+                        cache,
+                        frame_conditioning,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The frame-integrated divergence off the dense joint information: every trace
+    /// of [`Self::spectral_fitted_response_traces`] reads the lifted curvature
+    /// `G_ξ = diag(I, T)ᵀ·G·diag(I, T)` of the unframed `(t, vec B)` data curvature,
+    /// over the retained directions of `A_ξ`.
+    fn fitted_response_divergence_from_frame_marginal(
+        &self,
+        information: &FrameMarginalInformation,
+    ) -> Result<FittedResponseDivergence, FittedResponseDivergenceRefusal> {
+        let numerical = |reason: String| FittedResponseDivergenceRefusal::Numerical { reason };
         let total_t = information.total_t;
         let lift = &information.tangent.lift;
         let (beta_dim, xi_dim) = lift.dim();
@@ -387,14 +729,9 @@ impl SaeManifoldTerm {
                 geometry.eigenvectors.dim()
             ));
         }
-        let retained: Vec<usize> = (0..dim)
-            .filter(|&index| geometry.eigenvalues[index].abs() > geometry.rank_floor(index))
-            .collect();
-        let basis = geometry.eigenvectors.select(ndarray::Axis(1), &retained);
-        let inverse: Vec<f64> = retained
-            .iter()
-            .map(|&index| 1.0 / geometry.eigenvalues[index])
-            .collect();
+        // #2234 — `A⁺ = B·diag(w)·Bᵀ` over the resolved directions, from the block's one owner, so an
+        // orbit-stiffened block hands out the exact-`A` response rather than `A_s⁺`.
+        let (basis, inverse) = geometry.retained_pseudo_inverse_factors();
         let project = |gram: ResponseOutputGram| -> Result<Array2<f64>, String> {
             let curvature = curvature(gram)?;
             if curvature.dim() != (dim, dim) {
@@ -459,258 +796,375 @@ impl SaeManifoldTerm {
         ))
     }
 
-    /// Output-space Rademacher estimate of one frame's residual dof `‖I − R‖²_F`.
+    /// The unframed model at this state, assembled and factored for evidence: the
+    /// term with every frame dropped, its assembled system, and that system's
+    /// undamped evidence factor. Both frame-integrated routes read it (#2933
+    /// F35/F39).
     ///
-    /// For `z` with `E zzᵀ = I`, `E‖(I − R)z‖² = ‖I − R‖²_F`. Each probe is
-    /// non-negative, whereas `N − 2 tr R + ‖R‖²_F` from separate trace estimates can
-    /// cancel to either sign near interpolation. On the likelihood frame
-    /// `Ω^{½} = √wᵢ Uᵢᵀ` with `Mᵢ = UᵢUᵢᵀ` (`√wᵢ I` unwhitened), so a probe contracts
-    /// `J̃ᵢᵀUᵢzᵢ`, solves `A⁺`, and reads `UᵢᵀJ̃ᵢu`. On the raw frame `R = JA⁺JᵀΩ`, so
-    /// it contracts `J̃ᵢᵀ√wᵢMᵢzᵢ` and reads `J̃ᵢu/√wᵢ`.
-    fn hutchinson_fitted_response_residual_dof(
+    /// The decoder `B_k` is authoritative on a framed atom, so dropping every frame
+    /// leaves the state unchanged. `Clone` resets the collapse-prevention gates, and
+    /// an unframed assembly with no gates re-derives them from the state. The
+    /// criterion priced the gates this term holds, declared by the outer objective
+    /// or frozen at the criterion's entry, so the clone declares exactly those.
+    /// Otherwise the separation barrier's routing coactivations `q_jk` and effective
+    /// sample sizes, the repulsion gate and the amplitude turn-on radius of the
+    /// frame-integrated operator would be re-derived at this state, and it would not
+    /// be the operator the criterion and the fixed-frame covariance read.
+    fn unframed_evidence_factorization(
         &self,
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,
+        registry: Option<&AnalyticPenaltyRegistry>,
+    ) -> Result<(SaeManifoldTerm, ArrowSchurSystem, ArrowFactorCache), String> {
+        let mut unframed = self.clone();
+        for atom in unframed.atoms.iter_mut() {
+            atom.deactivate_decoder_frame();
+        }
+        unframed.declare_collapse_prevention_gates(&self.collapse_prevention_gates());
+        let mut system = unframed.assemble_arrow_schur(target, rho, registry)?;
+        Self::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
+        let (_delta_t, _delta_beta, cache) = solve_arrow_newton_step_with_options(
+            &system,
+            0.0,
+            0.0,
+            &unframed.evidence_factor_options(),
+        )
+        .map_err(|err| format!("frame-integrated operator: unframed evidence factor: {err}"))?;
+        Ok((unframed, system, cache))
+    }
+
+    /// The frame-integrated fitted response through the lifted evidence factor at
+    /// this state ([`FrameIntegratedResponseOperator`]).
+    pub(crate) fn frame_integrated_response_operator(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        registry: Option<&AnalyticPenaltyRegistry>,
+    ) -> Result<FrameIntegratedResponseOperator, String> {
+        let (unframed, system, cache) =
+            self.unframed_evidence_factorization(rho, target, registry)?;
+        let tangent = LearnedFrameTangentMap::new(self, system.gb.view())?;
+        // The assembled system holds the dense `k_u × k_u` border Hessian, which the
+        // factor has already reduced; the probes read only the factor.
+        drop(system);
+        let prepared = unframed.prepare_decoder_prior_beta_curvature(1.0);
+        let residual = unframed.prepare_residual_curvature_rows(target, &cache)?;
+        let rows = unframed.fitted_response_probe_rows(&cache)?;
+        Ok(FrameIntegratedResponseOperator {
+            rho: rho.clone(),
+            unframed,
+            cache,
+            tangent,
+            prepared,
+            residual,
+            rows,
+        })
+    }
+
+    /// What [`Self::fitted_response_probe`] reads off this term at `cache`.
+    fn fitted_response_probe_rows(
+        &self,
         cache: &ArrowFactorCache,
-        probes: usize,
-        seed: u64,
+    ) -> Result<FittedResponseProbeRows, String> {
+        Ok(FittedResponseProbeRows {
+            second_jets: self.atom_second_jets()?,
+            border: self.border_channels_for_cache(cache)?,
+            sphere_tangents: self.sphere_tangent_blocks(&cache.row_dims)?,
+        })
+    }
+
+    /// Entries of one row's output-space probe on `frame`: the whitening metric's
+    /// rank on the likelihood frame, the output dimension otherwise.
+    fn fitted_response_probe_width(&self, frame: FittedResponseFrame) -> Result<usize, String> {
+        Ok(match (frame, self.data_curvature_metric()?) {
+            (FittedResponseFrame::Likelihood, Some(metric)) => metric.metric_rank(),
+            _ => self.output_dim(),
+        })
+    }
+
+    /// `(‖z − Rz‖², zᵀRz)` for one output-space probe `z` of `frame` against the
+    /// evidence factor `cache`, with `z` given per row and empty on a row of zero
+    /// weight, which carries no scalar. `z` is contracted into the stationarity's
+    /// right-hand side, `solve` applies `A⁺` in `cache`'s `(t, β)` layout, and the
+    /// response is read back out.
+    ///
+    /// For `z` with `E zzᵀ = I`, `E‖(I − R)z‖² = ‖I − R‖²_F` and `E zᵀRz = tr R`. Each
+    /// `‖(I − R)z‖²` is non-negative, whereas `N − 2 tr R + ‖R‖²_F` from separate
+    /// trace estimates can cancel to either sign near interpolation. On the
+    /// likelihood frame `Ω^{½} = √wᵢ Uᵢᵀ` with `Mᵢ = UᵢUᵢᵀ` (`√wᵢ I` unwhitened), so a
+    /// probe contracts `J̃ᵢᵀUᵢzᵢ`, solves `A⁺`, and reads `UᵢᵀJ̃ᵢu`. On the raw frame
+    /// `R = JA⁺JᵀΩ`, so it contracts `J̃ᵢᵀ√wᵢMᵢzᵢ` and reads `J̃ᵢu/√wᵢ`, and its `zᵀRz`
+    /// estimates the same trace, because that `R` is similar to the likelihood
+    /// frame's. #2933 F36 — `R = J·P·A⁺·P·JᵀΩ` on sphere blocks: the contraction and
+    /// the solve's read-out both pass through the tangent projector.
+    fn fitted_response_probe(
+        &self,
+        cache: &ArrowFactorCache,
+        rows: &FittedResponseProbeRows,
         frame: FittedResponseFrame,
-    ) -> Result<f64, String> {
+        z: &[Vec<f64>],
+        solve: &dyn Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    ) -> Result<(f64, f64), String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let total_t = cache.delta_t_len();
-        let k = cache.k;
-        let second_jets = self.atom_second_jets()?;
-        let border = self.border_channels_for_cache(cache)?;
         let metric = self.data_curvature_metric()?;
-        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-        let residual = self.prepare_residual_curvature_rows(target, cache)?;
-        let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            self.apply_exact_hessian_prepared(rho, cache, vector, &prepared, &residual)
-        };
-        let apply_b = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            crate::manifold::arrow_solver::apply_cached_arrow_hessian(
-                cache,
-                vector.t.view(),
-                vector.beta.view(),
-            )
-        };
-        let apply_b_raw = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            apply_raw_cached_arrow_hessian(cache, vector.t.view(), vector.beta.view())
-        };
         let weights = self.row_loss_weights.as_deref();
-        // #2933 F36 — `R = J·P·A⁺·P·JᵀΩ` on sphere blocks: the probe's contraction
-        // and the solve's read-out both pass through the tangent projector.
-        let sphere_tangents = self.sphere_tangent_blocks(&cache.row_dims)?;
-        let probes = probes.max(1);
-        let mut accumulated = 0.0_f64;
-        for probe in 0..probes {
-            let mut state = seed.wrapping_add(probe as u64);
-            let mut bits = 0u64;
-            let mut remaining = 0u32;
-            let mut draw = || {
-                if remaining == 0 {
-                    bits = gam_linalg::utils::splitmix64(&mut state);
-                    remaining = 64;
-                }
-                let value = if bits & 1 == 1 { 1.0 } else { -1.0 };
-                bits >>= 1;
-                remaining -= 1;
-                value
-            };
-            let mut rhs = SaeArrowVector {
-                t: Array1::<f64>::zeros(total_t),
-                beta: Array1::<f64>::zeros(k),
-            };
-            let mut row_probes: Vec<Vec<f64>> = Vec::with_capacity(n);
-            let mut window: std::collections::VecDeque<SaeRowJets> =
-                std::collections::VecDeque::new();
-            let mut next = 0usize;
-            for row in 0..n {
-                if window.is_empty() {
-                    next = self.refill_jet_window(next, cache, &second_jets, &border, &mut window)?;
-                }
-                let jets = window.pop_front().ok_or_else(|| {
-                    format!("residual dof probe: the jet refill built no row {row}")
-                })?;
-                let weight = weights.map_or(1.0, |weights| weights[row]);
-                if !(weight > 0.0) {
-                    row_probes.push(Vec::new());
-                    continue;
-                }
-                let base = cache.row_offsets[row];
-                let q = cache.row_dims[row];
-                if jets.vars.len() != q {
-                    return Err(format!(
-                        "residual dof probe: row {row} jets have {} variables, cache row has {q}",
-                        jets.vars.len()
-                    ));
-                }
-                let z: Vec<f64> = match (frame, metric) {
-                    (FittedResponseFrame::Likelihood, Some(metric)) => {
-                        (0..metric.metric_rank()).map(|_| draw()).collect()
-                    }
-                    _ => (0..p).map(|_| draw()).collect(),
-                };
-                let output: Vec<f64> = match (frame, metric) {
-                    (FittedResponseFrame::Likelihood, Some(metric)) => (0..p)
-                        .map(|out| {
-                            z.iter()
-                                .enumerate()
-                                .map(|(column, &value)| metric.factor_entry(row, out, column) * value)
-                                .sum()
-                        })
-                        .collect(),
-                    (FittedResponseFrame::Raw, Some(metric)) => metric
-                        .apply_metric_row(row, ndarray::aview1(&z))
-                        .into_iter()
-                        .map(|value| weight.sqrt() * value)
-                        .collect(),
-                    (_, None) => z.clone(),
-                };
-                for a in 0..q {
-                    rhs.t[base + a] += sae_dot(jets.first(a), &output);
-                }
-                for (position, channel) in border.iter().enumerate() {
-                    rhs.beta[channel.index] += sae_dot(jets.beta(position), &output);
-                }
-                row_probes.push(z);
+        let width = self.fitted_response_probe_width(frame)?;
+        if z.len() != n {
+            return Err(format!(
+                "response probe: {} probe rows for {n} observations",
+                z.len()
+            ));
+        }
+        let mut rhs = SaeArrowVector {
+            t: Array1::<f64>::zeros(total_t),
+            beta: Array1::<f64>::zeros(cache.k),
+        };
+        let mut window: std::collections::VecDeque<SaeRowJets> = std::collections::VecDeque::new();
+        let mut next = 0usize;
+        for row in 0..n {
+            if window.is_empty() {
+                next = self.refill_jet_window(
+                    next,
+                    cache,
+                    &rows.second_jets,
+                    &rows.border,
+                    &mut window,
+                )?;
             }
-            project_sphere_tangent_slots(&sphere_tangents, &cache.row_offsets, &mut rhs.t.view_mut());
-            let mut solved =
-                solve_exact_stationarity_krylov(&rhs, &apply_a, &apply_b, &apply_b_raw)?;
-            project_sphere_tangent_slots(
-                &sphere_tangents,
-                &cache.row_offsets,
-                &mut solved.t.view_mut(),
-            );
-            let mut window: std::collections::VecDeque<SaeRowJets> =
-                std::collections::VecDeque::new();
-            let mut next = 0usize;
-            let mut response = vec![0.0_f64; p];
-            for row in 0..n {
-                if window.is_empty() {
-                    next = self.refill_jet_window(next, cache, &second_jets, &border, &mut window)?;
-                }
-                let jets = window.pop_front().ok_or_else(|| {
-                    format!("residual dof probe: the jet refill built no row {row}")
-                })?;
-                let z = &row_probes[row];
-                if z.is_empty() {
-                    continue;
-                }
-                let base = cache.row_offsets[row];
-                let q = cache.row_dims[row];
-                response.fill(0.0);
-                for a in 0..q {
-                    let coefficient = solved.t[base + a];
-                    for (slot, &value) in response.iter_mut().zip(jets.first(a)) {
-                        *slot += coefficient * value;
-                    }
-                }
-                for (position, channel) in border.iter().enumerate() {
-                    let coefficient = solved.beta[channel.index];
-                    for (slot, &value) in response.iter_mut().zip(jets.beta(position)) {
-                        *slot += coefficient * value;
-                    }
-                }
-                let weight = weights.map_or(1.0, |weights| weights[row]);
-                let image: Vec<f64> = match (frame, metric) {
-                    (FittedResponseFrame::Likelihood, Some(metric)) => {
-                        metric.whiten_residual_row(row, ndarray::aview1(&response))
-                    }
-                    (FittedResponseFrame::Raw, Some(_)) => {
-                        response.iter().map(|value| value / weight.sqrt()).collect()
-                    }
-                    (_, None) => response.clone(),
-                };
-                accumulated += z
-                    .iter()
-                    .zip(&image)
-                    .map(|(probe_value, image_value)| (probe_value - image_value).powi(2))
-                    .sum::<f64>();
+            let jets = window
+                .pop_front()
+                .ok_or_else(|| format!("response probe: the jet refill built no row {row}"))?;
+            let weight = weights.map_or(1.0, |weights| weights[row]);
+            let z_row = &z[row];
+            let expected = if weight > 0.0 { width } else { 0 };
+            if z_row.len() != expected {
+                return Err(format!(
+                    "response probe: row {row} of weight {weight} carries {} probe entries, not \
+                     {expected}",
+                    z_row.len()
+                ));
+            }
+            if z_row.is_empty() {
+                continue;
+            }
+            let base = cache.row_offsets[row];
+            let q = cache.row_dims[row];
+            if jets.vars.len() != q {
+                return Err(format!(
+                    "response probe: row {row} jets have {} variables, cache row has {q}",
+                    jets.vars.len()
+                ));
+            }
+            let output: Vec<f64> = match (frame, metric) {
+                (FittedResponseFrame::Likelihood, Some(metric)) => (0..p)
+                    .map(|out| {
+                        z_row
+                            .iter()
+                            .enumerate()
+                            .map(|(column, &value)| metric.factor_entry(row, out, column) * value)
+                            .sum()
+                    })
+                    .collect(),
+                (FittedResponseFrame::Raw, Some(metric)) => metric
+                    .apply_metric_row(row, ndarray::aview1(z_row))
+                    .into_iter()
+                    .map(|value| weight.sqrt() * value)
+                    .collect(),
+                (_, None) => z_row.clone(),
+            };
+            for a in 0..q {
+                rhs.t[base + a] += sae_dot(jets.first(a), &output);
+            }
+            for (position, channel) in rows.border.iter().enumerate() {
+                rhs.beta[channel.index] += sae_dot(jets.beta(position), &output);
             }
         }
-        let residual_dof = accumulated / probes as f64;
-        if !residual_dof.is_finite() {
-            return Err(format!("Hutchinson residual dof is non-finite: {residual_dof}"));
+        project_sphere_tangent_slots(&rows.sphere_tangents, &cache.row_offsets, &mut rhs.t.view_mut());
+        let mut solved = solve(&rhs)?;
+        if solved.t.len() != total_t || solved.beta.len() != cache.k {
+            return Err(format!(
+                "response probe: the solve returned (t={}, beta={}) for (t={total_t}, beta={})",
+                solved.t.len(),
+                solved.beta.len(),
+                cache.k
+            ));
         }
-        Ok(residual_dof)
+        project_sphere_tangent_slots(
+            &rows.sphere_tangents,
+            &cache.row_offsets,
+            &mut solved.t.view_mut(),
+        );
+        let mut window: std::collections::VecDeque<SaeRowJets> = std::collections::VecDeque::new();
+        let mut next = 0usize;
+        let mut response = vec![0.0_f64; p];
+        let mut residual = 0.0_f64;
+        let mut divergence = 0.0_f64;
+        for row in 0..n {
+            if window.is_empty() {
+                next = self.refill_jet_window(
+                    next,
+                    cache,
+                    &rows.second_jets,
+                    &rows.border,
+                    &mut window,
+                )?;
+            }
+            let jets = window
+                .pop_front()
+                .ok_or_else(|| format!("response probe: the jet refill built no row {row}"))?;
+            let z_row = &z[row];
+            if z_row.is_empty() {
+                continue;
+            }
+            let base = cache.row_offsets[row];
+            let q = cache.row_dims[row];
+            response.fill(0.0);
+            for a in 0..q {
+                let coefficient = solved.t[base + a];
+                for (slot, &value) in response.iter_mut().zip(jets.first(a)) {
+                    *slot += coefficient * value;
+                }
+            }
+            for (position, channel) in rows.border.iter().enumerate() {
+                let coefficient = solved.beta[channel.index];
+                for (slot, &value) in response.iter_mut().zip(jets.beta(position)) {
+                    *slot += coefficient * value;
+                }
+            }
+            let weight = weights.map_or(1.0, |weights| weights[row]);
+            let image: Vec<f64> = match (frame, metric) {
+                (FittedResponseFrame::Likelihood, Some(metric)) => {
+                    metric.whiten_residual_row(row, ndarray::aview1(&response))
+                }
+                (FittedResponseFrame::Raw, Some(_)) => {
+                    response.iter().map(|value| value / weight.sqrt()).collect()
+                }
+                (_, None) => response.clone(),
+            };
+            if image.len() != z_row.len() {
+                return Err(format!(
+                    "response probe: row {row} reads {} response entries for {} probe entries",
+                    image.len(),
+                    z_row.len()
+                ));
+            }
+            for (probe_value, image_value) in z_row.iter().zip(&image) {
+                residual += (probe_value - image_value).powi(2);
+                divergence += probe_value * image_value;
+            }
+        }
+        Ok((residual, divergence))
     }
 
-    /// Rademacher Hutchinson estimate of `tr(A⁺G)` and its standard error: each
-    /// probe is one data curvature apply and one Krylov exact-stationarity solve
-    /// against the cached arrow factorization, so nothing `dim × dim` is formed.
-    /// The standard error is the sample standard deviation of the probe values
-    /// over `√probes`.
-    fn hutchinson_fitted_response_divergence(
+    /// Both frames' [`FittedResponseProbeEstimate`]s through `probe`, one
+    /// [`Self::fitted_response_probe`] against some solve: the likelihood frame's,
+    /// and the raw frame's own where the metric whitens.
+    fn hutchinson_fitted_response(
         &self,
-        rho: &SaeManifoldRho,
-        target: ArrayView2<'_, f64>,
-        cache: &ArrowFactorCache,
-        probes: usize,
+        probe: &dyn Fn(FittedResponseFrame, &[Vec<f64>]) -> Result<(f64, f64), String>,
+    ) -> Result<(FittedResponseProbeEstimate, Option<FittedResponseProbeEstimate>), String> {
+        let likelihood = self.hutchinson_fitted_response_frame(
+            FittedResponseFrame::Likelihood,
+            FITTED_RESPONSE_HUTCHINSON_SEED.wrapping_add(1 << 32),
+            probe,
+        )?;
+        let raw = match self.data_curvature_metric()? {
+            Some(_) => Some(self.hutchinson_fitted_response_frame(
+                FittedResponseFrame::Raw,
+                FITTED_RESPONSE_HUTCHINSON_SEED.wrapping_add(2 << 32),
+                probe,
+            )?),
+            None => None,
+        };
+        Ok((likelihood, raw))
+    }
+
+    /// One frame's [`FittedResponseProbeEstimate`]: Rademacher probes on the stream
+    /// `seed`, drawn until the residual dof's Monte Carlo variance is within the
+    /// sampling variance the dispersion already carries.
+    fn hutchinson_fitted_response_frame(
+        &self,
+        frame: FittedResponseFrame,
         seed: u64,
-    ) -> Result<(f64, f64), String> {
-        let total_t = cache.delta_t_len();
-        let k = cache.k;
-        let second_jets = self.atom_second_jets()?;
-        let border = self.border_channels_for_cache(cache)?;
-        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-        let residual = self.prepare_residual_curvature_rows(target, cache)?;
-        let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            self.apply_exact_hessian_prepared(rho, cache, vector, &prepared, &residual)
-        };
-        let apply_b = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            crate::manifold::arrow_solver::apply_cached_arrow_hessian(
-                cache,
-                vector.t.view(),
-                vector.beta.view(),
-            )
-        };
-        let apply_b_raw = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            apply_raw_cached_arrow_hessian(cache, vector.t.view(), vector.beta.view())
-        };
-        if probes < 2 {
-            return Err(format!(
-                "Hutchinson divergence needs at least two probes for a standard error; got {probes}"
-            ));
+        probe: &dyn Fn(FittedResponseFrame, &[Vec<f64>]) -> Result<(f64, f64), String>,
+    ) -> Result<FittedResponseProbeEstimate, String> {
+        let mut residuals: Vec<f64> = Vec::new();
+        let mut divergences: Vec<f64> = Vec::new();
+        loop {
+            let z = self.rademacher_response_probe(frame, seed.wrapping_add(residuals.len() as u64))?;
+            let (residual, divergence) = probe(frame, &z)?;
+            if !(residual.is_finite() && divergence.is_finite()) {
+                return Err(format!(
+                    "Hutchinson probe {} of the {frame:?} frame is non-finite: ‖z − Rz‖² = \
+                     {residual}, zᵀRz = {divergence}",
+                    residuals.len()
+                ));
+            }
+            residuals.push(residual);
+            divergences.push(divergence);
+            if hutchinson_residual_dof_resolved(&residuals)? {
+                let probes = residuals.len();
+                let (residual_dof, residual_variance) = sample_mean_and_variance(&residuals);
+                let (divergence, divergence_variance) = sample_mean_and_variance(&divergences);
+                return Ok(FittedResponseProbeEstimate {
+                    probes,
+                    residual_dof,
+                    residual_dof_standard_error: (residual_variance / probes as f64).sqrt(),
+                    divergence,
+                    divergence_standard_error: (divergence_variance / probes as f64).sqrt(),
+                });
+            }
         }
-        let mut values = Vec::with_capacity(probes);
-        for probe in 0..probes {
-            let mut state = seed.wrapping_add(probe as u64);
-            let mut bits = 0u64;
-            let mut remaining = 0u32;
-            let mut draw = || {
-                if remaining == 0 {
-                    bits = gam_linalg::utils::splitmix64(&mut state);
-                    remaining = 64;
+    }
+
+    /// One Rademacher output-space probe of `frame` on the stream `seed`, per row
+    /// and empty on a row of zero weight.
+    fn rademacher_response_probe(
+        &self,
+        frame: FittedResponseFrame,
+        seed: u64,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        let width = self.fitted_response_probe_width(frame)?;
+        let weights = self.row_loss_weights.as_deref();
+        let mut state = seed;
+        let mut bits = 0u64;
+        let mut remaining = 0u32;
+        let mut draw = || {
+            if remaining == 0 {
+                bits = gam_linalg::utils::splitmix64(&mut state);
+                remaining = 64;
+            }
+            let value = if bits & 1 == 1 { 1.0 } else { -1.0 };
+            bits >>= 1;
+            remaining -= 1;
+            value
+        };
+        Ok((0..self.n_obs())
+            .map(|row| {
+                if weights.map_or(1.0, |weights| weights[row]) > 0.0 {
+                    (0..width).map(|_| draw()).collect()
+                } else {
+                    Vec::new()
                 }
-                let value = if bits & 1 == 1 { 1.0 } else { -1.0 };
-                bits >>= 1;
-                remaining -= 1;
-                value
-            };
-            let z = SaeArrowVector {
-                t: Array1::from_shape_fn(total_t, |_| draw()),
-                beta: Array1::from_shape_fn(k, |_| draw()),
-            };
-            let gz = self.apply_data_gauss_newton(cache, &second_jets, &border, &z)?;
-            let response = solve_exact_stationarity_krylov(&gz, &apply_a, &apply_b, &apply_b_raw)?;
-            values.push(z.t.dot(&response.t) + z.beta.dot(&response.beta));
+            })
+            .collect())
+    }
+
+    /// A [`FittedResponseDivergence`] off both frames' Rademacher estimates.
+    fn hutchinson_fitted_response_divergence(
+        likelihood: FittedResponseProbeEstimate,
+        raw: Option<FittedResponseProbeEstimate>,
+        frame_conditioning: SaeFrameConditioning,
+    ) -> FittedResponseDivergence {
+        FittedResponseDivergence {
+            divergence: likelihood.divergence,
+            likelihood_residual_dof: likelihood.residual_dof,
+            raw_residual_dof: raw.map_or(likelihood.residual_dof, |raw| raw.residual_dof),
+            estimator: FittedResponseDivergenceEstimator::Hutchinson { likelihood, raw },
+            frame_conditioning,
         }
-        let count = probes as f64;
-        let divergence = values.iter().sum::<f64>() / count;
-        let spread = values
-            .iter()
-            .map(|value| (value - divergence) * (value - divergence))
-            .sum::<f64>();
-        let standard_error = (spread / (count - 1.0) / count).sqrt();
-        if !(divergence.is_finite() && standard_error.is_finite()) {
-            return Err(format!(
-                "Hutchinson divergence is non-finite: {divergence} (standard error {standard_error})"
-            ));
-        }
-        Ok((divergence, standard_error))
     }
 
     /// The whitening metric the data likelihood is assembled through, or `None`
@@ -723,99 +1177,6 @@ impl SaeManifoldTerm {
             .as_ref()
             .map(Some)
             .ok_or_else(|| "data curvature: whitening metric absent".to_string())
-    }
-
-    /// `G v` for the data Gauss--Newton curvature `G = Σᵢ J̃ᵢᵀ Mᵢ J̃ᵢ`, in the joint
-    /// `(t, β)` cache layout, read off the `√w`-weighted row jets the arrow
-    /// assembly differentiates.
-    fn apply_data_gauss_newton(
-        &self,
-        cache: &ArrowFactorCache,
-        second_jets: &[Array4<f64>],
-        border: &[SaeBorderChannel],
-        v: &SaeArrowVector,
-    ) -> Result<SaeArrowVector, String> {
-        let n = self.n_obs();
-        let p = self.output_dim();
-        let total_t = cache.delta_t_len();
-        if v.t.len() != total_t || v.beta.len() != cache.k {
-            return Err(format!(
-                "data curvature apply: vector (t={}, beta={}) != cache (t={total_t}, beta={})",
-                v.t.len(),
-                v.beta.len(),
-                cache.k
-            ));
-        }
-        let metric = self.data_curvature_metric()?;
-        // #2933 F36 — a sphere coordinate's jets carry the radial component off the
-        // sphere, and the fit moves only along the tangent space, so `G` enters as
-        // `P·G·P` on every sphere block (see [`SphereTangentBlock`]).
-        let sphere_tangents = self.sphere_tangent_blocks(&cache.row_dims)?;
-        let tangent_direction;
-        let v = if sphere_tangents.is_empty() {
-            v
-        } else {
-            let mut projected = v.clone();
-            project_sphere_tangent_slots(
-                &sphere_tangents,
-                &cache.row_offsets,
-                &mut projected.t.view_mut(),
-            );
-            tangent_direction = projected;
-            &tangent_direction
-        };
-        let mut out = SaeArrowVector {
-            t: Array1::<f64>::zeros(total_t),
-            beta: Array1::<f64>::zeros(cache.k),
-        };
-        let mut window: std::collections::VecDeque<SaeRowJets> = std::collections::VecDeque::new();
-        let mut next = 0usize;
-        let mut response = vec![0.0_f64; p];
-        for row in 0..n {
-            if window.is_empty() {
-                next = self.refill_jet_window(next, cache, second_jets, border, &mut window)?;
-            }
-            let jets = window
-                .pop_front()
-                .ok_or_else(|| format!("data curvature apply: the jet refill built no row {row}"))?;
-            let base = cache.row_offsets[row];
-            let q = cache.row_dims[row];
-            if jets.vars.len() != q {
-                return Err(format!(
-                    "data curvature apply: row {row} jets have {} variables, cache row has {q}",
-                    jets.vars.len()
-                ));
-            }
-            response.fill(0.0);
-            for a in 0..q {
-                let coefficient = v.t[base + a];
-                if coefficient != 0.0 {
-                    for (slot, &value) in response.iter_mut().zip(jets.first(a)) {
-                        *slot += coefficient * value;
-                    }
-                }
-            }
-            for (position, channel) in border.iter().enumerate() {
-                let coefficient = v.beta[channel.index];
-                if coefficient != 0.0 {
-                    for (slot, &value) in response.iter_mut().zip(jets.beta(position)) {
-                        *slot += coefficient * value;
-                    }
-                }
-            }
-            let metric_response = match metric {
-                Some(metric) => metric.apply_metric_row(row, ndarray::aview1(&response)),
-                None => response.clone(),
-            };
-            for a in 0..q {
-                out.t[base + a] = sae_dot(jets.first(a), &metric_response);
-            }
-            for (position, channel) in border.iter().enumerate() {
-                out.beta[channel.index] += sae_dot(jets.beta(position), &metric_response);
-            }
-        }
-        project_sphere_tangent_slots(&sphere_tangents, &cache.row_offsets, &mut out.t.view_mut());
-        Ok(out)
     }
 
     /// The data Gauss--Newton curvature `G = Σᵢ J̃ᵢᵀ Mᵢ J̃ᵢ` as a dense matrix in the
@@ -951,8 +1312,8 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // #2933 F36 — `P·G·P` on every sphere block, as in `apply_data_gauss_newton`:
-        // project each column's coordinate slots, then each row's.
+        // #2933 F36 — `P·G·P` on every sphere block, as the response probe projects its
+        // contraction and read-out: project each column's coordinate slots, then each row's.
         let sphere_tangents = self.sphere_tangent_blocks(&cache.row_dims)?;
         if !sphere_tangents.is_empty() {
             for mut column in g.axis_iter_mut(ndarray::Axis(1)) {

@@ -60,10 +60,11 @@ pub use term_design::{
     apply_smooth_transform_to_design,
     build_term_collection_derivative_design, build_term_collection_design,
     build_planned_term_collection_design_inner_with_policy,
-    build_term_collection_design_with_policy,
+    build_term_collection_design_with_policy, duchon_operator_penalty_request,
     orthogonality_relative_residual_for_design, place_term_in_collection_gauge,
     smooth_intrinsic_parametric_feature_cols,
-    term_collection_has_anchored_bspline, term_collection_has_nonzero_anchor,
+    term_collection_has_anchored_bspline, term_collection_has_global_intercept,
+    term_collection_has_nonzero_anchor,
 };
 
 // Spec→spec freezer relocated DOWN from gam-models `fit_orchestration/drivers/
@@ -79,3 +80,9 @@ pub use design_freezing::freeze_term_collection_from_design;
 /// `data × centers` for the antipodal fold), not over `data` alone.
 #[cfg(test)]
 mod constant_curvature_kappa_box_tests;
+
+/// gam#2953: a term-local build's renormalization re-filter hands back its
+/// penalty builder's numbering, so a trial that drops a block ahead of an
+/// active one still aligns to the cached topology.
+#[cfg(test)]
+mod penalty_numbering_2953_tests;

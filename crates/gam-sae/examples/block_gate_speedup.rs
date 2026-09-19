@@ -256,7 +256,8 @@ fn run() -> Result<(), String> {
             b,
             k,
             shortlists.clone(),
-        );
+        )
+        .map_err(|error| format!("host coding (gamma={gamma}) refused: {error}"))?;
         let host_secs = host_start.elapsed().as_secs_f64();
         if let Some(mismatch) = first_code_mismatch(&device_codes, &host_codes) {
             return Err(format!("device coding (gamma={gamma}) differs from host coding: {mismatch}"));

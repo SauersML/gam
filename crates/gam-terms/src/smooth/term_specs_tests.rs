@@ -153,9 +153,10 @@ mod spatial_psi_bound_coordinate_tests {
                     },
                     input_scale: Some(input_scale),
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         spatial_term_psi_bounds(data.view(), &spec, 0).expect("finite spatial ψ bounds")
     }
@@ -215,9 +216,10 @@ mod spatial_psi_bound_coordinate_tests {
                         },
                         input_scale: Some(input_scale),
                     },
-                    shape: ShapeConstraint::None,
+                    shape: ShapeConstraint::None.into(),
                     joint_null_rotation: None,
                 }],
+                level: Default::default(),
             };
             let geometry =
                 spatial_term_psi_bounds(source.view(), &spec, 0).expect("finite geometry window");
@@ -833,45 +835,277 @@ mod pca_function_mass_tests {
 }
 
 #[cfg(test)]
-mod canonical_nullspace_direction_tests {
+mod factor_smooth_null_component_tests {
     use super::*;
-    use ndarray::array;
+    use crate::basis::{BasisOptions, BasisWorkspace, Dense, KnotSource};
+    use gam_linalg::faer_ndarray::FaerCholesky;
+    use ndarray::{Array1, Array2};
+
+    const DEGREE: usize = 3;
+
+    /// Cubic knots with deliberately asymmetric interior breaks, so no symmetry
+    /// of the coefficient chart lines up with the function-space split.
+    fn knots() -> Array1<f64> {
+        Array1::from(vec![0.0, 0.0, 0.0, 0.0, 0.2, 0.45, 0.6, 1.0, 1.0, 1.0, 1.0])
+    }
+
+    /// `double_penalty` as the DSL defaults it: on for `fs` (it gates the
+    /// per-component null penalties), off for `sz` (whose pooled null-function
+    /// penalties are emitted unconditionally).
+    fn marginal(double_penalty: bool) -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: DEGREE,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Provided(knots()),
+            double_penalty,
+            identifiability: BSplineIdentifiability::None,
+            boundary: crate::basis::OneDimensionalBoundary::Open,
+            boundary_conditions: crate::basis::BSplineBoundaryConditions::default(),
+        }
+    }
+
+    fn grouped_data(n_levels: usize) -> Array2<f64> {
+        let n = 60;
+        Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                i as f64 / (n - 1) as f64
+            } else {
+                (i % n_levels) as f64
+            }
+        })
+    }
+
+    fn build(flavour: FactorSmoothFlavour, n_levels: usize) -> LocalSmoothTermBuild {
+        let spec = FactorSmoothSpec {
+            continuous_cols: vec![0],
+            group_col: 1,
+            marginal: marginal(matches!(flavour, FactorSmoothFlavour::Fs { .. })),
+            flavour,
+            group_frozen_levels: None,
+            frozen_global_orthogonality: None,
+        };
+        build_factor_smooth(
+            grouped_data(n_levels).view(),
+            &spec,
+            "null_components",
+            &mut BasisWorkspace::new(),
+        )
+        .expect("build factor smooth")
+    }
+
+    /// Coefficients of the constant function and of the linear function
+    /// centred at the modeling interval's midpoint. B-splines reproduce `x`
+    /// with their Greville abscissae as coefficients.
+    fn constant_and_centred_linear() -> (Array1<f64>, Array1<f64>) {
+        let knots = knots();
+        let p = knots.len() - DEGREE - 1;
+        let midpoint = 0.5 * (knots[DEGREE] + knots[p]);
+        let linear = Array1::from_shape_fn(p, |i| {
+            (1..=DEGREE).map(|r| knots[i + r]).sum::<f64>() / DEGREE as f64 - midpoint
+        });
+        (Array1::ones(p), linear)
+    }
+
+    fn charge(penalty: &Array2<f64>, coefficients: &Array1<f64>) -> f64 {
+        coefficients.dot(&penalty.dot(coefficients))
+    }
+
+    /// The two null components must be the constant and the centred linear
+    /// function, each blind to the other: one charges the constant and nothing
+    /// for the centred line, the other the reverse.
+    fn assert_constant_and_centred_linear(level_blocks: &[Array2<f64>]) {
+        let (constant, linear) = constant_and_centred_linear();
+        assert_eq!(level_blocks.len(), 2, "one null component per null dimension");
+        let charges: Vec<(f64, f64)> = level_blocks
+            .iter()
+            .map(|block| (charge(block, &constant), charge(block, &linear)))
+            .collect();
+        let intercept = charges
+            .iter()
+            .position(|&(on_constant, on_linear)| on_constant > on_linear)
+            .expect("a component charging the constant");
+        let (on_constant, leak_to_linear) = charges[intercept];
+        let (leak_to_constant, on_linear) = charges[1 - intercept];
+        assert!(
+            leak_to_linear <= 1e-10 * on_constant,
+            "the intercept component charges the centred line {leak_to_linear:e} (constant {on_constant:e})"
+        );
+        assert!(
+            leak_to_constant <= 1e-10 * on_linear,
+            "the slope component charges the constant {leak_to_constant:e} (line {on_linear:e})"
+        );
+    }
 
     #[test]
-    fn per_axis_null_penalties_are_invariant_to_eigensolver_gauge_2315() {
-        let inv_sqrt_two = 0.5_f64.sqrt();
-        let z = array![
-            [inv_sqrt_two, 0.0],
-            [inv_sqrt_two, 0.0],
-            [0.0, 1.0],
-            [0.0, 0.0]
-        ];
-        let rotation = array![[0.6, -0.8], [0.8, 0.6]];
-        let rotated = z.dot(&rotation);
-        let reference = canonical_nullspace_directions(&z).expect("canonical null basis");
-        let actual =
-            canonical_nullspace_directions(&rotated).expect("rotated canonical null basis");
-        for axis in 0..reference.ncols() {
-            let reference_penalty = reference
-                .column(axis)
-                .to_owned()
-                .insert_axis(Axis(1))
-                .dot(&reference.column(axis).insert_axis(Axis(0)));
-            let actual_penalty = actual
-                .column(axis)
-                .to_owned()
-                .insert_axis(Axis(1))
-                .dot(&actual.column(axis).insert_axis(Axis(0)));
-            let max_error = reference_penalty
-                .iter()
-                .zip(actual_penalty.iter())
-                .map(|(left, right)| (left - right).abs())
-                .fold(0.0_f64, f64::max);
+    fn fs_null_penalties_charge_the_constant_and_the_centred_line_separately() {
+        let built = build(FactorSmoothFlavour::Fs {}, 2);
+        let p = knots().len() - DEGREE - 1;
+        let nulls: Vec<Array2<f64>> = built.active_penalties[1..]
+            .iter()
+            .map(|penalty| penalty.matrix.slice(s![0..p, 0..p]).to_owned())
+            .collect();
+        assert_constant_and_centred_linear(&nulls);
+    }
+
+    #[test]
+    fn sz_null_penalties_charge_the_constant_and_the_centred_line_separately() {
+        let n_levels = 3;
+        let built = build(FactorSmoothFlavour::Sz, n_levels);
+        let p = knots().len() - DEGREE - 1;
+        let nulls: Vec<Array2<f64>> = built
+            .active_penalties
+            .iter()
+            .filter(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
+            .map(|penalty| penalty.matrix.slice(s![0..p, 0..p]).to_owned())
+            .collect();
+        assert_constant_and_centred_linear(&nulls);
+    }
+
+    fn marginal_metrics() -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+        let knots = knots();
+        (
+            crate::basis::bspline_derivative_penalty_matrix(knots.view(), DEGREE, 2).expect("S"),
+            crate::basis::bspline_function_gram(&knots, DEGREE).expect("G"),
+            crate::basis::bspline_derivative_penalty_matrix(knots.view(), DEGREE, 1).expect("D1"),
+        )
+    }
+
+    /// A deterministic, well-conditioned, far-from-orthogonal chart change.
+    fn chart_change(p: usize) -> Array2<f64> {
+        let lower = Array2::from_shape_fn((p, p), |(i, j)| match i.cmp(&j) {
+            std::cmp::Ordering::Equal => 1.0 + 0.1 * i as f64,
+            std::cmp::Ordering::Greater => 0.35 * ((3 * i + 5 * j) as f64).sin(),
+            std::cmp::Ordering::Less => 0.0,
+        });
+        let upper = Array2::from_shape_fn((p, p), |(i, j)| match i.cmp(&j) {
+            std::cmp::Ordering::Equal => 1.0,
+            std::cmp::Ordering::Less => 0.4 * ((2 * i + 7 * j) as f64).cos(),
+            std::cmp::Ordering::Greater => 0.0,
+        });
+        lower.dot(&upper)
+    }
+
+    fn congruence(t: &Array2<f64>, m: &Array2<f64>) -> Array2<f64> {
+        t.t().dot(m).dot(t)
+    }
+
+    fn components(s: &Array2<f64>, g: &Array2<f64>, d: &Array2<f64>) -> Vec<Array2<f64>> {
+        crate::basis::null_function_mass_components(s, g, || Ok(d.clone()), "test")
+            .expect("null components")
+            .iter()
+            .map(|factor| factor.t().dot(factor))
+            .collect()
+    }
+
+    fn max_abs(m: &Array2<f64>) -> f64 {
+        m.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    }
+
+    #[test]
+    fn null_component_penalties_transform_by_congruence_with_the_chart() {
+        let (s, g, d) = marginal_metrics();
+        let t = chart_change(s.nrows());
+        let reference = components(&s, &g, &d);
+        let moved = components(
+            &congruence(&t, &s),
+            &congruence(&t, &g),
+            &congruence(&t, &d),
+        );
+        assert_eq!(reference.len(), 2);
+        assert_eq!(moved.len(), reference.len());
+        for (k, (r, r_moved)) in reference.iter().zip(&moved).enumerate() {
+            let expected = congruence(&t, r);
+            let error = max_abs(&(&expected - r_moved));
             assert!(
-                max_error <= 256.0 * f64::EPSILON,
-                "axis {axis} changed by {max_error:e}"
+                error <= 1e-9 * max_abs(&expected),
+                "component {k} is not covariant: error {error:e}"
             );
         }
+    }
+
+    fn penalized_fit(x: &Array2<f64>, y: &Array1<f64>, penalty: &Array2<f64>) -> Array1<f64> {
+        let system = x.t().dot(x) + penalty;
+        let factor = FaerCholesky::cholesky(&system, faer::Side::Lower).expect("SPD system");
+        x.dot(&factor.solvevec(&x.t().dot(y)))
+    }
+
+    /// Reparameterizing only the null-space coordinates (`β = Tβ'` with `T`
+    /// moving the null directions among themselves and into the range) leaves
+    /// the wiggliness penalty unchanged. The fitted function at fixed smoothing
+    /// parameters must not move: the null components are functions, so their
+    /// penalties follow the chart.
+    #[test]
+    fn penalized_fit_is_invariant_to_null_space_reparameterization() {
+        let (s, g, d) = marginal_metrics();
+        let p = s.nrows();
+        let n = 80;
+        let xs = Array1::from_shape_fn(n, |i| i as f64 / (n - 1) as f64);
+        let y = xs.mapv(|x| 1.3 - 2.1 * x + 0.4 * (7.0 * x).sin());
+        let (basis, _) = crate::basis::create_basis::<Dense>(
+            xs.view(),
+            KnotSource::Provided(knots().view()),
+            DEGREE,
+            BasisOptions::value(),
+        )
+        .expect("design");
+        let x = (*basis).clone();
+
+        // Null frame of S (constant and linear coefficient vectors), then a
+        // non-orthogonal map that mixes the null coordinates and shears range
+        // directions into them. `S T = S` because `S N = 0`.
+        let (constant, linear) = constant_and_centred_linear();
+        let mut null = Array2::<f64>::zeros((p, 2));
+        null.column_mut(0).assign(&constant);
+        null.column_mut(1).assign(&(&linear + 0.8 * &constant));
+        let mix = ndarray::array![[0.7, 2.5], [-1.9, 0.4]];
+        let shear = Array2::from_shape_fn((2, p), |(a, j)| 0.3 * ((a + 2 * j) as f64).sin());
+        let t = Array2::<f64>::eye(p) + null.dot(&mix).dot(&shear);
+        assert!(max_abs(&(congruence(&t, &s) - &s)) <= 1e-9 * max_abs(&s));
+
+        let (lambda_s, lambdas) = (0.02, [3.0, 0.05]);
+        let total = |s: &Array2<f64>, parts: &[Array2<f64>]| {
+            parts
+                .iter()
+                .zip(lambdas)
+                .fold(s.mapv(|v| lambda_s * v), |acc, (part, lambda)| acc + part.mapv(|v| lambda * v))
+        };
+        let reference = penalized_fit(&x, &y, &total(&s, &components(&s, &g, &d)));
+        let (s_t, g_t, d_t) = (congruence(&t, &s), congruence(&t, &g), congruence(&t, &d));
+        let moved = penalized_fit(&x.dot(&t), &y, &total(&s_t, &components(&s_t, &g_t, &d_t)));
+        let error = (&reference - &moved).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(error <= 1e-9, "fitted values moved by {error:e} under a null-space reparameterization");
+    }
+
+    /// Eigenvectors of one repeated slope-energy eigenvalue are one component;
+    /// splitting them would be an eigensolver gauge.
+    #[test]
+    fn degenerate_null_functions_form_one_component() {
+        let p = 4;
+        let mut s = Array2::<f64>::zeros((p, p));
+        s[[3, 3]] = 1.0;
+        let g = Array2::<f64>::eye(p);
+        let d = Array2::from_diag(&Array1::from(vec![0.0, 2.0, 2.0, 5.0]));
+        let parts = components(&s, &g, &d);
+        assert_eq!(parts.len(), 2);
+        let ranks: Vec<usize> = parts
+            .iter()
+            .map(|part| (0..p).filter(|&i| part[[i, i]] > 0.5).count())
+            .collect();
+        assert_eq!(ranks, vec![1, 2]);
+        assert!((parts[0][[0, 0]] - 1.0).abs() <= 1e-12);
+        assert!((parts[1][[1, 1]] - 1.0).abs() <= 1e-12 && (parts[1][[2, 2]] - 1.0).abs() <= 1e-12);
+    }
+
+    /// The cubic-regression slope energy is exact on the functions it can
+    /// represent: zero on the constant and `b − a` on `f(x) = x`, whose value
+    /// coefficients are the knots themselves.
+    #[test]
+    fn cubic_regression_slope_energy_is_exact_on_linear_functions() {
+        let cr_knots = Array1::from(vec![-0.4, 0.1, 0.35, 1.2, 2.0]);
+        let d = crate::basis::cubic_regression_slope_energy(&cr_knots).expect("D1");
+        let ones = Array1::<f64>::ones(cr_knots.len());
+        assert!(charge(&d, &ones).abs() <= 1e-12);
+        assert!((charge(&d, &cr_knots) - 2.4).abs() <= 1e-12);
     }
 }
 
@@ -912,7 +1146,7 @@ mod factor_smooth_heldout_group_tests {
                     frozen_global_orthogonality: None,
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }
@@ -1024,7 +1258,7 @@ mod frozen_factor_level_collection_tests {
             frozen_parametric_residualization: None,
             name: name.to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }
@@ -1062,6 +1296,7 @@ mod frozen_factor_level_collection_tests {
                     spec: marginal(),
                 },
             )],
+            level: Default::default(),
         };
 
         let levels = spec.frozen_factor_levels_by_col();
@@ -1138,6 +1373,7 @@ mod frozen_factor_level_collection_tests {
                 smooth("nested", nested),
                 smooth("numeric", numeric_wrappers),
             ],
+            level: Default::default(),
         };
 
         let levels = spec.frozen_factor_levels_by_col();

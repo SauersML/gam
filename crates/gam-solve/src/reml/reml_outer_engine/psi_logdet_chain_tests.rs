@@ -253,6 +253,7 @@ impl PsiModel {
         // unconverged inner solve.
         let g_psi = -h.dot(&self.beta_dot_at(psi));
         InnerSolution {
+            cone_normalizer: None,
             log_likelihood: -2.3,
             penalty_quadratic: 0.6,
             hessian_op: hop,

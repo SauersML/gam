@@ -207,6 +207,29 @@ impl JointPenaltySpec {
         beta.dot(&self.matrix.dot(&beta))
     }
 
+    /// [`Self::quadratic_form`] beside the magnitude its summation accumulates,
+    /// `Σ_ij |β_i S_ij β_j|`, from one explicit pass over the entries. The value is
+    /// the same `βᵀSβ` summed in a different order, so the two agree within
+    /// `accumulation_growth(dim²)` of the magnitude on each side, and the magnitude
+    /// is what bounds the rounding of the value (gam#2959).
+    pub fn quadratic_form_with_accumulation(&self, beta: ArrayView1<'_, f64>) -> (f64, f64) {
+        assert_eq!(
+            beta.len(),
+            self.dim(),
+            "joint penalty quadratic form: beta length {} != dim {}",
+            beta.len(),
+            self.dim()
+        );
+        let mut value = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        for ((row, column), &entry) in self.matrix.indexed_iter() {
+            let term = beta[row] * entry * beta[column];
+            value += term;
+            magnitude += term.abs();
+        }
+        (value, magnitude)
+    }
+
     /// Validate shape, finiteness, symmetry, PSD, and nullspace bookkeeping,
     /// returning the invariant thin root `R` such that `matrix = RᵀR`.
     ///
@@ -464,6 +487,20 @@ impl JointPenaltyBundle {
         total
     }
 
+    /// [`Self::quadratic`] beside the magnitude its summations accumulate,
+    /// `½ Σ_j exp(ρ_j)·Σ_ik |β_i S_j,ik β_k|`, through
+    /// [`JointPenaltySpec::quadratic_form_with_accumulation`] (gam#2959).
+    pub fn quadratic_with_accumulation(&self, beta: ArrayView1<'_, f64>) -> (f64, f64) {
+        let mut total = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
+            let (value, accumulated) = spec.quadratic_form_with_accumulation(beta);
+            total += 0.5 * lam * value;
+            magnitude += 0.5 * lam.abs() * accumulated;
+        }
+        (total, magnitude)
+    }
+
     /// Accumulate `Σ_j exp(ρ_j) · S_j · v` into `out` (additive).
     pub fn add_apply_into(&self, vector: ArrayView1<'_, f64>, out: &mut ndarray::Array1<f64>) {
         assert_eq!(out.len(), vector.len());
@@ -551,6 +588,28 @@ mod tests {
         // βᵀSβ = (v·β)^2 + (w·β)^2 = 0.25 + 1.0 = 1.25
         let q = spec.quadratic_form(beta.view());
         assert!((q - 1.25).abs() < 1e-12, "got {q}");
+    }
+
+    /// gam#2959. The explicit entry pass returns the mat-vec value within the
+    /// rounding both evaluations can carry, `γ_{dim²}` of the accumulated magnitude
+    /// for each, and a magnitude that bounds the value.
+    #[test]
+    fn quadratic_form_with_accumulation_matches_the_mat_vec_value_2959() {
+        let spec = cross_block_spec();
+        let beta: Array1<f64> = array![0.5, -0.25, 1.0, 0.75];
+        let (value, magnitude) = spec.quadratic_form_with_accumulation(beta.view());
+        let mat_vec = spec.quadratic_form(beta.view());
+        let dim = spec.dim();
+        let band = 2.0 * gam_linalg::roundoff::accumulation_growth(dim * dim) * magnitude;
+        let gap = (value - mat_vec).abs();
+        assert!(
+            gap <= band,
+            "explicit value {value:e} against mat-vec {mat_vec:e}: gap {gap:.3e} exceeds {band:.3e}"
+        );
+        assert!(
+            magnitude >= value.abs(),
+            "the accumulated magnitude {magnitude:e} must bound the value {value:e}"
+        );
     }
 
     #[test]

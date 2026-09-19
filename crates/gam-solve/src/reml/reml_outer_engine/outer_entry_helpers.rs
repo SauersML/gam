@@ -68,6 +68,143 @@ impl RemlLamlResult {
     }
 }
 
+/// The Laplace record of an inner mode along its softest direction (gam#2765, gam#979).
+///
+/// The criterion's normalizer is the Gaussian integral of the quadratic model of the inner
+/// objective `f` about its mode. Along the softest eigenpair `(σ, v)` of the operator the mode
+/// response inverts, `f(β̂ + s·v) = f̂ + ½σs² + (t₃/6)s³ + (t₄/24)s⁴ + …`, and the one-dimensional
+/// Laplace series is `log ∫ e^{−f} ds = −f̂ + ½log(2π/σ) + c + O(c²)` with leading correction
+/// `c = 5t₃²/(24σ³) − t₄/(8σ²)`.
+///
+/// The one refusal is the rounding band: at or below the span spectrum's band `σ` is not resolved
+/// from zero, so the normalizer has no curvature to integrate and the trial point is refused
+/// before anything is priced. The cubic share `5t₃²/(24σ³)` is a RECORD, not a refusal. It
+/// measures how non-Gaussian the posterior is along `v` at one point, which does not tell a mode
+/// folding along the search path (`σ → 0`) from a well-conditioned mode with a large third
+/// derivative. Refusing on it was measured wrong (gate job 1219877): a mode at `σ = 2`, `t₃ = 8.5`
+/// (share 1.875) was refused; on the #2894 repro 122 of 387 graded evaluations refused, 80 of them
+/// at `σ ≥ 0.1`; and six custom-family pins went red. A fold test compares the fold distance
+/// `σ/|t₃|` with the inner mode's motion along `v`, and is its own derivation.
+///
+/// `t₃ = vᵀ D_β M[v] v` prices the complete operator the mode response inverts: the drift of the
+/// log-determinant operator (`HessianDerivativeProvider::hessian_derivative_correction`) plus the
+/// motion of the stationarity operator's difference from it
+/// (`HessianDerivativeProvider::mode_response_rhs_correction`), which that hook's contract omits
+/// exactly when the difference is constant. Where the difference moves without its derivatives the
+/// record says so ([`CompletionShare::NotSupplied`]). The quartic share is not priced. Grading the
+/// softest eigenpair alone describes one direction: a stiffer direction with a much larger `t₃`,
+/// and mixed third derivatives coupling `v` to stiff directions, also enter the multivariate
+/// correction. Every quantity is un-scaled by the operator's uniform curvature scale, and the share
+/// is invariant to rescaling `v`, so the record describes the objective.
+#[derive(Clone, Debug)]
+pub struct InnerModeFold {
+    /// The softest eigenvalue `σ` on the span the mode response inverts, un-scaled.
+    pub sigma: f64,
+    /// The span spectrum's rounding band, un-scaled.
+    pub rounding_band: f64,
+    /// `t₃ = vᵀ D_β M[v] v` along the softest eigenvector, un-scaled; `None` when the rounding band
+    /// refused before it was priced, or when the grading priced no record (the unified evaluator's
+    /// verdict reads `σ` alone, #979).
+    pub third_derivative: Option<f64>,
+    /// The cubic share `5t₃²/(24σ³)` of the Laplace series' leading correction, priced with `t₃`.
+    pub cubic_correction: Option<f64>,
+    /// The quartic share `|t₄|/(8σ²)` of the leading correction.
+    pub quartic_correction: QuarticShare,
+    /// Whether `t₃` carries the stationarity difference's motion, priced with `t₃`.
+    pub completion: Option<CompletionShare>,
+}
+
+/// Whether a fold record's `t₃` carries the motion of the stationarity operator's difference from
+/// the log-determinant operator (gam#2765).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionShare {
+    /// `t₃` prices the complete operator: the difference is constant, or its motion was priced.
+    Priced,
+    /// The difference moves but the provider supplies no derivative of it, so `t₃` is the
+    /// log-determinant operator's share alone.
+    NotSupplied,
+}
+
+/// Whether the quartic share of a fold verdict's leading correction was priced (gam#2765).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarticShare {
+    /// Not priced by design: the verdict refuses on the cubic share and the rounding band, which is
+    /// sufficient for invalidity, and pricing `t₄` would add a second directional pass to every
+    /// healthy evaluation with no provider declaring that hook.
+    NotPriced,
+}
+
+impl InnerModeFold {
+    /// Whether the Laplace series' leading correction along the softest direction is below the
+    /// term it corrects.
+    pub fn is_valid(&self) -> bool {
+        self.sigma > self.rounding_band
+    }
+}
+
+impl std::fmt::Display for InnerModeFold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.third_derivative, self.cubic_correction, self.completion) {
+            (Some(third), Some(correction), Some(completion)) => write!(
+                f,
+                "the inner mode's softest curvature is {:.3e} (rounding band {:.3e}) with third \
+                 directional derivative {third:.3e} (completion {completion:?}), recording a \
+                 cubic share of {correction:.3e} of the Laplace series' leading correction; the \
+                 quartic share is not priced (gam#2765, gam#979)",
+                self.sigma, self.rounding_band,
+            ),
+            _ if self.is_valid() => write!(
+                f,
+                "the inner mode's softest curvature is {:.3e}, resolved above its rounding band \
+                 {:.3e}; its Laplace series' third-order share was not priced (gam#2765, gam#979)",
+                self.sigma, self.rounding_band,
+            ),
+            _ => write!(
+                f,
+                "the inner mode's softest curvature {:.3e} is at or below its rounding band \
+                 {:.3e}, so the Laplace normalizer has no resolved curvature to integrate \
+                 (gam#2765, gam#979)",
+                self.sigma, self.rounding_band,
+            ),
+        }
+    }
+}
+
+/// Why the unified evaluator published no evaluation (gam#2765).
+#[derive(Clone, Debug)]
+pub enum RemlLamlError {
+    /// The inner mode is at a fold: its Laplace normalizer approximates no integral, so the trial
+    /// point is refused, with no value or derivative standing in for one.
+    InnerModeFold(InnerModeFold),
+    /// The constrained Laplace normalizer could not be formed at this trial point (gam#2765), so it
+    /// is refused with no value or derivative standing in for one.
+    ConeNormalizer(crate::constrained_posterior::ConeNormalizerRefusal),
+    /// Any other failure, with its diagnostic.
+    Failed(String),
+}
+
+impl std::fmt::Display for RemlLamlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InnerModeFold(fold) => write!(f, "{fold}"),
+            Self::ConeNormalizer(refusal) => write!(f, "{refusal}"),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for RemlLamlError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+impl From<RemlError> for RemlLamlError {
+    fn from(error: RemlError) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
 /// Four additive scalar atoms of the unified criterion.
 ///
 /// `fixed_beta` owns every scalar other than the two determinant terms and the
@@ -122,7 +259,11 @@ pub(crate) fn profiled_gaussian_residual_dof(
         Ok(dof)
     } else {
         Err(format!(
-            "profiled Gaussian residual degrees of freedom must be positive; got              n({n_observations}) − M_p({nullspace_dim}) = {dof}. Every unpenalized              coefficient direction consumes one observation, so this design leaves              nothing to estimate the Gaussian scale from: penalize the offending              directions or drop them."
+            "profiled Gaussian residual degrees of freedom must be positive; got \
+             n({n_observations}) − M_p({nullspace_dim}) = {dof}. Every unpenalized \
+             coefficient direction consumes one observation, so this design leaves \
+             nothing to estimate the Gaussian scale from: penalize the offending \
+             directions or drop them."
         ))
     }
 }
@@ -678,9 +819,10 @@ fn tangent_from_row_factorization(
     vt: &Array2<f64>,
 ) -> Result<(usize, ActiveConstraintTangentGeometry), String> {
     let p = normalized.ncols();
-    let smax = singular.iter().fold(0.0_f64, |largest, &s| largest.max(s));
-    let rank_threshold = 100.0 * f64::EPSILON * (normalized.nrows().max(p) as f64) * smax;
-    let rank = singular.iter().filter(|&&s| s > rank_threshold).count();
+    // The row rank is read at the SVD's own rounding band `max(rows, p)·ε·σ_max`
+    // (`svd_rank_band`), with no extra factor: a singular value above it is
+    // resolved by the factorization that produced it (#2469).
+    let rank = crate::active_set::svd_rank(singular, normalized.nrows(), p);
     if rank == 0 {
         return Err("non-empty active constraint block has zero numerical row rank".to_string());
     }
@@ -688,38 +830,18 @@ fn tangent_from_row_factorization(
         return Ok((rank, ActiveConstraintTangentGeometry::FullyPinned));
     }
 
+    // The orthonormal complement of the leading `rank` right singular vectors.
+    // Pivoted Gram–Schmidt on the coordinate axes always takes the longest
+    // remaining residual, whose squared norm is at least `(p − rank − j)/p`
+    // after `j` columns, so no cutoff on residual length is needed (#2469).
     let null_count = p - rank;
-    let mut orthonormal_basis: Vec<Array1<f64>> = (0..rank).map(|i| vt.row(i).to_owned()).collect();
-    let mut z = Array2::<f64>::zeros((p, null_count));
-    let mut collected = 0usize;
-    let independence_floor = 100.0 * f64::EPSILON * p as f64;
-    for axis in 0..p {
-        if collected == null_count {
-            break;
-        }
-        let mut candidate = Array1::<f64>::zeros(p);
-        candidate[axis] = 1.0;
-        // A second pass is deliberate: modified Gram–Schmidt reorthogonalization
-        // keeps the constructed complement accurate for ill-conditioned faces.
-        for _ in 0..2 {
-            for q in &orthonormal_basis {
-                let projection = q.dot(&candidate);
-                candidate.scaled_add(-projection, q);
-            }
-        }
-        let norm = candidate.dot(&candidate).sqrt();
-        if norm > independence_floor {
-            candidate /= norm;
-            z.column_mut(collected).assign(&candidate);
-            orthonormal_basis.push(candidate);
-            collected += 1;
-        }
-    }
-    if collected != null_count {
-        return Err(format!(
-            "active constraint tangent complement construction produced {collected} of {null_count} columns"
-        ));
-    }
+    let z = crate::active_set::null_space_complement(vt, rank).ok_or_else(|| {
+        format!(
+            "active constraint tangent complement construction produced no {null_count}-column basis \
+             for row rank {rank} over {} right singular vectors",
+            vt.nrows()
+        )
+    })?;
 
     // This routine is the shared authority for both optimization and LAML
     // projection. Refuse geometry that cannot preserve the solver's working-
@@ -765,12 +887,12 @@ pub fn active_constraint_tangent_geometry(
     // normal direction: the next accepted point then falls off the working
     // face and discards the entire warm active set. The thin SVD gives the row
     // rank without normal equations; complete its right-singular row basis to
-    // an orthonormal null basis using twice-reorthogonalized coordinate axes.
+    // an orthonormal null basis by pivoted Gram–Schmidt on the coordinate axes.
     //
     // Left singular vectors are NOT requested here: this entry point answers
     // only the tangent question, and the callers that also need the affine
     // particular solution go through `active_constraint_face_geometry`, which
-    // pays for `U` once and shares this exact rank rule.
+    // pays for `U` once and shares this exact rank rule and completion.
     let (_u, singular, vt) = normalized
         .svd(false, true)
         .map_err(|error| format!("active constraint tangent SVD failed: {error}"))?;
@@ -1005,6 +1127,34 @@ mod active_constraint_tangent_geometry_tests {
         }
     }
 
+    /// #2469: the row rank is read at the SVD's own band `max(rows, p)·ε·σ_max`.
+    /// Two unit rows at angle `θ ≈ 1.33e-14` have `σ₂ ≈ θ/√2 ≈ 9.4e-15`, ten
+    /// times that band (`3·ε·√2 ≈ 9.4e-16`) and a tenth of the `100×` cutoff it
+    /// replaced. The face is rank two, and its tangent is the one untouched axis.
+    #[test]
+    fn row_rank_is_read_at_the_svd_rounding_band_2469() {
+        let theta = 1.33e-14_f64;
+        let a = ndarray::array![[1.0, 0.0, 0.0], [1.0, theta, 0.0]];
+        let geometry = active_constraint_face_geometry(&a).expect("face geometry");
+        let smax = geometry.singular.iter().fold(0.0_f64, |acc, &s| acc.max(s));
+        let band = 3.0 * f64::EPSILON * smax;
+        let smallest = geometry.singular.iter().fold(f64::INFINITY, |acc, &s| acc.min(s));
+        assert!(
+            smallest > band && smallest < 100.0 * band,
+            "fixture premise: the second singular value {smallest:.3e} sits between the band \
+             {band:.3e} and the replaced cutoff {:.3e}",
+            100.0 * band
+        );
+        assert_eq!(geometry.rank(), 2);
+        let ActiveConstraintTangentGeometry::Tangent(z) =
+            active_constraint_tangent_geometry(&a).expect("tangent geometry")
+        else {
+            panic!("a rank-two face in three dimensions has a tangent");
+        };
+        assert_eq!(z.dim(), (3, 1));
+        assert!((z[[2, 0]].abs() - 1.0).abs() <= 4.0 * f64::EPSILON);
+    }
+
     #[test]
     fn face_geometry_and_tangent_geometry_cannot_disagree_about_rank_2600() {
         // Two rows whose normalized independence is O(1e-8) and a third
@@ -1023,7 +1173,7 @@ mod active_constraint_tangent_geometry_tests {
             panic!("face geometry must agree that the face has a tangent");
         };
         assert_eq!(direct.dim(), shared.dim());
-        // Both bases are built by the same twice-reorthogonalized completion
+        // Both bases are built by the same pivoted completion
         // from the same rank, so they span the same line; assert the span
         // rather than the bits, since only one of the two SVD calls also asks
         // for `U` and the factorization is free to differ in the last digits.
@@ -1169,6 +1319,16 @@ impl HessianFactorization for TangentProjectedHessianOperator {
         self.h_t_op.active_rank()
     }
 
+    /// `Z · U_T` over the tangent operator's active eigenpairs: the span `solve` lifts through `Z`
+    /// (gam#2765).
+    fn inverted_span(&self) -> Option<InvertedSpan> {
+        let tangent = InvertedSpan::from_dense_spectral(&self.h_t_op)?;
+        Some(InvertedSpan {
+            basis: self.z.dot(&tangent.basis),
+            eigenvalues: tangent.eigenvalues,
+        })
+    }
+
     fn dim(&self) -> usize {
         self.z.nrows()
     }
@@ -1271,6 +1431,9 @@ pub(crate) struct BorrowedDerivProvider<'a>(&'a dyn HessianDerivativeProvider);
 impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
     fn mode_response_rhs_correction(&self) -> Option<ModeResponseRhsCorrectionFn> {
         self.0.mode_response_rhs_correction()
+    }
+    fn mode_response_rhs_correction_supplied(&self) -> bool {
+        self.0.mode_response_rhs_correction_supplied()
     }
     fn hessian_derivative_correction(
         &self,
@@ -1404,25 +1567,30 @@ pub(crate) fn try_tangent_projected_evaluate(
     rho: &[f64],
     mode: EvalMode,
     prior_cost_gradient: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
-) -> Result<Option<RemlLamlResult>, String> {
+) -> Result<Option<RemlLamlResult>, RemlLamlError> {
     let block = match solution.active_constraints.as_ref() {
         Some(block) if block.a.nrows() > 0 => block,
         _ => return Ok(None),
     };
     let p = solution.beta.len();
     if block.a.ncols() != p {
-        return Err(format!(
+        return Err(RemlLamlError::Failed(format!(
             "active_constraints.a has {} columns but beta is {}-dim",
             block.a.ncols(),
             p
-        ));
+        )));
     }
 
-    let constrained_mode_response: Arc<dyn HessianFactorization> =
-        match active_constraint_tangent_geometry(&block.a)? {
-            ActiveConstraintTangentGeometry::FullyPinned => {
-                Arc::new(FullyPinnedModeResponse { dimension: p })
-            }
+    // The KKT gradient's motion the constrained Laplace normalizer reads (gam#2765): on a face
+    // `ġ = M_true β̂̇ + ∂_θ∇F` with the same stationarity curvature the mode response solves.
+    let (constrained_mode_response, gradient_motion): (
+        Arc<dyn HessianFactorization>,
+        ConeGradientMotion,
+    ) = match active_constraint_tangent_geometry(&block.a)? {
+            ActiveConstraintTangentGeometry::FullyPinned => (
+                Arc::new(FullyPinnedModeResponse { dimension: p }),
+                ConeGradientMotion::Pinned,
+            ),
             ActiveConstraintTangentGeometry::Tangent(z) => {
                 // Differentiate the stationarity system the inner solve
                 // actually used, not the operator that owns the Laplace
@@ -1465,7 +1633,7 @@ pub(crate) fn try_tangent_projected_evaluate(
                                     operator.raw_spectrum().iter().copied().fold(f64::INFINITY, f64::min),
                                 ),
                                 Err(error) => {
-                                    log::info!("[979-FACE-LOGDET] spectrum unavailable: {error}");
+                                    log::debug!("[979-FACE-LOGDET] spectrum unavailable: {error}");
                                     None
                                 }
                             }
@@ -1477,7 +1645,7 @@ pub(crate) fn try_tangent_projected_evaluate(
                                     smallest_eigenvalue(&z.t().dot(&matrix).dot(&z)),
                                 ),
                                 Err(error) => {
-                                    log::info!(
+                                    log::debug!(
                                         "[979-FACE-LOGDET] log-determinant operator has no dense \
                                          assembly: {error}"
                                     );
@@ -1486,7 +1654,7 @@ pub(crate) fn try_tangent_projected_evaluate(
                             };
                         let true_min = smallest_eigenvalue(&response_full);
                         let true_tangent_min = smallest_eigenvalue(&z.t().dot(&response_full).dot(&z));
-                        log::info!(
+                        log::debug!(
                             "[979-FACE-LOGDET] kept_rank={rank}/{} tangent_dim={} \
                              sigma_min_kept={:.6e} normal_fraction={:.3e} \
                              value_min={value_min:?} value_tangent_min={value_tangent_min:?} \
@@ -1505,10 +1673,13 @@ pub(crate) fn try_tangent_projected_evaluate(
                             "constrained mode-response eigendecomposition failed: {error}"
                         )
                     })?;
-                Arc::new(TangentProjectedHessianOperator {
-                    z,
-                    h_t_op: response_tangent_op,
-                })
+                (
+                    Arc::new(TangentProjectedHessianOperator {
+                        z,
+                        h_t_op: response_tangent_op,
+                    }),
+                    ConeGradientMotion::OnFace(Arc::new(response_full)),
+                )
             }
         };
 
@@ -1544,6 +1715,12 @@ pub(crate) fn try_tangent_projected_evaluate(
         // Prevent recursive constrained-response installation. The operator
         // above already carries the active geometry.
         active_constraints: None,
+        cone_normalizer: solution.cone_normalizer.as_ref().map(|input| {
+            Arc::new(ConeNormalizerInput {
+                gradient_motion,
+                ..ConeNormalizerInput::clone(input)
+            })
+        }),
     };
     reml_laml_evaluate(&constrained, rho, mode, prior_cost_gradient).map(Some)
 }

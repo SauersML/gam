@@ -448,6 +448,31 @@ impl OrderedBetaBernoulliPenalty {
         }
         let n_eff: f64 = (0..n).map(|row| self.row_weight(row)).sum();
         let alpha = self.resolved_alpha(rho);
+        let columns = self.column_log_partitions(alpha, n_eff)?;
+        let rho_derivative = if self.learnable_alpha {
+            Array1::from_vec(vec![columns.log_alpha_derivative])
+        } else {
+            Array1::zeros(0)
+        };
+        Ok((columns.value, rho_derivative))
+    }
+
+    /// `Σ_k log C(a_k, N)` and its log-concentration derivative at concentration `α` over
+    /// `N` effective rows.
+    ///
+    /// They are a pure function of `(k_max, α, N)`, and an inner solve holds `ρ`, so `α`,
+    /// fixed while every objective trial scores the prior's value with its partition. Each
+    /// column is an adaptive quadrature, and in the anneal demo's 45 inner-thread stack
+    /// samples 10 sat in it, 9 of them under the gauge-orbit line search (#2627, run
+    /// 1212363). The last result on this thread is kept against the exact bits of its
+    /// inputs, so a repeat returns the words the quadrature would compute.
+    fn column_log_partitions(&self, alpha: f64, n_eff: f64) -> Result<ColumnLogPartitions, String> {
+        let key = (self.k_max, alpha.to_bits(), n_eff.to_bits());
+        if let Some(last) = LAST_COLUMN_LOG_PARTITIONS.with(std::cell::Cell::get)
+            && last.key == key
+        {
+            return Ok(last);
+        }
         let a_col = self.column_beta_shapes(alpha);
         let mut value = 0.0;
         let mut log_alpha_derivative = 0.0;
@@ -458,13 +483,27 @@ impl OrderedBetaBernoulliPenalty {
             log_alpha_derivative += partition.log_shape_derivative * ((k + 1) as f64) * (a_col[k] + 1.0)
                 / (alpha + 1.0);
         }
-        let rho_derivative = if self.learnable_alpha {
-            Array1::from_vec(vec![log_alpha_derivative])
-        } else {
-            Array1::zeros(0)
+        let columns = ColumnLogPartitions {
+            key,
+            value,
+            log_alpha_derivative,
         };
-        Ok((value, rho_derivative))
+        LAST_COLUMN_LOG_PARTITIONS.with(|last| last.set(Some(columns)));
+        Ok(columns)
     }
+}
+
+/// [`OrderedBetaBernoulliPenalty::column_log_partitions`] at `key = (k_max, α bits, N bits)`.
+#[derive(Clone, Copy)]
+struct ColumnLogPartitions {
+    key: (usize, u64, u64),
+    value: f64,
+    log_alpha_derivative: f64,
+}
+
+thread_local! {
+    static LAST_COLUMN_LOG_PARTITIONS: std::cell::Cell<Option<ColumnLogPartitions>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// #2330 Patch D — ordered-Beta--Bernoulli prior curvature `∂ΔC_obb/∂ℓ`
@@ -1159,6 +1198,63 @@ mod log_partition_2933_tests {
                 .log_partition(Array1::<f64>::zeros(2).view(), Array1::<f64>::zeros(0).view())
                 .is_err(),
             "a tempered energy has no computed partition and must be refused"
+        );
+    }
+
+    /// #2627 — the partition kept per thread answers only its own `(k_max, α, N)`. Alternating
+    /// concentrations and row weights each return the words of their own column quadratures,
+    /// and the three inputs give three different values, so a kept entry answering the wrong
+    /// input would fail the equality.
+    #[test]
+    fn a_kept_log_partition_answers_only_its_own_concentration_and_row_count_2627() {
+        let unweighted = OrderedBetaBernoulliPenalty::new(3, 1.0, 1.0, true);
+        let weighted = unweighted
+            .clone()
+            .with_row_weights(Some(&[0.5, 1.0, 2.0, 0.25]));
+        let target = Array1::<f64>::zeros(3 * 4);
+        let quadratures = |penalty: &OrderedBetaBernoulliPenalty, rho: &[f64]| {
+            let alpha = penalty.resolved_alpha(ArrayView1::from(rho));
+            let rows: f64 = (0..4).map(|row| penalty.row_weight(row)).sum();
+            let a_col = penalty.column_beta_shapes(alpha);
+            let mut value = 0.0;
+            let mut slope = 0.0;
+            for k in 0..penalty.k_max {
+                let partition =
+                    ordered_beta_bernoulli_log_partition(a_col[k], rows).expect("a, N > 0");
+                value += partition.value;
+                slope += partition.log_shape_derivative * ((k + 1) as f64) * (a_col[k] + 1.0)
+                    / (alpha + 1.0);
+            }
+            (value, slope)
+        };
+        let low = [1.3_f64.ln()];
+        let high = [4.0_f64.ln()];
+        let mut values = Vec::new();
+        for (penalty, rho) in [
+            (&unweighted, &low),
+            (&unweighted, &high),
+            (&unweighted, &low),
+            (&weighted, &low),
+            (&unweighted, &low),
+        ] {
+            let (value, slope) = penalty
+                .log_partition(target.view(), ArrayView1::from(&rho[..]))
+                .expect("untempered penalty");
+            let (expected_value, expected_slope) = quadratures(penalty, &rho[..]);
+            assert_eq!(
+                (value.to_bits(), slope[0].to_bits()),
+                (expected_value.to_bits(), expected_slope.to_bits()),
+                "log partition at ρ={rho:?}, weighted={}: kept {value:e}/{:e}, quadrature \
+                 {expected_value:e}/{expected_slope:e}",
+                penalty.row_weights.is_some(),
+                slope[0],
+            );
+            values.push(value);
+        }
+        assert!(
+            values[0] != values[1] && values[0] != values[3] && values[1] != values[3],
+            "control failed: the three inputs share a value {values:?}, so a kept entry answering \
+             the wrong input could not be told apart"
         );
     }
 }

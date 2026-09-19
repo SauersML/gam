@@ -19,7 +19,7 @@ def main() -> None:
         f"y ~ s(t, type='periodic', k=16, period={2.0 * np.pi}, origin=0)",
         family="gaussian",
         latents={
-            "t": gamfit.LatentCoord(
+            "t": gamfit.smooth.LatentCoord(
                 n=n,
                 d=1,
                 init=theta[:, None],

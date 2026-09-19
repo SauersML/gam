@@ -216,8 +216,32 @@ fn existence_and_intensity_are_separately_identified_1939() {
     );
     let loss = term
         .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 80, 0.05, 1.0e-3, 1.0e-3)
-        .expect("the 3-atom amplitude fixture converges within 80 inner iterations");
+        .expect("the 3-atom amplitude fit evaluates within its 80 inner iterations");
     assert!(loss.total().is_finite(), "loss must stay finite");
+    // The existence verdict below is read from this state, so it must be the inner
+    // optimum. `run_joint_fit_arrow_schur` also returns `Ok` when the iteration grant
+    // runs out, so certify the returned state against the ordinary fit's own KKT band,
+    // in the raw chart or on the identified quotient, before anything is judged.
+    let system = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("the fitted state assembles its arrow system");
+    let grad_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
+    let lambda_smooth = rho
+        .lambda_smooth_vec()
+        .expect("the fitted rho carries its smoothing strengths");
+    let quotient_grad_norm =
+        term.quotient_gradient_norm_from_system(&system, grad_norm_sq, &lambda_smooth);
+    let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * term.inner_iterate_scale();
+    assert!(
+        SaeManifoldTerm::quasi_laplace_kkt_stationary(
+            grad_norm_sq.sqrt(),
+            quotient_grad_norm,
+            grad_tolerance
+        ),
+        "the K=3 amplitude fit must reach its inner KKT band before existence is judged: \
+         ‖g‖={:.3e}, quotient ‖g‖={quotient_grad_norm:.3e}, tolerance {grad_tolerance:.3e}",
+        grad_norm_sq.sqrt()
+    );
 
     let ev = term
         .dictionary_reconstruction_ev(target.view(), &rho)

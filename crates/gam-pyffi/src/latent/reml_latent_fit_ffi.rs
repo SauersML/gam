@@ -61,7 +61,7 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
                     Some(value) => bound.setattr("final_grad_norm", value)?,
                     None => bound.setattr("final_grad_norm", py.None())?,
                 }
-                match result.final_gradient.as_ref() {
+                match result.final_gradient() {
                     Some(value) => {
                         bound.setattr("final_gradient", value.clone().into_pyarray(py))?
                     }
@@ -791,10 +791,7 @@ fn glm_reml_fit_latent<'py>(
         .transpose()
         .map_err(py_value_error)?;
     if y_values.ncols() > 1
-        || matches!(
-            family_normalized.as_str(),
-            "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
-        )
+        || gam::families::fit_orchestration::is_multinomial_family_name(&family_normalized)
     {
         // Per-row Fisher-block override is now threaded through the
         // multi-output canonical fitters (issue #349): the multinomial path
@@ -985,41 +982,6 @@ fn latent_analytic_penalty_registry(
     build_analytic_penalty_registry_from_json(Some(&latent_payload), descriptors.as_ref())
 }
 
-/// The registry energy a latent REML score adds, at descriptor-pinned weights
-/// (ρ = 0 on every owned axis).
-///
-/// #2933 F02 — these fits declare only the latent block `t` and install no
-/// decoder jets. A β-tier penalty would be priced on the fitted coefficients,
-/// whose layout none of the β-tier kinds describes here (each self-disables to
-/// 0 on the mismatch), so it is refused instead of scored as zero; an isometry
-/// penalty has no `J` and refuses through the registry precondition.
-fn latent_analytic_penalty_value(
-    registry: &AnalyticPenaltyRegistry,
-    t: ArrayView1<'_, f64>,
-) -> Result<f64, String> {
-    if let Some((_, _, name)) = registry
-        .rho_layout()
-        .into_iter()
-        .find(|(_, tier, _)| matches!(tier, PenaltyTier::Beta))
-    {
-        return Err(format!(
-            "analytic penalty `{name}` is β-tier, but a latent REML fit declares only the latent \
-             block t, so it has no coefficient block to price; refused instead of scored as zero"
-        ));
-    }
-    registry.isometry_evaluation_precondition(IsometryEvaluationOrder::Value, t.len())?;
-    let rho = Array1::<f64>::zeros(registry.total_rho_count());
-    registry.validate_rho(rho.view())?;
-    let mut value = 0.0_f64;
-    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
-    {
-        if matches!(tier, PenaltyTier::Psi) {
-            value += penalty.value(t, rho.slice(s![rho_slice]));
-        }
-    }
-    Ok(value)
-}
-
 /// `∂/∂t` of [`latent_analytic_penalty_value`], which both latent backward
 /// companions add into `grad_t` so it stays the gradient of the reported
 /// `reml_score` (#2933 F02).
@@ -1162,7 +1124,7 @@ fn glm_reml_fit_latent_backward_impl(
     if let Some(precisions) = dim_selection_precision {
         for n in 0..n_obs {
             for a in 0..latent_dim {
-                let prec = precisions.physical[a];
+                let prec = precisions.physical()[a];
                 grad_t[n * latent_dim + a] += grad_reml_score * prec * t_mat[[n, a]];
             }
         }
@@ -3054,54 +3016,6 @@ fn periodic_position_domain(
     Ok((left, right, knots_or_centers.len() - 1))
 }
 
-fn validate_position_period(
-    label: &str,
-    knots_or_centers: ArrayView1<'_, f64>,
-    periodic: bool,
-    period: Option<f64>,
-) -> Result<(), String> {
-    if periodic {
-        let left = knots_or_centers
-            .iter()
-            .fold(f64::INFINITY, |a, &b| a.min(b));
-        let right = knots_or_centers
-            .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        if !left.is_finite() || !right.is_finite() || left >= right {
-            return Err(format!(
-                "{label} periodic support must have increasing finite endpoints"
-            ));
-        }
-        let implied = right - left;
-        if let Some(period) = period {
-            if !period.is_finite() || period <= 0.0 {
-                return Err(format!(
-                    "{label} period must be finite and positive; got {period}"
-                ));
-            }
-            // The period is the domain WRAP, not the sample/center span. Centers
-            // on a half-open grid [start, start+period) (e.g. linspace(0,1,K,
-            // endpoint=False) with period 1.0) span only `period − one_spacing`,
-            // so requiring span == period rejected every legitimate explicit
-            // period (gam#580). The only real constraint is that every center
-            // fits inside a single period, i.e. `period >= span`.
-            if period < implied - 1.0e-10 * implied.max(1.0) {
-                return Err(format!(
-                    "{label} explicit period ({period}) is smaller than the center span \
-                     ({implied}); every center must lie within a single period"
-                ));
-            }
-        } else if label != "duchon" {
-            return Err(format!(
-                "{label} periodic position basis requires an explicit period"
-            ));
-        }
-    } else if period.is_some() {
-        return Err(format!("{label} period is only valid when periodic=true"));
-    }
-    Ok(())
-}
-
 fn normalized_position_basis_kind(basis_kind: &str) -> Result<String, String> {
     let normalized = basis_kind
         .trim()
@@ -3393,16 +3307,17 @@ fn posterior_predict_result_to_py(
 #[pyfunction]
 fn posterior_predict_table(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     samples: PyReadonlyArray2<'_, f64>,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let samples = owned_row_major_f64(samples.as_array());
     let result = detach_py_result(py, "posterior_predict_table", move || {
-        posterior_predict_encoded_table_impl(&model_bytes, dataset, samples)
+        posterior_predict_encoded_table_impl(&model, dataset, samples)
     })?;
     posterior_predict_result_to_py(py, result)
 }
@@ -3410,17 +3325,18 @@ fn posterior_predict_table(
 #[pyfunction]
 fn posterior_predict_bands_table(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     samples: PyReadonlyArray2<'_, f64>,
     level: f64,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let samples = owned_row_major_f64(samples.as_array());
     let payload = detach_py_result(py, "posterior_predict_bands_table", move || {
-        posterior_predict_bands_encoded_table_impl(&model_bytes, dataset, samples, level)
+        posterior_predict_bands_encoded_table_impl(&model, dataset, samples, level)
     })?;
     posterior_bands_payload_to_py(py, payload)
 }
@@ -3518,8 +3434,9 @@ fn apply_inverse_link_with_optional_spec(
 }
 
 #[pyfunction]
-fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
-    detach_py_result(py, "summary_json", move || summary_json_impl(&model_bytes))
+fn summary_json(model: PyRef<'_, PyFittedModel>) -> PyResult<String> {
+    serde_json::to_string(model.summary_value()?)
+        .map_err(|err| py_value_error(format!("failed to serialize summary: {err}")))
 }
 
 /// #944 curvature-as-an-estimand report for every `curv(...)` constant-curvature
@@ -3534,24 +3451,27 @@ fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 #[pyfunction]
 fn curvature_inference_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     level: Option<f64>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "curvature_inference_json", move || {
-        curvature_inference_dataset_json_impl(&model_bytes, dataset, level.unwrap_or(0.95))
+        curvature_inference_dataset_json_impl(&model, dataset, level.unwrap_or(0.95))
     })
 }
 
 /// #1063 per-term LR significance report for every penalized smooth term:
 /// `statistic_lr`, `ref_df`, `bartlett_factor`,
 /// `bartlett_factor_conditional`, `rho_variation_shift`,
-/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`, and
+/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`,
 /// `correction_provenance` (`"lawley_lr_estimated_lambda"` |
-/// `"lawley_lr_fixed_lambda"` | `"none"`).
+/// `"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
+/// `p_value_upper_bound` or `unavailable_reason` (with `unavailable_message`).
+/// Every row carries every key.
 ///
 /// Unlike `summary_json` (Wood rank-truncated **Wald** χ²), this computes a
 /// genuine **likelihood-ratio** statistic by a constrained refit dropping each
@@ -3561,14 +3481,15 @@ fn curvature_inference_json(
 #[pyfunction]
 fn smooth_term_lr_inference_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "smooth_term_lr_inference_json", move || {
-        smooth_term_lr_inference_dataset_json_impl(&model_bytes, dataset)
+        smooth_term_lr_inference_dataset_json_impl(&model, dataset)
     })
 }
 
@@ -3584,14 +3505,15 @@ fn smooth_term_lr_inference_json(
 #[pyfunction]
 fn basis_adequacy_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "basis_adequacy_json", move || {
-        basis_adequacy_dataset_json_impl(&model_bytes, dataset)
+        basis_adequacy_dataset_json_impl(&model, dataset)
     })
 }
 
@@ -3624,15 +3546,16 @@ fn basis_adequacy_json(
 #[pyfunction]
 fn model_debiased_functional_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     target_spec_json: String,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "model_debiased_functional_json", move || {
-        model_debiased_functional_dataset_json_impl(&model_bytes, dataset, &target_spec_json)
+        model_debiased_functional_dataset_json_impl(&model, dataset, &target_spec_json)
     })
 }
 
@@ -3785,13 +3708,12 @@ fn weighted_affine_mean(
 }
 
 fn model_debiased_functional_dataset_json_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     dataset: EncodedDataset,
     target_spec_json: &str,
 ) -> Result<String, String> {
     use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 
-    let model = load_model_impl(model_bytes)?;
     let formula = model.payload().formula.clone();
 
     // Only standard (non-survival, non-marginal-slope) models supported: they
@@ -4125,16 +4047,13 @@ fn resolve_average_derivative_column(
 }
 
 #[pyfunction]
-fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = detach_py_result(py, "summary_payload_from_model", move || {
-        summary_payload_value_from_model_bytes(&model_bytes)
-    })?;
-    json_object_to_py_dict(py, payload)
+fn summary_payload_from_model(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    json_object_to_py_dict(py, model.summary_value()?.clone())
 }
 
 #[pyfunction]
-fn smoothing_parameters_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+fn smoothing_parameters_from_model(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    let payload = model.summary_value()?;
     let out = PyDict::new(py);
     let Some(lambdas) = payload.get("lambdas").and_then(serde_json::Value::as_array) else {
         return Ok(out.unbind().into_any());
@@ -4149,17 +4068,16 @@ fn smoothing_parameters_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyRe
 }
 
 #[pyfunction]
-fn model_group_metadata(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
-    match payload.get("group_metadata") {
+fn model_group_metadata(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    match model.summary_value()?.get("group_metadata") {
         Some(value @ serde_json::Value::Object(_)) => json_value_to_py(py, value.clone()),
         _ => Ok(py.None()),
     }
 }
 
 #[pyfunction]
-fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+fn model_deployment_extensions(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    let payload = model.summary_value()?;
     let out = PyList::empty(py);
     let Some(extensions) = payload
         .get("deployment_extensions")
@@ -4176,19 +4094,19 @@ fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult
     Ok(out.unbind().into_any())
 }
 
-#[pyfunction]
-fn model_evidence(model_bytes: Vec<u8>) -> PyResult<f64> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
-    // Report the SAME Occam-penalised conditional-AIC ranking score that
-    // `gamfit.compare_models` ranks on (`-2·loglik + 2·edf`), not the raw
-    // REML/LAML evidence headline, so `Model.evidence` ordering agrees with the
-    // winner `compare_models` declares. Lower is still better (issue #2079).
-    ranking_score_from_summary_payload(&payload)
-}
-
-fn summary_payload_value_from_model_bytes(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
-    let summary_json = summary_json_impl(model_bytes)?;
-    serde_json::from_str(&summary_json).map_err(|err| format!("invalid model summary JSON: {err}"))
+/// The saved-model summary as a JSON value, built from the typed model, with its
+/// rendered text under `"text"`: the one Rust renderer `gam summary` prints, so
+/// `str(model.summary())` is that same string.
+fn summary_payload_value(model: &FittedModel) -> Result<serde_json::Value, String> {
+    let summary = saved_model_summary(model)?;
+    let text = render_summary_text(&summary);
+    let mut value = serde_json::to_value(&summary)
+        .map_err(|err| format!("failed to serialize summary: {err}"))?;
+    let serde_json::Value::Object(fields) = &mut value else {
+        return Err("model summary payload must be a JSON object".to_string());
+    };
+    fields.insert("text".to_string(), serde_json::Value::String(text));
+    Ok(value)
 }
 
 fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
@@ -4256,25 +4174,24 @@ fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
             fields.push(format!("{key}={repr}"));
         }
     }
+    if let Some(estimator) = summary_estimator_text(payload)? {
+        fields.push(format!("estimator={}", estimator.repr()?.extract::<String>()?));
+    }
     Ok(format!("Summary({})", fields.join(", ")))
 }
 
-/// The summary's criterion row in gam-report's words, so the printed summary
-/// names a fit without null-space metadata apart from an exact fit the same way
-/// `gam fit` and the HTML report do (#2627).
-#[pyfunction]
-fn summary_criterion_row(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    let criterion = |key: &str| -> PyResult<Option<f64>> {
-        match payload.get_item(key)? {
-            Some(value) if !value.is_none() => Ok(Some(value.extract::<f64>()?)),
-            _ => Ok(None),
-        }
+/// `convergence.estimator.text`: the words `SummaryEstimator` renders for the
+/// objective the fit optimized. `None` for a route that certifies no optimizer.
+fn summary_estimator_text<'py>(
+    payload: &Bound<'py, PyDict>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(convergence) = payload.get_item("convergence")? else {
+        return Ok(None);
     };
-    Ok(gam::report::criterion_row(
-        criterion("reml_score")?,
-        criterion("raw_reml_score")?,
-        summary_render::summary_format_float,
-    ))
+    if convergence.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(convergence.get_item("estimator")?.get_item("text")?))
 }
 
 #[pyfunction]
@@ -4304,36 +4221,40 @@ fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
 }
 
 #[pyfunction]
-fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
+fn coefficient_state_json(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     detach_py_result(py, "coefficient_state_json", move || {
-        coefficient_state_json_impl(&model_bytes)
+        coefficient_state_json_impl(&model)
     })
 }
 
 #[pyfunction]
-fn term_blocks_for_model(model_bytes: Vec<u8>) -> PyResult<Vec<(String, String, usize, usize)>> {
-    term_blocks_for_model_impl(&model_bytes).map_err(PyValueError::new_err)
+fn term_blocks_for_model(model: PyRef<'_, PyFittedModel>) -> PyResult<Vec<(String, String, usize, usize)>> {
+    let model = Arc::clone(&model.model);
+    term_blocks_for_model_impl(&model).map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
 fn difference_smooth_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     request_json: String,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     detach_py_result(py, "difference_smooth_json", move || {
-        difference_smooth_json_impl(&model_bytes, &request_json)
+        difference_smooth_json_impl(&model, &request_json)
     })
 }
 
 #[pyfunction]
 fn difference_smooth_rows(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     request_json: String,
 ) -> PyResult<PyObject> {
+    let model = Arc::clone(&model.model);
     let rows = detach_py_result(py, "difference_smooth_rows", move || {
-        let raw = difference_smooth_json_impl(&model_bytes, &request_json)?;
+        let raw = difference_smooth_json_impl(&model, &request_json)?;
         serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(&raw)
             .map_err(|err| format!("failed to parse difference_smooth rows json: {err}"))
     })?;
@@ -4455,28 +4376,30 @@ fn cross_fit_shared_precision_groups_json(
 #[pyfunction]
 fn check_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "check_json", move || {
-        check_dataset_json_impl(&model_bytes, dataset)
+        check_dataset_json_impl(&model, dataset)
     })
 }
 
 #[pyfunction]
 fn check_payload_from_model(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<PyObject> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let payload = detach_py_result(py, "check_payload_from_model", move || {
-        let check_json = check_dataset_json_impl(&model_bytes, dataset)?;
+        let check_json = check_dataset_json_impl(&model, dataset)?;
         serde_json::from_str::<serde_json::Value>(&check_json)
             .map_err(|err| format!("invalid schema check JSON: {err}"))
     })?;
@@ -4484,8 +4407,9 @@ fn check_payload_from_model(
 }
 
 #[pyfunction]
-fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
-    detach_py_result(py, "report_html", move || report_html_impl(&model_bytes))
+fn report_html(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
+    detach_py_result(py, "report_html", move || report_html_impl(&model))
 }
 
 #[pyfunction]
@@ -4517,20 +4441,6 @@ fn diagnostics_from_predictions(
 fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
     gam::inference::diagnostics::auc_from_predictions(&observed, &predicted_mean)
         .map_err(py_value_error)
-}
-
-#[pyfunction]
-fn weighted_auc_from_predictions(
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    weights: Vec<f64>,
-) -> PyResult<f64> {
-    gam::inference::diagnostics::weighted_auc_from_predictions(
-        &observed,
-        &predicted_mean,
-        Some(&weights),
-    )
-    .map_err(py_value_error)
 }
 
 #[pyfunction]
@@ -4603,17 +4513,17 @@ fn gaussian_prediction_scores_from_predictions(
     Ok(out.unbind())
 }
 
-#[pyfunction]
+#[pyfunction(signature = (observed, predicted_mean, null_mean = None))]
 fn classification_metrics(
     py: Python<'_>,
     observed: Vec<f64>,
     predicted_mean: Vec<f64>,
-    train_prev: f64,
+    null_mean: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let metrics = gam::inference::diagnostics::classification_metrics_from_predictions(
         &observed,
         &predicted_mean,
-        train_prev,
+        null_mean,
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);

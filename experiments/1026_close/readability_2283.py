@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 import platform
 import sys
@@ -40,6 +39,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+from crossover_theorem_check import support_code_bits
 
 
 def _sha256_array(a: np.ndarray) -> str:
@@ -208,12 +209,6 @@ def encode_recon_host(x, *, W_enc, W_dec, b_dec, top_k, block=8192):
 
 
 # --------------------------------------------------------------------------- #
-def selection_bits(n_atoms: int, k_active: int) -> float:
-    """log2 C(n_atoms, k_active) — the theorem's support currency."""
-    return (math.lgamma(n_atoms + 1) - math.lgamma(k_active + 1)
-            - math.lgamma(n_atoms - k_active + 1)) / math.log(2.0)
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--harvest", default=os.path.expanduser("~/i2502/harvest"))
@@ -455,10 +450,10 @@ def main() -> int:
         k_flat = args.K - 3 * charts       # faithful: k_flat*P + charts*3*P == K*P
         curved_k = 2
         margins[str(charts)] = (
-            selection_bits(args.K, args.top_k)
-            - selection_bits(k_flat + charts, args.top_k - curved_k))
+            support_code_bits(args.K, args.top_k)
+            - support_code_bits(k_flat + charts, args.top_k - curved_k))
     emit({"record": "theorem_margin", "support_bits_external":
-          selection_bits(args.K, args.top_k), "margin_by_charts": margins})
+          support_code_bits(args.K, args.top_k), "margin_by_charts": margins})
     log(f"theorem margin by chart count: {json.dumps(margins)}")
 
     log(f"wrote {len(records)} records to {outp}")

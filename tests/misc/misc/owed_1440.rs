@@ -23,17 +23,17 @@
 //!
 //! The scanner now confines `fd-ok` markers to the allowlist
 //! (`fd_ok_markers_are_confined_to_the_allowlist`): a non-test file that uses an
-//! `fd-ok` marker but is not allowlisted is itself a violation. The allowlist is
-//! populated with every sanctioned FD (audit oracle/certificate machinery and
-//! the tracked SAE chart Jacobian), each with a written justification.
+//! `fd-ok` marker but is not allowlisted is itself a violation. Since
+//! d7ec08b5cf the allowlist is EMPTY (see
+//! `no_production_file_is_sanctioned_for_finite_differences`).
 //!
 //! ## What this test guards
 //!
 //! It is a SOURCE-CONTRACT meta-guard (no gam dependency): it reads the scanner
 //! source via `include_str!` and asserts the confinement invariant and the
-//! enumerated allowlist survive, so a future edit cannot silently restore the
-//! per-line-marker hole or empty the allowlist while leaving production FD in the
-//! tree.
+//! allowlist's contents survive, so a future edit cannot silently restore the
+//! per-line-marker hole or sanction a production file without this guard
+//! naming it.
 
 const SCANNER_SRC: &str = include_str!("no_production_finite_differences.rs");
 
@@ -89,7 +89,10 @@ fn scanner_keeps_a_tracked_allowlist_constant() {
 /// one of them, `fd_audit.rs`, does not exist in the tree at all any more.
 ///
 /// So parse the literal instead: take the text between the const's `&[` and its
-/// closing `];`, drop comment-only lines, and collect the quoted entries.
+/// closing `];`, drop comment-only lines, and collect the quoted entries. The
+/// empty list is written on one line (`&[];`); a populated one closes on a line
+/// of its own. Any other shape is refused, so a reshaped literal cannot parse
+/// as empty.
 fn sanctioned_allowlist_entries() -> Vec<String> {
     const HEAD: &str = "const SANCTIONED_FD_FILES: &[&str] = &[";
     let start = SCANNER_SRC.find(HEAD).unwrap_or_else(|| {
@@ -99,6 +102,9 @@ fn sanctioned_allowlist_entries() -> Vec<String> {
         )
     });
     let body = &SCANNER_SRC[start + HEAD.len()..];
+    if body.starts_with("];") {
+        return Vec::new();
+    }
     let end = body
         .find("\n];")
         .unwrap_or_else(|| panic!("#1440: the FD allowlist must remain a closed literal list"));
@@ -125,49 +131,23 @@ fn sanctioned_allowlist_entries() -> Vec<String> {
     entries
 }
 
-/// The FD-audit oracle's successor files must remain ENUMERATED in the
-/// allowlist, and the retired paths must stay OUT of it. If FD is removed from
-/// one of these files, drop the entry here too (and from the scanner) — that is
-/// a deliberate, reviewed change, not a silent weakening.
+/// No production file is sanctioned for finite differences. 1bc46ac508 replaced
+/// the runner's FD audit (the Ridders probe in `rho_optimizer/run_plan.rs` and
+/// its certificate store in `estimate/outer_eval_capture.rs`) with an analytic
+/// seed probe, and d7ec08b5cf removed the last entry, `rho_optimizer/run.rs`,
+/// when opt dropped the `set_finite_difference_bounds` hook it delegated. The
+/// scanner's own tests prove no production FD remains outside the list.
+/// Sanctioning a file again is a deliberate, reviewed change that restates this
+/// test with the site and its justification.
 ///
 /// Checked against the PARSED allowlist, not against raw scanner source text.
 #[test]
-fn known_sanctioned_fd_sites_stay_enumerated() {
+fn no_production_file_is_sanctioned_for_finite_differences() {
     let entries = sanctioned_allowlist_entries();
     assert!(
-        !entries.is_empty(),
-        "#1440: the FD allowlist parsed EMPTY — either it was emptied while \
-         production FD remains in the tree, or its literal was reshaped and this \
-         guard can no longer read it. Both are a silent weakening."
+        entries.is_empty(),
+        "#1440: SANCTIONED_FD_FILES must stay empty unless a reviewed change \
+         restates this guard with the new site and its justification. Parsed \
+         allowlist: {entries:?}"
     );
-
-    for site in [
-        // The Ridders probe, folded out of `fd_audit.rs` in a6dbd67a7.
-        "crates/gam-solve/src/rho_optimizer/run_plan.rs",
-        // The FD-audit certificate's thread-local store, same fold.
-        "crates/gam-solve/src/estimate/outer_eval_capture.rs",
-        // Builds the FD-audit certificate from the oracle.
-        "crates/gam-solve/src/rho_optimizer/run.rs",
-    ] {
-        assert!(
-            entries.iter().any(|entry| entry == site),
-            "#1440: the sanctioned FD site `{site}` must stay enumerated in \
-             SANCTIONED_FD_FILES (with its justification) so it is tracked, not \
-             hidden. Parsed allowlist: {entries:?}"
-        );
-    }
-
-    for retired in [
-        // Deleted by a6dbd67a7 and folded into the two files above.
-        "crates/gam-solve/src/rho_optimizer/fd_audit.rs",
-        // The GN chart Jacobian is analytic in production; its FD oracle is
-        // test-only, so the production file is deliberately NOT sanctioned.
-        "crates/gam-sae/src/chart_canonicalization.rs",
-    ] {
-        assert!(
-            !entries.iter().any(|entry| entry == retired),
-            "#1440: `{retired}` is not a sanctioned FD site and must not appear in \
-             SANCTIONED_FD_FILES. Parsed allowlist: {entries:?}"
-        );
-    }
 }

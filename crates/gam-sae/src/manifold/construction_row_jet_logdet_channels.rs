@@ -579,7 +579,6 @@ impl SaeManifoldTerm {
                     .map_or(1.0, |weights| weights[row].sqrt());
                 let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                     &source,
-                    crate::gpu_kernels::sae_rowjet::SaeRowGateProgram::Softmax,
                     sqrt_row_weight,
                     shared_beta_layout.clone(),
                 )?;
@@ -691,7 +690,6 @@ impl SaeManifoldTerm {
                     .map_or(1.0, |weights| weights[row].sqrt());
                 let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                     &source,
-                    crate::gpu_kernels::sae_rowjet::SaeRowGateProgram::Softmax,
                     sqrt_row_weight,
                     shared_beta_layout.clone(),
                 )?;
@@ -785,16 +783,19 @@ impl SaeManifoldTerm {
                 v_t.extend_from_slice(&v_t_row);
                 v_beta.extend_from_slice(v_beta_row);
             }
-            let tile = crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile_contracted(
-                &tile_plan.inputs,
-                1.0 / temperature,
-                tile_plan.path,
-                crate::gpu_kernels::sae_rowjet::SaeRowJetContraction::Bilinear {
-                    probe: &tile_plan.probe,
-                    v_t: &v_t,
-                    v_beta: &v_beta,
-                },
-            )?;
+            let tile = match tile_plan.bilinear.as_ref() {
+                Some(kept) => kept.apply(&v_t, &v_beta)?,
+                None => crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile_contracted(
+                    &tile_plan.inputs,
+                    1.0 / temperature,
+                    tile_plan.path,
+                    crate::gpu_kernels::sae_rowjet::SaeRowJetContraction::Bilinear {
+                        probe: &tile_plan.probe,
+                        v_t: &v_t,
+                        v_beta: &v_beta,
+                    },
+                )?,
+            };
             if tile.n_rows != tile_rows || tile.q != q || tile.n_beta != n_beta {
                 return Err(format!(
                     "contracted SAE row-jet tile returned shape ({}, {}, {}); expected ({tile_rows}, {q}, {n_beta})",
@@ -891,7 +892,6 @@ impl SaeManifoldTerm {
                 let sqrt_row_weight = row_loss_w.map_or(1.0, |weights| weights[row].sqrt());
                 let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                     &source,
-                    crate::gpu_kernels::sae_rowjet::SaeRowGateProgram::Softmax,
                     sqrt_row_weight,
                     shared_beta_layout.clone(),
                 )?;
@@ -935,288 +935,39 @@ impl SaeManifoldTerm {
                 }
                 probe.extend_from_slice(&probe_row);
             }
+            let bilinear = match (plan.path, self.assignment.mode) {
+                (
+                    crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Cpu,
+                    AssignmentMode::Softmax { temperature, .. },
+                ) => crate::gpu_kernels::sae_rowjet::bilinear::prepare_bilinear_contractions(
+                    &inputs,
+                    1.0 / temperature,
+                    &probe,
+                )?,
+                _ => None,
+            };
             tiles.push(PreparedSoftmaxRowJetTile {
                 start,
                 q,
                 path: plan.path,
                 inputs,
                 probe,
+                bilinear,
             });
             start += tile_rows;
         }
         Ok(PreparedSoftmaxRowJets { border, tiles })
     }
-
-    /// Resident `Γ = tr(H⁻¹ ∂H/∂θ)` majorizer θ-adjoint of a threshold-gate fit
-    /// over the joint selected inverse (#2333).
-    ///
-    /// `H` is the majorizer the Newton factor builds (Gauss–Newton data curvature
-    /// plus the prior majorizers), so every channel is differentiated on the
-    /// majorizer branch. The criterion ranks the exact observed information
-    /// instead, so this is not the derivative of the criterion (#2933 F03); the
-    /// outer gradient takes `logdet_theta_adjoint_dense` on the dense exact-A
-    /// route and `logdet_theta_adjoint_from_probes` on the matrix-free lane.
-    /// This is the sole θ-adjoint consumer of
-    /// the Trace seam: it builds the joint selected-inverse blocks, folds the
-    /// deflation map of each row into `E_tt`, projects every semantic output base
-    /// into the row metric chart, and sends the independent-logistic
-    /// data-curvature tower through the typed Trace seam on the host. The
-    /// assignment-prior and ARD channels are host post-folds against the same
-    /// `E_tt`, so the conditioned operator is differentiated exactly once.
-    pub(crate) fn contracted_trace_adjoint(
-        &self,
-        rho: &SaeManifoldRho,
-        cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
-    ) -> Result<SaeArrowVector, String> {
-        use crate::gpu_kernels::sae_rowjet::SaeRowGateProgram;
-        self.assignment.validate_rho_domain(rho)?;
-        if cache.arrow_log_det().is_none() {
-            return Err(
-                "logdet_theta_adjoint: cache lacks an authoritative joint-Hessian log-det \
-                 for the selected-inverse operator"
-                    .to_string(),
-            );
-        }
-        // The majorizer θ-adjoint is modelled here for the threshold gate alone.
-        // Since #2933 F03 the dense exact-A route owns that family as well
-        // (`logdet_theta_adjoint_dense`), and the matrix-free lane owns the
-        // from-probes one, so no production outer gradient reaches this.
-        let (inv_tau, threshold_strength) = match self.assignment.mode {
-            AssignmentMode::ThresholdGate { temperature, .. } => {
-                (temperature.recip(), rho.lambda_sparse()?)
-            }
-            other => {
-                return Err(format!(
-                    "logdet_theta_adjoint: the majorizer theta-adjoint is modelled only for the \
-                     threshold gate; a {} fit takes logdet_theta_adjoint_dense on the dense \
-                     exact-A route or logdet_theta_adjoint_from_probes on the matrix-free lane",
-                    other.family_label()
-                ));
-            }
-        };
-        let n = self.n_obs();
-        let p = self.output_dim();
-        let k_atoms = self.k_atoms();
-        let total_t = cache.delta_t_len();
-        let mut gamma_t = Array1::<f64>::zeros(total_t);
-        let mut gamma_beta = Array1::<f64>::zeros(cache.k);
-        let second_jets = self.atom_second_jets()?;
-        let border = self.border_channels_for_cache(cache)?;
-        let n_beta = border.len();
-        let ard_precisions = self.validated_ard_precisions(rho)?;
-        let fast_selected = solver.plain_selected_inverse_available();
-        let beta_inv = Self::selected_inverse_beta_block(
-            solver,
-            cache,
-            fast_selected,
-            "contracted_trace_adjoint",
-        )?;
-        let mut beta_inv_border = vec![0.0_f64; n_beta * n_beta];
-        for (i, channel_i) in border.iter().enumerate() {
-            for (j, channel_j) in border.iter().enumerate() {
-                beta_inv_border[i * n_beta + j] =
-                    beta_inv[[channel_i.index, channel_j.index]];
-            }
-        }
-        let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
-        let selected_ctx = SelectedInverseRowSolve {
-            solver,
-            cache,
-            beta_inv: &beta_inv,
-            fast_selected,
-            rhs_beta_zero: rhs_beta_zero.view(),
-            context: "contracted_trace_adjoint",
-        };
-        let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
-        let whiten = self.whiten_logdet_row_jets();
-        let metric = if whiten {
-            Some(
-                self.row_metric
-                    .as_ref()
-                    .ok_or_else(|| "contracted Trace whitening metric absent".to_string())?,
-            )
-        } else {
-            None
-        };
-        let projected_p = metric.map_or(p, |metric| metric.metric_rank());
-        let host_budget = crate::manifold::sae_host_in_core_budget_bytes().0;
-        let mut assignments_scratch = Array1::<f64>::zeros(k_atoms);
-        let mut start = 0usize;
-        while start < n {
-            let q = cache.row_dims[start];
-            let same_shape_rows = cache.row_dims[start..]
-                .iter()
-                .take_while(|&&candidate| candidate == q)
-                .count();
-            let plan = crate::gpu_kernels::sae_rowjet::plan_softmax_row_jets_trace(
-                same_shape_rows,
-                k_atoms,
-                q,
-                projected_p,
-                n_beta,
-                host_budget,
-            )?;
-            if plan.tile_rows == 0 {
-                return Err(format!(
-                    "contracted Trace planner returned an empty tile at row {start}"
-                ));
-            }
-            let tile_rows = plan.tile_rows;
-            let mut inputs = Vec::with_capacity(tile_rows);
-            let mut layouts = Vec::with_capacity(tile_rows);
-            let mut e_tt = Vec::with_capacity(tile_rows * q * q);
-            let mut inv_vbeta = Vec::with_capacity(tile_rows * q * n_beta);
-            let mut shared_beta_layout = None;
-            for row in start..start + tile_rows {
-                let base = cache.row_offsets[row];
-                let vars = self.row_vars_for_cache_row(row, cache)?;
-                self.assignment.try_assignments_row_into(
-                    row,
-                    assignments_scratch
-                        .as_slice_mut()
-                        .expect("assignment scratch is contiguous"),
-                )?;
-                let source = ProductionRowProgram {
-                    term: self,
-                    row,
-                    vars: &vars,
-                    assignments: assignments_scratch.view(),
-                    second_jets: &second_jets,
-                    border: &border,
-                };
-                let sqrt_row_weight = self
-                    .row_loss_weights
-                    .as_deref()
-                    .map_or(1.0, |weights| weights[row].sqrt());
-                let mut input =
-                    crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
-                        &source,
-                        SaeRowGateProgram::IndependentLogistic,
-                        sqrt_row_weight,
-                        if metric.is_some() {
-                            None
-                        } else {
-                            shared_beta_layout.clone()
-                        },
-                    )?;
-                if let Some(metric) = metric {
-                    input.project_output_bases(projected_p, |source, projected| {
-                        for rank_col in 0..projected_p {
-                            let mut acc = 0.0_f64;
-                            for out_col in 0..p {
-                                acc += metric.factor_entry(row, out_col, rank_col)
-                                    * source[out_col];
-                            }
-                            projected[rank_col] = acc;
-                        }
-                    })?;
-                } else {
-                    shared_beta_layout =
-                        Some((input.beta_atoms.clone(), input.beta_outputs.clone()));
-                }
-                let (inv_vv_row, inv_vbeta_row) = Self::selected_inverse_row_blocks_or_solve(
-                    &selected_ctx,
-                    row,
-                    base,
-                    q,
-                    &mut rhs_t_scratch,
-                )?;
-                let defl_dirs = cache
-                    .deflated_row_directions
-                    .get(row)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let defl_spectrum = cache
-                    .deflation_row_spectra
-                    .get(row)
-                    .and_then(Option::as_ref);
-                let e_row = Self::deflation_folded_trace_weight(
-                    &inv_vv_row,
-                    defl_dirs,
-                    defl_spectrum,
-                );
-                e_tt.extend(e_row.iter().copied());
-                for a in 0..q {
-                    for channel in &border {
-                        inv_vbeta.push(inv_vbeta_row[[a, channel.index]]);
-                    }
-                }
-                inputs.push(input);
-                layouts.push(vars);
-            }
-            let trace = crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile_contracted(
-                &inputs,
-                inv_tau,
-                plan.path,
-                crate::gpu_kernels::sae_rowjet::SaeRowJetContraction::Trace {
-                    e_tt: &e_tt,
-                    inv_vbeta: &inv_vbeta,
-                    beta_inv: &beta_inv_border,
-                },
-            )?;
-            if (trace.n_rows, trace.q, trace.n_beta) != (tile_rows, q, n_beta) {
-                return Err(format!(
-                    "contracted Trace returned shape ({}, {}, {}); expected ({tile_rows}, {q}, {n_beta})",
-                    trace.n_rows, trace.q, trace.n_beta
-                ));
-            }
-            for local in 0..tile_rows {
-                let row = start + local;
-                let base = cache.row_offsets[row];
-                let vars = &layouts[local];
-                let e_row = &e_tt[local * q * q..(local + 1) * q * q];
-                for w in 0..q {
-                    let mut gamma = trace.t[local * q + w];
-                    for a in 0..q {
-                        if let SaeLocalRowVar::Logit { atom } = vars[a] {
-                            gamma += e_row[a * q + a]
-                                * self.assignment_prior_hdiag_derivative_entry(
-                                    threshold_strength,
-                                    row,
-                                    atom,
-                                    vars[w],
-                                    None,
-                                    false,
-                                );
-                        }
-                    }
-                    if let SaeLocalRowVar::Coord { atom, axis } = vars[w] {
-                        if !ard_precisions[atom].is_empty() {
-                            let derivative = self.ard_majorized_hessian_derivative(
-                                ard_precisions[atom][axis],
-                                row,
-                                atom,
-                                axis,
-                            );
-                            gamma += e_row[w * q + w] * derivative;
-                        }
-                    }
-                    gamma_t[base + w] = gamma;
-                }
-                for (border_pos, channel) in border.iter().enumerate() {
-                    gamma_beta[channel.index] += trace.beta[local * n_beta + border_pos];
-                }
-            }
-            start += tile_rows;
-        }
-        Ok(SaeArrowVector {
-            t: gamma_t,
-            beta: gamma_beta,
-        })
-    }
 }
 
-/// #2333 — the algebraic identity the Trace θ-adjoint rests on.
+/// #2333 — the algebraic identity the deflation-folded trace weight rests on.
 ///
-/// `SaeManifoldTerm::contracted_trace_adjoint` no longer computes the
-/// retired hand loop's `contract-then-subtract` shape
-/// `tr(inv_vv·D) − deflation_block_correction(inv_vv, D, …)`; it hands the seam a
-/// SINGLE weight `E_tt` and lets the kernel reduce `Σ_{a,b} E[a,b]·dh[a,b]`
-/// against the materialized tower. Every θ-adjoint value, for every gate family,
-/// is therefore only as correct as
-/// `SaeManifoldTerm::deflation_folded_trace_weight` reproducing that
-/// subtraction inside the weight. These tests pin exactly that, at the RELATIVE
+/// `SaeManifoldTerm::deflation_folded_trace_weight` returns ONE weight `E_tt`
+/// whose contraction `Σ_{a,b} E[a,b]·D[a,b]` equals the contract-then-subtract
+/// shape `tr(inv_vv·D) − deflation_block_correction(inv_vv, D, …)` for every
+/// symmetric `D`, so a consumer that contracts a row block against `E`
+/// (`evidence_metric_raw_weight`) prices the Daleckii–Krein correction without
+/// a separate subtraction. These tests pin exactly that, at the RELATIVE
 /// tolerance the fold's reassociation of the same `f64` sum earns, for every
 /// branch of the correction the fold has to mirror.
 #[cfg(test)]

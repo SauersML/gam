@@ -82,6 +82,19 @@ pub(crate) struct BinomialMeanWiggleGeometry {
     pub(crate) d4q_dq04: Array1<f64>,
 }
 
+/// The direction-independent pieces every directional Hessian operator of one binomial
+/// mean-wiggle workspace reads: the wiggle geometry at the workspace's frozen states and every
+/// design as a shared channel. The workspace builds this once, so its operators share one
+/// geometry and one pair-gram identity per design (#2940).
+pub(crate) struct BmwOperatorGeometry {
+    pub(crate) geometry: BinomialMeanWiggleGeometry,
+    pub(crate) x_eta: SharedDesign,
+    pub(crate) basis: SharedDesign,
+    pub(crate) basis_d1: SharedDesign,
+    pub(crate) basis_d2: SharedDesign,
+    pub(crate) basis_d3: SharedDesign,
+}
+
 pub(crate) struct BinomialMeanWiggleJointPsiDirection {
     pub(crate) x_eta_psi: Option<Array2<f64>>,
     pub(crate) z_eta_psi: Array1<f64>,
@@ -352,9 +365,9 @@ impl BinomialMeanWiggleFamily {
         Ok(Arc::new(RowCoeffOperator::from_directions(
             vec![p_eta, pw],
             vec![
-                (0, x_eta_arc),
-                (1, Arc::new(geom.basis)),
-                (1, Arc::new(geom.basis_d1)),
+                (0, SharedDesign::from_arc(x_eta_arc)),
+                (1, SharedDesign::new(geom.basis)),
+                (1, SharedDesign::new(geom.basis_d1)),
             ],
             vec![
                 (0, 0, coeff_eta),
@@ -366,12 +379,14 @@ impl BinomialMeanWiggleFamily {
         )))
     }
 
-    pub(crate) fn bmw_directional_operator(
+    /// The operator geometry at `block_states`: the wiggle geometry at those states and every
+    /// design as a shared channel, with identities minted here. A workspace builds it once and
+    /// hands it to every directional operator it builds (#2940).
+    pub(crate) fn bmw_operator_geometry(
         &self,
         block_states: &[ParameterBlockState],
         x_eta_arc: Arc<Array2<f64>>,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
+    ) -> Result<BmwOperatorGeometry, String> {
         validate_block_count::<GamlssError>("BinomialMeanWiggleFamily", 2, block_states.len())?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
@@ -383,8 +398,37 @@ impl BinomialMeanWiggleFamily {
             }
             .into());
         }
-        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
-        let p_eta = x_eta_arc.ncols();
+        let geometry = self.wiggle_geometry(eta.view(), betaw.view())?;
+        Ok(BmwOperatorGeometry {
+            x_eta: SharedDesign::from_arc(x_eta_arc),
+            basis: SharedDesign::new(geometry.basis.clone()),
+            basis_d1: SharedDesign::new(geometry.basis_d1.clone()),
+            basis_d2: SharedDesign::new(geometry.basis_d2.clone()),
+            basis_d3: SharedDesign::new(geometry.basis_d3.clone()),
+            geometry,
+        })
+    }
+
+    /// The first directional Hessian operator along `d_beta_flat`, at the states
+    /// `operator_geometry` was built from.
+    pub(crate) fn bmw_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        operator_geometry: &BmwOperatorGeometry,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
+        let BmwOperatorGeometry {
+            geometry: geom,
+            x_eta,
+            basis,
+            basis_d1,
+            basis_d2,
+            ..
+        } = operator_geometry;
+        let eta = &block_states[Self::BLOCK_ETA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        let n = self.y.len();
+        let p_eta = x_eta.matrix().ncols();
         let pw = geom.basis.ncols();
         let total = p_eta + pw;
         if d_beta_flat.len() != total {
@@ -399,7 +443,7 @@ impl BinomialMeanWiggleFamily {
         }
         let u_eta = d_beta_flat.slice(s![0..p_eta]).to_owned();
         let uw = d_beta_flat.slice(s![p_eta..total]).to_owned();
-        let xi = fast_av(x_eta_arc.as_ref(), &u_eta);
+        let xi = fast_av(x_eta.matrix().as_ref(), &u_eta);
         let phi = fast_av(&geom.basis, &uw);
         let basis1_u = fast_av(&geom.basis_d1, &uw);
         let basis2_u = fast_av(&geom.basis_d2, &uw);
@@ -439,10 +483,10 @@ impl BinomialMeanWiggleFamily {
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![p_eta, pw],
             vec![
-                (0, x_eta_arc),
-                (1, Arc::new(geom.basis)),
-                (1, Arc::new(geom.basis_d1)),
-                (1, Arc::new(geom.basis_d2)),
+                (0, x_eta.clone()),
+                (1, basis.clone()),
+                (1, basis_d1.clone()),
+                (1, basis_d2.clone()),
             ],
             vec![
                 (0, 0, coeff_eta),
@@ -456,26 +500,27 @@ impl BinomialMeanWiggleFamily {
         ))))
     }
 
+    /// The second directional Hessian operator along `(d_beta_u_flat, d_beta_v_flat)`, at the
+    /// states `operator_geometry` was built from.
     pub(crate) fn bmw_second_directional_operator(
         &self,
         block_states: &[ParameterBlockState],
-        x_eta_arc: Arc<Array2<f64>>,
+        operator_geometry: &BmwOperatorGeometry,
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        validate_block_count::<GamlssError>("BinomialMeanWiggleFamily", 2, block_states.len())?;
+        let BmwOperatorGeometry {
+            geometry: geom,
+            x_eta,
+            basis,
+            basis_d1,
+            basis_d2,
+            basis_d3,
+        } = operator_geometry;
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
-        if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
-        let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
-        let p_eta = x_eta_arc.ncols();
+        let p_eta = x_eta.matrix().ncols();
         let pw = geom.basis.ncols();
         let total = p_eta + pw;
         if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
@@ -491,8 +536,8 @@ impl BinomialMeanWiggleFamily {
         let uw = d_beta_u_flat.slice(s![p_eta..total]).to_owned();
         let vw = d_beta_v_flat.slice(s![p_eta..total]).to_owned();
 
-        let xi_u = fast_av(x_eta_arc.as_ref(), &u_eta);
-        let xi_v = fast_av(x_eta_arc.as_ref(), &v_eta);
+        let xi_u = fast_av(x_eta.matrix().as_ref(), &u_eta);
+        let xi_v = fast_av(x_eta.matrix().as_ref(), &v_eta);
         let phi_u = fast_av(&geom.basis, &uw);
         let phi_v = fast_av(&geom.basis, &vw);
         let b1u = fast_av(&geom.basis_d1, &uw);
@@ -562,11 +607,11 @@ impl BinomialMeanWiggleFamily {
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![p_eta, pw],
             vec![
-                (0, x_eta_arc),
-                (1, Arc::new(geom.basis)),
-                (1, Arc::new(geom.basis_d1)),
-                (1, Arc::new(geom.basis_d2)),
-                (1, Arc::new(geom.basis_d3)),
+                (0, x_eta.clone()),
+                (1, basis.clone()),
+                (1, basis_d1.clone()),
+                (1, basis_d2.clone()),
+                (1, basis_d3.clone()),
             ],
             vec![
                 (0, 0, coeff_eta),
@@ -1570,6 +1615,9 @@ pub(crate) struct BinomialMeanWiggleHessianWorkspace {
     pub(crate) specs: Vec<ParameterBlockSpec>,
     pub(crate) x_eta: Arc<Array2<f64>>,
     pub(crate) hessian_operator: Arc<RowCoeffOperator>,
+    /// The geometry every directional operator of this workspace shares, built on the first
+    /// request so value-only evaluations never build it (#2940).
+    pub(crate) operator_geometry: std::sync::OnceLock<BmwOperatorGeometry>,
 }
 
 impl BinomialMeanWiggleHessianWorkspace {
@@ -1587,7 +1635,21 @@ impl BinomialMeanWiggleHessianWorkspace {
             specs,
             x_eta,
             hessian_operator,
+            operator_geometry: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The shared operator geometry at this workspace's frozen states, built on first use. Two
+    /// concurrent first requests may both build one; `get_or_init` keeps the first, so every
+    /// operator reads one set of design identities.
+    fn shared_operator_geometry(&self) -> Result<&BmwOperatorGeometry, String> {
+        if let Some(geometry) = self.operator_geometry.get() {
+            return Ok(geometry);
+        }
+        let built = self
+            .family
+            .bmw_operator_geometry(&self.block_states, self.x_eta.clone())?;
+        Ok(self.operator_geometry.get_or_init(|| built))
     }
 }
 
@@ -1657,8 +1719,11 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        self.family
-            .bmw_directional_operator(&self.block_states, self.x_eta.clone(), d_beta_flat)
+        self.family.bmw_directional_operator(
+            &self.block_states,
+            self.shared_operator_geometry()?,
+            d_beta_flat,
+        )
     }
 
     fn second_directional_derivative(
@@ -1678,7 +1743,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         self.family.bmw_second_directional_operator(
             &self.block_states,
-            self.x_eta.clone(),
+            self.shared_operator_geometry()?,
             d_beta_u,
             d_beta_v,
         )

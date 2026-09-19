@@ -1,6 +1,6 @@
 # Manifold SAE: a sparse dictionary of typed shapes
 
-`gamfit.sae_manifold_fit(...)` fits a **sparse manifold dictionary**. The
+`gamfit.sae.sae_manifold_fit(...)` fits a **sparse manifold dictionary**. The
 data matrix `Z` (shape `(N, p)`, one ambient vector per token) is
 reconstructed as a sparse additive combination of `K` *atoms*. Each atom is a small,
 low-dimensional **typed shape** — a line, circle, sphere, torus, cylinder,
@@ -19,7 +19,7 @@ import gamfit
 
 Z = ...  # (N, p) activations / embeddings to decompose
 
-fit = gamfit.sae_manifold_fit(
+fit = gamfit.sae.sae_manifold_fit(
     X=Z,
     K=16,                       # dictionary size
     d_atom=1,                   # intrinsic dim per atom (default 2; int, or per-atom list)
@@ -33,7 +33,7 @@ recon = fit.reconstruct_training()  # exact stored (N, p) training reconstructio
 ```
 
 `sae_manifold_fit` returns a [`ManifoldSAE`](#the-manifoldsae-result). Both
-`gamfit.sae_manifold_fit` and `gamfit.ManifoldSAE` are top-level exports.
+`gamfit.sae.sae_manifold_fit` and `gamfit.sae.ManifoldSAE` are exported from the `gamfit.sae` submodule.
 
 ### `sae_manifold_fit` parameters
 
@@ -48,7 +48,6 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `assignment` | `"softmax"` | gate kind: `softmax` / `ordered_beta_bernoulli` / `threshold_gate` / `topk` |
 | `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
 | `isometry_weight` | `1.0` | unit-speed gauge penalty (on by default) |
-| `ard_per_atom` | `True` | ARD pruning of unused coordinate axes |
 | `decoder_feature_sparsity_groups` | `None` | output-feature partition for decoder group-lasso |
 | `n_iter` | `50` | joint-solve iterations |
 | `sparsity_weight` | `None` | optional coordinate-shrinkage strength override; omitted delegates to the native neutral log-strength origin (`1.0`). Refused with a fixed-concentration `ordered_beta_bernoulli` prior, which has no strength coordinate |
@@ -194,18 +193,21 @@ fixed prior has no strength to tune, so `sparsity_weight` is refused there. Each
 
   **Gumbel temperature schedules.** For the annealed gates, pass `schedule=`
   (a `GumbelTemperatureSchedule` or a mapping). Three constructors are
-  top-level exports:
+  exported from `gamfit.sae`:
 
   ```python no-exec
-  from gamfit import (gumbel_geometric_schedule, gumbel_linear_schedule,
-                      gumbel_reciprocal_iter_schedule)
+  from gamfit.sae import (
+      gumbel_geometric_schedule,
+      gumbel_linear_schedule,
+      gumbel_reciprocal_iter_schedule,
+  )
   # geometric decay τ_start → τ_min at the given multiplicative rate
   sched = gumbel_geometric_schedule(tau_start=4.0, tau_min=1.0, rate=0.9)
   # linear ramp over `steps` iterations
   sched = gumbel_linear_schedule(tau_start=4.0, tau_min=1.0, steps=50)
   # reciprocal-in-iteration decay τ(i) = τ_start / (1 + i)
   sched = gumbel_reciprocal_iter_schedule(tau_start=4.0, tau_min=1.0)
-  fit = gamfit.sae_manifold_fit(X=Z, K=16, assignment="softmax", schedule=sched)
+  fit = gamfit.sae.sae_manifold_fit(X=Z, K=16, assignment="softmax", schedule=sched)
   ```
 
 - **Cross-atom decoder incoherence** (`decoder_incoherence_weight=1.0`, **on
@@ -225,12 +227,13 @@ fixed prior has no strength to tune, so `sparsity_weight` is refused there. Each
   fixed. Routed to the decoder (`"beta"`) block, complementary to the
   intrinsic-dim and topology selection below.
 
-- **ARD intrinsic-dim pruning** (`ard_per_atom=True`, **on by default**). An
-  automatic-relevance-determination penalty on each atom's latent coordinate
-  block prunes unused coordinate axes, so the *intrinsic* dimension actually
-  used is driven below `d_atom` when the data does not fill it. The surviving
-  count per atom is `fit.atoms[k].active_dim` (also `fit.summary()
-  ["active_dims"]`).
+- **ARD intrinsic-dim pruning** (always on). An automatic-relevance-determination
+  prior on each atom's latent coordinate block prunes unused coordinate axes, so
+  the *intrinsic* dimension actually used is driven below `d_atom` when the data
+  does not fill it. It is also each row's proper coordinate prior. Without it the
+  coordinate posterior is improper and the criterion has no lower bound. So there
+  is no option to switch it off (#2822). The surviving count per atom is
+  `fit.atoms[k].active_dim` (also `fit.summary()["active_dims"]`).
 
 - **Isometry gauge** (`isometry_weight=1.0`, **on by default**).
   `IsometryPenalty` drives the pulled-back metric
@@ -357,7 +360,7 @@ model, so the reported band still reflects the joint covariance of the returned
 (possibly grown) dictionary, seed and born atoms alike.
 
 !!! note "Full fitted-state persistence"
-    `save` / `load` and `to_dict` / `from_dict` use the strict Rust-owned v7
+    `save` / `load` and `to_dict` / `from_dict` use the strict Rust-owned v9
     artifact schema. They retain each atom's decoder coefficients, fitted
     per-token coordinates, resolved topology, shape-band grid/mean/sd/robust sd, and a
     compact per-output-channel covariance factor. Loading reconstructs the
@@ -538,9 +541,9 @@ serialized structure certificate as `fit.structure_certificate_json`. These
 are the claims certified during fitting; reading the model does not rerun or
 retune the certification procedure.
 
-The same machinery is exposed at top level for working with raw claim ledgers:
-`gamfit.e_bh_dictionary_certificate(...)` and
-`gamfit.plan_probe_for_contested_claim(...)` (probe design for a contested
+The same machinery is exposed in `gamfit.sae` for working with raw claim ledgers:
+`gamfit.sae.e_bh_dictionary_certificate(...)` and
+`gamfit.sae.plan_probe_for_contested_claim(...)` (probe design for a contested
 claim).
 
 ## Trust, diagnostics, and curvature
@@ -555,13 +558,13 @@ is available in `fit.curvature_report` when the fit emitted it.
 The observed coordinate extent of an atom is read directly off
 `fit.coords[k]` (see [Typical coordinate range](#typical-coordinate-range)).
 
-The top-level helpers `gamfit.sae_trust_diagnostics(payload)` and
-`gamfit.atom_trust_scores(diagnostics)` compute the same quantities from a raw
+The helpers `gamfit.sae.sae_trust_diagnostics(payload)` and
+`gamfit.sae.atom_trust_scores(diagnostics)` compute the same quantities from a raw
 fit payload / diagnostics mapping (for batch or offline analysis).
 
 ## Shape adjudication: `adjudicate_atom_shape`
 
-`gamfit.adjudicate_atom_shape(coords, ...)` adjudicates the representational
+`gamfit.sae.adjudicate_atom_shape(coords, ...)` adjudicates the representational
 shape of a 2-D point set without forcing a topology: it races a smooth **S¹
 ring**, a **Euclidean Gaussian**, the best free **k-cluster Gaussian mixture**,
 and a constrained **ring of clusters** whose component centers share one fitted
@@ -582,14 +585,14 @@ topology verdict instead aggregates
 the stacking mass of the smooth-circle and ring-of-clusters densities before
 comparing it with the aggregate non-circular mass; this is invariant to an
 otherwise arbitrary split between two predictors of the same circular class.
-It is a top-level export, used throughout `tests/sae/`, and pairs naturally with
+It is exported from `gamfit.sae`, used throughout `tests/sae/`, and pairs naturally with
 `fit.coords[k]` from
 [`sae_manifold_fit`](#the-manifoldsae-result).
 
 ```python no-exec
 import gamfit
 
-verdict = gamfit.adjudicate_atom_shape(
+verdict = gamfit.sae.adjudicate_atom_shape(
     coords, folds=5, seed=11, mean_l0=dictionary_mean_l0
 )
 # coords: contiguous float64 (n, 2). Default folds=5 requires n >= 5;
@@ -686,7 +689,7 @@ def complete_pipeline(matrix, seed):
     # Fresh fit: SAE -> grouping -> projection/search -> adjudication.
     return run_census(matrix, seed=seed)
 
-controlled = gamfit.run_shape_controlled_census(
+controlled = gamfit.sae.run_shape_controlled_census(
     activations,
     complete_pipeline,
     control_seed=11,
@@ -723,11 +726,11 @@ observed **circular margin** with the full shuffle-margin distribution:
 def labeled_chart_pipeline(matrix, labels, seed):
     # Recompute class means, select/refit the chart, then adjudicate it.
     coords = build_class_mean_chart(matrix, labels)
-    return gamfit.adjudicate_atom_shape(
+    return gamfit.sae.adjudicate_atom_shape(
         coords, folds=5, seed=seed, matched_controls=False
     )
 
-margin_null = gamfit.run_label_shuffle_margin_null(
+margin_null = gamfit.sae.run_label_shuffle_margin_null(
     activations,
     labels,
     labeled_chart_pipeline,
@@ -783,12 +786,12 @@ audits with a warning.
 
 ## Supervised SAE
 
-`gamfit.sae_supervised` fits a manifold dictionary jointly with a supervised
+`gamfit.examples.sae_supervised` fits a manifold dictionary jointly with a supervised
 GLM head, so the learned atoms are predictive of a label on the rows where one
 is available (semi-supervised: `supervised_mask` selects them):
 
 ```python no-exec
-fit = gamfit.sae_supervised(
+fit = gamfit.examples.sae_supervised(
     X, Y, supervised_mask,        # (N, p) data, (N,) labels, (N,) bool mask
     K=16, d_atom=2,
     atom_topology="circle",       # default
@@ -809,7 +812,7 @@ It returns a `SaeSupervisedFit` carrying `sae` (the fitted `ManifoldSAE`),
 These track how the *same* dictionary atom moves as you sweep a third axis —
 training checkpoints or model layers — the OLMo-trajectory capability.
 
-`gamfit.sae_checkpoint_dynamics` takes a grid of per-checkpoint decoder
+`gamfit.sae.sae_checkpoint_dynamics` takes a grid of per-checkpoint decoder
 evaluations on a shared latent grid and reports each atom's displacement
 between consecutive checkpoints: its vector and L2 norm at the central grid
 node, plus the RMS and maximum L2 displacement over the grid. These are
@@ -818,7 +821,7 @@ statistical stability test. The shared coordinates fix the correspondence
 without fitting a transport.
 
 ```python no-exec
-dyn = gamfit.sae_checkpoint_dynamics(
+dyn = gamfit.sae.sae_checkpoint_dynamics(
     decoder_grid,                 # decoder evaluations across checkpoints
     checkpoint_ids=["step10k", "step20k", ...],
     atom_names=["atom0", "atom1", ...],
@@ -826,21 +829,22 @@ dyn = gamfit.sae_checkpoint_dynamics(
 )
 ```
 
-`gamfit.layer_transport_fit` aligns one atom's coordinates between two layers,
-and `gamfit.layer_transport_ladder` chains the pairwise transports across a
+`gamfit.sae.layer_transport_fit` aligns one atom's coordinates between two layers,
+and `gamfit.sae.layer_transport_ladder` chains the pairwise transports across a
 sequence of layers:
 
 ```python no-exec
-t = gamfit.layer_transport_fit(coords_from, coords_to,
-                               topology_from="circle", topology_to="circle",
-                               layer_from=0, layer_to=1)
-ladder = gamfit.layer_transport_ladder(coords, topology="circle", layers=None)
+t = gamfit.sae.layer_transport_fit(coords_from, coords_to,
+                                   topology_from="circle", topology_to="circle",
+                                   layer_from=0, layer_to=1)
+ladder = gamfit.sae.layer_transport_ladder(coords, topology="circle", layers=None)
 ```
 
 ## Visualization
 
-`gamfit.plot_atom(fit, k, ax=None)` draws one atom's fitted curve and band;
-`gamfit.plot_fit(fit)` draws the whole dictionary.
+`gamfit.plot.sae_atom(fit, atom=k, ax=None)` draws one atom's fitted curve and band;
+`gamfit.plot.sae_fit(fit)` draws the whole dictionary. Both need the optional
+matplotlib extra (`pip install 'gamfit[plot]'`).
 
 ## Frozen Torch adapter: `gamfit.torch.ManifoldSAE`
 
@@ -852,7 +856,7 @@ import torch
 import gamfit
 from gamfit.torch import ManifoldSAE
 
-fit = gamfit.sae_manifold_fit(
+fit = gamfit.sae.sae_manifold_fit(
     X=activations,
     K=F,
     d_atom=1,

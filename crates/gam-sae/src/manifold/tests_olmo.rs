@@ -410,7 +410,6 @@ fn production_circle_coords_at_seed(
         ridge_beta: 1.0e-6,
         top_k: None,
         threshold: 0.0,
-        native_ard_enabled: true,
         seed_refine_routing: refine_routing,
         seed_refine_random_state: random_state,
         fit_config: SaeFitConfig::default(),

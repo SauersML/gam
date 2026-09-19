@@ -381,7 +381,9 @@ struct Evaluation {
     hessian: Array2<f64>,
     coefficients: Array2<f64>,
     profiled_deviance: f64,
-    penalty_traces: Array1<f64>,
+    /// The factor and scaled roots this evaluation traced. The fit boundary admits
+    /// its EDF traces from them once, against their solves' bands (#2901).
+    trace_operator: PenaltyTraceOperator,
     lambdas: Array1<f64>,
     /// `rank(Σ_j λ_j S_j)` in the PER-OUTPUT coefficient basis, carried out of
     /// the evaluation that measured it. The fit boundary needs it to state the
@@ -447,6 +449,7 @@ pub fn fit_shared_tangent_reml(
                 curvature: gam_solve::rho_optimizer::CurvatureEvidence::NoEstimand,
                 lambdas_railed: Vec::new(),
                 railed_facts: Vec::new(),
+                newton_polish: None,
                 curvature_floor: None,
             },
         )
@@ -524,11 +527,9 @@ pub fn fit_shared_tangent_reml(
     //   mathematically possible one, and `σ̂² = D/(rows − edf)` and every SE off
     //   this path inherit it silently.
     // * **Saturation.** A redundant block driven to the λ ceiling can overflow
-    //   the raw product `λ_k·tr` to `+∞` on a ridge-stabilized system even
-    //   though the true value is exactly `rank_k` (#1379). The local
-    //   `bounded_roundoff_value` refuses any non-finite value, so this route
-    //   FAILED THE WHOLE FIT on a case the shared accounting resolves to the
-    //   saturated bound.
+    //   the raw product `λ_k·tr` to `+∞` (#1379). The shared accounting used to
+    //   clamp that to the rank. A trace outside `[0, rank]` by more than its
+    //   solve's band is now refused by name (#2901).
     // * **Summation.** `edf_total` is a difference of two like-sized quantities,
     //   so naive `.sum()` error lands directly in the reported dimension; the
     //   shared path sums the admitted traces with compensated addition.
@@ -547,19 +548,11 @@ pub fn fit_shared_tangent_reml(
         .iter()
         .map(|penalty| penalty.rank * prepared.n_outputs)
         .collect();
-    // Kept from the accounting this route used to own: a trace that is FINITE
-    // and materially outside `[0, rank]` is not saturation and not roundoff — it
-    // is broken linear algebra upstream, and admitting it at a bound would hide
-    // that. The shared accounting deliberately clamps (a `+∞` product is the
-    // ceiling case above; a NaN or `−∞` product propagates for the finiteness
-    // check below to refuse), so this input check stays here rather than
-    // becoming a second accounting policy.
-    for (active_index, &rank) in block_ranks.iter().enumerate() {
-        let raw = evaluation.penalty_traces[active_index];
-        if raw.is_finite() {
-            bounded_roundoff_value(raw, 0.0, rank as f64, "per-penalty penalty trace")?;
-        }
-    }
+    // Each trace is admitted only inside `[0, rank]` within the rounding band of
+    // the solve that formed it (#2901). A trace outside by more, a `+∞` product
+    // included, means the precision and the penalty were not one operator, and
+    // the shared accounting refuses it by name instead of publishing the rank.
+    let (penalty_traces, trace_bands) = evaluation.trace_operator.traces_with_bands()?;
     let total_coefficients = prepared
         .n_coefficients
         .checked_mul(prepared.n_outputs)
@@ -570,15 +563,23 @@ pub fn fit_shared_tangent_reml(
         .ok_or_else(|| invalid("combined penalty rank exceeds coefficient dimension"))?
         .checked_mul(prepared.n_outputs)
         .ok_or_else(|| invalid("joint penalty nullity overflow"))?;
-    let bundle = gam_solve::estimate::penalized_edf_bundle(
-        evaluation
-            .penalty_traces
-            .as_slice()
-            .ok_or_else(|| invalid("penalty traces are not contiguous"))?,
+    // #2901: the precision is the data root's `RᵀR` plus the penalty roots (or a
+    // Gram of positive definite metrics plus the penalty), so `H ⪰ λ_k S_k` holds
+    // by construction and every block is certified structurally.
+    let rank_bounds = vec![
+        gam_solve::estimate::EdfRankBound::Certified(
+            gam_solve::estimate::EdfRankCertificate::Structural
+        );
+        block_ranks.len()
+    ];
+    let bundle = gam_solve::estimate::penalized_edf_bundle_within_bands(
+        &penalty_traces,
+        &trace_bands,
+        &rank_bounds,
         &block_ranks,
         total_coefficients,
         joint_penalty_nullity as f64,
-    );
+    )?;
     let mut lambdas = Array1::<f64>::zeros(prepared.output_penalty_slots);
     let mut edf_by_penalty = Array1::<f64>::zeros(prepared.output_penalty_slots);
     for (active_index, penalty) in prepared.penalties.iter().enumerate() {
@@ -963,7 +964,11 @@ impl PreparedSharedTangent {
             hessian,
             coefficients,
             profiled_deviance,
-            penalty_traces,
+            trace_operator: PenaltyTraceOperator {
+                factor,
+                roots,
+                output_copies: d,
+            },
             lambdas,
             combined_penalty_rank: spectrum.rank,
         })
@@ -1082,7 +1087,11 @@ impl PreparedSharedTangent {
             hessian,
             coefficients,
             profiled_deviance,
-            penalty_traces,
+            trace_operator: PenaltyTraceOperator {
+                factor,
+                roots,
+                output_copies: 1,
+            },
             lambdas,
             combined_penalty_rank: spectrum.rank,
         })
@@ -1420,6 +1429,7 @@ fn validated_metric(mut metric: Array2<f64>, row: usize) -> Result<Array2<f64>, 
     Ok(metric)
 }
 
+#[derive(Debug)]
 struct TangentPrecisionFactor {
     /// Precision is RᵀR. Keeping R avoids squaring the design condition number.
     upper: Array2<f64>,
@@ -1532,6 +1542,58 @@ fn penalty_root_traces(
         }
     }
     (traces, cross_traces)
+}
+
+/// The precision factor an evaluation solved with and the λ-scaled penalty roots
+/// it traced.
+#[derive(Debug)]
+struct PenaltyTraceOperator {
+    factor: TangentPrecisionFactor,
+    roots: Vec<Array2<f64>>,
+    /// Copies of each root's trace in the joint space: `D` on the isotropic path,
+    /// whose roots and precision are per output, and 1 on the Fisher path, whose
+    /// roots are lifted to the joint layout.
+    output_copies: usize,
+}
+
+impl PenaltyTraceOperator {
+    /// Each penalty's trace `tr(A⁻¹RⱼRⱼᵀ)` in the joint space, with the rounding
+    /// band of the solve that formed it (#2901).
+    ///
+    /// The criterion reads whitened sums, a different formation of the same
+    /// numbers. This one solves `A x̂ = Rⱼ` through the factor and prices the
+    /// residual against `A = RᵀR`, the precision the factor represents, so each
+    /// trace carries the band [`gam_linalg::roundoff::solved_penalty_trace`]
+    /// measures.
+    fn traces_with_bands(&self) -> Result<(Vec<f64>, Vec<f64>), EstimationError> {
+        let precision = self.factor.upper.t().dot(&self.factor.upper);
+        let solve = |values: &mut [f64]| -> Result<(), EstimationError> {
+            let solved = self.factor.solvevec(&Array1::from(values.to_vec()));
+            for (slot, value) in values.iter_mut().zip(solved.iter()) {
+                *slot = *value;
+            }
+            Ok(())
+        };
+        let inverse_one_norm =
+            gam_linalg::condition::estimate_inverse_one_norm(precision.nrows(), solve, solve)?;
+        let copies = self.output_copies as f64;
+        let mut traces = Vec::with_capacity(self.roots.len());
+        let mut bands = Vec::with_capacity(self.roots.len());
+        for root in &self.roots {
+            let solution = self.factor.solve_mat(root);
+            let (trace, band) = gam_linalg::roundoff::solved_penalty_trace(
+                1.0,
+                root.view(),
+                solution.view(),
+                precision.view(),
+                inverse_one_norm,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            traces.push(copies * trace);
+            bands.push(copies * band);
+        }
+        Ok((traces, bands))
+    }
 }
 
 fn add_base_penalty_to_joint(joint: &mut Array2<f64>, penalty: &Array2<f64>, n_outputs: usize) {
@@ -1652,23 +1714,76 @@ fn validate_archived_tangent_fit(
     Ok(())
 }
 
-fn bounded_roundoff_value(
-    value: f64,
-    lower: f64,
-    upper: f64,
-    context: &str,
-) -> Result<f64, EstimationError> {
-    let tolerance = f64::EPSILON.sqrt() * upper.abs().max(1.0);
-    if !value.is_finite() || value < lower - tolerance || value > upper + tolerance {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "{FIT_CONTEXT}: {context} {value} lies outside [{lower}, {upper}] beyond roundoff"
-        )));
-    }
-    Ok(value.clamp(lower, upper))
-}
-
 fn invalid(message: impl Into<String>) -> EstimationError {
     EstimationError::InvalidInput(message.into())
+}
+
+#[cfg(test)]
+mod trace_admission_2901_tests {
+    use super::*;
+
+    /// A precision that dominates `RⱼRⱼᵀ` publishes its trace inside the rank. One
+    /// that does not is refused by name, where the old accounting clamped (#2901).
+    #[test]
+    fn a_root_the_precision_does_not_dominate_refuses_its_trace_2901() {
+        let root = Array2::from_diag(&Array1::from(vec![2.0, 2.0]));
+        let traced = |scale: f64, copies: usize| {
+            let upper = Array2::from_diag(&Array1::from(vec![scale, scale]));
+            let (factor, _) = TangentPrecisionFactor::from_upper(upper).expect("diagonal factor");
+            PenaltyTraceOperator {
+                factor,
+                roots: vec![root.clone()],
+                output_copies: copies,
+            }
+            .traces_with_bands()
+            .expect("traced")
+        };
+
+        let (dominated, dominated_bands) = traced(3.0, 2);
+        let exact = 2.0 * 8.0 / 9.0;
+        assert!(
+            (dominated[0] - exact).abs() <= dominated_bands[0] + exact * f64::EPSILON,
+            "trace {} against 16/9 with band {:e}",
+            dominated[0],
+            dominated_bands[0]
+        );
+        let bundle = gam_solve::estimate::penalized_edf_bundle_within_bands(
+            &dominated,
+            &dominated_bands,
+            &[gam_solve::estimate::EdfRankBound::Certified(
+                gam_solve::estimate::EdfRankCertificate::Structural,
+            )],
+            &[4],
+            4,
+            0.0,
+        )
+        .expect("a dominated trace publishes");
+        assert_eq!(bundle.penalty_block_trace, dominated);
+
+        let (undominated, undominated_bands) = traced(1.0, 1);
+        let refusal = gam_solve::estimate::penalized_edf_bundle_within_bands(
+            &undominated,
+            &undominated_bands,
+            &[gam_solve::estimate::EdfRankBound::Certified(
+                gam_solve::estimate::EdfRankCertificate::Structural,
+            )],
+            &[2],
+            2,
+            0.0,
+        )
+        .expect_err("a trace of 8 against rank 2 must refuse");
+        assert!(
+            matches!(
+                refusal,
+                EstimationError::EdfTraceOutsideRank {
+                    block: 0,
+                    rank: 2,
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
+    }
 }
 
 #[cfg(test)]

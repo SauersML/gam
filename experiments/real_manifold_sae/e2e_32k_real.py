@@ -122,7 +122,7 @@ def main() -> None:
     try:
         if lin_ev is not None:
             raise _LinearReused
-        lin = gamfit.sae_manifold_fit(
+        lin = gamfit.sae.sae_manifold_fit(
             train, K=args.k, assignment="softmax", top_k=args.top_k, n_iter=30,
         )
         lin_wall = time.perf_counter() - t0
@@ -140,7 +140,7 @@ def main() -> None:
     model = None
     t0 = time.perf_counter()
     try:
-        model = gamfit.sae_manifold_fit(
+        model = gamfit.sae.sae_manifold_fit(
             train,
             K=args.k,
             d_atom=1,
@@ -153,7 +153,6 @@ def main() -> None:
             smoothness_weight=0.01,
             isometry_weight=0.0,
             learning_rate=1.0,
-            ard_per_atom=False,
         )
         man_wall = time.perf_counter() - t0
         man_r2 = float(model.reconstruction_r2)

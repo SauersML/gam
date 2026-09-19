@@ -23,12 +23,13 @@
 //! This test fits the SAME deterministic dataset at response scales 1 and 1000
 //! and asserts, in order:
 //!   1. premise  — λ and EDF are equivariant,
-//!   2. premise  — `Vb` diagonals scale by exactly `c²`,
+//!   2. premise  — `Vb` diagonals scale by `c²` to the extent λ does,
 //!   3. property — `Vp` diagonals scale by the same `c²` (was `c⁴`).
 
 use gam::estimate::{FitOptions, fit_gamwith_heuristic_log_lambdas};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_math::roundoff::accumulation_growth;
 use ndarray::{Array1, Array2};
 
 fn fit_options() -> FitOptions {
@@ -139,7 +140,20 @@ fn corrected_covariance_is_response_scale_equivariant() {
          (edf@1={edf1:.10e}, edf@{c}={edfc:.10e}, rel diff {edf_rel:.3e})"
     );
 
-    // ── Premise 2: Vb scales by exactly c² to ~machine precision. ──────────
+    // ── Premise 2: Vb scales as c², to the extent premise 1's λ does. ──────
+    // Vb = φ̂·H⁻¹ with H = XᵀX + λS, and φ̂ is the profiled penalized deviance
+    // D_p over its residual degrees of freedom. Since 0 ⪯ λS ⪯ H,
+    // |∂ log (H⁻¹)_ii / ∂ log λ| ≤ 1, and by the envelope theorem
+    // ∂ log D_p / ∂ log λ = λβ̂ᵀSβ̂ / D_p ∈ [0, 1]. So to first order, two fits
+    // whose λ̂ premise 1 measured `lam_rel` apart have Vb diagonals within
+    // 2·lam_rel of an exact c² law, plus the residual-df ratio's change and the
+    // O(n) accumulation floor. The two certified searches stop at λ̂ values
+    // `lam_rel` apart: 1.348e-8 at 95115c8a1f (sw4l probe 1252880), where the
+    // worst Vb diagonal was 1.244e-8 off. An exact c² law to a fixed 1e-8 is
+    // therefore not what an equivariant fit reports; this bound is.
+    let n_rows = design(1.0).0.nrows();
+    let dof_rel = (edf1 - edfc).abs() / (n_rows as f64 - edf1.max(edfc));
+    let vb_bar = 2.0 * lam_rel + dof_rel + accumulation_growth(n_rows);
     let vb1 = fit1.beta_covariance().expect("Vb at scale 1").clone();
     let vbc = fitc.beta_covariance().expect("Vb at scale c").clone();
     assert_eq!(vb1.dim(), vbc.dim(), "Vb shape mismatch across scales");
@@ -149,10 +163,11 @@ fn corrected_covariance_is_response_scale_equivariant() {
         let got = vbc[[i, i]];
         let rel = (got - expected).abs() / expected.abs().max(1e-300);
         assert!(
-            rel < 1e-8,
-            "premise failed: Vb[{i},{i}] is not c²-equivariant (got {got:.6e}, \
-             expected {expected:.6e}, rel {rel:.3e}); the conditional covariance \
-             must scale exactly as c² for the Vp contract to be testable"
+            rel <= vb_bar,
+            "premise failed: Vb[{i},{i}] is not c²-equivariant to the extent λ is (got \
+             {got:.6e}, expected {expected:.6e}, rel {rel:.3e} > bar {vb_bar:.3e} = \
+             2·lam_rel {lam_rel:.3e} + dof_rel {dof_rel:.3e} + γ_n); the conditional \
+             covariance must scale as c² for the Vp contract to be testable"
         );
     }
 

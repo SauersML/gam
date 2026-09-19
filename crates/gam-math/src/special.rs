@@ -4,6 +4,9 @@
 //! dependencies, so they live in the lowest crate (`gam-math`) and can be
 //! consumed by any term/basis/inference code without inducing an SCC edge.
 
+use crate::double_double::{DoubleDouble, accurate_sum, push_product_parts};
+use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth, inflated};
+
 /// Numerically stable `C(n,k) = n! / (k!·(n−k)!)` as `f64`.  Uses the
 /// symmetry `C(n,k) = C(n, n−k)` to keep the loop count `min(k, n−k)`
 /// and the multiplicative recurrence `C(n,j+1) = C(n,j)·(n−j)/(j+1)`,
@@ -536,6 +539,216 @@ pub fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
         weights.push(w);
     }
     (nodes, weights)
+}
+
+/// A Gauss-Legendre rule on `[−1, 1]` whose computed nodes and weights carry derived bounds on their errors.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CertifiedGaussLegendreRule {
+    /// The computed nodes `x̂_j`, ascending.
+    pub nodes: Vec<f64>,
+    /// The computed weights `ŵ_j`.
+    pub weights: Vec<f64>,
+    /// An upper bound on `max_j |x̂_j − x_j|` over the true nodes. Infinite when the certificate cannot separate
+    /// the nodes.
+    pub node_error: f64,
+    /// An upper bound on `max_j |ŵ_j − w_j|/w_j` over the true weights. Infinite when the certificate declines.
+    pub weight_relative_error: f64,
+}
+
+/// The `n`-point Gauss-Legendre rule, with its node and weight errors bounded by a residual certificate.
+///
+/// Each root seeded by [`gauss_legendre`] is refined by Newton's method in double-double arithmetic on Bonnet's
+/// recurrence. That refinement carries no bound of its own: the certificate reads the refined values as the exact
+/// numbers they are.
+///
+/// # Certificate
+/// - **Eigenproblem.** The roots of `P_n` are the eigenvalues of the symmetric tridiagonal Jacobi matrix `J` with
+///   off-diagonal `β_j = j/√(4j² − 1)`. The weight of root `x_j` is `w_j = 2·v_{j,0}²` for the unit eigenvector
+///   `v_j` with `v_{j,0} > 0`.
+/// - **Integer residual.** For any `λ̂` and any values `P_0 = 1, P_1, …, P_{n−1}`, the vector `v_i = √(2i + 1)·P_i`
+///   satisfies `((J − λ̂)v)_i = s_i/√(2i + 1)`, with `s_i = (i + 1)P_{i+1}·[i < n − 1] + i·P_{i−1} − (2i + 1)λ̂P_i`.
+///   The diagonal similarity removes every irrational, so each `s_i` is an integer combination of the stored
+///   double-double values.
+/// - **Exact parts.** Every product in `s_i` and in `‖v‖² = Σ(2i + 1)P_i²` splits into `TwoProductFMA` parts:
+///   exact, or within `5·2^−1074` under underflow (Ogita, Rump and Oishi, *Accurate sum and dot product*, SIAM J.
+///   Sci. Comput. 26(6), 2005, Algorithm 3.5 and Theorem 3.4).
+/// - **Sums.** The parts are summed by `Sum2` (ibid., Algorithm 4.4), which errs by at most `u·|s| + γ²_{m−1}·Σ|parts|`
+///   over `m` parts (ibid., Proposition 4.5), with Wilkinson's `γ_k = k·u/(1 − k·u)`.
+/// - **Node radius.** By the Krylov–Weinstein theorem, some eigenvalue lies within `η_j = ‖(J − λ̂_j)v‖/‖v‖` of
+///   `λ̂_j`. The output node `x̂_j = fl(λ̂_j)` is within `u·|λ̂_j|` of it, so its radius is `η_j + u·|λ̂_j|`.
+/// - **Separation.** When the radii leave neighbouring intervals disjoint, each interval holds exactly one of the `n`
+///   eigenvalues. The distance `δ_j` from `λ̂_j` to the other eigenvalues is then at least the neighbour separation less
+///   the neighbours' radii.
+/// - **Eigenvector.** Write `û = v/‖v‖ = cos φ·v_j + sin φ·y` with `y ⊥ v_j`. Then `η_j ≥ |sin φ|·δ_j`, so
+///   `t = ‖û − v_j‖ ≤ √2·η_j/δ_j`.
+/// - **Weight.** `û_0 = 1/‖v‖`, so `|w_j − 2/‖v‖²| ≤ 2t(2û_0 + t)`. Relative to `w_j ≥ 2(û_0 − t)²`, and plus the
+///   rounding of `fl(2/‖v‖²)`, that bounds the weight's relative error.
+/// - **Rounding the bound itself.** Each bound quantity is a positive expression evaluated in `f64`, so it is
+///   inflated by `1 + γ_{k+3}` for its `k` rounded operations.
+///
+/// `γ_k` is [`accumulation_growth`].
+pub fn gauss_legendre_certified(n: usize) -> CertifiedGaussLegendreRule {
+    let seeds = gauss_legendre(n).0;
+    let roots: Vec<DoubleDouble> = seeds.iter().map(|&seed| refine_legendre_root(n, seed)).collect();
+    certify_legendre_rule(n, &roots)
+}
+
+/// `P_0, …, P_n` at `x` by Bonnet's recurrence `(j + 1)P_{j+1} = (2j + 1)x·P_j − j·P_{j−1}`, in double-double.
+fn legendre_values_double_double(n: usize, x: DoubleDouble) -> Vec<DoubleDouble> {
+    let mut values = Vec::with_capacity(n + 1);
+    values.push(DoubleDouble::from_f64(1.0));
+    if n >= 1 {
+        values.push(x);
+    }
+    for j in 1..n {
+        let degree = j as f64;
+        let next = DoubleDouble::from_f64(2.0 * degree + 1.0)
+            .mul(x)
+            .mul(values[j])
+            .sub(DoubleDouble::from_f64(degree).mul(values[j - 1]))
+            .div(DoubleDouble::from_f64(degree + 1.0));
+        values.push(next);
+    }
+    values
+}
+
+/// Newton's method for a root of `P_n` in double-double, from `seed`. `P_n' = n(x·P_n − P_{n−1})/(x² − 1)`. It stops
+/// at the first step that does not contract, as [`gauss_legendre`] does.
+fn refine_legendre_root(n: usize, seed: f64) -> DoubleDouble {
+    let mut root = DoubleDouble::from_f64(seed);
+    let mut last_step = f64::INFINITY;
+    loop {
+        let values = legendre_values_double_double(n, root);
+        let slope = DoubleDouble::from_f64(n as f64)
+            .mul(root.mul(values[n]).sub(values[n - 1]))
+            .div(root.mul(root).sub(DoubleDouble::from_f64(1.0)));
+        let step = values[n].div(slope);
+        let magnitude = (step.high + step.low).abs();
+        if !(magnitude < last_step) {
+            break;
+        }
+        root = root.sub(step);
+        last_step = magnitude;
+    }
+    root
+}
+
+/// The residual certificate of a Gauss-Legendre rule at the double-double roots `roots` (see
+/// [`gauss_legendre_certified`]). A failed separation declines with infinite errors.
+fn certify_legendre_rule(n: usize, roots: &[DoubleDouble]) -> CertifiedGaussLegendreRule {
+    let unit = UNIT_ROUNDOFF;
+    let declined = |nodes: Vec<f64>, weights: Vec<f64>| CertifiedGaussLegendreRule {
+        nodes,
+        weights,
+        node_error: f64::INFINITY,
+        weight_relative_error: f64::INFINITY,
+    };
+    let mut nodes = Vec::with_capacity(n);
+    let mut weights = Vec::with_capacity(n);
+    let mut offsets = Vec::with_capacity(n);
+    let mut residual_radii = Vec::with_capacity(n);
+    let mut norm_bounds = Vec::with_capacity(n);
+    let mut weight_roundings = Vec::with_capacity(n);
+    for &root in roots {
+        let values = legendre_values_double_double(n, root);
+        // ‖(J − λ̂)v‖² = Σ s_i²/(2i + 1), each s_i bounded above through Sum2.
+        let mut residual_squared = 0.0;
+        let mut parts = Vec::with_capacity(24);
+        for i in 0..n {
+            parts.clear();
+            let mut products = 0usize;
+            if i + 1 < n {
+                push_product_parts(&mut parts, (i + 1) as f64, values[i + 1]);
+                products += 2;
+            }
+            if i >= 1 {
+                push_product_parts(&mut parts, i as f64, values[i - 1]);
+                products += 2;
+            }
+            let scale = (2 * i + 1) as f64;
+            for component in [root.high, root.low] {
+                let head = scale * component;
+                let tail = scale.mul_add(component, -head);
+                for factor in [head, tail] {
+                    push_product_parts(&mut parts, -factor, values[i]);
+                    products += 2;
+                }
+            }
+            products += 2;
+            let (res, error) = accurate_sum(&mut parts, products);
+            let upper = inflated(res.abs() + error, 1);
+            residual_squared += upper * upper / scale;
+        }
+        let residual_bound = inflated(residual_squared, 4 * n).sqrt();
+        // ‖v‖² = Σ (2i + 1)·P_i², bounded on both sides through Sum2.
+        parts.clear();
+        let mut products = 0usize;
+        for (i, &value) in values.iter().take(n).enumerate() {
+            let scale = (2 * i + 1) as f64;
+            for component in [value.high, value.low] {
+                let head = component * value.high;
+                let tail = component.mul_add(value.high, -head);
+                push_product_parts(&mut parts, scale, DoubleDouble { high: head, low: tail });
+                let head_low = component * value.low;
+                let tail_low = component.mul_add(value.low, -head_low);
+                push_product_parts(&mut parts, scale, DoubleDouble { high: head_low, low: tail_low });
+                products += 6;
+            }
+        }
+        let (norm_squared, norm_error) = accurate_sum(&mut parts, products);
+        let norm_lower = (norm_squared - norm_error) * (1.0 - accumulation_growth(3));
+        let norm_upper = inflated(norm_squared + norm_error, 1);
+        if !(norm_lower > 0.0) {
+            return declined(nodes, weights);
+        }
+        let node = root.high + root.low;
+        nodes.push(node);
+        weights.push(2.0 / norm_squared);
+        offsets.push(inflated(unit * node.abs() / (1.0 - unit), 2));
+        // Two square roots and one division.
+        residual_radii.push(inflated(residual_bound / norm_lower.sqrt(), 3));
+        norm_bounds.push((norm_lower, norm_upper));
+        // fl(2/res) against 2/‖v‖²: res errs by norm_error and the division by u.
+        let relative = norm_error / norm_lower;
+        weight_roundings.push(inflated((relative + unit) / (1.0 - relative - unit), 4));
+    }
+    if nodes.windows(2).any(|pair| !(pair[0] < pair[1])) {
+        return declined(nodes, weights);
+    }
+    let radii: Vec<f64> = offsets.iter().zip(&residual_radii).map(|(offset, radius)| inflated(offset + radius, 1)).collect();
+    let mut node_error = 0.0_f64;
+    let mut weight_relative_error = 0.0_f64;
+    for j in 0..n {
+        // Distance from λ̂_j to the other eigenvalues: each lies in its own interval, so the nearest neighbours bound it.
+        let mut gap = f64::INFINITY;
+        for i in [j.wrapping_sub(1), j + 1] {
+            if i < n {
+                let separation = (nodes[i] - nodes[j]).abs() * (1.0 - accumulation_growth(2));
+                let distance = separation - inflated(radii[i] + offsets[j], 1);
+                if !(distance > inflated(radii[j], 1)) {
+                    return declined(nodes, weights);
+                }
+                gap = gap.min(distance);
+            }
+        }
+        let t = inflated(std::f64::consts::SQRT_2 * residual_radii[j] / gap, 3);
+        let (norm_lower, norm_upper) = norm_bounds[j];
+        let first_lower = (1.0 / norm_upper.sqrt()) * (1.0 - accumulation_growth(3));
+        let first_upper = inflated(1.0 / norm_lower.sqrt(), 2);
+        if !(first_lower > t) {
+            return declined(nodes, weights);
+        }
+        let eigenvector = inflated(t * (2.0 * first_upper + t) / ((first_lower - t) * (first_lower - t)), 6);
+        let rounding = weight_roundings[j];
+        weight_relative_error = weight_relative_error.max(inflated(rounding + eigenvector * (1.0 + rounding), 3));
+        node_error = node_error.max(radii[j]);
+    }
+    CertifiedGaussLegendreRule {
+        nodes,
+        weights,
+        node_error,
+        weight_relative_error,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,6 +1926,109 @@ mod tests {
                 assert_eq!(weights[mirror], got_weight, "n={n} weight {mirror} mirrors");
             }
         }
+    }
+
+    #[test]
+    fn certified_gauss_legendre_rule_bounds_its_node_and_weight_errors() {
+        // The certificate at these orders is about u·|x| for the output node's rounding, plus a residual radius near
+        // 2^−104. For the weights it is the norm's Sum2 rounding plus the division: a few u each.
+        for n in [1usize, 2, 3, 8, 9, 16, 33, 64, 100] {
+            let rule = gauss_legendre_certified(n);
+            assert_eq!(rule.nodes.len(), n);
+            assert_eq!(rule.weights.len(), n);
+            assert!(rule.nodes.windows(2).all(|pair| pair[0] < pair[1]), "n={n} nodes ascending");
+            assert!(rule.node_error <= 4.0 * f64::EPSILON, "n={n} node_error={:e}", rule.node_error);
+            assert!(
+                rule.weight_relative_error <= 8.0 * f64::EPSILON,
+                "n={n} weight_relative_error={:e}",
+                rule.weight_relative_error
+            );
+            // Degree-d exactness within the certified errors:
+            //   |ŵx̂ᵈ − w·xᵈ| ≤ e_w·w·|x̂|ᵈ + w·d·e_x·(1 + e_x)ᵈ, with w ≤ ŵ(1 + e_w),
+            // plus the powers' and the sum's rounding γ_{d+n+2}·Σ|ŵx̂ᵈ|.
+            let (e_x, e_w) = (rule.node_error, rule.weight_relative_error);
+            for degree in (0..2 * n).step_by(2) {
+                let d = degree as i32;
+                let quadrature: f64 = rule.nodes.iter().zip(&rule.weights).map(|(x, w)| w * x.powi(d)).sum();
+                let magnitude: f64 = rule.nodes.iter().zip(&rule.weights).map(|(x, w)| (w * x.powi(d)).abs()).sum();
+                let total_weight: f64 = rule.weights.iter().sum();
+                let exact = 2.0 / (degree as f64 + 1.0);
+                let allowance = e_w * magnitude * (1.0 + e_w)
+                    + total_weight * (1.0 + e_w) * degree as f64 * e_x * (1.0 + e_x).powi(d)
+                    + accumulation_growth(degree + n + 2) * magnitude;
+                assert!(
+                    (quadrature - exact).abs() <= allowance,
+                    "n={n} degree={degree}: quadrature={quadrature:.17e} exact={exact:.17e} allowance={allowance:e}"
+                );
+            }
+        }
+        // References from a 50-digit root solve, printed to 18 digits, so they carry about 1e−18 of their own.
+        const GL8: [(f64, f64); 4] = [
+            (0.183434642495649805, 0.362683783378361983),
+            (0.525532409916328986, 0.313706645877887287),
+            (0.796666477413626740, 0.222381034453374471),
+            (0.960289856497536232, 0.101228536290376259),
+        ];
+        const GL16: [(f64, f64); 8] = [
+            (0.0950125098376374402, 0.189450610455068496),
+            (0.281603550779258913, 0.182603415044923589),
+            (0.458016777657227386, 0.169156519395002538),
+            (0.617876244402643748, 0.149595988816576732),
+            (0.755404408355003034, 0.124628971255533872),
+            (0.865631202387831744, 0.0951585116824927848),
+            (0.944575023073232576, 0.0622535239386478929),
+            (0.989400934991649933, 0.0271524594117540949),
+        ];
+        for (n, reference) in [(8usize, &GL8[..]), (16, &GL16[..])] {
+            let rule = gauss_legendre_certified(n);
+            for (k, &(want_node, want_weight)) in reference.iter().enumerate() {
+                let index = n / 2 + k;
+                assert!(
+                    (rule.nodes[index] - want_node).abs() <= rule.node_error + 1.0e-18,
+                    "n={n} node {index}: got {:.17e}, want {want_node:.17e}, certified {:e}",
+                    rule.nodes[index],
+                    rule.node_error
+                );
+                assert!(
+                    (rule.weights[index] - want_weight).abs() <= (rule.weight_relative_error + 1.0e-17) * want_weight,
+                    "n={n} weight {index}: got {:.17e}, want {want_weight:.17e}, certified {:e}",
+                    rule.weights[index],
+                    rule.weight_relative_error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legendre_certificate_covers_roots_displaced_without_refinement() {
+        // Soundness control: roots displaced by 1e−9 and not refined. Krylov–Weinstein puts a true root within the
+        // certified radius, so the radius must reach the displacement. The weights computed at the displaced roots
+        // differ from the certified rule's by the weight function's variation, which the certificate must cover.
+        let n = 16;
+        let rule = gauss_legendre_certified(n);
+        let displacement = 1.0e-9;
+        let displaced: Vec<DoubleDouble> = rule
+            .nodes
+            .iter()
+            .map(|&x| DoubleDouble::from_f64(x + displacement))
+            .collect();
+        let certificate = certify_legendre_rule(n, &displaced);
+        assert!(
+            certificate.node_error >= 0.9 * displacement,
+            "node_error={:e} must reach the displacement",
+            certificate.node_error
+        );
+        for (displaced_weight, weight) in certificate.weights.iter().zip(&rule.weights) {
+            // |ŵ_d − ŵ| ≤ w·(e_d + e_r) and ŵ ≥ w·(1 − e_r).
+            let change = (displaced_weight - weight).abs() / weight;
+            assert!(
+                change * (1.0 - rule.weight_relative_error)
+                    <= certificate.weight_relative_error + rule.weight_relative_error,
+                "weight change {change:e} exceeds the certificate {:e}",
+                certificate.weight_relative_error
+            );
+        }
+        assert!(certificate.weight_relative_error > 1.0e3 * rule.weight_relative_error);
     }
 
     #[test]

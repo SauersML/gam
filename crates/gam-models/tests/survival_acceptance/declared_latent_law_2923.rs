@@ -223,12 +223,28 @@ fn build_dataset(
     seed: u64,
     standardize: bool,
 ) -> (gam_data::EncodedDataset, Vec<f64>, Vec<f64>) {
+    build_dataset_with_draws(law, seed, standardize, |law, u| law.draw(u))
+}
+
+/// [`build_dataset`] with the score drawn by `draw` instead of from `law`'s
+/// atoms. A Gaussian declaration is checked against the score it is made about
+/// (gam#2926), so the Gaussian arm draws a continuous standard normal and
+/// simulates on the Gauss–Hermite anchor, which is its anchor to quadrature
+/// tolerance.
+fn build_dataset_with_draws(
+    law: &Law,
+    seed: u64,
+    standardize: bool,
+    draw: impl Fn(&Law, f64) -> f64,
+) -> (gam_data::EncodedDataset, Vec<f64>, Vec<f64>) {
     let headers = ["time", "event", "z"]
         .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
     let mut state = seed;
-    let mut draws: Vec<f64> = (0..N).map(|_| law.draw(next_unit(&mut state))).collect();
+    let mut draws: Vec<f64> = (0..N)
+        .map(|_| draw(law, next_unit(&mut state).clamp(1e-12, 1.0 - 1e-12)))
+        .collect();
     if standardize {
         let mean = draws.iter().sum::<f64>() / N as f64;
         let variance = draws.iter().map(|z| (z - mean).powi(2)).sum::<f64>() / N as f64;
@@ -296,6 +312,10 @@ struct Fitted {
     exit_index: Vec<f64>,
     slope: f64,
     latent_measure_is_empirical: bool,
+    /// The latent law the fit consumed (gam#2926).
+    law: &'static str,
+    /// The global finite law the fit anchored on, when it anchored on one.
+    grid: Option<Law>,
 }
 
 fn fit(data: &gam_data::EncodedDataset, config: &FitConfig) -> Fitted {
@@ -308,15 +328,21 @@ fn fit(data: &gam_data::EncodedDataset, config: &FitConfig) -> Fitted {
     // An intercept-only slope surface: every row's slope is the same number.
     let slope_design = fit.slope_design.design.to_dense();
     let slope = slope_design.row(0).dot(&fit.fit.blocks[2].beta) + fit.baseline_slope;
+    let grid = match &fit.latent_measure {
+        gam_models::bms::LatentMeasureKind::GlobalEmpirical { grid } => Some(Law {
+            nodes: grid.nodes.clone(),
+            weights: grid.weights.clone(),
+        }),
+        _ => None,
+    };
     Fitted {
         coefficients: fit.fit.beta.to_vec(),
         log_likelihood: fit.fit.log_likelihood,
         exit_index,
         slope,
-        latent_measure_is_empirical: matches!(
-            fit.latent_measure,
-            gam_models::bms::LatentMeasureKind::GlobalEmpirical { .. }
-        ),
+        latent_measure_is_empirical: grid.is_some(),
+        law: fit.latent_law_consumed.label(),
+        grid,
     }
 }
 
@@ -338,7 +364,8 @@ fn anchored_fit_on_a_gaussian_law_reproduces_the_closed_form_2923() {
     gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
 
     let law = Law::gauss_hermite(65);
-    let (data, _, _) = build_dataset(&law, 0x2923_0000_0001, true);
+    let (data, _, _) =
+        build_dataset_with_draws(&law, 0x2923_0000_0001, true, |_, u| normal_quantile(u));
 
     let closed_form = fit(
         &data,
@@ -411,10 +438,45 @@ fn closed_form_is_miscalibrated_on_a_skewed_law_and_the_anchored_fit_is_not_2923
         .map(|(&q, &z)| normal_cdf(-(law.anchor(q, SLOPE) + SLOPE * z)))
         .collect();
 
+    // gam#2926: a Gaussian declaration on a score that fails the adequacy screen
+    // is fitted with a warning, not refused, and records what it costs: on a law
+    // this skewed its excess anchoring loss is positive. The closed form below is
+    // reached through the declared Gauss–Hermite law, which is its anchor to
+    // quadrature tolerance
+    // (`anchored_fit_on_a_gaussian_law_reproduces_the_closed_form_2923`).
+    let declared = fit_from_formula(
+        "Surv(time, event) ~ 1",
+        &data,
+        &FitConfig {
+            latent_measure: Some("gaussian".to_string()),
+            ..base_config()
+        },
+    )
+    .expect("a Gaussian declaration on a skewed score is fitted with a warning");
+    let FitResult::SurvivalMarginalSlope(declared) = declared else {
+        panic!("expected a SurvivalMarginalSlope fit result");
+    };
+    let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
+        adequacy: Some(_),
+        residual: Some(certificate),
+        ..
+    } = &declared.latent_law_consumed
+    else {
+        panic!(
+            "a declaration whose score fails the screen must record the ledger and its excess \
+             anchoring loss; got {:?}",
+            declared.latent_law_consumed
+        )
+    };
+    assert!(
+        certificate.excess_kl > 0.0,
+        "on a skewed score the declaration's excess anchoring loss must be positive: \
+         {certificate:?}"
+    );
     let closed_form = fit(
         &data,
         &FitConfig {
-            latent_measure: Some("standard-normal".to_string()),
+            declared_latent_law: Some(Law::gauss_hermite(65).declared()),
             ..base_config()
         },
     );
@@ -519,6 +581,72 @@ fn closed_form_is_miscalibrated_on_a_skewed_law_and_the_anchored_fit_is_not_2923
     );
 }
 
+/// gam#2926: with nothing declared the survival fit anchors on the law it
+/// estimates from the score, and on the skewed law that estimate is calibrated
+/// in context as the declared law is, where the Gaussian form is not.
+#[test]
+fn default_anchors_on_the_estimated_law_of_a_skewed_score_2926() {
+    super::initialize_cpu_fitting();
+    gam_runtime::test_support::install_diagnostic_logger();
+    #[cfg(target_os = "macos")]
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+
+    let law = Law::skewed();
+    let (data, times, scores) = build_dataset(&law, 0x2923_0000_0002, false);
+    let truth: Vec<f64> = times.iter().map(|t| planted_index(*t)).collect();
+    let true_survival: Vec<f64> = truth
+        .iter()
+        .zip(&scores)
+        .map(|(&q, &z)| normal_cdf(-(law.anchor(q, SLOPE) + SLOPE * z)))
+        .collect();
+
+    let estimated = fit(&data, &base_config());
+    assert_eq!(
+        estimated.law, "estimated-global",
+        "an intercept-only marginal formula has no span to move on, so one global law"
+    );
+    let grid = estimated
+        .grid
+        .as_ref()
+        .expect("the default must anchor on a finite law");
+    let conditional_error = estimated
+        .exit_index
+        .iter()
+        .zip(&scores)
+        .zip(&true_survival)
+        .map(|((&q_hat, &z), &truth)| {
+            (normal_cdf(-(grid.anchor(q_hat, estimated.slope) + estimated.slope * z)) - truth)
+                .abs()
+        })
+        .sum::<f64>()
+        / scores.len() as f64;
+    let marginal_error = estimated
+        .exit_index
+        .iter()
+        .zip(&truth)
+        .map(|(&q_hat, &q)| (normal_cdf(-q_hat) - normal_cdf(-q)).abs())
+        .sum::<f64>()
+        / truth.len() as f64;
+    eprintln!(
+        "[2926 survival skewed] n={N} planted b={SLOPE} | default law={} nodes={} slope={:.4} | \
+         mean |Ŝ(t,z) − S(t,z)|={conditional_error:.4} | mean |Φ(−q̂)−Φ(−q)|={marginal_error:.4} | \
+         index rmse vs truth={:.4}",
+        estimated.law,
+        grid.nodes.len(),
+        estimated.slope,
+        rmse(&estimated.exit_index, &truth),
+    );
+    assert!(
+        conditional_error < 0.02,
+        "the default fit must be calibrated in context; mean |Ŝ − S| = {conditional_error:.4}"
+    );
+    assert!(
+        (estimated.slope - SLOPE).abs() < 0.15,
+        "the default fit must recover the planted slope; got {}",
+        estimated.slope
+    );
+}
+
 /// The declared law is persisted as the model's latent measure and replayed
 /// at prediction by the same anchoring equation: the saved model's index at
 /// every training row is `α(q̂, b̂) + b̂·z` on the declared law, not the
@@ -600,4 +728,241 @@ fn declared_law_is_persisted_and_replayed_at_prediction_2923() {
         worst_closed_form > 1e-2,
         "the replayed index must not be the closed form on a skewed law; worst gap {worst_closed_form:.3e}"
     );
+}
+
+/// A declared law of one atom per training row (gam#2928): standardized
+/// log-normal mid-quantiles (skewness about one), equal weights.
+fn one_atom_per_row() -> Law {
+    let raw: Vec<f64> = (0..N)
+        .map(|k| (0.32 * normal_quantile((k as f64 + 0.5) / N as f64)).exp())
+        .collect();
+    let mean = raw.iter().sum::<f64>() / N as f64;
+    let sd = (raw.iter().map(|u| (u - mean).powi(2)).sum::<f64>() / N as f64).sqrt();
+    Law {
+        nodes: raw.iter().map(|u| (u - mean) / sd).collect(),
+        weights: vec![1.0 / N as f64; N],
+    }
+}
+
+#[test]
+fn many_atom_declared_law_is_compressed_persisted_and_replayed_bitwise_2928() {
+    super::initialize_cpu_fitting();
+    gam_runtime::test_support::install_diagnostic_logger();
+    #[cfg(target_os = "macos")]
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+
+    let atoms = one_atom_per_row();
+    let (data, _, _) = build_dataset(&Law::skewed(), 0x2928_0000_0001, false);
+    let config = FitConfig {
+        declared_latent_law: Some(atoms.declared()),
+        ..base_config()
+    };
+    let payload = fit_formula_to_payload("Surv(time, event) ~ 1".to_string(), &data, &config)
+        .expect("fit a many-atom declared law to a saved payload");
+
+    let declared = payload
+        .declared_latent_law
+        .as_ref()
+        .expect("the saved model must carry the declared atoms");
+    assert_eq!(declared.nodes, atoms.nodes, "the persisted atoms must be the declared nodes");
+    assert_eq!(declared.weights, atoms.weights, "the persisted atoms must be the declared weights");
+    let compressed = match payload.latent_measure.as_ref() {
+        Some(gam_models::bms::LatentMeasureKind::GlobalEmpirical { grid }) => grid.clone(),
+        other => panic!(
+            // SAFETY (test): the persisted measure is the property under test.
+            "the saved model must carry the compressed law as its latent measure; got {other:?}"
+        ),
+    };
+    let ledger = payload
+        .declared_latent_law_compression
+        .clone()
+        .expect("the saved model must carry the compression ledger");
+    eprintln!("[2928 persist] n={N} ledger {ledger:?}");
+    assert_eq!(ledger.atoms, N);
+    assert_eq!(ledger.nodes, compressed.nodes.len());
+    assert!(
+        2 * ledger.nodes <= N,
+        "a compressed law must at least halve the atoms: {} of {N}",
+        ledger.nodes
+    );
+    assert_eq!(
+        ledger.anchors_meeting_target, ledger.anchors_checked,
+        "every converged anchor must meet its certified target"
+    );
+    for statistic in ledger.certified_error_over_target {
+        assert!(
+            statistic.is_some_and(|value| value <= 1.0),
+            "certified error / target {statistic:?} must be certified and at most one"
+        );
+    }
+    for statistic in ledger.measured_error_over_certified {
+        assert!(
+            statistic.is_some_and(|value| value <= 1.0),
+            "measured / certified error {statistic:?} must be certified and at most one"
+        );
+    }
+
+    // The on-disk representation round-trips, and a model loaded from it
+    // predicts bit-identically to the model built from the fit in memory.
+    let text = serde_json::to_string(&payload).expect("serialize the saved model");
+    let reloaded: gam_models::inference::model::FittedModelPayload =
+        serde_json::from_str(&text).expect("deserialize the saved model");
+    assert_eq!(reloaded.latent_measure, payload.latent_measure);
+    assert_eq!(reloaded.declared_latent_law, payload.declared_latent_law);
+    assert_eq!(
+        reloaded.declared_latent_law_compression,
+        payload.declared_latent_law_compression
+    );
+    let col_map: HashMap<String, usize> = data
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    let zeros = Array1::<f64>::zeros(data.values.nrows());
+    let predict = |model: &FittedModel| {
+        predict_survival(
+            SurvivalPredictRequest {
+                model,
+                data: data.values.view(),
+                col_map: &col_map,
+                training_headers: Some(&data.headers),
+                primary_offset: &zeros,
+                noise_offset: &zeros,
+                time_grid: None,
+                with_uncertainty: false,
+                estimand: SurvivalPredictEstimand::Plugin,
+            },
+            SurvivalPredictionCovarianceMode::Conditional,
+        )
+        .expect("survival marginal-slope prediction at the training rows")
+    };
+    let in_memory = predict(&FittedModel::from_payload(payload));
+    let loaded = predict(&FittedModel::from_payload(reloaded));
+    assert!(
+        in_memory
+            .linear_predictor
+            .iter()
+            .zip(loaded.linear_predictor.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the loaded model's linear predictor must match the in-memory model's bit for bit"
+    );
+    assert!(
+        in_memory
+            .survival
+            .iter()
+            .zip(loaded.survival.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the loaded model's survival must match the in-memory model's bit for bit"
+    );
+}
+
+/// gam#2926 follow-up: a survival fit whose slope varies along follow-up, on a
+/// standard-normal score, certifies its closed form with each anchor's own slope:
+/// the entry slope at entry and the exit slope at exit. The record follows the sign
+/// of `D̂`: `D̂ ≤ 0` keeps a certified closed form, and `D̂ > 0` keeps the same fit
+/// recorded `gaussian-uncertified` with its certificate, because the anchored frame
+/// does not carry a follow-up-varying slope. A certified fit is calibrated under the
+/// TRUE law on the marginal index.
+#[test]
+fn follow_up_varying_slope_default_records_its_certificate_decision_2926() {
+    super::initialize_cpu_fitting();
+    gam_runtime::test_support::install_diagnostic_logger();
+    #[cfg(target_os = "macos")]
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+
+    let law = Law::gauss_hermite(65);
+    let (data, times, _) =
+        build_dataset_with_draws(&law, 0x2926_71E5_0000_0001, true, |_, u| normal_quantile(u));
+    let truth: Vec<f64> = times.iter().map(|t| planted_index(*t)).collect();
+    records_certificate_decision(
+        "follow-up-varying slope",
+        fit_from_formula(
+            "Surv(time, event) ~ 1",
+            &data,
+            &FitConfig {
+                slope_time_k: Some(4),
+                ..base_config()
+            },
+        ),
+        &truth,
+        "follow-up-varying slope",
+    );
+}
+
+/// The certificate decision of a default fit on a configuration the anchored frame
+/// does not serve, in either branch, and a fitted model in both: a certified
+/// closed form whose decision is the sign of its `D̂` and which is calibrated on the
+/// marginal index under the TRUE law, or, where `D̂` prefers the estimated law, the
+/// same closed-form fit recorded `gaussian-uncertified` with that certificate and
+/// why nothing here re-solves on it, which `require_certified` refuses by name.
+fn records_certificate_decision<E: std::fmt::Display>(
+    label: &str,
+    result: Result<FitResult, E>,
+    truth: &[f64],
+    unavailable_names: &str,
+) {
+    let fit = match result {
+        Ok(FitResult::SurvivalMarginalSlope(fit)) => fit,
+        Ok(_) => panic!("expected a SurvivalMarginalSlope fit result"),
+        Err(error) => panic!("a default {label} fit must return a model; got {error}"),
+    };
+    let marginal_error = fit
+        .fitted_exit_index
+        .iter()
+        .zip(truth)
+        .map(|(&q_hat, &q)| (normal_cdf(-q_hat) - normal_cdf(-q)).abs())
+        .sum::<f64>()
+        / truth.len() as f64;
+    match &fit.latent_law_consumed {
+        gam_models::bms::LatentLawConsumed::EstimatedGaussianAdequate {
+            residual: Some(certificate),
+            ..
+        } => {
+            assert!(
+                certificate.closed_form_chosen && certificate.excess_kl <= 0.0,
+                "a kept closed form's recorded decision must be the sign of its D̂: {certificate:?}"
+            );
+            eprintln!(
+                "[2926 {label}] n={N} planted b={SLOPE} | kept the closed form: {certificate:?} | \
+                 mean |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
+            );
+            assert!(
+                marginal_error < 0.02,
+                "a kept {label} fit must be calibrated on the marginal index under the TRUE law; \
+                 mean |Φ(−q̂)−Φ(−q)| = {marginal_error:.4}"
+            );
+        }
+        gam_models::bms::LatentLawConsumed::GaussianUncertified {
+            certificate: Some(certificate),
+            missing,
+            ..
+        } => {
+            eprintln!(
+                "[2926 {label}] n={N} planted b={SLOPE} | uncertified: {missing} | \
+                 mean |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
+            );
+            assert!(
+                !certificate.closed_form_chosen && certificate.excess_kl > 0.0,
+                "an uncertified closed form must carry the D̂ that preferred the estimated law: \
+                 {certificate:?}"
+            );
+            assert!(
+                missing.contains("expected to be the more accurate anchor")
+                    && missing.contains("D̂ =")
+                    && missing.contains(unavailable_names),
+                "an uncertified {label} fit must name its D̂ and why nothing can re-solve; got \
+                 {missing}"
+            );
+            let refusal = fit
+                .latent_law_consumed
+                .require_certified(label)
+                .expect_err("an uncertified closed form is not a certified fit");
+            assert!(refusal.contains(missing.as_str()), "{refusal}");
+        }
+        other => panic!(
+            "a default {label} fit must record a certified or an uncertified closed form; got \
+             {other:?}"
+        ),
+    }
 }

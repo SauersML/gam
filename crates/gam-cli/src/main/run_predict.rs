@@ -833,8 +833,14 @@ fn build_saved_location_scale_survival_alo_input(
             )?
         }
     };
+    // The fitted likelihood drops `S(entry)` for a row entering at the origin (#2695).
+    let entry_active = age_entry
+        .iter()
+        .map(|&entry| entry > gam::families::survival::ENTRY_AT_ORIGIN_THRESHOLD)
+        .collect::<Vec<_>>();
     let input = gam_predict::SavedLocationScaleSurvivalAloInput::new(
         event,
+        entry_active,
         derivative_guard,
         time_base,
         threshold,
@@ -1055,6 +1061,7 @@ pub(crate) fn run_predict_unified(
         posterior_mean_upper,
         point_covariance,
         uncertainty_covariance,
+        point_provenance,
     ) = (
         columns.linear_predictor_plugin,
         columns.mean_plugin,
@@ -1064,6 +1071,7 @@ pub(crate) fn run_predict_unified(
         columns.posterior_mean_upper,
         columns.point_covariance_source,
         columns.uncertainty_covariance_source,
+        columns.point_covariance_provenance,
     );
     let specialised_point = posterior_mean
         .as_ref()
@@ -1080,12 +1088,22 @@ pub(crate) fn run_predict_unified(
             // estimand a prediction surface reports, and the plug-in pair is
             // carried by name, not selected by a mode.
             let published_posterior_mean = posterior_mean.as_ref().map(|values| values.view());
+            // A joint expectile fit publishes its level curves `E[μ] + c_k·E[σ]`.
+            let expectile_curves = gam_predict::joint_expectile_curves(
+                model,
+                predictor,
+                pred_input,
+                specialised_point,
+            )
+            .map_err(|e| format!("expectile curve prediction failed: {e}"))?
+            .unwrap_or_default();
             write_estimand_explicit_prediction_csv(
                 &args.out,
                 linear_predictor_plugin.view(),
                 mean_plugin.view(),
                 published_posterior_mean,
                 noise_scale.as_ref().map(|values| values.view()),
+                &expectile_curves,
                 posterior_mean_standard_error.as_ref().map(|a| a.view()),
                 posterior_mean_lower.as_ref().map(|a| a.view()),
                 posterior_mean_upper.as_ref().map(|a| a.view()),
@@ -1140,6 +1158,9 @@ pub(crate) fn run_predict_unified(
         specialised_point.len(),
         covariance_provenance_note(point_covariance, uncertainty_covariance)
     );
+    if let Some(line) = point_covariance_provenance_line(point_provenance.as_ref()) {
+        cli_out!("{line}");
+    }
     Ok(())
 }
 
@@ -1259,6 +1280,7 @@ pub(crate) fn run_predict_spline_scan(
         mean.view(),
         Some(mean.view()),
         None,
+        &[],
         se_opt.as_ref().map(|a| a.view()),
         mean_lo.as_ref().map(|a| a.view()),
         mean_hi.as_ref().map(|a| a.view()),
@@ -1340,6 +1362,7 @@ pub(crate) fn run_predict_residual_cascade(
         mean.view(),
         Some(mean.view()),
         None,
+        &[],
         se_opt.as_ref().map(|a| a.view()),
         mean_lo.as_ref().map(|a| a.view()),
         mean_hi.as_ref().map(|a| a.view()),
@@ -1357,8 +1380,8 @@ pub(crate) fn run_predict_residual_cascade(
     Ok(())
 }
 
-/// `gam predict --conformal`: the exact full-conformal set, or with
-/// `--calibration` the split-conformal band, at coverage `--level`, built by
+/// `gam predict --conformal`: with `--training-data` the exact full-conformal
+/// set, or with `--calibration` the split-conformal band, at coverage `--level`, built by
 /// `gam_predict::conformal_routes` for a standard model.
 fn run_predict_conformal(
     args: &PredictArgs,
@@ -1370,21 +1393,44 @@ fn run_predict_conformal(
     effective_offset_column: Option<&str>,
     effective_noise_offset_column: Option<&str>,
 ) -> Result<(), String> {
-    let columns = match args.calibration.as_ref() {
-        None => gam_predict::conformal_routes::full_conformal_prediction_columns(
-            model,
-            ds.values.view(),
-            col_map,
-            args.level,
-        )?,
-        Some(calibration_path) => {
-            let response = gam::terms::inference::formula_dsl::formula_response_column(
-                &model.payload().formula,
-            )
+    let response_column = |flag: &str| {
+        gam::terms::inference::formula_dsl::formula_response_column(&model.payload().formula)
             .ok_or_else(|| {
-                "--calibration: could not resolve the response column from the saved formula"
-                    .to_string()
-            })?;
+                format!("{flag}: could not resolve the response column from the saved formula")
+            })
+    };
+    let columns = match (args.training_data.as_ref(), args.calibration.as_ref()) {
+        (None, None) => {
+            return Err(
+                "predict --conformal needs its labeled rows: pass --training-data <the table the \
+                 model was fit on> for the exact full-conformal set, or --calibration <a held-out \
+                 labeled table> for the split-conformal band"
+                    .to_string(),
+            );
+        }
+        (Some(_), Some(_)) => {
+            return Err("--training-data and --calibration are mutually exclusive".to_string());
+        }
+        (Some(training_path), None) => {
+            let extras = vec![response_column("--training-data")?];
+            let training = load_datasetwith_model_schema_extra(training_path, model, &extras)?;
+            require_dataset_rows("predict --training-data", training_path, training.values.nrows())?;
+            let training_col_map = training.column_map();
+            gam_predict::conformal_routes::full_conformal_prediction_columns(
+                model,
+                &gam_predict::conformal_routes::DesignRows {
+                    data: ds.values.view(),
+                    col_map,
+                },
+                &gam_predict::conformal_routes::DesignRows {
+                    data: training.values.view(),
+                    col_map: &training_col_map,
+                },
+                args.level,
+            )?
+        }
+        (None, Some(calibration_path)) => {
+            let response = response_column("--calibration")?;
             let mut extras = vec![response];
             extras.extend(
                 [effective_offset_column, effective_noise_offset_column]
@@ -1457,7 +1503,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
     }
     let phase_start = std::time::Instant::now();
     let model = SavedModel::load_from_path(&args.model)?;
-    log::info!(
+    log::debug!(
         "[PHASE] predict load-model done elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
@@ -1473,7 +1519,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
         .collect();
     let ds = load_datasetwith_model_schema_extra(&args.new_data, &model, &offset_extras)?;
     require_dataset_rows("predict", &args.new_data, ds.values.nrows())?;
-    log::info!(
+    log::debug!(
         "[PHASE] predict load-data done elapsed={:.3}s n={}",
         phase_start.elapsed().as_secs_f64(),
         ds.values.nrows()
@@ -2625,6 +2671,10 @@ pub(crate) fn run_predict_survival(
             &derivative_offset_exit,
             &effective_primary_offset,
             &effective_noise_offset,
+            gam::predict::input::build_marginal_slope_local_auxiliary_matrix(
+                model, data, col_map,
+            )
+            .map_err(|error| error.to_string())?,
         )?;
 
         let (eta, mean, eta_se_opt, mean_lo, mean_hi): (

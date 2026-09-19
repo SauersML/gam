@@ -1532,8 +1532,9 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_l
 /// The tiny-fixture test above converges to a well-conditioned PD state with NO
 /// per-row deflation, so it never exercises the Daleckii–Krein
 /// [`SaeManifoldTerm::deflation_block_correction`] path. This fixture (the
-/// residual-excited two-atom circle, lifted ρ) carries genuine per-row gauge
-/// deflation on the over-parametrized chart, so `logdet_theta_adjoint` here goes
+/// residual-excited two-atom circle, lifted ρ, its softmax on the ladder of
+/// [`super::tests_deflated_from_probes_2712::deflating_gate_temperatures`])
+/// deflates every row's logit slot by construction, so `logdet_theta_adjoint` here goes
 /// through the DK correction. `Γ_joint = tr(H⁻¹ ∂H/∂θ)` must equal the fixed-θ̂
 /// central difference of the criterion's authoritative `arrow_log_det()` — the
 /// SAME operator the DK comment claims to differentiate. The #2253 full-set
@@ -1546,75 +1547,13 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_l
 /// `max(α cos κt, 0)` is non-smooth.
 #[test]
 pub(crate) fn sae_logdet_theta_adjoint_matches_fd_on_deflated_fixture_2330() {
-    let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
-    let (n, p) = (target.nrows(), target.ncols());
-    for row in 0..n {
-        for col in 0..p {
-            let phase = (row as f64 + 0.35) / n as f64;
-            let theta = std::f64::consts::TAU * phase;
-            target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
-        }
-    }
-    rho.log_lambda_sparse = -0.5;
-    for value in rho.log_lambda_smooth.iter_mut() {
-        *value = -1.0;
-    }
-    for axis in rho.log_ard.iter_mut() {
-        for value in axis.iter_mut() {
-            *value = -0.5;
-        }
-    }
-    term.penalized_quasi_laplace_criterion_with_cache(
-        target.view(),
-        &rho,
-        None,
-        40,
-        0.4,
-        1.0e-6,
-        1.0e-6,
-    )
-    .expect("off-manifold fixture converges with both atoms alive");
-
-    // Evaluation ρ, θ̂ frozen: lifted off the floor so the deflated legs sit
-    // above finite-difference noise, and certified to be a MAXIMUM there. The
-    // historical `(0.5, −2.0, [−1.2, −1.0])` lift is the ladder's first member;
-    // #2398 measured that it now lands on a genuine exact-`A` saddle, where the
-    // deflated-PD state this gate differentiates does not exist at all. The
-    // ladder walks the lift down until a deflated maximum is certified.
-    let eval_rho_ladder: Vec<(String, SaeManifoldRho)> = [
-        (0.5_f64, -2.0_f64, -1.2_f64, -1.0_f64),
-        (0.5, -1.5, -1.2, -1.0),
-        (0.2, -2.0, -1.2, -1.0),
-        (0.2, -1.5, -1.0, -0.8),
-        (0.0, -1.5, -1.0, -0.8),
-        (-0.2, -1.2, -0.8, -0.6),
-        (-0.5, -1.0, -0.5, -0.5),
-    ]
-    .iter()
-    .map(|&(sparse, smooth, ard0, ard1)| {
-        let mut candidate = rho.clone();
-        candidate.log_lambda_sparse = sparse;
-        for value in candidate.log_lambda_smooth.iter_mut() {
-            *value = smooth;
-        }
-        candidate.log_ard = vec![ndarray::array![ard0], ndarray::array![ard1]];
-        (
-            format!(
-                "eval rho (sparse={sparse:.1}, smooth={smooth:.1}, ard=[{ard0:.1}, {ard1:.1}])"
-            ),
-            candidate,
-        )
-    })
-    .collect();
-    let anchor = certified_fd_anchor(
-        "#2330 deflated-fixture theta adjoint",
-        &target,
-        FdAnchorRegime::deflated(),
-        rho_ladder_family(&term, eval_rho_ladder, 0),
-    );
-    let term = anchor.term;
-    let rho = anchor.rho;
-    let cache = anchor.cache;
+    // The anchor is the shared residual-excited deflated anchor: evaluation ρ
+    // with θ̂ frozen, lifted off the floor so the deflated legs sit above
+    // finite-difference noise, and certified to be a MAXIMUM there.
+    let (term, rho, target, cache) =
+        super::tests_deflated_from_probes_2712::residual_excited_deflated_anchor(
+            "#2330 deflated-fixture theta adjoint",
+        );
     // #2144 — the majorized θ-adjoint production contracts, at full-basis probes
     // where its Hutchinson outer products are exact, as the three pins above.
     let (probes, sinv) = full_basis_probe_bundle(&cache);
@@ -1630,7 +1569,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_fd_on_deflated_fixture_2330() {
         .expect("Gamma_joint");
 
     let h = 1.0e-5;
-    let fd_stratum = anchor.stratum;
+    let fd_stratum = FiniteDifferenceStratumCertificate::from_arrow_cache(&cache);
     let mut checked = 0usize;
     let mut worst = 0.0_f64;
     // #2366 branch-guard tally. Reported rather than asserted: which regime a
@@ -1729,25 +1668,15 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_fd_on_deflated_fixture_2330() {
 /// rows, because `A_i⁻¹` would then be the undeflated block. It does not, because
 /// the factor carries the CONDITIONED spectrum: the gate also checks
 /// `A_i v = v` on each deflated direction, which is the unit-stiffness pin
-/// itself.
+/// itself. The anchor is the shared ordered Beta–Bernoulli deflated anchor,
+/// [`super::tests_deflated_from_probes_2712::obb_deflated_anchor`], where every
+/// row's logit slots deflate by construction.
 #[test]
 fn sae_row_selected_inverse_from_probes_is_the_deflated_block_2712() {
-    let (mut term, target, rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
-    let anchor = certified_fd_anchor(
+    let cache = super::tests_deflated_from_probes_2712::obb_deflated_anchor(
         "#2712 deflated selected-inverse reconstruction",
-        &target,
-        FdAnchorRegime::deflated(),
-        rho_ladder_family(
-            &term,
-            sparse_lift_ladder(
-                &rho,
-                &[2.4, 1.8, 1.3, 0.9, 0.5, 0.2, 0.0, -0.3, -0.6, -1.0],
-            ),
-            5,
-        ),
-    );
-    let cache = anchor.cache;
+    )
+    .3;
     let k = cache.k;
     assert!(k > 0, "the fixture must have a border for S⁻¹ to matter");
     let sqrt_k = (k as f64).sqrt();

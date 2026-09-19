@@ -30,9 +30,9 @@
 //! 2. *(Λ, D | scale)* — re-estimate the factor and diagonal from the
 //!    scale-deflated second-moment, holding the activity law fixed,
 //!
-//! a fixed small number of times. The **factor count `r`** is chosen by an
-//! evidence ladder: each candidate `r` is scored by its penalized Gaussian
-//! log-evidence and the best is kept.
+//! a fixed small number of times. The **factor count `r`** is chosen by a
+//! BIC ladder: each candidate `r` is scored by its Gaussian log-likelihood less
+//! `½·k·log n` (`−BIC/2`, not a marginal likelihood) and the best is kept.
 //!
 //! # What it produces
 //!
@@ -60,10 +60,10 @@ use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_problem::RowMetric;
 
 /// Alternation sweeps the structured-Gaussian fit may take before it is
-/// refused. The alternation is a block-coordinate ascent on the penalized
-/// log-evidence (with smoothed, floored scale updates, so not an exact
+/// refused. The alternation is a block-coordinate ascent on the BIC-penalized
+/// log-likelihood (with smoothed, floored scale updates, so not an exact
 /// ascent), and it stops on its own at the first sweep that fails to improve
-/// the evidence by more than the evidence's rounding band, keeping the best
+/// the score by more than the score's rounding band, keeping the best
 /// state it saw. This budget bounds an ascent that keeps improving, and its
 /// exhaustion is a refusal, not a result (#2469 — it used to run exactly 8
 /// sweeps and return whatever state that left).
@@ -103,9 +103,10 @@ pub struct StructuredResidualModel {
     diagonal: Array1<f64>,
     /// Per-row activity scale `c(z_n) > 0`, length `n`.
     row_scale: Array1<f64>,
-    /// Penalized Gaussian log-evidence of the selected model (higher is better).
-    /// The value the evidence ladder maximized over the candidate ranks.
-    log_evidence: f64,
+    /// BIC-penalized Gaussian log-likelihood of the selected model (higher is
+    /// better), the value the rank ladder maximized over the candidate ranks. It is
+    /// `−BIC/2`, not a marginal likelihood; see [`gaussian_bic_log_likelihood`].
+    bic_penalized_log_likelihood: f64,
 }
 
 /// Estimator inputs: the residual matrix and the smooth activity coordinate.
@@ -119,9 +120,9 @@ pub struct ResidualFactorInput<'a> {
     pub residuals: ArrayView2<'a, f64>,
     /// Activity coordinate `z ∈ ℝ^n` the scale law is smooth in.
     pub activity: ArrayView1<'a, f64>,
-    /// Maximum factor rank the evidence ladder is allowed to consider. The
+    /// Maximum factor rank the BIC ladder is allowed to consider. The
     /// ladder scores `r = 0, 1, …, min(max_factor_rank, p−1)` and keeps the
-    /// penalized-evidence maximizer. `0` forces the pure-diagonal model.
+    /// `−BIC/2` maximizer. `0` forces the pure-diagonal model.
     pub max_factor_rank: usize,
 }
 
@@ -154,7 +155,7 @@ pub struct FactorPromotion {
 
 impl StructuredResidualModel {
     /// Fit the structured residual-covariance model by the deterministic
-    /// fixed-iteration alternation, selecting the factor rank by the evidence
+    /// fixed-iteration alternation, selecting the factor rank by the BIC
     /// ladder. Returns an error only on shape / non-finite-input violations; the
     /// numerical path is total (every floor and solve is guarded).
     pub fn fit(input: ResidualFactorInput<'_>) -> Result<Self, String> {
@@ -201,8 +202,8 @@ impl StructuredResidualModel {
 
         let max_rank = input.max_factor_rank.min(p.saturating_sub(1));
 
-        // Evidence ladder over candidate factor ranks. Each candidate is fit by
-        // the full alternation and scored by its penalized Gaussian log-evidence;
+        // Rank ladder over candidate factor ranks. Each candidate is fit by the
+        // full alternation and scored by its BIC-penalized Gaussian log-likelihood;
         // the maximizer is kept. Index order breaks any tie (lowest rank wins on
         // an exact tie — Occam).
         let mut best: Option<StructuredResidualModel> = None;
@@ -210,13 +211,13 @@ impl StructuredResidualModel {
             let model = Self::fit_fixed_rank(r, &row_bin, bins, rank)?;
             let take = match &best {
                 None => true,
-                Some(b) => model.log_evidence > b.log_evidence,
+                Some(b) => model.bic_penalized_log_likelihood > b.bic_penalized_log_likelihood,
             };
             if take {
                 best = Some(model);
             }
         }
-        best.ok_or_else(|| "StructuredResidualModel::fit: evidence ladder empty".to_string())
+        best.ok_or_else(|| "StructuredResidualModel::fit: BIC ladder empty".to_string())
     }
 
     /// Fit the model at a fixed factor rank by the deterministic alternation.
@@ -250,7 +251,7 @@ impl StructuredResidualModel {
         let mut diagonal = raw_diag.mapv(|v| v.max(diag_floor));
         let mut lambda = Array2::<f64>::zeros((p, rank));
 
-        // Best state seen, restored when a sweep stops improving the evidence.
+        // Best state seen, restored when a sweep stops improving the score.
         let mut best: Option<(f64, Array2<f64>, Array1<f64>, Array1<f64>)> = None;
         let mut converged = false;
         for _sweep in 0..ALTERNATION_MAX_SWEEPS {
@@ -282,7 +283,7 @@ impl StructuredResidualModel {
             // part is scale-free) but its diagonal carries D·mean(1/c) — a
             // Jensen-inflated D (mean(1/c) > 1 for any non-constant law), which
             // biased D upward by exactly mean(1/c̃) and let a spurious
-            // higher-rank candidate win the evidence ladder on a better D
+            // higher-rank candidate win the BIC ladder on a better D
             // alone (the probe's rank-2 winner had a zero second column).
             for j in 0..p {
                 let mut factor_var = 0.0_f64;
@@ -368,21 +369,21 @@ impl StructuredResidualModel {
                     row_scale[i] = bin_scale[row_bin[i]];
                 }
             }
-            // Stop at the first sweep that does not improve the penalized
-            // log-evidence by more than the evidence's own rounding band: the
-            // band is the accumulation of every term the evidence sums, so an
+            // Stop at the first sweep that does not improve the BIC-penalized
+            // log-likelihood by more than the score's own rounding band: the
+            // band is the accumulation of every term the score sums, so an
             // improvement inside it is not one the arithmetic can attest to,
             // and a decrease is the smoothed, floored scale update overshooting.
             // The best state is kept either way.
-            let (evidence, band) =
-                penalized_log_evidence_with_band(r, &lambda, &diagonal, &row_scale, rank);
+            let (score, band) =
+                gaussian_bic_log_likelihood_with_band(r, &lambda, &diagonal, &row_scale, rank);
             match &best {
-                Some((best_evidence, _, _, _)) if evidence <= best_evidence + band => {
+                Some((best_score, _, _, _)) if score <= best_score + band => {
                     converged = true;
                     break;
                 }
                 _ => {
-                    best = Some((evidence, lambda.clone(), diagonal.clone(), row_scale.clone()));
+                    best = Some((score, lambda.clone(), diagonal.clone(), row_scale.clone()));
                 }
             }
         }
@@ -395,23 +396,24 @@ impl StructuredResidualModel {
         if !converged {
             return Err(format!(
                 "structured residual factor fit: the alternation was still improving the \
-                 penalized log-evidence beyond its rounding band after \
+                 BIC-penalized log-likelihood beyond its rounding band after \
                  {ALTERNATION_MAX_SWEEPS} sweeps (rank {rank}, p {p}, n {n})"
             ));
         }
         let (lambda, diagonal, row_scale) = (best_lambda, best_diagonal, best_row_scale);
 
-        let log_evidence = penalized_log_evidence(r, &lambda, &diagonal, &row_scale, rank);
+        let bic_penalized_log_likelihood =
+            gaussian_bic_log_likelihood(r, &lambda, &diagonal, &row_scale, rank);
         let mut model = Self {
             p,
             factor_rank: rank,
             lambda,
             diagonal,
             row_scale,
-            log_evidence,
+            bic_penalized_log_likelihood,
         };
         // Guard against any non-finite leak from a degenerate fit: fall back to a
-        // pure-diagonal model with the same evidence accounting.
+        // pure-diagonal model with the same score accounting.
         if !model.is_finite() {
             model.lambda = Array2::<f64>::zeros((p, rank));
             model.row_scale = Array1::<f64>::ones(n);
@@ -423,7 +425,7 @@ impl StructuredResidualModel {
         self.lambda.iter().all(|v| v.is_finite())
             && self.diagonal.iter().all(|v| v.is_finite() && *v > 0.0)
             && self.row_scale.iter().all(|v| v.is_finite() && *v > 0.0)
-            && self.log_evidence.is_finite()
+            && self.bic_penalized_log_likelihood.is_finite()
     }
 
     /// Selected factor rank `r`.
@@ -443,9 +445,12 @@ impl StructuredResidualModel {
         self.diagonal.view()
     }
 
-    /// The penalized Gaussian log-evidence the rank-selection ladder maximized.
-    pub fn log_evidence(&self) -> f64 {
-        self.log_evidence
+    /// The rank ladder's score: the Gaussian log-likelihood at the fitted
+    /// parameters minus the Schwarz penalty `½·k·log n`, i.e. `−BIC/2`. It drops
+    /// every `O(1)` prior and Fisher-determinant term, so it is not a marginal
+    /// likelihood.
+    pub fn bic_penalized_log_likelihood(&self) -> f64 {
+        self.bic_penalized_log_likelihood
     }
 
     /// #2021 Λ nursery→promotion: detect *persistent, evidence-earning* factor
@@ -575,7 +580,7 @@ impl StructuredResidualModel {
         // M0 = ΛᵀD^{-1}Λ. Only the c_n^{-1} I_r shift on the capacitance is
         // per-row, so the per-row capacitance is M_n = M0 + c_n^{-1} I_r — a
         // scalar-diagonal reweight of the SAME M0 (mirroring the Fix-B hoist in
-        // `penalized_log_evidence`). Building the n-row U_n stack now costs
+        // `gaussian_bic_log_likelihood`). Building the n-row U_n stack now costs
         // O(p·r² + n·(p·r + r³ + p³)) instead of rebuilding B and the Gram every
         // row. The summation order per row is unchanged, so the assembled U_n is
         // bit-for-bit identical to the per-row-rebuild it replaces.
@@ -761,7 +766,7 @@ impl StructuredResidualModel {
         let iid_anchor = self.isotropic_dispersion();
         // Row-INDEPENDENT outer products ΛΛᵀ (this model and, if present, prev):
         // only the per-row activity scale c(z) multiplies them, so hoist the Gram
-        // out of the per-row loop (mirroring the row_metric / penalized_log_evidence
+        // out of the per-row loop (mirroring the row_metric / gaussian_bic_log_likelihood
         // hoist).
         let self_gram = outer_product(&self.lambda);
         let prev_gram = prev.map(|pv| outer_product(&pv.lambda));
@@ -1208,32 +1213,34 @@ fn lower_cholesky_psd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         .map_err(|e| format!("lower_cholesky_psd eigen-repair: {e:?}"))
 }
 
-/// Penalized Gaussian log-evidence of the structured model at the fitted
-/// parameters — the evidence ladder's rank-selection score.
+/// BIC-penalized Gaussian log-likelihood of the structured model at the fitted
+/// parameters — the rank ladder's score.
 ///
 /// The per-row log-density of `r_n ~ N(0, Σ_n)` is
 /// `−½ ( log|Σ_n| + r_nᵀ Σ_n^{-1} r_n + p log 2π )`. We sum it across rows and
-/// subtract a parameter-count penalty `½ k_params · log n` (a BIC-style Occam
-/// term over the `p·r` factor entries + `p` diagonal entries + the bin scales),
-/// so adding a spurious factor that does not improve the fit is rejected. Both
-/// `log|Σ_n|` and the quadratic use the Woodbury / matrix-determinant lemma so no
-/// dense `p × p` inverse or determinant is formed.
-fn penalized_log_evidence(
+/// subtract the Schwarz parameter-count penalty `½ k_params · log n` (over the
+/// `p·r` factor entries + `p` diagonal entries + the bin scales), so adding a
+/// spurious factor that does not improve the fit is rejected. The result is
+/// `−BIC/2`: the leading terms of a large-sample expansion of the log marginal
+/// likelihood with every `O(1)` prior and Fisher-determinant term dropped, not the
+/// marginal likelihood itself (#2946). Both `log|Σ_n|` and the quadratic use the
+/// Woodbury / matrix-determinant lemma so no dense `p × p` inverse or determinant
+/// is formed.
+fn gaussian_bic_log_likelihood(
     r: ArrayView2<'_, f64>,
     lambda: &Array2<f64>,
     diagonal: &Array1<f64>,
     row_scale: &Array1<f64>,
     rank: usize,
 ) -> f64 {
-    penalized_log_evidence_with_band(r, lambda, diagonal, row_scale, rank).0
+    gaussian_bic_log_likelihood_with_band(r, lambda, diagonal, row_scale, rank).0
 }
 
-/// The penalized log-evidence and its rounding band: Wilkinson's growth factor
-/// for the number of floating-point operations the evidence accumulates, times
-/// the sum of the magnitudes of every term it adds, so a difference between
-/// two evidence values inside the band is not attested by the arithmetic
-/// (#2469).
-fn penalized_log_evidence_with_band(
+/// The BIC-penalized log-likelihood and its rounding band: Wilkinson's growth
+/// factor for the number of floating-point operations the score accumulates,
+/// times the sum of the magnitudes of every term it adds, so a difference between
+/// two scores inside the band is not attested by the arithmetic (#2469).
+fn gaussian_bic_log_likelihood_with_band(
     r: ArrayView2<'_, f64>,
     lambda: &Array2<f64>,
     diagonal: &Array1<f64>,
@@ -1389,7 +1396,7 @@ mod tests {
             let m = StructuredResidualModel::fit_fixed_rank(residuals.view(), &row_bin, bins, rank)
                 .expect("fixed-rank fit");
             let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
-            let log_lik = m.log_evidence() + 0.5 * k_params * (n as f64).ln();
+            let log_lik = m.bic_penalized_log_likelihood() + 0.5 * k_params * (n as f64).ln();
             let col_norms: Vec<f64> = (0..rank)
                 .map(|k| {
                     m.factor()
@@ -1401,8 +1408,8 @@ mod tests {
                 })
                 .collect();
             report.push_str(&format!(
-                "rank {rank}: evidence={:.3} loglik={:.3} penalty={:.3} col_norms={:?} diag={:?}\n",
-                m.log_evidence(),
+                "rank {rank}: score={:.3} loglik={:.3} penalty={:.3} col_norms={:?} diag={:?}\n",
+                m.bic_penalized_log_likelihood(),
                 log_lik,
                 0.5 * k_params * (n as f64).ln(),
                 col_norms,
@@ -1411,7 +1418,7 @@ mod tests {
                     .map(|v| (v * 1e4).round() / 1e4)
                     .collect::<Vec<_>>()
             ));
-            ev.push(m.log_evidence());
+            ev.push(m.bic_penalized_log_likelihood());
         }
         assert!(
             ev[1] > ev[0] && ev[1] > ev[2],
@@ -1480,9 +1487,9 @@ mod tests {
         assert_eq!(
             model.factor_rank(),
             2,
-            "ladder must select the planted rank 2 (got {}, evidence {:.3})",
+            "ladder must select the planted rank 2 (got {}, score {:.3})",
             model.factor_rank(),
-            model.log_evidence()
+            model.bic_penalized_log_likelihood()
         );
         let basis = orthonormal_columns(model.factor());
         assert_eq!(basis.len(), 2, "fitted factor must span 2 directions");
@@ -1513,10 +1520,10 @@ mod tests {
             .collect()
     }
 
-    /// Naive, pre-hoist reference for `penalized_log_evidence`: rebuilds the
+    /// Naive, pre-hoist reference for `gaussian_bic_log_likelihood`: rebuilds the
     /// row-independent Gram M0 = ΛᵀD⁻¹Λ INSIDE the per-row loop (the original
     /// formula). The production function hoists M0 out; the two must agree.
-    fn naive_penalized_log_evidence(
+    fn naive_gaussian_bic_log_likelihood(
         r: ArrayView2<'_, f64>,
         lambda: &Array2<f64>,
         diagonal: &Array1<f64>,
@@ -1628,7 +1635,7 @@ mod tests {
         coords
     }
 
-    /// FIX B equivalence: the hoisted `penalized_log_evidence` and the shared-
+    /// FIX B equivalence: the hoisted `gaussian_bic_log_likelihood` and the shared-
     /// factorization `factor_coordinates` must equal their naive per-row-rebuild
     /// references to ~1e-10 (in fact bit-for-bit — the hoist preserves op order).
     #[test]
@@ -1659,12 +1666,17 @@ mod tests {
         }
 
         let ev_hoisted =
-            penalized_log_evidence(residuals.view(), &lambda, &diagonal, &row_scale, rank);
-        let ev_naive =
-            naive_penalized_log_evidence(residuals.view(), &lambda, &diagonal, &row_scale, rank);
+            gaussian_bic_log_likelihood(residuals.view(), &lambda, &diagonal, &row_scale, rank);
+        let ev_naive = naive_gaussian_bic_log_likelihood(
+            residuals.view(),
+            &lambda,
+            &diagonal,
+            &row_scale,
+            rank,
+        );
         assert!(
             (ev_hoisted - ev_naive).abs() <= 1e-10 * (1.0 + ev_naive.abs()),
-            "hoisted log-evidence must equal naive rebuild: {ev_hoisted} vs {ev_naive}"
+            "hoisted score must equal naive rebuild: {ev_hoisted} vs {ev_naive}"
         );
 
         let coords_hoisted =

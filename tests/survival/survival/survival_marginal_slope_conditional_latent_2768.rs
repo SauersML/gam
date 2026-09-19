@@ -39,22 +39,26 @@
 //! difference. The pooled marginal gate cannot see any of it (z is exactly
 //! N(0,1)) and no monotone transform of the marginal law can remove it.
 //!
+//! A fit that anchors on the CONDITIONAL law of `z` — the default since gam#2926 —
+//! is estimating the same model: `z | x ~ N(m·x, 1−m²)` is the location-scale
+//! Gaussian law its moving-law certificate keeps here, which fits `m(x)` and
+//! `v(x)`, anchors `ζ` in closed form, and has slope `b` on that axis.
+//!
 //! # The gates
 //!
-//! Two arms of the same data, differing only in which column is handed over as
-//! the latent score: the shifted `z`, and the conditionally standardised `ζ` the
-//! outcome was actually generated from. The automatic gate exists precisely so
-//! that these two agree — so the assertions are
+//! Three arms of the same data: the default on the shifted `z`, the default on
+//! the conditionally standardised `ζ` the outcome was generated from, and the
+//! declared conditional location-scale law on `z`. The assertions are
 //!
-//!   1. the `z` arm fires the conditional location-scale gate and the `ζ` arm
-//!      does not (the gate is neither asleep nor trigger-happy);
-//!   2. both arms recover `β_x` and `b`;
-//!   3. the two arms agree with each other far more tightly than either agrees
-//!      with the uncalibrated value — this is the clause that goes red if the
-//!      gate is ever removed from the survival path again.
+//!   1. the default on `z` is certified on the location-scale Gaussian law, the
+//!      fixture's law, which calibrates `z` onto `ζ`, and the default on `ζ` on
+//!      one global law (the span test is neither asleep nor trigger-happy);
+//!   2. every arm recovers `β_x`, and the slope of its own axis;
+//!   3. the arms agree with each other far more tightly than any agrees with the
+//!      Gaussian raw-axis value — this is the clause that goes red if the
+//!      survival path ever stops anchoring on the conditional law.
 
 use csv::StringRecord;
-use gam::families::bms::LatentMeasureCalibration;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -162,7 +166,12 @@ struct ArmSummary {
     marginal_x_slope: f64,
     /// Weighted-mean fitted conditional slope on the latent score.
     mean_slope: f64,
-    calibration: &'static str,
+    /// The latent law the fit consumed.
+    law: &'static str,
+    /// Whether the fit replaced the score by a calibrated one.
+    calibrated: bool,
+    /// `D̂` of the closed-form certificate, when the adequacy screen passed.
+    excess_kl: Option<f64>,
 }
 
 fn slope_on_x(values: &Array1<f64>, x: &Array1<f64>) -> f64 {
@@ -190,12 +199,13 @@ fn slope_on_x(values: &Array1<f64>, x: &Array1<f64>) -> f64 {
 const MARGINAL_FORMULA: &str = "Surv(time, event) ~ smooth(x)";
 const SLOPE_FORMULA: &str = "smooth(x)";
 
-fn fit_arm(fixture: &Fixture, z_column: &str) -> ArmSummary {
+fn fit_arm(fixture: &Fixture, z_column: &str, latent_measure: Option<&str>) -> ArmSummary {
     let cfg = FitConfig {
         survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some(z_column.to_string()),
         slope_formula: Some(SLOPE_FORMULA.to_string()),
         baseline_target: "linear".to_string(),
+        latent_measure: latent_measure.map(str::to_string),
         ..FitConfig::default()
     };
     let result = fit_from_formula(MARGINAL_FORMULA, &fixture.dataset, &cfg)
@@ -211,27 +221,34 @@ fn fit_arm(fixture: &Fixture, z_column: &str) -> ArmSummary {
     let mean_slope = fit.baseline_slope
         + slope_eta.iter().sum::<f64>() / slope_eta.len() as f64;
 
-    let calibration = match fit
-        .latent_z_calibrations
-        .first()
-        .expect("one latent calibration per z column")
-    {
-        LatentMeasureCalibration::None => "none",
-        LatentMeasureCalibration::RankInverseNormal(_) => "rank-int",
-        LatentMeasureCalibration::ConditionalLocationScale(_) => "conditional",
-    };
-
     ArmSummary {
         marginal_x_slope: slope_on_x(&marginal_eta, &fixture.x),
         mean_slope,
-        calibration,
+        law: fit.latent_law_consumed.label(),
+        excess_kl: match &fit.latent_law_consumed {
+            gam::families::bms::LatentLawConsumed::EstimatedGaussianAdequate {
+                residual: Some(certificate),
+                ..
+            }
+            | gam::families::bms::LatentLawConsumed::EstimatedGlobalByResidual {
+                residual: certificate,
+                ..
+            } => Some(certificate.excess_kl),
+            _ => None,
+        },
+        calibrated: fit.latent_z_calibrations.first().is_some_and(|calibration| {
+            !matches!(
+                calibration,
+                gam::families::bms::LatentMeasureCalibration::None
+            )
+        }),
     }
 }
 
-/// The uncalibrated marginal x-coefficient this fixture produces when the raw
-/// `z` axis reaches the kernel — the value the survival path returned before
-/// gam#2768. Derived in the module header, not measured, so the gate is a
-/// statement about the model rather than a snapshot of an old build.
+/// The marginal x-coefficient this fixture produces when the raw `z` axis is
+/// anchored on `N(0, 1)` — the value the survival path returned before gam#2768.
+/// Derived in the module header, not measured, so the gate is a statement about
+/// the model rather than a snapshot of an old build.
 fn uncalibrated_marginal_x_slope() -> f64 {
     let c_true = (1.0 + TRUE_SLOPE * TRUE_SLOPE).sqrt();
     let residual_sd = (1.0 - M_SHIFT * M_SHIFT).sqrt();
@@ -248,51 +265,91 @@ fn survival_marginal_slope_removes_the_conditional_latent_shift() {
     gam::gpu::configure_global_policy(gam::gpu::GpuPolicy::Off);
 
     let fixture = build_fixture();
-    let shifted = fit_arm(&fixture, "z");
-    let clean = fit_arm(&fixture, "zeta");
+    let shifted = fit_arm(&fixture, "z", None);
+    let clean = fit_arm(&fixture, "zeta", None);
+    let location_scale = fit_arm(&fixture, "z", Some("conditional-location-scale"));
     let uncalibrated = uncalibrated_marginal_x_slope();
+    let raw_axis_slope = TRUE_SLOPE / (1.0 - M_SHIFT * M_SHIFT).sqrt();
 
     eprintln!(
-        "[2768] shifted: calibration={} beta_x={:.4} slope={:.4} | clean: calibration={} \
-         beta_x={:.4} slope={:.4} | truth beta_x={TRUE_BETA_X:.4} slope={TRUE_SLOPE:.4} | \
-         uncalibrated beta_x={uncalibrated:.4}",
-        shifted.calibration,
+        "[2768] default z: law={} beta_x={:.4} slope={:.4} | default zeta: law={} beta_x={:.4} \
+         slope={:.4} | location-scale z: law={} beta_x={:.4} slope={:.4} | truth \
+         beta_x={TRUE_BETA_X:.4} slope(zeta axis)={TRUE_SLOPE:.4} slope(z axis)={raw_axis_slope:.4} \
+         | gaussian on raw z beta_x={uncalibrated:.4}",
+        shifted.law,
         shifted.marginal_x_slope,
         shifted.mean_slope,
-        clean.calibration,
+        clean.law,
         clean.marginal_x_slope,
         clean.mean_slope,
+        location_scale.law,
+        location_scale.marginal_x_slope,
+        location_scale.mean_slope,
     );
 
-    // 1. The gate fires on the shifted axis and stays quiet on the clean one.
+    // 1. The conditional law moves on the shifted axis and not on the clean one.
+    //    The shifted score is location-scale with a Gaussian residual by
+    //    construction, so the moving-law certificate keeps the location-scale
+    //    Gaussian law it fits first (gam#2926 diag15: on this fixture that arm had
+    //    the lowest held-out loss and exact risk from every anchor source), which
+    //    calibrates the score onto the `ζ` axis.
     assert_eq!(
-        shifted.calibration, "conditional",
-        "the E[z|C] Rao gate must fire on a {M_SHIFT} conditional correlation at n={N}"
+        shifted.law, "estimated-location-scale-gaussian",
+        "the conditional law of z moves on the span at a {M_SHIFT} conditional correlation, n={N}"
     );
+    assert!(
+        shifted.calibrated,
+        "the location-scale Gaussian law fits m(x) on the shifted score"
+    );
+    // The law of an already conditionally standard score must not be local, and it
+    // passes the adequacy screen, so the closed form's certificate decides: a
+    // trigger-happy span test would make every clean fit local instead.
+    let Some(clean_excess_kl) = clean.excess_kl else {
+        panic!(
+            "a conditionally standard score must pass the adequacy screen and carry the closed-form \
+             certificate; got law={}",
+            clean.law
+        )
+    };
     assert_eq!(
-        clean.calibration, "none",
-        "the gate must NOT fire on a latent score that is already conditionally standard \
-         normal — a trigger-happy gate would redefine the latent axis of every clean fit"
+        clean.law,
+        if clean_excess_kl <= 0.0 {
+            "estimated-gaussian-adequate"
+        } else {
+            "estimated-global-by-residual"
+        },
+        "the clean arm's law must follow the sign of its recorded D̂ = {clean_excess_kl:.4e}"
+    );
+    assert_eq!(location_scale.law, "conditional-location-scale");
+    assert!(
+        location_scale.calibrated,
+        "the declared location-scale law must fit m(x) on this score"
     );
 
-    // 2. Both arms recover the truth.
-    for (label, arm) in [("shifted", &shifted), ("clean", &clean)] {
+    // 2. Every arm recovers the marginal index and the slope of its own axis.
+    for (label, arm, slope) in [
+        ("default z", &shifted, TRUE_SLOPE),
+        ("default zeta", &clean, TRUE_SLOPE),
+        ("location-scale z", &location_scale, TRUE_SLOPE),
+    ] {
         assert!(
             (arm.marginal_x_slope - TRUE_BETA_X).abs() < 0.06,
             "{label} arm must recover the marginal x-coefficient {TRUE_BETA_X}; got {:.4}",
             arm.marginal_x_slope
         );
         assert!(
-            (arm.mean_slope - TRUE_SLOPE).abs() < 0.08,
-            "{label} arm must recover the conditional slope {TRUE_SLOPE}; got {:.4}",
+            (arm.mean_slope - slope).abs() < 0.08,
+            "{label} arm must recover the slope of its own axis {slope:.4}; got {:.4}",
             arm.mean_slope
         );
     }
 
-    // 3. The two arms agree with each other far more tightly than either agrees
-    //    with the uncalibrated value. This is the clause that goes red if the
-    //    survival path ever stops running the gate.
-    let arm_gap = (shifted.marginal_x_slope - clean.marginal_x_slope).abs();
+    // 3. The arms agree with each other far more tightly than any agrees with
+    //    the Gaussian raw-axis value. This is the clause that goes red if the
+    //    survival path ever stops anchoring on the conditional law.
+    let arm_gap = (shifted.marginal_x_slope - clean.marginal_x_slope)
+        .abs()
+        .max((location_scale.marginal_x_slope - clean.marginal_x_slope).abs());
     let uncalibrated_gap = (clean.marginal_x_slope - uncalibrated).abs();
     assert!(
         arm_gap < 0.05,

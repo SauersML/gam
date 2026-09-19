@@ -86,7 +86,7 @@ fn age_smooth(feature_col: usize, name: &str) -> SmoothTermSpec {
                 boundary: gam::basis::OneDimensionalBoundary::Open,
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -112,7 +112,7 @@ fn pc16_duchon_smooth(name: &str) -> SmoothTermSpec {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -156,6 +156,7 @@ pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
             pc16_duchon_smooth("pc16_duchon_mean"),
             age_smooth(LARGE_SCALE_SHAPE_PC_DIM, "age_entry_std_mean"),
         ],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
@@ -164,6 +165,7 @@ pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
             pc16_duchon_smooth("pc16_duchon_slope"),
             age_smooth(LARGE_SCALE_SHAPE_PC_DIM, "age_entry_std_slope"),
         ],
+        level: Default::default(),
     };
     let dev_cfg = DeviationBlockConfig::default();
     LargeScaleShapeProblem {
@@ -182,6 +184,8 @@ pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
             link_dev: Some(dev_cfg),
             latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
             score_influence_jacobian: None,
+            residual: None,
+            declared_latent_law: None,
         },
     }
 }

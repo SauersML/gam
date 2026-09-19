@@ -1,0 +1,1 @@
+[2m 59s] [HGB] target_mse below mandatory floors; target_mse=2.439e-12 floors=3.000e-12

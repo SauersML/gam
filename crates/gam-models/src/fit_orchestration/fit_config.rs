@@ -80,14 +80,14 @@ pub fn validate_survival_baseline_config(
     Ok(())
 }
 
-/// The `latent_measure` spellings a request may carry. `None` is the automatic
-/// gate (the default policy), so the caller need not construct one.
+/// The `latent_measure` spellings a request may carry. `None` is the default
+/// estimated law (the default policy), so the caller need not construct one.
 pub(crate) fn parse_latent_measure_spec(
     value: &str,
 ) -> Result<Option<crate::bms::LatentMeasureSpec>, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok(None),
-        "standard-normal" | "standard_normal" | "gaussian" => {
+        "gaussian" | "standard-normal" | "standard_normal" => {
             Ok(Some(crate::bms::LatentMeasureSpec::StandardNormal))
         }
         "global-empirical" | "global_empirical" | "empirical" => {
@@ -95,8 +95,14 @@ pub(crate) fn parse_latent_measure_spec(
                 grid_size: crate::bms::DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
             }))
         }
+        "conditional-location-scale" | "conditional_location_scale" => {
+            Ok(Some(crate::bms::LatentMeasureSpec::ConditionalLocationScale {
+                grid_size: crate::bms::DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+            }))
+        }
         other => Err(format!(
-            "unsupported latent_measure '{other}'; use auto, standard-normal, or global-empirical"
+            "unsupported latent_measure '{other}'; use auto (the estimated law of the score, the \
+             default), gaussian, global-empirical, or conditional-location-scale"
         )),
     }
 }
@@ -179,11 +185,36 @@ impl FitConfig {
             let value = value.trim();
             (!value.is_empty()).then(|| value.to_string())
         });
+        self.resolved_expectile_levels()?;
         self.offset_column = normalize_optional_column(self.offset_column, "offset_column")?;
         self.noise_offset_column =
             normalize_optional_column(self.noise_offset_column, "noise_offset_column")?;
         self.weight_column = normalize_optional_column(self.weight_column, "weight_column")?;
         self.z_column = normalize_optional_column(self.z_column, "z_column")?;
+        self.residual_columns = normalize_residual_columns(
+            std::mem::take(&mut self.residual_columns),
+            self.z_column.as_deref(),
+        )?;
+        // The block lives inside the Bernoulli marginal-slope likelihood, which
+        // front ends select either by name or, with the family left automatic,
+        // by the score column; any other family or no score is refused rather
+        // than dropping the features on a path that never reads them.
+        if !self.residual_columns.is_empty() {
+            let names_another_family = self.family.as_deref().is_some_and(|family| {
+                let canonical = family.to_ascii_lowercase().replace('_', "-");
+                canonical != "bernoulli-marginal-slope" && canonical != "binary-marginal-slope"
+            });
+            if names_another_family
+                || self.z_column.is_none()
+                || self.survival_likelihood.as_deref() == Some("marginal-slope")
+            {
+                return Err(
+                    "residual_columns requires a Bernoulli marginal-slope fit with a z_column \
+                     (gam#2924); the survival marginal-slope family takes it once gam#2923 lands"
+                        .to_string(),
+                );
+            }
+        }
         if self.transformation_normal_config.is_some()
             && !(self.transformation_normal || self.family.as_deref() == Some("transformation-normal"))
         {
@@ -201,10 +232,8 @@ impl FitConfig {
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty());
         if self.declared_latent_law.is_some() {
-            if self.survival_likelihood.as_deref() != Some("marginal-slope") {
-                return Err(
-                    "declared_latent_law applies to survival marginal-slope fits only".to_string(),
-                );
+            if !self.requests_marginal_slope() {
+                return Err("declared_latent_law applies to marginal-slope fits only".to_string());
             }
             if self.z_column.is_none() || self.ctn_stage1.is_some() {
                 return Err(
@@ -223,13 +252,15 @@ impl FitConfig {
             self.declared_latent_law_grid()?;
         }
         if let Some(measure) = self.latent_measure.as_deref() {
-            parse_latent_measure_spec(measure)?;
+            let spec = parse_latent_measure_spec(measure)?;
             if !self.requests_marginal_slope() {
                 return Err("latent_measure applies to marginal-slope fits only".to_string());
             }
-            if self.frozen_score && measure != "standard-normal" {
+            // Compared by the law it names, so every spelling of the Gaussian
+            // declaration agrees with frozen_score.
+            if self.frozen_score && spec != Some(crate::bms::LatentMeasureSpec::StandardNormal) {
                 return Err(format!(
-                    "frozen_score pins the standard-normal latent measure; it cannot be combined with latent_measure = '{measure}'"
+                    "frozen_score declares the Gaussian latent law; it cannot be combined with latent_measure = '{measure}'"
                 ));
             }
         }
@@ -261,6 +292,82 @@ impl FitConfig {
             self.baseline_makeham,
         )?;
         Ok(self)
+    }
+
+    /// The expectile levels this config requests, if any.
+    ///
+    /// `Ok(Some(levels))` when `family` is `"expectile"` (optionally with
+    /// inline levels, `"expectile(0.9)"` or `"expectile(0.1, 0.9)"`);
+    /// `Ok(None)` for every other family with `expectile_tau` unset. The levels
+    /// are a parameter of the expectile family and never select it, so
+    /// `expectile_tau` with any other family (including an inferred one) is an
+    /// error rather than an ignored field. `Err` also when an expectile request
+    /// is malformed: a level outside `(0, 1)`, levels that are not strictly
+    /// increasing, or inline levels that contradict `expectile_tau`. When
+    /// neither spelling pins the levels, the single median level `[0.5]` (the
+    /// ordinary mean fit) is the default.
+    pub fn resolved_expectile_levels(&self) -> Result<Option<Vec<f64>>, String> {
+        let trimmed = self.family.as_deref().map(str::trim).unwrap_or("");
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower == "expectile" || lower.starts_with("expectile(")) {
+            return match &self.expectile_tau {
+                None => Ok(None),
+                Some(levels) => Err(format!(
+                    "expectile_tau = {levels:?} requires family = \"expectile\"; got family = {}",
+                    self.family
+                        .as_deref()
+                        .map_or_else(|| "auto".to_string(), |family| format!("\"{family}\""))
+                )),
+            };
+        }
+        // Optional inline levels: `expectile(0.9)` or `expectile(0.1, 0.5, 0.9)`.
+        let inline_levels = match lower.strip_prefix("expectile(") {
+            Some(rest) => {
+                let inner = rest.strip_suffix(')').ok_or_else(|| {
+                    format!(
+                        "expectile family levels must be written as `expectile(τ)` or \
+                         `expectile(τ₁, τ₂, …)`; got `{trimmed}`"
+                    )
+                })?;
+                let levels = inner
+                    .split(',')
+                    .map(|item| {
+                        item.trim().parse::<f64>().map_err(|_| {
+                            format!("expectile level `{}` is not a finite number", item.trim())
+                        })
+                    })
+                    .collect::<Result<Vec<f64>, _>>()?;
+                Some(levels)
+            }
+            None => None,
+        };
+        let levels = match (inline_levels, self.expectile_tau.clone()) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(format!(
+                    "expectile levels given both inline (`{trimmed}`) and via expectile_tau \
+                     ({b:?}); supply exactly one"
+                ));
+            }
+            (Some(a), _) => a,
+            (None, Some(b)) => b,
+            (None, None) => vec![0.5],
+        };
+        if levels.is_empty() {
+            return Err("expectile_tau must name at least one expectile level".to_string());
+        }
+        for &tau in &levels {
+            if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+                return Err(format!(
+                    "expectile level τ must be finite and strictly in (0, 1); got {tau}"
+                ));
+            }
+        }
+        if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(format!(
+                "expectile levels must be strictly increasing with no duplicates; got {levels:?}"
+            ));
+        }
+        Ok(Some(levels))
     }
 
     /// The survival likelihood mode this config resolves to for a `Surv(...)`
@@ -302,6 +409,42 @@ mod tests {
             Some("transformation")
         );
         assert_eq!(resolved.baseline_target, "linear");
+    }
+
+    /// `expectile_tau` is a parameter of the expectile family and never selects
+    /// it: with any other family it is refused rather than ignored, and `τ` is
+    /// held to the open unit interval (pyGAM audit F10).
+    #[test]
+    fn resolve_holds_expectile_tau_to_the_expectile_family_and_the_open_unit_interval() {
+        let config = |family: Option<&str>, levels: Option<&[f64]>| FitConfig {
+            family: family.map(str::to_string),
+            expectile_tau: levels.map(<[f64]>::to_vec),
+            ..FitConfig::default()
+        };
+        for family in [None, Some("auto"), Some("gaussian"), Some("poisson")] {
+            for levels in [&[0.9][..], &[0.1, 0.9]] {
+                let error = config(family, Some(levels)).resolve().unwrap_err();
+                assert!(
+                    error.contains("requires family = \"expectile\""),
+                    "{family:?} {levels:?}: {error}"
+                );
+            }
+            assert!(config(family, None).resolve().is_ok());
+        }
+        for tau in [0.0, 1.0, 1.5, -0.1, f64::NAN, f64::INFINITY] {
+            let error = config(Some("expectile"), Some(&[tau])).resolve().unwrap_err();
+            assert!(error.contains("strictly in (0, 1)"), "{tau}: {error}");
+            let error = config(Some("expectile"), Some(&[0.5, tau])).resolve().unwrap_err();
+            assert!(error.contains("strictly"), "{tau}: {error}");
+        }
+        assert!(config(Some("expectile(1.5)"), None).resolve().is_err());
+        assert!(config(Some("expectile(0.9)"), Some(&[0.8])).resolve().is_err());
+        let resolved = config(Some("Expectile"), Some(&[0.9])).resolve().unwrap();
+        assert_eq!(resolved.resolved_expectile_levels(), Ok(Some(vec![0.9])));
+        let inline = config(Some("expectile(0.25, 0.75)"), None).resolve().unwrap();
+        assert_eq!(inline.resolved_expectile_levels(), Ok(Some(vec![0.25, 0.75])));
+        let median = config(Some("expectile"), None).resolve().unwrap();
+        assert_eq!(median.resolved_expectile_levels(), Ok(Some(vec![0.5])));
     }
 
     #[test]
@@ -360,4 +503,58 @@ mod tests {
             "{refused_frozen}"
         );
     }
+
+    #[test]
+    fn resolve_admits_residual_columns_only_on_a_bernoulli_marginal_slope_request() {
+        fn request(
+            family: Option<&str>,
+            z_column: Option<&str>,
+            survival_likelihood: Option<&str>,
+        ) -> Result<FitConfig, String> {
+            FitConfig {
+                family: family.map(str::to_string),
+                z_column: z_column.map(str::to_string),
+                survival_likelihood: survival_likelihood.map(str::to_string),
+                residual_columns: vec!["r1".to_string(), "r2".to_string()],
+                ..FitConfig::default()
+            }
+            .resolve()
+        }
+        let refused = |result: Result<FitConfig, String>| {
+            result.is_err_and(|reason| reason.contains("residual_columns requires"))
+        };
+        // Front ends select the family by the score column with the family
+        // left automatic (the CLI has no family value for it), or by name.
+        assert!(request(None, Some("z"), None).is_ok());
+        assert!(request(Some("auto"), Some("z"), None).is_ok());
+        assert!(request(Some("bernoulli-marginal-slope"), Some("z"), None).is_ok());
+        assert!(refused(request(Some("binomial-probit"), Some("z"), None)));
+        assert!(refused(request(None, None, None)));
+        assert!(refused(request(None, Some("z"), Some("marginal-slope"))));
+    }
+}
+
+/// Trim, reject empties and duplicates, and keep the score out of the residual
+/// block: a residual column that IS the score would enter the drive twice.
+fn normalize_residual_columns(
+    columns: Vec<String>,
+    z_column: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(columns.len());
+    for raw in columns {
+        let name = raw.trim();
+        if name.is_empty() {
+            return Err("residual_columns contains an empty column name".to_string());
+        }
+        if out.iter().any(|existing| existing == name) {
+            return Err(format!("residual_columns names '{name}' more than once"));
+        }
+        if z_column == Some(name) {
+            return Err(format!(
+                "residual_columns names the score column '{name}'; the score enters through z_column"
+            ));
+        }
+        out.push(name.to_string());
+    }
+    Ok(out)
 }

@@ -147,7 +147,7 @@ fn gam_weibull_by_factor_recovers_per_group_baseline_level() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "Surv(time, event) ~ x + s(x, by=group) + survmodel(spec=\"transformation\", distribution=\"weibull\")",
+        "Surv(time, event) ~ x + s(x, by=group) + survmodel(spec=\"net\")",
         &ds,
         &cfg,
     )

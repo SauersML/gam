@@ -3,6 +3,8 @@
 // so `use super::*;` makes the sibling-concern symbols this module references
 // resolve through the parent namespace.
 use super::*;
+use crate::fit_orchestration::FitFailure;
+use gam_problem::FailureCategory;
 
 #[derive(Clone, Copy)]
 pub(crate) struct GamlssLambdaLayout {
@@ -203,30 +205,39 @@ fn fitted_log_lambdas(lambdas: &Array1<f64>, context: &str) -> Result<Array1<f64
         .map(Array1::from_vec)
 }
 
+/// The GAMLSS exact-joint ρ seed in `[mean | noise | extra]` penalty order: the
+/// extra coordinates take their own seeds and every penalty coordinate starts at
+/// unit strength.
+pub(crate) fn two_block_rho_seed(
+    mean_penalties: usize,
+    noise_penalties: usize,
+    extra_rho0: &[f64],
+) -> Array1<f64> {
+    let mut rho0vec = Array1::<f64>::zeros(mean_penalties + noise_penalties + extra_rho0.len());
+    for (i, &rho_init) in extra_rho0.iter().enumerate() {
+        rho0vec[mean_penalties + noise_penalties + i] = rho_init;
+    }
+    rho0vec
+}
+
 pub(crate) fn build_two_block_exact_joint_setup(
     data: ArrayView2<'_, f64>,
     meanspec: &TermCollectionSpec,
     noisespec: &TermCollectionSpec,
-    mean_penalties: usize,
-    noise_penalties: usize,
-    extra_rho0: &[f64],
-    rho0_override: Option<&Array1<f64>>,
+    rho0: Array1<f64>,
+    rho_lower: Array1<f64>,
+    rho_upper: Array1<f64>,
 ) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
-    // GAMLSS-specific part: assemble the rho seed in [mean | noise | extra]
-    // penalty order, honoring a caller override when it matches the layout.
-    let rho_dim = mean_penalties + noise_penalties + extra_rho0.len();
-    let mut rho0vec = Array1::<f64>::zeros(rho_dim);
-    if let Some(rho0) = rho0_override.filter(|rho0| rho0.len() == rho_dim) {
-        rho0vec.assign(rho0);
-    } else {
-        for (i, &rho_init) in extra_rho0.iter().enumerate() {
-            rho0vec[mean_penalties + noise_penalties + i] = rho_init;
-        }
-    }
-
-    // Generic part: per-block log(kappa) seed/bounds and exact-joint assembly,
-    // with the two linear predictors (mean, noise) in theta order.
-    build_location_scale_exact_joint_setup(data, &[meanspec, noisespec], rho0vec)
+    // Per-block log(kappa) seed/bounds and exact-joint assembly, with the two
+    // linear predictors (mean, noise) in theta order and the ρ domain the caller
+    // derived over the realized blocks.
+    build_location_scale_exact_joint_setup(
+        data,
+        &[meanspec, noisespec],
+        rho0,
+        rho_lower,
+        rho_upper,
+    )
 }
 
 pub(crate) fn gaussian_location_scalewarm_start(
@@ -1386,53 +1397,13 @@ fn finalize_binomial_mean_wiggle_saved_frame(
 
     let mut saved_inference = fit.inference.clone();
     if let Some(inference) = saved_inference.as_mut() {
-        if inference.beta_covariance.is_none() && inference.beta_standard_errors.is_some() {
+        // Standard errors published without their covariance have no saved-frame
+        // map: a diagonal does not survive the frame change.
+        if inference.factorized_standard_errors.is_some() {
             return Err(
-                "binomial mean-wiggle inference has conditional standard errors without their covariance"
+                "binomial mean-wiggle inference has standard errors without their covariance"
                     .to_string(),
             );
-        }
-        if inference.beta_covariance_corrected.is_none()
-            && inference.beta_standard_errors_corrected.is_some()
-        {
-            return Err(
-                "binomial mean-wiggle inference has corrected standard errors without their covariance"
-                    .to_string(),
-            );
-        }
-        if let Some(covariance) = inference.beta_covariance.take() {
-            let covariance = binomial_mean_wiggle_saved_covariance(
-                covariance.as_array(),
-                &saved_frame,
-                "inference conditional covariance",
-            )?;
-            if inference.beta_standard_errors.is_some() {
-                inference.beta_standard_errors = Some(
-                    gam_problem::se_from_covariance(&covariance).map_err(|reason| {
-                        format!(
-                            "binomial mean-wiggle saved conditional standard errors are invalid: {reason}"
-                        )
-                    })?,
-                );
-            }
-            inference.beta_covariance = Some(covariance.into());
-        }
-        if let Some(covariance) = inference.beta_covariance_corrected.take() {
-            let covariance = binomial_mean_wiggle_saved_covariance(
-                &covariance,
-                &saved_frame,
-                "inference corrected covariance",
-            )?;
-            if inference.beta_standard_errors_corrected.is_some() {
-                inference.beta_standard_errors_corrected = Some(
-                    gam_problem::se_from_covariance(&covariance).map_err(|reason| {
-                        format!(
-                            "binomial mean-wiggle saved corrected standard errors are invalid: {reason}"
-                        )
-                    })?,
-                );
-            }
-            inference.beta_covariance_corrected = Some(covariance);
         }
         if let Some(covariance) = inference.beta_covariance_frequentist.take() {
             inference.beta_covariance_frequentist = Some(binomial_mean_wiggle_saved_covariance(
@@ -2830,7 +2801,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
             .fold(f64::NEG_INFINITY, f64::max);
         let mean_slope =
             warp_slope.iter().map(|value| value - 1.0).sum::<f64>() / warp_slope.len() as f64;
-        log::info!(
+        log::debug!(
             "[WIGGLE-OUTER] #2748 pass {_outer}: delta={last_delta:.6e} scale={last_scale:.6e} \
              tol={:.6e} |step|={step_norm:.6e} |step_k|/|step_k-1|={step_ratio:.6e} \
              cos(step_k, step_k-1)={step_cosine:+.6} mu_hat={dominant_multiplier:+.6e} \
@@ -2868,7 +2839,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
             .chain(step.iter().copied())
             .collect();
         let (advance, advance_kind, history_reset) = mixer.advance(&residual, relaxation)?;
-        log::info!(
+        log::debug!(
             "[WIGGLE-OUTER] #2748 pass {_outer}: advance={advance_kind} |residual|={:.6e} \
              history_reset={history_reset}",
             mixer.last_residual_norm().unwrap_or(f64::NAN),
@@ -3039,14 +3010,15 @@ pub(crate) trait LocationScaleFamilyBuilder {
 
     /// Fit this builder's family over `blocks` at the caller's options. A family
     /// whose Jeffreys/Firth prior arms on evidence overrides this with
-    /// `fit_custom_family_arming_on_evidence` (#979).
+    /// `fit_custom_family_arming_on_evidence` (#979). The solver's
+    /// `CustomFamilyError` is carried whole (#2937).
     fn fit_blocks(
         &self,
         family: &Self::Family,
         blocks: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
-    ) -> Result<UnifiedFitResult, String> {
-        fit_custom_family(family, blocks, options).map_err(|error| error.to_string())
+    ) -> Result<UnifiedFitResult, FitFailure> {
+        fit_custom_family(family, blocks, options).map_err(FitFailure::from)
     }
 
     fn mean_penalty_count(&self, mean_design: &TermCollectionDesign) -> usize {
@@ -3088,7 +3060,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     builder: B,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermFitResult, String> {
+) -> Result<BlockwiseTermFitResult, FitFailure> {
     // Large-n location-scale fits keep the caller's explicit Hessian request.
     // The unified REML evaluator chooses a dense or matrix-free exact
     // representation from the realized (n, p, K) work model, so there is no
@@ -3096,17 +3068,18 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
-    let extra_rho0 = builder.extra_rho0()?;
+    // The only extra seeds are the selected link-wiggle block's, which the
+    // engine built itself, so a refusal here is an engine defect.
+    let extra_rho0 = builder
+        .extra_rho0()
+        .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
 
-    let mean_boot_design =
-        build_term_collection_design(data, builder.meanspec()).map_err(|e| e.to_string())?;
-    let noise_boot_design =
-        build_term_collection_design(data, builder.noisespec()).map_err(|e| e.to_string())?;
-    let mean_bootspec = freeze_term_collection_from_design(builder.meanspec(), &mean_boot_design)
-        .map_err(|e| e.to_string())?;
+    let mean_boot_design = build_term_collection_design(data, builder.meanspec())?;
+    let noise_boot_design = build_term_collection_design(data, builder.noisespec())?;
+    let mean_bootspec =
+        freeze_term_collection_from_design(builder.meanspec(), &mean_boot_design)?;
     let noise_bootspec =
-        freeze_term_collection_from_design(builder.noisespec(), &noise_boot_design)
-            .map_err(|e| e.to_string())?;
+        freeze_term_collection_from_design(builder.noisespec(), &noise_boot_design)?;
 
     let require_exact_spatial_joint = builder.require_exact_spatial_joint();
     let analytic_joint_derivatives_check = if builder.exact_spatial_joint_supported() {
@@ -3134,8 +3107,14 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     };
     let analytic_joint_derivatives_available = analytic_joint_derivatives_check.is_ok();
     if require_exact_spatial_joint {
+        // A family that requires the exact path declares its ψ derivatives, and
+        // they differentiate designs built above, so failing to build them is
+        // an engine defect.
         analytic_joint_derivatives_check.map_err(|err| {
-            format!("exact two-block spatial path requires analytic psi derivatives: {err}")
+            FitFailure::raised(
+                FailureCategory::Invariant,
+                format!("exact two-block spatial path requires analytic psi derivatives: {err}"),
+            )
         })?;
     }
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
@@ -3150,13 +3129,13 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     // short-circuit the Bernoulli marginal-slope entry point performs at
     // bernoulli_marginal_slope.rs:16432-16442; mirroring it here makes the
     // GAMLSS path skip straight to the `(!enabled || log_kappa_dim == 0)`
-    // fast path in `optimize_spatial_length_scale_exact_joint`.
+    // fast path in `optimize_spatial_length_scale_exact_joint_typed`.
     let mut effective_kappa_options = kappa_options.clone();
     if effective_kappa_options.enabled
         && gam_terms::smooth::all_spatial_terms_kappa_fixed(&mean_bootspec)
         && gam_terms::smooth::all_spatial_terms_kappa_fixed(&noise_bootspec)
     {
-        log::info!(
+        log::debug!(
             "[GAMLSS spatial] disabling κ/ψ optimization: every spatial term in \
              both blocks has an explicit length_scale and no anisotropy; \
              user-supplied kernel scale is fixed"
@@ -3170,16 +3149,39 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     // theta = [rho, psi] with the real joint Hessian required by NewtonTR/ARC.
     macro_rules! run_exact_joint_spatial {
         () => {{
+            let rho_seed = two_block_rho_seed(
+                mean_penalty_count,
+                noise_penalty_count,
+                extra_rho0.as_slice().unwrap_or(&[]),
+            );
+            // The blocks realized at the seed: every block that owns a ρ
+            // coordinate, the noise ridge and the link wiggle included. The
+            // family reports its capability on them, and the search takes its ρ
+            // domain from them by the #2812 law `fit_custom_family` applies to
+            // the same blocks (#2902 item 15).
+            let seed_blocks = builder
+                .build_blocks(
+                    &rho_seed,
+                    &mean_boot_design,
+                    &noise_boot_design,
+                    mean_beta_hint.clone(),
+                    noise_beta_hint.clone(),
+                )
+                .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+            let (rho_lower, rho_upper) =
+                crate::fit_orchestration::drivers::realized_blocks_rho_domain(
+                    &seed_blocks,
+                    options,
+                    rho_seed.len(),
+                )?;
             let joint_setup = build_two_block_exact_joint_setup(
                 data,
                 builder.meanspec(),
                 builder.noisespec(),
-                mean_penalty_count,
-                noise_penalty_count,
-                extra_rho0.as_slice().unwrap_or(&[]),
-                None,
-            )
-            .map_err(|error| error.to_string())?;
+                rho_seed,
+                rho_lower,
+                rho_upper,
+            )?;
             let mean_terms = spatial_length_scale_term_indices(builder.meanspec());
             let noise_terms = spatial_length_scale_term_indices(builder.noisespec());
             let mean_beta_hint_cell = std::cell::RefCell::new(mean_beta_hint.clone());
@@ -3197,46 +3199,13 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             // for hundreds of seconds before the runner falls back.
             let gamlss_disable_fixed_point = true;
             let outer_policy = {
-                // Realize the blocks at the seed rho so the family reports its
-                // capability on the realized designs.
-                let theta_seed = joint_setup.theta0();
-                let rho_dim = joint_setup.rho_dim();
-                let rho_seed = theta_seed.slice(s![..rho_dim]).to_owned();
-                let policy_blocks_res = builder.build_blocks(
-                    &rho_seed,
-                    &mean_boot_design,
-                    &noise_boot_design,
-                    mean_beta_hint_cell.borrow().clone(),
-                    noise_beta_hint_cell.borrow().clone(),
+                // The family reports its capability on the seed blocks.
+                let policy_family = builder.build_family(&mean_boot_design, &noise_boot_design);
+                let mut policy = crate::custom_family::CustomFamily::outer_derivative_policy(
+                    &policy_family,
+                    &seed_blocks,
+                    options,
                 );
-                let mut policy = match policy_blocks_res {
-                    Ok(policy_blocks) => {
-                        let policy_family =
-                            builder.build_family(&mean_boot_design, &noise_boot_design);
-                        crate::custom_family::CustomFamily::outer_derivative_policy(
-                            &policy_family,
-                            &policy_blocks,
-                            options,
-                        )
-                    }
-                    Err(err) => {
-                        // Block construction at the seed should not fail for
-                        // any in-tree family, but if it does, fall back to a
-                        // policy that names the capability honestly.
-                        log::warn!(
-                            "[GAMLSS spatial] failed to realize policy blocks at seed rho ({err}); \
-                             routing outer optimizer through gradient-only BFGS"
-                        );
-                        let capability = if analytic_joint_derivatives_available {
-                            crate::custom_family::ExactOuterDerivativeOrder::Second
-                        } else {
-                            crate::custom_family::ExactOuterDerivativeOrder::First
-                        };
-                        crate::custom_family::OuterDerivativePolicy {
-                            capability,
-                        }
-                    }
-                };
                 if !analytic_joint_derivatives_available {
                     // Capability must not exceed what the analytic derivatives
                     // path can supply — the macro's hyper evaluator returns
@@ -3246,7 +3215,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 }
                 policy
             };
-            optimize_spatial_length_scale_exact_joint(
+            optimize_spatial_length_scale_exact_joint_typed(
                 data,
                 &[builder.meanspec().clone(), builder.noisespec().clone()],
                 &[mean_terms, noise_terms],
@@ -3257,7 +3226,12 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 analytic_joint_derivatives_available,
                 gamlss_disable_fixed_point,
                 None,
+                None,
                 outer_policy,
+                // The final coefficient fit: the solver's error is carried whole
+                // (#2937). Its blocks are built from designs the engine built
+                // from a validated spec, so failing to build them, or a fit
+                // missing its own blocks, is an engine defect.
                 |theta,
                  specs: &[TermCollectionSpec],
                  designs: &[TermCollectionDesign],
@@ -3276,13 +3250,17 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     );
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {
-                        let blocks = builder.build_blocks(
-                            &rho,
-                            &designs[0],
-                            &designs[1],
-                            mean_beta_hint_cell.borrow().clone(),
-                            noise_beta_hint_cell.borrow().clone(),
-                        )?;
+                        let blocks = builder
+                            .build_blocks(
+                                &rho,
+                                &designs[0],
+                                &designs[1],
+                                mean_beta_hint_cell.borrow().clone(),
+                                noise_beta_hint_cell.borrow().clone(),
+                            )
+                            .map_err(|reason| {
+                                FitFailure::raised(FailureCategory::Invariant, reason)
+                            })?;
                         if mean_beta_hint_cell.borrow().is_none()
                             && let Some(beta) = blocks.first().and_then(|block| block.initial_beta.clone())
                         {
@@ -3307,7 +3285,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         // * Otherwise (κ disabled via the locked-κ
                         //   short-circuit, or no spatial terms at all)
                         //   the fast path in
-                        //   `optimize_spatial_length_scale_exact_joint`
+                        //   `optimize_spatial_length_scale_exact_joint_typed`
                         //   calls this closure exactly once at
                         //   `theta = theta0`; ρ must still be optimized
                         //   from data because the user never pinned it.
@@ -3320,10 +3298,10 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                             let (certified_outer, mode) = match provenance {
                                 SpatialFitProvenance::Certified { outer, mode } => (outer, mode),
                                 SpatialFitProvenance::NoOuterOptimization => {
-                                    return Err(
-                                        "active GAMLSS spatial optimization returned no certified outer provenance"
-                                            .to_string(),
-                                    );
+                                    return Err(FitFailure::raised(
+                                        FailureCategory::Invariant,
+                                        "active GAMLSS spatial optimization returned no certified outer provenance",
+                                    ));
                                 }
                             };
                             let exact_options = crate::outer_subsample::exact_outer_options(options);
@@ -3334,12 +3312,14 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                                 mode,
                                 theta,
                                 certified_outer,
-                            ).map_err(|error| error.to_string())?
+                            )?
                         } else {
                             builder.fit_blocks(&family, &blocks, options)?
                         }
                     };
-                    let (mean_beta, noise_beta) = builder.extract_primary_betas(&fit)?;
+                    let (mean_beta, noise_beta) = builder
+                        .extract_primary_betas(&fit)
+                        .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
                     mean_beta_hint = Some(mean_beta);
                     noise_beta_hint = Some(noise_beta);
                     *mean_beta_hint_cell.borrow_mut() = mean_beta_hint.clone();
@@ -3492,19 +3472,19 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     }
 
     let mut solved = run_exact_joint_spatial!()
-        .map_err(|err| format!("exact two-block spatial optimization failed: {err}"))?;
+        .map_err(|failure| failure.context("exact two-block spatial optimization failed"))?;
 
     let expected_noise_penalty_count = builder.noise_penalty_count(&solved.designs[1]);
     let actual_noise_penalty_count = solved.designs[1].penalties.len();
     if expected_noise_penalty_count > actual_noise_penalty_count {
         if expected_noise_penalty_count != actual_noise_penalty_count + 1 {
-            return Err(GamlssError::UnsupportedConfiguration {
-                reason: format!(
+            return Err(FitFailure::raised(
+                FailureCategory::Invariant,
+                format!(
                     "location-scale result noise design expected {} penalties after augmentation, got {} before augmentation",
                     expected_noise_penalty_count, actual_noise_penalty_count
                 ),
-            }
-            .into());
+            ));
         }
         append_binomial_log_sigma_shrinkage_penalty_design(&mut solved.designs[1]);
     }
@@ -3516,6 +3496,25 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         mean_design: solved.designs.remove(0),
         noise_design: solved.designs.remove(0),
     })
+    .map_err(assembly_failure)
+}
+
+/// A fit result that failed its own assembly checks (finiteness, block count,
+/// shapes against its designs): an engine defect (#2937).
+pub(crate) fn assembly_failure(reason: String) -> FitFailure {
+    FitFailure::raised(FailureCategory::Invariant, reason)
+}
+
+/// A caller's spec or data refused by this module's validators, which only
+/// check what the caller supplied (#2937).
+pub(crate) fn input_failure(reason: String) -> FitFailure {
+    FitFailure::raised(FailureCategory::Input, reason)
+}
+
+/// The requested link wiggle (its degree, knot count and penalty orders) could
+/// not be built on the pilot's predictor (#2937).
+pub(crate) fn wiggle_basis_failure(reason: String) -> FitFailure {
+    FitFailure::raised(FailureCategory::Input, reason)
 }
 
 pub(crate) struct GaussianLocationScaleTermBuilder {
@@ -3650,9 +3649,9 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         family: &Self::Family,
         blocks: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
-    ) -> Result<UnifiedFitResult, String> {
+    ) -> Result<UnifiedFitResult, FitFailure> {
         crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
-            .map_err(|error| error.to_string())
+            .map_err(FitFailure::from)
     }
 
     fn meanspec(&self) -> &TermCollectionSpec {
@@ -3744,7 +3743,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
-            cached_row_scalars: std::sync::RwLock::new(None),
             jeffreys_armed: true,
         }
     }
@@ -3807,9 +3805,9 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         family: &Self::Family,
         blocks: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
-    ) -> Result<UnifiedFitResult, String> {
+    ) -> Result<UnifiedFitResult, FitFailure> {
         crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
-            .map_err(|error| error.to_string())
+            .map_err(FitFailure::from)
     }
 
     fn meanspec(&self) -> &TermCollectionSpec {
@@ -3939,9 +3937,9 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         family: &Self::Family,
         blocks: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
-    ) -> Result<UnifiedFitResult, String> {
+    ) -> Result<UnifiedFitResult, FitFailure> {
         crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
-            .map_err(|error| error.to_string())
+            .map_err(FitFailure::from)
     }
 
     fn meanspec(&self) -> &TermCollectionSpec {
@@ -4094,8 +4092,9 @@ pub(crate) fn fit_gaussian_location_scale_terms(
     spec: GaussianLocationScaleTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermFitResult, String> {
-    validate_gaussian_location_scale_termspec(data, &spec, "fit_gaussian_location_scale_terms")?;
+) -> Result<BlockwiseTermFitResult, FitFailure> {
+    validate_gaussian_location_scale_termspec(data, &spec, "fit_gaussian_location_scale_terms")
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleTermBuilder {
@@ -4116,12 +4115,13 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
     spec: GaussianLocationScaleWiggleTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermFitResult, String> {
+) -> Result<BlockwiseTermFitResult, FitFailure> {
     validate_gaussian_location_scalewiggle_termspec(
         data,
         &spec,
         "fit_gaussian_location_scalewiggle_terms",
-    )?;
+    )
+    .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleWiggleTermBuilder {
@@ -4144,15 +4144,18 @@ pub(crate) fn select_gaussian_location_scale_link_wiggle_basis_from_pilot(
     pilot: &BlockwiseTermFitResult,
     wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
-) -> Result<SelectedWiggleBasis, String> {
+) -> Result<SelectedWiggleBasis, FitFailure> {
     let q_seed = pilot
         .fit
         .block_states
         .first()
-        .ok_or_else(|| "pilot Gaussian wiggle fit is missing mean block".to_string())?
+        .ok_or_else(|| {
+            assembly_failure("pilot Gaussian wiggle fit is missing mean block".to_string())
+        })?
         .eta
         .view();
     select_wiggle_basis_from_seed(q_seed, wiggle_cfg, wiggle_penalty_orders)
+        .map_err(wiggle_basis_failure)
 }
 
 pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
@@ -4161,7 +4164,7 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
     selected_wiggle_basis: SelectedWiggleBasis,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermWiggleFitResult, String> {
+) -> Result<BlockwiseTermWiggleFitResult, FitFailure> {
     let SelectedWiggleBasis {
         knots: wiggle_knots,
         degree: wiggle_degree,
@@ -4190,6 +4193,7 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
         wiggle_knots,
         wiggle_degree,
     })
+    .map_err(assembly_failure)
 }
 
 pub(crate) fn fit_binomial_location_scale_terms(
@@ -4197,8 +4201,9 @@ pub(crate) fn fit_binomial_location_scale_terms(
     spec: BinomialLocationScaleTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermFitResult, String> {
-    validate_binomial_location_scale_termspec(data, &spec, "fit_binomial_location_scale_terms")?;
+) -> Result<BlockwiseTermFitResult, FitFailure> {
+    validate_binomial_location_scale_termspec(data, &spec, "fit_binomial_location_scale_terms")
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         BinomialLocationScaleTermBuilder {
@@ -4220,12 +4225,13 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms(
     spec: BinomialLocationScaleWiggleTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermFitResult, String> {
+) -> Result<BlockwiseTermFitResult, FitFailure> {
     validate_binomial_location_scalewiggle_termspec(
         data,
         &spec,
         "fit_binomial_location_scalewiggle_terms",
-    )?;
+    )
+    .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         BinomialLocationScaleWiggleTermBuilder {
@@ -4249,24 +4255,25 @@ pub(crate) fn select_binomial_location_scale_link_wiggle_basis_from_pilot(
     pilot: &BlockwiseTermFitResult,
     wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
-) -> Result<SelectedWiggleBasis, String> {
+) -> Result<SelectedWiggleBasis, FitFailure> {
     let eta_t = pilot
         .fit
         .block_states
         .first()
-        .ok_or_else(|| "pilot fit is missing threshold block".to_string())?
+        .ok_or_else(|| assembly_failure("pilot fit is missing threshold block".to_string()))?
         .eta
         .view();
     let eta_ls = pilot
         .fit
         .block_states
         .get(1)
-        .ok_or_else(|| "pilot fit is missing log_sigma block".to_string())?
+        .ok_or_else(|| assembly_failure("pilot fit is missing log_sigma block".to_string()))?
         .eta
         .view();
     let sigma = eta_ls.mapv(safe_exp);
     let q_seed = Array1::from_iter(eta_t.iter().zip(sigma.iter()).map(|(&t, &s)| -t / s));
     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+        .map_err(wiggle_basis_failure)
 }
 
 pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
@@ -4275,7 +4282,7 @@ pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
     selected_wiggle_basis: SelectedWiggleBasis,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<BlockwiseTermWiggleFitResult, String> {
+) -> Result<BlockwiseTermWiggleFitResult, FitFailure> {
     let SelectedWiggleBasis {
         knots: wiggle_knots,
         degree: wiggle_degree,
@@ -4305,6 +4312,7 @@ pub(crate) fn fit_binomial_location_scale_terms_with_selected_wiggle(
         wiggle_knots,
         wiggle_degree,
     })
+    .map_err(assembly_failure)
 }
 
 pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
@@ -4312,11 +4320,12 @@ pub(crate) fn select_binomial_mean_link_wiggle_basis_from_pilot(
     pilot_fit: &UnifiedFitResult,
     wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
-) -> Result<SelectedWiggleBasis, String> {
+) -> Result<SelectedWiggleBasis, FitFailure> {
     let q_seed = pilot_design
         .apply(pilot_fit.beta.view())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| assembly_failure(error.to_string()))?;
     select_wiggle_basis_from_seed(q_seed.view(), wiggle_cfg, wiggle_penalty_orders)
+        .map_err(wiggle_basis_failure)
 }
 
 pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
@@ -4603,7 +4612,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         &baseline_design.penalties,
         rho_dim,
     );
-    log::info!(
+    log::debug!(
         "[binomial-mean-wiggle] joint rho domain per coordinate: lower={:?} upper={:?} seed={:?}",
         rho_lower.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
         rho_upper.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),

@@ -1,11 +1,13 @@
 """The quality gate must count experiments, not how many metrics they print."""
 
 import contextlib
+import csv
 import importlib.util
 import io
 import itertools
 import math
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import mock_open, patch
 
@@ -118,6 +120,29 @@ class QualityGate(unittest.TestCase):
     def test_small_panels_cannot_gain_significance_from_a_normal_approximation(self):
         self.assertEqual(gate._wilcoxon_less([-1.0] * 4), (0.0, 1 / 16))
         self.assertEqual(gate._wilcoxon_less([-1.0] * 5), (0.0, 1 / 32))
+
+    def test_outcome_tsv_reads_a_cell_longer_than_the_csv_field_limit(self):
+        # Run 35301501610: a PASS row's metric cell was 176,202 chars, past csv's
+        # 131,072 default, and the Aggregate step died reading the TSV.
+        self.addCleanup(csv.field_size_limit, csv.field_size_limit())
+        long_cell = "rmse=0.5 " * (csv.field_size_limit() // 9 + 1)
+        header = "idx\toutcome\tcause\ttest\trc\tdur_s\tsub_passed\tsub_failed\tmetric\treason\n"
+        rows = (
+            f"1\tPASS\tok\tfamilies::module::long\t0\t1\t1\t0\t{long_cell}\t\n"
+            "2\tMETRIC_OFF\tquality_metric\tfamilies::module::off\t101\t1\t0\t1\t\tmissed\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quality_results.tsv"
+            path.write_text(header + rows)
+            # Positive control: the reader the parser used before refuses this file.
+            with path.open(newline="") as handle, self.assertRaisesRegex(csv.Error, "field limit"):
+                list(csv.DictReader(handle, delimiter="\t"))
+            counts = gate._parse_outcome_tsv(str(path))
+        self.assertEqual(counts["families"]["executed"], 2)
+        self.assertEqual(counts["families"]["failed"], 1)
+        self.assertEqual(
+            counts["families"]["failed_paths"], ["METRIC_OFF/quality_metric families::module::off"]
+        )
 
     def report(self, extra="", manifest_count=40):
         body = "".join(line(f"module::case{i}") for i in range(40)) + extra

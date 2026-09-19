@@ -51,13 +51,16 @@ pub enum AnchoredPosteriorIntegration {
     /// `∂a/∂θ = −F_θ/F_a`), then `Φ(η̂/√(1 + gᵀVg))`. Exact for a linear `η(θ)`;
     /// drops the curvature of `c(b)·q` and of `a(q, b)`. This is what the
     /// posterior-mean pass reported before the exact integration existed, and
-    /// what the flexible (score-warp / link-deviation) path still reports.
+    /// what the flexible (score-warp / link-deviation) and residual repair
+    /// paths still report.
     LinearisedAnchorGaussian,
     /// Exact: `(q, b) ~ N₂((q̂, b̂), J V Jᵀ)` — exact because both are affine
     /// in `θ` — and `Φ(η(q, b))` is integrated over that bivariate law by
     /// adaptive Gauss–Hermite quadrature with the anchor re-solved at every
     /// node. Unavailable while a flexible runtime is active, where the anchor
-    /// depends on the flex coefficient vectors and not on `(q, b)` alone.
+    /// depends on the flex coefficient vectors and not on `(q, b)` alone, and
+    /// while a residual repair block is present, where the anchor reads the
+    /// whole residual coefficient vector through `b̃ᵀΣb̃` (gam#2924).
     ExactAnchor,
 }
 
@@ -65,7 +68,7 @@ impl AnchoredPosteriorIntegration {
     /// The integration the posterior-mean pass runs for `predictor`: exact
     /// wherever the anchor is a function of `(q, b)`, first-order otherwise.
     pub fn default_for(predictor: &BernoulliMarginalSlopePredictor) -> Self {
-        if predictor.has_flexible_runtime() {
+        if predictor.has_flexible_runtime() || predictor.has_residual_repair() {
             Self::LinearisedAnchorGaussian
         } else {
             Self::ExactAnchor
@@ -312,11 +315,18 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
     }
 
     fn n_blocks(&self) -> usize {
-        2 + usize::from(self.beta_score_warp.is_some()) + usize::from(self.beta_link_dev.is_some())
+        2 + usize::from(self.beta_residual.is_some())
+            + usize::from(self.beta_score_warp.is_some())
+            + usize::from(self.beta_link_dev.is_some())
     }
 
     fn block_roles(&self) -> Vec<BlockRole> {
         let mut roles = vec![BlockRole::Location, BlockRole::Scale];
+        if self.beta_residual.is_some() {
+            // The residual repair block reads the genome beside the score: a
+            // mean-model read of the outcome, not a link or scale correction.
+            roles.push(BlockRole::Mean);
+        }
         if self.beta_score_warp.is_some() {
             roles.push(BlockRole::Mean);
         }

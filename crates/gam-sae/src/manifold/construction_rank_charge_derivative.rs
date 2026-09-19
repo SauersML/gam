@@ -63,8 +63,10 @@ impl SaeManifoldTerm {
     ///
     /// #2267 — `geometry` is the spectral block the dense evaluation priced `½log|A|` on, so
     /// the dispersion's fitted-response divergence reads it instead of decomposing `A` a
-    /// second time. `None` is the streaming route, whose value routes the divergence by
-    /// admission; the dense gradient refuses to assemble without its evaluation's block.
+    /// second time, and where the value already priced the dispersion on it (#2933 F39) the
+    /// dispersion is read as priced. `None` is the streaming route, whose value routes the
+    /// divergence by admission; the dense gradient refuses to assemble without its
+    /// evaluation's block.
     pub(crate) fn production_rank_charge_derivative(
         &self,
         target: ArrayView2<'_, f64>,
@@ -74,16 +76,22 @@ impl SaeManifoldTerm {
         geometry: Option<&DenseExactAGeometry>,
     ) -> Result<ProductionRankChargeDerivative, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let residual = self.reconstruction_residual(target, rho)?;
-        let dispersion = self
-            .reconstruction_dispersion_with_geometry(
-                loss,
-                cache,
-                rho,
-                residual.view(),
-                geometry.map(|geometry| &geometry.block),
-            )?
-            .raw_output_noise_variance;
+        // #2933 F39 — the value priced this state's dispersion and left it on the geometry
+        // it handed here, so the fitted-response divergence is not formed a second time.
+        let dispersion = match geometry.and_then(|geometry| geometry.rank_charge_dispersion) {
+            Some(dispersion) => dispersion,
+            None => {
+                let residual = self.reconstruction_residual(target, rho)?;
+                self.reconstruction_dispersion_with_geometry(
+                    loss,
+                    cache,
+                    rho,
+                    residual.view(),
+                    geometry.map(|geometry| HeldResponseGeometry::FixedFrame(&geometry.block)),
+                )?
+            }
+        }
+        .raw_output_noise_variance;
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams)?;
         let n_eff = self.per_atom_effective_sample_size();

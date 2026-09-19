@@ -3409,7 +3409,12 @@ fn evaluate_non_affine_cell_with_rule<const COMPUTE_VALUE: bool>(
 /// `non_affine_cell_state_matches_prefold_reference_to_1e_minus_13` value
 /// contract without forcing every derivative-moment caller to use the terminal
 /// rung.
-const NON_AFFINE_LADDER_RTOL: f64 = 1e-15;
+///
+/// Public so a consumer can bound what the certificate admits. The certificate
+/// scales every slot by the largest one, so a cell built through a higher
+/// degree can certify a different rung and move its low moments inside this
+/// band (gam#932). The tolerance itself is not derived.
+pub const NON_AFFINE_LADDER_RTOL: f64 = 1e-15;
 
 /// Node counts of the progressive ladder below the 384-node terminal rung.
 /// All divisible by 4 so the SIMD sweep needs no scalar tail.

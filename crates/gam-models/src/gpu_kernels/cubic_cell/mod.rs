@@ -51,6 +51,9 @@ use gam_gpu::gpu_error::GpuError;
 /// * Bernoulli flex Hessian: 9
 /// * BMS outer higher-derivative reuse: 21
 /// * Survival flex Hessian (with `D_uv` cross terms): 24
+///
+/// Structural (#2469): a supported-order cap, the highest of those high-water
+/// marks; a larger request is refused, never truncated.
 // Consumed by the CUDA device dispatcher (`device`, Linux-only) and by the
 // host-substrate/ABI test oracles. Off-Linux the lib target has no caller, so
 // `-D dead-code` rejects it — the break that has been failing the macOS and

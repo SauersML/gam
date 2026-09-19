@@ -84,12 +84,12 @@ fn main() -> Result<(), String> {
         .collect();
     let lambda = vec![1.0_f64; term.k_atoms()];
     // A cold decoder leaves every `H_tt` singular (the latent Gauss-Newton block
-    // is `J' J` with `J = 0`), so drive the inner fixed point far enough that
-    // the row blocks are PD and the factorization the ladder needs exists. The
-    // cycles are the means, not the measurement.
+    // is `J' J` with `J = 0`), so drive the inner fixed point until the row blocks
+    // are PD and the factorization the ladder needs exists. The fixed point is the
+    // means, not the measurement.
     let mut term = term;
     let inner = term
-        .solve_fixed_point(centered.view(), &lambda, &ard, 40, 1.0e-4, 1.0)
+        .solve_fixed_point(centered.view(), &lambda, &ard, 1.0e-4, 1.0)
         .map(|report| format!("recurred in {}", report.iterations))
         .unwrap_or_else(|error| format!("did not recur: {}", &error[..error.len().min(60)]));
     println!("inner fixed point: {inner}");

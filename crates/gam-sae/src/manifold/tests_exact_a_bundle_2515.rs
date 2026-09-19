@@ -174,7 +174,7 @@ fn dense_and_arrow_materialize_the_same_raw_exact_a_2515() {
 /// one route, but a criterion on one route and nothing on the other.
 #[test]
 fn forced_streaming_admits_a_deflating_state_and_matches_dense_2515() {
-    // Both routes' `[SAE-CRITERION]` term lines are `log::info!`; they say which
+    // Both routes' `[SAE-CRITERION]` term lines are `log::debug!`; they say which
     // term of the value the two routes disagree on.
     gam_runtime::test_support::install_diagnostic_logger();
     let (term, rho, target, b_cache) =
@@ -303,7 +303,7 @@ fn forced_streaming_admits_a_deflating_state_and_matches_dense_2515() {
 /// throughout the era this fixes.
 #[test]
 fn forced_streaming_has_a_gradient_wherever_the_dense_route_does_2515() {
-    // Both routes' `[SAE-CRITERION]` term lines are `log::info!`.
+    // Both routes' `[SAE-CRITERION]` term lines are `log::debug!`.
     gam_runtime::test_support::install_diagnostic_logger();
     let (term, anchor_rho, target, _cache) =
         super::tests_deflated_from_probes_2712::residual_excited_deflated_anchor(

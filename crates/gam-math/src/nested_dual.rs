@@ -21,6 +21,12 @@
 //! its correctness is pinned channel-for-channel against the engine
 //! [`crate::jet_tower::Tower4`] on smooth programs (see the module tests).
 
+/// The highest derivative order any [`JetField`] carries exactly:
+/// [`JetField::compose_unary`] passes `f` and its first `JET_ORDER_CAP`
+/// derivatives, so a channel of higher order through a unary function is not
+/// formed.
+pub const JET_ORDER_CAP: usize = 4;
+
 /// Minimal scalar field a [`Dual2`] can be built over. Implemented by `f64` (the
 /// base case) and by [`Dual2`] itself (the nesting case). Every operation mirrors
 /// the [`crate::jet_tower::Tower4`] / [`crate::jet_scalar::JetScalar`] Faà di
@@ -48,7 +54,7 @@ pub trait JetField: Clone {
     /// derivative stack `d = [f(u), f′(u), f″(u), f‴(u), f⁗(u)]` evaluated at
     /// `u = self.value()` — the identical `[f64; 5]` stack shape
     /// [`crate::jet_tower::Tower4::compose_unary`] consumes.
-    fn compose_unary(&self, d: [f64; 5]) -> Self;
+    fn compose_unary(&self, d: [f64; JET_ORDER_CAP + 1]) -> Self;
 
     /// A constant carrying THIS element's shape: real value `v`, every
     /// derivative channel zero.

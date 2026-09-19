@@ -109,6 +109,12 @@ pub(crate) const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 pub(crate) const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// Row count from which `gamlss_rowwise_map` and `gamlss_rowwise_map_result` map
+/// rows on rayon workers.
+///
+/// Work bound (#2469): result-invariant. Both sides evaluate `f(i)` for every row
+/// and return the values in index order, so they are identical. When several rows
+/// fail, which row's error comes back can differ.
 pub(crate) const GAMLSS_ROWWISE_PAR_MIN_N: usize = 4096;
 
 pub(crate) const GAMLSS_PROJECTED_TRACE_TARGET_BYTES: usize = 32 * 1024 * 1024;

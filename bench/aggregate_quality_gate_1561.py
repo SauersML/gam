@@ -153,12 +153,27 @@ def _parse_outcome_tsv(path: str) -> dict[str, dict]:
     counts as a failure for attrition purposes, including REF_ERROR: a reference
     tool that could not run is still a test that produced no comparable pair,
     and the report distinguishes the causes by name.
+
+    The workflow writes one row per line with no quoting: it rewrites tabs and
+    double quotes inside every cell. So the file is read with `QUOTE_NONE`, and
+    each physical line is one row. csv refuses a field longer than
+    `csv.field_size_limit()`, 131,072 by default. Run 35301501610's `metric` cell
+    was 176,202 chars, and the whole Aggregate step died on it. The limit is
+    raised to the longest field actually in the file, measured by the same
+    tab split, so no row the writer produced is refused.
     """
+    with open(path, newline="") as handle:
+        longest = max(
+            (len(field) for line in handle for field in line.rstrip("\r\n").split("\t")),
+            default=0,
+        )
+    if longest > csv.field_size_limit():
+        csv.field_size_limit(longest)
     by_cat: dict[str, dict] = defaultdict(
         lambda: {"executed": 0, "failed": 0, "failed_paths": [], "cases": set()}
     )
     with open(path, newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
+        reader = csv.DictReader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
         for row in reader:
             test = (row.get("test") or "").strip()
             outcome = (row.get("outcome") or "").strip()

@@ -1,0 +1,8 @@
+[run] chicago_docs n=4863 poisson :: y ~ s(time, k=200) + te(o3, tmpd) + s(pm10)
+   pygam_default  ok=5/5 dev=1.7588
+   pygam_grid     ok=5/5 dev=1.3781
+   gamfit         ok=2/5 dev=1.1321  ERR=['IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain']
+[run] toy_interaction n=5000 gaussian :: y ~ te(x0, x1)
+   pygam_default  ok=5/5 truth_mse=0.060356
+   pygam_grid     ok=5/5 truth_mse=0.0027738
+   gamfit         ok=5/5 truth_mse=0.12263

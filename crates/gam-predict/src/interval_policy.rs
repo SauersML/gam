@@ -20,9 +20,9 @@
 //! behaviour cannot drift between families.
 
 use crate::{
-    InferenceCovarianceMode, PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult,
-    PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult, PredictionWithSE,
-    family_observation_band,
+    InferenceCovarianceMode, PointCovarianceProvenance, PosteriorMeanOptions, PredictInput,
+    PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
+    PredictionWithSE, family_observation_band, refuse_declined_covariance,
 };
 use gam_problem::EstimationError;
 use gam_solve::model_types::UnifiedFitResult;
@@ -719,11 +719,8 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     if options.includeobservation_interval && override_band.is_none() && observation.is_none() {
         let z = validated_central_z(options.confidence_level)?;
         let z_row = Array1::from_elem(state.mean.len(), z);
-        let eta_variance = eta_se.mapv(|standard_error| standard_error * standard_error);
         let (lower, upper) = family_observation_band(
             &response_family,
-            &state.eta,
-            &eta_variance,
             &state.mean,
             &mean_se,
             &z_row,
@@ -824,11 +821,15 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
         observation_upper: None,
         point_covariance_source: InferenceCovarianceMode::Conditional,
         uncertainty_covariance_source: None,
+        point_covariance_provenance: PointCovarianceProvenance::of_fit(fit),
     };
 
     let Some(level) = options.confidence_level else {
         return Ok(result);
     };
+    // The conditional SE above is the point's own; as an interval it would be
+    // one the fit declared inadmissible.
+    refuse_declined_covariance(fit, "posterior-mean prediction interval")?;
 
     // UNCERTAINTY: the reported SE / credible bounds / observation band honour
     // `covariance_mode` (issues #811/#812: this path previously hardwired the
@@ -922,11 +923,8 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
             // and `family_observation_band` additionally applies the skew-aware
             // Gamma predictive arm for the right-skewed positive families.
             (None, None) => {
-                let etavar = result.eta_standard_error.mapv(|s| s * s);
                 let (obs_lower, obs_upper) = family_observation_band(
                     &transform.response_family(),
-                    &result.eta,
-                    &etavar,
                     &result.mean,
                     &mean_se,
                     &z_row,
@@ -1023,6 +1021,9 @@ pub struct PredictionColumns {
     /// Covariance consulted to form the reported uncertainty. `None` for a
     /// point-only request.
     pub uncertainty_covariance_source: Option<InferenceCovarianceMode>,
+    /// What the posterior-mean point is conditional on when its covariance is not
+    /// one the fit published (gam#2985). `None` for a plug-in point.
+    pub point_covariance_provenance: Option<PointCovarianceProvenance>,
 }
 
 /// Resolve a [`PredictionRequest`] against a model: the `(interval × curved
@@ -1090,6 +1091,7 @@ pub fn resolve_prediction_request(
                 observation_upper: prediction.observation_upper,
                 point_covariance_source: Some(prediction.point_covariance_source),
                 uncertainty_covariance_source: prediction.uncertainty_covariance_source,
+                point_covariance_provenance: prediction.point_covariance_provenance,
             })
         }
         // Effectively-linear model + interval: the plug-in equals the posterior
@@ -1121,6 +1123,7 @@ pub fn resolve_prediction_request(
                 // covariance; only the band does.
                 point_covariance_source: None,
                 uncertainty_covariance_source: Some(prediction.covariance_source),
+                point_covariance_provenance: None,
             })
         }
         // Point-only. A curved link integrates the posterior mean — the only
@@ -1147,6 +1150,7 @@ pub fn resolve_prediction_request(
                 observation_upper: None,
                 point_covariance_source: Some(prediction.point_covariance_source),
                 uncertainty_covariance_source: None,
+                point_covariance_provenance: prediction.point_covariance_provenance,
             })
         }
         // Effectively linear response: the posterior mean and plug-in response
@@ -1165,6 +1169,7 @@ pub fn resolve_prediction_request(
                 observation_upper: None,
                 point_covariance_source: None,
                 uncertainty_covariance_source: None,
+                point_covariance_provenance: None,
             })
         }
     }
@@ -1434,6 +1439,7 @@ mod parity_tests {
             observation_upper: None,
             point_covariance_source: InferenceCovarianceMode::Conditional,
             uncertainty_covariance_source: None,
+            point_covariance_provenance: None,
         };
         assemble_posterior_mean_bounds(
             &mut none_result,
@@ -1465,6 +1471,7 @@ mod parity_tests {
             observation_upper: None,
             point_covariance_source: InferenceCovarianceMode::Conditional,
             uncertainty_covariance_source: None,
+            point_covariance_provenance: None,
         };
         assemble_posterior_mean_bounds(
             &mut some_result,

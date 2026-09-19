@@ -15,3 +15,6 @@ gam-problem = { path = "../gam-problem", version = "=0.3.157" }
 gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
+serde = "1.0.228"
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+thiserror = "2.0.18"

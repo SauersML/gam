@@ -78,7 +78,7 @@ fn duchon2_smooth(name: &str, centers: usize) -> SmoothTermSpec {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -141,11 +141,13 @@ fn build_margslope(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalS
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![duchon2_smooth("f_pc", centers)],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![duchon2_smooth("ls_pc", centers)],
+        level: Default::default(),
     };
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
@@ -161,6 +163,8 @@ fn build_margslope(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalS
         link_dev: None,
         latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
+        residual: None,
+        declared_latent_law: None,
     };
     (data, spec)
 }
@@ -265,6 +269,7 @@ fn duchon_gaussian_smooth_baseline_is_fast() {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![duchon2_smooth("f_pc", centers)],
+        level: Default::default(),
     };
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);

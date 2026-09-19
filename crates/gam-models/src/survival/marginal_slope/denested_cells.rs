@@ -200,18 +200,93 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
+    /// The declared finite law the flex row program anchors on at `row`, or
+    /// `None` on the Gaussian law, whose calibration the de-nested cells
+    /// integrate in closed form (gam#2948).
+    pub(crate) fn flex_law_grid(
+        &self,
+        row: Option<usize>,
+    ) -> Result<Option<AnchorGrid<'_>>, String> {
+        self.latent_law
+            .as_deref()
+            .map(|law| law.scalar_grid(row))
+            .transpose()
+    }
+
+    /// The flex calibration `F(a) = Σ_k w_k Φ(−η_k) − Φ(−q)` on a declared finite
+    /// law and its first two `a`-derivatives: the node sum that replaces the
+    /// Gaussian integral of [`Self::evaluate_denested_survival_calibration`]
+    /// (gam#2948). At node `u_k`, with `U = a + b·u_k`,
+    /// `η_k = s·(U + b·h(u_k) + w(U))` and `χ_k = ∂η_k/∂a = s·(1 + w′(U))`, so
+    /// `F_a = −Σ_k w_k φ(η_k) χ_k` and `F_aa = −Σ_k w_k φ(η_k)(s·w″(U) − η_k χ_k²)`.
+    /// `F` is summed on the smaller tail: the weights sum to one, so
+    /// `Σ_k w_k Φ(−η_k) − Φ(−q) = Φ(q) − Σ_k w_k Φ(η_k)`, the form read where `q < 0`.
+    pub(crate) fn evaluate_law_survival_calibration(
+        &self,
+        grid: AnchorGrid<'_>,
+        a: f64,
+        q: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<(f64, f64, f64), String> {
+        let scale = self.probit_frailty_scale();
+        let upper = q < 0.0;
+        let mut tail = 0.0;
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        for (&node, &weight) in grid.nodes.iter().zip(grid.weights) {
+            let score = match (self.score_warp.as_ref(), beta_h) {
+                (Some(runtime), Some(beta)) => {
+                    runtime.local_cubic_at(beta.view(), node)?.evaluate(node)
+                }
+                _ => 0.0,
+            };
+            let u = a + slope * node;
+            let (deviation, deviation_d1, deviation_d2) = match (self.link_dev.as_ref(), beta_w) {
+                (Some(runtime), Some(beta)) => {
+                    let span = runtime.local_cubic_at(beta.view(), u)?;
+                    (
+                        span.evaluate(u),
+                        span.first_derivative(u),
+                        span.second_derivative(u),
+                    )
+                }
+                _ => (0.0, 0.0, 0.0),
+            };
+            let eta = scale * (u + slope * score + deviation);
+            let chi = scale * (1.0 + deviation_d1);
+            let density = crate::probability::normal_pdf(eta);
+            tail += weight * crate::probability::normal_cdf(if upper { eta } else { -eta });
+            f_a -= weight * density * chi;
+            f_aa -= weight * density * (scale * deviation_d2 - eta * chi * chi);
+        }
+        let f = if upper {
+            crate::probability::normal_cdf(q) - tail
+        } else {
+            tail - crate::probability::normal_cdf(-q)
+        };
+        Ok((f, f_a, f_aa))
+    }
+
     pub(crate) fn evaluate_survival_denom_d(
         &self,
+        row: usize,
         a: f64,
         b: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<f64, String> {
         // Density normalization is |F'(a)| for the same calibration equation
-        // solved by `solve_row_survival_intercept`. Reusing that exact
-        // derivative convention avoids sign drift between the solver path and
-        // the direct-check path.
-        let (_, f_a, _) = self.evaluate_denested_survival_calibration(a, 0.0, b, beta_h, beta_w)?;
+        // solved by `solve_row_survival_intercept`, on the row's own law.
+        // Reusing that exact derivative convention avoids sign drift between the
+        // solver path and the direct-check path.
+        let (_, f_a, _) = match self.flex_law_grid(Some(row))? {
+            Some(grid) => {
+                self.evaluate_law_survival_calibration(grid, a, 0.0, b, beta_h, beta_w)?
+            }
+            None => self.evaluate_denested_survival_calibration(a, 0.0, b, beta_h, beta_w)?,
+        };
         let d = f_a.abs();
         if !d.is_finite() || d <= 0.0 {
             return Err(SurvivalMarginalSlopeError::NumericalFailure {

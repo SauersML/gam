@@ -375,6 +375,14 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
     );
 }
 
+/// An absent `warm_start_from` leaves every custom-family request without a cache
+/// session, so the default fit is unchanged.
+#[test]
+fn an_absent_warm_start_attaches_no_cache_session() {
+    let absent = blockwise_fit_options(&FitConfig::default());
+    assert!(absent.cache_session.is_none() && absent.warm_start.is_none());
+}
+
 /// The carrier is survival-only: a standard fit has no survival time basis to
 /// record, and must not fabricate one.
 #[test]
@@ -388,67 +396,129 @@ fn materialized_standard_fit_carries_no_survival_time_basis_2470() {
     );
 }
 
-/// #2633: `FitConfig::precompute_conformal = Some(false)` must drop the exact
-/// full-conformal substrate from the saved payload, and nothing else about the
-/// fit.
-///
-/// The substrate grows with the training rows. The knob lets a caller that
-/// keeps its training data decline it. Both arms are asserted so the test
-/// proves the FLAG is what removed it, rather than the fit having been
-/// ineligible for a substrate all along — an assertion on the off-arm alone
-/// would pass just as well against a model that never qualified.
+/// Speed F6: a saved standard GAM carries only O(p²) state and term metadata,
+/// never per-row training data, so its size does not grow with the training
+/// rows. The same formula is fit at two training sizes; the longest array
+/// anywhere in the serialized payload must be the same length at both, and the
+/// exact full-conformal field must hold only the p × p frozen penalty. Before
+/// the fix the payload persisted the training design and response for the
+/// conformal set and the final PIRLS working weights and response (twice, once
+/// under `unified` and once under `fit_result`), each of length n.
 #[test]
-fn precompute_conformal_false_drops_the_full_conformal_substrate_2633() {
+fn saved_standard_payload_carries_no_per_row_training_data() {
     use crate::inference::model_payload_builders::fit_formula_to_payload;
 
-    let td = tempdir().expect("tempdir");
-    let data_path = td.path().join("conformal_optout.csv");
-    let mut csv = String::from("y,x1,x2\n");
-    for i in 0..80u32 {
-        let t = f64::from(i) / 80.0;
-        let x1 = t * 10.0;
-        let x2 = f64::from((i * 7) % 40) / 4.0;
-        let y = (x1 * 0.7).sin() * 2.0 + (x2 * 0.4).cos();
-        csv.push_str(&format!("{y:.6},{x1:.6},{x2:.6}\n"));
+    fn longest_array(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(longest_array)
+                .max()
+                .unwrap_or(0)
+                .max(items.len()),
+            serde_json::Value::Object(fields) => {
+                fields.values().map(longest_array).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
     }
-    fs::write(&data_path, csv).expect("write conformal opt-out csv");
-    let data = load_dataset_projected(
-        &data_path,
-        &["y".to_string(), "x1".to_string(), "x2".to_string()],
-    )
-    .expect("load conformal opt-out dataset");
-    // Two smooths, so the single-smooth spline-scan fast path (which produces a
-    // payload with no fit_result and therefore no substrates for an unrelated
-    // reason) is not taken.
+
+    let td = tempdir().expect("tempdir");
     let formula = "y ~ s(x1, k=6) + s(x2, k=6)".to_string();
-
-    let on = fit_formula_to_payload(formula.clone(), &data, &FitConfig::default())
-        .expect("eligible gaussian fit should materialize and fit");
-    assert!(
-        on.full_conformal.is_some(),
-        "precondition: this fit must be substrate-eligible by default, otherwise the \
-         opt-out arm below proves nothing"
-    );
-
-    let config = FitConfig {
-        precompute_conformal: Some(false),
-        ..FitConfig::default()
+    let fit_at = |n: u32| {
+        let data_path = td.path().join(format!("rows_{n}.csv"));
+        let mut csv = String::from("y,x1,x2\n");
+        for i in 0..n {
+            let t = f64::from(i) / f64::from(n);
+            let x1 = t * 10.0;
+            let x2 = f64::from((i * 7) % 40) / 4.0;
+            let y = (x1 * 0.7).sin() * 2.0 + (x2 * 0.4).cos() + 0.3 * (f64::from(i) * 1.7).sin();
+            csv.push_str(&format!("{y:.6},{x1:.6},{x2:.6}\n"));
+        }
+        fs::write(&data_path, csv).expect("write training csv");
+        let data = load_dataset_projected(
+            &data_path,
+            &["y".to_string(), "x1".to_string(), "x2".to_string()],
+        )
+        .expect("load training dataset");
+        let payload = fit_formula_to_payload(formula.clone(), &data, &FitConfig::default())
+            .expect("gaussian fit should materialize and fit");
+        serde_json::to_value(&payload).expect("payload serializes")
     };
-    let off = fit_formula_to_payload(formula, &data, &config)
-        .expect("opting out of the substrate must not affect fittability");
-    assert!(
-        off.full_conformal.is_none(),
-        "precompute_conformal=false must drop the exact full-conformal substrate"
+    let small_rows = 400u32;
+    let large_rows = 4 * small_rows;
+    let small = fit_at(small_rows);
+    let large = fit_at(large_rows);
+
+    // Two smooths, so the single-smooth spline-scan path is not taken and the
+    // payload is the standard one that carries the conformal penalty.
+    let conformal = large
+        .get("full_conformal")
+        .and_then(serde_json::Value::as_object)
+        .expect("an eligible gaussian fit persists its exact full-conformal penalty");
+    assert_eq!(
+        conformal.keys().collect::<Vec<_>>(),
+        vec!["s_lambda"],
+        "the exact full-conformal field must persist only the frozen penalty"
     );
-    // The knob is about what is PERSISTED, not about how the model was fitted.
     assert!(
-        off.unified.is_some() && off.fit_result.is_some(),
-        "opting out of the substrates must leave the fit itself on the payload"
+        longest_array(&large) < small_rows as usize,
+        "a saved standard payload must hold no array as long as the training rows \
+         (longest array {} at n={large_rows})",
+        longest_array(&large)
     );
     assert_eq!(
-        on.formula, off.formula,
-        "the knob must not disturb anything else on the payload"
+        longest_array(&small),
+        longest_array(&large),
+        "the longest array in the saved payload must not depend on the training rows"
     );
+
+    // A v28 payload of the same fit carried the per-row data this version no
+    // longer writes: the conformal training `x` and `y`, and the working PIRLS
+    // geometry under every fit geometry. It must still load.
+    fn insert_working_geometry(value: &mut serde_json::Value, rows: usize) -> usize {
+        match value {
+            serde_json::Value::Object(fields) => {
+                let mut inserted = 0;
+                if fields.contains_key("coefficient_gauge") && fields.contains_key("penalized_hessian")
+                {
+                    fields.insert(
+                        "working".to_string(),
+                        serde_json::json!({
+                            "weights": vec![1.0; rows],
+                            "working_response": vec![0.5; rows],
+                        }),
+                    );
+                    inserted += 1;
+                }
+                inserted + fields.values_mut().map(|v| insert_working_geometry(v, rows)).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().map(|v| insert_working_geometry(v, rows)).sum()
+            }
+            _ => 0,
+        }
+    }
+    let rows = large_rows as usize;
+    let mut legacy = large.clone();
+    legacy["version"] = serde_json::json!(28);
+    let p = conformal["s_lambda"]["dim"][0].as_u64().expect("s_lambda dim") as usize;
+    legacy["full_conformal"]["x"] = serde_json::to_value(Array2::<f64>::zeros((rows, p))).expect("x");
+    legacy["full_conformal"]["y"] = serde_json::to_value(ndarray::Array1::<f64>::zeros(rows)).expect("y");
+    assert!(
+        insert_working_geometry(&mut legacy, rows) > 0,
+        "the fit payload must carry a fit geometry to plant the v28 working rows in"
+    );
+    let loaded: crate::inference::model::FittedModelPayload =
+        serde_json::from_value(legacy).expect("a v28 standard payload with training rows must load");
+    let penalty = loaded
+        .full_conformal
+        .as_ref()
+        .expect("the v28 conformal field loads as the frozen penalty");
+    assert_eq!(penalty.p(), p);
+    crate::inference::model::FittedModel::from_payload(loaded)
+        .validate_for_persistence()
+        .expect("a loaded v28 standard payload passes the saved-model gate");
 }
 
 #[test]
@@ -2152,8 +2222,9 @@ fn bernoulli_marginal_slope_prune_drops_penalized_redundant_scalar_term() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
-    let mut notes = Vec::new();
+    let mut notes = crate::fit_orchestration::FitNotes::default();
     let removed = prune_unidentified_linear_terms_for_marginal_slope(
         &mut spec,
         &data,
@@ -2398,10 +2469,14 @@ fn survival_location_scale_wiggle_rejects_unsupported_inverse_link() {
         .expect("valid SAS state"),
     );
 
-    let err = match fit_survival_location_scale_model(request) {
+    // Through the fit boundary: the refusal keeps its category (#2937).
+    let err = match fit_model(FitRequest::SurvivalLocationScale(request)) {
         Ok(_) => panic!("survival link wiggle should reject unsupported inverse links"),
         Err(e) => e,
     };
+    assert_eq!(err.failure_category(), gam_problem::FailureCategory::Input, "{err}");
+    assert_eq!(err.variant_name(), "FitFailure::Input", "{err}");
+    let err = err.to_string();
 
     assert!(err.contains("survival link wiggle"));
     assert!(err.contains("does not support"));
@@ -2873,10 +2948,6 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
             .inference
             .as_mut()
             .expect("terms fit must carry an inference block");
-        inference.beta_covariance = Some(conditional.clone().into());
-        inference.beta_covariance_corrected = Some(corrected.clone());
-        inference.beta_standard_errors_corrected =
-            Some(corrected.diag().mapv(|v| v.max(0.0).sqrt()));
         inference.smoothing_correction = Some(&corrected - &conditional);
         inference.smoothing_correction_method = Some(
             gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
@@ -2904,25 +2975,6 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
         (top_corrected[[0, 0]] - corrected[[0, 0]]).abs() > 1e-12,
         "remap with s={s} must rescale the corrected covariance"
     );
-    // ...and every inference copy must land bitwise on its top-level twin,
-    // which is exactly what the predict-time revalidation requires.
-    assert_eq!(
-        inference
-            .beta_covariance
-            .as_ref()
-            .expect("inference conditional copy survives")
-            .as_array(),
-        top_conditional,
-        "inference conditional covariance must ride the raw remap bitwise (#2386)"
-    );
-    assert_eq!(
-        inference
-            .beta_covariance_corrected
-            .as_ref()
-            .expect("inference corrected copy survives"),
-        top_corrected,
-        "inference corrected covariance must ride the raw remap bitwise (#2386)"
-    );
     // The corrected decomposition Vp = Vb + C must keep holding in raw units:
     // both sides ride the same congruence, so their difference is the remapped
     // correction matrix.
@@ -2941,12 +2993,11 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
             );
         }
     }
-    // Corrected SEs are the remapped per-coordinate scale of the corrected
-    // diagonal: se_raw_i = f_i * se_i with f_i > 0, so se_raw_i^2 must equal
-    // the corrected diagonal exactly up to float regrouping.
-    let se = inference
-        .beta_standard_errors_corrected
-        .as_ref()
+    // Corrected SEs are derived from the one remapped corrected covariance, so
+    // se_raw_i^2 must equal the corrected diagonal exactly up to float
+    // regrouping.
+    let se = fit
+        .beta_standard_errors_corrected()
         .expect("corrected SEs survive");
     assert_eq!(se.len(), p);
     for i in 0..p {
@@ -3057,16 +3108,14 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         .expect("the terms fit publishes a conditional covariance");
     assert_eq!(Some(covariance_a), b.covariance_conditional.as_ref());
     assert_eq!(a.covariance_corrected, b.covariance_corrected);
-    let inf_a = a.inference.as_ref().expect("rescaled inference block");
-    let inf_b = b.inference.as_ref().expect("composed inference block");
     assert!(
-        inf_a.beta_standard_errors.is_some(),
+        a.beta_standard_errors().is_some(),
         "the terms fit publishes conditional standard errors"
     );
-    assert_eq!(inf_a.beta_standard_errors, inf_b.beta_standard_errors);
+    assert_eq!(a.beta_standard_errors(), b.beta_standard_errors());
     assert_eq!(
-        inf_a.beta_standard_errors_corrected,
-        inf_b.beta_standard_errors_corrected
+        a.beta_standard_errors_corrected(),
+        b.beta_standard_errors_corrected()
     );
 
     // Predictions on the fitted rows: each channel's linear predictor
@@ -3119,6 +3168,8 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
     // the as-solved precision on the composed section β_raw = D·β_internal + a.
     let geom_a = a.geometry.as_ref().expect("rescaled geometry");
     let geom_b = b.geometry.as_ref().expect("composed geometry");
+    let inf_a = a.inference.as_ref().expect("rescaled inference block");
+    let inf_b = b.inference.as_ref().expect("composed inference block");
     assert!(geom_a.coefficient_gauge.is_identity());
     assert!(!geom_b.coefficient_gauge.is_identity());
     assert!(
@@ -3961,8 +4012,10 @@ fn gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differ
 fn marginal_slope_base_link_accepts_only_probit() {
     let parsed = gam_terms::inference::formula_dsl::parse_formula("y ~ x + link(type=probit)")
         .expect("main formula");
-    let resolved = super::marginal_slope::resolve_marginal_slope_base_link(
+    let (resolved, _) = super::marginal_slope::resolve_marginal_slope_link(
         parsed.linkspec.as_ref(),
+        None,
+        false,
         "bernoulli marginal-slope",
     )
     .expect("explicit probit base link");
@@ -3973,11 +4026,15 @@ fn marginal_slope_base_link_accepts_only_probit() {
         "y ~ x + link(type=sas, sas_init=\"0.1,-0.2\")",
         "y ~ x + link(type=beta-logistic, beta_logistic_init=\"0.3,0.7\")",
         "y ~ x + link(type=blended(logit,probit,cloglog), rho=\"0.4,-0.1\")",
+        "y ~ x + link(type=flexible(logit))",
+        "y ~ x + link(type=log)",
     ] {
         let parsed =
             gam_terms::inference::formula_dsl::parse_formula(formula).expect("main formula");
-        let err = super::marginal_slope::resolve_marginal_slope_base_link(
+        let err = super::marginal_slope::resolve_marginal_slope_link(
             parsed.linkspec.as_ref(),
+            None,
+            false,
             "bernoulli marginal-slope",
         )
         .expect_err("non-probit marginal-slope link should be rejected");
@@ -3994,42 +4051,413 @@ fn marginal_slope_base_link_accepts_only_probit() {
     }
 }
 
+/// gam#2999: the request's `link` and `flexible_link` arguments (gamfit's `link=` and
+/// `flexible_link=`) are read, never dropped. A non-probit link named there is refused
+/// by the argument's name, and a flexible probit link, in either place, comes back as
+/// a flexible choice for the default link deviation.
 #[test]
-fn marginal_slope_base_link_rejects_flexible_and_unbounded_links() {
-    let parsed =
-        gam_terms::inference::formula_dsl::parse_formula("y ~ x + link(type=flexible(logit))")
-            .expect("main formula");
-    let err = super::marginal_slope::resolve_marginal_slope_base_link(
-        parsed.linkspec.as_ref(),
-        "bernoulli marginal-slope",
-    )
-    .expect_err("flexible link should be rejected");
-    assert!(
-        matches!(
-            err,
-            WorkflowError::MarginalSlopeLink {
-                context: "bernoulli marginal-slope",
-                refusal: MarginalSlopeLinkRefusal::Flexible,
-            }
-        ),
-        "a flexible link must be the typed flexible refusal, got {err:?}"
-    );
+fn marginal_slope_link_arguments_are_honoured_or_refused_by_name_2999() {
+    use gam_terms::inference::formula_dsl::LinkMode;
+    let resolve = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let parsed =
+            gam_terms::inference::formula_dsl::parse_formula(formula).expect("main formula");
+        super::marginal_slope::resolve_marginal_slope_link(
+            parsed.linkspec.as_ref(),
+            link,
+            flexible_link,
+            "bernoulli marginal-slope",
+        )
+    };
+    let mode = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let (base, choice) = resolve(formula, link, flexible_link)
+            .unwrap_or_else(|err| panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}"));
+        assert_eq!(base, InverseLink::Standard(StandardLink::Probit));
+        choice.map(|choice| {
+            assert_eq!(choice.link, LinkFunction::Probit);
+            matches!(choice.mode, LinkMode::Flexible)
+        })
+    };
+    assert_eq!(mode("y ~ x", None, false), None);
+    assert_eq!(mode("y ~ x", Some("probit"), false), Some(false));
+    assert_eq!(mode("y ~ x + link(type=probit)", Some("probit"), false), Some(false));
+    for (formula, link, flexible_link) in [
+        ("y ~ x", None, true),
+        ("y ~ x", Some("probit"), true),
+        ("y ~ x", Some("flexible(probit)"), false),
+        ("y ~ x + link(type=flexible(probit))", None, false),
+        ("y ~ x + link(type=probit)", None, true),
+        ("y ~ x + link(type=probit)", Some("flexible(probit)"), false),
+    ] {
+        assert_eq!(
+            mode(formula, link, flexible_link),
+            Some(true),
+            "{formula} link={link:?} flexible_link={flexible_link} must ask for the link deviation"
+        );
+    }
+    for (formula, link, flexible_link) in [
+        ("y ~ x", "logit", false),
+        ("y ~ x", "cloglog", false),
+        ("y ~ x", "sas", false),
+        ("y ~ x", "cauchit", false),
+        ("y ~ x", "flexible(logit)", false),
+        ("y ~ x", "logit", true),
+        ("y ~ x + link(type=probit)", "logit", false),
+    ] {
+        let err = resolve(formula, Some(link), flexible_link)
+            .expect_err("a non-probit link argument must be refused");
+        assert!(
+            matches!(
+                &err,
+                WorkflowError::MarginalSlopeLink {
+                    context: "bernoulli marginal-slope",
+                    refusal: MarginalSlopeLinkRefusal::NonProbitArgument { link: named },
+                } if named == link
+            ),
+            "{formula} link={link}: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&format!("the link argument names '{link}'")),
+            "the refusal must name the argument and its value: {err}"
+        );
+    }
+}
 
-    let parsed = gam_terms::inference::formula_dsl::parse_formula("y ~ x + link(type=log)")
-        .expect("main formula");
-    let err = super::marginal_slope::resolve_marginal_slope_base_link(
-        parsed.linkspec.as_ref(),
-        "bernoulli marginal-slope",
-    )
-    .expect_err("log link should be rejected");
+/// gam#2999: through materialization, `flexible_link=True` and `link="flexible(probit)"`
+/// give the Bernoulli marginal-slope fit the link deviation the formula's `linkwiggle()`
+/// gives, an explicit `linkwiggle(...)` still wins, and `link="logit"` is refused.
+#[test]
+fn bernoulli_marginal_slope_reads_the_link_arguments_2999() {
+    let data = workflow_test_dataset();
+    let link_dev = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let config = FitConfig {
+            slope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            link: link.map(str::to_string),
+            flexible_link,
+            ..FitConfig::default()
+        };
+        let materialized = materialize(formula, &data, &config).unwrap_or_else(|err| {
+            panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}")
+        });
+        let FitRequest::BernoulliMarginalSlope(request) = materialized.request else {
+            panic!("expected a Bernoulli marginal-slope request");
+        };
+        request.spec.link_dev.map(|config| format!("{config:?}"))
+    };
+    let formula_default = link_dev("event ~ bmi + linkwiggle()", None, false)
+        .expect("linkwiggle() builds the link deviation");
+    assert_eq!(link_dev("event ~ bmi", None, false), None);
+    assert_eq!(link_dev("event ~ bmi", Some("probit"), false), None);
+    for (link, flexible_link) in [(None, true), (Some("flexible(probit)"), false)] {
+        assert_eq!(
+            link_dev("event ~ bmi", link, flexible_link).as_deref(),
+            Some(formula_default.as_str()),
+            "link={link:?} flexible_link={flexible_link} must build linkwiggle()'s block"
+        );
+    }
+    let explicit = "event ~ bmi + linkwiggle(degree=3, internal_knots=9, penalty_order=\"1\")";
+    assert_eq!(
+        link_dev(explicit, None, true),
+        link_dev(explicit, None, false),
+        "an explicit linkwiggle(...) wins over flexible_link"
+    );
+    let config = FitConfig {
+        slope_formula: Some("1".to_string()),
+        z_column: Some("z".to_string()),
+        link: Some("logit".to_string()),
+        ..FitConfig::default()
+    };
+    let err = match materialize("event ~ bmi", &data, &config) {
+        Ok(_) => panic!("link=\"logit\" must be refused"),
+        Err(err) => err,
+    };
     assert!(
         matches!(
-            err,
+            &err,
             WorkflowError::MarginalSlopeLink {
                 context: "bernoulli marginal-slope",
-                refusal: MarginalSlopeLinkRefusal::NonProbit,
-            }
+                refusal: MarginalSlopeLinkRefusal::NonProbitArgument { link },
+            } if link == "logit"
         ),
-        "a log link must be the typed probit-only refusal, got {err:?}"
+        "link=\"logit\" must be the named link-argument refusal, got {err:?}"
     );
+}
+
+/// gam#2999: survival marginal-slope reads the link arguments too. Its main-formula
+/// `linkwiggle()` is its link deviation, so a flexible link builds that block, and
+/// `link="logit"` is refused by the argument's name.
+#[test]
+fn survival_marginal_slope_reads_the_link_arguments_2999() {
+    let data = workflow_test_dataset();
+    let link_dev = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let config = FitConfig {
+            survival_likelihood: Some("marginal-slope".to_string()),
+            slope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            link: link.map(str::to_string),
+            flexible_link,
+            ..FitConfig::default()
+        };
+        let materialized = materialize(formula, &data, &config).unwrap_or_else(|err| {
+            panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}")
+        });
+        let FitRequest::SurvivalMarginalSlope(request) = materialized.request else {
+            panic!("expected a survival marginal-slope request");
+        };
+        request.spec.link_dev.map(|config| format!("{config:?}"))
+    };
+    let formula = "Surv(age_entry, age_exit, event) ~ bmi";
+    let formula_default = link_dev(&format!("{formula} + linkwiggle()"), None, false)
+        .expect("linkwiggle() builds the link deviation");
+    assert_eq!(link_dev(formula, None, false), None);
+    assert_eq!(link_dev(formula, Some("probit"), false), None);
+    for (link, flexible_link) in [(None, true), (Some("flexible(probit)"), false)] {
+        assert_eq!(
+            link_dev(formula, link, flexible_link).as_deref(),
+            Some(formula_default.as_str()),
+            "link={link:?} flexible_link={flexible_link} must build linkwiggle()'s block"
+        );
+    }
+
+    let config = FitConfig {
+        survival_likelihood: Some("marginal-slope".to_string()),
+        slope_formula: Some("1".to_string()),
+        z_column: Some("z".to_string()),
+        link: Some("logit".to_string()),
+        ..FitConfig::default()
+    };
+    let err = match materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config) {
+        Ok(_) => panic!("link=\"logit\" must be refused on survival marginal-slope"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            &err,
+            WorkflowError::MarginalSlopeLink {
+                context: "survival marginal-slope",
+                refusal: MarginalSlopeLinkRefusal::NonProbitArgument { link },
+            } if link == "logit"
+        ),
+        "link=\"logit\" must be the named link-argument refusal, got {err:?}"
+    );
+}
+
+/// #2677 B0: every materialized request whose custom-family solver options come
+/// from `blockwise_fit_options` computes the conditional covariance unless the
+/// caller declines it.
+///
+/// The latent survival and latent binary requests used to spread
+/// `BlockwiseFitOptions::default()`, whose `compute_covariance` is `false`, and
+/// never read `FitConfig::compute_covariance`. `compute_joint_posterior`
+/// publishes the conditional covariance only under that flag, so a latent fit
+/// whose cone moments were available (probe 1201712: moment status
+/// `Available`) published none. Every builder the resolver serves is covered,
+/// so a builder that bypasses it shows here. Materializing these requests runs
+/// no fit (#2714 moved the latent baseline chart into the fit), so this reads
+/// the request itself.
+#[test]
+fn materialized_requests_carry_the_callers_covariance_request_2677() {
+    use crate::fit_orchestration::request::FitRequest;
+    use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
+
+    let carried = |label: &str, request: &FitRequest<'_>| match request {
+        FitRequest::SurvivalMarginalSlope(request) => request.options.compute_covariance,
+        FitRequest::LatentSurvival(request) => request.options.compute_covariance,
+        FitRequest::LatentBinary(request) => request.options.compute_covariance,
+        FitRequest::BernoulliMarginalSlope(request) => request.options.compute_covariance,
+        FitRequest::TransformationNormal(request) => request.options.compute_covariance,
+        _ => panic!("{label} must materialize its own custom-family request"),
+    };
+    let requests = [(None, true), (Some(false), false), (Some(true), true)];
+
+    let workflow = workflow_test_dataset();
+    for (label, formula, family, slope_formula, z_column) in [
+        ("bernoulli marginal-slope", "event ~ bmi", None, Some("1"), Some("z")),
+        ("transformation-normal", "bmi ~ s(age_entry, k=4)", Some("transformation-normal"), None, None),
+    ] {
+        for (requested, expected) in requests {
+            let config = FitConfig {
+                family: family.map(str::to_string),
+                slope_formula: slope_formula.map(str::to_string),
+                z_column: z_column.map(str::to_string),
+                compute_covariance: requested,
+                ..FitConfig::default()
+            };
+            let materialized = materialize(formula, &workflow, &config)
+                .unwrap_or_else(|error| panic!("{label} should materialize: {error}"));
+            assert_eq!(
+                carried(label, &materialized.request),
+                expected,
+                "#2677 B0: {label} with compute_covariance={requested:?} must carry \
+                 compute_covariance={expected} to the fit"
+            );
+        }
+    }
+
+    let td = tempdir().expect("tempdir");
+    let data_path = td.path().join("survival_covariance_request_2677.csv");
+    fs::write(
+        &data_path,
+        "entry,exit,event,x,z\n\
+         0.0,0.4,1,-0.9,0.3\n\
+         0.0,0.7,0,-0.6,-1.1\n\
+         0.0,0.9,1,-0.3,0.8\n\
+         0.0,1.2,1,-0.1,-0.4\n\
+         0.0,1.5,0,0.2,1.3\n\
+         0.0,1.8,1,0.4,-0.7\n\
+         0.0,2.2,0,0.6,0.1\n\
+         0.0,2.6,1,0.8,-1.5\n\
+         0.0,3.1,1,0.9,0.6\n\
+         0.0,3.7,0,-0.4,-0.2\n\
+         0.0,4.2,1,0.1,1.0\n\
+         0.0,4.8,0,-0.7,-0.9\n",
+    )
+    .expect("write survival covariance request csv");
+    let data = load_dataset_projected(
+        &data_path,
+        &[
+            "entry".to_string(),
+            "exit".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ],
+    )
+    .expect("load survival covariance request dataset");
+
+    for mode in ["marginal-slope", "latent", "latent-binary"] {
+        for (requested, expected) in requests {
+            let config = if mode == "marginal-slope" {
+                FitConfig {
+                    survival_likelihood: Some(mode.to_string()),
+                    z_column: Some("z".to_string()),
+                    compute_covariance: requested,
+                    ..FitConfig::default()
+                }
+            } else {
+                FitConfig {
+                    survival_likelihood: Some(mode.to_string()),
+                    baseline_target: "weibull".to_string(),
+                    frailty: FrailtySpec::HazardMultiplier {
+                        scale: FrailtyScale::Fixed { sigma: 0.5 },
+                        loading: HazardLoading::Full,
+                    },
+                    compute_covariance: requested,
+                    ..FitConfig::default()
+                }
+            };
+            let materialized = materialize("Surv(entry, exit, event) ~ x", &data, &config)
+                .unwrap_or_else(|error| panic!("{mode} should materialize: {error}"));
+            assert_eq!(
+                carried(mode, &materialized.request),
+                expected,
+                "#2677 B0: survival {mode} with compute_covariance={requested:?} must carry \
+                 compute_covariance={expected} to the fit"
+            );
+        }
+    }
+}
+
+/// #2937: a survival marginal-slope, latent or latent-binary fit refused by its
+/// own input validation raises that category through `fit_model`. All three
+/// routes handed back text, which `fit_model` recorded as
+/// `FitFailure::Unclassified`, so Python raised the bare `FitError`.
+#[test]
+fn survival_marginal_slope_and_latent_refusals_raise_their_category_2937() {
+    use crate::fit_orchestration::request::FitRequest;
+    use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
+
+    let td = tempdir().expect("tempdir");
+    let data_path = td.path().join("survival_refusal_category_2937.csv");
+    fs::write(
+        &data_path,
+        "entry,exit,event,x,z\n\
+         0.0,0.4,1,-0.9,0.3\n\
+         0.0,0.7,0,-0.6,-1.1\n\
+         0.0,0.9,1,-0.3,0.8\n\
+         0.0,1.2,1,-0.1,-0.4\n\
+         0.0,1.5,0,0.2,1.3\n\
+         0.0,1.8,1,0.4,-0.7\n\
+         0.0,2.2,0,0.6,0.1\n\
+         0.0,2.6,1,0.8,-1.5\n\
+         0.0,3.1,1,0.9,0.6\n\
+         0.0,3.7,0,-0.4,-0.2\n\
+         0.0,4.2,1,0.1,1.0\n\
+         0.0,4.8,0,-0.7,-0.9\n",
+    )
+    .expect("write survival refusal category csv");
+    let data = load_dataset_projected(
+        &data_path,
+        &[
+            "entry".to_string(),
+            "exit".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ],
+    )
+    .expect("load survival refusal category dataset");
+
+    for mode in ["marginal-slope", "latent", "latent-binary"] {
+        let config = if mode == "marginal-slope" {
+            FitConfig {
+                survival_likelihood: Some(mode.to_string()),
+                z_column: Some("z".to_string()),
+                ..FitConfig::default()
+            }
+        } else {
+            FitConfig {
+                survival_likelihood: Some(mode.to_string()),
+                baseline_target: "weibull".to_string(),
+                frailty: FrailtySpec::HazardMultiplier {
+                    scale: FrailtyScale::Fixed { sigma: 0.5 },
+                    loading: HazardLoading::Full,
+                },
+                ..FitConfig::default()
+            }
+        };
+        let mut request = materialize("Surv(entry, exit, event) ~ x", &data, &config)
+            .unwrap_or_else(|error| panic!("{mode} should materialize: {error}"))
+            .request;
+        // A negative prior weight, which each route's own validator refuses.
+        match &mut request {
+            FitRequest::SurvivalMarginalSlope(request) => request.spec.weights[0] = -1.0,
+            FitRequest::LatentSurvival(request) => request.spec.weights[0] = -1.0,
+            FitRequest::LatentBinary(request) => request.spec.weights[0] = -1.0,
+            _ => panic!("{mode} must materialize its own request"),
+        }
+        let err = match fit_model(request) {
+            Ok(_) => panic!("#2937: {mode} must refuse a negative prior weight"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.failure_category(),
+            gam_problem::FailureCategory::Input,
+            "{mode}: {err}"
+        );
+        assert_eq!(err.variant_name(), "FitFailure::Input", "{mode}: {err}");
+    }
+}
+
+/// PKG-10: one predicate names the multinomial-logit family for the CLI, the
+/// Python `fit_table` entry and the latent fitters, and the scalar resolver
+/// refuses exactly those names.
+#[test]
+fn multinomial_family_names_are_one_predicate() {
+    for name in [
+        "multinomial",
+        "Multinomial_Logit",
+        "categorical",
+        "categorical-logit",
+        "SOFTMAX",
+    ] {
+        assert!(is_multinomial_family_name(name), "{name}");
+        assert!(
+            scalar_family_from_name(name, FamilyNuisanceOverrides::default()).is_err(),
+            "{name}"
+        );
+    }
+    for name in ["binomial", "gaussian", "poisson", "ordinal", "auto"] {
+        assert!(!is_multinomial_family_name(name), "{name}");
+    }
 }

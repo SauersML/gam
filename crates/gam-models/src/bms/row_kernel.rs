@@ -26,13 +26,20 @@ use std::sync::{Mutex, OnceLock};
 type RigidThirdFull = Vec<[[[f64; 2]; 2]; 2]>;
 type RigidFourthFull = Vec<[[[[f64; 2]; 2]; 2]; 2]>;
 
-struct SharedRigidTensorStore {
+pub(super) struct SharedRigidTensorStore {
     third: Vec<(u64, Arc<RigidThirdFull>)>,
     fourth: Vec<(u64, Arc<RigidFourthFull>)>,
 }
 
 impl SharedRigidTensorStore {
     const CAPACITY: usize = 2;
+
+    pub(super) fn empty() -> Self {
+        Self {
+            third: Vec::with_capacity(Self::CAPACITY),
+            fourth: Vec::with_capacity(Self::CAPACITY),
+        }
+    }
 
     fn get_third(&self, fp: u64) -> Option<Arc<RigidThirdFull>> {
         self.third
@@ -71,12 +78,16 @@ impl SharedRigidTensorStore {
 
 fn shared_rigid_tensor_store() -> &'static Mutex<SharedRigidTensorStore> {
     static STORE: OnceLock<Mutex<SharedRigidTensorStore>> = OnceLock::new();
-    STORE.get_or_init(|| {
-        Mutex::new(SharedRigidTensorStore {
-            third: Vec::with_capacity(SharedRigidTensorStore::CAPACITY),
-            fourth: Vec::with_capacity(SharedRigidTensorStore::CAPACITY),
-        })
-    })
+    STORE.get_or_init(|| Mutex::new(SharedRigidTensorStore::empty()))
+}
+
+/// The rigid-tensor store `family` reuses from: its own search's in a parallel
+/// multistart (gnomon#2359), else the process-wide one.
+fn rigid_tensor_store(family: &BernoulliMarginalSlopeFamily) -> &Mutex<SharedRigidTensorStore> {
+    match family.search.as_deref() {
+        Some(member) => &member.rigid_tensors,
+        None => shared_rigid_tensor_store(),
+    }
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -118,6 +129,39 @@ impl BernoulliRigidRowKernel {
             slices,
             third_full_cache: gam_runtime::resource::RayonSafeOnce::new(),
             fourth_full_cache: gam_runtime::resource::RayonSafeOnce::new(),
+        }
+    }
+
+    /// The row's uncontracted third tensor: the empirical-grid closed form, or
+    /// the inherited program for the standard-normal measure (see
+    /// [`RowKernel::row_kernel`] on this kernel for why the empirical rows skip
+    /// the program).
+    fn row_third_full(&self, row: usize) -> Result<[[[f64; 2]; 2]; 2], String> {
+        match self.family.training_row_grid(row)? {
+            None => gam_math::jet_tower::program_full_tower(self, row).map(|tower| tower.t3),
+            Some(grid) => self.family.empirical_rigid_third_full_closed_form(
+                row,
+                self.family
+                    .marginal_link_map(self.block_states[0].eta[row])?,
+                self.block_states[1].eta[row],
+                &grid.nodes,
+                &grid.weights,
+            ),
+        }
+    }
+
+    /// The row's uncontracted fourth tensor, as [`Self::row_third_full`].
+    fn row_fourth_full(&self, row: usize) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
+        match self.family.training_row_grid(row)? {
+            None => gam_math::jet_tower::program_full_tower(self, row).map(|tower| tower.t4),
+            Some(grid) => self.family.empirical_rigid_fourth_full_closed_form(
+                row,
+                self.family
+                    .marginal_link_map(self.block_states[0].eta[row])?,
+                self.block_states[1].eta[row],
+                &grid.nodes,
+                &grid.weights,
+            ),
         }
     }
 
@@ -194,7 +238,7 @@ impl BernoulliRigidRowKernel {
         self.third_full_cache
             .get_or_compute(|| {
                 let fp = self.rigid_tensor_fingerprint(0xa3);
-                if let Some(hit) = shared_rigid_tensor_store()
+                if let Some(hit) = rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on third read")
                     .get_third(fp)
@@ -211,16 +255,14 @@ impl BernoulliRigidRowKernel {
                 ));
                 let built: RigidThirdFull = (0..n)
                     .into_par_iter()
-                    .map(|row| {
-                        gam_math::jet_tower::program_full_tower(self, row).map(|tower| tower.t3)
-                    })
+                    .map(|row| self.row_third_full(row))
                     .collect::<Result<Vec<_>, String>>()
                     .expect(
                         "BernoulliRigidRowKernel third-full cache build failed; \
                          per-row jet should not error at the converged β snapshot",
                     );
                 let shared = Arc::new(built);
-                shared_rigid_tensor_store()
+                rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on third write")
                     .insert_third(fp, Arc::clone(&shared));
@@ -241,7 +283,7 @@ impl BernoulliRigidRowKernel {
         self.fourth_full_cache
             .get_or_compute(|| {
                 let fp = self.rigid_tensor_fingerprint(0xa4);
-                if let Some(hit) = shared_rigid_tensor_store()
+                if let Some(hit) = rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on fourth read")
                     .get_fourth(fp)
@@ -254,16 +296,14 @@ impl BernoulliRigidRowKernel {
                 ));
                 let built: RigidFourthFull = (0..n)
                     .into_par_iter()
-                    .map(|row| {
-                        gam_math::jet_tower::program_full_tower(self, row).map(|tower| tower.t4)
-                    })
+                    .map(|row| self.row_fourth_full(row))
                     .collect::<Result<Vec<_>, String>>()
                     .expect(
                         "BernoulliRigidRowKernel fourth-full cache build failed; \
                          per-row jet should not error at the converged β snapshot",
                     );
                 let shared = Arc::new(built);
-                shared_rigid_tensor_store()
+                rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on fourth write")
                     .insert_fourth(fp, Arc::clone(&shared));
@@ -298,11 +338,7 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel {
             .family
             .marginal_link_map(self.block_states[0].eta[row])?;
         let slope = self.block_states[1].eta[row];
-        match self
-            .family
-            .latent_measure
-            .empirical_grid_for_training_row(row)?
-        {
+        match self.family.training_row_grid(row)? {
             None => rigid_standard_normal_row_nll_generic(
                 p,
                 marginal,
@@ -329,6 +365,35 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel {
 impl RowKernel<2> for BernoulliRigidRowKernel {
     fn n_coefficients(&self) -> usize {
         self.slices.total
+    }
+
+    /// Empirical-grid rows read value, score and curvature off the closed form
+    /// every rigid evaluation shares (`empirical_rigid_primary_grad_hess_closed_form`,
+    /// pinned by `empirical_rigid_jet_oracle_tests` and against the inherited
+    /// program by `rigid_row_kernel_closed_form_tests`). The inherited program
+    /// compiles the FLEX row program for the row on every call: a second Newton
+    /// polish of the intercept root and one index program per grid node, only to
+    /// read its order-two channels. That compile was half the CPU of a
+    /// production-shape fit, paid once per row per joint-Newton cycle.
+    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
+        if row >= self.family.y.len() {
+            return Err(format!("BernoulliRigidRowKernel: row {row} out of range"));
+        }
+        match self.family.training_row_grid(row)? {
+            None => gam_math::jet_tower::program_row_kernel(self, row),
+            Some(grid) => {
+                let marginal = self
+                    .family
+                    .marginal_link_map(self.block_states[0].eta[row])?;
+                self.family.empirical_rigid_primary_grad_hess_closed_form(
+                    row,
+                    marginal,
+                    self.block_states[1].eta[row],
+                    &grid.nodes,
+                    &grid.weights,
+                )
+            }
+        }
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
@@ -643,7 +708,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             // identical entries.
             static DD_NOT_TAKEN_LOGGED: std::sync::Once = std::sync::Once::new();
             DD_NOT_TAKEN_LOGGED.call_once(|| {
-                log::info!(
+                log::debug!(
                     "[STAGE] BMS rigid directional_derivative BLAS-3 path NOT taken: RowSet is a \
                      subsample (generic per-row Horvitz-Thompson scatter)"
                 );
@@ -761,7 +826,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             // so an unguarded line floods the biobank fit log.
             static H_NOT_TAKEN_LOGGED: std::sync::Once = std::sync::Once::new();
             H_NOT_TAKEN_LOGGED.call_once(|| {
-                log::info!(
+                log::debug!(
                     "[STAGE] BMS rigid hessian_dense BLAS-3 path NOT taken: sparse design \
                      (marginal_sparse={marginal_sparse} slope_sparse={slope_sparse}) \
                      -> generic per-row scatter"
@@ -1041,8 +1106,9 @@ impl BernoulliRigidRowKernel {
             }
             return Ok(acc.to_dense(slices));
         }
-        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
             chunks.len(),
+            chunk_rows,
             |range| -> Result<BernoulliBlockHessianAccumulator, String> {
                 let mut acc = BernoulliBlockHessianAccumulator::new(slices);
                 for chunk in &chunks[range] {
@@ -1160,8 +1226,9 @@ impl BernoulliRigidRowKernel {
             }
             return Ok(acc.to_dense(slices));
         }
-        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
             chunks.len(),
+            chunk_rows,
             |range| -> Result<BernoulliBlockHessianAccumulator, String> {
                 let mut acc = BernoulliBlockHessianAccumulator::new(slices);
                 for chunk in &chunks[range] {
@@ -1762,5 +1829,135 @@ mod early_exit_soundness_tests {
             "a trial worse than the threshold by far more than the round-off band \
              must still early-reject"
         );
+    }
+}
+
+#[cfg(test)]
+mod rigid_row_kernel_closed_form_tests {
+    //! The rigid kernel's empirical-grid `row_kernel` and third/fourth tensors
+    //! read the closed forms the family's own rigid paths use instead of
+    //! compiling the FLEX row program for the row. Both are the same row NLL at
+    //! the same calibration root, so every channel must match the inherited
+    //! program's value, score, curvature and tensors to the 1e-9
+    //! scaled error the closed form is pinned at against its exact oracle
+    //! (`empirical_rigid_all_channels_match_independent_polynomial_932`).
+    use super::*;
+    use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_problem::{InverseLink, ParameterBlockState, StandardLink};
+    use ndarray::{Array1, Array2};
+
+    /// A skewed, heavy-tailed 65-node latent law, the production grid size.
+    fn skewed_grid() -> EmpiricalZGrid {
+        let k = 65usize;
+        let nodes: Vec<f64> = (0..k)
+            .map(|i| {
+                let t = -3.0 + 6.0 * i as f64 / (k - 1) as f64;
+                t + 0.18 * (t * t - 1.0) + 0.02 * t * t * t
+            })
+            .collect();
+        let raw: Vec<f64> = (0..k)
+            .map(|i| {
+                let t = -3.0 + 6.0 * i as f64 / (k - 1) as f64;
+                (-0.5 * t * t).exp() * (1.0 + 0.3 * (1.7 * t).sin().abs())
+            })
+            .collect();
+        let total: f64 = raw.iter().sum();
+        let weights = raw.iter().map(|w| w / total).collect();
+        EmpiricalZGrid::new(nodes, weights, "rigid row-kernel closed form").expect("valid grid")
+    }
+
+    fn fixture(frailty_sd: Option<f64>) -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+        let n = 48usize;
+        let marginal_x = Array2::from_shape_fn((n, 3), |(i, j)| {
+            if j == 0 { 1.0 } else { ((i * (j + 2)) as f64 * 0.31).sin() }
+        });
+        let slope_x = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 { 1.0 } else { ((i + 3 * j) as f64 * 0.23).cos() }
+        });
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        let latent_measure = LatentMeasureKind::GlobalEmpirical { grid: skewed_grid() };
+        let intercept_warm_starts = new_intercept_warm_start_cache_on_law(&latent_measure, n)
+            .expect("an intercept cache on the empirical law");
+        let family = BernoulliMarginalSlopeFamily {
+            jeffreys_armed: true,
+            residual: None,
+            search: None,
+            y: Arc::new(Array1::from_shape_fn(n, |i| if (i * 7) % 5 < 2 { 1.0 } else { 0.0 })),
+            weights: Arc::new(Array1::from_shape_fn(n, |i| 0.6 + 0.02 * i as f64)),
+            z: Arc::new(Array1::from_shape_fn(n, |i| 1.9 * (i as f64 * 0.57).sin())),
+            latent_measure,
+            gaussian_frailty_sd: frailty_sd,
+            base_link: InverseLink::Standard(StandardLink::Probit),
+            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(marginal_x.clone())),
+            slope_design: DesignMatrix::Dense(DenseDesignMatrix::from(slope_x.clone())),
+            score_warp: None,
+            link_dev: None,
+            policy: policy.clone(),
+            cell_moment_lru: new_cell_moment_lru_cache(&policy),
+            cell_moment_cache_stats: new_cell_moment_cache_stats(),
+            intercept_warm_starts: Some(intercept_warm_starts),
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        // Marginal η spans roughly ±1.6 and the slope ±0.9 across the rows.
+        let marginal_beta = Array1::from_vec(vec![-0.4, 0.9, -0.7]);
+        let slope_beta = Array1::from_vec(vec![0.35, -0.55]);
+        let states = vec![
+            ParameterBlockState { eta: marginal_x.dot(&marginal_beta), beta: marginal_beta },
+            ParameterBlockState { eta: slope_x.dot(&slope_beta), beta: slope_beta },
+        ];
+        (family, states)
+    }
+
+    fn scaled_error(actual: f64, expected: f64) -> f64 {
+        if !actual.is_finite() || !expected.is_finite() {
+            return f64::INFINITY;
+        }
+        (actual - expected).abs() / actual.abs().max(expected.abs()).max(1.0)
+    }
+
+    #[test]
+    fn empirical_row_kernel_matches_the_inherited_program_channels() {
+        let mut worst = 0.0_f64;
+        for frailty_sd in [None, Some(0.6)] {
+            let (family, states) = fixture(frailty_sd);
+            let n = family.y.len();
+            let kern = BernoulliRigidRowKernel::new(family, states);
+            for row in 0..n {
+                let (value, gradient, hessian) = kern.row_kernel(row).expect("closed-form row");
+                let (p_value, p_gradient, p_hessian) =
+                    gam_math::jet_tower::program_row_kernel(&kern, row).expect("program row");
+                let mut pairs = vec![(value, p_value)];
+                for a in 0..2 {
+                    pairs.push((gradient[a], p_gradient[a]));
+                    for b in 0..2 {
+                        pairs.push((hessian[a][b], p_hessian[a][b]));
+                    }
+                }
+                let tower = gam_math::jet_tower::program_full_tower(&kern, row).expect("program tower");
+                let third = kern.row_third_full(row).expect("closed-form third");
+                let fourth = kern.row_fourth_full(row).expect("closed-form fourth");
+                for a in 0..2 {
+                    for b in 0..2 {
+                        for c in 0..2 {
+                            pairs.push((third[a][b][c], tower.t3[a][b][c]));
+                            for d in 0..2 {
+                                pairs.push((fourth[a][b][c][d], tower.t4[a][b][c][d]));
+                            }
+                        }
+                    }
+                }
+                for (channel, (actual, expected)) in pairs.into_iter().enumerate() {
+                    let error = scaled_error(actual, expected);
+                    assert!(
+                        error <= 1e-9,
+                        "frailty={frailty_sd:?} row={row} channel={channel}: closed form {actual:.16e} \
+                         vs program {expected:.16e} (scaled error {error:.3e})"
+                    );
+                    worst = worst.max(error);
+                }
+            }
+        }
+        eprintln!("RIGID-ROW-KERNEL-CLOSED-FORM worst_scaled_error={worst:.3e}");
     }
 }

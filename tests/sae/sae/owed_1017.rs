@@ -147,18 +147,20 @@ fn matvec_dispatch_predicate_admits_sae_llm_shape_rejects_tiny() {
     let policy = GpuDispatchPolicy::default();
 
     // SAE LLM joint-fit shape: ~2000 rows, ~2048 atom border, frame depth 8.
-    // The CG budget the live gate derives from default options.
-    let options = ArrowSolveOptions::inexact_pcg();
-    let cg_iters = options
-        .pcg
-        .max_iterations
-        .min(options.trust_region.max_iterations);
+    let (n_llm, k_llm, d_llm) = (2_000usize, 2_048usize, 8usize);
+    // The CG budget the live gate reads: the dense route's price for this shape, the
+    // budget an InexactPCG request on it resolves to (#2900 row 6.15).
+    let cg_iters = gam::solver::arrow_schur::price_arrow_step(
+        &vec![d_llm; n_llm],
+        k_llm,
+        usize::MAX,
+        false,
+    )
+    .products();
     assert!(
         cg_iters >= 1,
-        "default PCG budget must launch at least one apply"
+        "the resolved PCG budget must launch at least one apply"
     );
-
-    let (n_llm, k_llm, d_llm) = (2_000usize, 2_048usize, 8usize);
     assert!(
         policy.reduced_schur_matvec_should_offload(n_llm, k_llm, d_llm, cg_iters),
         "the CG-amortised, frame-depth-aware predicate must admit the SAE LLM shape"

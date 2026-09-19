@@ -31,6 +31,7 @@ mod error;
 pub mod faer_ndarray;
 pub mod gaussian_weighted_ridge_backward;
 pub mod gpu_hook;
+pub mod gram_schmidt;
 pub mod lanczos;
 pub mod matrix;
 pub mod packed_symmetric_spectrum;

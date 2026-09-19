@@ -115,7 +115,9 @@ def test_atoms_is_an_object_surface() -> None:
     assert not isinstance(a0, dict)  # object surface, not a mapping
     assert a0.basis == golden["geometry_plans"][0]["kind"]
     assert a0.active_dim == g0["active_dim"]
-    assert a0.evidence == g0["evidence"]
+    # #2946: the per-atom evidence copy of penalized_loss_score is gone, from
+    # the payload and from the AtomCore surface.
+    assert "evidence" not in g0 and not hasattr(a0, "evidence")
     np.testing.assert_array_equal(
         a0.decoder_coefficients, np.asarray(g0["decoder_coefficients"])
     )

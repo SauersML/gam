@@ -18,7 +18,7 @@
 //! derivatives — is then generic over any `RowKernel<K>`.
 
 use crate::custom_family::{
-    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, GradientAccumulation,
     JointHessianSourcePreference, MaterializationIntent,
 };
 use crate::util::loop_progress::LoopProgress;
@@ -783,19 +783,22 @@ pub fn build_row_kernel_cache<const K: usize>(
                         let start = block_idx * block_rows;
                         let end = (start + block_rows).min(n);
                         let mut chunk = Vec::with_capacity(end - start);
+                        let mut block_progress = progress_ticker.as_ref().map(|ticker| {
+                            ticker.chunk(|progress, elapsed| {
+                                log::debug!(
+                                    "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                                    progress.min(n),
+                                    n,
+                                    100.0 * progress.min(n) as f64 / n.max(1) as f64,
+                                    elapsed,
+                                    rayon::current_num_threads(),
+                                );
+                            })
+                        });
                         for row in start..end {
                             let out = kern.row_kernel(row)?;
-                            if let Some(ticker) = progress_ticker.as_ref() {
-                                ticker.tick(1, |progress, elapsed| {
-                                    log::info!(
-                                        "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
-                                        progress.min(n),
-                                        n,
-                                        100.0 * progress.min(n) as f64 / n.max(1) as f64,
-                                        elapsed,
-                                        rayon::current_num_threads(),
-                                    );
-                                });
+                            if let Some(block_progress) = block_progress.as_mut() {
+                                block_progress.advance(1);
                             }
                             chunk.push(out);
                         }
@@ -825,19 +828,22 @@ pub fn build_row_kernel_cache<const K: usize>(
                 .par_chunks(block_rows)
                 .map(|row_chunk| {
                     let mut chunk = Vec::with_capacity(row_chunk.len());
+                    let mut block_progress = progress_ticker.as_ref().map(|ticker| {
+                        ticker.chunk(|progress, elapsed| {
+                            log::debug!(
+                                "[STAGE] row-kernel cache (subsample) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                                progress.min(total),
+                                total,
+                                100.0 * progress.min(total) as f64 / total.max(1) as f64,
+                                elapsed,
+                                rayon::current_num_threads(),
+                            );
+                        })
+                    });
                     for r in row_chunk {
                         let out = kern.row_kernel(r.index).map(|out| (r.index, out))?;
-                        if let Some(ticker) = progress_ticker.as_ref() {
-                            ticker.tick(1, |progress, elapsed| {
-                                log::info!(
-                                    "[STAGE] row-kernel cache (subsample) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
-                                    progress.min(total),
-                                    total,
-                                    100.0 * progress.min(total) as f64 / total.max(1) as f64,
-                                    elapsed,
-                                    rayon::current_num_threads(),
-                                );
-                            });
+                        if let Some(block_progress) = block_progress.as_mut() {
+                            block_progress.advance(1);
                         }
                         chunk.push(out);
                     }
@@ -983,6 +989,52 @@ pub fn row_kernel_gradient<const K: usize>(
         },
     );
     Array1::from_vec(out)
+}
+
+/// The absolute summands behind [`row_kernel_gradient`], and the depth of the
+/// reduction that sums them (#2976).
+///
+/// `absolute_sums[j]` is `Σ_i Σ_a |(Jᵢᵀ e_a)_j · w_i g_{i,a}|`: every product the
+/// adjoint action adds into coordinate `j`, in absolute value, so cancellation
+/// inside a row does not hide its rounding. The gradient's reduction folds each
+/// `ARROW_ROW_CHUNK` tile sequentially, adding up to `K` products per row into a
+/// coordinate, and then combines the tile partials in tile order, so its sequential
+/// depth is at most `K · min(rows, ARROW_ROW_CHUNK) + tiles`.
+pub fn row_kernel_gradient_accumulation<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    cache: &RowKernelCache<K>,
+    rows: &RowSet,
+) -> GradientAccumulation {
+    let p = cache.p;
+    let (absolute_sums, _scratch, row_count) = rows.par_reduce_fold(
+        cache.n,
+        || (vec![0.0_f64; p], vec![0.0_f64; p], 0_usize),
+        |(mut acc, mut product, count), row, w| {
+            let g = &cache.gradients[row];
+            for a in 0..K {
+                let mut axis = [0.0_f64; K];
+                axis[a] = w * g[a];
+                product.iter_mut().for_each(|value| *value = 0.0);
+                kern.jacobian_transpose_action(row, &axis, &mut product);
+                for (total, value) in acc.iter_mut().zip(&product) {
+                    *total += value.abs();
+                }
+            }
+            (acc, product, count + 1)
+        },
+        |(mut a, scratch, a_count), (b, _, b_count)| {
+            for (total, value) in a.iter_mut().zip(&b) {
+                *total += value;
+            }
+            (a, scratch, a_count + b_count)
+        },
+    );
+    let tile = row_count.min(gam_problem::outer_subsample::ARROW_ROW_CHUNK);
+    GradientAccumulation {
+        accumulation_depth: K * tile
+            + gam_problem::outer_subsample::arrow_row_chunk_count(row_count),
+        absolute_sums: Array1::from_vec(absolute_sums),
+    }
 }
 
 /// Log-likelihood from cached row kernels: ℓ = -Σ_i w_i · nll_i over `rows`.
@@ -1217,6 +1269,189 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
             })
         })
         .collect::<Result<Vec<_>, _>>()
+}
+
+/// Why [`all_axes_symmetric_tensor_pullback`] refused its inputs.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum AllAxesPullbackError {
+    /// `tensors` does not hold one tensor per kernel row.
+    #[error("all-axes tensor pullback: {tensors} tensors for {rows} rows")]
+    TensorRowCount { tensors: usize, rows: usize },
+    /// A row tile's `J·I` block is not `(rows in the tile) × P·p`.
+    #[error("all-axes tensor pullback: J·I tile shape {got:?}, expected {expected:?}")]
+    TileShape {
+        got: (usize, usize),
+        expected: (usize, usize),
+    },
+}
+
+/// Pull back a symmetric per-row primary third tensor along every coefficient
+/// axis: `Hdot[e_a] = Σ_i J_iᵀ T_i[J_i e_a] J_i` for every canonical axis `e_a`,
+/// with `J_i` the row's Jacobian from [`RowKernel::jacobian_action_matrix_rows`].
+/// Higher information derivatives first contract their fixed directions into
+/// `tensors`, so every order shares this one assembly. The result is
+/// bit-identical at every thread count.
+///
+/// Two contracts, which the assembly does not check:
+/// - Each `tensors[i]` must be FULLY symmetric in `(α, β, γ)`. Only one
+///   representative of each sorted index triple is formed and then mirrored, so
+///   a tensor symmetric in one pair alone comes out wrong by more than roundoff.
+/// - The identity is the whole derivative only when the primaries are affine in
+///   the coefficients, so `J_i` does not depend on them and the Hessian is
+///   exactly `Σ_i J_iᵀ H_i J_i`. Otherwise it is the pullback part alone, and the
+///   caller adds the terms carrying the primaries' own second derivatives.
+pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P> + ?Sized>(
+    kern: &R,
+    tensors: &[[[[f64; P]; P]; P]],
+) -> Result<Vec<Array2<f64>>, AllAxesPullbackError> {
+    use faer::Accum;
+    use faer::linalg::matmul::matmul;
+    use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut};
+
+    // Rows per tile: a tile's Jacobian rows and contracted weights stay
+    // cache-resident through its GEMM.
+    const ALL_AXES_PULLBACK_ROW_TILE: usize = 64;
+    // At most this many row groups, and at most this many bytes of group
+    // accumulators alive at once.
+    const ALL_AXES_PULLBACK_MAX_GROUPS: usize = 64;
+    const ALL_AXES_PULLBACK_ACCUMULATOR_BYTES: usize = 256 << 20;
+
+    let p = kern.n_coefficients();
+    let n = gam_math::jet_tower::RowProgram::n_rows(kern);
+    if tensors.len() != n {
+        return Err(AllAxesPullbackError::TensorRowCount {
+            tensors: tensors.len(),
+            rows: n,
+        });
+    }
+    // For a symmetric T_i the axis derivatives form one fully symmetric
+    // coefficient tensor
+    //
+    //   Hdot[e_a]_{jk} = D_{ajk} = Σ_i Σ_{αβγ} T_i[α][β][γ] J_i[α,a] J_i[β,j] J_i[γ,k],
+    //
+    // so only the pairs a ≤ j of its first two indices are formed. Per row,
+    // V[β][γ][a] = Σ_α T[α][β][γ] J[α,a], then W_γ[(a,j)] = Σ_β V[β][γ][a] J[β,j],
+    // and one GEMM per row tile adds Σ_{i,γ} W_iγ[(a,j)] J_i[γ,k]: 4·n·p³ flops
+    // against 20·n·p³ for ten weighted Grams per axis. Each tile's Jacobian rows
+    // are built in place from the designs, so J is never materialized and the
+    // data a GEMM reads stays in cache; the former assembly streamed two n×p
+    // blocks from memory per Gram, 20·p times per call, which left it
+    // bandwidth-bound on a full node (gnomon#2337).
+    //
+    // Tiles fold in index order inside a group, and groups sum in group order.
+    // The group count depends only on the problem shape, never on the pool
+    // width, so the result is bit-identical at every thread count.
+    let pairs = p * (p + 1) / 2;
+    let pair_offset = |a: usize| a * (2 * p - a + 1) / 2;
+    let tile = ALL_AXES_PULLBACK_ROW_TILE;
+    let n_tiles = n.div_ceil(tile);
+    let group_bytes = (pairs * p).max(1) * std::mem::size_of::<f64>();
+    let n_groups = (ALL_AXES_PULLBACK_ACCUMULATOR_BYTES / group_bytes)
+        .clamp(1, ALL_AXES_PULLBACK_MAX_GROUPS)
+        .min(n_tiles.max(1));
+    let identity = Array2::<f64>::eye(p);
+    let group_totals: Vec<Result<Array2<f64>, AllAxesPullbackError>> = (0..n_groups)
+        .into_par_iter()
+        .map(|group| {
+            let mut total = Array2::<f64>::zeros((pairs, p));
+            let mut weights = Array2::<f64>::zeros((P * tile, pairs));
+            let mut stacked = Array2::<f64>::zeros((P * tile, p));
+            let mut contracted = vec![0.0_f64; P * P * p];
+            for tile_index in group * n_tiles / n_groups..(group + 1) * n_tiles / n_groups {
+                let start = tile_index * tile;
+                let end = (start + tile).min(n);
+                let jacobian = kern.jacobian_action_matrix_rows(identity.view(), start, end);
+                if jacobian.dim() != (end - start, P * p) {
+                    return Err(AllAxesPullbackError::TileShape {
+                        got: jacobian.dim(),
+                        expected: (end - start, P * p),
+                    });
+                }
+                // Row-major slices and one pass per output entry: each sum runs over
+                // its primaries in index order from zero, as a zero-filled target
+                // accumulated one primary at a time would, with no per-segment view
+                // set-up in the inner loops.
+                let jacobian = jacobian.as_standard_layout();
+                let jacobian_flat = jacobian
+                    .as_slice()
+                    .expect("a standard-layout J·I tile is contiguous");
+                let weights_flat = weights
+                    .as_slice_mut()
+                    .expect("the owned weight buffer is contiguous");
+                let stacked_flat = stacked
+                    .as_slice_mut()
+                    .expect("the owned stacked-row buffer is contiguous");
+                for local in 0..end - start {
+                    let row = &jacobian_flat[local * P * p..][..P * p];
+                    let tensor = &tensors[start + local];
+                    let primary_rows: [&[f64]; P] =
+                        std::array::from_fn(|primary| &row[primary * p..][..p]);
+                    for beta in 0..P {
+                        for gamma in 0..P {
+                            let target = &mut contracted[(beta * P + gamma) * p..][..p];
+                            for (a, value) in target.iter_mut().enumerate() {
+                                let mut sum = 0.0;
+                                for alpha in 0..P {
+                                    sum += tensor[alpha][beta][gamma] * primary_rows[alpha][a];
+                                }
+                                *value = sum;
+                            }
+                        }
+                    }
+                    for gamma in 0..P {
+                        let stacked_row = local * P + gamma;
+                        stacked_flat[stacked_row * p..][..p].copy_from_slice(primary_rows[gamma]);
+                        let weight_row = &mut weights_flat[stacked_row * pairs..][..pairs];
+                        for a in 0..p {
+                            let len = p - a;
+                            let v: [f64; P] =
+                                std::array::from_fn(|beta| contracted[(beta * P + gamma) * p + a]);
+                            let tails: [&[f64]; P] =
+                                std::array::from_fn(|beta| &primary_rows[beta][a..][..len]);
+                            for (offset, value) in
+                                weight_row[pair_offset(a)..][..len].iter_mut().enumerate()
+                            {
+                                let mut sum = 0.0;
+                                for beta in 0..P {
+                                    sum += v[beta] * tails[beta][offset];
+                                }
+                                *value = sum;
+                            }
+                        }
+                    }
+                }
+                let used = (end - start) * P;
+                let weights_used = weights.slice(s![..used, ..]);
+                let stacked_used = stacked.slice(s![..used, ..]);
+                let weights_view = FaerArrayView::new(&weights_used);
+                let stacked_view = FaerArrayView::new(&stacked_used);
+                matmul(
+                    array2_to_matmut(&mut total),
+                    Accum::Add,
+                    weights_view.as_ref().transpose(),
+                    stacked_view.as_ref(),
+                    1.0,
+                    faer::Par::Seq,
+                );
+            }
+            Ok(total)
+        })
+        .collect();
+    let mut total = Array2::<f64>::zeros((pairs, p));
+    for group_total in group_totals {
+        total += &group_total?;
+    }
+    // Every permutation of (a, j, k) reads the one representative at sorted
+    // indices, so each axis matrix is exactly symmetric.
+    Ok((0..p)
+        .map(|a| {
+            Array2::from_shape_fn((p, p), |(j, k)| {
+                let mut index = [a, j, k];
+                index.sort_unstable();
+                total[[pair_offset(index[0]) + index[1] - index[0], index[2]]]
+            })
+        })
+        .collect())
 }
 
 /// Contracted second derivative of the Hessian against a fixed coefficient-space
@@ -2181,6 +2416,14 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         }))
     }
 
+    fn joint_gradient_accumulation(&self) -> Result<Option<GradientAccumulation>, String> {
+        Ok(Some(row_kernel_gradient_accumulation(
+            &*self.kern,
+            &self.cache,
+            &self.rows,
+        )))
+    }
+
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // The cached row-kernel state already encodes everything needed to
         // accumulate the dense joint Hessian in one row pass via
@@ -2522,6 +2765,67 @@ mod gram_inner_contraction_tests {
     }
 
     #[test]
+    fn gradient_accumulation_sums_each_rows_formed_term_in_absolute_value_2976() {
+        let (n, p) = (64, 8);
+        // The synthetic designs draw every entry from [−0.5, 0), and on this kernel
+        // every product then shares a sign within its coordinate: absolute and
+        // signed sums agreed to rounding (job 1219893). Alternating the design's sign
+        // across rows and columns gives each coordinate products of both signs.
+        let mut kernel = SyntheticKernel::new(n, p, 0x2976);
+        for design in kernel.designs.iter_mut() {
+            for ((row, column), entry) in design.indexed_iter_mut() {
+                if (row + column) % 2 == 0 {
+                    *entry = -*entry;
+                }
+            }
+        }
+        let rows = RowSet::All;
+        let cache = build_row_kernel_cache(&kernel, &rows).expect("row-kernel cache");
+        let gradient = row_kernel_gradient(&kernel, &cache, &rows);
+        let accumulation = row_kernel_gradient_accumulation(&kernel, &cache, &rows);
+        // Independent reference: every product through the four design rows, in
+        // absolute value, summed serially.
+        let mut reference = vec![0.0_f64; p];
+        for row in 0..n {
+            let g = cache.gradients[row];
+            for (j, total) in reference.iter_mut().enumerate() {
+                for (axis, design) in kernel.designs.iter().enumerate() {
+                    *total += (design[[row, j]] * g[axis]).abs();
+                }
+            }
+        }
+        // 64 rows fit one tile: four products per row, then one tile partial.
+        assert_eq!(accumulation.accumulation_depth, 4 * n + 1);
+        for (j, &expected) in reference.iter().enumerate() {
+            // Two orderings of the same non-negative products: each carries at most
+            // its own accumulation band.
+            let gap = (accumulation.absolute_sums[j] - expected).abs();
+            assert!(
+                gap <= 2.0 * gam_linalg::roundoff::accumulation_band(4 * n, expected),
+                "coordinate {j}: accumulation {} against the serial reference {expected} \
+                 (gap {gap:.3e})",
+                accumulation.absolute_sums[j]
+            );
+        }
+        // The rows cancel, so the absolute sum exceeds the assembled gradient's
+        // magnitude: a signed sum would equal it.
+        assert!(
+            (0..p).any(|j| {
+                accumulation.absolute_sums[j] - gradient[j].abs()
+                    > gam_linalg::roundoff::accumulation_band(n, accumulation.absolute_sums[j])
+            }),
+            "no coordinate's absolute sum exceeds its assembled gradient"
+        );
+        let workspace = RowKernelHessianWorkspace::new(kernel).expect("workspace");
+        let published = workspace
+            .joint_gradient_accumulation()
+            .expect("the row-kernel workspace measures its summands")
+            .expect("the row-kernel workspace publishes an accumulation");
+        assert_eq!(published.accumulation_depth, accumulation.accumulation_depth);
+        assert_eq!(published.absolute_sums, accumulation.absolute_sums);
+    }
+
+    #[test]
     fn row_kernel_workspace_routes_inner_solve_to_operator() {
         // 64 rows over 8 coefficients is a tall shape the worst-case rule priced
         // dense; the inner solve still gets the operator, so its PCG attempt can run.
@@ -2817,5 +3121,68 @@ mod gram_inner_contraction_tests {
                  identical to the per-axis loop it replaced",
             );
         }
+    }
+
+    /// #2984 — above `ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS` rows the cache build counts
+    /// its rows through per-block progress chunks. The progress count must not touch
+    /// the numerics: every cached slot holds its own row's kernel words, bit for bit,
+    /// over all rows and over a subsample, and the unsampled slots stay at zero.
+    #[test]
+    fn a_ticked_cache_build_stores_each_rows_own_kernel_words_2984() {
+        let n = 2 * ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS;
+        let kern = SyntheticKernel::new(n, 3, 0x2984);
+        let words = |value: f64, gradient: &[f64; 4], hessian: &[[f64; 4]; 4]| -> Vec<u64> {
+            std::iter::once(value)
+                .chain(gradient.iter().copied())
+                .chain(hessian.iter().flatten().copied())
+                .map(f64::to_bits)
+                .collect()
+        };
+        let own_words = |row: usize| {
+            let (value, gradient, hessian) = kern.row_kernel(row).expect("synthetic row kernel");
+            words(value, &gradient, &hessian)
+        };
+        let cached_words = |cache: &RowKernelCache<4>, row: usize| {
+            words(cache.nll[row], &cache.gradients[row], &cache.hessians[row])
+        };
+
+        let all = build_row_kernel_cache(&kern, &RowSet::All).expect("full-row cache");
+        let all_mismatches = (0..n)
+            .filter(|&row| cached_words(&all, row) != own_words(row))
+            .count();
+        assert_eq!(
+            all_mismatches, 0,
+            "{all_mismatches} of {n} cached rows differ from their own kernel's words"
+        );
+
+        let sampled: Vec<crate::outer_subsample::WeightedOuterRow> = (0..n)
+            .step_by(2)
+            .map(|index| crate::outer_subsample::WeightedOuterRow {
+                index,
+                weight: 2.0,
+                stratum: 0,
+            })
+            .collect();
+        assert!(
+            sampled.len() >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS,
+            "the subsample must be large enough to turn the progress count on"
+        );
+        let subsample = RowSet::Subsample {
+            rows: Arc::new(sampled),
+            n_full: n,
+        };
+        let partial = build_row_kernel_cache(&kern, &subsample).expect("subsample cache");
+        let zero = words(0.0, &[0.0; 4], &[[0.0; 4]; 4]);
+        let partial_mismatches = (0..n)
+            .filter(|&row| {
+                let expected = if row % 2 == 0 { own_words(row) } else { zero.clone() };
+                cached_words(&partial, row) != expected
+            })
+            .count();
+        assert_eq!(
+            partial_mismatches, 0,
+            "{partial_mismatches} of {n} subsample cache slots differ from their row's own \
+             kernel words (sampled) or from zero (unsampled)"
+        );
     }
 }

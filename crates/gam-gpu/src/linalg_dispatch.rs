@@ -72,9 +72,8 @@ impl gam_linalg::gpu_hook::GpuGemmDispatch for CudaGemmDispatch {
         try_fast_joint_hessian_2x2(x_a, x_b, w_aa, w_ab, w_bb)
     }
 
-    fn device_count(&self) -> usize {
-        let policy = super::global_policy();
-        runtime_for_dispatch(policy).map_or(0, GpuRuntime::device_count)
+    fn multi_gpu_batch_floor(&self) -> Option<usize> {
+        multi_gpu_batch_floor()
     }
 
     fn try_fast_ab_broadcast_b_batched(
@@ -363,14 +362,29 @@ pub fn route_through_gpu_with_policy(
 #[cfg(target_os = "linux")]
 const MULTI_GPU_BATCH_FLOOR: usize = 64;
 
+/// [`MULTI_GPU_BATCH_FLOOR`] when the pool has more than one usable device, the
+/// batch length from which [`should_split_batch`] splits; `None` when no split
+/// can happen.
+#[cfg(target_os = "linux")]
+fn multi_gpu_batch_floor() -> Option<usize> {
+    let policy = super::global_policy();
+    runtime_for_dispatch(policy)
+        .is_some_and(|rt| rt.device_count() > 1)
+        .then_some(MULTI_GPU_BATCH_FLOOR)
+}
+
+/// Without the CUDA backend no batch is ever split.
+#[cfg(not(target_os = "linux"))]
+fn multi_gpu_batch_floor() -> Option<usize> {
+    None
+}
+
 /// True when the pool has >1 usable device and `batch` is large enough that
 /// splitting the batch dimension across devices is worthwhile.
 #[cfg(target_os = "linux")]
 #[inline]
 fn should_split_batch(batch: usize) -> bool {
-    let policy = super::global_policy();
-    runtime_for_dispatch(policy).is_some_and(|rt| rt.device_count() > 1)
-        && batch >= MULTI_GPU_BATCH_FLOOR
+    multi_gpu_batch_floor().is_some_and(|floor| batch >= floor)
 }
 
 #[inline]

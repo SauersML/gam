@@ -78,7 +78,7 @@ impl<'a> RemlState<'a> {
             || !beta_norm_squared.is_finite()
             || polish_norm_squared > Self::POLISH_NORM_RATIO * beta_norm_squared
         {
-            log::info!(
+            log::debug!(
                 "[POLISH-SKIP] reason=large_step polish_norm²={} beta_norm²={}",
                 polish_norm_squared,
                 beta_norm_squared
@@ -172,7 +172,9 @@ impl<'a> RemlState<'a> {
         {
             return false;
         }
-        true
+        // A latched #784 block correction splices `Δ_b` with its exact
+        // gradient but no ρ-Hessian, so the criterion it defines has none.
+        !self.block_correction_latched()
     }
 
     /// Whether the exact analytic outer Hessian of the Tierney-Kadane
@@ -219,7 +221,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         e_for_logdet: &Array2<f64>,
         penalty_roots: &[Array2<f64>],
-        penalty_subspace: Option<&PenaltySubspace>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
         free_basis: Option<&Array2<f64>>,
@@ -313,7 +314,7 @@ impl<'a> RemlState<'a> {
                 .collect();
             let (value, penalty_rank, det1, det2_full) = self
                 .structural_penalty_logdet_value_and_derivatives(&projected_roots, &lambdas)?;
-            log::info!(
+            log::debug!(
                 "[STAGE] logdet S (Z-projected) rho_dim={} penalty_rank={} elapsed={:.3}s",
                 rho.len(),
                 penalty_rank,
@@ -384,14 +385,11 @@ impl<'a> RemlState<'a> {
             // a zero gradient. Fail loud instead of silently mis-optimizing ρ if a
             // future penalty configuration ever lands a penalized fit here without
             // a per-component representation.
-            let owned_subspace;
-            let subspace = if let Some(penalty_subspace) = penalty_subspace {
-                penalty_subspace
-            } else {
-                owned_subspace = self.compute_penalty_subspace(e_for_logdet)?;
-                &owned_subspace
-            };
-            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace);
+            //
+            // This branch is the only consumer of the `EᵀE` eigensystem, so it
+            // is formed here rather than by the callers on every evaluation.
+            let subspace = self.compute_penalty_subspace(e_for_logdet)?;
+            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(&subspace);
             if !rho.is_empty() {
                 crate::bail_invalid_estim!(
                     "penalty log|Σλ S|₊ ρ-derivatives unavailable: rho_dim={} but no canonical \
@@ -411,7 +409,7 @@ impl<'a> RemlState<'a> {
                 Array2::zeros((rho.len(), rho.len())),
             )
         };
-        log::info!(
+        log::debug!(
             "[STAGE] logdet S rho_dim={} penalty_rank={} elapsed={:.3}s",
             rho.len(),
             penalty_rank,
@@ -540,7 +538,7 @@ impl<'a> RemlState<'a> {
         {
             Ok(reservation) => reservation,
             Err(error) => {
-                log::info!(
+                log::debug!(
                     "{context}: Tierney-Kadane tensor working set refused by the memory ledger \
                      ({error}); evaluating row pairs"
                 );
@@ -550,7 +548,7 @@ impl<'a> RemlState<'a> {
         let results = match governor.try_reserve_dense_f64(n, p.saturating_add(1), context) {
             Ok(reservation) => reservation,
             Err(error) => {
-                log::info!(
+                log::debug!(
                     "{context}: Tierney-Kadane tensor results refused by the memory ledger \
                      ({error}); evaluating row pairs"
                 );
@@ -747,7 +745,7 @@ impl<'a> RemlState<'a> {
         {
             Ok(reservation) => reservation,
             Err(error) => {
-                log::info!("{context} refused by the memory ledger ({error}); evaluating row pairs");
+                log::debug!("{context} refused by the memory ledger ({error}); evaluating row pairs");
                 return Ok(None);
             }
         };
@@ -1595,8 +1593,7 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn tk_xt_diag_x(x_dense: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
-        let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
-        Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted)
+        Self::xt_diag_x_dense(x_dense, diag)
     }
 
     pub(crate) fn tk_hessian_rho_canonical_logit<S>(
@@ -2617,7 +2614,7 @@ impl<'a> RemlState<'a> {
         // Emit on the first eval and then once every this-many evals so a long
         // outer optimization leaves a periodic trace without flooding the log.
         const HOT_DIAGNOSTIC_EVAL_INTERVAL: u64 = 200;
-        (log::log_enabled!(log::Level::Info) || log::log_enabled!(log::Level::Warn))
+        log::log_enabled!(log::Level::Debug)
             && (eval_idx == 1 || eval_idx.is_multiple_of(HOT_DIAGNOSTIC_EVAL_INTERVAL))
     }
 
@@ -2757,7 +2754,7 @@ impl<'a> RemlState<'a> {
             rho_mode_response_cols: rho_cols.clone(),
             ext_mode_response_cols: ext_cols.clone(),
         });
-        log::debug!(
+        log::trace!(
             "[IFT-CACHE] outcome=mode_response_store rho_cols={} ext_cols={} p={}",
             rho_col_count,
             ext_col_count,
@@ -2793,7 +2790,7 @@ impl<'a> RemlState<'a> {
             .is_some();
         if active_constraints {
             self.clear_joint_ift_mode_response_cache();
-            log::info!(
+            log::debug!(
                 "[IFT-REJECTED] reason=active_constraints joint_dim={}",
                 theta.len()
             );
@@ -2835,7 +2832,7 @@ impl<'a> RemlState<'a> {
                 mode_response_cols,
                 active_constraints,
             });
-        log::debug!(
+        log::trace!(
             "[IFT-CACHE] outcome=joint_mode_response_store rho_cols={} ext_cols={} p={}",
             rho_col_count,
             ext_col_count,
@@ -2889,7 +2886,7 @@ impl<'a> RemlState<'a> {
             guard.as_ref()?.clone()
         };
         if cache.active_constraints {
-            log::info!(
+            log::debug!(
                 "[IFT-REJECTED] reason=active_constraints joint_dim={}",
                 cache.theta.len(),
             );
@@ -2919,7 +2916,7 @@ impl<'a> RemlState<'a> {
             })
             .collect();
         if !max_abs_dtheta.is_finite() || max_abs_dtheta > max_dtheta_cap {
-            log::info!(
+            log::debug!(
                 "[IFT-REJECTED] reason=large_dtheta max_dtheta={:.3e} cap={:.3e} joint_dim={}",
                 max_abs_dtheta,
                 max_dtheta_cap,
@@ -2928,7 +2925,7 @@ impl<'a> RemlState<'a> {
             return None;
         }
         if dtheta.iter().all(|d| *d == 0.0) {
-            log::info!(
+            log::debug!(
                 "[IFT-NOOP] reason=all_dtheta_zero max_dtheta={:.3e} joint_dim={}",
                 max_abs_dtheta,
                 cache.theta.len(),
@@ -2941,7 +2938,7 @@ impl<'a> RemlState<'a> {
 
         let solution_original = cache.mode_response_cols.dot(&dtheta);
         if !solution_original.iter().all(|v| v.is_finite()) {
-            log::info!(
+            log::debug!(
                 "[IFT-REJECTED] reason=non_finite_solution max_dtheta={:.3e} joint_dim={}",
                 max_abs_dtheta,
                 cache.theta.len(),
@@ -2954,20 +2951,20 @@ impl<'a> RemlState<'a> {
             *target -= correction;
         }
         if !predicted.iter().all(|v| v.is_finite()) {
-            log::info!(
+            log::debug!(
                 "[IFT-REJECTED] reason=non_finite_predicted max_dtheta={:.3e} joint_dim={}",
                 max_abs_dtheta,
                 cache.theta.len(),
             );
             return None;
         }
-        log::info!(
+        log::debug!(
             "[IFT-CACHE] outcome=joint_mode_response_hit joint_dim={} rho_dim={} p={}",
             cache.theta.len(),
             cache.rho_dim,
             self.p,
         );
-        log::debug!(
+        log::trace!(
             "[warm-start] joint IFT prediction reused mode responses: max|Δθ|={:.3e}, ‖Δβ‖={:.3e}",
             max_abs_dtheta,
             solution_original.dot(&solution_original).sqrt(),
@@ -3034,6 +3031,53 @@ impl<'a> RemlState<'a> {
         }
         self.runtime_mixture_link_state = mixture_link_state;
         self.runtime_sas_link_state = sas_link_state;
+        *self
+            .persistent_warm_start_key
+            .write()
+            .expect("persistent warm-start key lock poisoned") = None;
+        self.persistent_warm_start_loaded
+            .store(false, Ordering::Relaxed);
+        self.invalidate_link_dependent_state();
+    }
+
+    /// Install the Student-t `(σ, ν)` the next evaluation is taken at. They are
+    /// outer hyperparameters on the same footing as a flexible link's shape, so
+    /// a change invalidates exactly what [`Self::set_link_states`] does.
+    pub(crate) fn set_student_t_state(
+        &mut self,
+        sigma: f64,
+        nu: f64,
+    ) -> Result<(), EstimationError> {
+        if self.config.likelihood.student_t_parameters().is_none() {
+            crate::bail_invalid_estim!(
+                "Student-t (sigma, nu) installed on a {} fit",
+                self.config.likelihood.spec.response.name()
+            );
+        }
+        self.install_student_t_state(sigma, nu);
+        Ok(())
+    }
+
+    /// Restore the Student-t `(σ, ν)` carried by `likelihood` — the outer
+    /// seed-reset hook's counterpart of [`Self::set_student_t_state`]. A no-op
+    /// for every other family.
+    pub(crate) fn restore_student_t_state(&mut self, likelihood: &GlmLikelihoodSpec) {
+        if self.config.likelihood.student_t_parameters().is_some()
+            && let Some(Ok((sigma, nu))) = likelihood.student_t_parameters()
+        {
+            self.install_student_t_state(sigma, nu);
+        }
+    }
+
+    fn install_student_t_state(&mut self, sigma: f64, nu: f64) {
+        if let Some(Ok(current)) = self.config.likelihood.student_t_parameters()
+            && current == (sigma, nu)
+        {
+            return;
+        }
+        let mut config = self.config.as_ref().clone();
+        config.likelihood = config.likelihood.clone().with_student_t(sigma, nu);
+        self.config = Arc::new(config);
         *self
             .persistent_warm_start_key
             .write()
@@ -3152,9 +3196,11 @@ impl<'a> RemlState<'a> {
         }
 
         // General observed-information path for the non-canonical Bernoulli
-        // links (Probit, CLogLog, SAS, BetaLogistic, Mixture). Its only caller
-        // is the Tierney-Kadane correction, armed for Firth-penalized binomial
-        // fits (`reml_jeffreys_supported_link`).
+        // links (Probit, CLogLog, SAS, BetaLogistic, Mixture), armed by the
+        // Tierney-Kadane correction for Firth-penalized binomial fits
+        // (`reml_jeffreys_supported_link`). The EDM formula is the family's own,
+        // so it also serves the #784 mixed-axis term on every exact-curvature
+        // family, Poisson-log included.
         let likelihood = &pirls_result.likelihood;
         let weight_family = pirls::weight_family_for_glm_likelihood(likelihood)?;
         let phi = reml_fixed_glm_dispersion(likelihood)?;
@@ -3320,7 +3366,7 @@ impl<'a> RemlState<'a> {
             // here looks exactly like "this penalty map has no redundancy", and
             // the two have opposite meanings for the certificate.
             if k > 0 {
-                log::debug!(
+                log::trace!(
                     "[#2676] invariance declined: the caller passed {} rho coordinate(s) for a \
                      penalty map of {k}",
                     rho.len(),
@@ -3345,14 +3391,14 @@ impl<'a> RemlState<'a> {
                     // Not a refusal: an unformable Gram means the certificate
                     // simply has no invariance to excuse, which is exactly where
                     // it stood before this hook existed.
-                    log::debug!("[#2676] penalty-map invariance unavailable: {error}");
+                    log::trace!("[#2676] penalty-map invariance unavailable: {error}");
                     return None;
                 }
             };
         if invariance.dimension() == 0 {
             return None;
         }
-        log::info!(
+        log::debug!(
             "[#2676] the penalty map carries an exact {}-dimensional invariance (k={k}, \
              resolution={:.3e}); the outer curvature certificate deflates it instead of judging \
              a chain-rule term against its own absolute value",
@@ -3876,8 +3922,6 @@ impl<'a> RemlState<'a> {
             None => vec![0; expected_len],
         };
 
-        let balanced_penalty_root =
-            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
 
@@ -3886,6 +3930,7 @@ impl<'a> RemlState<'a> {
 
         let runtime_mixture_link_state = config.link_kind.mixture_state().cloned();
         let runtime_sas_link_state = config.link_kind.sas_state().copied();
+        let pirls_cache_budget = pirls_cache_byte_budget(&x);
 
         Ok(Self {
             y,
@@ -3893,7 +3938,6 @@ impl<'a> RemlState<'a> {
             weights,
             offset: offset.to_owned(),
             canonical_penalties,
-            balanced_penalty_root,
             reparam_invariant,
             sparse_penalty_block_count,
             p,
@@ -3904,13 +3948,16 @@ impl<'a> RemlState<'a> {
             coefficient_lower_bounds,
             linear_constraints,
             rho_prior: RhoPrior::Flat,
-            cache_manager: EvalCacheManager::new(),
+            cache_manager: EvalCacheManager::new(pirls_cache_budget),
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_rho: RwLock::new(None),
             prev_warm_start_beta: RwLock::new(None),
             prev_warm_start_rho: RwLock::new(None),
             block_correction_admission: AtomicUsize::new(0),
+            block_correction_decision: std::sync::Mutex::new(
+                BlockCorrectionDecision::AtFirstEngagedEvaluation,
+            ),
             block_correction_axis_orders: std::sync::Mutex::new(None),
             ift_quality_runtime: std::sync::Mutex::new(Default::default()),
             ift_mode_response_slot: std::sync::Mutex::new(None),
@@ -3926,6 +3973,7 @@ impl<'a> RemlState<'a> {
             frozen_tweedie_phi: Arc::new(AtomicU64::new(0)),
             frozen_gamma_shape: Arc::new(AtomicU64::new(0)),
             frozen_beta_phi: Arc::new(AtomicU64::new(0)),
+            frozen_dispersion_phi: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
@@ -3946,6 +3994,7 @@ impl<'a> RemlState<'a> {
             gaussian_dp_floor_scale_cache: std::sync::OnceLock::new(),
             positive_weight_observation_count_cache: std::sync::OnceLock::new(),
             rho_weight_anchor_cache: std::sync::OnceLock::new(),
+            data_root_cache: Default::default(),
         })
     }
 
@@ -3970,8 +4019,6 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        let balanced_penalty_root =
-            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
         let sparse_penalty_block_count =
@@ -3979,7 +4026,6 @@ impl<'a> RemlState<'a> {
 
         self.x = x.into();
         self.canonical_penalties = canonical_penalties;
-        self.balanced_penalty_root = balanced_penalty_root;
         self.reparam_invariant = reparam_invariant;
         self.sparse_penalty_block_count = sparse_penalty_block_count;
         self.p = p;
@@ -4017,6 +4063,8 @@ impl<'a> RemlState<'a> {
             .flat_glm_first_step_gram
             .write()
             .expect("flat-GLM first-step Gram cache lock poisoned") = None;
+        // The root-scale operator's data root is keyed to the same design.
+        self.data_root_cache.clear();
         *self
             .persistent_warm_start_key
             .write()
@@ -4060,12 +4108,12 @@ impl<'a> RemlState<'a> {
     /// — but for a spatial smooth ψ ALSO moves the penalty matrix `S(ψ)` (the
     /// Duchon/Matérn Hilbert scale is built as a function of the length scale).
     /// `reset_surface` is the only place the canonical penalty surface
-    /// (`balanced_penalty_root` / `reparam_invariant` / `sparse_penalty_block_count`)
+    /// (`reparam_invariant` / `sparse_penalty_block_count`)
     /// is rebuilt, and the fast path skips it — so without this the inner solve
     /// would pair `XᵀWX(ψ_new)` with the STALE `S(ψ_old)` and converge to the
     /// wrong β̂ / κ-optimum. This re-keys `S(ψ_new)` from the supplied canonical
     /// penalties (a k×k object built from the basis centers, not the data rows,
-    /// so the refresh stays n-free) and re-runs exactly the three k-space penalty
+    /// so the refresh stays n-free) and re-runs exactly the two k-space penalty
     /// derivations `reset_surface` runs — nothing design- or n-shaped.
     ///
     /// It does NOT touch `self.x`, the Gaussian-fixed Gram cache, or the
@@ -4095,15 +4143,12 @@ impl<'a> RemlState<'a> {
             );
         }
         let p = self.p;
-        let balanced_penalty_root =
-            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
         let sparse_penalty_block_count =
             sparse_penalty_block_count_from_canonical(canonical_penalties.as_ref(), p)?;
 
         self.canonical_penalties = canonical_penalties;
-        self.balanced_penalty_root = balanced_penalty_root;
         self.reparam_invariant = reparam_invariant;
         self.sparse_penalty_block_count = sparse_penalty_block_count;
         self.nullspace_dims = nullspace_dims;
@@ -4197,13 +4242,13 @@ impl<'a> RemlState<'a> {
         // routed dense logged nothing, so `penalized_hessian_too_dense` (a
         // density genuinely measured above the threshold) could not be told from
         // `design_not_sparse`, `constraints_present`,
-        // `penalty_blocks_not_separable`, `firth_bias_reduction_active` or
-        // `sparse_stats_failed` — four of which never measure a density at all.
+        // `firth_bias_reduction_active` or `sparse_stats_failed` — none of
+        // which measures a density at all.
         // "Which side of SPARSE_HESSIAN_MAX_DENSITY does this design land on"
         // was therefore unanswerable from a log for exactly the shapes where it
         // decides the cost. Report the decision itself, with the threshold it
         // was compared against, on BOTH branches.
-        log::info!(
+        log::debug!(
             "[reml-geometry] {} {}",
             match decision.geometry {
                 RemlGeometry::SparseExactSpd => "sparse_exact_spd",
@@ -4221,7 +4266,7 @@ impl<'a> RemlState<'a> {
                 ) {
                     Ok(bundle) => Ok(bundle),
                     Err(err) => {
-                        log::warn!(
+                        log::debug!(
                             "[reml-geometry] sparse_exact_spd failed ({}); falling back to dense spectral",
                             err
                         );
@@ -4417,13 +4462,21 @@ impl<'a> RemlState<'a> {
         // constrained optimum (issue #989). `bounded()`, which solves via the
         // exact-interval path rather than this active-set gate, was unaffected —
         // hence the two documented ways to bound a coefficient disagreed.
-        let stationarity_rel = kkt.stationarity / kkt.gradient_scale.max(1.0);
-        let stationarity_ok =
-            kkt.stationarity <= stationarity_tol || stationarity_rel <= stationarity_tol;
+        //
+        // The dual-feasibility and complementarity channels carry the same
+        // gradient units (`λ` solves `g = Aᵀλ` on unit rows) and are judged in
+        // the same frame. Held to a bare absolute bar they made convergence
+        // depend on the response's units: `y → 1e6·y` on a monotone smooth
+        // scales `g` and `λ` by 1e6 and was refused at `comp = 9.65e-5` under
+        // `‖g‖∞ = 1.5e6` — a relative complementarity of 6e-11.
+        let gradient_scale = kkt.gradient_scale;
+        let exceeds = |residual: f64, tolerance: f64| {
+            crate::active_set::exceeds_at_gradient_scale(residual, tolerance, gradient_scale)
+        };
         if kkt.primal_feasibility > KKT_TOL_PRIMAL
-            || kkt.dual_feasibility > KKT_TOL_DUAL
-            || kkt.complementarity > KKT_TOL_COMP
-            || !stationarity_ok
+            || exceeds(kkt.dual_feasibility, KKT_TOL_DUAL)
+            || exceeds(kkt.complementarity, KKT_TOL_COMP)
+            || exceeds(kkt.stationarity, stationarity_tol)
         {
             let mut worstrow_msg = String::new();
             if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
@@ -4475,7 +4528,7 @@ impl<'a> RemlState<'a> {
                 kkt.dual_feasibility,
                 kkt.complementarity,
                 kkt.stationarity,
-                stationarity_rel,
+                kkt.stationarity / gradient_scale.max(1.0),
                 stationarity_tol,
                 if kkt.working_set_rank_deficient {
                     ", degenerate face"
@@ -5154,7 +5207,7 @@ impl<'a> RemlState<'a> {
             finite_nonnegative_bits_or_no_signal(record.last_pirls_accept_rho),
             Ordering::Relaxed,
         );
-        log::info!("[warm-start-cache] restored persistent warm start key={key}");
+        log::debug!("[warm-start-cache] restored persistent warm start key={key}");
     }
 
     pub(crate) fn store_persistent_warm_start(&self) {
@@ -5335,7 +5388,7 @@ impl<'a> RemlState<'a> {
                 // Same NOOP marker the inner function would emit, so the
                 // bench runner aggregator's count is preserved across
                 // both the early-out path and the post-factor path.
-                log::info!(
+                log::debug!(
                     "[IFT-NOOP] reason=all_drho_zero max_drho={:.3e} drho_dim={}",
                     max_abs_drho,
                     cache.rho.len(),
@@ -5353,7 +5406,7 @@ impl<'a> RemlState<'a> {
             // across both paths.
             let max_drho_cap = current_ift_step_cap;
             if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
-                log::info!(
+                log::debug!(
                     "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
                     max_abs_drho,
                     max_drho_cap,
@@ -5371,14 +5424,14 @@ impl<'a> RemlState<'a> {
                 Some(current_ift_step_cap),
                 &rho_mode_response_cols,
             ) {
-                log::info!(
+                log::debug!(
                     "[IFT-CACHE] outcome=mode_response_hit drho_dim={} p={}",
                     new_rho.len(),
                     self.p,
                 );
                 return Some(prediction);
             }
-            log::debug!(
+            log::trace!(
                 "[IFT-CACHE] outcome=mode_response_fallback drho_dim={} p={}",
                 new_rho.len(),
                 self.p,
@@ -5403,7 +5456,7 @@ impl<'a> RemlState<'a> {
                 // (commit ec18559d) is paying off at large scale —
                 // every cache hit avoids a fresh O(p³)/3 Cholesky,
                 // which is multiple seconds at p ≈ several thousand.
-                log::info!(
+                log::debug!(
                     "[IFT-CACHE] outcome=hit drho_dim={} p={}",
                     new_rho.len(),
                     self.p,
@@ -5416,7 +5469,7 @@ impl<'a> RemlState<'a> {
                 let new_factor = match cache.penalized_hessian_transformed.factorize() {
                     Ok(f) => f,
                     Err(_) => {
-                        log::info!(
+                        log::debug!(
                             "[IFT-REJECTED] reason=hessian_factorize_failed_cached drho_dim={}",
                             new_rho.len(),
                         );
@@ -5425,7 +5478,7 @@ impl<'a> RemlState<'a> {
                 };
                 // Cache miss: paid the Cholesky once. Subsequent predict
                 // calls at the same surface will hit the cache.
-                log::info!(
+                log::debug!(
                     "[IFT-CACHE] outcome=miss drho_dim={} p={} elapsed={:.3}s",
                     new_rho.len(),
                     self.p,
@@ -5532,7 +5585,7 @@ impl<'a> RemlState<'a> {
         // the prior implementation needed to re-derive noop-ness here.
         // Map outcome → source enum without further work.
         if let Some((predicted, outcome)) = self.predict_warm_start_beta_ift_with_outcome(new_rho) {
-            log::debug!("[warm-start] IFT prediction accepted");
+            log::trace!("[warm-start] IFT prediction accepted");
             let source = match outcome {
                 IftPredictionOutcome::Predicted => WarmStartPredictionSource::Ift,
                 IftPredictionOutcome::Noop => WarmStartPredictionSource::Flat,
@@ -5575,7 +5628,7 @@ impl<'a> RemlState<'a> {
         // 6f7cbfc8 should have cleared these slots before the layout
         // shifted; non-zero count indicates a missed invalidation.
         if cur_rho.len() != new_rho.len() || cur_rho.len() != prev_rho.len() {
-            log::info!(
+            log::debug!(
                 "[TANGENT-REJECTED] reason=rho_dim_mismatch new_rho_dim={} cur_rho_dim={} prev_rho_dim={}",
                 new_rho.len(),
                 cur_rho.len(),
@@ -5584,7 +5637,7 @@ impl<'a> RemlState<'a> {
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         if cur_beta.0.len() != prev_beta.0.len() {
-            log::info!(
+            log::debug!(
                 "[TANGENT-REJECTED] reason=beta_dim_mismatch cur_beta_dim={} prev_beta_dim={}",
                 cur_beta.0.len(),
                 prev_beta.0.len(),
@@ -5605,7 +5658,7 @@ impl<'a> RemlState<'a> {
             // when the outer optimizer landed on a flat region or the
             // ρ history collapsed. Surfacing the case lets the bench
             // runner see flat-region traces.
-            log::info!(
+            log::debug!(
                 "[TANGENT-REJECTED] reason=degenerate_drho d_rho_norm_sq={:.3e}",
                 d_rho_norm_sq,
             );
@@ -5622,7 +5675,7 @@ impl<'a> RemlState<'a> {
             // Non-finite α (NaN or Inf). Real bug signal — the
             // numerator or denominator overflowed. Should never happen
             // if d_rho_norm_sq passed the prior finiteness check.
-            log::info!(
+            log::debug!(
                 "[TANGENT-REJECTED] reason=nonfinite_alpha step_dot_d={:.3e} d_rho_norm_sq={:.3e}",
                 step_dot_d,
                 d_rho_norm_sq,
@@ -5664,7 +5717,7 @@ impl<'a> RemlState<'a> {
             } else {
                 "alpha_above_cap"
             };
-            log::info!(
+            log::debug!(
                 "[TANGENT-REJECTED] reason={} alpha={:.3e} cap={:.3e}",
                 reason,
                 alpha,
@@ -5695,21 +5748,21 @@ impl<'a> RemlState<'a> {
             *p = c + alpha * (c - pp);
         }
         if predicted.iter().zip(cur_beta.0.iter()).all(|(p, c)| p == c) {
-            log::info!(
+            log::debug!(
                 "[TANGENT-NOOP] reason=prediction_equals_current alpha={:.3e}",
                 alpha,
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         if !predicted.iter().all(|v: &f64| v.is_finite()) {
-            log::info!(
+            log::debug!(
                 "[TANGENT-REJECTED] reason=non_finite_predicted alpha={:.3e} cap={:.3e}",
                 alpha,
                 alpha_cap,
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
-        log::info!(
+        log::debug!(
             "[TANGENT-PREDICT] alpha={:.3e} cap={:.3e} drho_step_norm_sq={:.3e} drho_prev_norm_sq={:.3e}",
             alpha,
             alpha_cap,
@@ -5757,7 +5810,7 @@ impl<'a> RemlState<'a> {
                     // poison the next PIRLS solve immediately. Refuse
                     // (slot remains cleared) and log so the source of
                     // the bad seed is debuggable.
-                    log::warn!(
+                    log::debug!(
                         "[warm-start] external β setter rejected non-finite seed (len={}); slot left empty",
                         beta.len(),
                     );
@@ -5772,7 +5825,7 @@ impl<'a> RemlState<'a> {
                 // re-derive β under a basis transformation. Surface it
                 // rather than silently dropping; the slot is already
                 // cleared.
-                log::warn!(
+                log::debug!(
                     "[warm-start] external β setter rejected length mismatch: got {}, expected {}",
                     beta.len(),
                     self.p,
@@ -5823,10 +5876,6 @@ impl<'a> RemlState<'a> {
     // Accessor methods for private fields
     pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
-    }
-
-    pub(crate) fn balanced_penalty_root(&self) -> &Array2<f64> {
-        &self.balanced_penalty_root
     }
 
     /// Return a Gaussian-Identity `XᵀWX` / `XᵀW(y−offset)` cache when the
@@ -6122,7 +6171,7 @@ impl<'a> RemlState<'a> {
         ) {
             Ok(m) => m,
             Err(e) => {
-                log::warn!("[gaussian-fixed-cache] disabling cache: failed to build XᵀWX: {e}");
+                log::debug!("[gaussian-fixed-cache] disabling cache: failed to build XᵀWX: {e}");
                 return None;
             }
         };
@@ -6136,7 +6185,7 @@ impl<'a> RemlState<'a> {
             match crate::pirls::SparseXtwxPrecomputed::build(sparse_design.as_ref(), &weights_owned)
             {
                 Ok(precomp) => {
-                    log::info!(
+                    log::debug!(
                         "[gaussian-fixed-cache] sparse XᵀWX nnz={} built in {:.3} ms",
                         precomp.xtwxvalues.len(),
                         sparse_start.elapsed().as_secs_f64() * 1e3
@@ -6144,7 +6193,7 @@ impl<'a> RemlState<'a> {
                     Some(Arc::new(precomp))
                 }
                 Err(e) => {
-                    log::warn!(
+                    log::debug!(
                         "[gaussian-fixed-cache] sparse XᵀWX build failed; falling back: {e}"
                     );
                     None
@@ -6163,7 +6212,7 @@ impl<'a> RemlState<'a> {
             // so there is no shared frozen-row bundle to attach (#1868).
             frozen_rows: None,
         });
-        log::info!(
+        log::debug!(
             "[gaussian-fixed-cache] built p={} n={} in {:.3} ms",
             self.p,
             self.y.len(),
@@ -6254,7 +6303,7 @@ impl<'a> RemlState<'a> {
                 &pirls_result.final_eta.to_owned(),
                 self.weights,
             )?);
-            log::debug!(
+            log::trace!(
                 "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
                 firth_op.x_dense.nrows(),
                 firth_op.x_dense.ncols(),
@@ -6274,12 +6323,8 @@ impl<'a> RemlState<'a> {
             // the transformed design column space. The hphi block below is
             // therefore the curvature of that basis-invariant penalty,
             // represented in the current transformed basis.
-            let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
-            let diag_term = Self::xt_diag_x_dense_into(
-                &firth_op.x_dense,
-                &(&firth_op.w2 * &firth_op.h_diag),
-                &mut weighted_xtdx,
-            );
+            let diag_term =
+                Self::xt_diag_x_dense(&firth_op.x_dense, &(&firth_op.w2 * &firth_op.h_diag));
             let bpb = gam_linalg::faer_ndarray::fast_atb(&firth_op.b_base, &firth_op.p_b_base);
             let mut hphi = 0.5 * (diag_term - bpb);
             // Numerical symmetry guard.
@@ -6299,7 +6344,7 @@ impl<'a> RemlState<'a> {
         {
             let beta_t = pirls_result.beta_transformed.as_ref();
             if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total, beta_t) {
-                log::warn!("Barrier Hessian diagonal skipped: {e}");
+                log::debug!("Barrier Hessian diagonal skipped: {e}");
             }
         }
 
@@ -6313,6 +6358,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
+            criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
             block_local_correction: std::sync::OnceLock::new(),
@@ -6344,11 +6390,6 @@ impl<'a> RemlState<'a> {
                 "sparse exact geometry requires sparse original design".to_string(),
             )
         })?;
-        self.sparse_penalty_block_count.ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "sparse exact geometry requires block-separable penalties".to_string(),
-            )
-        })?;
 
         let lambdas =
             Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
@@ -6375,7 +6416,7 @@ impl<'a> RemlState<'a> {
         {
             let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
             if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig) {
-                log::warn!("Sparse barrier Hessian diagonal skipped: {e}");
+                log::debug!("Sparse barrier Hessian diagonal skipped: {e}");
             }
         }
 
@@ -6448,6 +6489,7 @@ impl<'a> RemlState<'a> {
                 SparseExactEvalData {
                     factor,
                     takahashi,
+                    hessian: Arc::new(sparse_system.h_sparse),
                     logdet_h: sparse_system.logdet_h,
                     logdet_s_pos,
                     penalty_rank,
@@ -6458,6 +6500,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
+            criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             // Seeded, not left empty: this bundle's sparse system and its
             // `logdet_s_pos` / `det1_values` were already built from THESE
             // components, and a later consumer re-deriving them would be free
@@ -6692,7 +6735,7 @@ impl<'a> RemlState<'a> {
                 || (in_screening
                     && pirls_config.convergence_tolerance > self.config.pirls_convergence_tolerance)
             {
-                log::debug!(
+                log::trace!(
                     "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={}) inner_tol={:.1e} (full_tol={:.1e})",
                     pirls_config.max_iterations,
                     original_cap,
@@ -6818,6 +6861,21 @@ impl<'a> RemlState<'a> {
                 "frozen Beta precision",
                 |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
             )?;
+            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+            // same λ-search freeze as the Tweedie φ.
+            apply_frozen_search_scale(
+                &mut pirls_config.likelihood,
+                matches!(
+                    resolved_likelihood_scale,
+                    gam_problem::ResolvedLikelihoodScale::Dispersion {
+                        estimated: true,
+                        ..
+                    }
+                ),
+                self.frozen_dispersion_phi.load(Ordering::Relaxed),
+                "frozen dispersion",
+                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
+            )?;
             // Levenberg-Marquardt damping warm-start: the λ the previous
             // successful PIRLS solve at this surface ended on (0 = no hint).
             // It encodes the curvature regime that solve settled into; PIRLS
@@ -6890,7 +6948,6 @@ impl<'a> RemlState<'a> {
             };
             let penalty = pirls::PenaltyConfig {
                 canonical_penalties: &self.canonical_penalties,
-                balanced_penalty_root: Some(&self.balanced_penalty_root),
                 reparam_invariant: Some(&self.reparam_invariant),
                 p: self.p,
                 coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
@@ -6934,7 +6991,7 @@ impl<'a> RemlState<'a> {
                     (true, false) => "full(no-frozen-bundle)",
                     (false, false) => "full(derivative-request)",
                 };
-                log::info!(
+                log::debug!(
                     "[STAGE] inner pirls solve iters={} status={:?} max_eta={:.1} jeffreys_logdet={} rows={} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
@@ -7008,7 +7065,6 @@ impl<'a> RemlState<'a> {
                 };
                 let penalty_cold = pirls::PenaltyConfig {
                     canonical_penalties: &self.canonical_penalties,
-                    balanced_penalty_root: Some(&self.balanced_penalty_root),
                     reparam_invariant: Some(&self.reparam_invariant),
                     p: self.p,
                     coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
@@ -7033,7 +7089,7 @@ impl<'a> RemlState<'a> {
                     )
                 );
                 if cold_reached_minimum {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS] the warm-started inner solve did not reach a valid minimum \
                          and the cold retry did; taking the cold solve (#2519)"
                     );
@@ -7051,9 +7107,9 @@ impl<'a> RemlState<'a> {
                 // Seed-screening intentionally caps inner iterations very low,
                 // so trial-point failures here are routine and ranked — not
                 // bugs.
-                log::debug!("[seed-screen] P-IRLS rejected candidate: {e:?}");
+                log::trace!("[seed-screen] P-IRLS rejected candidate: {e:?}");
             } else {
-                log::warn!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
+                log::debug!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
             }
             // Keep the previous successful warm start even when a trial point
             // fails. Outer line search commonly probes unstable candidates and
@@ -7104,7 +7160,7 @@ impl<'a> RemlState<'a> {
             }
             self.frozen_negbin_theta
                 .store(theta.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] negative-binomial λ-search θ frozen at {theta:.6e} (#1082/#2363, \
                  measured at the converged η); outer REML criterion now stationary in ρ"
             );
@@ -7159,7 +7215,7 @@ impl<'a> RemlState<'a> {
             )?;
             self.frozen_tweedie_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] tweedie λ-search φ frozen at {phi:.6e} (#1477/#2363, \
                  measured at the converged η); outer LAML criterion now stationary in ρ"
             );
@@ -7216,7 +7272,7 @@ impl<'a> RemlState<'a> {
             )?;
             self.frozen_gamma_shape
                 .store(shape.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] gamma λ-search shape frozen at {shape:.6e} (#1074/#2361, \
                  measured at the converged η); outer REML criterion now stationary in ρ"
             );
@@ -7266,9 +7322,41 @@ impl<'a> RemlState<'a> {
                 )));
             }
             self.frozen_beta_phi.store(phi.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] beta λ-search precision frozen at {phi:.6e} (#2369, \
                  measured at the converged η); outer REML criterion now stationary in ρ"
+            );
+        }
+        // Capture the Gaussian (non-identity link) / inverse Gaussian dispersion
+        // MLE at the first converged non-screening solve's η and hold it for the
+        // rest of the search, exactly as the Tweedie φ above.
+        if !in_screening
+            && matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            )
+            && self.frozen_dispersion_phi.load(Ordering::Relaxed) == 0
+            && matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            )
+        {
+            let spec = reml_spec(&self.config.likelihood);
+            let phi = pirls::estimate_dispersion_phi_from_eta(
+                &spec.response,
+                &spec.link,
+                self.y,
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?;
+            self.frozen_dispersion_phi
+                .store(phi.to_bits(), Ordering::Relaxed);
+            log::info!(
+                "[OUTER] dispersion λ-search φ frozen at {phi:.6e} (measured at the \
+                 converged η); outer REML criterion now stationary in ρ"
             );
         }
         // Check the status returned by the P-IRLS routine.
@@ -7348,7 +7436,7 @@ impl<'a> RemlState<'a> {
                                     let cap_predicted = self
                                         .record_ift_prediction_quality(quality, current_cap)
                                         .unwrap_or(current_cap);
-                                    log::info!(
+                                    log::debug!(
                                         "[IFT-QUALITY] quality={:.3e} ift={:.3e} pred_residual={:.3e} cap_predicted={:.3e} iters={}",
                                         quality,
                                         current_cap,
@@ -7359,7 +7447,7 @@ impl<'a> RemlState<'a> {
                                     self.last_ift_prediction_residual
                                         .store(quality.to_bits(), Ordering::Relaxed);
                                 } else {
-                                    log::info!(
+                                    log::debug!(
                                         "[TANGENT-QUALITY] quality={:.3e} pred_residual={:.3e} iters={}",
                                         quality,
                                         pred_residual,
@@ -7468,7 +7556,7 @@ impl<'a> RemlState<'a> {
                         .iter()
                         .all(|v| v.is_finite())
                 {
-                    log::debug!(
+                    log::trace!(
                         "[seed-screen] partial-fit accepted for ranking: {kind} (|g| {:.3e}, r_g {:.3e}, iter {})",
                         pirls_result.lastgradient_norm,
                         pirls_result.relative_gradient_norm(),
@@ -7477,7 +7565,7 @@ impl<'a> RemlState<'a> {
                     return Ok(pirls_result);
                 }
                 if in_screening {
-                    log::debug!(
+                    log::trace!(
                         "[seed-screen] P-IRLS rejected: {kind} (gradient norm {:.3e}, iter {})",
                         pirls_result.lastgradient_norm,
                         pirls_result.iteration
@@ -7505,7 +7593,7 @@ impl<'a> RemlState<'a> {
                         configured_cap,
                     );
                     if budget_was_throttled {
-                        log::debug!(
+                        log::trace!(
                             "P-IRLS stopped at the scheduled inner cap: {kind} (gradient norm \
                              {:.3e}, iter {}; scheduled cap {} of configured budget {}). The \
                              outer schedule grows the cap for the next outer iteration.",
@@ -7515,7 +7603,7 @@ impl<'a> RemlState<'a> {
                             configured_cap,
                         );
                     } else {
-                        log::error!(
+                        log::debug!(
                             "P-IRLS could not certify a valid minimum: {kind} (gradient norm \
                              {:.3e}, iter {} of configured budget {})",
                             pirls_result.lastgradient_norm,
@@ -7668,6 +7756,21 @@ impl<'a> RemlState<'a> {
             "frozen Beta precision",
             |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
         )?;
+        // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+        // same λ-search freeze as the Tweedie φ.
+        apply_frozen_search_scale(
+            &mut pirls_config.likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_dispersion_phi.load(Ordering::Relaxed),
+            "frozen dispersion",
+            |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
+        )?;
 
         // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
         // XᵀW(y − offset) across every inner solve; for other families /
@@ -7688,7 +7791,6 @@ impl<'a> RemlState<'a> {
         };
         let penalty = pirls::PenaltyConfig {
             canonical_penalties: &self.canonical_penalties,
-            balanced_penalty_root: Some(&self.balanced_penalty_root),
             reparam_invariant: Some(&self.reparam_invariant),
             p: self.p,
             coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
@@ -7734,14 +7836,14 @@ impl<'a> RemlState<'a> {
             .collect::<Vec<_>>()
             .join(",");
         match result {
-            Ok((ref res, ref wm)) => log::info!(
+            Ok((ref res, ref wm)) => log::debug!(
                 "[STAGE] sigma-cubature pirls solve rho=[{rho_text}] iters={} status={:?} max_eta={:.1} elapsed={:.3}s",
                 wm.iterations,
                 res.status,
                 res.max_abs_eta,
                 pirls_elapsed.as_secs_f64(),
             ),
-            Err(ref error) => log::info!(
+            Err(ref error) => log::debug!(
                 "[STAGE] sigma-cubature pirls solve rho=[{rho_text}] FAILED in {:.3}s: {error}",
                 pirls_elapsed.as_secs_f64(),
             ),
@@ -8183,7 +8285,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     // in the cache invalidation chain; reset_surface, link change, and
     // similar should have wiped the cache before the layout shifted.
     if new_rho.len() != k {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=rho_dim_mismatch new_rho_dim={} cache_rho_dim={}",
             new_rho.len(),
             k,
@@ -8191,7 +8293,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         return None;
     }
     if canonical_penalties.len() != k {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=penalty_dim_mismatch penalties_dim={} cache_rho_dim={}",
             canonical_penalties.len(),
             k,
@@ -8199,7 +8301,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         return None;
     }
     if cache.beta_original.len() != p {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=beta_dim_mismatch cache_beta_dim={} expected_p={}",
             cache.beta_original.len(),
             p,
@@ -8246,7 +8348,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         // the warm-start machinery is actually delivering, vs
         // falling through to flat warm-start at every accepted
         // outer iter.
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
             max_abs_drho,
             max_drho_cap,
@@ -8328,7 +8430,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         // Without this marker, "noop" calls would inflate the accept count
         // because the predictor returns Some(β) — masking how often the
         // outer is actually exercising the linearization.
-        log::info!(
+        log::debug!(
             "[IFT-NOOP] reason=all_drho_below_eps max_drho={:.3e} drho_dim={}",
             max_abs_drho,
             k,
@@ -8340,7 +8442,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     }
 
     if !rhs_original.iter().all(|v| v.is_finite()) {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=non_finite_rhs max_drho={:.3e} drho_dim={}",
             max_abs_drho,
             k,
@@ -8355,7 +8457,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     } else {
         // rhs_tfd = qs^T · rhs_original. Dimension check: qs is p×p.
         if cache.qs.nrows() != p || cache.qs.ncols() != p {
-            log::info!(
+            log::debug!(
                 "[IFT-REJECTED] reason=qs_dim_mismatch qs_dim={}x{} expected_p={}",
                 cache.qs.nrows(),
                 cache.qs.ncols(),
@@ -8375,7 +8477,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
             owned_factor = match cache.penalized_hessian_transformed.factorize() {
                 Ok(f) => f,
                 Err(_) => {
-                    log::info!(
+                    log::debug!(
                         "[IFT-REJECTED] reason=hessian_factorize_failed max_drho={:.3e} drho_dim={}",
                         max_abs_drho,
                         k,
@@ -8389,7 +8491,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     let solution_in_h_basis = match factor_ref.solve(&rhs_in_h_basis) {
         Ok(u) => u,
         Err(_) => {
-            log::info!(
+            log::debug!(
                 "[IFT-REJECTED] reason=hessian_solve_failed max_drho={:.3e} drho_dim={}",
                 max_abs_drho,
                 k,
@@ -8404,7 +8506,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     };
 
     if !solution_original.iter().all(|v| v.is_finite()) {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=non_finite_solution max_drho={:.3e} drho_dim={}",
             max_abs_drho,
             k,
@@ -8420,14 +8522,14 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         *target -= correction;
     }
     if !predicted.iter().all(|v| v.is_finite()) {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=non_finite_predicted max_drho={:.3e} drho_dim={}",
             max_abs_drho,
             k,
         );
         return None;
     }
-    log::debug!(
+    log::trace!(
         "[warm-start] IFT prediction: max|Δρ|={:.3e}, ‖rhs‖={:.3e}, ‖Δβ‖={:.3e}",
         max_abs_drho,
         rhs_in_h_basis.dot(&rhs_in_h_basis).sqrt(),
@@ -8452,7 +8554,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
     }
     let k = cache.rho.len();
     if new_rho.len() != k {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=rho_dim_mismatch new_rho_dim={} cache_rho_dim={}",
             new_rho.len(),
             k,
@@ -8460,7 +8562,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
         return None;
     }
     if cache.beta_original.len() != p {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=beta_dim_mismatch cache_beta_dim={} expected_p={}",
             cache.beta_original.len(),
             p,
@@ -8499,7 +8601,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
         .filter(|cap| cap.is_finite() && *cap > 0.0)
         .unwrap_or_else(|| adaptive_ift_max_drho(last_ift_residual));
     if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
             max_abs_drho,
             max_drho_cap,
@@ -8509,7 +8611,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
     }
 
     if drho.iter().all(|d| *d == 0.0) {
-        log::info!(
+        log::debug!(
             "[IFT-NOOP] reason=all_drho_zero max_drho={:.3e} drho_dim={}",
             max_abs_drho,
             k,
@@ -8530,14 +8632,14 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
         *target -= correction;
     }
     if !predicted.iter().all(|v| v.is_finite()) {
-        log::info!(
+        log::debug!(
             "[IFT-REJECTED] reason=non_finite_predicted max_drho={:.3e} drho_dim={}",
             max_abs_drho,
             k,
         );
         return None;
     }
-    log::debug!(
+    log::trace!(
         "[warm-start] IFT prediction reused mode responses: max|Δρ|={:.3e}, ‖Δβ‖={:.3e}",
         max_abs_drho,
         solution_original.dot(&solution_original).sqrt(),

@@ -1824,6 +1824,463 @@ fn design_psi_pair_third_information_matches_finite_difference_2765() {
     }
 }
 
+/// A symmetric contraction weight with every entry nonzero, so each cross term is graded.
+fn contraction_weight(dim: usize) -> Array2<f64> {
+    Array2::from_shape_fn((dim, dim), |(a, b)| {
+        (0.37 * (a + b + 1) as f64).sin() + if a == b { 0.8 } else { 0.0 }
+    })
+}
+
+/// gam#2930: the one-pass `⟨W, ∂_ψ H²[e_a, e_b]⟩` along a design ψ is the contraction with `W`
+/// of the column-by-column `{D_β_a D_β ∂_ψ H[e_b]}`, to roundoff, on the marginal and the slope
+/// surface of a time-constant slope.
+#[test]
+fn design_contracted_trace_hessian_psi_matches_column_contraction_2930() {
+    let options = BlockwiseFitOptions::default();
+    for axis in [PsiAxis::MarginalDesign, PsiAxis::SlopeDesign] {
+        let layout = hyper_layout(axis);
+        let (family, beta) = drift_family_and_states(SlopeFrame::Static);
+        let states = states_at_beta(&family, &beta);
+        let total = beta.len();
+        let weight = contraction_weight(total);
+        assert!(
+            family
+                .design_contracted_trace_hessian_psi_available(
+                    &states,
+                    layout.design_derivative_blocks(),
+                    0
+                )
+                .expect("availability query"),
+            "{axis:?}: a design ψ axis on the rigid frame must serve the one-pass contraction"
+        );
+        let contracted = family
+            .design_contracted_trace_hessian_psi_with_options(
+                &states,
+                layout.design_derivative_blocks(),
+                0,
+                &weight,
+                &options,
+            )
+            .expect("one-pass design contraction")
+            .expect("a design ψ axis on the rigid frame serves the one-pass contraction");
+        let mut reference = Array2::<f64>::zeros((total, total));
+        for b in 0..total {
+            let mut unit = Array1::<f64>::zeros(total);
+            unit[b] = 1.0;
+            let columns = family
+                .design_psi_hessian_second_directional_derivative_all_beta_axes_with_options(
+                    &states,
+                    layout.design_derivative_blocks(),
+                    0,
+                    &unit,
+                    &options,
+                )
+                .expect("column-by-column design third information derivative")
+                .expect("a design ψ axis publishes its third information derivative");
+            for a in 0..total {
+                reference[[a, b]] = (&weight * &columns[a]).sum();
+            }
+        }
+        let scale = max_abs(reference.iter());
+        assert!(
+            scale > 1e-8,
+            "{axis:?}: the reference contraction is identically zero, so it grades nothing"
+        );
+        let gap = max_abs((&contracted - &reference).iter());
+        assert!(
+            gap <= 1e-12 * scale,
+            "{axis:?}: one-pass {contracted:?} against column contraction {reference:?}"
+        );
+    }
+}
+
+/// gam#2930: `⟨W, ∂_ψ H³[v, e_a, e_b]⟩` along a design ψ is the coefficient derivative of the
+/// one-pass `⟨W, ∂_ψ H²⟩` at fixed `W`, graded along every coefficient axis.
+#[test]
+fn design_contracted_trace_hessian_psi_directional_matches_finite_difference_2930() {
+    let options = BlockwiseFitOptions::default();
+    for axis in [PsiAxis::MarginalDesign, PsiAxis::SlopeDesign] {
+        let layout = hyper_layout(axis);
+        let (family, beta) = drift_family_and_states(SlopeFrame::Static);
+        let states = states_at_beta(&family, &beta);
+        let total = beta.len();
+        let weight = contraction_weight(total);
+        let analytic: Vec<Array2<f64>> = (0..total)
+            .map(|coefficient_axis| {
+                let mut unit = Array1::<f64>::zeros(total);
+                unit[coefficient_axis] = 1.0;
+                family
+                    .design_contracted_trace_hessian_psi_directional_with_options(
+                        &states,
+                        layout.design_derivative_blocks(),
+                        0,
+                        &weight,
+                        &unit,
+                        &options,
+                    )
+                    .expect("directional design contraction")
+                    .expect("a design ψ axis on the rigid frame serves the directional contraction")
+            })
+            .collect();
+        grade_all_beta_axes_on_derived_band(
+            &format!("static/{axis:?} contracted trace Hessian by beta"),
+            &analytic,
+            &beta,
+            |displaced| {
+                family
+                    .design_contracted_trace_hessian_psi_with_options(
+                        &states_at_beta(&family, displaced),
+                        layout.design_derivative_blocks(),
+                        0,
+                        &weight,
+                        &options,
+                    )
+                    .expect("displaced design contraction")
+                    .expect("a design ψ axis on the rigid frame serves the one-pass contraction")
+            },
+        );
+    }
+}
+
+/// gam#2930: `⟨W, ∂²_ψψ' H²[e_a, e_b]⟩` for design pairs is the coefficient derivative along
+/// `e_b` of the contraction with `W` of `{D_β_a ∂²_ψψ' H}`, on the diagonal and cross-block pairs
+/// of a time-constant slope.
+#[test]
+fn design_contracted_trace_hessian_psi_pair_matches_finite_difference_2930() {
+    let options = BlockwiseFitOptions::default();
+    let blocks = two_design_axis_blocks();
+    for (psi_i, psi_j) in [(0, 0), (0, 1), (1, 1)] {
+        let (family, beta) = drift_family_and_states(SlopeFrame::Static);
+        let total = beta.len();
+        let weight = contraction_weight(total);
+        let analytic = family
+            .design_contracted_trace_hessian_psi_pair_with_options(
+                &states_at_beta(&family, &beta),
+                &blocks,
+                psi_i,
+                psi_j,
+                &weight,
+                &options,
+            )
+            .expect("pair design contraction")
+            .expect("a design pair on the rigid frame serves the pair contraction");
+        let contracted_at = |displaced: &Array1<f64>| -> Array1<f64> {
+            let axes = family
+                .design_psi_pair_hessian_directional_derivative_all_beta_axes_with_options(
+                    &states_at_beta(&family, displaced),
+                    &blocks,
+                    psi_i,
+                    psi_j,
+                    &options,
+                )
+                .expect("design-pair third information derivative")
+                .expect("a design pair on supported blocks publishes its third information derivative");
+            Array1::from_iter(axes.iter().map(|matrix| (&weight * matrix).sum()))
+        };
+        grade_contraction_by_beta(
+            &format!("static/design pair ({psi_i},{psi_j}) contracted trace Hessian"),
+            &analytic,
+            &beta,
+            contracted_at,
+        );
+    }
+}
+
+/// gam#2945: the graded step `g` of [`derived_difference`]. The stencil reaches `±2g = ±1e-3`.
+const DERIVED_DIFFERENCE_STEP: f64 = 5e-4;
+
+/// gam#2945: `f` on the stencil [`derived_difference`] reads, `[f(−2g), f(−g), f(g), f(2g)]`.
+fn derived_difference_stencil<T>(f: impl Fn(f64) -> T) -> [T; 4] {
+    let g = DERIVED_DIFFERENCE_STEP;
+    [f(-2.0 * g), f(-g), f(g), f(2.0 * g)]
+}
+
+/// gam#2945: a central difference `D(g)` and an error band derived from the difference's own error
+/// sources, not a literal floor.
+///
+/// Truncation: with `E(g) = D(g) − f′`, the disagreement `Δ₁ = D(2g) − D(g)` is `E(2g) − E(g)`, so
+/// `|E(g)| ≤ |Δ₁|` whenever the error at least halves per halving, `|E(2g)| ≥ 2·|E(g)|`. A central
+/// difference in its asymptotic range quarters it (`E = a·g² + …`), where `|E(g)| = |Δ₁|/3`. The richer
+/// estimate `Δ₁/3 − (Δ₂ − 4Δ₁)/45` is not a bound: its correction can cancel while sixth-order error
+/// remains, and it fell short by 0.04 % on a design-axis contraction here.
+///
+/// Roundoff: an object assembled as a floating sum of `n` summands carries Higham's recursive-summation
+/// error `(n − 1)·ε·Σ|x|` beside the summands' own `ε·Σ|x|`, so `δ ≤ n·ε·Σ|x|`. The summands are not
+/// published, so `Σ|x|` is taken at `M`, the largest magnitude the stencil took: exact when the summands
+/// share a sign, a named proxy otherwise. With `δ = n·ε·M`, `D(g)` carries `δ/g` and `Δ₁` carries
+/// `1.5·δ/g`, so the band adds `2.5·δ/g`.
+///
+/// The step `g` places the stencil; it is not a tolerance. The band is derived for whatever step is
+/// used, so a different `g` moves the band with it and never loosens the gate.
+#[derive(Clone, Copy, Debug)]
+struct DerivedDifference {
+    value: f64,
+    band: f64,
+}
+
+fn derived_difference(stencil: [f64; 4], g: f64, summands: usize) -> DerivedDifference {
+    let [minus_2, minus_1, plus_1, plus_2] = stencil;
+    let d_1 = (plus_1 - minus_1) / (2.0 * g);
+    let d_2 = (plus_2 - minus_2) / (4.0 * g);
+    let magnitude = stencil.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let roundoff = summands as f64 * f64::EPSILON * magnitude;
+    DerivedDifference {
+        value: d_1,
+        band: (d_2 - d_1).abs() + 2.5 * roundoff / g,
+    }
+}
+
+/// gam#2945: grade `analytic` against a [`DerivedDifference`]. The difference must resolve the object
+/// it grades, `band ≤ scale`, before any gap is charged to the analytic term.
+fn assert_within_derived_band(label: &str, analytic: f64, oracle: DerivedDifference, scale: f64) {
+    assert!(
+        oracle.band <= scale,
+        "{label}: the central difference did not resolve this object (band {:.3e} against scale \
+         {scale:.3e}); the analytic term is not on trial here",
+        oracle.band,
+    );
+    let gap = (analytic - oracle.value).abs();
+    assert!(
+        gap <= oracle.band,
+        "{label}: analytic={analytic:.9e} fd={:.9e} gap={gap:.3e} band={:.3e}",
+        oracle.value,
+        oracle.band,
+    );
+}
+
+/// gam#2945: [`grade_all_beta_axes`] on the band of [`derived_difference`]. Every object of the family
+/// is resolved against the family's largest analytic magnitude. The object differenced is a one-pass
+/// contraction `⟨W, ·⟩` over `N_ROWS` rows and the `p²` entries of `W`, so it carries `N_ROWS·p²`
+/// summands.
+fn grade_all_beta_axes_on_derived_band(
+    label: &str,
+    analytic: &[Array2<f64>],
+    beta: &Array1<f64>,
+    lower_order_at: impl Fn(&Array1<f64>) -> Array2<f64>,
+) {
+    let dim = beta.len();
+    assert_eq!(analytic.len(), dim, "{label}: one matrix per coefficient axis");
+    let scale = analytic
+        .iter()
+        .fold(0.0_f64, |acc, matrix| acc.max(max_abs(matrix.iter())));
+    assert!(
+        scale > 1e-8,
+        "{label}: every analytic matrix is identically zero, so it grades nothing"
+    );
+    for (coefficient_axis, matrix) in analytic.iter().enumerate() {
+        assert_eq!(matrix.dim(), (dim, dim), "{label}: axis {coefficient_axis} shape");
+        let stencil = derived_difference_stencil(|t| {
+            let mut displaced = beta.clone();
+            displaced[coefficient_axis] += t;
+            lower_order_at(&displaced)
+        });
+        for row in 0..dim {
+            for column in 0..dim {
+                assert_within_derived_band(
+                    &format!("{label} coefficient axis {coefficient_axis} [{row},{column}]"),
+                    matrix[[row, column]],
+                    derived_difference(
+                        std::array::from_fn(|k| stencil[k][[row, column]]),
+                        DERIVED_DIFFERENCE_STEP,
+                        N_ROWS * dim * dim,
+                    ),
+                    scale,
+                );
+            }
+        }
+    }
+}
+
+/// Grade `analytic[[a, b]]` against the central difference along `e_b` of `contracted_at(β)[a]`,
+/// the contraction with `W` of each coefficient axis's lower-order derivative, on the band of
+/// [`derived_difference`].
+fn grade_contraction_by_beta(
+    label: &str,
+    analytic: &Array2<f64>,
+    beta: &Array1<f64>,
+    contracted_at: impl Fn(&Array1<f64>) -> Array1<f64>,
+) {
+    let total = beta.len();
+    assert_eq!(analytic.dim(), (total, total), "{label}: shape");
+    let scale = max_abs(analytic.iter());
+    assert!(
+        scale > 1e-8,
+        "{label}: the contraction is identically zero, so it grades nothing"
+    );
+    for column in 0..total {
+        let stencil = derived_difference_stencil(|t| {
+            let mut displaced = beta.clone();
+            displaced[column] += t;
+            contracted_at(&displaced)
+        });
+        for row in 0..total {
+            assert_within_derived_band(
+                &format!("{label} [{row},{column}]"),
+                analytic[[row, column]],
+                derived_difference(
+                    std::array::from_fn(|k| stencil[k][row]),
+                    DERIVED_DIFFERENCE_STEP,
+                    N_ROWS * total * total,
+                ),
+                scale,
+            );
+        }
+    }
+}
+
+/// gam#2930: along a baseline-chart coordinate, `⟨W, ∂_θ H³[v, e_a, e_b]⟩` is the coefficient
+/// derivative of the one-pass `⟨W, ∂_θ H²⟩` at fixed `W`, graded along every coefficient axis.
+#[test]
+fn baseline_contracted_trace_hessian_psi_directional_matches_finite_difference_2930() {
+    let options = BlockwiseFitOptions::default();
+    let (family, beta) = drift_family_and_states(SlopeFrame::Static);
+    let states = states_at_beta(&family, &beta);
+    let total = beta.len();
+    let weight = contraction_weight(total);
+    for axis in [0, 1, 2] {
+        let analytic: Vec<Array2<f64>> = (0..total)
+            .map(|coefficient_axis| {
+                let mut unit = Array1::<f64>::zeros(total);
+                unit[coefficient_axis] = 1.0;
+                family
+                    .baseline_contracted_trace_hessian_psi_directional_with_options(
+                        &states, axis, &weight, &unit, &options,
+                    )
+                    .expect("directional chart contraction")
+                    .expect("a chart axis on the rigid frame serves the directional contraction")
+            })
+            .collect();
+        grade_all_beta_axes_on_derived_band(
+            &format!("static/chart axis {axis} contracted trace Hessian by beta"),
+            &analytic,
+            &beta,
+            |displaced| {
+                family
+                    .baseline_contracted_trace_hessian_psi_with_options(
+                        &states_at_beta(&family, displaced),
+                        axis,
+                        &weight,
+                        &options,
+                    )
+                    .expect("displaced chart contraction")
+                    .expect("a chart axis on the rigid frame serves the one-pass contraction")
+            },
+        );
+    }
+}
+
+/// gam#2930: `⟨W, ∂²_θθ' H²[e_a, e_b]⟩` for baseline-chart pairs is the coefficient derivative
+/// along `e_b` of the contraction with `W` of `{D_β_a ∂²_θθ' H}`, on diagonal and cross pairs.
+#[test]
+fn baseline_contracted_trace_hessian_psi_pair_matches_finite_difference_2930() {
+    let options = BlockwiseFitOptions::default();
+    let (family, beta) = drift_family_and_states(SlopeFrame::Static);
+    let weight = contraction_weight(beta.len());
+    for (axis, other_axis) in [(0, 0), (1, 1), (0, 2), (1, 2)] {
+        let analytic = family
+            .baseline_contracted_trace_hessian_psi_pair_with_options(
+                &states_at_beta(&family, &beta),
+                axis,
+                other_axis,
+                &weight,
+                &options,
+            )
+            .expect("pair chart contraction")
+            .expect("a chart pair on the rigid frame serves the pair contraction");
+        grade_contraction_by_beta(
+            &format!("static/chart pair ({axis},{other_axis}) contracted trace Hessian"),
+            &analytic,
+            &beta,
+            |displaced| {
+                let axes = family
+                    .baseline_exact_joint_psisecond_order_hessian_directional_derivative_all_beta_axes_with_options(
+                        &states_at_beta(&family, displaced),
+                        axis,
+                        other_axis,
+                        &options,
+                    )
+                    .expect("chart-pair third information derivative");
+                Array1::from_iter(axes.iter().map(|matrix| (&weight * matrix).sum()))
+            },
+        );
+    }
+}
+
+/// gam#2945 positive control for [`baseline_contracted_trace_hessian_psi_pair_matches_finite_difference_2930`]:
+/// the same derived band ([`derived_difference`]) rejects the pair contraction with the chart's second
+/// primary shift `∂²_θθ' (q₀, q₁, q̇₁)` zeroed. That shift is the `T5[d_θθ']` half of
+/// `⟨W, ∂²_θθ' H²⟩`; a pair calculus that omits it must not pass the gate.
+#[test]
+fn baseline_psi_pair_gate_rejects_a_dropped_second_chart_shift_2930() {
+    use super::row_kernel::SurvivalMarginalSlopeRowKernel;
+    use super::slope_geometry::{STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry};
+
+    let options = BlockwiseFitOptions::default();
+    let (family, beta) = drift_family_and_states(SlopeFrame::Static);
+    let weight = contraction_weight(beta.len());
+    let states = states_at_beta(&family, &beta);
+    let geometry = family
+        .rigid_baseline_geometry()
+        .expect("the chart fixture carries frozen baseline geometry");
+    let row_weights = family.rigid_third_row_weights(&options);
+    let mut worst = 0.0_f64;
+    for (axis, other_axis) in [(0, 0), (1, 1), (0, 2), (1, 2)] {
+        let dropped =
+            SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+                family.clone(),
+                states.clone(),
+            )
+            .contracted_trace_hessian_primary_shift_pair(&weight, &row_weights, |row| {
+                Ok((
+                    SurvivalMarginalSlopeFamily::rigid_baseline_primary_first::<
+                        STATIC_SLOPE_PRIMARIES,
+                    >(geometry, row, axis)?,
+                    SurvivalMarginalSlopeFamily::rigid_baseline_primary_first::<
+                        STATIC_SLOPE_PRIMARIES,
+                    >(geometry, row, other_axis)?,
+                    [0.0; STATIC_SLOPE_PRIMARIES],
+                ))
+            })
+            .expect("pair contraction with the second chart shift dropped");
+        let contracted_at = |displaced: &Array1<f64>| {
+            let axes = family
+                .baseline_exact_joint_psisecond_order_hessian_directional_derivative_all_beta_axes_with_options(
+                    &states_at_beta(&family, displaced),
+                    axis,
+                    other_axis,
+                    &options,
+                )
+                .expect("chart-pair third information derivative");
+            Array1::from_iter(axes.iter().map(|matrix| (&weight * matrix).sum()))
+        };
+        let scale = max_abs(dropped.iter());
+        for column in 0..beta.len() {
+            let stencil = derived_difference_stencil(|t| {
+                let mut displaced = beta.clone();
+                displaced[column] += t;
+                contracted_at(&displaced)
+            });
+            for row in 0..beta.len() {
+                let oracle = derived_difference(
+                    std::array::from_fn(|k| stencil[k][row]),
+                    DERIVED_DIFFERENCE_STEP,
+                    N_ROWS * beta.len() * beta.len(),
+                );
+                if oracle.band > scale {
+                    continue;
+                }
+                worst = worst.max((dropped[[row, column]] - oracle.value).abs() / oracle.band);
+            }
+        }
+    }
+    eprintln!("[2930-CONTROL] second chart shift dropped: worst gap over the gate band {worst:.3e}");
+    assert!(
+        worst > 1.0,
+        "the pair gate accepted a contraction missing the chart's second primary shift \
+         (worst gap over band {worst:.3e}), so it grades nothing about that term"
+    );
+}
+
 /// `D_β ∂²_θθ' H` for diagonal and cross baseline pairs, in both slope frames.
 #[test]
 fn baseline_psi_pair_third_information_matches_finite_difference_2765() {

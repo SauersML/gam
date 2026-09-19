@@ -15,6 +15,21 @@ pub(crate) struct GaussianLocationScaleWiggleGeometry {
     pub(crate) d4q_dq04: Array1<f64>,
 }
 
+/// The direction-independent pieces every directional Hessian operator of one workspace reads:
+/// the wiggle geometry and row scalars at the workspace's frozen states, and every design as a
+/// shared channel. The workspace builds this once, so its operators share one geometry and one
+/// pair-gram identity per design (#2940).
+pub(crate) struct GlsWiggleOperatorGeometry {
+    pub(crate) geometry: GaussianLocationScaleWiggleGeometry,
+    pub(crate) rows: Arc<GaussianJointRowScalars>,
+    pub(crate) xmu: SharedDesign,
+    pub(crate) x_ls: SharedDesign,
+    pub(crate) basis: SharedDesign,
+    pub(crate) basis_d1: SharedDesign,
+    pub(crate) basis_d2: SharedDesign,
+    pub(crate) basis_d3: SharedDesign,
+}
+
 /// Per-row pieces of the 3-block Gaussian location-scale-wiggle joint
 /// gradient and Hessian. Both the dense path and the matrix-free workspace
 /// share these row coefficients; only the assembly differs.
@@ -92,6 +107,7 @@ impl GaussianLocationScaleWiggleHessianRowPieces {
     }
 }
 
+#[derive(Clone)]
 pub struct GaussianLocationScaleWiggleFamily {
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -104,8 +120,6 @@ pub struct GaussianLocationScaleWiggleFamily {
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
     pub policy: gam_runtime::resource::ResourcePolicy,
-    pub(crate) cached_row_scalars:
-        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
     /// Whether this member's Jeffreys/Firth prior is armed. A fit arms it only
     /// on the unarmed fit's own evidence, through
     /// `fit_custom_family_arming_on_evidence` (#979).
@@ -119,27 +133,6 @@ impl MonotoneWiggleFamily for GaussianLocationScaleWiggleFamily {
 
     fn wiggle_degree(&self) -> usize {
         self.wiggle_degree
-    }
-}
-
-impl Clone for GaussianLocationScaleWiggleFamily {
-    fn clone(&self) -> Self {
-        Self {
-            y: self.y.clone(),
-            weights: self.weights.clone(),
-            mu_design: self.mu_design.clone(),
-            log_sigma_design: self.log_sigma_design.clone(),
-            wiggle_knots: self.wiggle_knots.clone(),
-            wiggle_degree: self.wiggle_degree,
-            policy: self.policy.clone(),
-            jeffreys_armed: self.jeffreys_armed,
-            cached_row_scalars: std::sync::RwLock::new(
-                self.cached_row_scalars
-                    .read()
-                    .expect("lock poisoned")
-                    .clone(),
-            ),
-        }
     }
 }
 
@@ -716,28 +709,25 @@ impl GaussianLocationScaleWiggleFamily {
     /// Build a matrix-free `RowCoeffOperator` for the GLS Wiggle joint
     /// directional derivative `D_β H_L[u]`. Output dimension is
     /// `pmu + p_ls + pw`. Channels (in order): X_mu, X_ls, B, B', B''.
-    pub(crate) fn gls_wiggle_directional_operator(
+    /// The operator geometry at `block_states`: the wiggle geometry and row scalars at those
+    /// states and every design as a shared channel, with identities minted here. A workspace
+    /// builds it once and hands it to every directional operator it builds (#2940).
+    pub(crate) fn gls_wiggle_operator_geometry(
         &self,
         block_states: &[ParameterBlockState],
         xmu_arc: Arc<Array2<f64>>,
         x_ls_arc: Arc<Array2<f64>>,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
+    ) -> Result<GlsWiggleOperatorGeometry, String> {
         validate_block_count::<GamlssError>(
             "GaussianLocationScaleWiggleFamily",
             3,
             block_states.len(),
         )?;
-        let pmu = xmu_arc.ncols();
-        let p_ls = x_ls_arc.ncols();
         let q0_eta = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
-        let layout = GamlssBetaLayout::withwiggle(pmu, p_ls, betaw.len());
-        let (umu, u_ls, uw) =
-            layout.split_three(d_beta_flat, "GLS Wiggle joint dH operator d_beta")?;
         if q0_eta.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
             return Err(GamlssError::DimensionMismatch {
                 reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
@@ -745,10 +735,52 @@ impl GaussianLocationScaleWiggleFamily {
             .into());
         }
         let q = q0_eta + etaw;
-        let geom = self.wiggle_geometry(q0_eta.view(), betaw.view())?;
+        let geometry = self.wiggle_geometry(q0_eta.view(), betaw.view())?;
+        if geometry.basis.ncols() != betaw.len() {
+            return Err(GamlssError::DimensionMismatch { reason: format!(
+                "GaussianLocationScaleWiggleFamily wiggle basis/beta mismatch: basis has {} columns but beta has {} entries",
+                geometry.basis.ncols(),
+                betaw.len()
+            ) }.into());
+        }
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
-        let xi = fast_av(xmu_arc.as_ref(), &umu);
-        let zeta = fast_av(x_ls_arc.as_ref(), &u_ls);
+        Ok(GlsWiggleOperatorGeometry {
+            rows,
+            xmu: SharedDesign::from_arc(xmu_arc),
+            x_ls: SharedDesign::from_arc(x_ls_arc),
+            basis: SharedDesign::new(geometry.basis.clone()),
+            basis_d1: SharedDesign::new(geometry.basis_d1.clone()),
+            basis_d2: SharedDesign::new(geometry.basis_d2.clone()),
+            basis_d3: SharedDesign::new(geometry.basis_d3.clone()),
+            geometry,
+        })
+    }
+
+    /// The first directional Hessian operator along `d_beta_flat`, at the states
+    /// `operator_geometry` was built from.
+    pub(crate) fn gls_wiggle_directional_operator(
+        &self,
+        operator_geometry: &GlsWiggleOperatorGeometry,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
+        let GlsWiggleOperatorGeometry {
+            geometry: geom,
+            rows,
+            xmu,
+            x_ls,
+            basis,
+            basis_d1,
+            basis_d2,
+            ..
+        } = operator_geometry;
+        let pmu = xmu.matrix().ncols();
+        let p_ls = x_ls.matrix().ncols();
+        let n = self.y.len();
+        let layout = GamlssBetaLayout::withwiggle(pmu, p_ls, basis.matrix().ncols());
+        let (umu, u_ls, uw) =
+            layout.split_three(d_beta_flat, "GLS Wiggle joint dH operator d_beta")?;
+        let xi = fast_av(xmu.matrix().as_ref(), &umu);
+        let zeta = fast_av(x_ls.matrix().as_ref(), &u_ls);
         let phi = fast_av(&geom.basis, &uw);
         let mut q_u = &geom.dq_dq0 * &xi;
         q_u += &phi;
@@ -786,19 +818,16 @@ impl GaussianLocationScaleWiggleFamily {
         // `RowCoeffOperator` reproduces a_ww + a_ww^T with c = w·xi.
         let coeff_b_b1 = &hessian_mm_base * &xi;
 
-        let basis: Arc<Array2<f64>> = Arc::new(geom.basis.clone());
-        let basis_d1: Arc<Array2<f64>> = Arc::new(geom.basis_d1.clone());
-        let basis_d2: Arc<Array2<f64>> = Arc::new(geom.basis_d2.clone());
-        let pw = basis.ncols();
+        let pw = basis.matrix().ncols();
 
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pmu, p_ls, pw],
             vec![
-                (0, xmu_arc),
-                (1, x_ls_arc),
-                (2, basis),
-                (2, basis_d1),
-                (2, basis_d2),
+                (0, xmu.clone()),
+                (1, x_ls.clone()),
+                (2, basis.clone()),
+                (2, basis_d1.clone()),
+                (2, basis_d2.clone()),
             ],
             vec![
                 // (X_mu, X_mu) ← `xt_diag_x_dense(xmu, &coeff_mm_u)`
@@ -834,41 +863,31 @@ impl GaussianLocationScaleWiggleFamily {
     /// `basis_u = diag(ξ_u)·B'`, `basis_uv = diag(ξ_u·ξ_v)·B''`, etc.
     pub(crate) fn gls_wiggle_second_directional_operator(
         &self,
-        block_states: &[ParameterBlockState],
-        xmu_arc: Arc<Array2<f64>>,
-        x_ls_arc: Arc<Array2<f64>>,
+        operator_geometry: &GlsWiggleOperatorGeometry,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        validate_block_count::<GamlssError>(
-            "GaussianLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let pmu = xmu_arc.ncols();
-        let p_ls = x_ls_arc.ncols();
-        let q0_eta = &block_states[Self::BLOCK_MU].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
+        let GlsWiggleOperatorGeometry {
+            geometry: geom,
+            rows,
+            xmu,
+            x_ls,
+            basis,
+            basis_d1,
+            basis_d2,
+            basis_d3,
+        } = operator_geometry;
+        let pmu = xmu.matrix().ncols();
+        let p_ls = x_ls.matrix().ncols();
         let n = self.y.len();
-        let layout = GamlssBetaLayout::withwiggle(pmu, p_ls, betaw.len());
+        let layout = GamlssBetaLayout::withwiggle(pmu, p_ls, basis.matrix().ncols());
         let (umu, u_ls, uw) = layout.split_three(d_beta_u, "GLS Wiggle d2H operator (u)")?;
         let (vmu, v_ls, vw) = layout.split_three(d_beta_v, "GLS Wiggle d2H operator (v)")?;
-        if q0_eta.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
-        let q = q0_eta + etaw;
-        let geom = self.wiggle_geometry(q0_eta.view(), betaw.view())?;
-        let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
 
-        let xi_u = fast_av(xmu_arc.as_ref(), &umu);
-        let xi_v = fast_av(xmu_arc.as_ref(), &vmu);
-        let zeta_u = fast_av(x_ls_arc.as_ref(), &u_ls);
-        let zeta_v = fast_av(x_ls_arc.as_ref(), &v_ls);
+        let xi_u = fast_av(xmu.matrix().as_ref(), &umu);
+        let xi_v = fast_av(xmu.matrix().as_ref(), &vmu);
+        let zeta_u = fast_av(x_ls.matrix().as_ref(), &u_ls);
+        let zeta_v = fast_av(x_ls.matrix().as_ref(), &v_ls);
         let phi_u = fast_av(&geom.basis, &uw);
         let phi_v = fast_av(&geom.basis, &vw);
         let b1u = fast_av(&geom.basis_d1, &uw);
@@ -953,21 +972,17 @@ impl GaussianLocationScaleWiggleFamily {
         let coeff_b_b2 = &hessian_mm_base * &xi_u_xi_v;
         let coeff_b1_b1 = 2.0 * &(&hessian_mm_base * &xi_u_xi_v);
 
-        let basis: Arc<Array2<f64>> = Arc::new(geom.basis.clone());
-        let basis_d1: Arc<Array2<f64>> = Arc::new(geom.basis_d1.clone());
-        let basis_d2: Arc<Array2<f64>> = Arc::new(geom.basis_d2.clone());
-        let basis_d3: Arc<Array2<f64>> = Arc::new(geom.basis_d3.clone());
-        let pw = basis.ncols();
+        let pw = basis.matrix().ncols();
 
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pmu, p_ls, pw],
             vec![
-                (0, xmu_arc),
-                (1, x_ls_arc),
-                (2, basis),
-                (2, basis_d1),
-                (2, basis_d2),
-                (2, basis_d3),
+                (0, xmu.clone()),
+                (1, x_ls.clone()),
+                (2, basis.clone()),
+                (2, basis_d1.clone()),
+                (2, basis_d2.clone()),
+                (2, basis_d3.clone()),
             ],
             vec![
                 // (X_mu, X_mu) ← `xt_diag_x_dense(xmu, &coeff_mm_uv)`
@@ -2496,6 +2511,9 @@ pub(crate) struct GaussianLocationScaleWiggleHessianWorkspace {
     pub(crate) xmu: Arc<Array2<f64>>,
     pub(crate) x_ls: Arc<Array2<f64>>,
     pub(crate) pieces: GaussianLocationScaleWiggleHessianRowPieces,
+    /// The geometry every directional operator of this workspace shares, built on the first
+    /// request so value-only evaluations never build it (#2940).
+    pub(crate) operator_geometry: std::sync::OnceLock<GlsWiggleOperatorGeometry>,
 }
 
 impl GaussianLocationScaleWiggleHessianWorkspace {
@@ -2512,7 +2530,23 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
             xmu: Arc::new(xmu),
             x_ls: Arc::new(x_ls),
             pieces,
+            operator_geometry: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The shared operator geometry at this workspace's frozen states, built on first use. Two
+    /// concurrent first requests may both build one; `get_or_init` keeps the first, so every
+    /// operator reads one set of design identities.
+    fn shared_operator_geometry(&self) -> Result<&GlsWiggleOperatorGeometry, String> {
+        if let Some(geometry) = self.operator_geometry.get() {
+            return Ok(geometry);
+        }
+        let built = self.family.gls_wiggle_operator_geometry(
+            &self.block_states,
+            self.xmu.clone(),
+            self.x_ls.clone(),
+        )?;
+        Ok(self.operator_geometry.get_or_init(|| built))
     }
 
     /// Apply a Horvitz–Thompson outer-row subsample mask to the precomputed
@@ -2705,12 +2739,8 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        self.family.gls_wiggle_directional_operator(
-            &self.block_states,
-            self.xmu.clone(),
-            self.x_ls.clone(),
-            d_beta_flat,
-        )
+        self.family
+            .gls_wiggle_directional_operator(self.shared_operator_geometry()?, d_beta_flat)
     }
 
     fn second_directional_derivative(
@@ -2734,9 +2764,7 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         self.family.gls_wiggle_second_directional_operator(
-            &self.block_states,
-            self.xmu.clone(),
-            self.x_ls.clone(),
+            self.shared_operator_geometry()?,
             d_beta_u,
             d_beta_v,
         )

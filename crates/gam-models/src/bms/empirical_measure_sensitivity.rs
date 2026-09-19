@@ -328,6 +328,22 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
             }
         }
     }
+    // Each node is its bin's rounded mean. The bins fill in ascending score order,
+    // so the exact means ascend, but on a tie two bins share the rounded means can
+    // come out in the wrong order, which the grid refuses (gam#2926). Sort the
+    // nodes once, carrying each node's weight, mass and allocation entries.
+    let mut order: Vec<usize> = (0..nodes.len()).collect();
+    order.sort_by(|&left, &right| nodes[left].total_cmp(&nodes[right]));
+    let mut position_of = vec![0usize; order.len()];
+    for (position, &node) in order.iter().enumerate() {
+        position_of[node] = position;
+    }
+    nodes = order.iter().map(|&node| nodes[node]).collect();
+    out_weights = order.iter().map(|&node| out_weights[node]).collect();
+    bin_mass = order.iter().map(|&node| bin_mass[node]).collect();
+    for entry in &mut alpha {
+        entry.0 = position_of[entry.0];
+    }
     if nodes.len() < 2 {
         return Err(format!(
             "{context} compression produced fewer than two nodes"

@@ -57,11 +57,7 @@ fn already_resident_cuda_driver() -> Option<Library> {
     None
 }
 
-fn load_library_names(candidates: &[String]) -> Result<Library, GpuError> {
-    #[cfg(target_os = "linux")]
-    if let Some(resident) = already_resident_cuda_driver() {
-        return Ok(resident);
-    }
+pub(crate) fn load_library_names(candidates: &[String]) -> Result<Library, GpuError> {
     let mut load_faults = Vec::new();
     for candidate in candidates {
         // SAFETY: Library::new runs the library's loader initializer; we
@@ -133,7 +129,16 @@ fn load_failure_is_candidate_absence(
 fn load_static_cuda_driver_library() -> Result<&'static Library, GpuError> {
     static LIBRARY: OnceLock<Result<Library, GpuError>> = OnceLock::new();
     LIBRARY
-        .get_or_init(|| load_library_names(&cuda_library_candidate_names()))
+        .get_or_init(|| {
+            // Only libcuda may be answered by the resident driver. Inside the shared
+            // candidate walk it answered every compute-library probe with libcuda
+            // once libcuda was loaded, so a host without cuBLAS passed admission.
+            #[cfg(target_os = "linux")]
+            if let Some(resident) = already_resident_cuda_driver() {
+                return Ok(resident);
+            }
+            load_library_names(&cuda_library_candidate_names())
+        })
         .as_ref()
         .map_err(Clone::clone)
 }
@@ -146,6 +151,202 @@ pub fn preload_cuda_driver() -> Result<(), GpuError> {
             Ok(())
         })
         .clone()
+}
+
+/// A CUDA library that cudarc opens lazily, the first time one of its entry
+/// points needs it.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CudarcLibrary {
+    Driver,
+    Runtime,
+    Blas,
+    Solver,
+    Nvrtc,
+}
+
+#[cfg(target_os = "linux")]
+impl CudarcLibrary {
+    /// The names cudarc's generated `culib()` expands into candidates for this
+    /// library (cudarc 0.19.8 `src/{driver,runtime,cublas,cusolver,nvrtc}/sys/mod.rs`),
+    /// and the slot that keeps gam's opened handle resident.
+    fn cudarc_names_and_slot(
+        self,
+    ) -> (
+        &'static [&'static str],
+        &'static OnceLock<Result<Library, GpuError>>,
+    ) {
+        static DRIVER: OnceLock<Result<Library, GpuError>> = OnceLock::new();
+        static RUNTIME: OnceLock<Result<Library, GpuError>> = OnceLock::new();
+        static BLAS: OnceLock<Result<Library, GpuError>> = OnceLock::new();
+        static SOLVER: OnceLock<Result<Library, GpuError>> = OnceLock::new();
+        static NVRTC: OnceLock<Result<Library, GpuError>> = OnceLock::new();
+        match self {
+            Self::Driver => (&["cuda", "nvcuda"], &DRIVER),
+            Self::Runtime => (&["cudart"], &RUNTIME),
+            Self::Blas => (&["cublas"], &BLAS),
+            Self::Solver => (&["cusolver"], &SOLVER),
+            Self::Nvrtc => (&["nvrtc"], &NVRTC),
+        }
+    }
+
+    /// cudarc's primary name for this library, for refusal messages.
+    pub(crate) fn name(self) -> &'static str {
+        self.cudarc_names_and_slot().0[0]
+    }
+}
+
+/// Open `library` the way cudarc's lazy loader will, returning a typed error
+/// where cudarc would panic.
+///
+/// cudarc's `culib()` tries `libloading::Library::new` on each
+/// `get_lib_name_candidates` name in order and calls `panic_no_lib_found` when
+/// none opens (cudarc 0.19.8 `src/driver/sys/mod.rs:16119`). Nothing recovers
+/// that panic in a `panic = "abort"` build, so every cudarc call that can reach
+/// the loader must pass this walk first (#2972). The walk tries the same names in
+/// the same order and keeps the opened handle resident, so cudarc's own walk
+/// opens that same library and nothing else is mapped. gam's wider candidate
+/// list in [`preload_cuda_driver`] must not stand in for it before cudarc's
+/// primary context exists: opening that list first left cuBLAS/cuSOLVER handles
+/// NOT_INITIALIZED on a T4 (#1017, cf746561f8).
+///
+/// `get_lib_name_candidates` is compiled because cudarc's build script turns
+/// `fallback-dynamic-loading` into `dynamic-loading`, which is also the only mode
+/// whose loader can panic.
+#[cfg(target_os = "linux")]
+pub(crate) fn require_cudarc_library(library: CudarcLibrary) -> Result<(), GpuError> {
+    let (names, slot) = library.cudarc_names_and_slot();
+    let opened = slot.get_or_init(|| {
+        let searched = match library {
+            CudarcLibrary::Nvrtc => preload_runtime_matched_nvrtc()?,
+            CudarcLibrary::Driver
+            | CudarcLibrary::Runtime
+            | CudarcLibrary::Blas
+            | CudarcLibrary::Solver => Vec::new(),
+        };
+        let candidates: Vec<String> = names
+            .iter()
+            .flat_map(|name| cudarc::get_lib_name_candidates(name))
+            .collect();
+        load_library_names(&candidates).map_err(|error| naming_searched_paths(error, &searched))
+    });
+    match opened {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+/// An absence refusal from cudarc's names, extended by the explicit paths
+/// searched beside the mapped CUDA runtime (#2283), so it says every place the
+/// library was looked for.
+#[cfg(target_os = "linux")]
+fn naming_searched_paths(error: GpuError, searched: &[PathBuf]) -> GpuError {
+    match error {
+        GpuError::DriverLibraryUnavailable { reason } if !searched.is_empty() => {
+            GpuError::DriverLibraryUnavailable {
+                reason: format!(
+                    "{reason}; beside the mapped CUDA runtime: {}",
+                    searched
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Where NVRTC for the CUDA runtime at `cudart` lives, in the order it is looked
+/// for (#2283). A pip install keeps each CUDA component in its own `nvidia`
+/// package (`cuda_runtime/lib/libcudart.so.<major>` beside
+/// `cuda_nvrtc/lib/libnvrtc.so.<major>`); a toolkit keeps both in one directory.
+/// The major is the runtime's own soname major (a mapped toolkit runtime reads
+/// as `libcudart.so.12.4.127`), so NVRTC always matches the runtime the process
+/// runs. `None` when `cudart` is not a runtime library.
+#[cfg(target_os = "linux")]
+fn nvrtc_paths_for_runtime(cudart: &Path) -> Option<Vec<PathBuf>> {
+    let version = cudart.file_name()?.to_str()?.strip_prefix("libcudart.so")?;
+    let soname = match version.strip_prefix('.').and_then(|rest| rest.split('.').next()) {
+        Some(major) if !major.is_empty() => format!("libnvrtc.so.{major}"),
+        _ if version.is_empty() => "libnvrtc.so".to_string(),
+        _ => return None,
+    };
+    let mut dirs = Vec::new();
+    if let Some(root) = nvidia_package_root_for_library(cudart) {
+        dirs.push(root.join("cuda_nvrtc").join("lib"));
+    }
+    if let Some(parent) = cudart.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    Some(dedup_paths(dirs.into_iter().map(|dir| dir.join(&soname)).collect()))
+}
+
+/// Map NVRTC from the CUDA userspace stack whose runtime this process has
+/// mapped, by explicit path, and return the paths searched (#2283).
+///
+/// cudarc opens NVRTC by bare soname, which the platform loader resolves only on
+/// its search path. The preload that maps the rest of the stack from its own
+/// directories does not carry NVRTC, so on a pip install NVRTC was unreachable:
+/// the sparse-dictionary device score block refused at its compile with "could
+/// not load any of: libnvrtc.so, …" on an A100 whose environment ships
+/// `nvidia/cuda_nvrtc/lib/libnvrtc.so.12` (job 1253972). Mapped here in the global
+/// scope the stack preload uses, the bare-soname open then binds to it. When no
+/// runtime is mapped, or NVRTC is already mapped, or no NVRTC sits beside the
+/// runtime, nothing is loaded and cudarc's own walk decides; the searched paths
+/// then go into its refusal.
+#[cfg(target_os = "linux")]
+fn preload_runtime_matched_nvrtc() -> Result<Vec<PathBuf>, GpuError> {
+    static NVRTC: OnceLock<Result<(Vec<PathBuf>, Option<UnixLibrary>), GpuError>> =
+        OnceLock::new();
+    NVRTC
+        .get_or_init(|| {
+            let maps = std::fs::read_to_string("/proc/self/maps").map_err(|error| {
+                GpuError::DriverLibraryUnavailable {
+                    reason: format!("cannot inspect mapped CUDA libraries for NVRTC: {error}"),
+                }
+            })?;
+            let mapped: Vec<PathBuf> = maps
+                .lines()
+                .filter_map(|line| line.split_whitespace().last())
+                .filter(|path| path.starts_with('/'))
+                .map(PathBuf::from)
+                .collect();
+            let is_named = |path: &PathBuf, prefix: &str| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix))
+            };
+            if mapped.iter().any(|path| is_named(path, "libnvrtc.so")) {
+                return Ok((Vec::new(), None));
+            }
+            let Some(searched) = mapped
+                .iter()
+                .find(|path| is_named(path, "libcudart.so"))
+                .and_then(|cudart| nvrtc_paths_for_runtime(cudart))
+            else {
+                return Ok((Vec::new(), None));
+            };
+            let Some(path) = searched.iter().find(|path| path.exists()) else {
+                return Ok((searched, None));
+            };
+            // SAFETY: `path` is the NVRTC library of the CUDA stack whose runtime
+            // this process already runs, found beside that runtime; global scope
+            // is what lets cudarc's bare-soname open bind to it.
+            let library = unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }
+                .map_err(|error| GpuError::DriverLibraryLoadFailed {
+                    reason: format!(
+                        "NVRTC beside the mapped CUDA runtime failed to load: {}: {}",
+                        path.display(),
+                        library_load_error_detail(&error)
+                    ),
+                })?;
+            Ok((searched, Some(library)))
+        })
+        .as_ref()
+        .map(|(searched, _)| searched.clone())
+        .map_err(Clone::clone)
 }
 
 #[cfg(test)]
@@ -255,7 +456,8 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
 ///
 /// `GpuRuntime::probe()` calls this for every compute library it depends on;
 /// failure retains the exact stack-selection or loader error in the typed GPU
-/// refusal and keeps cudarc's panic completely off the call path.
+/// refusal. What keeps cudarc's loader panic off the call path is the probe's
+/// separate walk over cudarc's own names (`require_cudarc_library`).
 pub fn require_cuda_compute_library(stem: &str) -> Result<(), String> {
     // Cache the probe per stem and KEEP the loaded handle alive for the process
     // lifetime. Dropping the `Library` here dlclose's it; that dlopen+dlclose
@@ -354,7 +556,7 @@ fn is_cuda_compute_component(component: &str) -> bool {
 fn complete_mapped_cuda_stack(mapped: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let canonical = |p: &Path| {
         p.canonicalize().unwrap_or_else(|error| {
-            log::debug!(
+            log::trace!(
                 "cuda stack: cannot canonicalize {}: {error}; \
                  comparing the path as given",
                 p.display()
@@ -1023,6 +1225,72 @@ mod tests {
     fn from_col_major_single_element() {
         let result = from_col_major(&[7.0], 1, 1).expect("should succeed");
         assert_eq!(result[[0, 0]], 7.0);
+    }
+
+    /// #2283: NVRTC is found beside a pip runtime, in its own `cuda_nvrtc`
+    /// package, at the runtime's own major; a decoy of another major is not
+    /// taken, and a toolkit runtime (mapped under its full version) finds NVRTC
+    /// in its own directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvrtc_resolves_beside_the_mapped_runtime_at_its_major_2283() {
+        let temp = tempfile::tempdir().expect("temporary CUDA tree");
+        let root = temp.path().join("venv").join("site-packages").join("nvidia");
+        let runtime = root.join("cuda_runtime").join("lib").join("libcudart.so.13");
+        let nvrtc_dir = root.join("cuda_nvrtc").join("lib");
+        for path in [&runtime, &nvrtc_dir.join("libnvrtc.so.13"), &nvrtc_dir.join("libnvrtc.so.12")] {
+            std::fs::create_dir_all(path.parent().expect("library parent"))
+                .expect("create fake CUDA component directory");
+            std::fs::write(path, []).expect("create fake CUDA library");
+        }
+        let searched = nvrtc_paths_for_runtime(&runtime).expect("a runtime library");
+        let found = searched.iter().find(|path| path.exists()).expect("NVRTC beside the runtime");
+        assert_eq!(
+            found,
+            &nvrtc_dir.join("libnvrtc.so.13").canonicalize().expect("canonical NVRTC"),
+            "NVRTC must come from the runtime's own package at its major: searched {searched:?}"
+        );
+
+        let toolkit = temp.path().join("cuda").join("lib64");
+        std::fs::create_dir_all(&toolkit).expect("toolkit dir");
+        let toolkit_runtime = toolkit.join("libcudart.so.12.4.127");
+        std::fs::write(&toolkit_runtime, []).expect("toolkit runtime");
+        std::fs::write(toolkit.join("libnvrtc.so.12"), []).expect("toolkit NVRTC");
+        let searched = nvrtc_paths_for_runtime(&toolkit_runtime).expect("a runtime library");
+        assert_eq!(searched, vec![
+            toolkit.join("libnvrtc.so.12").canonicalize().expect("canonical toolkit NVRTC")
+        ]);
+        assert!(nvrtc_paths_for_runtime(&toolkit.join("libcublas.so.12")).is_none());
+    }
+
+    /// #2283: with no NVRTC beside the runtime, the refusal names each path
+    /// searched there as well as cudarc's names.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_absent_nvrtc_is_refused_naming_the_searched_paths_2283() {
+        let temp = tempfile::tempdir().expect("temporary CUDA tree");
+        let root = temp.path().join("site-packages").join("nvidia");
+        let stack = fake_nvidia_stack(&root);
+        let searched = nvrtc_paths_for_runtime(&stack[0]).expect("a runtime library");
+        assert!(searched.iter().all(|path| !path.exists()), "the fixture carries no NVRTC");
+        let refusal = naming_searched_paths(
+            GpuError::DriverLibraryUnavailable {
+                reason: "could not load any of: libnvrtc.so, libnvrtc.so.12".to_string(),
+            },
+            &searched,
+        );
+        let GpuError::DriverLibraryUnavailable { reason } = refusal else {
+            panic!("an absent NVRTC stays an absence refusal, got {refusal:?}");
+        };
+        assert!(reason.contains("libnvrtc.so.12"), "cudarc's names stay in the refusal: {reason}");
+        for path in &searched {
+            assert!(
+                reason.contains(&path.display().to_string()),
+                "the refusal must name {} : {reason}",
+                path.display()
+            );
+        }
+        assert!(reason.contains("cuda_nvrtc"), "the pip package path is searched: {reason}");
     }
 
     #[cfg(target_os = "linux")]

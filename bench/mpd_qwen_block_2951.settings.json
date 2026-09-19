@@ -1,0 +1,91 @@
+{
+  "schema": "mpd-qwen-block-settings/1",
+  "note": "Declared experiment inputs for the #2951 A12-style Qwen3-8B l18 SwiGLU receipt. Coefficients s give the executed tensor W + left diag(1) right^T with row j scaled by 1+s (row) or column k scaled by 1+s (column); every s is exactly representable. t* = 5.",
+  "rows": 32,
+  "settings": [
+    {"name": "all_on", "edits": []},
+    {"name": "gate_global_continuous", "edits": [
+      {"tensor_id": "gate_proj.weight", "scope": "global", "positions": null, "components": [
+        {"kind": "row", "index": 0, "coefficient": -0.25},
+        {"kind": "row", "index": 1, "coefficient": -0.5},
+        {"kind": "row", "index": 6143, "coefficient": -0.75},
+        {"kind": "row", "index": 12287, "coefficient": -0.125},
+        {"kind": "column", "index": 0, "coefficient": -0.5},
+        {"kind": "column", "index": 4095, "coefficient": -0.25}
+      ]}
+    ]},
+    {"name": "gate_use_site0_continuous", "edits": [
+      {"tensor_id": "gate_proj.weight", "scope": "use_site", "ordinal": 0, "positions": null, "components": [
+        {"kind": "row", "index": 0, "coefficient": -0.25},
+        {"kind": "row", "index": 1, "coefficient": -0.5},
+        {"kind": "row", "index": 6143, "coefficient": -0.75},
+        {"kind": "row", "index": 12287, "coefficient": -0.125},
+        {"kind": "column", "index": 0, "coefficient": -0.5},
+        {"kind": "column", "index": 4095, "coefficient": -0.25}
+      ]}
+    ]},
+    {"name": "gate_global_p1_subset", "edits": [
+      {"tensor_id": "gate_proj.weight", "scope": "global", "positions": null, "components": [
+        {"kind": "row", "index": 0, "coefficient": -0.25},
+        {"kind": "row", "index": 1, "coefficient": -0.5},
+        {"kind": "column", "index": 0, "coefficient": -0.5}
+      ]}
+    ]},
+    {"name": "up_global_binary", "edits": [
+      {"tensor_id": "up_proj.weight", "scope": "global", "positions": null, "components": [
+        {"kind": "row", "index": 2, "coefficient": -1.0},
+        {"kind": "row", "index": 3, "coefficient": -1.0},
+        {"kind": "row", "index": 9000, "coefficient": -1.0},
+        {"kind": "column", "index": 1, "coefficient": -1.0}
+      ]}
+    ]},
+    {"name": "down_global_signed", "edits": [
+      {"tensor_id": "down_proj.weight", "scope": "global", "positions": null, "components": [
+        {"kind": "column", "index": 0, "coefficient": -2.0},
+        {"kind": "column", "index": 6143, "coefficient": 0.5},
+        {"kind": "row", "index": 17, "coefficient": -1.5}
+      ]}
+    ]},
+    {"name": "gate_up_down_one_forward", "edits": [
+      {"tensor_id": "gate_proj.weight", "scope": "global", "positions": null, "components": [
+        {"kind": "row", "index": 0, "coefficient": -0.25},
+        {"kind": "row", "index": 1, "coefficient": -0.5},
+        {"kind": "column", "index": 0, "coefficient": -0.5}
+      ]},
+      {"tensor_id": "up_proj.weight", "scope": "global", "positions": null, "components": [
+        {"kind": "row", "index": 2, "coefficient": -1.0},
+        {"kind": "column", "index": 1, "coefficient": -1.0}
+      ]},
+      {"tensor_id": "down_proj.weight", "scope": "global", "positions": null, "components": [
+        {"kind": "column", "index": 0, "coefficient": -2.0},
+        {"kind": "row", "index": 17, "coefficient": -1.5}
+      ]}
+    ]},
+    {"name": "gate_global_at_t5", "edits": [
+      {"tensor_id": "gate_proj.weight", "scope": "global", "positions": [5], "components": [
+        {"kind": "row", "index": 0, "coefficient": -0.25},
+        {"kind": "row", "index": 1, "coefficient": -0.5},
+        {"kind": "row", "index": 6143, "coefficient": -0.75},
+        {"kind": "row", "index": 12287, "coefficient": -0.125},
+        {"kind": "column", "index": 0, "coefficient": -0.5},
+        {"kind": "column", "index": 4095, "coefficient": -0.25}
+      ]}
+    ]},
+    {"name": "up_use_site0_at_t5", "edits": [
+      {"tensor_id": "up_proj.weight", "scope": "use_site", "ordinal": 0, "positions": [5], "components": [
+        {"kind": "row", "index": 2, "coefficient": -1.0},
+        {"kind": "row", "index": 3, "coefficient": -1.0},
+        {"kind": "row", "index": 9000, "coefficient": -1.0},
+        {"kind": "column", "index": 1, "coefficient": -1.0}
+      ]}
+    ]}
+  ],
+  "controls": [
+    {"name": "I1_global_equals_use_site0", "kind": "identity", "native_from": "gate_global_continuous", "externals_from": "gate_use_site0_continuous"},
+    {"name": "D1_global_differs_from_p1_subset", "kind": "distinct", "native_from": "gate_global_continuous", "externals_from": "gate_global_p1_subset"},
+    {"name": "C1_native_p1_plus_p2_vs_torch_p1", "kind": "refute", "native_from": "gate_global_continuous", "externals_from": "gate_global_p1_subset", "stages": ["gate"]},
+    {"name": "C2_scope_at_t6_vs_torch_t5", "kind": "refute", "native_from": "gate_global_at_t5", "externals_from": "gate_global_at_t5", "rows_override": {"gate_proj.weight": [6]}, "stages": ["gate"]},
+    {"name": "C3_gate_edit_on_up", "kind": "refute", "native_from": "gate_global_continuous", "externals_from": "gate_global_continuous", "move_edit": {"from": "gate_proj.weight", "to": "up_proj.weight"}, "stages": ["gate", "up"]},
+    {"name": "C4_binary_coefficient_flipped", "kind": "refute", "native_from": "up_global_binary", "externals_from": "up_global_binary", "coefficients_override": {"up_proj.weight": [1.0, 1.0, 0.0, 1.0]}, "stages": ["up"]}
+  ]
+}

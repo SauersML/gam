@@ -402,6 +402,250 @@ impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>
             Ok(())
         })
     }
+
+    /// `⟨W, ∂_θ H²[e_a, e_b]⟩` for every axis pair along a coordinate that moves only the
+    /// location index's offsets (gam#2930). A baseline chart shifts the primaries by `∂_θ o`
+    /// and leaves the coefficient map `J` fixed, so a row contributes
+    /// `w_r·Jᵀ⟨W_row, T⁵[·, ·, ·, ·, ∂_θ o]⟩J`, pulled back as a Hessian in one row pass.
+    /// `row_weights` is the outer row measure. Linear in the symmetric weight `W`.
+    pub(crate) fn contracted_trace_hessian_primary_shift(
+        &self,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+        shift: impl Fn(usize) -> Result<[f64; STATIC_SLOPE_PRIMARIES], String> + Sync,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p) || row_weights.len() != self.family.n {
+            return Err(format!(
+                "survival contracted trace Hessian offset derivative requires a ({p}, {p}) weight and {} row weights",
+                self.family.n
+            ));
+        }
+        self.chunked_pullback_reduce(p, |row, acc| -> Result<(), String> {
+            let row_weight = row_weights[row];
+            if row_weight == 0.0 {
+                return Ok(());
+            }
+            let inputs = rigid_row_inputs(
+                &self.family,
+                &self.block_states,
+                row,
+                "contracted trace Hessian offset derivative",
+            )?;
+            let primaries = rigid_row_kernel_primaries::<
+                STATIC_SLOPE_PRIMARIES,
+                StaticSlopeGeometry,
+            >(&self.family, &self.block_states, row)?;
+            let fifth = static_row_fifth(&primaries, &inputs)?;
+            let w_row = self.primary_trace_weight(row, weight)?;
+            let offset = shift(row)?;
+            let mut coeff = [[0.0_f64; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES];
+            for c in 0..STATIC_SLOPE_PRIMARIES {
+                for d in 0..STATIC_SLOPE_PRIMARIES {
+                    let mut sum = 0.0;
+                    for a in 0..STATIC_SLOPE_PRIMARIES {
+                        for b in 0..STATIC_SLOPE_PRIMARIES {
+                            for e in 0..STATIC_SLOPE_PRIMARIES {
+                                sum += w_row[a][b] * fifth[a][b][c][d][e] * offset[e];
+                            }
+                        }
+                    }
+                    coeff[c][d] = row_weight * sum;
+                }
+            }
+            self.add_pullback_hessian(row, &coeff, acc);
+            Ok(())
+        })
+    }
+
+    /// `⟨W, ∂_θ H³[u, e_a, e_b]⟩` for every axis pair along an offset-moving coordinate `θ`
+    /// (gam#2930): a row contributes `w_r·Jᵀ⟨W_row, T⁶[·, ·, ·, ·, Ju, ∂_θ o]⟩J`, pulled back as
+    /// a Hessian in one row pass. Linear in the symmetric weight `W`.
+    pub(crate) fn contracted_trace_hessian_primary_shift_directional(
+        &self,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+        u: &[f64],
+        shift: impl Fn(usize) -> Result<[f64; STATIC_SLOPE_PRIMARIES], String> + Sync,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p)
+            || row_weights.len() != self.family.n
+            || u.len() != p
+            || u.iter().any(|x| !x.is_finite())
+        {
+            return Err(format!(
+                "survival contracted trace Hessian offset-directional derivative requires a ({p}, {p}) weight, {} row weights and a finite direction of length {p}",
+                self.family.n
+            ));
+        }
+        self.chunked_pullback_reduce(p, |row, acc| -> Result<(), String> {
+            let row_weight = row_weights[row];
+            if row_weight == 0.0 {
+                return Ok(());
+            }
+            let inputs = rigid_row_inputs(
+                &self.family,
+                &self.block_states,
+                row,
+                "contracted trace Hessian offset-directional derivative",
+            )?;
+            let primaries = rigid_row_kernel_primaries::<
+                STATIC_SLOPE_PRIMARIES,
+                StaticSlopeGeometry,
+            >(&self.family, &self.block_states, row)?;
+            let sixth = static_row_sixth(&primaries, &inputs)?;
+            let w_row = self.primary_trace_weight(row, weight)?;
+            let du = self.jacobian_action(row, u);
+            let offset = shift(row)?;
+            let mut coeff = [[0.0_f64; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES];
+            for c in 0..STATIC_SLOPE_PRIMARIES {
+                for d in 0..STATIC_SLOPE_PRIMARIES {
+                    let mut sum = 0.0;
+                    for a in 0..STATIC_SLOPE_PRIMARIES {
+                        for b in 0..STATIC_SLOPE_PRIMARIES {
+                            for e in 0..STATIC_SLOPE_PRIMARIES {
+                                for f in 0..STATIC_SLOPE_PRIMARIES {
+                                    sum += w_row[a][b] * sixth[a][b][c][d][e][f] * du[e] * offset[f];
+                                }
+                            }
+                        }
+                    }
+                    coeff[c][d] = row_weight * sum;
+                }
+            }
+            self.add_pullback_hessian(row, &coeff, acc);
+            Ok(())
+        })
+    }
+
+    /// `⟨W, ∂²_θθ' H²[e_a, e_b]⟩` for every axis pair along two offset-moving coordinates
+    /// (gam#2930). With first shifts `∂_θ o`, `∂_θ' o` and second shift `∂²_θθ' o`, a row
+    /// contributes `w_r·Jᵀ⟨W_row, T⁶[·, ·, ·, ·, ∂_θ o, ∂_θ' o] + T⁵[·, ·, ·, ·, ∂²_θθ' o]⟩J`,
+    /// pulled back as a Hessian in one row pass. Linear in the symmetric weight `W`.
+    pub(crate) fn contracted_trace_hessian_primary_shift_pair(
+        &self,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+        shifts: impl Fn(
+            usize,
+        ) -> Result<
+            (
+                [f64; STATIC_SLOPE_PRIMARIES],
+                [f64; STATIC_SLOPE_PRIMARIES],
+                [f64; STATIC_SLOPE_PRIMARIES],
+            ),
+            String,
+        > + Sync,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p) || row_weights.len() != self.family.n {
+            return Err(format!(
+                "survival contracted trace Hessian offset-pair derivative requires a ({p}, {p}) weight and {} row weights",
+                self.family.n
+            ));
+        }
+        self.chunked_pullback_reduce(p, |row, acc| -> Result<(), String> {
+            let row_weight = row_weights[row];
+            if row_weight == 0.0 {
+                return Ok(());
+            }
+            let inputs = rigid_row_inputs(
+                &self.family,
+                &self.block_states,
+                row,
+                "contracted trace Hessian offset-pair derivative",
+            )?;
+            let primaries = rigid_row_kernel_primaries::<
+                STATIC_SLOPE_PRIMARIES,
+                StaticSlopeGeometry,
+            >(&self.family, &self.block_states, row)?;
+            let fifth = static_row_fifth(&primaries, &inputs)?;
+            let sixth = static_row_sixth(&primaries, &inputs)?;
+            let w_row = self.primary_trace_weight(row, weight)?;
+            let (offset_i, offset_j, offset_ij) = shifts(row)?;
+            let mut coeff = [[0.0_f64; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES];
+            for c in 0..STATIC_SLOPE_PRIMARIES {
+                for d in 0..STATIC_SLOPE_PRIMARIES {
+                    let mut sum = 0.0;
+                    for a in 0..STATIC_SLOPE_PRIMARIES {
+                        for b in 0..STATIC_SLOPE_PRIMARIES {
+                            for e in 0..STATIC_SLOPE_PRIMARIES {
+                                sum += w_row[a][b] * fifth[a][b][c][d][e] * offset_ij[e];
+                                for f in 0..STATIC_SLOPE_PRIMARIES {
+                                    sum += w_row[a][b]
+                                        * sixth[a][b][c][d][e][f]
+                                        * offset_i[e]
+                                        * offset_j[f];
+                                }
+                            }
+                        }
+                    }
+                    coeff[c][d] = row_weight * sum;
+                }
+            }
+            self.add_pullback_hessian(row, &coeff, acc);
+            Ok(())
+        })
+    }
+
+    /// [`Self::design_contracted_trace_hessian_psi_from`] on the time-constant slope frame.
+    pub(crate) fn design_contracted_trace_hessian_psi(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.design_contracted_trace_hessian_psi_from(
+            derivative_blocks,
+            psi_index,
+            weight,
+            row_weights,
+            static_row_fifth,
+        )
+    }
+
+    /// [`Self::design_contracted_trace_hessian_psi_directional_from`] on the time-constant slope
+    /// frame.
+    pub(crate) fn design_contracted_trace_hessian_psi_directional(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+        u: &[f64],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.design_contracted_trace_hessian_psi_directional_from(
+            derivative_blocks,
+            psi_index,
+            weight,
+            row_weights,
+            u,
+            static_row_fifth,
+            static_row_sixth,
+        )
+    }
+
+    /// [`Self::design_contracted_trace_hessian_psi_pair_from`] on the time-constant slope frame.
+    pub(crate) fn design_contracted_trace_hessian_psi_pair(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.design_contracted_trace_hessian_psi_pair_from(
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            weight,
+            row_weights,
+            static_row_fifth,
+            static_row_sixth,
+        )
+    }
 }
 
 /// One row's primary directions for
@@ -555,9 +799,12 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                     }
                 }
                 if let Some(z) = z {
-                    let vars: [G::Tower4; P] =
-                        std::array::from_fn(|axis| G::Tower4::variable(primaries[axis], axis));
-                    let tower = rigid_row_nll::<P, G, _>(&vars, &inputs)?;
+                    let mut tower = G::Tower4::constant(0.0);
+                    SurvivalMarginalSlopeFamily::write_primary_tower::<P, G, _>(
+                        &primaries,
+                        &inputs,
+                        &mut tower,
+                    )?;
                     let t4 = tower.t4();
                     for a in 0..P {
                         for b in 0..P {
@@ -676,17 +923,13 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                     .collect::<Vec<_>>()
             },
             |row, accumulators| -> Result<(), String> {
-                let inputs = rigid_row_inputs(
-                    family,
-                    &self.block_states,
+                let mut tower = G::Tower4::constant(0.0);
+                family.write_row_primary_tower::<P, G, _>(
                     row,
+                    &self.block_states,
                     "design ψ third information derivative",
+                    &mut tower,
                 )?;
-                let primaries =
-                    rigid_row_kernel_primaries::<P, G>(family, &self.block_states, row)?;
-                let vars: [G::Tower4; P] =
-                    std::array::from_fn(|axis| G::Tower4::variable(primaries[axis], axis));
-                let tower = rigid_row_nll::<P, G, _>(&vars, &inputs)?;
                 let t4 = tower.t4();
                 let jv = self.jacobian_action(row, d_beta);
                 let channels = channels_at(row)?;
@@ -896,17 +1139,13 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                     .collect::<Vec<_>>()
             },
             |row, accumulators| -> Result<(), String> {
-                let inputs = rigid_row_inputs(
-                    family,
-                    &self.block_states,
+                let mut tower = G::Tower4::constant(0.0);
+                family.write_row_primary_tower::<P, G, _>(
                     row,
+                    &self.block_states,
                     "design ψ-pair third information derivative",
+                    &mut tower,
                 )?;
-                let primaries =
-                    rigid_row_kernel_primaries::<P, G>(family, &self.block_states, row)?;
-                let vars: [G::Tower4; P] =
-                    std::array::from_fn(|axis| G::Tower4::variable(primaries[axis], axis));
-                let tower = rigid_row_nll::<P, G, _>(&vars, &inputs)?;
                 let t4 = tower.t4();
                 let (channels_i, channels_j, channels_ij) = channels_at(row)?;
                 let d_i = primary_array(&channels_i.direction(beta_i.view()))?;
@@ -1068,6 +1307,533 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
         }
         Ok(Some(axes))
     }
+
+    /// A block-local Hessian accumulator over this kernel's coefficient slices.
+    fn design_contraction_accumulator(&self) -> BlockHessianAccumulator {
+        let slices = &self.slices;
+        BlockHessianAccumulator::new(
+            slices.time.len(),
+            slices.marginal.len(),
+            slices.slope.len(),
+            slices.score_warp.as_ref().map_or(0, |range| range.len()),
+            slices.link_dev.as_ref().map_or(0, |range| range.len()),
+            slices.influence.as_ref().map_or(0, |range| range.len()),
+        )
+    }
+
+    /// The coefficients and flat coefficient range of design ψ block `block_idx`: the marginal
+    /// block 1 or the slope block 2.
+    fn design_psi_block(&self, block_idx: usize) -> (&Array1<f64>, std::ops::Range<usize>) {
+        match block_idx {
+            1 => (&self.block_states[1].beta, self.slices.marginal.clone()),
+            _ => (&self.block_states[2].beta, self.slices.slope.clone()),
+        }
+    }
+
+    /// `Σ_c L_c ⊗ J(W x̃_c) + J(W x̃_c) ⊗ L_c`: the motion of the row trace weight `w = JWJᵀ`
+    /// when the design moves by `J_ψ = Σ_c L_c ⊗ x̃_c`, with `x̃_c` the channel's design row at
+    /// the ψ block's coefficient range.
+    fn design_trace_weight_motion(
+        &self,
+        row: usize,
+        weight: &Array2<f64>,
+        range: &std::ops::Range<usize>,
+        channels: &PsiRowChannels,
+    ) -> Result<[[f64; P]; P], String> {
+        let mut motion = [[0.0; P]; P];
+        for (loading, design_row) in channels.channels() {
+            let moved = weight.slice(ndarray::s![.., range.clone()]).dot(design_row);
+            let projected = self.jacobian_action(
+                row,
+                moved.as_slice().ok_or_else(|| {
+                    "survival design ψ trace weight motion needs a contiguous coefficient vector"
+                        .to_string()
+                })?,
+            );
+            for a in 0..P {
+                for b in 0..P {
+                    motion[a][b] += loading[a] * projected[b] + projected[a] * loading[b];
+                }
+            }
+        }
+        Ok(motion)
+    }
+
+    /// `⟨W, ∂_ψ H²[e_a, e_b]⟩` for every axis pair along a design hyperparameter ψ that moves
+    /// the marginal or the slope design (gam#2930). With the design motion `J_ψ = Σ_c L_c ⊗ x_c`,
+    /// the primaries move by `δ = J_ψβ` and the row trace weight `w = JWJᵀ` by
+    /// `ẇ = J_ψWJᵀ + JWJ_ψᵀ`, so a row contributes `Jᵀ(⟨w, T⁵[δ]⟩ + ⟨ẇ, T⁴⟩)J` and the
+    /// ψ-sided crosses `x_c ⊗ Jᵀ⟨w, T⁴⟩L_c` with their transposes, in one row pass. Returns
+    /// `None` where the family has no ψ block for the axis. Linear in the symmetric weight `W`.
+    pub(super) fn design_contracted_trace_hessian_psi_from(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+        fifth: impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[f64; P]; P]; P]; P]; P], String>
+        + Sync,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let family = &self.family;
+        let Some((block_idx, local_idx, p_psi, label)) =
+            family.psi_block_info(derivative_blocks, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p) || row_weights.len() != family.n {
+            return Err(format!(
+                "survival design ψ contracted trace Hessian derivative requires a ({p}, {p}) weight and {} row weights",
+                family.n
+            ));
+        }
+        let (beta_block, psi_range) = self.design_psi_block(block_idx);
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
+            &derivative_blocks[block_idx][local_idx],
+            family.n,
+            p_psi,
+            0..family.n,
+            label,
+            &policy,
+        )
+        .map_err(|error| error.to_string())?;
+        let context = "design ψ contracted trace Hessian derivative";
+        let rows: Vec<usize> = (0..family.n).filter(|&row| row_weights[row] != 0.0).collect();
+        let accumulator = crate::marginal_slope_shared::chunked_row_reduction(
+            rows.as_slice(),
+            || self.design_contraction_accumulator(),
+            |row, accumulator| -> Result<(), String> {
+                let inputs = rigid_row_inputs(family, &self.block_states, row, context)?;
+                let primaries =
+                    rigid_row_kernel_primaries::<P, G>(family, &self.block_states, row)?;
+                let mut tower = G::Tower4::constant(0.0);
+                SurvivalMarginalSlopeFamily::write_primary_tower::<P, G, _>(
+                    &primaries,
+                    &inputs,
+                    &mut tower,
+                )?;
+                let fifth = fifth(&primaries, &inputs)?;
+                let psi_row = psi_map
+                    .row_vector(row)
+                    .map_err(|error| format!("survival {context} row: {error}"))?;
+                let channels = psi_row_channels(family, None, row, block_idx, psi_row)?;
+                let trace_weight = self.primary_trace_weight(row, weight)?;
+                let motion = self.design_trace_weight_motion(row, weight, &psi_range, &channels)?;
+                let shift = primary_fixed::<P>(&channels.direction(beta_block.view()), context)?;
+                let fourth = trace_weight_fourth(&trace_weight, tower.t4());
+                let row_weight = row_weights[row];
+                let pullback = primary_sum(&[
+                    trace_weight_fifth(&trace_weight, &fifth, &shift),
+                    trace_weight_fourth(&motion, tower.t4()),
+                ]);
+                accumulator.add_pullback(family, row, &scaled_primary_matrix(row_weight, &pullback))?;
+                for (loading, design_row) in channels.channels() {
+                    accumulator.add_rank1_psi_cross(
+                        family,
+                        row,
+                        block_idx,
+                        design_row,
+                        &scaled_kernel_action(row_weight, &fourth, loading),
+                    )?;
+                }
+                Ok(())
+            },
+            |total, chunk| total.add(&chunk),
+        )?;
+        Ok(Some(accumulator.to_dense(&self.slices)))
+    }
+
+    /// `⟨W, ∂_ψ H³[u, e_a, e_b]⟩` for every axis pair along a design hyperparameter ψ
+    /// (gam#2930). Beside the motions of [`Self::design_contracted_trace_hessian_psi_from`], the
+    /// row direction `Ju` moves by `J_ψu`, so a row contributes
+    /// `Jᵀ(⟨w, T⁶[Ju, δ] + T⁵[J_ψu]⟩ + ⟨ẇ, T⁵[Ju]⟩)J` and the crosses `x_c ⊗ Jᵀ⟨w, T⁵[Ju]⟩L_c`
+    /// with their transposes. Linear in the symmetric weight `W`.
+    pub(super) fn design_contracted_trace_hessian_psi_directional_from(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+        u: &[f64],
+        fifth: impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[f64; P]; P]; P]; P]; P], String>
+        + Sync,
+        sixth: impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[[f64; P]; P]; P]; P]; P]; P], String>
+        + Sync,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let family = &self.family;
+        let Some((block_idx, local_idx, p_psi, label)) =
+            family.psi_block_info(derivative_blocks, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p)
+            || row_weights.len() != family.n
+            || u.len() != p
+            || u.iter().any(|x| !x.is_finite())
+        {
+            return Err(format!(
+                "survival design ψ directional contracted trace Hessian derivative requires a ({p}, {p}) weight, {} row weights and a finite direction of length {p}",
+                family.n
+            ));
+        }
+        let (beta_block, psi_range) = self.design_psi_block(block_idx);
+        let u_block = ndarray::ArrayView1::from(&u[psi_range.clone()]);
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
+            &derivative_blocks[block_idx][local_idx],
+            family.n,
+            p_psi,
+            0..family.n,
+            label,
+            &policy,
+        )
+        .map_err(|error| error.to_string())?;
+        let context = "design ψ directional contracted trace Hessian derivative";
+        let rows: Vec<usize> = (0..family.n).filter(|&row| row_weights[row] != 0.0).collect();
+        let accumulator = crate::marginal_slope_shared::chunked_row_reduction(
+            rows.as_slice(),
+            || self.design_contraction_accumulator(),
+            |row, accumulator| -> Result<(), String> {
+                let inputs = rigid_row_inputs(family, &self.block_states, row, context)?;
+                let primaries =
+                    rigid_row_kernel_primaries::<P, G>(family, &self.block_states, row)?;
+                let fifth = fifth(&primaries, &inputs)?;
+                let sixth = sixth(&primaries, &inputs)?;
+                let psi_row = psi_map
+                    .row_vector(row)
+                    .map_err(|error| format!("survival {context} row: {error}"))?;
+                let channels = psi_row_channels(family, None, row, block_idx, psi_row)?;
+                let trace_weight = self.primary_trace_weight(row, weight)?;
+                let motion = self.design_trace_weight_motion(row, weight, &psi_range, &channels)?;
+                let shift = primary_fixed::<P>(&channels.direction(beta_block.view()), context)?;
+                let direction = self.jacobian_action(row, u);
+                let moved_direction = primary_fixed::<P>(&channels.direction(u_block), context)?;
+                let kernel = trace_weight_fifth(&trace_weight, &fifth, &direction);
+                let row_weight = row_weights[row];
+                let pullback = primary_sum(&[
+                    trace_weight_sixth(&trace_weight, &sixth, &direction, &shift),
+                    trace_weight_fifth(&trace_weight, &fifth, &moved_direction),
+                    trace_weight_fifth(&motion, &fifth, &direction),
+                ]);
+                accumulator.add_pullback(family, row, &scaled_primary_matrix(row_weight, &pullback))?;
+                for (loading, design_row) in channels.channels() {
+                    accumulator.add_rank1_psi_cross(
+                        family,
+                        row,
+                        block_idx,
+                        design_row,
+                        &scaled_kernel_action(row_weight, &kernel, loading),
+                    )?;
+                }
+                Ok(())
+            },
+            |total, chunk| total.add(&chunk),
+        )?;
+        Ok(Some(accumulator.to_dense(&self.slices)))
+    }
+
+    /// `⟨W, ∂²_ψψ' H²[e_a, e_b]⟩` for every axis pair along two design hyperparameters
+    /// (gam#2930). With each axis's first motions `δ_i, ẇ_i` of
+    /// [`Self::design_contracted_trace_hessian_psi_from`], the second shift `δ_ij = J_ijβ` and
+    /// the second weight motion `ẅ_ij = J_ijWJᵀ + JWJ_ijᵀ + J_iWJ_jᵀ + J_jWJ_iᵀ`, a row
+    /// contributes `Jᵀ(⟨w, T⁶[δ_i, δ_j] + T⁵[δ_ij]⟩ + ⟨ẇ_j, T⁵[δ_i]⟩ + ⟨ẇ_i, T⁵[δ_j]⟩ +
+    /// ⟨ẅ_ij, T⁴⟩)J`; the crosses `x_i ⊗ JᵀK_jL_i`, `x_j ⊗ JᵀK_iL_j` and `x_ij ⊗ JᵀKL_i` with
+    /// `K = ⟨w, T⁴⟩` and `K_i = ⟨w, T⁵[δ_i]⟩ + ⟨ẇ_i, T⁴⟩`, with their transposes; and the ψ-sided
+    /// outer product `x_i ⊗ x_j · L_iᵀKL_j` with its transpose. Returns `None` where the family
+    /// has no ψ block for either axis. Linear in the symmetric weight `W`.
+    pub(super) fn design_contracted_trace_hessian_psi_pair_from(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        weight: &Array2<f64>,
+        row_weights: &[f64],
+        fifth: impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[f64; P]; P]; P]; P]; P], String>
+        + Sync,
+        sixth: impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[[f64; P]; P]; P]; P]; P]; P], String>
+        + Sync,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let family = &self.family;
+        let n = family.n;
+        let Some((block_i, local_i, p_psi_i, label_i)) =
+            family.psi_block_info(derivative_blocks, psi_i)?
+        else {
+            return Ok(None);
+        };
+        let Some((block_j, local_j, p_psi_j, label_j)) =
+            family.psi_block_info(derivative_blocks, psi_j)?
+        else {
+            return Ok(None);
+        };
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p) || row_weights.len() != n {
+            return Err(format!(
+                "survival design ψ-pair contracted trace Hessian derivative requires a ({p}, {p}) weight and {n} row weights"
+            ));
+        }
+        let (beta_i, range_i) = self.design_psi_block(block_i);
+        let (beta_j, range_j) = self.design_psi_block(block_j);
+        let coupling_block = weight.slice(ndarray::s![range_i.clone(), range_j.clone()]);
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        let map_i = crate::custom_family::resolve_custom_family_x_psi_map(
+            &derivative_blocks[block_i][local_i],
+            n,
+            p_psi_i,
+            0..n,
+            label_i,
+            &policy,
+        )
+        .map_err(|error| error.to_string())?;
+        let map_j = crate::custom_family::resolve_custom_family_x_psi_map(
+            &derivative_blocks[block_j][local_j],
+            n,
+            p_psi_j,
+            0..n,
+            label_j,
+            &policy,
+        )
+        .map_err(|error| error.to_string())?;
+        let map_ij = if block_i == block_j {
+            Some(
+                crate::custom_family::resolve_custom_family_x_psi_psi_map(
+                    &derivative_blocks[block_i][local_i],
+                    &derivative_blocks[block_j][local_j],
+                    local_j,
+                    n,
+                    p_psi_i,
+                    0..n,
+                    label_i,
+                    &policy,
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let context = "design ψ-pair contracted trace Hessian derivative";
+        let rows: Vec<usize> = (0..n).filter(|&row| row_weights[row] != 0.0).collect();
+        let accumulator = crate::marginal_slope_shared::chunked_row_reduction(
+            rows.as_slice(),
+            || self.design_contraction_accumulator(),
+            |row, accumulator| -> Result<(), String> {
+                let inputs = rigid_row_inputs(family, &self.block_states, row, context)?;
+                let primaries =
+                    rigid_row_kernel_primaries::<P, G>(family, &self.block_states, row)?;
+                let mut tower = G::Tower4::constant(0.0);
+                SurvivalMarginalSlopeFamily::write_primary_tower::<P, G, _>(
+                    &primaries,
+                    &inputs,
+                    &mut tower,
+                )?;
+                let fifth = fifth(&primaries, &inputs)?;
+                let sixth = sixth(&primaries, &inputs)?;
+                let row_error = |error: String| format!("survival {context} row: {error}");
+                let channels_i = psi_row_channels(
+                    family,
+                    None,
+                    row,
+                    block_i,
+                    map_i.row_vector(row).map_err(|error| row_error(error.to_string()))?,
+                )?;
+                let channels_j = psi_row_channels(
+                    family,
+                    None,
+                    row,
+                    block_j,
+                    map_j.row_vector(row).map_err(|error| row_error(error.to_string()))?,
+                )?;
+                let channels_ij = match map_ij.as_ref() {
+                    Some(map) => Some(psi_row_channels(
+                        family,
+                        None,
+                        row,
+                        block_i,
+                        map.row_vector(row).map_err(|error| row_error(error.to_string()))?,
+                    )?),
+                    None => None,
+                };
+                let trace_weight = self.primary_trace_weight(row, weight)?;
+                let motion_i = self.design_trace_weight_motion(row, weight, &range_i, &channels_i)?;
+                let motion_j = self.design_trace_weight_motion(row, weight, &range_j, &channels_j)?;
+                let shift_i = primary_fixed::<P>(&channels_i.direction(beta_i.view()), context)?;
+                let shift_j = primary_fixed::<P>(&channels_j.direction(beta_j.view()), context)?;
+                let (second_shift, mut second_motion) = match channels_ij.as_ref() {
+                    Some(channels) => (
+                        primary_fixed::<P>(&channels.direction(beta_i.view()), context)?,
+                        self.design_trace_weight_motion(row, weight, &range_i, channels)?,
+                    ),
+                    None => ([0.0; P], [[0.0; P]; P]),
+                };
+                for (loading_i, row_i) in channels_i.channels() {
+                    for (loading_j, row_j) in channels_j.channels() {
+                        let coupling = row_i.dot(&coupling_block.dot(row_j));
+                        for a in 0..P {
+                            for b in 0..P {
+                                second_motion[a][b] += coupling
+                                    * (loading_i[a] * loading_j[b] + loading_j[a] * loading_i[b]);
+                            }
+                        }
+                    }
+                }
+                let fourth = trace_weight_fourth(&trace_weight, tower.t4());
+                let kernel_i = primary_sum(&[
+                    trace_weight_fifth(&trace_weight, &fifth, &shift_i),
+                    trace_weight_fourth(&motion_i, tower.t4()),
+                ]);
+                let kernel_j = primary_sum(&[
+                    trace_weight_fifth(&trace_weight, &fifth, &shift_j),
+                    trace_weight_fourth(&motion_j, tower.t4()),
+                ]);
+                let pullback = primary_sum(&[
+                    trace_weight_sixth(&trace_weight, &sixth, &shift_i, &shift_j),
+                    trace_weight_fifth(&trace_weight, &fifth, &second_shift),
+                    trace_weight_fifth(&motion_j, &fifth, &shift_i),
+                    trace_weight_fifth(&motion_i, &fifth, &shift_j),
+                    trace_weight_fourth(&second_motion, tower.t4()),
+                ]);
+                let row_weight = row_weights[row];
+                accumulator.add_pullback(family, row, &scaled_primary_matrix(row_weight, &pullback))?;
+                for (loading, design_row) in channels_i.channels() {
+                    accumulator.add_rank1_psi_cross(
+                        family,
+                        row,
+                        block_i,
+                        design_row,
+                        &scaled_kernel_action(row_weight, &kernel_j, loading),
+                    )?;
+                }
+                for (loading, design_row) in channels_j.channels() {
+                    accumulator.add_rank1_psi_cross(
+                        family,
+                        row,
+                        block_j,
+                        design_row,
+                        &scaled_kernel_action(row_weight, &kernel_i, loading),
+                    )?;
+                }
+                if let Some(channels) = channels_ij.as_ref() {
+                    for (loading, design_row) in channels.channels() {
+                        accumulator.add_rank1_psi_cross(
+                            family,
+                            row,
+                            block_i,
+                            design_row,
+                            &scaled_kernel_action(row_weight, &fourth, loading),
+                        )?;
+                    }
+                }
+                for (loading_i, row_i) in channels_i.channels() {
+                    for (loading_j, row_j) in channels_j.channels() {
+                        let form: f64 = (0..P)
+                            .map(|c| (0..P).map(|d| loading_i[c] * fourth[c][d] * loading_j[d]).sum::<f64>())
+                            .sum();
+                        accumulator.add_psi_psi_outer(block_i, row_i, block_j, row_j, row_weight * form);
+                    }
+                }
+                Ok(())
+            },
+            |total, chunk| total.add(&chunk),
+        )?;
+        Ok(Some(accumulator.to_dense(&self.slices)))
+    }
+}
+
+/// `Σ_ab w[a][b]·T⁴[a, b, c, d]`: a row trace weight contracted with the fourth likelihood
+/// derivatives.
+fn trace_weight_fourth<const P: usize>(
+    weight: &[[f64; P]; P],
+    fourth: &[[[[f64; P]; P]; P]; P],
+) -> [[f64; P]; P] {
+    std::array::from_fn(|c| {
+        std::array::from_fn(|d| {
+            let mut sum = 0.0;
+            for a in 0..P {
+                for b in 0..P {
+                    sum += weight[a][b] * fourth[a][b][c][d];
+                }
+            }
+            sum
+        })
+    })
+}
+
+/// `Σ_ab w[a][b]·T⁵[a, b, c, d, x]`.
+fn trace_weight_fifth<const P: usize>(
+    weight: &[[f64; P]; P],
+    fifth: &[[[[[f64; P]; P]; P]; P]; P],
+    x: &[f64; P],
+) -> [[f64; P]; P] {
+    std::array::from_fn(|c| {
+        std::array::from_fn(|d| {
+            let mut sum = 0.0;
+            for a in 0..P {
+                for b in 0..P {
+                    for e in 0..P {
+                        sum += weight[a][b] * fifth[a][b][c][d][e] * x[e];
+                    }
+                }
+            }
+            sum
+        })
+    })
+}
+
+/// `Σ_ab w[a][b]·T⁶[a, b, c, d, x, y]`.
+fn trace_weight_sixth<const P: usize>(
+    weight: &[[f64; P]; P],
+    sixth: &[[[[[[f64; P]; P]; P]; P]; P]; P],
+    x: &[f64; P],
+    y: &[f64; P],
+) -> [[f64; P]; P] {
+    std::array::from_fn(|c| {
+        std::array::from_fn(|d| {
+            let mut sum = 0.0;
+            for a in 0..P {
+                for b in 0..P {
+                    for e in 0..P {
+                        for f in 0..P {
+                            sum += weight[a][b] * sixth[a][b][c][d][e][f] * x[e] * y[f];
+                        }
+                    }
+                }
+            }
+            sum
+        })
+    })
+}
+
+/// The entrywise sum of primary-space matrices.
+fn primary_sum<const P: usize>(terms: &[[[f64; P]; P]]) -> [[f64; P]; P] {
+    std::array::from_fn(|c| std::array::from_fn(|d| terms.iter().map(|term| term[c][d]).sum()))
+}
+
+/// `scale·H` as a dense primary-space Hessian.
+fn scaled_primary_matrix<const P: usize>(scale: f64, h: &[[f64; P]; P]) -> Array2<f64> {
+    Array2::from_shape_fn((P, P), |(c, d)| scale * h[c][d])
+}
+
+/// `scale·K·L`: a primary-space kernel applied to a channel's primary loading.
+fn scaled_kernel_action<const P: usize>(
+    scale: f64,
+    kernel: &[[f64; P]; P],
+    loading: &Array1<f64>,
+) -> Array1<f64> {
+    Array1::from_shape_fn(P, |c| {
+        scale * (0..P).map(|d| kernel[c][d] * loading[d]).sum::<f64>()
+    })
+}
+
+/// A primary-space vector as a fixed-width array.
+fn primary_fixed<const P: usize>(vector: &Array1<f64>, context: &str) -> Result<[f64; P], String> {
+    if vector.len() != P {
+        return Err(format!(
+            "survival {context}: a primary vector has {} entries for a {P}-primary frame",
+            vector.len()
+        ));
+    }
+    Ok(std::array::from_fn(|k| vector[k]))
 }
 
 #[cfg(test)]

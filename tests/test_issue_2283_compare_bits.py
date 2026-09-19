@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import math
 from pathlib import Path
 
 import numpy as np
@@ -103,3 +104,69 @@ def test_component_reconciliation_includes_dictionary_bits():
     row["bits_bits_at_r2_0.99"] = 25.0
     with np.testing.assert_raises_regex(ValueError, "does not reconcile"):
         compare._components(row, "0.99")
+
+
+def _load_theorem():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "experiments"
+        / "1026_close"
+        / "crossover_theorem_check.py"
+    )
+    spec = importlib.util.spec_from_file_location("issue_2283_theorem", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_support_code_bits_is_a_kraft_complete_cardinality_then_subset_code():
+    theorem = _load_theorem()
+    eps = np.finfo(np.float64).eps
+    for atoms in range(1, 9):
+        bar = 8 * (atoms + 1) * eps
+        kraft = sum(
+            math.comb(atoms, k) * 2.0 ** -theorem.support_code_bits(atoms, k)
+            for k in range(atoms + 1)
+        )
+        assert abs(kraft - 1.0) <= bar, (atoms, kraft)
+        # The retired price, `log2 C(G, k)` with no cardinality term, sums to
+        # `G + 1` over the same supports, so the Kraft sum separates the two.
+        retired = sum(
+            math.comb(atoms, k) * 2.0 ** -theorem.selection_bits(atoms, k)
+            for k in range(atoms + 1)
+        )
+        assert abs(retired - (atoms + 1)) <= bar, (atoms, retired)
+
+
+def test_predicted_support_margin_prices_each_config_with_the_scorers_support_code():
+    compare = _load_compare()
+    hybrid = {
+        "K": 32768,
+        "top_k": 32,
+        "curved_k": 2,
+        "d_atom": 1,
+        "k_flat": 32672,
+        "curved_atoms": 32,
+    }
+    paired_atoms = hybrid["k_flat"] + hybrid["curved_atoms"]
+    paired_cardinality = (
+        hybrid["top_k"] - hybrid["curved_k"] * (1 + hybrid["d_atom"]) + hybrid["curved_k"]
+    )
+    external_code = math.log2(hybrid["K"] + 1) + math.log2(
+        math.comb(hybrid["K"], hybrid["top_k"])
+    )
+    paired_code = math.log2(paired_atoms + 1) + math.log2(
+        math.comb(paired_atoms, paired_cardinality)
+    )
+    # `selection_bits` sums `top_k` rounded log terms, each below the total.
+    bar = 4 * hybrid["top_k"] * np.finfo(np.float64).eps * external_code
+    predicted = compare._predicted_support_margin(hybrid)
+    assert abs(predicted - (external_code - paired_code)) <= bar, (
+        predicted,
+        external_code - paired_code,
+    )
+    # The cardinality term the retired `log2 C(G, L0)` margin omitted is resolvable
+    # at this bar, so a margin without it fails the assertion above.
+    assert abs(math.log2(hybrid["K"] + 1) - math.log2(paired_atoms + 1)) > bar

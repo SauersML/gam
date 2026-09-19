@@ -403,7 +403,7 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
                 "{repro}\n  I5 VIOLATED: edf_total {edf:.4} outside [0, p={p}]"
             ));
         }
-        if let Some(se) = inf.beta_standard_errors.as_ref() {
+        if let Some(se) = fit.fit.beta_standard_errors() {
             if se.iter().any(|v| !v.is_finite() || *v < 0.0) {
                 return Err(format!(
                     "{repro}\n  I6 VIOLATED: standard error non-finite or negative: {se:?}"

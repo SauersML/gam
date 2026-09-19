@@ -225,6 +225,9 @@ pub struct SaeHybridSplitReport {
 /// straight-line fit with a residual estimate, so the linear candidate's
 /// deviance is undefined. Such atoms are skipped (absent from the report),
 /// never adjudicated on a fabricated deviance.
+///
+/// Structural (#2469): the line's two parameters plus one residual degree of
+/// freedom, `2 + 1`.
 const MIN_ROWS_FOR_LINEAR_FIT: usize = 3;
 
 /// #1610/#1026 — EV-PRESERVATION gate tolerance: a `d = 1` slot may collapse to

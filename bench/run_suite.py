@@ -2453,7 +2453,7 @@ def run_rust_gamlss_survival_cv(
             ]
             if survival_link:
                 fit_cmd.extend(["--link", str(survival_link)])
-            fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
+            fit_cmd.extend(_rust_survival_fit_cli_args())
             fit_cmd.extend([str(train_path), fit_formula])
 
             t0 = perf_counter()
@@ -2632,7 +2632,7 @@ def run_rust_gamlss_survival_marginal_slope_cv(
                 "--out",
                 str(model_path),
             ]
-            fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
+            fit_cmd.extend(_rust_survival_fit_cli_args())
             fit_cmd.extend([str(train_path), fit_formula])
 
             t0 = perf_counter()
@@ -2764,28 +2764,6 @@ def _assert_basis_parity_for_scenario(s_cfg: typing.Any, *, ds: dict[str, typing
     if rust_cfg is None:
         return
     basis = _canonical_smooth_basis(rust_cfg.get("smooth_basis", "ps"))
-    pc_layout = _pc_smooth_layout(rust_cfg)
-    if pc_layout == "additive":
-        smooth_cols = list(rust_cfg.get("smooth_cols") or [])
-        pc_cols, non_pc_cols = _split_pc_columns(smooth_cols)
-        if non_pc_cols or len(pc_cols) < 2:
-            raise SystemExit(
-                f"additive-PC parity check received invalid mapping for {scenario_name}: {smooth_cols}"
-            )
-        _family, rust_formula = _rust_formula_for_scenario(scenario_name, ds)
-        mgcv_formula = _mgcv_formula_for_scenario(scenario_name, ds)
-        knots = int(rust_cfg["knots"])
-        expected_rust = [f"s({col}, type=ps, knots={knots}" for col in pc_cols]
-        expected_mgcv = [f"s({col}, bs='ps', k=min({knots + 4}," for col in pc_cols]
-        if not all(term in rust_formula for term in expected_rust) or "duchon(" in rust_formula:
-            raise SystemExit(
-                f"additive-PC Rust parity check failed for {scenario_name}: '{rust_formula}'"
-            )
-        if not all(term in mgcv_formula for term in expected_mgcv) or "bs='ds'" in mgcv_formula:
-            raise SystemExit(
-                f"additive-PC mgcv parity check failed for {scenario_name}: '{mgcv_formula}'"
-            )
-        return
     if basis not in {"duchon", "matern"}:
         return
 
@@ -2822,11 +2800,10 @@ def _assert_marginal_pspline_basis_budget(
     smooth_cols = list(cfg.get("smooth_cols") or [])
     if not smooth_cols and cfg.get("smooth_col"):
         smooth_cols = [cfg["smooth_col"]]
-    # Multi-axis PCs only bypass this identity when they are emitted as one
-    # joint spatial smooth. Explicit additive-PC benchmarks must pay the full
-    # marginal-spline coefficient budget.
+    # Two or more PCs are always emitted as one joint spatial smooth, not as
+    # marginal splines, so they carry no marginal-spline coefficient budget.
     pc_smooth_cols, _ = _split_pc_columns(smooth_cols)
-    if _pc_smooth_layout(cfg) == "joint" and len(pc_smooth_cols) >= 2:
+    if len(pc_smooth_cols) >= 2:
         return
     knots = int(cfg.get("knots", 8))
     free_coefficients = (

@@ -10,7 +10,9 @@ prices the water-filled code + residual terms on fitted spectra); it certifies
 the two terms the theorem turns on and the config that makes the contest fair.
 
 Scorer terms reproduced verbatim (see eq4_description_length.rs):
-  * support_bits   = log2 C(G, round(L0))                      [selection_bits]
+  * support_bits   = log2(G+1) + mean_i log2 C(G, |S_i|)       [support_code_bits]
+    each row transmits its own cardinality, then its subset; for a configuration
+    naming exactly L0 atoms on every row this is log2(G+1) + log2 C(G, L0)
   * dictionary_bits = 0.5 * dictionary_params / N * log2(N)
 Here N is the DECLARED amortization horizon (the message/deployment or declared
 training-N), NOT the number of rows sampled to estimate the score (#2283 / audit
@@ -35,6 +37,18 @@ def selection_bits(g_dict: int, k_active: int) -> float:
         return 0.0
     k = min(k_active, g_dict)
     return sum(math.log2((g_dict - k + i) / i) for i in range(1, k + 1))
+
+
+def support_code_bits(g_dict: int, cardinality: int) -> float:
+    """The scorer's support charge for rows that each name ``cardinality`` atoms.
+
+    ``combinatorial_support_bits`` (``crates/gam-sae/src/atom_codes.rs``) sends each
+    row's cardinality uniformly over ``0..=G`` and then its subset uniformly among
+    ``C(G, |S|)``, so every support costs ``log2(G+1) + log2 C(G, |S|)`` and the
+    code is Kraft-complete. A configuration with a fixed per-row cardinality pays
+    exactly that on every row.
+    """
+    return math.log2(g_dict + 1) + selection_bits(g_dict, cardinality)
 
 
 def dict_bits(dictionary_params: int, amortization_horizon: int) -> float:
@@ -107,19 +121,21 @@ def main() -> int:
     # ------------------------------------------------------------------ #
     # 2. The support win at the faithful config (dict term neutralized).
     #    Flat lights s=2 atoms per circle; curved lights 1 => L0 drops by
-    #    k_circ_active on the hybrid. Support = log2 C(G, L0).
+    #    k_circ_active on the hybrid. Support = log2(G+1) + log2 C(G, L0).
     # ------------------------------------------------------------------ #
     kca = args.k_circ_active
     l0_flat = L0
     l0_hyb = L0 - kca                      # each circle: 2 flat slots -> 1 curved
     G_hyb = k_flat_faithful + Kc           # atoms the hybrid actually indexes
-    sup_flat = selection_bits(K, l0_flat)
-    sup_hyb = selection_bits(G_hyb, l0_hyb)
+    sup_flat = support_code_bits(K, l0_flat)
+    sup_hyb = support_code_bits(G_hyb, l0_hyb)
     slot = math.log2(K / max(l0_hyb, 1))   # analytic per-slot cost log2(G/L0)
 
     print("## 2. support win at the faithful config (dcode=dresid=0 for a circle)")
-    print(f"  flat   L0={l0_flat}  support = log2 C({K},{l0_flat}) = {sup_flat:10.1f} bits")
-    print(f"  hybrid L0={l0_hyb}  support = log2 C({G_hyb},{l0_hyb}) = {sup_hyb:10.1f} bits")
+    print(f"  flat   L0={l0_flat}  support = log2({K}+1) + log2 C({K},{l0_flat}) = "
+          f"{sup_flat:10.1f} bits")
+    print(f"  hybrid L0={l0_hyb}  support = log2({G_hyb}+1) + log2 C({G_hyb},{l0_hyb}) = "
+          f"{sup_hyb:10.1f} bits")
     print(f"  d_support = {sup_flat - sup_hyb:+.1f} bits  "
           f"(~ {kca} freed slots * log2(G/L0)={slot:.1f})")
     print()

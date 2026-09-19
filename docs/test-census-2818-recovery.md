@@ -853,7 +853,8 @@ instead of a literal 60.
 ### Two pins already disposed of by other records
 
 - `latent_log_sigma_curvature_tracks_gradient_fd_scale_ladder_2566`: two
-  existing records cover it. `docs/source-removal-changes.json` records the
+  existing records cover it. The acknowledgement in the deleting commit
+  (`git log -p -- docs/source-removal-changes.json`) records the
   #2901 SPEC rule 16 deletion of the print-only #2566 log-sigma curvature ladder,
   together with its only helpers, `richardson_central_difference` and
   `latent_survival_value_fd_authority`. `docs/public-api-2829-disposition.tsv`
@@ -906,8 +907,9 @@ recreated `tests_exact_a_bundle_2515.rs`.
 The section above says the census's last undispositioned rows are restored or
 retired. They were not the last. A recount of
 `docs/test-census-2818-inventory.json` at origin/main treated a name as disposed of
-only when some `.rs` file declares `fn NAME(`, this record names it, or
-`docs/source-removal-changes.json` records its deletion. Sixteen more names
+only when some `.rs` file declares `fn NAME(`, this record names it, or the
+acknowledgement in the deleting commit (`git log -p -- docs/source-removal-changes.json`)
+records its deletion. Sixteen more names
 failed all three tests. Five are restored:
 
 - `5e2877f1a`: `nested_response_moment_rule_reproduces_the_scalar_gaussian_law_2446`,
@@ -943,7 +945,7 @@ stay deleted.
 doc comments say "reports, never fails": they print a finite-difference or rho-part
 ladder and assert nothing about their subject. Tonight's retirements hold every
 print-only scan to that standard, so these three are deleted, with their
-`docs/source-removal-changes.json` entry:
+acknowledgement in the deleting commit (`git log -p -- docs/source-removal-changes.json`):
 
 - `zz_measure_iso_kappa_rail_gradient_fd_2425` and
   `zz_measure_iso_kappa_face_saturation_ladder_2425`. The #2425 rail question stays gated
@@ -961,7 +963,7 @@ the psi-jet entry point that resolves a cold spec's chart before differentiating
 compiling. The surviving `build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace`
 takes explicit centers and transform, so the cold-spec contract the file pins has no
 production subject. The body is removed again, and its identities are recorded in
-`docs/source-removal-changes.json`.
+the deleting commit's acknowledgement (`git log -p -- docs/source-removal-changes.json`).
 
 `duchon_resolve_chart` is gone as well. `59d30a5b8` (#2829) deleted it with
 `ResolvedDuchonChart` and the empty module, because nothing calls it. Before that landing, MSI
@@ -994,7 +996,8 @@ The tip check at `9c266da56` failed on the `inference` and `perf_scale` binaries
   `crates/gam-predict/src/conformal.rs` pin the order statistic, and the file's two
   end-to-end arms pin realized coverage through `predict_full_uncertainty_conformal`. The
   second test moves into `conformal.rs`'s test module and reads the `q_hat` field. Both
-  root identities are recorded in `docs/source-removal-changes.json`.
+  root identities are recorded in the deleting commit's acknowledgement
+  (`git log -p -- docs/source-removal-changes.json`).
 - `tests/perf_scale/misc/row_metric_loud_vs_loadbearing.rs` (`358e2a197`):
   `AtomLensEntry::is_represented_not_used` and `is_used` were deleted by `d484a091a`. They
   read `discrepancy >= 0.5` and `discrepancy <= 0.0`. The test already asserts
@@ -1015,8 +1018,8 @@ issue suffix, so neither the census nor this record saw them. Restored so far:
   `5d74ecb1b` (#2899) later deleted `tests_joint_vs_cascade_2131.rs`. Its tests
   `split_single_circle_is_a_lower_tail_gap`, `gated_torus_fires_scale_invariant` and
   `phase_correlation_is_invisible_to_energy_screen` went with the pairwise energy screen and
-  conditionality fit they exercised, and `docs/source-removal-changes.json` records that
-  energy-screen deletion
+  conditionality fit they exercised, and the acknowledgement in the deleting commit
+  (`git log -p -- docs/source-removal-changes.json`) records that energy-screen deletion
 - `497f37257`: the Beta and Tweedie arms of the dispersion location-scale variance gate
 - `358e2a197`: `row_metric_loud_vs_loadbearing.rs` (`from_blocks_with_mode` is the
   `_and_manifolds` form on Euclidean blocks) and the #1124 negative-binomial seed-spec test

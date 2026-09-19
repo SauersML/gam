@@ -996,7 +996,7 @@ mod tests {
                 audited_by: "sbc_gaussian_smooth_band_coverage",
             },
             CalibrationTarget {
-                name: "rho_posterior_certificate",
+                name: "rho_posterior_adequacy",
                 kind: SurfaceKind::PosteriorSample,
                 mode: AuditMode::SbcRankUniformity,
                 guards: &[1810],

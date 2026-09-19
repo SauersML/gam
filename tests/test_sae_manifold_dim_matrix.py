@@ -52,14 +52,13 @@ def _fit_or_fail(z: np.ndarray, *, atom_topology: str, d_atom: int):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            fit = gamfit.sae_manifold_fit(
+            fit = gamfit.sae.sae_manifold_fit(
                 X=z,
                 K=1,
                 d_atom=d_atom,
                 atom_topology=atom_topology,
                 assignment="softmax",
                 isometry_weight=0.0,
-                ard_per_atom=False,
                 sparsity_weight=0.01,
                 smoothness_weight=0.01,
                 decoder_incoherence_weight=0.0,

@@ -9,60 +9,71 @@
 
 use gam_math::nested_dual::JetField;
 
-/// Two independent differentiation directions over another jet. The mixed
-/// component differentiates the *computed* filter, including reference-law
-/// evolution and adaptive grid placement. Nesting over a directional jet
-/// supplies the third and fourth derivatives required by LAML.
+/// `W` independent tangent directions over another jet, every channel itself
+/// an `S`. One level carries a block of first derivatives. Two levels,
+/// `Rows<Rows<S, W>, W>`, carry the `W × W` block of second derivatives between
+/// two blocks of coefficients, each entry still carrying the directions `S` was
+/// seeded with, which supplies the third and fourth derivatives LAML reads.
+/// Every channel differentiates the *computed* filter, including reference-law
+/// evolution and adaptive grid placement.
 #[derive(Clone, Debug)]
-pub(crate) struct Mixed<S> {
+pub(crate) struct Rows<S, const W: usize> {
     pub base: S,
-    pub u: S,
-    pub v: S,
-    pub uv: S,
+    pub rows: [S; W],
 }
 
-impl<S: JetField> Mixed<S> {
-    pub fn seed(base: S, u: f64, v: f64) -> Self {
-        Self { u: base.constant_like(u), v: base.constant_like(v),
-            uv: base.constant_like(0.0), base }
+impl<S: JetField, const W: usize> Rows<S, W> {
+    /// `base` with derivative `tangents[k]` along direction `k`.
+    pub fn seed(base: S, tangents: [f64; W]) -> Self {
+        let rows = std::array::from_fn(|k| base.constant_like(tangents[k]));
+        Self { base, rows }
     }
 }
 
-impl<S: JetField> JetField for Mixed<S> {
+impl<S: JetField, const W: usize> JetField for Rows<S, W> {
     fn value(&self) -> f64 { self.base.value() }
     fn add(&self, other: &Self) -> Self {
-        Self { base: self.base.add(&other.base), u: self.u.add(&other.u),
-            v: self.v.add(&other.v), uv: self.uv.add(&other.uv) }
+        Self { base: self.base.add(&other.base),
+            rows: std::array::from_fn(|k| self.rows[k].add(&other.rows[k])) }
     }
-    fn sub(&self, other: &Self) -> Self { self.add(&other.neg()) }
-    fn neg(&self) -> Self { self.scale(-1.0) }
+    fn sub(&self, other: &Self) -> Self {
+        Self { base: self.base.sub(&other.base),
+            rows: std::array::from_fn(|k| self.rows[k].sub(&other.rows[k])) }
+    }
+    fn neg(&self) -> Self {
+        Self { base: self.base.neg(), rows: std::array::from_fn(|k| self.rows[k].neg()) }
+    }
     fn scale(&self, factor: f64) -> Self {
-        Self { base: self.base.scale(factor), u: self.u.scale(factor),
-            v: self.v.scale(factor), uv: self.uv.scale(factor) }
+        Self { base: self.base.scale(factor),
+            rows: std::array::from_fn(|k| self.rows[k].scale(factor)) }
     }
     fn mul(&self, other: &Self) -> Self {
-        Self {
-            base: self.base.mul(&other.base),
-            u: self.u.mul(&other.base).add(&self.base.mul(&other.u)),
-            v: self.v.mul(&other.base).add(&self.base.mul(&other.v)),
-            uv: self.uv.mul(&other.base).add(&self.u.mul(&other.v))
-                .add(&self.v.mul(&other.u)).add(&self.base.mul(&other.uv)),
-        }
+        Self { base: self.base.mul(&other.base),
+            rows: std::array::from_fn(|k|
+                self.rows[k].mul(&other.base).add(&self.base.mul(&other.rows[k]))) }
     }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let first = self.base.compose_unary([d[1], d[2], d[3], d[4], 0.0]);
-        let second = self.base.compose_unary([d[2], d[3], d[4], 0.0, 0.0]);
-        Self { base: self.base.compose_unary(d), u: first.mul(&self.u),
-            v: first.mul(&self.v),
-            uv: first.mul(&self.uv).add(&second.mul(&self.u).mul(&self.v)) }
+        Self { base: self.base.compose_unary(d),
+            rows: std::array::from_fn(|k| first.mul(&self.rows[k])) }
     }
     fn constant_like(&self, value: f64) -> Self {
-        Self::seed(self.base.constant_like(value), 0.0, 0.0)
+        Self { base: self.base.constant_like(value),
+            rows: std::array::from_fn(|_| self.base.constant_like(0.0)) }
     }
     fn with_value(&self, value: f64) -> Self {
-        Self { base: self.base.with_value(value), ..self.clone() }
+        Self { base: self.base.with_value(value), rows: self.rows.clone() }
     }
 }
+
+/// The coefficient directions one forward jet sweep carries: the channel count
+/// of `Tangent<W>` in the gradient sweeps and of each level of
+/// `Rows<Rows<S, W>, W>` in the Hessian block sweeps. It sets how many path
+/// evaluations a derivative takes and how many channels each jet scalar holds,
+/// never a derivative's value: every channel is formed from the same operands
+/// in the same order at any width, so any width gives the same entries bit for
+/// bit.
+pub(crate) const TANGENT_WIDTH: usize = 8;
 
 /// `exp(x)`.
 #[inline]

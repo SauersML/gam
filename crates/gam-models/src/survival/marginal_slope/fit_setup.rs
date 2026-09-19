@@ -66,7 +66,7 @@ pub(crate) fn build_time_blockspec(
                 }
             })
             .collect();
-        log::info!(
+        log::debug!(
             "[marginal-slope/time_surface-diag] design_exit {n_rows}x{p_cols}; constant cols={degenerate_cols}/{p_cols}; ref_col={ref_col}; per-col span={:?}; |cos vs ref (mean-centered)|={:?}",
             spans.iter().map(|s| format!("{s:.3e}")).collect::<Vec<_>>(),
             cosines,
@@ -174,13 +174,14 @@ pub(crate) fn build_marginal_blockspec(
     }
 }
 
+/// The inner coefficient fit. The solver's error is returned whole, so the fit
+/// that stops on it raises its category (#2937).
 pub(crate) fn inner_fit(
     family: &SurvivalMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, String> {
+) -> Result<UnifiedFitResult, crate::custom_family::CustomFamilyError> {
     crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
-        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn inner_fit_from_certified_outer(
@@ -190,12 +191,11 @@ pub(crate) fn inner_fit_from_certified_outer(
     mode: CustomFamilyJointHyperModeSelection,
     theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
-) -> Result<UnifiedFitResult, String> {
+) -> Result<UnifiedFitResult, crate::custom_family::CustomFamilyError> {
     let options = crate::outer_subsample::exact_outer_options(options);
     fit_custom_family_fixed_log_lambdas_from_mode_selection(
         family, blocks, &options, mode, theta, outer,
     )
-    .map_err(|error| error.to_string())
 }
 
 /// Marginal-slope guard policy: the guard is required to be strictly positive
@@ -372,40 +372,6 @@ where
         .collect()
 }
 
-/// Return the closed smoothing-strength domain centred on each block's natural
-/// scale. At either edge one curvature is `sqrt(EPSILON)` times the other, the
-/// resolution relevant to the criterion gradient consumed by the outer solver.
-fn log_lambda_domain(seeds: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-    let radius = -0.5 * f64::EPSILON.ln();
-    (
-        seeds.mapv(|seed| seed - radius),
-        seeds.mapv(|seed| seed + radius),
-    )
-}
-
-#[cfg(test)]
-mod log_lambda_domain_tests {
-    use super::*;
-
-    /// gam#2765/gam#2767: clipping a scale-derived seed to an unrelated wall
-    /// let the projected gradient certify while REML was still descending.
-    #[test]
-    fn scale_matched_log_lambda_seed_owns_a_resolution_derived_domain_2767() {
-        let design = DesignMatrix::from(Array2::from_elem((2, 1), 1.0e4));
-        let penalty = Array2::from_elem((1, 1), 1.0e-4);
-        let seeds = Array1::from_vec(
-            block_log_lambda_seeds(&design, [&penalty]).expect("a scaled design and penalty seed"),
-        );
-        assert!(seeds[0] > 12.0, "the fixture must cross the removed hand box");
-
-        let (lower, upper) = log_lambda_domain(&seeds);
-        let radius = -0.5 * f64::EPSILON.ln();
-        assert_eq!(lower[0], seeds[0] - radius);
-        assert_eq!(upper[0], seeds[0] + radius);
-        assert!(lower[0] < seeds[0] && seeds[0] < upper[0]);
-    }
-}
-
 pub(crate) fn joint_setup(
     data: ArrayView2<'_, f64>,
     time_penalties: usize,
@@ -415,7 +381,8 @@ pub(crate) fn joint_setup(
     slope_penalties: usize,
     core_rho0_seed: &[f64],
     extra_rho0: &[f64],
-    rho_domain: Option<(Array1<f64>, Array1<f64>)>,
+    rho_lower: Array1<f64>,
+    rho_upper: Array1<f64>,
     baseline_initial_theta: &[f64],
     baseline_lower_theta: &[f64],
     baseline_upper_theta: &[f64],
@@ -491,18 +458,16 @@ pub(crate) fn joint_setup(
     let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
     // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-    // The ρ domain of the time block and of the prepared extra blocks lives
-    // in structures the joint driver never sees; the caller derived it (#2812).
-    // Without a caller-derived domain, centre each block's domain on its own
-    // scale-matched seed (#2767) rather than leaving the engine's wall.
-    let (rho_lower, rho_upper) = rho_domain.unwrap_or_else(|| log_lambda_domain(&rho0vec));
+    // The ρ domain of the time block and of the prepared extra blocks lives in
+    // structures the joint driver never sees; the caller derived it (#2812).
     let setup = ExactJointHyperSetup::new(
         rho0vec,
+        rho_lower,
+        rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
-    )
-    .with_rho_domain(rho_lower, rho_upper);
+    );
     assert_eq!(
         baseline_initial_theta.len(),
         baseline_lower_theta.len(),
@@ -665,7 +630,7 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
         .assign(&shrinkage_value);
     time_block.penalties.push(shrinkage);
     time_block.nullspace_dims.push(0);
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] added time_block nullspace shrinkage penalty (p={p}, penalties={})",
         time_block.penalties.len(),
     );
@@ -725,6 +690,7 @@ pub(crate) fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollec
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     };
     for spec in specs {
         out.linear_terms.extend(spec.linear_terms.clone());
@@ -853,12 +819,15 @@ pub(crate) fn combine_slope_surface_designs(
 ///
 /// This is a safeguarded 1D Newton solve on the true row objective. It does not
 /// use a coarse fixed grid scan. A row entering at the time origin carries no
-/// entry factor here, as in the fitted likelihood (gnomon#2336).
+/// entry factor here, as in the fitted likelihood (gnomon#2336), and each row's
+/// score reads its conditional variance `z_variance[i] = Var(z | a_i)`, the
+/// covariance the fitted likelihood reads (gam#2766, gam#2952).
 pub(crate) fn pooled_survival_baseline(
     event: &Array1<f64>,
     weights: &Array1<f64>,
     entry_at_origin: &Array1<bool>,
     z: &Array1<f64>,
+    z_variance: &Array1<f64>,
     q0: &Array1<f64>,
     q1: &Array1<f64>,
     qd1: &Array1<f64>,
@@ -879,6 +848,7 @@ pub(crate) fn pooled_survival_baseline(
                     qd1[i],
                     slope,
                     z[i],
+                    z_variance[i],
                     weights[i],
                     if entry_at_origin[i] { 0.0 } else { weights[i] },
                     event[i],

@@ -114,8 +114,8 @@ fn every_published_covariance_of_a_shape_constrained_fit_is_a_covariance_2705() 
 
         // The ρ̂-conditional covariance. A truncated Gaussian's covariance is
         // PSD; the pre-#2705 subtraction published a `−3.09e-15` diagonal here.
-        if let Some(conditional) = inference.beta_covariance.as_ref() {
-            let (floor, scale) = spectrum_floor(conditional.as_array());
+        if let Some(conditional) = fitted.fit.covariance_conditional.as_ref() {
+            let (floor, scale) = spectrum_floor(conditional);
             // The resolution of an eigenvalue of a matrix assembled at this
             // scale, by Weyl: the backward error of the assembly itself.
             let resolution = 64.0 * (conditional.nrows() as f64) * f64::EPSILON * scale.max(1.0);
@@ -126,7 +126,7 @@ fn every_published_covariance_of_a_shape_constrained_fit_is_a_covariance_2705() 
                      {resolution:.6e}"
                 ));
             }
-            for (index, &variance) in conditional.as_array().diag().iter().enumerate() {
+            for (index, &variance) in conditional.diag().iter().enumerate() {
                 if variance < 0.0 {
                     failures.push(format!(
                         "{kind}: conditional variance {index} is negative: {variance:.6e}"
@@ -139,7 +139,7 @@ fn every_published_covariance_of_a_shape_constrained_fit_is_a_covariance_2705() 
 
         // The ρ-marginal covariance. Pre-#2705 this was `Vp − GΔGᵀ` with `G`
         // and `Δ` built for `Vb`, which is the truncation of neither.
-        let Some(corrected) = inference.beta_covariance_corrected.as_ref() else {
+        let Some(corrected) = fitted.fit.covariance_corrected.as_ref() else {
             // A typed absence is honest (a rail-certified fit has no ρ-variance
             // to propagate), so it is not a failure — but if EVERY shape
             // declines, this test has stopped measuring the corrected path and
@@ -175,7 +175,7 @@ fn every_published_covariance_of_a_shape_constrained_fit_is_a_covariance_2705() 
         // both are truncations of nested Gaussians, so a corrected variance that
         // is orders of magnitude below its conditional counterpart while the
         // smoothing correction is positive is the pre-fix signature.
-        if let Some(conditional) = inference.beta_covariance.as_ref()
+        if let Some(conditional) = fitted.fit.covariance_conditional.as_ref()
             && let Some(smoothing) = inference.smoothing_correction.as_ref()
         {
             for index in 0..corrected.nrows() {
@@ -183,7 +183,7 @@ fn every_published_covariance_of_a_shape_constrained_fit_is_a_covariance_2705() 
                 if smoothing_ii <= 0.0 {
                     continue;
                 }
-                let conditional_ii = conditional.as_array()[[index, index]];
+                let conditional_ii = conditional[[index, index]];
                 let corrected_ii = corrected[[index, index]];
                 // Allow the truncation at `Vp` to remove more than the
                 // truncation at `Vb` did (it acts on a wider Gaussian), but not

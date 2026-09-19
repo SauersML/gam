@@ -215,9 +215,10 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
@@ -346,9 +347,10 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {

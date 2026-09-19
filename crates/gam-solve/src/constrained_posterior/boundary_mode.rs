@@ -100,18 +100,56 @@ pub struct BoundaryModeApproximation {
     pub certificate: BoundaryModeCertificate,
 }
 
+/// Why no boundary-mode approximation was published at a converged constrained mode.
+///
+/// The caller keeps the mode under its moment decline either way, and the decline records
+/// this refusal, so a saved model says why its moments are unavailable at the boundary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BoundaryModeRefusal {
+    pub reason: String,
+    /// The measured certificate, once the approximation got as far as measuring it. A
+    /// refusal by the certificate names its failing entry, such as the overturn tail mass,
+    /// and keeps every measured value.
+    #[serde(default)]
+    pub certificate: Option<BoundaryModeCertificate>,
+}
+
+impl BoundaryModeRefusal {
+    fn measured(reason: String, certificate: &BoundaryModeCertificate) -> Self {
+        Self {
+            reason,
+            certificate: Some(certificate.clone()),
+        }
+    }
+}
+
+impl From<String> for BoundaryModeRefusal {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            certificate: None,
+        }
+    }
+}
+
+impl std::fmt::Display for BoundaryModeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
 impl BoundaryModeApproximation {
     /// The boundary-mode law at `mode`, or why it may not be published.
     ///
     /// `precision` is `∇²F(β̂)` and `penalized_gradient` is `∇F(β̂)`, for `F` the negative
-    /// log posterior the fit minimized. Every refusal is a reason text, because the
-    /// caller keeps the converged mode under its moment decline either way.
+    /// log posterior the fit minimized. Every refusal names its reason, and a refusal made
+    /// once the certificate is measured also carries the certificate.
     pub fn at_converged_mode(
         precision: ArrayView2<'_, f64>,
         constraints: &LinearInequalityConstraints,
         mode: &Array1<f64>,
         penalized_gradient: &Array1<f64>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BoundaryModeRefusal> {
         let p = precision.nrows();
         if precision.ncols() != p
             || constraints.a.ncols() != p
@@ -128,7 +166,8 @@ impl BoundaryModeApproximation {
                 constraints.b.len(),
                 mode.len(),
                 penalized_gradient.len()
-            ));
+            )
+            .into());
         }
         let face = crate::active_set::active_face(mode, constraints).ok_or_else(|| {
             "boundary-mode approximation: the mode does not match the constraint width".to_string()
@@ -138,7 +177,8 @@ impl BoundaryModeApproximation {
             return Err(
                 "boundary-mode approximation: the mode binds no constraint row, so no \
                  coordinate is held by a multiplier"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         let rows = face.a_active.clone();
@@ -162,7 +202,8 @@ impl BoundaryModeApproximation {
         if rank != q {
             return Err(format!(
                 "boundary-mode approximation: {q} active row(s) have numerical rank {rank}"
-            ));
+            )
+            .into());
         }
 
         let precision = precision.to_owned();
@@ -218,7 +259,8 @@ impl BoundaryModeApproximation {
                 "boundary-mode approximation: active constraint row {} carries multiplier \
                  {:.3e}; without strict complementarity its coordinate has no exponential scale",
                 face.active_idx[position], rates[position]
-            ));
+            )
+            .into());
         }
 
         let mut rate_scaled_lift = lift.clone();
@@ -273,12 +315,15 @@ impl BoundaryModeApproximation {
             .into_iter()
             .find(|&(_, value)| !(value <= certificate.tolerance))
         {
-            return Err(format!(
-                "boundary-mode approximation not certified: {name} {value:.3e} exceeds the moment \
-                 accuracy {:.1e} (multipliers {}, min vᵀKv over the simplex {:.3e})",
-                certificate.tolerance,
-                render_rates(&certificate.rates),
-                certificate.scaled_copositive_minimum
+            return Err(BoundaryModeRefusal::measured(
+                format!(
+                    "boundary-mode approximation not certified: {name} {value:.3e} exceeds the \
+                     moment accuracy {:.1e} (multipliers {}, min vᵀKv over the simplex {:.3e})",
+                    certificate.tolerance,
+                    render_rates(&certificate.rates),
+                    certificate.scaled_copositive_minimum
+                ),
+                &certificate,
             ));
         }
 
@@ -307,10 +352,13 @@ impl BoundaryModeApproximation {
                     .sum::<f64>()
                     * (1.0 / share).ln();
             if !(slack > horizon) {
-                return Err(format!(
-                    "boundary-mode approximation: inactive constraint row {row} sits {slack:.3e} \
-                     from the mode, inside the approximate law's double-precision reach \
-                     {horizon:.3e}, and the approximation does not model that wall"
+                return Err(BoundaryModeRefusal::measured(
+                    format!(
+                        "boundary-mode approximation: inactive constraint row {row} sits \
+                         {slack:.3e} from the mode, inside the approximate law's double-precision \
+                         reach {horizon:.3e}, and the approximation does not model that wall"
+                    ),
+                    &certificate,
                 ));
             }
         }
@@ -505,8 +553,17 @@ mod tests {
         )
         .expect_err("a multiplier of 1 against a normal curvature of -1 is not certified");
         assert!(
-            refusal.contains("not certified") && refusal.contains("overturn tail mass 1.353e-1"),
+            refusal.reason.contains("not certified") && refusal.reason.contains("overturn tail mass 1.353e-1"),
             "the refusal must name the failing entry and its value, got: {refusal}"
+        );
+        let certificate = refusal
+            .certificate
+            .as_ref()
+            .expect("a refusal by the certificate keeps the measured certificate");
+        assert!(
+            (certificate.overturn_tail_mass - (-2.0_f64).exp()).abs() <= 1e-10,
+            "the recorded overturn tail mass must be e^-2, got {:e}",
+            certificate.overturn_tail_mass
         );
     }
 
@@ -522,7 +579,7 @@ mod tests {
             &gradient,
         )
         .expect_err("a zero multiplier holds no coordinate");
-        assert!(refusal.contains("strict complementarity"), "got: {refusal}");
+        assert!(refusal.reason.contains("strict complementarity"), "got: {refusal}");
     }
 
     /// The fixture `a_cone_improper_posterior_keeps_the_mode_under_a_named_decline` uses:
@@ -539,7 +596,7 @@ mod tests {
             &gradient,
         )
         .expect_err("an indefinite face has no Gaussian law");
-        assert!(refusal.contains("not positive definite on the 1-dimensional face tangent"), "got: {refusal}");
+        assert!(refusal.reason.contains("not positive definite on the 1-dimensional face tangent"), "got: {refusal}");
     }
 
     /// An inactive wall at `β₁ ≤ 0.6` sits `0.1` from the mode against a face standard
@@ -557,7 +614,7 @@ mod tests {
         let refusal =
             BoundaryModeApproximation::at_converged_mode(precision.view(), &near, &mode, &gradient)
                 .expect_err("a wall 0.1 away inside a spread of 0.71 is within reach");
-        assert!(refusal.contains("inactive constraint row 1"), "got: {refusal}");
+        assert!(refusal.reason.contains("inactive constraint row 1"), "got: {refusal}");
         let far = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [0.0, -1.0]],
             b: array![0.0, -100.0],

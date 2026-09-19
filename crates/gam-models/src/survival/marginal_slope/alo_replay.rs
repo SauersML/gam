@@ -377,13 +377,6 @@ pub fn replay_saved_survival_marginal_slope_alo(
             );
         }
     };
-    if latent_law.is_some() && (score_warp.is_some() || link_dev.is_some()) {
-        return Err(
-            "saved survival marginal-slope ALO: a declared latent law is not supported \
-             together with a score-warp or link-deviation flex block"
-                .to_string(),
-        );
-    }
     let family = SurvivalMarginalSlopeFamily {
         jeffreys_armed: true,
         latent_law,

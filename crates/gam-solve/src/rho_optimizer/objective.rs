@@ -71,10 +71,14 @@ pub enum SeedOutcome {
 ///   points even when `capability().hessian == Analytic`; `opt` degrades that
 ///   step to first-order behavior instead of requiring the objective to fake a
 ///   stale or non-finite Hessian.
-/// - Use `eval_cost()` / `OuterEval::infeasible()` for infeasible trial points.
-///   Return `Err(...)` only when the evaluation artifact itself cannot be
-///   constructed. Such errors are fatal across screening, multistart, and
-///   solver plans; they are never reinterpreted as another numerical trial.
+/// - An infeasible trial point returns `Err` carrying a refusal whose
+///   `EstimationError::is_trial_point_infeasible` answers true (for example
+///   `EstimationError::TrialPointRefused`), so the refusal's reason reaches the
+///   outer log and every consumer classifies the point by variant (#2735). Every
+///   other `Err` means the evaluation artifact itself cannot be constructed; it
+///   is fatal across screening, multistart, and solver plans and is never
+///   reinterpreted as another numerical trial. A +∞ cost
+///   (`OuterEval::infeasible()`) still reads as infeasible but names no reason.
 /// - `eval_cost()` is used only for cost-based optimization paths.
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
 /// - `eval_efs()` is used only by the EFS solver. It runs the inner solve,
@@ -521,7 +525,7 @@ pub trait OuterObjective {
         rho: &Array1<f64>,
         plan: &OuterPlan,
     ) -> Result<(), EstimationError> {
-        log::debug!(
+        log::trace!(
             "[OUTER] finalize: re-installing best rho into the objective (solver {:?})",
             plan.solver
         );
@@ -623,6 +627,14 @@ pub(crate) fn encode_iterate(
         eval_id,
     };
     serde_json::to_vec(&p).ok()
+}
+
+/// The cache payload of a prior fit's certified outer point, for a caller that
+/// resumes a new fit from it (`warm_start_from`). The optimizer decodes it like
+/// its own checkpoints, so the point is recertified on the new fit, never
+/// trusted.
+pub fn encode_outer_warm_start(rho: &Array1<f64>, beta: &Array1<f64>) -> Option<Vec<u8>> {
+    encode_iterate(rho, Some(beta), None, 0.0, 0)
 }
 
 pub(crate) fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayload> {
@@ -827,11 +839,11 @@ impl<'a> CheckpointingObjective<'a> {
     /// `ρ` is printed in full: the whole point is to be able to difference two
     /// consecutive trial points by hand, and a norm cannot be differenced.
     fn trace_eval(&self, rho: &Array1<f64>, cost: f64, gradient: Option<&Array1<f64>>, what: &str) {
-        if !log::log_enabled!(log::Level::Debug) {
+        if !log::log_enabled!(log::Level::Trace) {
             return;
         }
         let gradient_norm = gradient.map_or(f64::NAN, |g| g.dot(g).sqrt());
-        log::debug!(
+        log::trace!(
             "[OUTER eval] #{} {what} cost={cost:.15e} |g|={gradient_norm:.6e} rho={:?}",
             self.eval_counter.load(Ordering::Relaxed),
             rho.to_vec(),
@@ -1653,10 +1665,20 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
     if result.rho.len() == perm.len() {
         result.rho = permute_to_native(&result.rho, perm);
     }
-    if let Some(g) = result.final_gradient.as_ref()
-        && g.len() == perm.len()
-    {
-        result.final_gradient = Some(permute_to_native(g, perm));
+    if let Some(measurement) = result.final_measurement.take() {
+        let (rho, value, gradient) = measurement.into_parts();
+        let to_native = |coordinates: Array1<f64>| {
+            if coordinates.len() == perm.len() {
+                permute_to_native(&coordinates, perm)
+            } else {
+                coordinates
+            }
+        };
+        result.final_measurement = Some(OuterFirstOrderMeasurement::new(
+            to_native(rho),
+            value,
+            to_native(gradient),
+        ));
     }
     if let Some(h) = result.final_hessian.as_ref()
         && h.nrows() == perm.len()
@@ -1688,6 +1710,12 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
         .flatten()
         .chain(active_set.into_iter().flatten())
         .chain(result.refused_seed_points.iter_mut())
+        .chain(
+            result
+                .dominated_plateau
+                .as_mut()
+                .map(|plateau| &mut plateau.plateau_rho),
+        )
     {
         if point.len() == perm.len() {
             *point = permute_to_native(point, perm);
@@ -1704,8 +1732,16 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
 /// than the one the refusal reported. Every coordinate `reason` names was
 /// rendered in native order when the text was written, through
 /// [`native_coordinate`] on `OuterConfig::native_coordinate_order` (#2817), so
-/// only the checkpoint is permuted here.
+/// only the points are permuted here: the checkpoint, and a dominated-plateau
+/// refusal's declined optimum (#2953).
 pub(crate) fn outer_error_to_native(error: EstimationError, perm: &[usize]) -> EstimationError {
+    let to_native = |rho: Vec<f64>| {
+        if rho.len() == perm.len() {
+            permute_to_native(&Array1::from_vec(rho), perm).to_vec()
+        } else {
+            rho
+        }
+    };
     match error {
         EstimationError::RemlDidNotConverge {
             context,
@@ -1715,22 +1751,40 @@ pub(crate) fn outer_error_to_native(error: EstimationError, perm: &[usize]) -> E
             projected_grad_norm,
             stationarity_standard,
             rho_checkpoint,
-        } => {
-            let rho_checkpoint = if rho_checkpoint.len() == perm.len() {
-                permute_to_native(&Array1::from_vec(rho_checkpoint), perm).to_vec()
-            } else {
-                rho_checkpoint
-            };
-            EstimationError::RemlDidNotConverge {
-                context,
-                reason,
-                iterations,
-                final_value,
-                projected_grad_norm,
-                stationarity_standard,
-                rho_checkpoint,
-            }
-        }
+        } => EstimationError::RemlDidNotConverge {
+            context,
+            reason,
+            iterations,
+            final_value,
+            projected_grad_norm,
+            stationarity_standard,
+            rho_checkpoint: to_native(rho_checkpoint),
+        },
+        EstimationError::DominatedCertifiedPlateau {
+            context,
+            kind,
+            plateau_rho,
+            plateau_value,
+            incumbent_rho,
+            incumbent_value,
+            incumbent_projected_grad_norm,
+            gap,
+            band,
+            continuation,
+            terminal_refusal,
+        } => EstimationError::DominatedCertifiedPlateau {
+            context,
+            kind,
+            plateau_rho: to_native(plateau_rho),
+            plateau_value,
+            incumbent_rho: to_native(incumbent_rho),
+            incumbent_value,
+            incumbent_projected_grad_norm,
+            gap,
+            band,
+            continuation,
+            terminal_refusal: Box::new(outer_error_to_native(*terminal_refusal, perm)),
+        },
         other => other,
     }
 }
@@ -1761,6 +1815,20 @@ pub(crate) fn criterion_certificate_to_native(
             rail.index = native(rail.index);
         }
         rails.sort_by_key(|rail| rail.index);
+    }
+    // The polish's rails stay in the order they were taken, which the index does
+    // not encode.
+    if let Some(polish) = certificate.newton_polish.as_mut() {
+        for rail in polish.rails.iter_mut() {
+            rail.index = native(rail.index);
+        }
+        let mut entry = polish.entry.clone();
+        for (canonical, &value) in polish.entry.iter().enumerate() {
+            if let Some(slot) = entry.get_mut(native(canonical)) {
+                *slot = value;
+            }
+        }
+        polish.entry = entry;
     }
 }
 
@@ -2234,6 +2302,7 @@ mod native_certificate_index_tests {
             lower: -1.0,
             upper: 1.0,
             margin: 0.5,
+            face: crate::model_types::RailFaceKind::Representability,
         }
     }
 
@@ -2258,6 +2327,7 @@ mod native_certificate_index_tests {
             curvature: CurvatureEvidence::NotSpent,
             lambdas_railed: vec![0, 3, 5],
             railed_facts: vec![fact(0), fact(3)],
+            newton_polish: None,
             curvature_floor: None,
         };
         criterion_certificate_to_native(&mut certificate, &perm);

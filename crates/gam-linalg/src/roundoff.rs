@@ -39,28 +39,8 @@
 //! * A **compensated (Kahan/Neumaier) sum** has a bound with no `n` in it at
 //!   all — [`compensated_band`].
 
-/// Unit roundoff `u = EPSILON/2`.
-///
-/// `EPSILON` is the gap between `1.0` and the next representable `f64`; the
-/// error of a single correctly-rounded operation is at most half that gap
-/// relative to the result, which is the quantity every backward-error bound is
-/// stated in. The factor of two between the two is the single most common
-/// source of "the same tolerance, twice, 2× apart".
-pub const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
-
-/// Wilkinson's growth factor `γ_n = n·u / (1 − n·u)` for an `n`-operation
-/// accumulation.
-///
-/// Returns infinity once `n·u ≥ 1`, where the bound carries no information —
-/// an accumulation that long has no useful error bound, and reporting an
-/// infinite band is the honest answer rather than a negative or wrapped one.
-pub fn accumulation_growth(operations: usize) -> f64 {
-    let scaled = operations as f64 * UNIT_ROUNDOFF;
-    if !(scaled < 1.0) {
-        return f64::INFINITY;
-    }
-    scaled / (1.0 - scaled)
-}
+// Owned by gam-math, the lowest crate, so the math crate's bounds read the same definitions.
+pub use gam_math::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 
 /// Backward-error band of an inner product of length `terms` whose summands
 /// have absolute sum `absolute_sum`: `γ_terms · absolute_sum`.
@@ -118,6 +98,22 @@ pub fn resolved_eigenvalue_count(eigenvalues: &[f64], assembly_band: f64) -> usi
 /// costs three. Count the operations at the call site, where they are visible.
 pub fn compensated_band(formation_roundings: usize, absolute_sum: f64) -> f64 {
     (2.0 + formation_roundings as f64) * UNIT_ROUNDOFF * absolute_sum
+}
+
+/// The absolute summands behind a gradient summed from terms (#2976, #2822).
+///
+/// A gradient summed from rows carries the rounding of that sum, which scales with
+/// the summands' magnitudes and not with the assembled result: near a mode each
+/// row's term is `O(1)` while their sum is small. Coordinate `j` of the computed sum
+/// is within `accumulation_growth(accumulation_depth) · absolute_sums[j]` of the exact
+/// sum of the same computed terms.
+pub struct GradientAccumulation {
+    /// The sequential depth of the floating-point reduction that sums the terms:
+    /// the `m` of the `γ_m` that bands the sum.
+    pub accumulation_depth: usize,
+    /// `Σ |terms|` per coordinate: every product the reduction adds into that
+    /// coordinate, in absolute value.
+    pub absolute_sums: ndarray::Array1<f64>,
 }
 
 /// Backward-error band on the singular values of an `m × n` factor with largest
@@ -268,9 +264,78 @@ pub fn solved_penalty_trace_band(
     Ok(lambda.abs() * (solve_band + accumulation_growth(rows * columns) * absolute_sum))
 }
 
+/// The trace `t̂ = λ·Σ_c r_cᵀ x̂_c` of solved penalty-root columns, with its
+/// [`solved_penalty_trace_band`] (#2901).
+///
+/// `rhs` holds the columns `r_c` a route solved against `operator`, and `solution`
+/// the computed `x̂_c`. For a pseudoinverse solve, `rhs` is the root projected onto
+/// the operator's range, the right-hand side that solve reproduces. The true
+/// residual `operator·x̂_c − r_c` is formed here, so every route prices its trace
+/// against the operator its solve represents.
+pub fn solved_penalty_trace(
+    lambda: f64,
+    rhs: ndarray::ArrayView2<'_, f64>,
+    solution: ndarray::ArrayView2<'_, f64>,
+    operator: ndarray::ArrayView2<'_, f64>,
+    inverse_one_norm_estimate: f64,
+) -> Result<(f64, f64), String> {
+    if operator.nrows() != rhs.nrows() || operator.ncols() != solution.nrows() {
+        return Err(format!(
+            "solved_penalty_trace: a {}x{} operator against a {}x{} right-hand side and a {}x{} \
+             solution",
+            operator.nrows(),
+            operator.ncols(),
+            rhs.nrows(),
+            rhs.ncols(),
+            solution.nrows(),
+            solution.ncols()
+        ));
+    }
+    let residual = operator.dot(&solution) - &rhs;
+    let matrix_max_abs = operator
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let band = solved_penalty_trace_band(
+        lambda,
+        rhs,
+        solution,
+        residual.view(),
+        matrix_max_abs,
+        inverse_one_norm_estimate,
+    )?;
+    let trace: f64 = rhs.iter().zip(solution.iter()).map(|(r, x)| r * x).sum();
+    Ok((lambda * trace, band))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The composed trace is `λ·Σ r·x̂`, and its band covers the error of a
+    /// displaced solution through the residual it forms against the operator.
+    #[test]
+    fn a_solved_penalty_trace_prices_its_solution_against_the_operator_2901() {
+        let operator = ndarray::array![[2.0, 0.0], [0.0, 4.0]];
+        let rhs = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
+        let exact = ndarray::array![[0.5, 0.0], [0.0, 0.25]];
+        let (trace, band) =
+            solved_penalty_trace(3.0, rhs.view(), exact.view(), operator.view(), 0.5)
+                .expect("exact solve");
+        assert_eq!(trace, 2.25);
+        let displaced = ndarray::array![[0.501, 0.0], [0.0, 0.25]];
+        let (displaced_trace, displaced_band) =
+            solved_penalty_trace(3.0, rhs.view(), displaced.view(), operator.view(), 0.5)
+                .expect("displaced solve");
+        let error = (displaced_trace - trace).abs();
+        assert!(
+            error <= displaced_band,
+            "displaced trace error {error:e} escapes its band {displaced_band:e}"
+        );
+        assert!(
+            error > band,
+            "the exact solve's band {band:e} must not cover a displacement of {error:e}"
+        );
+    }
 
     /// #2901: a solve left inexact by a known perturbation moves the trace by
     /// `−λ·Σ x_cᵀρ_c`, and the band carries it. `H = diag(4, 0.5)`, `r = (1, 1)`,

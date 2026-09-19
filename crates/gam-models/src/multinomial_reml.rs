@@ -64,8 +64,8 @@ use crate::block_layout::block_count::validate_block_count;
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, CustomFamily,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, FamilyEvaluation,
-    FamilyLinearizationState, JointHessianSourcePreference, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix,
+    FamilyLinearizationState, GradientAccumulation, JointHessianSourcePreference,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
 use crate::vector_response::{
     MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
@@ -1724,11 +1724,16 @@ impl MultinomialFamily {
     /// [`Self::assemble_joint_hessian`]. Reused by the frozen-β workspace so the
     /// inner joint-Newton gradient load and line-search log-likelihood reads
     /// share the same cached probabilities as the matrix-free `H·v` contraction.
+    ///
+    /// The same loop measures the gradient's accumulation (#2976): each
+    /// coordinate is one sequential sum of `N` formed products `X_{row,i} ·
+    /// w_row (y − p)_{row,a}`, so its depth is `N`, and the absolute value of
+    /// every product is summed beside it.
     fn joint_loglik_and_gradient_from_probs(
         &self,
         eta: ArrayView2<'_, f64>,
         probs_full: ArrayView2<'_, f64>,
-    ) -> Result<(f64, Array1<f64>), String> {
+    ) -> Result<MultinomialGradientPass, String> {
         let n = self.weights.len();
         let p = self.design.ncols();
         let m = self.active_classes();
@@ -1766,21 +1771,36 @@ impl MultinomialFamily {
             log_lik -= program.negative_log_likelihood();
         }
         let mut grad = Array1::<f64>::zeros(m * p);
+        let mut absolute_sums = Array1::<f64>::zeros(m * p);
         let grad_values = grad
             .as_slice_mut()
             .expect("fresh joint gradient is contiguous");
+        let absolute_values = absolute_sums
+            .as_slice_mut()
+            .expect("fresh absolute sums are contiguous");
         for a in 0..m {
             for i in 0..p {
                 let mut acc = 0.0_f64;
+                let mut absolute = 0.0_f64;
                 for row in 0..n {
                     let resid = self.weights[row]
                         * (response_values[row * k + a] - probability_values[row * k + a]);
-                    acc += design_values[row * p + i] * resid;
+                    let product = design_values[row * p + i] * resid;
+                    acc += product;
+                    absolute += product.abs();
                 }
                 grad_values[a * p + i] = acc;
+                absolute_values[a * p + i] = absolute;
             }
         }
-        Ok((log_lik, grad))
+        Ok(MultinomialGradientPass {
+            log_likelihood: log_lik,
+            gradient: grad,
+            accumulation: GradientAccumulation {
+                accumulation_depth: n,
+                absolute_sums,
+            },
+        })
     }
 
     /// Apply a coefficient-space direction `d_β` to the design to obtain
@@ -3230,6 +3250,7 @@ impl CustomFamily for MultinomialFamily {
             eta,
             probs,
             projection_cache: Arc::new(gam_runtime::resource::RayonSafeOnce::new()),
+            gradient_pass: gam_runtime::resource::RayonSafeOnce::new(),
         })))
     }
 
@@ -3423,6 +3444,30 @@ struct MultinomialHessianWorkspace {
     /// trace kernels query all directional operators with the same factor, so
     /// `X·F_a` is workspace geometry, not direction-specific work.
     projection_cache: Arc<gam_runtime::resource::RayonSafeOnce<MultinomialClassProjection>>,
+    /// The value, gradient and gradient accumulation at the frozen state, from
+    /// one pass of [`MultinomialFamily::joint_loglik_and_gradient_from_probs`],
+    /// so the accumulation always describes the gradient the solve read.
+    gradient_pass: gam_runtime::resource::RayonSafeOnce<Result<MultinomialGradientPass, String>>,
+}
+
+/// The joint log-likelihood, its gradient and that gradient's accumulation
+/// (#2976), formed in one row pass.
+struct MultinomialGradientPass {
+    log_likelihood: f64,
+    gradient: Array1<f64>,
+    accumulation: GradientAccumulation,
+}
+
+impl MultinomialHessianWorkspace {
+    fn gradient_pass(&self) -> Result<&MultinomialGradientPass, String> {
+        self.gradient_pass
+            .get_or_compute(|| {
+                self.family
+                    .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
 }
 
 impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
@@ -3452,21 +3497,24 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     }
 
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
-        let (log_lik, _) = self
-            .family
-            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())?;
-        Ok(Some(log_lik))
+        Ok(Some(self.gradient_pass()?.log_likelihood))
     }
 
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        let (log_likelihood, gradient) = self
-            .family
-            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())?;
+        let pass = self.gradient_pass()?;
         Ok(Some(ExactNewtonJointGradientEvaluation {
-            log_likelihood,
-            gradient,
+            log_likelihood: pass.log_likelihood,
+            gradient: pass.gradient.clone(),
+        }))
+    }
+
+    fn joint_gradient_accumulation(&self) -> Result<Option<GradientAccumulation>, String> {
+        let accumulation = &self.gradient_pass()?.accumulation;
+        Ok(Some(GradientAccumulation {
+            accumulation_depth: accumulation.accumulation_depth,
+            absolute_sums: accumulation.absolute_sums.clone(),
         }))
     }
 
@@ -4054,9 +4102,10 @@ mod tests {
                 // ∇NLL = −∇log_lik).
                 let probs = active_probs(&family, &eta);
                 let eta_matrix = Array2::from_shape_vec((1, M), eta.to_vec()).expect("eta matrix");
-                let (log_lik, grad_ll) = family
+                let pass = family
                     .joint_loglik_and_gradient_from_probs(eta_matrix.view(), probs.view())
                     .expect("valid frozen multinomial row");
+                let (log_lik, grad_ll) = (pass.log_likelihood, pass.gradient);
                 close(
                     jet_v,
                     -log_lik,
@@ -6579,6 +6628,224 @@ mod tests {
             max_abs <= 1e-10 * scale + 1e-13,
             "workspace gradient deviates from family gradient by {max_abs} (scale {scale})"
         );
+    }
+
+    /// #2976: the workspace measures its gradient's row summands in the pass
+    /// that forms the gradient, per coordinate in flattened class-major order.
+    ///
+    /// At `β = 0` every row's softmax is uniform, so the product the reduction
+    /// adds into coordinate `(a, i)` from a row is `X_{row,i} · w_row ·
+    /// (y_{row,a} − 1/3)`, known in closed form. Each row is paired with one of
+    /// opposite sign in the first column, so that column's gradient cancels to
+    /// zero while its summands do not: a band read off `|∇ℓ|` would be zero there.
+    #[test]
+    fn workspace_gradient_accumulation_is_the_closed_form_row_summand_band_2976() {
+        let classes = [0usize, 0, 1, 1];
+        let rows = classes.len();
+        let mut y = Array2::<f64>::zeros((rows, 3));
+        for (row, &class) in classes.iter().enumerate() {
+            y[[row, class]] = 1.0;
+        }
+        let family = MultinomialFamily::new(
+            y,
+            array![1.0, 1.0, 3.0, 3.0],
+            3,
+            Arc::new(array![[2.0, 1.0], [-2.0, 0.5], [1.0, -2.0], [-1.0, 4.0]]),
+            Arc::new(Vec::new()),
+        )
+        .expect("closed-form multinomial family must construct");
+        let specs = family.build_block_specs();
+        let states = states_at_betas(&family, &[Array1::zeros(2), Array1::zeros(2)]);
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+        let gradient = workspace
+            .joint_gradient_evaluation()
+            .expect("workspace gradient")
+            .expect("workspace gradient present")
+            .gradient;
+        let accumulation = workspace
+            .joint_gradient_accumulation()
+            .expect("workspace accumulation")
+            .expect("the multinomial workspace measures its gradient's summands");
+        // Class-major coordinates (class 0, x₀), (class 0, x₁), (class 1, x₀),
+        // (class 1, x₁). Rows 0-1 are class 0 and rows 2-3 class 1, so
+        // |y − 1/3| is 2/3 on a coordinate's own class rows and 1/3 on the others.
+        let closed_form_gradient = [0.0, -1.0, 0.0, 3.5];
+        let closed_form_absolute_sums = [14.0 / 3.0, 7.0, 16.0 / 3.0, 12.5];
+        assert_eq!(
+            accumulation.accumulation_depth, rows,
+            "each coordinate is one sequential sum over the rows"
+        );
+        assert_eq!(accumulation.absolute_sums.len(), closed_form_absolute_sums.len());
+        let growth = gam_linalg::roundoff::accumulation_growth(rows);
+        for j in 0..closed_form_absolute_sums.len() {
+            let band = growth * accumulation.absolute_sums[j];
+            let closed_form_band = growth * closed_form_absolute_sums[j];
+            println!(
+                "[2976] multinomial closed form: coordinate {j} gradient={:.17e} \
+                 band={band:.6e} closed_form_band={closed_form_band:.6e}",
+                gradient[j]
+            );
+            assert!(
+                (band - closed_form_band).abs() <= 8.0 * f64::EPSILON * closed_form_band,
+                "coordinate {j}: the band from the workspace's absolute summand sums, {band:.17e}, \
+                 must be the closed form γ_N · Σ_rows |X·w·(y − p)| = {closed_form_band:.17e}"
+            );
+            assert!(
+                (gradient[j] - closed_form_gradient[j]).abs() <= band,
+                "coordinate {j}: the computed gradient {:.17e} must lie within its band \
+                 {band:.3e} of the closed form {:.17e}",
+                gradient[j],
+                closed_form_gradient[j]
+            );
+        }
+    }
+
+    /// #2976 settlement fixture: an intercept-only three-class fit whose rows
+    /// each stand for `SUMMAND_FLOOR_ROW_WEIGHT` observations, in class
+    /// proportions 7 : 5 : 3.
+    ///
+    /// Every row shares one softmax, so the computed gradient `Σ_rows W·(y − p̂)`
+    /// moves in steps of about `W·N·ulp(p̂)` as `β` moves and cannot be driven to
+    /// zero. Its residual floors six decades above an absolute target of `1e-11` and
+    /// three below `γ_N · Σ_rows |W·(y − p̂)| ≈ 1e-2`, the band its summands
+    /// accumulate (at the settled mode: residual 1.07e-5, bands 1.24e-2 and 1.11e-2).
+    /// The Jeffreys term is off, so the solve's gradient is the workspace's alone.
+    const SUMMAND_FLOOR_ROWS: usize = 15_000;
+    const SUMMAND_FLOOR_ROW_WEIGHT: f64 = 1.0e6;
+    const SUMMAND_FLOOR_INNER_TOL: f64 = 1.0e-11;
+
+    fn summand_floor_family() -> MultinomialFamily {
+        let mut y = Array2::<f64>::zeros((SUMMAND_FLOOR_ROWS, 3));
+        for row in 0..SUMMAND_FLOOR_ROWS {
+            let class = match row % 15 {
+                0..=6 => 0,
+                7..=11 => 1,
+                _ => 2,
+            };
+            y[[row, class]] = 1.0;
+        }
+        MultinomialFamily::new(
+            y,
+            Array1::from_elem(SUMMAND_FLOOR_ROWS, SUMMAND_FLOOR_ROW_WEIGHT),
+            3,
+            Arc::new(Array2::ones((SUMMAND_FLOOR_ROWS, 1))),
+            Arc::new(Vec::new()),
+        )
+        .expect("summand-floor multinomial family must construct")
+        .with_joint_jeffreys_term(false)
+    }
+
+    fn summand_floor_options(inner_max_cycles: usize) -> crate::custom_family::BlockwiseFitOptions {
+        crate::custom_family::BlockwiseFitOptions {
+            inner_max_cycles,
+            inner_tol: SUMMAND_FLOOR_INNER_TOL,
+            use_remlobjective: false,
+            compute_covariance: false,
+            ..crate::custom_family::BlockwiseFitOptions::default()
+        }
+    }
+
+    /// (a) The returned mode settles. Its residual is above the caller's target
+    /// and, coordinate by coordinate, within the band the workspace measures.
+    #[test]
+    fn a_multinomial_mode_on_its_summand_floor_settles_on_the_measured_band_2976() {
+        let family = summand_floor_family();
+        let specs = family.build_block_specs();
+        let budget = crate::custom_family::BlockwiseFitOptions::default().inner_max_cycles;
+        let fit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
+            &family,
+            &specs,
+            &summand_floor_options(budget),
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!("a multinomial mode on its summand floor must settle on its measured band: {error}")
+        });
+        let betas: Vec<Array1<f64>> = fit.blocks.iter().map(|block| block.beta.clone()).collect();
+        let states = states_at_betas(&family, &betas);
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build at the settled mode")
+            .expect("workspace present at the settled mode");
+        let gradient = workspace
+            .joint_gradient_evaluation()
+            .expect("workspace gradient at the settled mode")
+            .expect("workspace gradient present at the settled mode")
+            .gradient;
+        let accumulation = workspace
+            .joint_gradient_accumulation()
+            .expect("workspace accumulation at the settled mode")
+            .expect("the multinomial workspace measures its gradient's summands");
+        let growth = gam_linalg::roundoff::accumulation_growth(accumulation.accumulation_depth);
+        let residual = gradient.iter().fold(0.0_f64, |largest, value| largest.max(value.abs()));
+        let caller_target = SUMMAND_FLOOR_INNER_TOL * (1.0 + residual);
+        let bands = accumulation.absolute_sums.mapv(|sum| growth * sum);
+        println!(
+            "[2976] multinomial summand floor: beta={betas:?} residual={residual:.3e} \
+             caller_target={caller_target:.3e} bands={bands:?}"
+        );
+        assert!(
+            residual > caller_target,
+            "the fixture must floor above the caller's target: residual {residual:.3e} against \
+             {caller_target:.3e}"
+        );
+        for (j, (value, band)) in gradient.iter().zip(bands.iter()).enumerate() {
+            assert!(
+                value.abs() <= *band,
+                "coordinate {j}: the settled mode must sit within its summand band: residual \
+                 {:.3e} against {band:.3e}",
+                value.abs()
+            );
+        }
+    }
+
+    /// (b) Negative control: a state whose residual is above its summand band
+    /// is not settled. Two cycles from the uniform start leave the residual
+    /// above the largest band any state of this fixture can have.
+    #[test]
+    fn a_multinomial_state_above_its_summand_band_is_not_settled_2976() {
+        let family = summand_floor_family();
+        let specs = family.build_block_specs();
+        // |X| = 1 and |y − p| ≤ 1 on every row, so no state's band exceeds γ_N · N · W.
+        let band_ceiling = gam_linalg::roundoff::accumulation_growth(SUMMAND_FLOOR_ROWS)
+            * SUMMAND_FLOOR_ROWS as f64
+            * SUMMAND_FLOOR_ROW_WEIGHT;
+        match crate::custom_family::fit_custom_family_fixed_log_lambdas(
+            &family,
+            &specs,
+            &summand_floor_options(2),
+            None,
+        ) {
+            Ok(_) => panic!(
+                "a two-cycle solve from the uniform start must not settle: every state's summand \
+                 band is at most {band_ceiling:.3e}"
+            ),
+            Err(gam_problem::CustomFamilyError::InnerSolveNotConverged {
+                terminal:
+                    Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                        stationarity_residual,
+                        ..
+                    }),
+                ..
+            }) => {
+                println!(
+                    "[2976] multinomial above the band: residual={stationarity_residual:.3e} \
+                     band_ceiling={band_ceiling:.3e}"
+                );
+                assert!(
+                    stationarity_residual > band_ceiling,
+                    "the control must end above the summand band: residual \
+                     {stationarity_residual:.3e} against {band_ceiling:.3e}"
+                );
+            }
+            Err(other) => panic!(
+                "the truncated solve must refuse as an unconverged joint-Newton inner solve, got: \
+                 {other}"
+            ),
+        }
     }
 
     #[test]

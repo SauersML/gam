@@ -33,7 +33,7 @@ def test_heterogeneous_d_atom_with_fixed_d_row_block_penalty_raises_clear_error(
     X = rng.normal(size=(12, 4))
 
     with pytest.raises(ValueError) as excinfo:
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=X,
             K=2,
             d_atom=[2, 1],
@@ -45,7 +45,6 @@ def test_heterogeneous_d_atom_with_fixed_d_row_block_penalty_raises_clear_error(
             smoothness_weight=0.01,
             isometry_weight=0.0,
             block_orthogonality_weight=0.1,
-            ard_per_atom=False,
             decoder_incoherence_weight=0.1,
             nuclear_norm_weight=0.0,
             random_state=0,
@@ -72,7 +71,7 @@ def test_isometry_gauge_is_admitted_on_heterogeneous_atom_dims() -> None:
     X = rng.normal(size=(12, 4))
 
     try:
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=X,
             K=2,
             d_atom=[2, 1],
@@ -84,7 +83,6 @@ def test_isometry_gauge_is_admitted_on_heterogeneous_atom_dims() -> None:
             smoothness_weight=0.01,
             isometry_weight=0.1,
             block_orthogonality_weight=0.0,
-            ard_per_atom=True,
             decoder_incoherence_weight=0.1,
             nuclear_norm_weight=0.0,
             random_state=0,
@@ -106,7 +104,7 @@ def test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disable
     X = rng.normal(size=(24, 4))
 
     try:
-        model = gamfit.sae_manifold_fit(
+        model = gamfit.sae.sae_manifold_fit(
             X=X,
             K=2,
             d_atom=[2, 1],
@@ -117,7 +115,6 @@ def test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disable
             coord_sparsity="l1",
             smoothness_weight=0.01,
             isometry_weight=0.0,
-            ard_per_atom=False,
             decoder_incoherence_weight=0.0,
             nuclear_norm_weight=0.0,
             block_orthogonality_weight=0.0,

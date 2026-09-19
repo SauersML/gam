@@ -1160,13 +1160,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
         if factor.nrows() != self.slices.total {
             return None;
         }
-        let n_rows = self.family.n;
-        // Whole-projection build: each axis uses the batched design matvec
-        // (`fast_ab` on dense, one operator `dot` per column on operator-backed
-        // designs).
-        Some(self.assemble_jf(factor, n_rows, |design, factor_block| {
-            crate::row_kernel::row_kernel_design_jf(design, factor_block, n_rows)
-        }))
+        self.tiled_jacobian_action_matrix(factor)
     }
 
     fn jacobian_action_matrix_rows(
@@ -1535,7 +1529,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
 
             static HESSIAN_STORAGE_LOGGED: std::sync::Once = std::sync::Once::new();
             HESSIAN_STORAGE_LOGGED.call_once(|| {
-                log::info!(
+                log::debug!(
                     "[STAGE] survival marginal-slope hybrid Hessian assembly: \
                      sparse=({},{},{},{},{}) dims=({},{},{},{},{})",
                     time_designs[0].is_sparse(),
@@ -1727,6 +1721,195 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
         });
         crate::row_kernel::row_kernel_pack_jf_axes::<P>(n_out, rank, axes)
     }
+
+    /// The whole-projection `J · F` (`n × P·rank`), built one row tile at a time
+    /// with [`Self::assemble_jf`]'s channel map. Each tile forms every channel's
+    /// product through the design's `row_chunk_matmul_into` (its rows times the
+    /// factor block in one sequential GEMM, unless an operator keeps the
+    /// association of its own `apply`), adds the marginal block, formed once per
+    /// tile, into both location channels, and writes its own rows of the output.
+    ///
+    /// The former build formed each channel over all rows, paid one full matvec
+    /// per factor column on an operator-backed design, then packed five
+    /// `n × rank` blocks and added the marginal block into the output on one
+    /// thread: 9.7 s of the 12.1 s of single-threaded J·F time on the AoU death
+    /// fit (gnomon#2337). Tiles write disjoint rows, so the result does not
+    /// depend on the pool width, and a dense design's entries are the same
+    /// k-ordered GEMM sums as before.
+    fn tiled_jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        let governor = gam_runtime::resource::MemoryGovernor::global();
+        self.tiled_jacobian_action_matrix_within(
+            factor,
+            &|bytes| {
+                governor
+                    .try_reserve(bytes, "survival marginal-slope J·F row tiles")
+                    .ok()
+            },
+            &|| governor.remaining_bytes(),
+        )
+    }
+
+    /// [`Self::tiled_jacobian_action_matrix`] with its tile buffers reserved
+    /// through `reserve`, which answers a byte request with a held reservation
+    /// or `None` for a refusal.
+    ///
+    /// Every tile in flight holds its buffers' reservation. On a refusal the
+    /// build first runs fewer tiles at once, then halves the tile height, down to
+    /// 32 rows. Tiles are near-equal slices of at least that many rows, so no
+    /// GEMM runs on a sliver, and on a dense design neither the tile height nor
+    /// the number in flight changes a bit of the result. When not even one
+    /// minimal tile is admitted, or a design cannot produce its rows, the build
+    /// returns `None`, the caller's cue for its per-row route,
+    /// and says so once per fit with the refused tile's size and the budget left.
+    pub(super) fn tiled_jacobian_action_matrix_within(
+        &self,
+        factor: ArrayView2<'_, f64>,
+        reserve: &dyn Fn(usize) -> Option<gam_runtime::resource::MemoryReservation>,
+        remaining: &dyn Fn() -> usize,
+    ) -> Option<Array2<f64>> {
+        // Tile height to aim for, and the least it is halved to under refusal.
+        const JF_TILE_ROWS: usize = 256;
+        const JF_MIN_TILE_ROWS: usize = 32;
+
+        let n = self.family.n;
+        let rank = factor.ncols();
+        if rank == 0 {
+            return Some(Array2::<f64>::zeros((n, 0)));
+        }
+        let block = |range: std::ops::Range<usize>| {
+            factor.slice(s![range, ..]).as_standard_layout().into_owned()
+        };
+        let f_time = block(self.slices.time.clone());
+        let f_marginal = block(self.slices.marginal.clone());
+        let f_slope = block(self.slices.slope.clone());
+        // (design, factor block, adds the marginal block), one per primary,
+        // filled by index as `assemble_jf` fills its slots.
+        let mut slots: [Option<(&DesignMatrix, &Array2<f64>, bool)>; P] =
+            std::array::from_fn(|_| None);
+        slots[PRIMARY_Q0] = Some((&self.family.design_entry, &f_time, true));
+        slots[PRIMARY_Q1] = Some((&self.family.design_exit, &f_time, true));
+        slots[PRIMARY_QD1] = Some((&self.family.design_derivative_exit, &f_time, false));
+        for &(primary, design) in self.slope_channels().as_slice() {
+            slots[primary] = Some((design, &f_slope, false));
+        }
+        let channels: [(&DesignMatrix, &Array2<f64>, bool); P] = std::array::from_fn(|primary| {
+            slots[primary].expect(
+                "every primary of the frame owns exactly one J·F axis: the three location \
+                 channels plus the slope layout's follow-up channels",
+            )
+        });
+        let max_cols = channels
+            .iter()
+            .map(|(design, _, _)| design.ncols())
+            .fold(self.family.marginal_design.ncols(), usize::max);
+
+        let mut out = Array2::<f64>::zeros((n, P * rank));
+        if n == 0 {
+            return Some(out);
+        }
+        // Per tile in flight: one channel product and the marginal product, and
+        // inside `row_chunk_matmul_into` the design rows and their GEMM result,
+        // with room for a coefficient transform's inner rows up to twice the
+        // design's width.
+        let tile_bytes =
+            |rows: usize| gam_runtime::resource::dense_f64_bytes(rows, 2 * max_cols + 3 * rank);
+        let mut target_rows = JF_TILE_ROWS;
+        let (n_tiles, in_flight, tile_buffers) = loop {
+            let n_tiles = (n / target_rows).max(1);
+            let bytes = tile_bytes(n.div_ceil(n_tiles))?;
+            let mut in_flight = rayon::current_num_threads().clamp(1, n_tiles);
+            let admitted = loop {
+                match reserve(bytes.checked_mul(in_flight)?) {
+                    Some(reservation) => break Some(reservation),
+                    None if in_flight > 1 => in_flight = in_flight.div_ceil(2),
+                    None => break None,
+                }
+            };
+            match admitted {
+                Some(reservation) => break (n_tiles, in_flight, reservation),
+                None if target_rows > JF_MIN_TILE_ROWS => target_rows /= 2,
+                None => {
+                    self.warn_jf_row_route_once(&format!(
+                        "the memory governor refused one {bytes}-byte J·F row tile with {} bytes \
+                         of budget left",
+                        remaining()
+                    ));
+                    return None;
+                }
+            }
+        };
+
+        // Tile t is rows [t·n/n_tiles, (t+1)·n/n_tiles); slot s runs tiles
+        // [s·n_tiles/in_flight, (s+1)·n_tiles/in_flight) on its own buffers.
+        let tile_start = |tile: usize| tile * n / n_tiles;
+        let mut slot_views = Vec::with_capacity(in_flight);
+        let mut rest = out.view_mut();
+        let mut consumed = 0;
+        for slot in 0..in_flight {
+            let first_tile = slot * n_tiles / in_flight;
+            let end_row = tile_start((slot + 1) * n_tiles / in_flight);
+            let (head, tail) = rest.split_at(Axis(0), end_row - consumed);
+            slot_views.push((first_tile, (slot + 1) * n_tiles / in_flight, head));
+            rest = tail;
+            consumed = end_row;
+        }
+        let max_tile_rows = n.div_ceil(n_tiles);
+        let built = slot_views.into_par_iter().try_for_each(|(first_tile, end_tile, mut slot_rows)| {
+            let mut product = Array2::<f64>::zeros((max_tile_rows, rank));
+            let mut marginal = Array2::<f64>::zeros((max_tile_rows, rank));
+            let slot_start = tile_start(first_tile);
+            for tile in first_tile..end_tile {
+                let global = tile_start(tile)..tile_start(tile + 1);
+                let len = global.len();
+                let local = global.start - slot_start;
+                self.family
+                    .marginal_design
+                    .row_chunk_matmul_into(global.clone(), f_marginal.view(), marginal.slice_mut(s![..len, ..]))
+                    .map_err(|error| error.to_string())?;
+                for (primary, &(design, factor_block, adds_marginal)) in channels.iter().enumerate() {
+                    design
+                        .row_chunk_matmul_into(global.clone(), factor_block.view(), product.slice_mut(s![..len, ..]))
+                        .map_err(|error| error.to_string())?;
+                    let mut target = slot_rows.slice_mut(s![
+                        local..local + len,
+                        primary * rank..(primary + 1) * rank
+                    ]);
+                    for i in 0..len {
+                        for j in 0..rank {
+                            target[[i, j]] = if adds_marginal {
+                                product[[i, j]] + marginal[[i, j]]
+                            } else {
+                                product[[i, j]]
+                            };
+                        }
+                    }
+                }
+            }
+            Ok::<(), String>(())
+        });
+        drop(tile_buffers);
+        match built {
+            Ok(()) => Some(out),
+            Err(reason) => {
+                self.warn_jf_row_route_once(&format!("a design refused its J·F row tile: {reason}"));
+                None
+            }
+        }
+    }
+
+    /// Log, once per fit, why J·F falls to the per-row route. A fit is
+    /// identified by its family's shared weight vector, which every clone of
+    /// the family and every kernel built from it hold.
+    fn warn_jf_row_route_once(&self, reason: &str) {
+        static LAST_FIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let fit = Arc::as_ptr(&self.family.weights) as usize;
+        if LAST_FIT.swap(fit, std::sync::atomic::Ordering::Relaxed) != fit {
+            log::debug!(
+                "[survival-marginal-slope] {reason}, so this fit builds J·F one row at a time, which \
+                 is slower"
+            );
+        }
+    }
 }
 
 impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G> {
@@ -1745,24 +1928,26 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// is therefore bit-for-bit what `program_full_tower(row)` would produce, so the
     /// build-once batched override contracts against it without changing any
     /// downstream arithmetic.
+    ///
+    /// The towers live in a heap vector that the Rayon workers fill in place
+    /// through [`SurvivalMarginalSlopeFamily::write_row_primary_tower`], so a
+    /// split frame holds a row index and a slot pointer, never a tower or the
+    /// row program (gam#2967).
     fn build_row_towers(&self) -> Result<Vec<G::Tower4>, String> {
         let n = gam_math::jet_tower::RowProgram::n_rows(self);
-        (0..n)
-            .into_par_iter()
-            .map(|row| {
-                let inputs = rigid_row_inputs(
-                    &self.family,
-                    &self.block_states,
+        let mut towers = vec![G::Tower4::constant(0.0); n];
+        towers
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(row, tower)| {
+                self.family.write_row_primary_tower::<P, G, _>(
                     row,
+                    &self.block_states,
                     "survival marginal-slope rigid row fourth tower (build-once)",
-                )?;
-                let p =
-                    rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
-                let vars: [G::Tower4; P] =
-                    std::array::from_fn(|a| G::Tower4::variable(p[a], a));
-                rigid_row_nll::<P, G, _>(&vars, &inputs)
-            })
-            .collect()
+                    tower,
+                )
+            })?;
+        Ok(towers)
     }
 
     /// Build every row's order-≤3 primary tower ONCE for the first-directional
@@ -1776,25 +1961,23 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// the `t3` build; standalone oracle scratchpad/sparse_t3_probe.rs,
     /// 5000/5000 rows `to_bits`-identical to the engine `Tower3<4>` / `Tower4<4>`
     /// `t3` channel). The cached `t3` is bit-for-bit what the dense tower would
-    /// produce.
+    /// produce. Built in place like [`Self::build_row_towers`], so no split frame
+    /// holds a tower (gam#2967).
     fn build_row_third_towers(&self) -> Result<Vec<G::Tower3>, String> {
         let n = gam_math::jet_tower::RowProgram::n_rows(self);
-        (0..n)
-            .into_par_iter()
-            .map(|row| {
-                let inputs = rigid_row_inputs(
-                    &self.family,
-                    &self.block_states,
+        let mut towers = vec![G::Tower3::constant(0.0); n];
+        towers
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(row, tower)| {
+                self.family.write_row_primary_tower::<P, G, _>(
                     row,
+                    &self.block_states,
                     "survival marginal-slope rigid row third tower (build-once)",
-                )?;
-                let p =
-                    rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
-                let vars: [G::Tower3; P] =
-                    std::array::from_fn(|a| G::Tower3::variable(p[a], a));
-                rigid_row_nll::<P, G, _>(&vars, &inputs)
-            })
-            .collect()
+                    tower,
+                )
+            })?;
+        Ok(towers)
     }
 
     /// Deterministic `ARROW_ROW_CHUNK`-chunked reduction matching
@@ -1843,96 +2026,25 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
 
     /// Pull back a symmetric primary third tensor along every coefficient axis.
     /// Higher information derivatives first contract their fixed directions
-    /// into this tensor, so all orders share the same weighted-Gram assembly.
+    /// into this tensor, so all orders share the same assembly
+    /// ([`crate::row_kernel::all_axes_symmetric_tensor_pullback`]).
     pub(super) fn all_axes_primary_tensor_pullback(
         &self,
         tensors: &[[[[f64; P]; P]; P]],
     ) -> Result<Vec<Array2<f64>>, String> {
-        let p = self.n_coefficients();
-        let n = gam_math::jet_tower::RowProgram::n_rows(self);
-        if tensors.len() != n {
-            return Err("survival all-axes primary tensor row count mismatch".into());
-        }
-        // This is a genuinely batched dense consumer: materialize the complete
-        // row Jacobian J = J·I once through the kernel's structured BLAS-3
-        // projection. The former axis loop called `jacobian_action` and
-        // `add_pullback_hessian` for every (axis,row) pair, repeatedly decoding
-        // the same dense/operator/sparse design rows and allocating ndarray
-        // row-chunk views. A live #979 stack showed that representation work,
-        // rather than the four-primary tower contraction, dominating every
-        // worker. With J resident (n·4p scalars), each axis is the literal dense
-        // identity
-        //
-        //   Hdot[e_a] = Σ_i J_iᵀ T³_i[J_i[:,a]] J_i,
-        //
-        // evaluated with two small contractions and no design access. Memory is
-        // O(n·4p + p³), bounded here by the already-selected rigid dense path.
-        let identity = Array2::<f64>::eye(p);
-        let jacobians = self
-            .jacobian_action_matrix(identity.view())
-            .ok_or_else(|| {
-                "survival marginal-slope all-axes derivative requires a dense J·I projection"
-                    .to_string()
-            })?;
-        let expected = (n, P * p);
-        if jacobians.dim() != expected {
-            return Err(format!(
-                "survival marginal-slope all-axes J·I shape {:?}, expected {:?}",
-                jacobians.dim(),
-                expected,
-            ));
-        }
-
-        // Split the packed J into four contiguous n×p primary blocks once.
-        // For canonical coefficient axis a, symmetry of T³ gives the exact
-        // weighted-Gram decomposition
-        //
-        //   Hdot[e_a] = Σ_{α≤β} sym_{αβ}(
-        //       J_αᵀ diag(Σ_γ T³_{αβγ} J_γ[:,a]) J_β),
-        //
-        // where sym keeps a diagonal-primary Gram once and adds G+Gᵀ for an
-        // off-diagonal primary pair. Thus each axis is ten cache-friendly
-        // BLAS-3 Grams rather than n scalar p×p pullbacks. The row weights are
-        // built in index order from the same cached tower, so only the Gram's
-        // associative reduction changes (covered by the all-axes oracle).
-        let jacobian_blocks: [Array2<f64>; P] = std::array::from_fn(|primary| {
-            jacobians
-                .slice(s![.., primary * p..(primary + 1) * p])
-                .to_owned()
-        });
-        (0..p)
-            .into_par_iter()
-            .map(|axis| {
-                let mut total = Array2::<f64>::zeros((p, p));
-                for primary_left in 0..P {
-                    for primary_right in primary_left..P {
-                        let weights = Array1::from_shape_fn(n, |row| {
-                            let mut weight = 0.0;
-                            for direction_primary in 0..P {
-                                weight += tensors[row][primary_left][primary_right]
-                                    [direction_primary]
-                                    * jacobian_blocks[direction_primary][[row, axis]];
-                            }
-                            weight
-                        });
-                        let gram = gam_linalg::faer_ndarray::fast_xt_diag_y(
-                            &jacobian_blocks[primary_left],
-                            &weights,
-                            &jacobian_blocks[primary_right],
-                        );
-                        total.scaled_add(1.0, &gram);
-                        if primary_left != primary_right {
-                            total.scaled_add(1.0, &gram.t());
-                        }
-                    }
-                }
-                Ok(total)
-            })
-            .collect()
+        use crate::row_kernel::AllAxesPullbackError;
+        crate::row_kernel::all_axes_symmetric_tensor_pullback(self, tensors).map_err(|error| match error {
+            AllAxesPullbackError::TensorRowCount { .. } => {
+                "survival all-axes primary tensor row count mismatch".to_string()
+            }
+            AllAxesPullbackError::TileShape { got, expected } => format!(
+                "survival marginal-slope all-axes J·I tile shape {got:?}, expected {expected:?}"
+            ),
+        })
     }
 
     /// Contract the fixed direction once per row, then use the shared
-    /// weighted-Gram pullback for every swept coefficient axis.
+    /// pullback for every swept coefficient axis.
     fn second_directional_derivative_all_axes_from_towers(
         &self,
         d_beta_u: &[f64],
@@ -1993,9 +2105,8 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
 
     /// gam#979 Jeffreys wide-p contracted-trace-Hessian for the rigid survival
     /// marginal-slope kernel: `∇²_β tr(W · H(β))` for a caller-supplied
-    /// full-joint trace weight `W`. Binary twin of BMS's
-    /// `rigid_row_contracted_trace_hessian_coefficients` +
-    /// `joint_jeffreys_information_contracted_trace_hessian_with_specs`,
+    /// full-joint trace weight `W`. The observed-Hessian form BMS used before its
+    /// Jeffreys information became the expected information (gam#2922),
     /// generalized from BMS's 2 block-orthogonal primaries to survival's 4
     /// primaries `(q0, q1, qd1, g)`. Unlike BMS, the primaries are NOT
     /// block-diagonal in coefficient space: `q0, q1, qd1` all read the SAME

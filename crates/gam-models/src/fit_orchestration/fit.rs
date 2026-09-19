@@ -108,8 +108,8 @@ fn resolved_wiggle_inverse_link(
     spec: &LikelihoodSpec,
     fit: &UnifiedFitResult,
     fallback: &InverseLink,
-) -> Result<InverseLink, String> {
-    let resolved = match fit.fitted_link_state(spec).map_err(|e| e.to_string())? {
+) -> Result<InverseLink, FitFailure> {
+    let resolved = match fit.fitted_link_state(spec)? {
         FittedLinkState::Standard(Some(link)) => InverseLink::Standard(link),
         FittedLinkState::Standard(None) => fallback.clone(),
         FittedLinkState::LatentCLogLog { state } => InverseLink::LatentCLogLog(state),
@@ -117,7 +117,8 @@ fn resolved_wiggle_inverse_link(
         FittedLinkState::BetaLogistic { state, .. } => InverseLink::BetaLogistic(state),
         FittedLinkState::Mixture { state, .. } => InverseLink::Mixture(state),
     };
-    require_inverse_link_supports_joint_wiggle(&resolved, "standard link wiggle")?;
+    require_inverse_link_supports_joint_wiggle(&resolved, "standard link wiggle")
+        .map_err(FitFailure::input)?;
     Ok(resolved)
 }
 
@@ -192,15 +193,13 @@ fn fit_standard_base(
     }
 }
 
-fn firth_can_rescue(error: &gam_solve::estimate::EstimationError) -> bool {
-    use gam_solve::estimate::EstimationError;
-    error.is_inner_solve_retreat()
-        || matches!(
-            error,
-            EstimationError::PrefitPerfectSeparationDetected { .. }
-                | EstimationError::PrefitLinearSeparationDetected { .. }
-                | EstimationError::RemlDidNotConverge { .. }
-        )
+/// The separation certificate that lets a binomial fit switch to the Jeffreys
+/// prior, or `None`. Only a proof that the likelihood has no finite maximizer
+/// changes the estimator: a solve that did not converge is reported as it is.
+fn firth_rescue_evidence(
+    error: &gam_solve::estimate::EstimationError,
+) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
+    error.separation_arming_evidence()
 }
 
 /// Whether an automatic Firth retry can use the same outer-coordinate model as
@@ -312,7 +311,7 @@ fn compose_raw_unit_map_into_gauge(
 #[cfg(test)]
 mod standard_convergence_gate_tests {
     use super::{
-        certified_retry_or_original, compose_raw_unit_map_into_gauge, firth_can_rescue,
+        certified_retry_or_original, compose_raw_unit_map_into_gauge, firth_rescue_evidence,
         firth_rescue_has_compatible_outer_coordinates, rescale_covariance_coordinates,
         rescale_precision_coordinates, survival_baseline_parameter_checkpoint,
         survival_pirls_status_is_certified,
@@ -435,23 +434,38 @@ mod standard_convergence_gate_tests {
     }
 
     #[test]
-    fn firth_retry_is_limited_to_separation_and_nonconvergence() {
-        assert!(firth_can_rescue(&EstimationError::PirlsDidNotConverge {
-            iterations: 20,
-            budget: 20,
-            stop: "max iterations reached".to_string(),
-            last_change: 1.0,
-        }));
-        assert!(firth_can_rescue(
-            &EstimationError::PrefitPerfectSeparationDetected {
+    fn firth_retry_is_limited_to_proven_separation() {
+        // A fit that did not converge is not evidence of separation, so it must
+        // not switch the estimator.
+        assert_eq!(
+            firth_rescue_evidence(&EstimationError::PirlsDidNotConverge {
+                iterations: 20,
+                budget: 20,
+                stop: "max iterations reached".to_string(),
+                last_change: 1.0,
+            }),
+            None
+        );
+        assert_eq!(
+            firth_rescue_evidence(&EstimationError::RemlOptimizationFailed(
+                "railed smoothing strength".to_string()
+            )),
+            None
+        );
+        assert!(
+            firth_rescue_evidence(&EstimationError::PrefitPerfectSeparationDetected {
                 column_index: 0,
                 threshold: 0.0,
                 positive_above_threshold: true,
-            }
-        ));
-        assert!(!firth_can_rescue(&EstimationError::InvalidInput(
-            "structural mismatch".to_string()
-        )));
+            })
+            .is_some()
+        );
+        assert_eq!(
+            firth_rescue_evidence(&EstimationError::InvalidInput(
+                "structural mismatch".to_string()
+            )),
+            None
+        );
     }
 
     #[test]
@@ -510,76 +524,65 @@ pub(crate) fn fit_standard_model(
         &mut request.spec,
     );
     if seeded > 0 {
-        log::info!(
+        log::debug!(
             "[#2750] screened the representer range of {seeded} auto measure-jet term(s) against \
              the response before the standard-fit dispatch"
         );
     }
 
-    // #1762: near-perfect linear separation drives the binomial REML/ARC
-    // outer optimizer into a FLAT-VALLEY STALL. As the fit approaches
-    // separation the coefficients want to run to infinity, the PIRLS working
-    // weights w = μ̂(1−μ̂) collapse to ~0 over the saturated majority of rows,
-    // and the inner solve can no longer certify a minimum at the small-λ REML
-    // optimum — so the outer optimizer wanders the flat valley, burns its
-    // cost-stall escapes, and reports NON-CONVERGED (the ~117s / |g|≫tol
-    // pathology; separation can also surface as a hard PerfectSeparation /
-    // PirlsDidNotConverge error). Firth's Jeffreys-prior penalty is the textbook
-    // remedy: it bounds the coefficients and keeps the working weights from
-    // collapsing, so the inner solve is well conditioned at every λ and the
-    // outer optimizer certifies quickly.
+    // #1762/#2273: a separated binomial design has no finite maximum
+    // likelihood, on every binomial link. The Jeffreys prior |I(β)|^½ bounds
+    // the coefficients there, so a Firth-capable binomial fit whose base fit
+    // refused with a pre-fit separation certificate is refit ONCE under it.
     //
-    // #2273: this pathology is NOT logit-specific. The coefficient runaway and
-    // Fisher-weight collapse under separation happen on EVERY binomial link
-    // (probit's Φ, cloglog, loglog, cauchit, and the stateful SAS/Beta-Logistic/
-    // Mixture links) — measured directly on the issue's n=6 exact-separation
-    // fixture, where the probit fit halts on a flat-valley stall (|g|≈1.9e2 ≫
-    // bound) and mints only under Firth. Firth's Jeffreys prior is a link-general
-    // remedy: it is defined for any binomial inverse link that exposes a
-    // Fisher-weight jet (exactly `LikelihoodSpec::supports_firth`, the same gate
-    // `--firth` validates against), so the reactive rescue must be armed for the
-    // whole Firth-capable binomial family, not just the logit special case — else
-    // the README's "Firth / Jeffreys bias reduction handles separation in
-    // binomial fits" promise silently fails to hold off the default link.
+    // The estimator changes only on that proof. A base fit that did not
+    // converge, railed a smoothing strength or had a trial point refused is a
+    // numerical failure of the penalized likelihood fit and is reported as it
+    // is: refitting a different model to get past it would hand back an
+    // estimator nobody asked for. The adopted fit records the certificate in
+    // `FitArtifacts::jeffreys_arming_evidence`, and every summary surface
+    // names the estimator and this reason.
     //
-    // Retry ONCE with Firth when a plain (non-Firth) Firth-capable binomial fit
-    // fails with typed separation/non-convergence evidence, and adopt it only if
-    // the retry itself carries both inner and outer convergence certificates. If
-    // the retry fails, return the ORIGINAL base error unchanged; a failed rescue
-    // can never replace its evidence or mint the abandoned base iterate.
-    // Structural errors and link-parameter outer problems are not
-    // Firth-retryable. The latter are declined before solving because the Firth
-    // outer derivative does not define their appended link coordinates (#2654).
+    // The retry is adopted only if it carries its own inner and outer
+    // certificates. If it fails, the ORIGINAL base error is returned; a failed
+    // rescue can never replace its evidence. Link-parameter outer problems are
+    // declined before solving because the Firth outer derivative does not
+    // define their appended link coordinates (#2654).
     let is_firth_capable_binomial = request.family.supports_firth();
     let base = fit_standard_base(&request, &request.family, &request.options);
     let fitted = match base {
         Ok(fitted) => fitted,
-        Err(original_error)
-            if is_firth_capable_binomial
+        Err(original_error) => {
+            let rescue_is_defined = is_firth_capable_binomial
                 && !request.options.firth_bias_reduction
-                && firth_rescue_has_compatible_outer_coordinates(&request.options)
-                && firth_can_rescue(&original_error) =>
-        {
+                && firth_rescue_has_compatible_outer_coordinates(&request.options);
+            let Some(evidence) = rescue_is_defined
+                .then(|| firth_rescue_evidence(&original_error))
+                .flatten()
+            else {
+                return Err(original_error.into());
+            };
             let original_report = original_error.to_string();
             let mut firth_options = request.options.clone();
             firth_options.firth_bias_reduction = true;
             let firth = fit_standard_base(&request, &request.family, &firth_options);
             let firth_failure = firth.as_ref().err().map(ToString::to_string);
             match certified_retry_or_original(original_error, firth) {
-                Ok(firth_fitted) => {
-                    log::info!(
-                        "[#1762/#2273] Firth-capable binomial base fit ({}) failed with \
-                         retryable separation/non-convergence evidence ({original_report}); Firth \
-                         bias-reduction retry certified — adopting it (Firth edf {:.2}).",
+                Ok(mut firth_fitted) => {
+                    log::debug!(
+                        "[#1762/#2273] Firth-capable binomial base fit ({}) refused with a \
+                         separation certificate ({original_report}); the Jeffreys-prior refit \
+                         certified — adopting it (edf {:.2}).",
                         request.family.pretty_name(),
                         firth_fitted.fit.edf_total().unwrap_or(f64::NAN),
                     );
+                    firth_fitted.fit.artifacts.jeffreys_arming_evidence = Some(evidence);
                     firth_fitted
                 }
                 Err(original_error) => {
                     let retry_report = firth_failure
                         .unwrap_or_else(|| "unknown retry failure".to_string());
-                    log::warn!(
+                    log::debug!(
                         "[#1762/#2273] Firth-capable binomial base fit ({}) failed \
                          ({original_report}); Firth retry also failed to certify \
                          ({retry_report}) — returning the original typed base evidence, not \
@@ -595,7 +598,7 @@ pub(crate) fn fit_standard_model(
                     // reduction or remove/reparameterize the separating column" --
                     // advice to do the thing that was just done automatically and
                     // failed. A caller following it gets the same refusal, and the
-                    // reason the rescue failed lives only in a `log::warn!`, which
+                    // reason the rescue failed lives only in a `log::debug!`, which
                     // is not present in a test panic message and is inert through
                     // the Python extension where this pathology is reported.
                     //
@@ -611,7 +614,6 @@ pub(crate) fn fit_standard_model(
                 }
             }
         }
-        Err(error) => return Err(error.into()),
     };
 
     let adaptive_spatial_terms = adaptive_spatial_term_mask(&request.spec);
@@ -651,7 +653,10 @@ pub(crate) fn fit_standard_model(
         request.family.response.clone(),
         wiggle_link_kind.clone(),
     )
-    .map_err(|error| format!("invalid resolved link-wiggle likelihood: {error}"))?;
+    .map_err(|error| {
+        // The link was resolved from the pilot's own fit (#2937).
+        FitFailure::invariant(format!("invalid resolved link-wiggle likelihood: {error}"))
+    })?;
     let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
         &result.design,
         &result.fit,
@@ -713,7 +718,7 @@ pub(crate) fn fit_standard_model(
             // (a real `Err` the caller sees), matching how the SAS / mixture
             // adaptive-link paths now report startup-validation failures
             // (#1571/#1572). The fit is NOT silently downgraded.
-            log::warn!("[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})");
+            log::debug!("[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})");
             return Err(FitFailure::raised(gam_problem::FailureCategory::Convergence, format!(
                 "flexible/learnable link requested via link(type=flexible(...)) / \
                  linkwiggle(...), but the binomial mean link-wiggle joint solve did not \
@@ -800,7 +805,7 @@ trait LocationScaleWorkflowAdapter {
         spec: &Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, String>;
+    ) -> Result<BlockwiseTermFitResult, FitFailure>;
 
     /// Select the link-wiggle basis from the pilot, then refit the full model
     /// with that selected wiggle block. Consumes `spec`.
@@ -811,7 +816,7 @@ trait LocationScaleWorkflowAdapter {
         wiggle_cfg: &LinkWiggleConfig,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermWiggleFitResult, String>;
+    ) -> Result<BlockwiseTermWiggleFitResult, FitFailure>;
 
     /// Plain non-wiggle fit, used when no wiggle config is present. Consumes
     /// `spec`.
@@ -820,7 +825,7 @@ trait LocationScaleWorkflowAdapter {
         spec: Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, String>;
+    ) -> Result<BlockwiseTermFitResult, FitFailure>;
 
     /// Assemble the family result from a non-wiggle fit (knots/degree/wiggle
     /// coefficients all absent).
@@ -843,19 +848,24 @@ trait LocationScaleWorkflowAdapter {
 fn require_location_scale_covariance_or_decline(
     fit: &UnifiedFitResult,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), FitFailure> {
     if fit.beta_covariance().is_some() {
         return Ok(());
     }
     if let Some(decline) = fit.posterior_moment_decline() {
-        log::warn!(
+        log::debug!(
             "[{context}] preserving converged constrained fit with unavailable posterior moments: {}",
             decline.summary(),
         );
         return Ok(());
     }
-    Err(format!(
-        "{context} reached assembly without its joint posterior covariance or a typed constrained-posterior moment decline; no model was minted"
+    // The fit was asked for its covariance, so returning neither it nor a typed
+    // decline breaks the engine's own contract (#2937).
+    Err(FitFailure::raised(
+        gam_problem::FailureCategory::Invariant,
+        format!(
+            "{context} reached assembly without its joint posterior covariance or a typed constrained-posterior moment decline; no model was minted"
+        ),
     ))
 }
 
@@ -864,7 +874,7 @@ fn require_location_scale_covariance_or_decline(
 /// their [`LocationScaleWorkflowAdapter`].
 fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     request: A::Request<'_>,
-) -> Result<A::Result, String> {
+) -> Result<A::Result, FitFailure> {
     let LocationScaleWorkflowParts {
         data,
         spec,
@@ -921,7 +931,8 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
         noisespec_resolved: solved.fit.noisespec_resolved,
         mean_design: solved.fit.mean_design,
         noise_design: solved.fit.noise_design,
-    })?;
+    })
+    .map_err(crate::gamlss::assembly_failure)?;
     Ok(A::assemble_with_wiggle(
         assembled_fit,
         solved.wiggle_knots,
@@ -953,7 +964,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         spec: &Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, String> {
+    ) -> Result<BlockwiseTermFitResult, FitFailure> {
         // Gaussian location-scale uses an identity mean link; the joint wiggle
         // refit is always admissible, so the pilot fits with no extra guard.
         fit_gaussian_location_scale_terms(
@@ -978,7 +989,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         wiggle_cfg: &LinkWiggleConfig,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermWiggleFitResult, String> {
+    ) -> Result<BlockwiseTermWiggleFitResult, FitFailure> {
         let selected_wiggle_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
             pilot,
             &WiggleBlockConfig {
@@ -1003,7 +1014,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         spec: Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, String> {
+    ) -> Result<BlockwiseTermFitResult, FitFailure> {
         fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
     }
 
@@ -1062,14 +1073,15 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
         spec: &Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, String> {
+    ) -> Result<BlockwiseTermFitResult, FitFailure> {
         // Binomial location-scale requires an inverse link that supports the
         // joint link-wiggle refit; gate it before any fitting work (the pilot
         // runs only on the wiggle path).
         require_inverse_link_supports_joint_wiggle(
             &spec.link_kind,
             "binomial location-scale link wiggle",
-        )?;
+        )
+        .map_err(|reason| FitFailure::raised(gam_problem::FailureCategory::Input, reason))?;
         fit_binomial_location_scale_terms(
             data,
             BinomialLocationScaleTermSpec {
@@ -1093,7 +1105,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
         wiggle_cfg: &LinkWiggleConfig,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermWiggleFitResult, String> {
+    ) -> Result<BlockwiseTermWiggleFitResult, FitFailure> {
         let selected_wiggle_basis = select_binomial_location_scale_link_wiggle_basis_from_pilot(
             pilot,
             &WiggleBlockConfig {
@@ -1118,7 +1130,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
         spec: Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, String> {
+    ) -> Result<BlockwiseTermFitResult, FitFailure> {
         fit_binomial_location_scale_terms(data, spec, options, kappa_options)
     }
 
@@ -1386,19 +1398,10 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
             rescale_precision_coordinates(&mut inference.penalized_hessian.0, &row_factors)?;
         }
 
-        // The inference block carries its own copies of every coefficient-frame
-        // covariance object, and `UnifiedFitResult::try_from_parts` re-runs on
-        // every saved-model load requiring the conditional/corrected copies to
-        // equal the top-level matrices exactly. Each copy must therefore ride
-        // the identical remap: a copy left in standardized units made every
-        // saved location-scale fit refuse to predict once the custom-family
-        // lane began publishing the corrected covariance (#2346).
-        if let Some(cov) = inference.beta_covariance.as_mut() {
-            rescale_covariance_coordinates(&mut cov.0, &row_factors);
-        }
-        if let Some(cov) = inference.beta_covariance_corrected.as_mut() {
-            rescale_covariance_coordinates(cov, &row_factors);
-        }
+        // The conditional and corrected covariances have one store each, the
+        // top-level matrices remapped above, and their standard errors derive
+        // from it (#2955). The inference block's other coefficient-frame
+        // covariance objects ride the same remap.
         if let Some(cov) = inference.beta_covariance_frequentist.as_mut() {
             rescale_covariance_coordinates(cov, &row_factors);
         }
@@ -1412,13 +1415,7 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
         {
             rescale_covariance_coordinates(residual, &row_factors);
         }
-        for se in [
-            inference.beta_standard_errors.as_mut(),
-            inference.beta_standard_errors_corrected.as_mut(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        if let Some(se) = inference.factorized_standard_errors.as_mut() {
             for (value, &factor) in se.iter_mut().zip(row_factors.iter()) {
                 *value *= factor;
             }
@@ -1527,7 +1524,10 @@ pub(crate) fn fit_gaussian_location_scale_model(
     let mut result =
         fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;
 
-    rescale_gaussian_location_scale_to_raw(&mut result, response_scale)?;
+    // The raw-unit remap rewrites a fitted result the engine assembled, so its
+    // refusals are shape disagreements inside that result (#2937).
+    rescale_gaussian_location_scale_to_raw(&mut result, response_scale)
+        .map_err(crate::gamlss::assembly_failure)?;
     Ok(result)
 }
 
@@ -1552,7 +1552,6 @@ pub(crate) fn fit_binomial_location_scale_model(
     request: BinomialLocationScaleFitRequest<'_>,
 ) -> Result<BinomialLocationScaleFitResult, FitFailure> {
     fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)
-        .map_err(FitFailure::from)
 }
 
 /// Penalized effective degrees of freedom for a survival transformation fit.
@@ -1574,11 +1573,14 @@ pub(crate) fn fit_binomial_location_scale_model(
 fn survival_transformation_edf(
     state: &gam_solve::pirls::WorkingState,
     penalty_blocks: &[PenaltyBlock],
-) -> Result<(f64, Vec<f64>, Vec<f64>, Array2<f64>), String> {
+) -> Result<
+    (f64, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>, Array2<f64>),
+    String,
+> {
     let h_dense = state.hessian.to_dense();
-    let (edf_total, edf_by_block, penalty_block_trace) =
+    let (edf_total, edf_by_block, penalty_block_trace, rank_bound) =
         survival_edf_from_dense_hessian(&h_dense, penalty_blocks)?;
-    Ok((edf_total, edf_by_block, penalty_block_trace, h_dense))
+    Ok((edf_total, edf_by_block, penalty_block_trace, rank_bound, h_dense))
 }
 
 /// Trace-form penalized EDF from a converged dense penalized Hessian.
@@ -1589,7 +1591,7 @@ fn survival_transformation_edf(
 fn survival_edf_from_dense_hessian(
     h_dense: &Array2<f64>,
     penalty_blocks: &[PenaltyBlock],
-) -> Result<(f64, Vec<f64>, Vec<f64>), String> {
+) -> Result<(f64, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>), String> {
     let p = h_dense.nrows();
     let h_sym = gam_linalg::matrix::SymmetricMatrix::Dense(h_dense.clone());
     // EDF is an exact trace of the fitted (unperturbed) penalized Hessian.
@@ -1603,14 +1605,25 @@ fn survival_edf_from_dense_hessian(
     let factor = h_sym.factorize().map_err(|error| {
         format!("survival edf: exact penalized-Hessian factorization failed: {error}")
     })?;
-    // Raw per-block penalty traces and their ranks, handed to the shared
-    // accounting (#2470). The rank comes from the realized penalty root, NOT
-    // from the declared `block.nullspace_dim`: a declared nullity is a
-    // pre-transform statement that canonical pullback intentionally clears, so
-    // consulting it here can price a block against a rank the fitted penalty no
-    // longer has. `penalty_matrix_root` is the same oracle the REML criterion
-    // uses when it charges `rank(S_k)·rho_k`.
+    let solve = |values: &mut [f64]| -> Result<(), String> {
+        let solved = factor.solve(&ndarray::Array1::from(values.to_vec()))?;
+        for (slot, value) in values.iter_mut().zip(solved.iter()) {
+            *slot = *value;
+        }
+        Ok(())
+    };
+    let inverse_one_norm = gam_linalg::condition::estimate_inverse_one_norm(p, solve, solve)
+        .map_err(|error| format!("survival edf: inverse-norm estimate failed: {error}"))?;
+    // Per-block penalty traces, the rounding band of the solve behind each, and
+    // their ranks, handed to the shared accounting (#2470, #2901). The rank comes
+    // from the realized penalty root, NOT from the declared `block.nullspace_dim`:
+    // a declared nullity is a pre-transform statement that canonical pullback
+    // intentionally clears, so consulting it here can price a block against a
+    // rank the fitted penalty no longer has. `penalty_matrix_root` is the same
+    // oracle the REML criterion uses when it charges `rank(S_k)·rho_k`.
     let mut raw_traces = vec![0.0_f64; penalty_blocks.len()];
+    let mut trace_bands = vec![0.0_f64; penalty_blocks.len()];
+    let mut rank_bounds = Vec::with_capacity(penalty_blocks.len());
     let mut block_ranks = vec![0_usize; penalty_blocks.len()];
     // `Σ_k S_k` in the joint layout. Summed UNSCALED on purpose: the penalty
     // null space is a structural property of the penalty geometry, so the floor
@@ -1618,35 +1631,48 @@ fn survival_edf_from_dense_hessian(
     let mut joint_penalty = Array2::<f64>::zeros((p, p));
     for (kk, block) in penalty_blocks.iter().enumerate() {
         let block_cols = block.range.end - block.range.start;
-        let penalty_rank = if block_cols == 0 {
-            0
+        let root = if block_cols == 0 {
+            Array2::<f64>::zeros((0, 0))
         } else {
-            penalty_matrix_root(&block.matrix)
-                .map_err(|error| {
-                    format!("survival edf: penalty {kk} rank factorization failed: {error}")
-                })?
-                .nrows()
+            penalty_matrix_root(&block.matrix).map_err(|error| {
+                format!("survival edf: penalty {kk} rank factorization failed: {error}")
+            })?
         };
+        let penalty_rank = root.nrows();
         block_ranks[kk] = penalty_rank;
         if block_cols > 0 {
             let r = block.range.start..block.range.end;
             let mut target = joint_penalty.slice_mut(ndarray::s![r.clone(), r]);
             target += &block.matrix;
         }
+        // #2901: the survival Hessian is observed information, so `H ⪰ λ_k S_k` is
+        // certified per block from the inertia of `H − λ_k S_k` shifted by its rounding
+        // band.
+        let scaled_penalty_block = if block_cols > 0 && block.lambda > 0.0 {
+            &block.matrix * block.lambda
+        } else {
+            Array2::<f64>::zeros((0, 0))
+        };
+        rank_bounds.push(
+            gam_solve::estimate::numerical_rank_bound(
+                h_dense.view(),
+                scaled_penalty_block.view(),
+                block.range.start,
+                gam_runtime::resource::MemoryGovernor::global(),
+            )
+            .map_err(|error| {
+                format!("survival edf: penalty block {kk} rank certificate failed: {error}")
+            })?,
+        );
         if block.lambda <= 0.0 || block_cols == 0 {
             raw_traces[kk] = 0.0;
             continue;
         }
-        // RHS = S_k embedded into the full p×block_cols layout: column j holds
-        // column j of S_k placed in the block rows. Solving H Z = RHS gives the
-        // block columns of H⁻¹ S_full, whose block-diagonal entries sum to
-        // tr(H⁻¹ S_k).
-        let mut rhs = Array2::<f64>::zeros((p, block_cols));
-        for c in 0..block_cols {
-            for r in 0..block_cols {
-                rhs[[block.range.start + r, c]] = block.matrix[[r, c]];
-            }
-        }
+        // RHS = the root's modes (`S_k = RᵀR`) placed in the block rows of the
+        // p×rank layout, so λ_k tr(H⁻¹S_k) = λ_k Σ_c r_cᵀ H⁻¹ r_c.
+        let mut rhs = Array2::<f64>::zeros((p, penalty_rank));
+        rhs.slice_mut(ndarray::s![block.range.clone(), ..])
+            .assign(&root.t());
         let sol = factor.solvemulti(&rhs).map_err(|e| {
             // A converged fit whose penalized Hessian cannot support a finite
             // trace solve is an identifiability failure; name the flat direction
@@ -1681,24 +1707,29 @@ fn survival_edf_from_dense_hessian(
                 block.lambda
             )
         })?;
-        let mut trace = 0.0_f64;
-        for j in 0..block_cols {
-            trace += sol[[block.range.start + j, j]];
-        }
-        // Raw product; the `[0, rank]` admission (which is what keeps a
-        // ceiling-`λ` redundant block's `+∞` from poisoning the stored trace,
-        // gam#1379) is applied by the shared accounting below.
-        raw_traces[kk] = block.lambda * trace;
+        let (trace, band) = gam_linalg::roundoff::solved_penalty_trace(
+            block.lambda,
+            rhs.view(),
+            sol.view(),
+            h_dense.view(),
+            inverse_one_norm,
+        )
+        .map_err(|error| format!("survival edf: penalty block {kk} trace band failed: {error}"))?;
+        raw_traces[kk] = trace;
+        trace_bands[kk] = band;
     }
     let joint_penalty_rank = penalty_matrix_root(&joint_penalty)
         .map_err(|error| format!("survival edf: joint penalty rank failed: {error}"))?
         .nrows();
-    let bundle = gam_solve::estimate::penalized_edf_bundle(
+    let bundle = gam_solve::estimate::penalized_edf_bundle_within_bands(
         &raw_traces,
+        &trace_bands,
+        &rank_bounds,
         &block_ranks,
         p,
         (p - joint_penalty_rank.min(p)) as f64,
-    );
+    )
+    .map_err(|error| format!("survival edf: {error}"))?;
     let edf_by_block = bundle.edf_by_block;
     let penalty_block_trace = bundle.penalty_block_trace;
     let edf_total = bundle.edf_total;
@@ -1708,7 +1739,7 @@ fn survival_edf_from_dense_hessian(
     {
         return Err("survival edf: non-finite effective degrees of freedom".to_string());
     }
-    Ok((edf_total, edf_by_block, penalty_block_trace))
+    Ok((edf_total, edf_by_block, penalty_block_trace, bundle.rank_bound))
 }
 
 /// REML/LAML smoothing-parameter selection for the single-cause transformation
@@ -1791,7 +1822,7 @@ fn optimize_survival_transformation_smoothing(
     penalty_blocks: &[PenaltyBlock],
     beta0: &Array1<f64>,
     structural_lower_bounds: Option<&Array1<f64>>,
-) -> Result<Option<SurvivalSmoothingSelection>, String> {
+) -> Result<Option<SurvivalSmoothingSelection>, FitFailure> {
     use gam_problem::{Derivative, HessianValue, OuterEval};
     use gam_solve::rho_optimizer::{OuterEvalOrder, OuterProblem};
     // One outer coordinate per penalty block: every block is REML-selected.
@@ -1806,7 +1837,10 @@ fn optimize_survival_transformation_smoothing(
         .enumerate()
         .map(|(coordinate, value)| {
             gam_problem::checked_log_strength(value).map_err(|error| {
-                format!("survival transformation seed lambda {coordinate}: {error}")
+                FitFailure::raised(
+                    gam_problem::FailureCategory::Numerical,
+                    format!("survival transformation seed lambda {coordinate}: {error}"),
+                )
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2081,10 +2115,13 @@ fn optimize_survival_transformation_smoothing(
     // space to working precision.
     let (lower, upper) = model.resolvability_rho_domain();
     if lower.len() != num_smoothing {
-        return Err(format!(
-            "survival smoothing domain has {} coordinates for {num_smoothing} smoothing \
-             coordinates",
-            lower.len()
+        return Err(FitFailure::raised(
+            gam_problem::FailureCategory::Invariant,
+            format!(
+                "survival smoothing domain has {} coordinates for {num_smoothing} smoothing \
+                 coordinates",
+                lower.len()
+            ),
         ));
     }
     let context =
@@ -2157,22 +2194,32 @@ fn optimize_survival_transformation_smoothing(
                 -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
         >,
     );
-    let result = problem.run(&mut obj, &context).map_err(|error| error.to_string())?;
+    let result = problem.run(&mut obj, &context).map_err(FitFailure::from)?;
     let outer_iterations = result.iterations;
     let criterion_certificate = result.criterion_certificate;
     let outer_hessian = result.final_hessian;
-    let outer_gradient = result.final_gradient;
+    let outer_gradient = result
+        .final_measurement
+        .map(gam_solve::rho_optimizer::OuterFirstOrderMeasurement::into_gradient);
     let selected_rho = result.rho;
     if selected_rho.len() != num_smoothing {
-        return Err(format!(
-            "survival transformation smoothing selector returned {} coordinates for \
-             {num_smoothing} smoothing parameters; selected-rho checkpoint={:?}",
-            selected_rho.len(),
-            selected_rho.to_vec(),
+        return Err(FitFailure::raised(
+            gam_problem::FailureCategory::Invariant,
+            format!(
+                "survival transformation smoothing selector returned {} coordinates for \
+                 {num_smoothing} smoothing parameters; selected-rho checkpoint={:?}",
+                selected_rho.len(),
+                selected_rho.to_vec(),
+            ),
         ));
     }
     let lambdas = gam_problem::checked_exp_log_strengths(selected_rho.iter().copied())
-        .map_err(|error| format!("survival transformation selected rho: {error}"))?;
+        .map_err(|error| {
+            FitFailure::raised(
+                gam_problem::FailureCategory::Numerical,
+                format!("survival transformation selected rho: {error}"),
+            )
+        })?;
     Ok(Some(SurvivalSmoothingSelection {
         lambdas,
         outer_iterations,
@@ -2301,7 +2348,7 @@ fn survival_unified_fit_result(
     // Hessian and penalty roots (issue #565). `lambdas` is built one entry per
     // penalty block, so `edf_by_block` aligns 1:1 with `lambdas` as the
     // `try_from_parts` invariant requires.
-    let (edf_total, edf_by_block, penalty_block_trace, penalized_hessian) =
+    let (edf_total, edf_by_block, penalty_block_trace, edf_rank_bound, penalized_hessian) =
         survival_transformation_edf(state, penalty_blocks)?;
     assert_eq!(edf_by_block.len(), lambdas.len());
     assert_eq!(penalty_block_trace.len(), lambdas.len());
@@ -2322,21 +2369,18 @@ fn survival_unified_fit_result(
     // a fabricated nearby matrix.
     let covariance_conditional =
         survival_conditional_covariance_from_penalized_hessian(&penalized_hessian);
-    // Standard errors come from the one gate that owns the negative-diagonal
-    // judgement (`gam_problem::se_from_covariance`), not a local `max(0, ·)`.
-    // A clamp reports a materially negative variance as `SE = 0` — an
-    // infinitely precise coefficient — where the shared gate refuses anything
-    // outside its dimension-scaled backward-error bound.
-    let beta_standard_errors = covariance_conditional
+    // Standard errors derive from this matrix (#2955) under the one gate that
+    // owns the negative-diagonal judgement (`gam_problem::se_from_covariance`),
+    // not a local `max(0, ·)`. A clamp reports a materially negative variance as
+    // `SE = 0` — an infinitely precise coefficient — where the shared gate
+    // refuses anything outside its dimension-scaled backward-error bound.
+    covariance_conditional
         .as_ref()
         .map(gam_problem::se_from_covariance)
         .transpose()
         .map_err(|reason| {
             format!("survival transformation conditional standard errors are invalid: {reason}")
         })?;
-    let beta_covariance = covariance_conditional
-        .clone()
-        .map(gam_problem::dispersion_cov::PhiScaledCovariance::wrap);
     let penalized_hessian = gam_problem::dispersion_cov::UnscaledPrecision::wrap(penalized_hessian);
 
     // #2627: on the FIXED-lambda survival path, lambda is a CONSTANT of the model
@@ -2420,7 +2464,7 @@ fn survival_unified_fit_result(
                 }
             }
             (Some(_), None, _) => {
-                log::info!(
+                log::debug!(
                     "[smoothing-correction] branch=unavailable reason=outer-hessian-not-published \
                      rho_dimension={}",
                     lambdas.len(),
@@ -2443,7 +2487,7 @@ fn survival_unified_fit_result(
             .zip(covariance_conditional.as_ref())
             .map(|((correction, _), v_cond)| v_cond + correction)
     };
-    let beta_standard_errors_corrected = covariance_corrected
+    covariance_corrected
         .as_ref()
         .map(gam_problem::se_from_covariance)
         .transpose()
@@ -2454,6 +2498,7 @@ fn survival_unified_fit_result(
     let inference = gam_solve::estimate::FitInference {
         edf_by_block: edf_by_block.clone(),
         penalty_block_trace,
+        edf_rank_bound,
         edf_total,
         // This lane computes only the first-order correction, so its retained
         // first-order pair is its primary pair, as on the custom-family lane.
@@ -2477,10 +2522,7 @@ fn survival_unified_fit_result(
         penalized_hessian: penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
-        beta_covariance,
-        beta_standard_errors,
-        beta_covariance_corrected: covariance_corrected.clone(),
-        beta_standard_errors_corrected,
+        factorized_standard_errors: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,
@@ -2585,9 +2627,9 @@ fn fit_cause_specific_survival_transformation_custom(
     derivative_floor: f64,
     penalty_block_gamma_priors: &[(String, f64, f64)],
     persistent_warm_start_store: Option<gam_runtime::warm_start::ConfiguredWarmStartStore>,
-) -> Result<SurvivalTransformationFitResult, String> {
+) -> Result<SurvivalTransformationFitResult, FitFailure> {
     let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view())
-        .into_workflow_result()?;
+        .map_err(|err| FitFailure::raised(err.failure_category(), err.to_string()))?;
     if cause_count == 0 {
         return Err(WorkflowError::MissingDependency {
             reason: "cause-specific custom survival fit requires at least one cause".to_string(),
@@ -2618,23 +2660,23 @@ fn fit_cause_specific_survival_transformation_custom(
     let joint_design_charge = gam_runtime::resource::MemoryGovernor::global()
         .try_reserve_dense_f64_copies(n, p, 3, "cause-specific survival joint designs")
         .map_err(|error| {
-            format!("cause-specific survival: refusing three {n}x{p} joint designs: {error}")
+            FitFailure::input(format!(
+                "cause-specific survival: refusing three {n}x{p} joint designs: {error}"
+            ))
         })?;
-    let x_entry = std::sync::Arc::new(joint_time_covariate_design(
-        &prepared.time_design_entry,
-        Some(dense_cov_design),
-        p,
-    )?);
-    let x_exit = std::sync::Arc::new(joint_time_covariate_design(
-        &prepared.time_design_exit,
-        Some(dense_cov_design),
-        p,
-    )?);
-    let x_derivative = std::sync::Arc::new(joint_time_covariate_design(
-        &prepared.time_design_derivative_exit,
-        None,
-        p,
-    )?);
+    // The joint designs are assembled from the time and covariate designs above.
+    let x_entry = std::sync::Arc::new(
+        joint_time_covariate_design(&prepared.time_design_entry, Some(dense_cov_design), p)
+            .map_err(FitFailure::invariant)?,
+    );
+    let x_exit = std::sync::Arc::new(
+        joint_time_covariate_design(&prepared.time_design_exit, Some(dense_cov_design), p)
+            .map_err(FitFailure::invariant)?,
+    );
+    let x_derivative = std::sync::Arc::new(
+        joint_time_covariate_design(&prepared.time_design_derivative_exit, None, p)
+            .map_err(FitFailure::invariant)?,
+    );
 
     let mut family_blocks = Vec::with_capacity(cause_count);
     let mut block_specs = Vec::with_capacity(cause_count);
@@ -2702,7 +2744,9 @@ fn fit_cause_specific_survival_transformation_custom(
             nullspace_dims.push(block.nullspace_dim);
             initial_log_lambdas[penalty_idx] = gam_problem::checked_log_strength(block.lambda)
                 .map_err(|error| {
-                    format!("cause-specific survival penalty {penalty_idx} strength: {error}")
+                    FitFailure::numerical(format!(
+                        "cause-specific survival penalty {penalty_idx} strength: {error}"
+                    ))
                 })?;
         }
         let beta_start = beta0_flat.slice(s![cause * p..(cause + 1) * p]).to_owned();
@@ -2753,7 +2797,9 @@ fn fit_cause_specific_survival_transformation_custom(
         });
     }
 
-    let family = crate::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
+    // Its endpoint, block and constraint-size refusals are different kinds.
+    let family = crate::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)
+        .map_err(FitFailure::unclassified)?;
     let fit_options = BlockwiseFitOptions {
         // Joint posterior prediction and CIF uncertainty consume the complete
         // cross-cause conditional covariance. Computing it here is part of the
@@ -2768,14 +2814,18 @@ fn fit_cause_specific_survival_transformation_custom(
         cause_count,
         penalty_blocks.len(),
         penalty_block_gamma_priors,
-    )?;
+    )
+    // The Gamma precision hyperpriors are the caller's configuration.
+    .map_err(FitFailure::input)?;
     let mut fit = crate::custom_family::fit_custom_family_arming_on_evidence_with_rho_prior(
         &family,
         &block_specs,
         &fit_options,
         rho_prior,
     )
-        .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
+        .map_err(|err| {
+            FitFailure::from(err).context("cause-specific survival custom-family fit failed")
+        })?;
     fit.likelihood_family = Some(LikelihoodSpec::royston_parmar());
     let time_basis = crate::survival::construction::SavedSurvivalTimeBasis::from_build(
         &spec.time_build,
@@ -2802,15 +2852,16 @@ fn fit_cause_specific_survival_transformation_custom(
         && spec.timewiggle.is_none()
     {
         let first_block = fit.blocks.first().ok_or_else(|| {
-            "cause-specific survival fit produced no coefficient blocks".to_string()
+            FitFailure::invariant("cause-specific survival fit produced no coefficient blocks")
         })?;
         let time_beta = first_block
             .beta
             .slice(s![..spec.time_build.x_exit_time.ncols()])
             .to_owned();
         fitted_weibull_baseline_from_linear_time_beta(&time_beta, spec.time_anchor).ok_or_else(|| {
-            "failed to recover fitted Weibull scale/shape from the cause-specific linear time coefficients"
-                .to_string()
+            FitFailure::numerical(
+                "failed to recover fitted Weibull scale/shape from the cause-specific linear time coefficients",
+            )
         })?
     } else {
         baseline_cfg
@@ -2991,13 +3042,17 @@ fn hash_workflow_design_matrix(
 
 fn survival_transformation_log_lambdas(
     penalty_blocks: &[crate::survival::PenaltyBlock],
-) -> Result<Vec<f64>, String> {
+) -> Result<Vec<f64>, FitFailure> {
     penalty_blocks
         .iter()
         .enumerate()
         .map(|(coordinate, block)| {
-            gam_problem::checked_log_strength(block.lambda)
-                .map_err(|error| format!("survival transformation penalty {coordinate}: {error}"))
+            gam_problem::checked_log_strength(block.lambda).map_err(|error| {
+                FitFailure::raised(
+                    gam_problem::FailureCategory::Numerical,
+                    format!("survival transformation penalty {coordinate}: {error}"),
+                )
+            })
         })
         .collect()
 }
@@ -3113,7 +3168,7 @@ fn load_survival_transformation_persistent_warm_start(
     {
         return None;
     }
-    log::info!("[warm-start-cache] restored survival transformation warm start key={key}");
+    log::debug!("[warm-start-cache] restored survival transformation warm start key={key}");
     let lm_lambda = record
         .last_pirls_lm_lambda
         .filter(|value| value.is_finite() && *value > 0.0);
@@ -3161,7 +3216,7 @@ fn store_survival_transformation_persistent_warm_start(
 
 pub(crate) fn fit_survival_transformation_model(
     request: SurvivalTransformationFitRequest<'_>,
-) -> Result<SurvivalTransformationFitResult, String> {
+) -> Result<SurvivalTransformationFitResult, FitFailure> {
     use crate::survival::{PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
 
     let SurvivalTransformationFitRequest {
@@ -3170,23 +3225,31 @@ pub(crate) fn fit_survival_transformation_model(
         persistent_warm_start_store,
     } = request;
     let mut baseline_cfg = spec.baseline_cfg.clone();
-    let covariate_design =
-        build_term_collection_design(data, &spec.covariate_spec).map_err(|err| err.to_string())?;
+    let covariate_design = build_term_collection_design(data, &spec.covariate_spec)
+        .map_err(|err| {
+            let reason = err.to_string();
+            FitFailure::raised(
+                gam_solve::estimate::EstimationError::from(err).failure_category(),
+                reason,
+            )
+        })?;
     let resolvedspec = crate::fit_orchestration::drivers::freeze_term_collection_from_design(
         &spec.covariate_spec,
         &covariate_design,
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(FitFailure::from)?;
     // Densified once, on the governor's ledger, and shared by every working model
     // the baseline search builds rather than copied into each one (#2900).
     let dense_cov_design = std::sync::Arc::new(
         covariate_design
             .design
-            .try_to_dense_by_chunks("survival transformation covariate design")?,
+            // A design the process cannot hold is refused by its size (#2937).
+            .try_to_dense_by_chunks("survival transformation covariate design")
+            .map_err(FitFailure::input)?,
     );
     let p_cov = dense_cov_design.ncols();
     let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view())
-        .into_workflow_result()?;
+        .map_err(|err| FitFailure::raised(err.failure_category(), err.to_string()))?;
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(spec.likelihood_mode);
 
     let build_working_model =
@@ -3202,7 +3265,10 @@ pub(crate) fn fit_survival_transformation_model(
                 &spec.time_build,
                 spec.timewiggle.as_ref(),
                 None,
-            )?;
+            )
+            // Baseline offsets, the derivative guard and the time wiggle each
+            // refuse for a different reason (#2937).
+            .map_err(FitFailure::unclassified)?;
             let mut eta_offset_entry = prepared.eta_offset_entry.clone();
             let mut eta_offset_exit = prepared.eta_offset_exit.clone();
             eta_offset_entry += &spec.covariate_offset;
@@ -3252,10 +3318,13 @@ pub(crate) fn fit_survival_transformation_model(
                 p_cov,
                 p_time_total,
             ) {
+                // A seed refuses a block with no usable Gram scale, a degenerate
+                // design the caller's data produced (#2937).
                 let log_lambda = crate::survival::marginal_slope::block_log_lambda_seeds(
                     &covariate_design.design,
                     [block.matrix],
-                )?[0];
+                )
+                .map_err(FitFailure::input)?[0];
                 penalty_blocks.push(PenaltyBlock {
                     matrix: block.matrix.clone(),
                     lambda: log_lambda.exp(),
@@ -3282,13 +3351,16 @@ pub(crate) fn fit_survival_transformation_model(
             // to copy each view again on every baseline-search evaluation (#2900).
             let dense_time_entry = prepared
                 .time_design_entry
-                .try_to_dense_by_chunks("survival transformation entry time design")?;
+                .try_to_dense_by_chunks("survival transformation entry time design")
+                .map_err(FitFailure::input)?;
             let dense_time_exit = prepared
                 .time_design_exit
-                .try_to_dense_by_chunks("survival transformation exit time design")?;
+                .try_to_dense_by_chunks("survival transformation exit time design")
+                .map_err(FitFailure::input)?;
             let dense_time_derivative = prepared
                 .time_design_derivative_exit
-                .try_to_dense_by_chunks("survival transformation derivative time design")?;
+                .try_to_dense_by_chunks("survival transformation derivative time design")
+                .map_err(FitFailure::input)?;
             let event_competing = Array1::<u8>::zeros(spec.event_target.len());
             // `spec.event_target` carries *cause labels* (0 = censored, k = cause k).
             // The shared baseline working model is a single-hazard Royston-Parmar
@@ -3321,18 +3393,30 @@ pub(crate) fn fit_survival_transformation_model(
                         derivative_offset_exit: Some(prepared.derivative_offset_exit.view()),
                     },
                 )
-                .map_err(|err| format!("failed to construct survival model: {err}"))?;
+                .map_err(|err| {
+                    FitFailure::raised(
+                        err.failure_category(),
+                        format!("failed to construct survival model: {err}"),
+                    )
+                })?;
             if spec.likelihood_mode != SurvivalLikelihoodMode::Weibull {
                 model
                     .set_structural_monotonicity(true, p_time_total)
-                    .map_err(|err| format!("failed to enable structural monotonicity: {err}"))?;
+                    .map_err(|err| {
+                        FitFailure::from(err).context("failed to enable structural monotonicity")
+                    })?;
             }
             let mut beta0 = Array1::<f64>::zeros(p);
             if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull && spec.timewiggle.is_none()
             {
                 let (scale, shape) = spec
                     .weibull_seed
-                    .ok_or_else(|| "weibull survival fit missing scale/shape seed".to_string())?;
+                    .ok_or_else(|| {
+                        FitFailure::raised(
+                            gam_problem::FailureCategory::Invariant,
+                            "weibull survival fit missing scale/shape seed",
+                        )
+                    })?;
                 // #2301: the built-in Weibull time basis is now a single `log t`
                 // column carrying the shape. The `−shape·log_scale` LOCATION that
                 // the dropped constant column used to seed is folded into the mean
@@ -3343,17 +3427,20 @@ pub(crate) fn fit_survival_transformation_model(
                 // is ever lifted, the location has no home and the fit must refuse
                 // here rather than silently mis-seed a singular direction.
                 if p_time_total < 1 {
-                    return Err(format!(
-                        "weibull built-in time basis has {p_time_total} columns but needs 1 for the shape"
+                    return Err(FitFailure::raised(
+                        gam_problem::FailureCategory::Invariant,
+                        format!(
+                            "weibull built-in time basis has {p_time_total} columns but needs 1 for the shape"
+                        ),
                     ));
                 }
                 if covariate_design.intercept_range.is_empty() {
-                    return Err(
+                    return Err(FitFailure::raised(
+                        gam_problem::FailureCategory::Input,
                         "weibull survival fit requires a mean intercept to carry the baseline \
                          location, but the covariate design has none (intercept suppression such \
-                         as `~ x - 1` is unsupported; see formula_dsl.rs:2456)"
-                            .to_string(),
-                    );
+                         as `~ x - 1` is unsupported; see formula_dsl.rs:2456)",
+                    ));
                 }
                 beta0[0] = shape;
                 let intercept_col = p_time_total + covariate_design.intercept_range.start;
@@ -3370,7 +3457,7 @@ pub(crate) fn fit_survival_transformation_model(
                 } else {
                     None
                 };
-            Ok::<_, String>((prepared, penalty_blocks, beta0, structural_lower_bounds, model))
+            Ok::<_, FitFailure>((prepared, penalty_blocks, beta0, structural_lower_bounds, model))
         };
 
     if baseline_cfg.target != SurvivalBaselineTarget::Linear {
@@ -3394,13 +3481,23 @@ pub(crate) fn fit_survival_transformation_model(
         // (contracted by baseline_chain_rule_gradient). See the derivation header
         // on baseline_chain_rule_gradient. BFGS over this exact gradient converges
         // in ≲10 outer evaluations on the 2–3 dim surface.
+        // The search takes text (survival construction), so a candidate's
+        // failure is kept typed here (#2937). The outer engine never retries a
+        // thrown objective error: it ends the search, so the kept failure is the
+        // one that stopped it.
+        let candidate_failure = std::cell::RefCell::new(None::<FitFailure>);
+        let stop_on = |failure: FitFailure| {
+            let reason = failure.to_string();
+            *candidate_failure.borrow_mut() = Some(failure);
+            reason
+        };
         baseline_cfg = optimize_survival_baseline_config_with_gradient_only(
             &baseline_cfg,
             spec.age_exit.view(),
             "workflow survival transformation baseline",
             |candidate| {
                 let (_, _, beta0, structural_lower_bounds, mut model) =
-                    build_working_model(candidate)?;
+                    build_working_model(candidate).map_err(stop_on)?;
                 let opts = gam_solve::pirls::WorkingModelPirlsOptions {
                     max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
                     convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
@@ -3411,7 +3508,9 @@ pub(crate) fn fit_survival_transformation_model(
                     linear_constraints: None,
                     initial_lm_lambda: None,
                 };
-                let parameter_checkpoint = survival_baseline_parameter_checkpoint(candidate)?;
+                // The candidate is the search's own point on its domain.
+                let parameter_checkpoint = survival_baseline_parameter_checkpoint(candidate)
+                    .map_err(|reason| stop_on(FitFailure::invariant(reason)))?;
                 let summary = gam_solve::pirls::runworking_model_pirls(
                     &mut model,
                     gam_problem::Coefficients::new(beta0),
@@ -3430,9 +3529,13 @@ pub(crate) fn fit_survival_transformation_model(
                     }),
                 )
                 .map_err(|error| {
-                    format!(
-                        "survival baseline PIRLS failed at parameter_checkpoint=\
-                         {parameter_checkpoint:?}: {error}; no fit was minted"
+                    stop_on(
+                        FitFailure::from(error)
+                            .context(format!(
+                                "survival baseline PIRLS failed at parameter_checkpoint=\
+                                 {parameter_checkpoint:?}"
+                            ))
+                            .annotated("no fit was minted"),
                     )
                 })?;
                 require_certified_survival_pirls(
@@ -3440,14 +3543,20 @@ pub(crate) fn fit_survival_transformation_model(
                     "survival transformation baseline profile",
                     &parameter_checkpoint,
                     None,
-                )?;
+                )
+                .map_err(|reason| {
+                    stop_on(FitFailure::raised(gam_problem::FailureCategory::Convergence, reason))
+                })?;
                 let beta = summary.beta.as_ref().to_owned();
                 let state = model.update_state(&beta).map_err(|err| {
-                    format!("failed to evaluate survival baseline candidate: {err}")
+                    stop_on(FitFailure::from(err).context("failed to evaluate survival baseline candidate"))
                 })?;
                 let cost = state.penalized_objective();
                 let residuals = model.offset_channel_residuals(&beta).map_err(|err| {
-                    format!("failed to form survival baseline offset residuals: {err}")
+                    stop_on(
+                        FitFailure::from(err)
+                            .context("failed to form survival baseline offset residuals"),
+                    )
                 })?;
                 let gradient = baseline_chain_rule_gradient(
                     spec.age_entry.view(),
@@ -3458,14 +3567,19 @@ pub(crate) fn fit_survival_transformation_model(
                     spec.age_exit.view(),
                     candidate,
                     &residuals,
-                )?
+                )
+                .map_err(|reason| stop_on(FitFailure::unclassified(reason)))?
                 .ok_or_else(|| {
-                    "workflow survival transformation baseline unexpectedly has no theta gradient"
-                        .to_string()
+                    stop_on(FitFailure::invariant(
+                        "workflow survival transformation baseline unexpectedly has no theta gradient",
+                    ))
                 })?;
                 Ok((cost, gradient))
             },
-        )?;
+        )
+        // A candidate that stopped the search raises its own failure. Otherwise
+        // the search's typed verdict, or its configuration refusal, stands.
+        .map_err(|search| candidate_failure.take().unwrap_or_else(|| FitFailure::from(search)))?;
     }
 
     let (prepared, mut penalty_blocks, beta0, structural_lower_bounds, mut model) =
@@ -3506,7 +3620,7 @@ pub(crate) fn fit_survival_transformation_model(
     )? {
         model
             .set_penalty_lambdas(&selection.lambdas)
-            .map_err(|e| e.to_string())?;
+            .map_err(FitFailure::from)?;
         for (block, &lam) in penalty_blocks.iter_mut().zip(selection.lambdas.iter()) {
             block.lambda = lam;
         }
@@ -3545,7 +3659,9 @@ pub(crate) fn fit_survival_transformation_model(
         &penalty_blocks,
         &opts,
         expected_beta_len,
-    )?;
+    )
+    // The key hashes state this fit assembled.
+    .map_err(FitFailure::invariant)?;
     let mut opts = opts;
     // The final fixed-λ solve is the inner problem at the selected ρ, which
     // the selector has just solved and certified: start from that mode so the
@@ -3589,11 +3705,13 @@ pub(crate) fn fit_survival_transformation_model(
         }),
     )
     .map_err(|error| {
-        format!(
-            "survival transformation final fixed-lambda PIRLS failed at \
-             parameter_checkpoint={rho_for_cache:?} (warm_start_key=\
-             {persistent_warm_start_key}): {error}; no fit was minted"
-        )
+        FitFailure::from(error)
+            .context(format!(
+                "survival transformation final fixed-lambda PIRLS failed at \
+                 parameter_checkpoint={rho_for_cache:?} (warm_start_key=\
+                 {persistent_warm_start_key})"
+            ))
+            .annotated("no fit was minted")
     })?;
     let beta = summary.beta.as_ref().to_owned();
     // Persist every finite accepted iterate before enforcing the certificate:
@@ -3615,10 +3733,11 @@ pub(crate) fn fit_survival_transformation_model(
         "survival transformation final fixed-lambda PIRLS",
         &rho_for_cache,
         checkpoint_persisted.then_some(persistent_warm_start_key.as_str()),
-    )?;
+    )
+    .map_err(|reason| FitFailure::raised(gam_problem::FailureCategory::Convergence, reason))?;
     let state = model
         .update_state(&beta)
-        .map_err(|err| format!("failed to evaluate survival optimum: {err}"))?;
+        .map_err(|err| FitFailure::from(err).context("failed to evaluate survival optimum"))?;
     let lambdas = Array1::from_iter(penalty_blocks.iter().map(|block| block.lambda));
     let fitted_baseline_cfg =
         if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull && spec.timewiggle.is_none() {
@@ -3627,8 +3746,10 @@ pub(crate) fn fit_survival_transformation_model(
                 .to_owned();
             fitted_weibull_baseline_from_linear_time_beta(&time_beta, spec.time_anchor).ok_or_else(
                 || {
-                    "failed to recover fitted Weibull scale/shape from the linear time coefficients"
-                        .to_string()
+                    FitFailure::raised(
+                        gam_problem::FailureCategory::Numerical,
+                        "failed to recover fitted Weibull scale/shape from the linear time coefficients",
+                    )
                 },
             )?
         } else {
@@ -3645,7 +3766,9 @@ pub(crate) fn fit_survival_transformation_model(
         survival_outer_certificate,
         survival_outer_hessian,
         survival_outer_gradient,
-    )?;
+    )
+    // Result assembly from the fit's own state (#2937).
+    .map_err(FitFailure::invariant)?;
 
     let time_base_ncols = spec.time_build.x_exit_time.ncols();
     let time_basis = crate::survival::construction::SavedSurvivalTimeBasis::from_build(
@@ -3665,7 +3788,7 @@ pub(crate) fn fit_survival_transformation_model(
 
 pub(crate) fn fit_survival_location_scale_model(
     request: SurvivalLocationScaleFitRequest<'_>,
-) -> Result<SurvivalLocationScaleFitResult, String> {
+) -> Result<SurvivalLocationScaleFitResult, FitFailure> {
     // Fit one coherent survival subproblem: select/apply the link-wiggle basis,
     // then solve the full penalized location-scale fit, whose outer selects the
     // inverse-link shape together with ρ (#2904).
@@ -3674,12 +3797,15 @@ pub(crate) fn fit_survival_location_scale_model(
         spec: SurvivalLocationScaleTermSpec,
         wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<SurvivalLocationScaleProfile, String> {
+    ) -> Result<SurvivalLocationScaleProfile, FitFailure> {
         let mut wiggle_knots = None;
         let mut wiggle_degree = None;
 
         let fit = if let Some(wiggle) = wiggle {
-            require_inverse_link_supports_joint_wiggle(&spec.inverse_link, "survival link wiggle")?;
+            require_inverse_link_supports_joint_wiggle(&spec.inverse_link, "survival link wiggle")
+                .map_err(|reason| {
+                    FitFailure::raised(gam_problem::FailureCategory::Input, reason)
+                })?;
             let mut pilot_spec = spec.clone();
             pilot_spec.linkwiggle_block = None;
             let pilot = fit_survival_location_scale_terms(data, pilot_spec, kappa_options)?;
@@ -3745,7 +3871,6 @@ pub(crate) fn fit_survival_marginal_slope_model(
         &request.options,
         &request.kappa_options,
     )
-    .map_err(FitFailure::from)
 }
 
 pub(crate) fn fit_latent_survival_model(
@@ -3757,7 +3882,6 @@ pub(crate) fn fit_latent_survival_model(
         request.frailty,
         &request.options,
     )
-    .map_err(FitFailure::from)
 }
 
 pub(crate) fn fit_latent_binary_model(
@@ -3769,7 +3893,6 @@ pub(crate) fn fit_latent_binary_model(
         request.frailty,
         &request.options,
     )
-    .map_err(FitFailure::from)
 }
 
 pub(crate) fn fit_transformation_normal_model(
@@ -3828,8 +3951,19 @@ mod survival_edf_tests {
         let h = array![[4.0, 1.0, 0.0], [1.0, 3.0, 0.0], [0.0, 0.0, 2.0]];
         let blocks = vec![penalty_block(array![[1.0, 0.0], [0.0, 1.0]], 1.0, 0)];
 
-        let (edf_total, edf_by_block, penalty_block_trace) =
+        let (edf_total, edf_by_block, penalty_block_trace, rank_bound) =
             survival_edf_from_dense_hessian(&h, &blocks).expect("PD Hessian must compute EDF");
+        // #2901: `H − S` is `[[3, 1], [1, 2]] ⊕ [2]`, positive definite, so the block
+        // is certified numerically.
+        assert!(
+            matches!(
+                rank_bound[0],
+                gam_solve::estimate::EdfRankBound::Certified(
+                    gam_solve::estimate::EdfRankCertificate::Numerical { .. }
+                )
+            ),
+            "{rank_bound:?}"
+        );
 
         // Leading 2×2 block [[4,1],[1,3]] has det 11 and inverse (1/11)[[3,-1],[-1,4]];
         // tr(H⁻¹ S) over that block = (3 + 4)/11 = 7/11. p = 3, so
@@ -3850,6 +3984,53 @@ mod survival_edf_tests {
             "total EDF {:.9} != 26/11",
             edf_total
         );
+    }
+
+    /// #2901: `H ⪰ λS` is what bounds a block's trace by its rank. `H = I` against
+    /// `λS = 4I` on a rank-2 block has no certified rank bound, and its raw trace 8 publishes
+    /// with `edf_by_block = 2 − 8` unclamped, where the old clamp published the rank.
+    #[test]
+    fn survival_edf_publishes_an_uncertified_trace_unclamped_2901() {
+        let h = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let blocks = vec![penalty_block(array![[4.0, 0.0], [0.0, 4.0]], 1.0, 0)];
+        let (edf_total, edf_by_block, penalty_block_trace, rank_bound) =
+            survival_edf_from_dense_hessian(&h, &blocks)
+                .expect("an indefinite data curvature publishes its raw trace");
+        assert!(
+            matches!(
+                rank_bound[0],
+                gam_solve::estimate::EdfRankBound::Uncertified { smallest_pivot, band }
+                    if smallest_pivot < -band
+            ),
+            "{rank_bound:?}"
+        );
+        assert!((penalty_block_trace[0] - 8.0).abs() < 1e-12, "{penalty_block_trace:?}");
+        assert!((edf_by_block[0] - (2.0 - 8.0)).abs() < 1e-12, "{edf_by_block:?}");
+        assert!((edf_total - (3.0 - 8.0)).abs() < 1e-12, "{edf_total}");
+    }
+
+    /// #2901: `H ≻ 0` is certified only with the block's rank bound, and the
+    /// transformation baseline's box-constrained mode need not have it. `H = −I`
+    /// against `λS = 4I` is not certified, so its trace −8 below its band publishes raw
+    /// with `edf_by_block = 2 + 8` and `edf_total = 3 + 8` unclamped.
+    #[test]
+    fn survival_edf_publishes_an_uncertified_negative_trace_2901() {
+        let h = array![[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]];
+        let blocks = vec![penalty_block(array![[4.0, 0.0], [0.0, 4.0]], 1.0, 0)];
+        let (edf_total, edf_by_block, penalty_block_trace, rank_bound) =
+            survival_edf_from_dense_hessian(&h, &blocks)
+                .expect("an uncertified negative trace publishes raw");
+        assert!(
+            matches!(
+                rank_bound[0],
+                gam_solve::estimate::EdfRankBound::Uncertified { smallest_pivot, band }
+                    if smallest_pivot < -band
+            ),
+            "{rank_bound:?}"
+        );
+        assert!((penalty_block_trace[0] + 8.0).abs() < 1e-12, "{penalty_block_trace:?}");
+        assert!((edf_by_block[0] - (2.0 + 8.0)).abs() < 1e-12, "{edf_by_block:?}");
+        assert!((edf_total - (3.0 + 8.0)).abs() < 1e-12, "{edf_total}");
     }
 }
 

@@ -5,2126 +5,11 @@
 /// iteration (#1053/#1066/#1069).
 const SPATIAL_PSI_BFGS_STEP_CAP: f64 = std::f64::consts::LN_2;
 
-fn try_build_spatial_term_log_kappa_derivative(
-    data: ArrayView2<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    design: &TermCollectionDesign,
-    term_idx: usize,
-) -> Result<
-    Option<(
-        Range<usize>,
-        usize,
-        Array2<f64>,
-        Array2<f64>,
-        Array2<f64>,
-        Array2<f64>,
-        Vec<Array2<f64>>,
-        Vec<Array2<f64>>,
-        Option<std::sync::Arc<gam_terms::basis::ImplicitDesignPsiDerivative>>,
-    )>,
-    EstimationError,
-> {
-    let Some(smooth_term) = design.smooth.terms.get(term_idx) else {
-        return Ok(None);
-    };
-    let Some(termspec) = resolvedspec.smooth_terms.get(term_idx) else {
-        return Ok(None);
-    };
-
-    let derivative_bundle = match &termspec.basis {
-        SmoothBasisSpec::ThinPlate {
-            feature_cols,
-            spec,
-            input_scale,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            let mut spec_local = spec.clone();
-            if let Some(scale) = input_scale {
-                scale.standardize(&mut x);
-                spec_local.length_scale = scale
-                    .to_standardized_units(gam_terms::OriginalUnits::new(spec.length_scale))
-                    .standardized_value();
-            }
-            // Same fitted-chart replay as the Matérn arm below: the realizer's
-            // spec is in `z_local`; the metadata carries the composed chart.
-            if let BasisMetadata::ThinPlate {
-                identifiability_transform: Some(transform),
-                ..
-            } = &smooth_term.metadata
-            {
-                spec_local.identifiability = SpatialIdentifiability::FrozenTransform {
-                    transform: transform.clone(),
-                };
-            }
-            build_thin_plate_basis_log_kappa_derivatives(x.view(), &spec_local)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::Sphere { .. } => return Ok(None),
-        // Constant-curvature smooths expose κ as one signed, design-moving
-        // outer ψ-coordinate (#944 stage 3 final wiring). Unlike the Matérn /
-        // Duchon / TPS kernels — whose ψ-coordinate is `log κ = −log ℓ` — the
-        // constant-curvature ψ-coordinate is the **raw curvature κ itself**, so
-        // κ = 0 stays an interior point of the `S^d ← ℝ^d → H^d` family. The
-        // bundle therefore carries `∂·/∂κ` / `∂²·/∂κ²` directly, and the chart
-        // coordinates are consumed verbatim (no input standardization — the
-        // gauge `1 + κ‖x‖²` defines what κ means; see the basis builder).
-        SmoothBasisSpec::ConstantCurvature { feature_cols, spec } => {
-            let x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            build_constant_curvature_basis_kappa_derivatives(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
-        // Measure-jet routes through the GROUPED dial builder
-        // (`try_build_spatial_term_log_kappa_aniso_derivativeinfos`):
-        // `spatial_term_uses_per_axis_psi` is true for every enrolled
-        // measure-jet term, so this isotropic path only sees unenrolled
-        // terms (`measure_jet_enrolls_psi` = false), which expose no ψ bundle.
-        SmoothBasisSpec::MeasureJet { .. } => return Ok(None),
-        SmoothBasisSpec::Matern {
-            feature_cols,
-            spec,
-            input_scale,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            let mut spec_local = spec.clone();
-            if let Some(scale) = input_scale {
-                scale.standardize(&mut x);
-                let length_scale = spec.length_scale.resolved().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "Matérn Auto length_scale reached derivative construction unresolved"
-                            .to_string(),
-                    )
-                })?;
-                spec_local.length_scale.set_resolved(
-                    scale
-                        .to_standardized_units(gam_terms::OriginalUnits::new(length_scale))
-                        .standardized_value(),
-                );
-            }
-            // The realized Matérn DESIGN penalty is ALWAYS the operator-collocation
-            // {mass, tension, stiffness} triplet — the term-collection assembler
-            // overrides whatever `double_penalty` produced at the basis level with
-            // `matern_operator_penalty_triplet_from_metadata` (see
-            // `gam_terms::smooth::term_specs`, "The Matérn design ALWAYS uses the
-            // operator-collocation … triplet"; #1074/#1270). The ψ=log κ outer
-            // gradient must differentiate the SAME penalty the REML cost is built
-            // on, so the derivative is forced onto the operator-triplet path here.
-            // Honoring `double_penalty: true` instead returned the kernel-Gram
-            // double-penalty ψ-derivatives — a penalty the design does NOT carry —
-            // which desynced the analytic iso-κ gradient from the cost's FD and
-            // stalled the κ-optimizer at its iteration cap with a large residual
-            // gradient (#1122). `double_penalty: false` reproduces the operator
-            // triplet exactly (verified: the 2-D iso-κ FD matches to ~1e-9).
-            // The jet is built in the FITTED coefficient chart. The incremental
-            // realizer hands this builder a spec whose identifiability has been
-            // put back into the TERM-LOCAL chart `z_local`
-            // (`restore_local_identifiability_chart`, gam#2760) so that a design
-            // REBUILD can apply the collection gauge's fixed `T0` itself; the
-            // design the criterion is built on lives in the composition
-            // `z_local · T0` the realized term's metadata records. Built on
-            // `z_local`, the jet has the fitted WIDTH whenever `T0` is square
-            // (the Residualize arm), so nothing declines and the ψ-gradient is
-            // silently wrong: measured on the #1379 seed-3 fixture, the same θ
-            // and the same cost (−138.0325036) gave ∂V/∂ψ = −2.949e4 here
-            // against +0.2253 from the composed chart (central differences
-            // +0.2249), and the line search walked uphill for 50 attempts. The
-            // Duchon arm below already replays its chart from metadata; the
-            // measure-jet per-axis arm was fixed the same way (597003f2e).
-            if let BasisMetadata::Matern {
-                identifiability_transform: Some(transform),
-                ..
-            } = &smooth_term.metadata
-            {
-                spec_local.identifiability = MaternIdentifiability::FrozenTransform {
-                    transform: transform.clone(),
-                };
-            }
-            spec_local.double_penalty = false;
-            build_matern_basis_log_kappa_derivatives(x.view(), &spec_local)
-                .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::Duchon {
-            feature_cols,
-            spec,
-            input_scale,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            let mut spec_local = spec.clone();
-            if let Some(scale) = input_scale {
-                scale.standardize(&mut x);
-                spec_local.length_scale = spec.length_scale.map(|length| {
-                    scale
-                        .to_standardized_units(gam_terms::OriginalUnits::new(length))
-                        .standardized_value()
-                });
-            }
-            let BasisMetadata::Duchon {
-                centers,
-                identifiability_transform,
-                operator_collocation_points,
-                radial_reparam,
-                ..
-            } = &smooth_term.metadata
-            else {
-                return Ok(None);
-            };
-            // #1355: replay the frozen data-metric reparam into the derivative
-            // spec so the ψ-derivative arms assemble in the rotated radial basis.
-            if spec_local.radial_reparam.is_none() {
-                spec_local.radial_reparam = radial_reparam.clone();
-            }
-            gam_terms::basis::build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
-                x.view(),
-                &spec_local,
-                centers.view(),
-                identifiability_transform.as_ref(),
-                operator_collocation_points
-                    .as_ref()
-                    .map(|points| points.view()),
-                &mut BasisWorkspace::default(),
-            )
-            .map_err(EstimationError::from)?
-        }
-        SmoothBasisSpec::BSpline1D { .. }
-        | SmoothBasisSpec::TensorBSpline { .. }
-        | SmoothBasisSpec::ByVariable { .. }
-        | SmoothBasisSpec::FactorSumToZero { .. }
-        | SmoothBasisSpec::BySmooth { .. }
-        | SmoothBasisSpec::FactorSmooth { .. }
-        | SmoothBasisSpec::Pca { .. } => {
-            return Ok(None);
-        }
-    };
-    let mut implicit_operator = derivative_bundle.implicit_operator;
-    let BasisPsiDerivativeResult {
-        design_derivative: mut local_x_psi,
-        penalties_derivative: mut local_s_psi,
-        implicit_operator: local_implicit_first_unused,
-    } = derivative_bundle.first;
-    let BasisPsiSecondDerivativeResult {
-        designsecond_derivative: mut local_x_psi_psi,
-        penaltiessecond_derivative: mut local_s_psi_psi,
-        implicit_operator: local_implicit_second_unused,
-    } = derivative_bundle.second;
-    assert!(local_implicit_first_unused.is_none());
-    assert!(local_implicit_second_unused.is_none());
-
-    if let Some(rotation) = smooth_term.joint_null_rotation.as_ref() {
-        let q = &rotation.rotation;
-        if let Some(op) = implicit_operator.take() {
-            implicit_operator = Some(op.append_full_transform(q).map_err(EstimationError::from)?);
-        } else {
-            if local_x_psi.ncols() != q.nrows() || local_x_psi_psi.ncols() != q.nrows() {
-                return Ok(None);
-            }
-            local_x_psi = fast_ab(&local_x_psi, q);
-            local_x_psi_psi = fast_ab(&local_x_psi_psi, q);
-        }
-        let rotate_penalty = |s_local: Array2<f64>| -> Option<Array2<f64>> {
-            if s_local.nrows() != q.nrows() || s_local.ncols() != q.nrows() {
-                return None;
-            }
-            let qt_s = gam_linalg::faer_ndarray::fast_atb(q, &s_local);
-            Some(gam_linalg::faer_ndarray::fast_ab(&qt_s, q))
-        };
-        let Some(rotated_s_psi) = local_s_psi
-            .into_iter()
-            .map(|s| rotate_penalty(s))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Ok(None);
-        };
-        local_s_psi = rotated_s_psi;
-        let Some(rotated_s_psi_psi) = local_s_psi_psi
-            .into_iter()
-            .map(|s| rotate_penalty(s))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return Ok(None);
-        };
-        local_s_psi_psi = rotated_s_psi_psi;
-    }
-
-    // gam#2760: the collection owns a FIXED row-space constraint `C`, while
-    // its per-realization coefficient whitening is only a coordinate chart.
-    // Differentiate the statistical smooth in the current coefficient chart:
-    //
-    //     X_g(psi) = P_C X(psi) T_0,  P_C = I - C(C'C)^-C'
-    //
-    // rather than differentiating the arbitrary RRQR/eigenvectors that produce
-    // a fresh `T(psi)`.  Penalty jets already use the fixed `T_0` through the
-    // metadata transform; only the design jets need this left projection.
-    if let Some(gauge) = smooth_term.collection_gauge.as_ref() {
-        let projector = FixedRowSpaceProjector::from_constraint_block(
-            gauge.constraint_block.view(),
-        )
-        .map_err(EstimationError::from)?;
-        // The scalar builders return dense jets beside the implicit operator, so
-        // the dense jets take the same projection whether or not an operator is
-        // present. Leaving them unprojected beside a projected operator carried a
-        // second, wrong design derivative: on the gam#2895 Matérn fixture it
-        // differed from central differences of the realized design by rel 6.67,
-        // against 5.6e-7 once projected (MSI job 434079).
-        if local_x_psi.nrows() > 0 {
-            projector
-                .project_matrix_in_place(&mut local_x_psi)
-                .map_err(EstimationError::from)?;
-        }
-        if local_x_psi_psi.nrows() > 0 {
-            projector
-                .project_matrix_in_place(&mut local_x_psi_psi)
-                .map_err(EstimationError::from)?;
-        }
-        if let Some(op) = implicit_operator.take() {
-            implicit_operator = Some(
-                op.with_fixed_row_space_projection(projector)
-                    .map_err(EstimationError::from)?,
-            );
-        }
-    }
-    let implicit_operator = implicit_operator.map(std::sync::Arc::new);
-
-    if let Some(ref op) = implicit_operator {
-        if op.p_out() != smooth_term.coeff_range.len() {
-            return Ok(None);
-        }
-    } else {
-        if local_x_psi.ncols() != smooth_term.coeff_range.len() {
-            return Ok(None);
-        }
-        if local_x_psi_psi.ncols() != smooth_term.coeff_range.len() {
-            return Ok(None);
-        }
-    }
-    if local_s_psi.is_empty() || local_s_psi.len() != local_s_psi_psi.len() {
-        return Ok(None);
-    }
-    if local_s_psi.iter().any(|s| {
-        s.nrows() != smooth_term.coeff_range.len() || s.ncols() != smooth_term.coeff_range.len()
-    }) {
-        return Ok(None);
-    }
-    if local_s_psi_psi.iter().any(|s| {
-        s.nrows() != smooth_term.coeff_range.len() || s.ncols() != smooth_term.coeff_range.len()
-    }) {
-        return Ok(None);
-    }
-
-    let p_total = design.design.ncols();
-    let smooth_start = p_total.saturating_sub(design.smooth.total_smooth_cols());
-    let global_range = (smooth_start + smooth_term.coeff_range.start)
-        ..(smooth_start + smooth_term.coeff_range.end);
-
-    Ok(Some((
-        global_range,
-        p_total,
-        local_x_psi,
-        local_s_psi.iter().fold(
-            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
-            |acc, m| acc + m,
-        ),
-        local_x_psi_psi,
-        local_s_psi_psi.iter().fold(
-            Array2::<f64>::zeros((smooth_term.coeff_range.len(), smooth_term.coeff_range.len())),
-            |acc, m| acc + m,
-        ),
-        local_s_psi,
-        local_s_psi_psi,
-        implicit_operator,
-    )))
-}
-
-fn try_build_spatial_log_kappa_hyper_dirs(
-    data: ArrayView2<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    design: &TermCollectionDesign,
-    spatial_terms: &[usize],
-) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
-    // Each spatial term contributes one continuous scale hyperparameter
-    //   psi = log(kappa) = -log(length_scale),
-    // while rho = log(lambda) still indexes the smoothing parameters of the
-    // three operator penalties. The joint outer vector is therefore
-    //   theta = (rho_0, ..., rho_{K-1}, psi_1, ..., psi_q)
-    // for q spatial terms participating in exact joint optimization.
-    let Some(info_list) =
-        try_build_spatial_log_kappa_derivativeinfo_list(data, resolvedspec, design, spatial_terms)?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(spatial_log_kappa_hyper_dirs_frominfo_list(info_list)?))
-}
-
-pub(crate) fn try_build_latent_coord_hyper_dirs(
-    latent: std::sync::Arc<gam_terms::latent::LatentCoordValues>,
-    resolvedspec: &TermCollectionSpec,
-    design: &TermCollectionDesign,
-    latent_terms: &[gam_problem::types::SmoothTermIdx],
-    analytic_rho_count: usize,
-) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
-    if latent_terms.is_empty() || latent.is_empty() {
-        return Ok(None);
-    }
-    if latent_terms.len() != 1 {
-        crate::bail_invalid_estim!(
-            "LatentCoord standard-fit hyper_dirs currently require exactly one latent smooth term"
-                .to_string(),
-        );
-    }
-    let term_idx = latent_terms[0];
-    let smooth_term = design.smooth.terms.get(term_idx.get()).ok_or_else(|| {
-        EstimationError::InvalidInput(format!(
-            "LatentCoord term index {term_idx} out of bounds for realized smooth design"
-        ))
-    })?;
-    let termspec = resolvedspec
-        .smooth_terms
-        .get(term_idx.get())
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(format!(
-                "LatentCoord term index {term_idx} out of bounds for resolved smooth spec"
-            ))
-        })?;
-    let p_total = design.design.ncols();
-    let smooth_start = p_total.saturating_sub(design.smooth.total_smooth_cols());
-    let global_range = (smooth_start + smooth_term.coeff_range.start)
-        ..(smooth_start + smooth_term.coeff_range.end);
-
-    // Spline bases do not add a separate continuous basis-scale ψ coordinate
-    // here. When they are latent-coordinate terms, their ψ directions are the
-    // latent-coordinate axes below, using the same DirectionalHyperParam layout
-    // as Matérn and Duchon.
-    let operator = match (&termspec.basis, &smooth_term.metadata) {
-        (
-            SmoothBasisSpec::Matern { .. },
-            BasisMetadata::Matern {
-                centers,
-                length_scale,
-                nu,
-                include_intercept,
-                identifiability_transform,
-                input_scale,
-                ..
-            },
-        ) => gam_terms::basis::LatentCoordDesignDerivative::new_matern(
-            latent.clone(),
-            std::sync::Arc::new(centers.clone()),
-            // The metadata's own frame pair: standardized `centers` above,
-            // original-units range here. The constructor owns the single
-            // conversion between them (#2643).
-            *input_scale,
-            *length_scale,
-            *nu,
-            *include_intercept,
-            identifiability_transform.clone(),
-        )
-        .map_err(EstimationError::from)?,
-        (
-            SmoothBasisSpec::Duchon { .. },
-            BasisMetadata::Duchon {
-                centers,
-                length_scale,
-                power,
-                nullspace_order,
-                identifiability_transform,
-                input_scale,
-                radial_reparam,
-                ..
-            },
-        ) => gam_terms::basis::LatentCoordDesignDerivative::new_duchon(
-            latent.clone(),
-            std::sync::Arc::new(centers.clone()),
-            // See the Matérn arm: the pair travels together (#2643).
-            *input_scale,
-            *length_scale,
-            *power,
-            *nullspace_order,
-            // The frozen data-metric radial chart the shipped kernel block is
-            // expressed in (gam#979).
-            radial_reparam.as_ref(),
-            identifiability_transform.clone(),
-        )
-        .map_err(EstimationError::from)?,
-        (
-            SmoothBasisSpec::Sphere { .. },
-            BasisMetadata::Sphere {
-                centers,
-                penalty_order,
-                method,
-                constraint_transform,
-                ..
-            },
-        ) if matches!(*method, gam_terms::basis::SphereMethod::Wahba) => {
-            gam_terms::basis::LatentCoordDesignDerivative::new_sphere(
-                latent.clone(),
-                std::sync::Arc::new(centers.clone()),
-                *penalty_order,
-                constraint_transform.clone(),
-            )
-            .map_err(EstimationError::from)?
-        }
-        (
-            SmoothBasisSpec::BSpline1D { spec, .. },
-            BasisMetadata::BSpline1D {
-                knots,
-                identifiability_transform,
-                periodic,
-                degree: meta_degree,
-                ..
-            },
-        ) => {
-            // Issue #340: use the metadata-recorded effective degree so the
-            // latent-design Jacobian matches what `build_bspline_basis_1d`
-            // actually built at fit time after auto-shrink.
-            let effective_degree = meta_degree.unwrap_or(spec.degree);
-            if let Some((domain_start, period, num_basis)) = periodic {
-                gam_terms::basis::LatentCoordDesignDerivative::new_periodic_bspline(
-                    latent.clone(),
-                    (*domain_start, *domain_start + *period),
-                    effective_degree,
-                    *num_basis,
-                    identifiability_transform.clone(),
-                )
-                .map_err(EstimationError::from)?
-            } else {
-                gam_terms::basis::LatentCoordDesignDerivative::new_tensor_bspline(
-                    latent.clone(),
-                    vec![knots.clone()],
-                    vec![effective_degree],
-                    identifiability_transform.clone(),
-                )
-                .map_err(EstimationError::from)?
-            }
-        }
-        (
-            SmoothBasisSpec::TensorBSpline { .. },
-            BasisMetadata::TensorBSpline {
-                knots,
-                degrees,
-                identifiability_transform,
-                ..
-            },
-        ) => gam_terms::basis::LatentCoordDesignDerivative::new_tensor_bspline(
-            latent.clone(),
-            knots.clone(),
-            degrees.clone(),
-            identifiability_transform.clone(),
-        )
-        .map_err(EstimationError::from)?,
-        (SmoothBasisSpec::Pca { .. }, BasisMetadata::Pca { basis_matrix, .. }) => {
-            gam_terms::basis::LatentCoordDesignDerivative::new_pca(
-                latent.clone(),
-                std::sync::Arc::new(basis_matrix.clone()),
-            )
-            .map_err(EstimationError::from)?
-        }
-        _ => return Ok(None),
-    };
-    if operator.p_out() != global_range.len() {
-        crate::bail_invalid_estim!(
-            "LatentCoord derivative width mismatch for term '{}': operator p={}, coeff range={}",
-            smooth_term.name,
-            operator.p_out(),
-            global_range.len()
-        );
-    }
-    let operator = std::sync::Arc::new(operator);
-    let mut hyper_dirs = Vec::with_capacity(operator.n_axes());
-    for flat_axis in 0..operator.n_axes() {
-        let dir = DirectionalHyperParam::new_compact(
-            gam_solve::estimate::reml::HyperDesignDerivative::from_latent_coord(
-                operator.clone(),
-                flat_axis,
-                global_range.clone(),
-                p_total,
-            ),
-            Vec::new(),
-            None,
-            None,
-        )?
-        .not_penalty_like();
-        hyper_dirs.push(dir);
-    }
-    let direct_dim = latent_coord_direct_hyper_count(latent.id_mode(), latent.latent_dim());
-    if analytic_rho_count + direct_dim > 0 {
-        let zero_x = gam_solve::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros(
-            (design.design.nrows(), p_total),
-        ));
-        for _ in 0..analytic_rho_count {
-            hyper_dirs.push(
-                DirectionalHyperParam::new_compact(zero_x.clone(), Vec::new(), None, None)?
-                    .not_penalty_like(),
-            );
-        }
-        for _ in 0..direct_dim {
-            hyper_dirs.push(
-                DirectionalHyperParam::new_compact(zero_x.clone(), Vec::new(), None, None)?
-                    .not_penalty_like(),
-            );
-        }
-    }
-    Ok(Some(hyper_dirs))
-}
-
-fn latent_coord_direct_hyper_count(
-    id_mode: &gam_terms::latent::LatentIdMode,
-    latent_dim: usize,
-) -> usize {
-    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
-    match id_mode {
-        LatentIdMode::AuxPrior { strength, .. } => match strength {
-            AuxPriorStrength::Auto => 1,
-            AuxPriorStrength::Fixed(_) => 0,
-        },
-        LatentIdMode::AuxPriorDimSelection { strength, .. } => {
-            latent_dim
-                + match strength {
-                    AuxPriorStrength::Auto => 1,
-                    AuxPriorStrength::Fixed(_) => 0,
-                }
-        }
-        LatentIdMode::DimSelection { .. } => latent_dim,
-        // A fixed-reference anchor carries at most the REML-selectable log-`μ`
-        // (one direct hyper when `Auto`, none when `Fixed`), like `AuxPrior`.
-        LatentIdMode::IsometryToReference { strength, .. } => match strength {
-            AuxPriorStrength::Auto => 1,
-            AuxPriorStrength::Fixed(_) => 0,
-        },
-        // The behavioral head appends one (1 + d) coefficient block per
-        // η-channel, plus the composed per-axis ARD log-precisions.
-        LatentIdMode::AuxOutcome { head, .. } => head.n_coeffs(latent_dim) + latent_dim,
-        LatentIdMode::None => 0,
-    }
-}
-
-fn latent_coord_initial_direct_hypers(
-    id_mode: &gam_terms::latent::LatentIdMode,
-    latent_dim: usize,
-) -> Result<Array1<f64>, EstimationError> {
-    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
-    let mut values = Vec::with_capacity(latent_coord_direct_hyper_count(id_mode, latent_dim));
-    match id_mode {
-        LatentIdMode::AuxPrior { strength, .. } => {
-            if matches!(strength, AuxPriorStrength::Auto) {
-                values.push(0.0);
-            }
-        }
-        LatentIdMode::AuxPriorDimSelection {
-            strength,
-            init_log_precision,
-            ..
-        } => {
-            if matches!(strength, AuxPriorStrength::Auto) {
-                values.push(0.0);
-            }
-            append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
-        }
-        LatentIdMode::DimSelection { init_log_precision } => {
-            append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
-        }
-        LatentIdMode::IsometryToReference { strength, .. } => {
-            if matches!(strength, AuxPriorStrength::Auto) {
-                values.push(0.0);
-            }
-        }
-        LatentIdMode::AuxOutcome {
-            head,
-            init_log_precision,
-        } => {
-            // Head coefficients seed at zero: intercept 0 ⇒ baseline rate, all
-            // loadings 0 ⇒ no behavioral anchoring at start (REML/Newton move
-            // them). One (1 + d) block per η-channel.
-            values.extend(std::iter::repeat_n(0.0, head.n_coeffs(latent_dim)));
-            append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
-        }
-        LatentIdMode::None => {}
-    }
-    Ok(Array1::from_vec(values))
-}
-
-fn append_latent_ard_seed(
-    values: &mut Vec<f64>,
-    init: Option<&Array1<f64>>,
-    latent_dim: usize,
-) -> Result<(), EstimationError> {
-    if let Some(init) = init {
-        if init.len() != latent_dim {
-            crate::bail_invalid_estim!(
-                "latent dim_selection init_log_precision length mismatch: got {}, expected {}",
-                init.len(),
-                latent_dim
-            );
-        }
-        values.extend(init.iter().copied());
-    } else {
-        values.extend(std::iter::repeat_n(0.0, latent_dim));
-    }
-    Ok(())
-}
-
-struct LatentIdObjectiveContribution {
-    cost: f64,
-    gradient: Array1<f64>,
-}
-
-fn latent_id_objective_contribution(
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    analytic_rho_count: usize,
-    latent: &gam_terms::latent::LatentCoordValues,
-) -> Result<LatentIdObjectiveContribution, EstimationError> {
-    use gam_terms::latent::{AuxPriorStrength, LatentIdMode, aux_prior_targets};
-    let n_obs = latent.n_obs();
-    let latent_dim = latent.latent_dim();
-    let flat_len = latent.len();
-    let mut gradient = Array1::<f64>::zeros(theta.len());
-    let t_start = rho_dim;
-    let direct_start = t_start + flat_len + analytic_rho_count;
-    if theta.len() < direct_start {
-        crate::bail_invalid_estim!(
-            "latent-coordinate theta too short for id objective: got {}, need at least {}",
-            theta.len(),
-            direct_start
-        );
-    }
-    let t = latent.as_matrix();
-    let mut cost = 0.0;
-    let mut cursor = direct_start;
-
-    match latent.id_mode() {
-        LatentIdMode::AuxPrior {
-            u,
-            family,
-            strength,
-        }
-        | LatentIdMode::AuxPriorDimSelection {
-            u,
-            family,
-            strength,
-            ..
-        } => {
-            let (log_mu, mu) = match strength {
-                AuxPriorStrength::Fixed(mu) => (
-                    gam_problem::checked_log_strength(*mu).map_err(|error| {
-                        EstimationError::InvalidInput(format!(
-                            "fixed latent auxiliary-prior precision is outside the canonical physical-strength domain: {error}"
-                        ))
-                    })?,
-                    *mu,
-                ),
-                AuxPriorStrength::Auto => {
-                    let log_mu = *theta.get(cursor).ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "latent auxiliary-prior precision coordinate {cursor} is missing from theta length {}",
-                            theta.len(),
-                        ))
-                    })?;
-                    cursor += 1;
-                    let mu = gam_problem::checked_exp_log_strength(log_mu).map_err(|error| {
-                        EstimationError::InvalidInput(format!(
-                            "latent auxiliary-prior log precision is outside the canonical log-strength domain: {error}"
-                        ))
-                    })?;
-                    (log_mu, mu)
-                }
-            };
-            let targets = aux_prior_targets(t.view(), u.view(), *family)
-                .map_err(EstimationError::InvalidInput)?;
-            let residual = &t - &targets;
-            let q = residual.iter().map(|v| v * v).sum::<f64>();
-            // The single shared precision `mu` governs every one of the
-            // `n_obs · latent_dim` scalar latent coordinates, so the prior
-            // log-determinant normalizer `−0.5·log det₊(mu · I_K)` counts
-            // `K = n_obs · latent_dim`. (The per-axis ARD path below emits
-            // `−0.5·n_obs·ln(α)` for each of `latent_dim` axes; one shared `mu`
-            // must equal that sum.)
-            let k = (n_obs * latent_dim) as f64;
-            cost += 0.5 * mu * q - 0.5 * k * log_mu;
-
-            let projected_residual = aux_prior_targets(residual.view(), u.view(), *family)
-                .map_err(EstimationError::InvalidInput)?;
-            let grad_base = residual - projected_residual;
-            for n in 0..n_obs {
-                for axis in 0..latent_dim {
-                    gradient[t_start + n * latent_dim + axis] += mu * grad_base[[n, axis]];
-                }
-            }
-            if matches!(strength, AuxPriorStrength::Auto) {
-                gradient[direct_start] += 0.5 * mu * q - 0.5 * k;
-            }
-        }
-        LatentIdMode::IsometryToReference {
-            reference,
-            strength,
-        } => {
-            // Fixed-reference anchor `½ μ ‖t − reference‖²` with REML-selectable
-            // `μ`. Identical structure to `AuxPrior` except the target is a
-            // constant configuration (independent of `t`), so the latent
-            // gradient is the plain `μ · (t − reference)` with no projection
-            // term (`AuxPrior` subtracts the projected residual only because its
-            // target `ĥ(u)` depends on `t` through the internal ridge fit).
-            if reference.dim() != (n_obs, latent_dim) {
-                crate::bail_invalid_estim!(
-                    "IsometryToReference reference shape {:?} must equal (n_obs, latent_dim) = ({}, {})",
-                    reference.dim(),
-                    n_obs,
-                    latent_dim
-                );
-            }
-            let mu_slot = cursor;
-            let (log_mu, mu) = match strength {
-                AuxPriorStrength::Fixed(mu) => (
-                    gam_problem::checked_log_strength(*mu).map_err(|error| {
-                        EstimationError::InvalidInput(format!(
-                            "fixed latent isometry precision is outside the canonical physical-strength domain: {error}"
-                        ))
-                    })?,
-                    *mu,
-                ),
-                AuxPriorStrength::Auto => {
-                    let log_mu = *theta.get(cursor).ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "latent isometry precision coordinate {cursor} is missing from theta length {}",
-                            theta.len(),
-                        ))
-                    })?;
-                    cursor += 1;
-                    let mu = gam_problem::checked_exp_log_strength(log_mu).map_err(|error| {
-                        EstimationError::InvalidInput(format!(
-                            "latent isometry log precision is outside the canonical log-strength domain: {error}"
-                        ))
-                    })?;
-                    (log_mu, mu)
-                }
-            };
-            let residual = &t - reference;
-            let q = residual.iter().map(|v| v * v).sum::<f64>();
-            // Shared precision `mu` over all `K = n_obs · latent_dim` scalar
-            // coordinates: the normalizer `−0.5·log det₊(mu · I_K)` counts `K`,
-            // matching the AuxPrior arm and the ARD path's per-axis sum.
-            let k = (n_obs * latent_dim) as f64;
-            cost += 0.5 * mu * q - 0.5 * k * log_mu;
-            for n in 0..n_obs {
-                for axis in 0..latent_dim {
-                    gradient[t_start + n * latent_dim + axis] += mu * residual[[n, axis]];
-                }
-            }
-            if matches!(strength, AuxPriorStrength::Auto) {
-                gradient[mu_slot] += 0.5 * mu * q - 0.5 * k;
-            }
-        }
-        LatentIdMode::AuxOutcome { head, .. } => {
-            // Behavioral head likelihood channel: the head's design columns are
-            // the live latent codes, so its NLL enters the SAME joint objective
-            // as the reconstruction term and REML balances the two channels.
-            // The head coefficients occupy `head.n_coeffs(d)` direct-hyper slots
-            // starting at `cursor`; their gradient drives the β-tier update and
-            // the head's latent-code gradient flows into the `t` block (the
-            // arrow-Schur cross-channel coupling).
-            let n_coeffs = head.n_coeffs(latent_dim);
-            if cursor + n_coeffs > theta.len() {
-                crate::bail_invalid_estim!(
-                    "latent auxiliary-outcome coefficient block overruns theta: start={cursor}, width={n_coeffs}, theta_len={}",
-                    theta.len(),
-                );
-            }
-            let coeffs = theta
-                .slice(ndarray::s![cursor..cursor + n_coeffs])
-                .to_owned();
-            let (head_nll, grad_coeffs, grad_t) = head
-                .neg_loglik_and_grad(t.view(), coeffs.view())
-                .map_err(EstimationError::InvalidInput)?;
-            cost += head_nll;
-            for (offset, &g) in grad_coeffs.iter().enumerate() {
-                gradient[cursor + offset] += g;
-            }
-            for n in 0..n_obs {
-                for axis in 0..latent_dim {
-                    gradient[t_start + n * latent_dim + axis] += grad_t[[n, axis]];
-                }
-            }
-            cursor += n_coeffs;
-        }
-        LatentIdMode::DimSelection { .. } | LatentIdMode::None => {}
-    }
-
-    match latent.id_mode() {
-        LatentIdMode::AuxPriorDimSelection { .. }
-        | LatentIdMode::DimSelection { .. }
-        | LatentIdMode::AuxOutcome { .. } => {
-            if cursor + latent_dim > theta.len() {
-                crate::bail_invalid_estim!(
-                    "latent dimension-selection precision block overruns theta: start={cursor}, width={latent_dim}, theta_len={}",
-                    theta.len(),
-                );
-            }
-            let alphas = gam_problem::checked_exp_log_strengths(
-                theta.slice(s![cursor..cursor + latent_dim]).iter().copied(),
-            )
-            .map_err(|error| {
-                EstimationError::InvalidInput(format!(
-                    "latent dimension-selection log precision is outside the canonical log-strength domain: {error}"
-                ))
-            })?;
-            for axis in 0..latent_dim {
-                let log_alpha = theta[cursor + axis];
-                let alpha = alphas[axis];
-                let mut q_axis = 0.0;
-                for n in 0..n_obs {
-                    let flat_idx = n * latent_dim + axis;
-                    let value = latent.as_flat()[flat_idx];
-                    q_axis += value * value;
-                    gradient[t_start + flat_idx] += alpha * value;
-                }
-                cost += 0.5 * alpha * q_axis - 0.5 * n_obs as f64 * log_alpha;
-                gradient[cursor + axis] += 0.5 * alpha * q_axis - 0.5 * n_obs as f64;
-            }
-            cursor += latent_dim;
-        }
-        LatentIdMode::AuxPrior { .. }
-        | LatentIdMode::IsometryToReference { .. }
-        | LatentIdMode::None => {}
-    }
-
-    if cursor != theta.len() {
-        crate::bail_invalid_estim!(
-            "latent-coordinate direct hyperparameter length mismatch: consumed {}, theta len {}",
-            cursor,
-            theta.len()
-        );
-    }
-    Ok(LatentIdObjectiveContribution { cost, gradient })
-}
-
-fn add_latent_id_objective_to_eval(
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    analytic_rho_count: usize,
-    latent: &gam_terms::latent::LatentCoordValues,
-    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
-) -> Result<(), EstimationError> {
-    let contribution =
-        latent_id_objective_contribution(theta, rho_dim, analytic_rho_count, latent)?;
-    eval.0 += contribution.cost;
-    if eval.1.len() != contribution.gradient.len() {
-        crate::bail_invalid_estim!(
-            "latent-coordinate REML gradient length mismatch: base={}, id={}",
-            eval.1.len(),
-            contribution.gradient.len()
-        );
-    }
-    eval.1 += &contribution.gradient;
-    if eval.2.is_analytic() {
-        eval.2 = gam_problem::HessianValue::Unavailable;
-    }
-    Ok(())
-}
-
-fn analytic_penalty_objective_contribution(
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    latent: &gam_terms::latent::LatentCoordValues,
-    registry: &gam_terms::AnalyticPenaltyRegistry,
-) -> Result<LatentIdObjectiveContribution, EstimationError> {
-    let flat_len = latent.len();
-    let t_start = rho_dim;
-    let t_end = t_start + flat_len;
-    let rho_start = t_end;
-    let rho_end = rho_start + registry.total_rho_count();
-    if theta.len() < rho_end {
-        crate::bail_invalid_estim!(
-            "latent-coordinate theta too short for analytic penalties: got {}, need at least {}",
-            theta.len(),
-            rho_end
-        );
-    }
-    let target_t = theta.slice(s![t_start..t_end]);
-    let rho = theta.slice(s![rho_start..rho_end]);
-    registry
-        .validate_rho(rho)
-        .map_err(EstimationError::InvalidInput)?;
-    let mut cost = 0.0_f64;
-    let mut gradient = Array1::<f64>::zeros(theta.len());
-    for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
-        let rho_local = rho.slice(s![rho_slice.clone()]);
-        match tier {
-            gam_terms::PenaltyTier::Psi => {
-                cost += penalty.value(target_t.view(), rho_local);
-                let grad = penalty.grad_target(target_t.view(), rho_local);
-                if grad.len() != flat_len {
-                    crate::bail_invalid_estim!(
-                        "analytic penalty {name:?} gradient length mismatch: got {}, expected {}",
-                        grad.len(),
-                        flat_len
-                    );
-                }
-                for i in 0..flat_len {
-                    gradient[t_start + i] += grad[i];
-                }
-                let grad_rho_local = penalty.grad_rho(target_t.view(), rho_local);
-                if grad_rho_local.len() != rho_slice.len() {
-                    crate::bail_invalid_estim!(
-                        "analytic penalty {name:?} rho-gradient length mismatch: got {}, expected {}",
-                        grad_rho_local.len(),
-                        rho_slice.len()
-                    );
-                }
-                for local_idx in 0..grad_rho_local.len() {
-                    gradient[rho_start + rho_slice.start + local_idx] += grad_rho_local[local_idx];
-                }
-            }
-            gam_terms::PenaltyTier::Beta => {}
-            gam_terms::PenaltyTier::Rho => {}
-        }
-    }
-    Ok(LatentIdObjectiveContribution { cost, gradient })
-}
-
-fn add_analytic_penalty_hessian_to_eval(
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    latent: &gam_terms::latent::LatentCoordValues,
-    registry: &gam_terms::AnalyticPenaltyRegistry,
-    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
-) -> Result<(), EstimationError> {
-    let flat_len = latent.len();
-    let t_start = rho_dim;
-    let t_end = t_start + flat_len;
-    let rho_start = t_end;
-    let rho_end = rho_start + registry.total_rho_count();
-    if theta.len() < rho_end {
-        crate::bail_invalid_estim!(
-            "latent-coordinate theta too short for analytic penalty Hessian: got {}, need at least {}",
-            theta.len(),
-            rho_end
-        );
-    }
-    let gam_problem::HessianValue::Dense(hessian) = &mut eval.2 else {
-        if eval.2.is_analytic() {
-            eval.2 = gam_problem::HessianValue::Unavailable;
-        }
-        return Ok(());
-    };
-    if hessian.dim() != (theta.len(), theta.len()) {
-        crate::bail_invalid_estim!(
-            "analytic penalty Hessian target shape mismatch: got {}x{}, expected {}x{}",
-            hessian.nrows(),
-            hessian.ncols(),
-            theta.len(),
-            theta.len()
-        );
-    }
-    let target_t = theta.slice(s![t_start..t_end]);
-    let rho = theta.slice(s![rho_start..rho_end]);
-    registry
-        .validate_rho(rho)
-        .map_err(EstimationError::InvalidInput)?;
-    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
-    {
-        let rho_local = rho.slice(s![rho_slice]);
-        if !matches!(tier, gam_terms::PenaltyTier::Psi) {
-            continue;
-        }
-        if let Some(diag) = penalty.hessian_diag(target_t.view(), rho_local) {
-            if diag.len() != flat_len {
-                crate::bail_invalid_estim!(
-                    "analytic penalty Hessian diagonal length mismatch: got {}, expected {}",
-                    diag.len(),
-                    flat_len
-                );
-            }
-            for i in 0..flat_len {
-                hessian[[t_start + i, t_start + i]] += diag[i];
-            }
-            continue;
-        }
-        let mut probe = Array1::<f64>::zeros(flat_len);
-        for col in 0..flat_len {
-            probe[col] = 1.0;
-            let hv = penalty.hvp(target_t.view(), rho_local, probe.view());
-            if hv.len() != flat_len {
-                crate::bail_invalid_estim!(
-                    "analytic penalty Hessian-vector length mismatch: got {}, expected {}",
-                    hv.len(),
-                    flat_len
-                );
-            }
-            for row in 0..flat_len {
-                hessian[[t_start + row, t_start + col]] += hv[row];
-            }
-            probe[col] = 0.0;
-        }
-    }
-    Ok(())
-}
-
-fn add_analytic_penalty_objective_to_eval(
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    latent: &gam_terms::latent::LatentCoordValues,
-    registry: &gam_terms::AnalyticPenaltyRegistry,
-    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
-) -> Result<(), EstimationError> {
-    let contribution = analytic_penalty_objective_contribution(theta, rho_dim, latent, registry)?;
-    eval.0 += contribution.cost;
-    if eval.1.len() != contribution.gradient.len() {
-        crate::bail_invalid_estim!(
-            "latent-coordinate REML gradient length mismatch: base={}, analytic_penalty={}",
-            eval.1.len(),
-            contribution.gradient.len()
-        );
-    }
-    eval.1 += &contribution.gradient;
-    add_analytic_penalty_hessian_to_eval(theta, rho_dim, latent, registry, eval)?;
-    Ok(())
-}
-
-fn spatial_log_kappa_hyper_dirs_frominfo_list(
-    info_list: Vec<SpatialPsiDerivative>,
-) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
-    use gam_solve::estimate::reml::ImplicitDerivLevel;
-    use std::collections::HashMap;
-
-    let log_kappa_dim = info_list.len();
-    // Layout-only metadata (group_id per axis) is cheap to snapshot up front so
-    // the consumption loop below can MOVE the dense (n × p) derivative arrays
-    // out of each entry instead of cloning. At large scale (n≈3×10⁵, 16-axis
-    // CTN) the prior `.clone()` sites doubled peak working memory for the
-    // psi-derivative pass through several GiB.
-    let group_ids: Vec<Option<usize>> = info_list.iter().map(|e| e.aniso_group_id).collect();
-    let mut group_indices_map: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (idx, gid) in group_ids.iter().enumerate() {
-        if let Some(g) = gid {
-            group_indices_map.entry(*g).or_default().push(idx);
-        }
-    }
-
-    let mut hyper_dirs = Vec::with_capacity(log_kappa_dim);
-    for (i, info) in info_list.into_iter().enumerate() {
-        let SpatialPsiDerivative {
-            penalty_index: _,
-            penalty_indices,
-            global_range,
-            total_p,
-            x_psi_local,
-            s_psi_components_local,
-            x_psi_psi_local,
-            s_psi_psi_components_local,
-            aniso_group_id,
-            aniso_cross_designs,
-            aniso_cross_penalty_provider,
-            implicit_operator,
-            implicit_axis,
-        } = info;
-
-        let mut xsecond = vec![None; log_kappa_dim];
-        // Diagonal second derivative (same axis).
-        xsecond[i] = Some(if let Some(ref op) = implicit_operator {
-            gam_solve::estimate::reml::HyperDesignDerivative::from_implicit(
-                op.clone(),
-                ImplicitDerivLevel::SecondDiag(implicit_axis),
-                global_range.clone(),
-                total_p,
-            )
-        } else {
-            gam_solve::estimate::reml::HyperDesignDerivative::from_embedded(
-                x_psi_psi_local,
-                global_range.clone(),
-                total_p,
-            )
-        });
-        // Cross second derivatives for axes in the same aniso group.
-        if let Some(cross_designs) = aniso_cross_designs {
-            // Use the base index of this aniso group in the original info_list.
-            // Entries for the same group are contiguous: the first index in the
-            // group gives the base, and axis b is at base+b.
-            if let Some(gid) = aniso_group_id {
-                let base = group_indices_map
-                    .get(&gid)
-                    .and_then(|v| v.first().copied())
-                    .unwrap_or(i);
-                for (b_axis, cross_mat) in cross_designs.into_iter() {
-                    let j = base + b_axis;
-                    if j < log_kappa_dim {
-                        xsecond[j] = Some(if let Some(ref op) = implicit_operator {
-                            gam_solve::estimate::reml::HyperDesignDerivative::from_implicit(
-                                op.clone(),
-                                ImplicitDerivLevel::SecondCross(implicit_axis, b_axis),
-                                global_range.clone(),
-                                total_p,
-                            )
-                        } else {
-                            gam_solve::estimate::reml::HyperDesignDerivative::from_embedded(
-                                cross_mat,
-                                global_range.clone(),
-                                total_p,
-                            )
-                        });
-                    }
-                }
-            }
-        }
-        let s_components = penalty_indices
-            .iter()
-            .copied()
-            .zip(s_psi_components_local.into_iter().map(|local| {
-                gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                    local,
-                    global_range.clone(),
-                    total_p,
-                )
-            }))
-            .collect::<Vec<_>>();
-        let s2_components = penalty_indices
-            .iter()
-            .copied()
-            .zip(s_psi_psi_components_local.into_iter().map(|local| {
-                gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                    local,
-                    global_range.clone(),
-                    total_p,
-                )
-            }))
-            .collect::<Vec<_>>();
-        let mut ssecond_components = vec![None; log_kappa_dim];
-        ssecond_components[i] = Some(s2_components);
-        let penaltysecond_component_provider =
-            if let (Some(provider), Some(gid)) = (aniso_cross_penalty_provider, aniso_group_id) {
-                let group_indices = group_indices_map.get(&gid).cloned().unwrap_or_default();
-                let axis_in_group =
-                    group_indices
-                        .iter()
-                        .position(|&idx| idx == i)
-                        .ok_or_else(|| {
-                            EstimationError::InvalidInput(format!(
-                                "missing spatial hyper axis {} in anisotropy group {}",
-                                i, gid
-                            ))
-                        })?;
-                let penalty_indices_inner = penalty_indices.clone();
-                let global_range_inner = global_range.clone();
-                let total_p_inner = total_p;
-                let group_indices_inner = group_indices;
-                Some(std::sync::Arc::new(
-                    move |j: usize| -> Result<
-                        Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
-                        EstimationError,
-                    > {
-                        let Some(other_axis_in_group) =
-                            group_indices_inner.iter().position(|&idx| idx == j)
-                        else {
-                            return Ok(None);
-                        };
-                        if other_axis_in_group == axis_in_group {
-                            return Ok(None);
-                        }
-                        let cross_pens = provider(other_axis_in_group)?;
-                        if cross_pens.is_empty() {
-                            return Ok(None);
-                        }
-                        Ok(Some(
-                        penalty_indices_inner
-                            .iter()
-                            .copied()
-                            .zip(cross_pens.into_iter().map(|local| {
-                                gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                                    local,
-                                    global_range_inner.clone(),
-                                    total_p_inner,
-                                )
-                            }))
-                            .map(|(penalty_index, matrix)| {
-                                gam_solve::estimate::reml::PenaltyDerivativeComponent {
-                                    penalty_index,
-                                    matrix,
-                                }
-                            })
-                            .collect(),
-                    ))
-                    },
-                )
-                    as std::sync::Arc<
-                        dyn Fn(
-                                usize,
-                            ) -> Result<
-                                Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
-                                EstimationError,
-                            > + Send
-                            + Sync
-                            + 'static,
-                    >)
-            } else {
-                None
-            };
-        // First derivative: use implicit operator when available to avoid
-        // storing dense (n x p) matrices for all D axes simultaneously.
-        let x_first_hyper = if let Some(ref op) = implicit_operator {
-            gam_solve::estimate::reml::HyperDesignDerivative::from_implicit(
-                op.clone(),
-                ImplicitDerivLevel::First(implicit_axis),
-                global_range.clone(),
-                total_p,
-            )
-        } else {
-            gam_solve::estimate::reml::HyperDesignDerivative::from_embedded(
-                x_psi_local,
-                global_range.clone(),
-                total_p,
-            )
-        };
-        let mut dir = DirectionalHyperParam::new_compact(
-            x_first_hyper,
-            s_components,
-            Some(xsecond),
-            Some(ssecond_components),
-        )?
-        .not_penalty_like();
-        if let Some(provider) = penaltysecond_component_provider {
-            dir = dir.with_penaltysecond_component_provider(provider);
-        }
-        hyper_dirs.push(dir);
-    }
-    Ok(hyper_dirs)
-}
-
-/// Compute `dims_per_term` for a list of spatial term indices.
-///
-/// Returns a vector where entry i is the number of stored ψ values for
-/// spatial term i: `d` for terms that enroll per-axis anisotropy in the
-/// REML joint vector (`spatial_term_uses_per_axis_psi`), `1` otherwise.
-pub(crate) fn spatial_dims_per_term(
-    resolvedspec: &TermCollectionSpec,
-    spatial_terms: &[usize],
-) -> Vec<usize> {
-    spatial_terms
-        .iter()
-        .map(|&term_idx| {
-            if let Some(mj) = measure_jet_term_spec(resolvedspec, term_idx) {
-                // Dial group, not per-axis anisotropy; layout owned by
-                // `measure_jet_psi_dim`.
-                measure_jet_psi_dim(mj)
-            } else if spatial_term_uses_per_axis_psi(resolvedspec, term_idx) {
-                get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1)
-            } else {
-                1
-            }
-        })
-        .collect()
-}
-
-/// Check whether any spatial terms enroll per-axis anisotropic ψ in the joint
-/// outer vector. Mirrors the hyper_dirs builder's enrollment predicate so the
-/// outer θ-layout cannot drift from the inner evaluator's ψ count.
-fn has_aniso_terms(resolvedspec: &TermCollectionSpec, spatial_terms: &[usize]) -> bool {
-    spatial_terms
-        .iter()
-        .any(|&term_idx| spatial_term_uses_per_axis_psi(resolvedspec, term_idx))
-}
-
-/// Emits the `theta`-keyed memoization accessors shared verbatim by the
-/// single-block and n-block exact-joint design caches. Both carry the same
-/// `current_theta` / `last_cost` / `last_eval` fields, so the cost/eval
-/// lookups and the `store_eval` writer are identical; this macro is the single
-/// source so the two inherent impls cannot drift.
-macro_rules! impl_exact_joint_theta_memo {
-    () => {
-        fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
-            if self
-                .current_theta
-                .as_ref()
-                .is_some_and(|cached| theta_values_match(cached, theta))
-            {
-                self.last_eval
-                    .as_ref()
-                    .map(|cached| cached.0)
-                    .or(self.last_cost)
-            } else {
-                None
-            }
-        }
-
-        fn memoized_eval(
-            &self,
-            theta: &Array1<f64>,
-        ) -> Option<(f64, Array1<f64>, gam_problem::HessianValue)> {
-            if self
-                .current_theta
-                .as_ref()
-                .is_some_and(|cached| theta_values_match(cached, theta))
-            {
-                self.last_eval.clone()
-            } else {
-                None
-            }
-        }
-
-        fn store_eval(&mut self, eval: (f64, Array1<f64>, gam_problem::HessianValue)) {
-            self.last_cost = Some(eval.0);
-            self.last_eval = Some(eval);
-        }
-    };
-}
-
-struct SingleBlockExactJointDesignCache<'d> {
-    realizer: FrozenTermCollectionIncrementalRealizer<'d>,
-    current_theta: Option<Array1<f64>>,
-    // Memo key for `last_cost`/`last_eval`. Distinct from `current_theta` (which
-    // tracks the θ the n×k design is REALIZED at): on the #1033 certified
-    // Gaussian path `eval_full` evaluates a trial ψ WITHOUT re-realizing the
-    // design (the tensor serves value+gradient n-free), so the eval θ and the
-    // realized-design θ diverge. Keying the memo on a dedicated field keeps a
-    // ψ-skip from ever mis-associating one ψ's cost/eval with another ψ's key.
-    last_eval_theta: Option<Array1<f64>>,
-    last_cost: Option<f64>,
-    last_eval: Option<(f64, Array1<f64>, gam_problem::HessianValue)>,
-    // #1033: ψ-invariant hyper-direction slab cache. The κ hyper_dirs (the n×k
-    // ∂X/∂ψ design-derivative slabs + their k×k penalty derivatives) are a pure
-    // function of (data, frozen spec, REALIZED column layout) — they do NOT
-    // depend on the trial ψ once the design is fixed. On the certified Gaussian
-    // n-free path `eval_full` evaluates trial ψ WITHOUT re-realizing the design,
-    // so the realized layout (and hence the hyper_dirs) is identical across an
-    // entire run of skip-path trials. Rebuilding them each trial re-runs the
-    // basis ψ-derivative over all n rows + an O(n·k²) `fast_ab` rotation — the
-    // last per-trial O(n) pass in the κ loop. Cache them keyed by the realizer
-    // `design_revision`: a skip-path trial (revision unchanged) reuses the
-    // build; a slow-path trial (revision advanced) rebuilds and re-keys.
-    cached_hyper_dirs: Option<(u64, Vec<DirectionalHyperParam>)>,
-    spatial_terms: Vec<usize>,
-    rho_dim: usize,
-    dims_per_term: Vec<usize>,
-}
-
-impl<'d> SingleBlockExactJointDesignCache<'d> {
-    fn new_with_policy(
-        data: ArrayView2<'d, f64>,
-        spec: TermCollectionSpec,
-        design: TermCollectionDesign,
-        spatial_terms: Vec<usize>,
-        rho_dim: usize,
-        dims_per_term: Vec<usize>,
-        policy: &gam_runtime::resource::ResourcePolicy,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            realizer: FrozenTermCollectionIncrementalRealizer::new_with_policy(
-                data, spec, design, policy,
-            )?,
-            current_theta: None,
-            last_eval_theta: None,
-            last_cost: None,
-            last_eval: None,
-            cached_hyper_dirs: None,
-            spatial_terms,
-            rho_dim,
-            dims_per_term,
-        })
-    }
-
-    fn design_revision(&self) -> u64 {
-        self.realizer.design_revision()
-    }
-
-    /// Build the κ hyper-directions for the CURRENT realized design, reusing the
-    /// `cached_hyper_dirs` slab when the realizer revision has not advanced since
-    /// the last build (#1033). The slab is ψ-invariant at a fixed realized
-    /// layout, so a skip-path trial (which does not re-realize the design) gets a
-    /// bit-identical clone instead of re-running the per-row basis ψ-derivative +
-    /// O(n·k²) rotation. A revision change (slow-path re-realization) rebuilds and
-    /// re-keys. The clone is an O(n·k) memcpy — far cheaper than the O(n·k²)
-    /// rebuild, and the conditioning pass it feeds is itself skipped on the
-    /// certified path (see `prepare_eval_state`'s fast path).
-    fn hyper_dirs_for_current_design(
-        &mut self,
-        data: ArrayView2<'_, f64>,
-        kind: SpatialHyperKind,
-    ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
-        let revision = self.realizer.design_revision();
-        if let Some((cached_rev, dirs)) = self.cached_hyper_dirs.as_ref()
-            && *cached_rev == revision
-        {
-            return Ok(dirs.clone());
-        }
-        let t_build = std::time::Instant::now();
-        let dirs = try_build_spatial_log_kappa_hyper_dirs(
-            data,
-            self.realizer.spec(),
-            self.realizer.design(),
-            &self.spatial_terms,
-        )?
-        .ok_or_else(|| {
-            EstimationError::InvalidInput(format!(
-                "failed to build {} hyper_dirs at current {}",
-                kind.adjective(),
-                kind.coord_name(),
-            ))
-        })?;
-        // Every accepted step realizes a new design revision, so this rebuild
-        // runs once per step inside the gradient call, where nothing clocked it
-        // (#2735).
-        log::info!(
-            "[STAGE] {} psi derivative rebuild (design revision {revision}, {} directions): {:.3}s",
-            kind.label(),
-            dirs.len(),
-            t_build.elapsed().as_secs_f64(),
-        );
-        self.cached_hyper_dirs = Some((revision, dirs.clone()));
-        Ok(dirs)
-    }
-
-    fn nfree_tensor_gradient_hyper_dirs(
-        &mut self,
-        theta: &Array1<f64>,
-    ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
-        let psi = &theta.as_slice().ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "nfree_tensor_gradient_hyper_dirs: theta is not contiguous".to_string(),
-            )
-        })?[self.rho_dim..];
-        let (global_range, p_total, s_psi_components) = self
-            .realizer
-            .canonical_penalty_derivatives_at_psi(&self.spatial_terms, psi)
-            .map_err(EstimationError::InvalidInput)?;
-        let zero_x = gam_solve::estimate::reml::HyperDesignDerivative::zero(
-            self.realizer.design().design.nrows(),
-            p_total,
-        );
-        let components = s_psi_components
-            .into_iter()
-            .enumerate()
-            .map(|(penalty_index, local)| {
-                (
-                    penalty_index,
-                    gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                        local,
-                        global_range.clone(),
-                        p_total,
-                    ),
-                )
-            })
-            .collect::<Vec<_>>();
-        Ok(DirectionalHyperParam::new_compact(zero_x, components, None, None)?.not_penalty_like())
-            .map(|dir| vec![dir])
-    }
-
-    /// Realize `theta`'s ψ tail on the cached design.
-    ///
-    /// Typed (gam#2760): see `apply_log_kappa` — a trial ψ the collection's model
-    /// cannot be realized at is a domain wall, not a fatal error, and only the
-    /// error VARIANT can carry that.
-    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), EstimationError> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            return Ok(());
-        }
-        let t_ensure = std::time::Instant::now();
-        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-            theta,
-            self.rho_dim,
-            self.dims_per_term.clone(),
-        );
-        self.realizer
-            .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
-        // The ψ this realization is FOR. `ensure_theta` is memoized on θ, so
-        // every line here is a distinct point, and the cost of a spatial fit is
-        // the number of them: 518 realizations against 189 reported outer
-        // evaluations on the 6-D k=100 fit. Which points those are — a line
-        // search, a probe ladder, or one evaluation re-entered — cannot be read
-        // from a line that prints only how long it took (#2735).
-        log::info!(
-            "[STAGE] ensure_theta (apply_log_kappa, {} terms) psi={:?}: {:.3}s",
-            self.spatial_terms.len(),
-            theta
-                .iter()
-                .skip(self.rho_dim)
-                .map(|value| format!("{value:.6}"))
-                .collect::<Vec<_>>(),
-            t_ensure.elapsed().as_secs_f64(),
-        );
-        self.current_theta = Some(theta.clone());
-        self.last_eval_theta = None;
-        self.last_cost = None;
-        self.last_eval = None;
-        Ok(())
-    }
-
-    // Memo methods keyed on `last_eval_theta` (NOT `current_theta`): the #1033
-    // certified Gaussian path evaluates a trial ψ without re-realizing the
-    // design, so the eval θ and the realized-design θ can differ. Keying the
-    // memo on the eval θ keeps a ψ-skip from mis-associating one ψ's result
-    // with another ψ's key. The other exact-joint caches still use the shared
-    // `impl_exact_joint_theta_memo!` macro (they always realize before eval).
-    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
-        if self
-            .last_eval_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval
-                .as_ref()
-                .map(|cached| cached.0)
-                .or(self.last_cost)
-        } else {
-            None
-        }
-    }
-
-    fn memoized_eval(
-        &self,
-        theta: &Array1<f64>,
-    ) -> Option<(f64, Array1<f64>, gam_problem::HessianValue)> {
-        if self
-            .last_eval_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval.clone()
-        } else {
-            None
-        }
-    }
-
-    /// Drop every memoized criterion value, keeping the realized design.
-    ///
-    /// The memo is keyed on θ alone, so it cannot tell two evaluations of two
-    /// different MEASURES at the same θ apart. `begin_exact_polish` changes the
-    /// measure — it retires the #1033b n-free surrogate — so the surrogate's
-    /// value at the search checkpoint must not be served to the exact lane that
-    /// follows (gam#2760).
-    fn forget_eval_memo(&mut self) {
-        self.last_eval_theta = None;
-        self.last_cost = None;
-        self.last_eval = None;
-    }
-
-    /// Record an eval result keyed to the θ it was computed at. Used in place of
-    /// the macro's `store_eval` so the memo key reflects the EVAL θ even when the
-    /// design was not re-realized at that θ (#1033 certified skip).
-    fn store_eval_at(
-        &mut self,
-        theta: &Array1<f64>,
-        eval: (f64, Array1<f64>, gam_problem::HessianValue),
-    ) {
-        self.last_eval_theta = Some(theta.clone());
-        self.last_cost = Some(eval.0);
-        self.last_eval = Some(eval);
-    }
-
-    /// Record a cost-only result keyed to the θ it was computed at, so
-    /// `memoized_cost` keys on the EVAL θ (matching `store_eval_at`).
-    fn store_cost_at(&mut self, theta: &Array1<f64>, cost: f64) {
-        self.last_eval_theta = Some(theta.clone());
-        self.last_cost = Some(cost);
-        // A cost-only probe carries no gradient/Hessian, so drop any prior
-        // full eval: `memoized_cost` prefers `last_eval.0`, and a stale
-        // `last_eval` from a different θ must never answer for this θ.
-        self.last_eval = None;
-    }
-
-    fn spec(&self) -> &TermCollectionSpec {
-        self.realizer.spec()
-    }
-
-    fn design(&self) -> &TermCollectionDesign {
-        self.realizer.design()
-    }
-
-    /// True when the single spatial term's frozen geometry admits an EXACT,
-    /// n-free penalty re-key at a new length-scale (#1033). The κ-loop fast path
-    /// gates its design-realization skip on this (replacing the old certified
-    /// `psi_penalty_tensor_covers` gate): the skip leaves `reset_surface`
-    /// un-run, so it is sound only when `S(ψ_new)` can be rebuilt n-free.
-    fn supports_nfree_penalty_rekey(&self) -> bool {
-        self.realizer
-            .supports_nfree_penalty_rekey(&self.spatial_terms)
-    }
-
-    fn supports_nfree_gradient_only_routing(&self) -> bool {
-        self.realizer
-            .supports_nfree_gradient_only_routing(&self.spatial_terms)
-    }
-
-    /// Build the EXACT canonical penalty surface `S(ψ)` at the length-scale
-    /// implied by `theta`'s ψ tail, entirely n-free (#1033). Maps ψ→length-scale
-    /// with the IDENTICAL `spatial_term_psi_to_length_scale_and_aniso` the slow
-    /// path uses, reuses the frozen basis geometry, and runs the SAME
-    /// `canonicalize_penalty_specs` pipeline `reset_surface` runs — so the
-    /// returned canonical list is the one the kept reference surface must be
-    /// re-keyed with on the design-revision fast path. The caller (which holds
-    /// `cache`) computes this and hands the owned result to the evaluator via
-    /// `stage_fast_path_penalty`, avoiding a `&mut cache` borrow alias.
-    fn canonical_penalties_at(
-        &mut self,
-        theta: &Array1<f64>,
-        frozen_penalty_ranks: &[usize],
-    ) -> Result<(Vec<gam_terms::construction::CanonicalPenalty>, Vec<usize>), String> {
-        let psi = &theta
-            .as_slice()
-            .ok_or_else(|| "canonical_penalties_at: theta is not contiguous".to_string())?
-            [self.rho_dim..];
-        self.realizer
-            .canonical_penalties_at_psi(&self.spatial_terms, psi, frozen_penalty_ranks)
-    }
-}
-
-struct SingleBlockLatentCoordDesignCache {
-    data: Array2<f64>,
-    spec: TermCollectionSpec,
-    design: TermCollectionDesign,
-    current_theta: Option<Array1<f64>>,
-    current_latent: Option<std::sync::Arc<gam_terms::latent::LatentCoordValues>>,
-    current_hyper_dirs: Option<Vec<gam_solve::estimate::reml::DirectionalHyperParam>>,
-    current_design_cache_id: Option<u64>,
-    latent_design_cache: gam_solve::latent_cache::LatentDesignCache,
-    last_cost: Option<f64>,
-    last_eval: Option<(f64, Array1<f64>, gam_problem::HessianValue)>,
-    term_index: gam_problem::types::SmoothTermIdx,
-    feature_cols: Vec<usize>,
-    rho_dim: usize,
-    n_obs: usize,
-    latent_dim: usize,
-    id_mode: gam_terms::latent::LatentIdMode,
-    manifold: gam_terms::latent::LatentManifold,
-    retraction_registry: gam_solve::latent_cache::LatentRetractionRegistry,
-    latent_id: u64,
-    analytic_penalties: Option<std::sync::Arc<gam_terms::AnalyticPenaltyRegistry>>,
-    analytic_rho_count: usize,
-    design_revision: u64,
-}
-
-impl SingleBlockLatentCoordDesignCache {
-    fn new(
-        data: Array2<f64>,
-        spec: TermCollectionSpec,
-        design: TermCollectionDesign,
-        latent: &StandardLatentCoordConfig,
-        rho_dim: usize,
-    ) -> Result<Self, String> {
-        if latent.term_index.get() >= spec.smooth_terms.len() {
-            return Err(SmoothError::dimension_mismatch(format!(
-                "latent-coordinate term index {} out of bounds for {} smooth terms",
-                latent.term_index,
-                spec.smooth_terms.len()
-            ))
-            .into());
-        }
-        if latent.feature_cols.len() != latent.values.latent_dim() {
-            return Err(SmoothError::dimension_mismatch(format!(
-                "latent-coordinate feature width mismatch: feature_cols={}, latent_dim={}",
-                latent.feature_cols.len(),
-                latent.values.latent_dim()
-            ))
-            .into());
-        }
-        if latent.values.n_obs() != data.nrows() {
-            return Err(SmoothError::dimension_mismatch(format!(
-                "latent-coordinate row mismatch: latent n={}, data n={}",
-                latent.values.n_obs(),
-                data.nrows()
-            ))
-            .into());
-        }
-        let analytic_rho_count = latent
-            .analytic_penalties
-            .as_ref()
-            .map_or(0, |registry| registry.total_rho_count());
-        Ok(Self {
-            data,
-            spec,
-            design,
-            current_theta: None,
-            current_latent: None,
-            current_hyper_dirs: None,
-            current_design_cache_id: None,
-            latent_design_cache: gam_solve::latent_cache::LatentDesignCache::default(),
-            last_cost: None,
-            last_eval: None,
-            term_index: latent.term_index,
-            feature_cols: latent.feature_cols.clone(),
-            rho_dim,
-            n_obs: latent.values.n_obs(),
-            latent_dim: latent.values.latent_dim(),
-            id_mode: latent.values.id_mode().clone(),
-            manifold: latent.values.manifold().clone(),
-            retraction_registry: latent.values.retraction_registry().clone(),
-            latent_id: latent.values.latent_id(),
-            analytic_penalties: latent.analytic_penalties.clone(),
-            analytic_rho_count,
-            design_revision: 0,
-        })
-    }
-
-    fn design_revision(&self) -> u64 {
-        self.design_revision
-    }
-
-    fn design(&self) -> &TermCollectionDesign {
-        &self.design
-    }
-
-    fn latent(&self) -> Result<std::sync::Arc<gam_terms::latent::LatentCoordValues>, String> {
-        self.current_latent
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "latent-coordinate cache has not been realized".to_string())
-    }
-
-    fn analytic_penalties(&self) -> Option<std::sync::Arc<gam_terms::AnalyticPenaltyRegistry>> {
-        self.analytic_penalties.clone()
-    }
-
-    fn analytic_penalty_rho_count(&self) -> usize {
-        self.analytic_rho_count
-    }
-
-    fn hyper_dirs(&self) -> Result<Vec<gam_solve::estimate::reml::DirectionalHyperParam>, String> {
-        self.current_hyper_dirs
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "latent-coordinate hyper_dirs cache has not been realized".to_string())
-    }
-
-    fn latent_basis_kind(&self) -> Result<gam_solve::latent_cache::LatentBasisKind, String> {
-        let smooth_term = self
-            .design
-            .smooth
-            .terms
-            .get(self.term_index.get())
-            .ok_or_else(|| {
-                SmoothError::dimension_mismatch(format!(
-                    "LatentCoord term index {} out of bounds for realized smooth design",
-                    self.term_index
-                ))
-            })?;
-        let termspec = self
-            .spec
-            .smooth_terms
-            .get(self.term_index.get())
-            .ok_or_else(|| {
-                SmoothError::dimension_mismatch(format!(
-                    "LatentCoord term index {} out of bounds for resolved smooth spec",
-                    self.term_index
-                ))
-            })?;
-        match (&termspec.basis, &smooth_term.metadata) {
-            (
-                SmoothBasisSpec::Matern { .. },
-                BasisMetadata::Matern {
-                    centers,
-                    length_scale,
-                    nu,
-                    aniso_log_scales,
-                    input_scale,
-                    ..
-                },
-            ) => Ok(gam_solve::latent_cache::LatentBasisKind::Matern {
-                centers: centers.clone(),
-                // The metadata's frame pair travels together into the cache
-                // key and into the radii it builds (#2643).
-                input_scale: *input_scale,
-                length_scale: *length_scale,
-                nu: *nu,
-                aniso_log_scales: aniso_log_scales
-                    .clone()
-                    .unwrap_or_else(|| vec![0.0; centers.ncols()]),
-                chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
-                    self.n_obs,
-                    centers.nrows(),
-                ),
-            }),
-            (
-                SmoothBasisSpec::Duchon { .. },
-                BasisMetadata::Duchon {
-                    centers,
-                    length_scale,
-                    power,
-                    nullspace_order,
-                    aniso_log_scales,
-                    input_scale,
-                    ..
-                },
-            ) => Ok(gam_solve::latent_cache::LatentBasisKind::Duchon {
-                centers: centers.clone(),
-                // See the Matérn arm (#2643).
-                input_scale: *input_scale,
-                length_scale: *length_scale,
-                power: *power,
-                nullspace_order: *nullspace_order,
-                aniso_log_scales: aniso_log_scales
-                    .clone()
-                    .unwrap_or_else(|| vec![0.0; centers.ncols()]),
-            }),
-            (
-                SmoothBasisSpec::Sphere { .. },
-                BasisMetadata::Sphere {
-                    centers,
-                    penalty_order,
-                    method,
-                    ..
-                },
-            ) if matches!(*method, gam_terms::basis::SphereMethod::Wahba) => {
-                Ok(gam_solve::latent_cache::LatentBasisKind::Sphere {
-                    centers: centers.clone(),
-                    penalty_order: *penalty_order,
-                    chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
-                        self.n_obs,
-                        centers.nrows(),
-                    ),
-                })
-            }
-            (
-                SmoothBasisSpec::BSpline1D { spec, .. },
-                BasisMetadata::BSpline1D {
-                    knots,
-                    periodic,
-                    degree: meta_degree,
-                    ..
-                },
-            ) => {
-                // Issue #340: prefer the metadata-recorded effective degree
-                // (which reflects fit-time auto-shrink) over the upstream
-                // user-requested `spec.degree`.
-                let effective_degree = meta_degree.unwrap_or(spec.degree);
-                if let Some((domain_start, period, num_basis)) = periodic {
-                    Ok(gam_solve::latent_cache::LatentBasisKind::PeriodicBspline {
-                        domain_start: *domain_start,
-                        period: *period,
-                        degree: effective_degree,
-                        num_basis: *num_basis,
-                        chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
-                            self.n_obs, *num_basis,
-                        ),
-                    })
-                } else {
-                    let num_basis_est = knots.len().saturating_sub(effective_degree + 1);
-                    Ok(gam_solve::latent_cache::LatentBasisKind::TensorBspline {
-                        knots: vec![knots.clone()],
-                        degrees: vec![effective_degree],
-                        chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
-                            self.n_obs,
-                            num_basis_est,
-                        ),
-                    })
-                }
-            }
-            (
-                SmoothBasisSpec::TensorBSpline { .. },
-                BasisMetadata::TensorBSpline { knots, degrees, .. },
-            ) => Ok(gam_solve::latent_cache::LatentBasisKind::TensorBspline {
-                knots: knots.clone(),
-                degrees: degrees.clone(),
-                chunk_size: None,
-            }),
-            (
-                SmoothBasisSpec::Pca { .. },
-                BasisMetadata::Pca {
-                    basis_matrix,
-                    centered,
-                    center_mean,
-                    pca_basis_path,
-                    chunk_size,
-                    ..
-                },
-            ) => {
-                let center_mean_fingerprint = if *centered && pca_basis_path.is_none() {
-                    let mean = center_mean.as_ref().ok_or_else(|| {
-                        SmoothError::invalid_config(
-                            "latent-coordinate Pca cache key requires center_mean when centered",
-                        )
-                    })?;
-                    Some(gam_solve::latent_cache::pca_center_mean_fingerprint(mean))
-                } else {
-                    None
-                };
-                Ok(gam_solve::latent_cache::LatentBasisKind::Pca {
-                    basis_matrix: basis_matrix.clone(),
-                    centered: *centered,
-                    center_mean_fingerprint,
-                    pca_basis_path: pca_basis_path.clone(),
-                    chunk_size: *chunk_size,
-                })
-            }
-            _ => Err(SmoothError::invalid_config(
-                "latent-coordinate design cache could not key the realized latent smooth basis"
-                    .to_string(),
-            )
-            .into()),
-        }
-    }
-
-    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            return Ok(());
-        }
-        let latent_flat_len = self.n_obs * self.latent_dim;
-        let direct_hyper_count = latent_coord_direct_hyper_count(&self.id_mode, self.latent_dim);
-        let expected =
-            self.rho_dim + latent_flat_len + self.analytic_rho_count + direct_hyper_count;
-        if theta.len() != expected {
-            return Err(SmoothError::dimension_mismatch(format!(
-                "latent-coordinate theta length mismatch: got {}, expected {} (rho_dim={}, n={}, d={}, analytic_rhos={}, direct_hypers={})",
-                theta.len(),
-                expected,
-                self.rho_dim,
-                self.n_obs,
-                self.latent_dim,
-                self.analytic_rho_count,
-                direct_hyper_count
-            ))
-            .into());
-        }
-        let flat = theta
-            .slice(s![self.rho_dim..self.rho_dim + latent_flat_len])
-            .to_owned();
-        let latent = std::sync::Arc::new(
-            gam_terms::latent::LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
-                flat,
-                self.n_obs,
-                self.latent_dim,
-                self.id_mode.clone(),
-                self.manifold.clone(),
-                self.retraction_registry.clone(),
-                self.latent_id,
-            ),
-        );
-        let latent_values_changed = self
-            .current_latent
-            .as_ref()
-            .map(|cached| !latent_values_match(cached.as_flat(), latent.as_flat()))
-            .unwrap_or(true);
-        if latent_values_changed {
-            self.latent_design_cache.invalidate_all();
-            self.current_design_cache_id = None;
-            self.design_revision = self.design_revision.wrapping_add(1);
-        }
-        for n in 0..self.n_obs {
-            for axis in 0..self.latent_dim {
-                let col = self.feature_cols[axis];
-                self.data[[n, col]] = latent.as_flat()[n * self.latent_dim + axis];
-            }
-        }
-
-        let basis_kind = self.latent_basis_kind()?;
-        let rebuilt_width = self.design.design.ncols();
-        let spec = self.spec.clone();
-        let term_index = self.term_index;
-        let analytic_rho_count = self.analytic_rho_count;
-        let data = self.data.view();
-        let design_context_digest = gam_solve::latent_cache::latent_design_context_cache_digest(
-            data,
-            &spec,
-            term_index,
-            analytic_rho_count,
-            &self.feature_cols,
-        )
-        .map_err(|e| e.to_string())?;
-        let lookup = self
-            .latent_design_cache
-            .lookup_or_compute(latent.clone(), basis_kind, design_context_digest, || {
-                let rebuilt = build_term_collection_design(data, &spec).map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "failed to rebuild latent-coordinate design: {e}"
-                    ))
-                })?;
-                if rebuilt.design.ncols() != rebuilt_width {
-                    crate::bail_invalid_estim!(
-                        "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
-                        rebuilt.design.ncols(),
-                        rebuilt_width
-                    );
-                }
-                let hyper_dirs = try_build_latent_coord_hyper_dirs(
-                    latent.clone(),
-                    &spec,
-                    &rebuilt,
-                    &[term_index],
-                    analytic_rho_count,
-                )?
-                .ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "failed to build latent-coordinate hyper_dirs".to_string(),
-                    )
-                })?;
-                Ok(gam_solve::latent_cache::ComputedLatentDesign {
-                    design: rebuilt,
-                    hyper_dirs,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        if lookup.cached.design.design.ncols() != self.design.design.ncols() {
-            return Err(SmoothError::dimension_mismatch(format!(
-                "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
-                lookup.cached.design.design.ncols(),
-                self.design.design.ncols()
-            ))
-            .into());
-        }
-        self.design = lookup.cached.design.clone();
-        self.current_hyper_dirs = Some(lookup.cached.hyper_dirs.clone());
-        self.current_latent = Some(latent);
-        self.current_theta = Some(theta.clone());
-        self.last_cost = None;
-        self.last_eval = None;
-        if !latent_values_changed && self.current_design_cache_id != Some(lookup.entry_id) {
-            self.design_revision = self.design_revision.wrapping_add(1);
-        }
-        self.current_design_cache_id = Some(lookup.entry_id);
-        Ok(())
-    }
-
-    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval
-                .as_ref()
-                .map(|cached| cached.0)
-                .or(self.last_cost)
-        } else {
-            None
-        }
-    }
-
-    fn memoized_eval(
-        &self,
-        theta: &Array1<f64>,
-    ) -> Option<(f64, Array1<f64>, gam_problem::HessianValue)> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval.clone()
-        } else {
-            None
-        }
-    }
-
-    fn store_eval(&mut self, eval: (f64, Array1<f64>, gam_problem::HessianValue)) {
-        self.last_cost = Some(eval.0);
-        self.last_eval = Some(eval);
-    }
-
-    fn store_cost(&mut self, cost: f64) {
-        self.last_cost = Some(cost);
-    }
-
-    fn reset(&mut self) {
-        self.current_theta = None;
-        self.current_latent = None;
-        self.current_hyper_dirs = None;
-        self.current_design_cache_id = None;
-        self.latent_design_cache.invalidate();
-        self.last_cost = None;
-        self.last_eval = None;
-    }
-}
-
+// The ψ hyper-direction builders and latent/analytic-penalty objective terms (moved verbatim, line limit).
+include!("spatial_hyper_dirs.rs");
+
+// The single-block exact-joint and latent-coordinate design caches (moved verbatim, line limit).
+include!("spatial_single_block_caches.rs");
 
 /// The λ-selection domain of the joint spatial search, derived per ρ
 /// coordinate from the term's own design-relative penalty spectrum (#2812):
@@ -2161,7 +46,7 @@ pub(crate) fn joint_rho_resolvability_domain(
     let mut lower = Array1::<f64>::from_elem(rho_dim, precision_box.0);
     let mut upper = Array1::<f64>::from_elem(rho_dim, precision_box.1);
     if rho_dim > penalties.len() {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] joint rho domain: {rho_dim} coordinates but {} penalty blocks; \
              the coordinates past the blocks keep the precision box",
             penalties.len()
@@ -2188,37 +73,32 @@ pub(crate) fn joint_rho_resolvability_domain(
     (lower, upper)
 }
 
-/// The joint ρ domain across the blocks of an exact-joint route: the blocks'
-/// penalties, in block order, are the ρ coordinates, and each takes the
-/// resolvability interval of its own block design (#2812). When the blocks'
-/// penalties do not account for every coordinate the layout is not the
-/// driver's to guess: `None`, and the box the setup's builder derived (or the
-/// precision box) stands.
-pub(crate) fn joint_rho_resolvability_domain_over_blocks<'a>(
-    blocks: &[(&'a DesignMatrix, &'a [gam_terms::smooth::BlockwisePenalty])],
+/// The ρ domain of an exact-joint search over a custom family's blocks realized
+/// at the seed: the #2812 law `fit_custom_family` applies to those same blocks
+/// ([`per_block_resolvability_rho_domain`](crate::custom_family::per_block_resolvability_rho_domain)),
+/// so a coordinate is searched on one domain whichever route fits it. Every
+/// block that owns a ρ coordinate is realized, including the ones the driver's
+/// term collections never carry (a survival time or link-wiggle block, an
+/// influence absorber, a noise ridge). A layout whose free penalties do not
+/// number `rho_dim` is refused rather than given a box (#2902 item 15).
+pub(crate) fn realized_blocks_rho_domain(
+    blocks: &[crate::custom_family::ParameterBlockSpec],
+    options: &crate::custom_family::BlockwiseFitOptions,
     rho_dim: usize,
-) -> Option<(Array1<f64>, Array1<f64>)> {
-    let declared: usize = blocks.iter().map(|(_, penalties)| penalties.len()).sum();
-    if declared != rho_dim {
-        log::info!(
-            "[spatial-exact-joint] joint rho domain: {rho_dim} coordinates but the {} blocks \
-             declare {declared} penalties between them; the setup's own box stands",
-            blocks.len()
-        );
-        return None;
+) -> Result<(Array1<f64>, Array1<f64>), FitFailure> {
+    let (lower, upper) = crate::custom_family::per_block_resolvability_rho_domain(blocks, options)
+        .map_err(|error| FitFailure::from(error).context("exact-joint rho resolvability domain"))?;
+    if lower.len() != rho_dim || upper.len() != rho_dim {
+        return Err(FitFailure::raised(
+            gam_problem::FailureCategory::Invariant,
+            format!(
+                "exact-joint rho resolvability domain: the realized blocks carry {} free \
+                 penalties for {rho_dim} rho coordinates",
+                lower.len()
+            ),
+        ));
     }
-    let mut lower = Array1::<f64>::zeros(rho_dim);
-    let mut upper = Array1::<f64>::zeros(rho_dim);
-    let mut cursor = 0usize;
-    for (design, penalties) in blocks {
-        let n_block = penalties.len();
-        let (block_lower, block_upper) =
-            joint_rho_resolvability_domain(design, penalties, n_block);
-        lower.slice_mut(s![cursor..cursor + n_block]).assign(&block_lower);
-        upper.slice_mut(s![cursor..cursor + n_block]).assign(&block_upper);
-        cursor += n_block;
-    }
-    Some((lower, upper))
+    Ok((lower, upper))
 }
 
 /// The per-coordinate ρ domain of one penalized block given as a design and
@@ -2314,7 +194,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         .is_none()
     {
         if !constant_curvature_term_indices(resolvedspec).is_empty() {
-            log::info!(
+            log::debug!(
                 "[#1464-trace] try_exact_joint RETURNED None (hyper_dirs unavailable); \
                  κ̂ comes from a NON-joint path"
             );
@@ -2322,7 +202,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         return Ok(JointSpatialKappaOutcome::Unavailable);
     }
     if !constant_curvature_term_indices(resolvedspec).is_empty() {
-        log::info!(
+        log::debug!(
             "[#1464-trace] try_exact_joint ENTERED for {} spatial term(s); CC present",
             spatial_terms.len()
         );
@@ -2427,7 +307,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // `outer_arithmetic_gradient_floor` calls the resolution of a
     // matrix-factorization REML score — so it is not roundoff, and reading it at
     // every `n` is how the residual half of #2671 gets bisected.
-    log::info!(
+    log::debug!(
         "[spatial-kappa] route agreement at theta0: joint_seed={joint_seed_value:.12e} \
          baseline={baseline_score:.12e} gap={:.6e} ({:.6e} relative) \
          agreement_tolerance={accept_tol:.6e} ({}) sqrt_eps_scale={:.6e}",
@@ -2471,7 +351,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // So the number keeps its full decomposition and its loudness, and the
     // REFUSAL moves to a comparison both sides of which come from ONE route.
     if (joint_seed_value - baseline_score).abs() > accept_tol {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] the joint and scalar-rho routes disagree about the criterion AT \
              THE SAME POINT theta0: joint_seed={joint_seed_value:.12e}, \
              baseline={baseline_score:.12e}, gap={:.3e} ({:.3e} relative) against a \
@@ -2508,7 +388,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // a solver defect and must stay visible, so it is logged with both values
     // and the rejected checkpoint rather than silently absorbed.
     let (theta_star, joint_final_value) = if joint_final_value > joint_seed_value + accept_tol {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] the exact joint search terminated ABOVE its own seed \
              (seed={joint_seed_value:.12e}, final={joint_final_value:.12e}, \
              regression={:.3e}, acceptance_tolerance={accept_tol:.3e}); its terminal \
@@ -2545,7 +425,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         for (slot, &term_idx) in spatial_terms.iter().enumerate() {
             if constant_curvature_term_spec(resolvedspec, term_idx).is_some() {
                 let off: usize = dims[..slot].iter().sum();
-                log::info!(
+                log::debug!(
                     "[#1464-trace] term {term_idx}: joint solver CONVERGED ψ-tail κ = {} \
                      (this is the optimised candidate; joint_final_value={joint_final_value})",
                     star[off]
@@ -2577,7 +457,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // holds both candidates and can simply return the better one.
     let optimized_score = fit_score(&optimized.fit);
     if optimized_score > baseline_score + accept_tol {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] joint kappa optimization did not improve the SHIPPED scalar-route \
              score (baseline={baseline_score:.12e}, at theta_star={optimized_score:.12e}, \
              regression={:.3e}, acceptance_tolerance={accept_tol:.3e}); keeping the incumbent \
@@ -2699,7 +579,7 @@ fn exact_joint_spatial_seed(
     for &(slot, kappa) in &cc_profiled_values {
         log_kappa_lower.set_scalar_slot(slot, kappa);
         log_kappa_upper.set_scalar_slot(slot, kappa);
-        log::info!("[spatial-kappa] slot {slot}: profiling rho at certified kappa={kappa}");
+        log::debug!("[spatial-kappa] slot {slot}: profiling rho at certified kappa={kappa}");
     }
     // Project seed onto data-derived bounds; spec.length_scale is a hint,
     // not a hard constraint. BFGS requires theta0 ∈ [lower, upper].
@@ -2765,34 +645,29 @@ fn exact_joint_spatial_seed(
     }
 
     // The joint ρ domain is derived from the incumbent's own design and
-    // penalties (#2812): this route hands its θ box straight to the joint
-    // optimizer, so the derivation happens here rather than in the
-    // multi-block driver. The setup itself carries only the seed.
-    let rho_seed = best.fit.lambdas.mapv(f64::ln);
-    let setup = ExactJointHyperSetup::new(rho_seed, log_kappa0, log_kappa_lower, log_kappa_upper);
-
-    let mut theta0 = setup.theta0();
-    let mut lower = setup.lower();
-    let mut upper = setup.upper();
-    {
-        let (rho_lower, rho_upper) =
-            joint_rho_resolvability_domain(&best.design.design, &best.design.penalties, rho_dim);
-        for k in 0..rho_dim {
-            lower[k] = rho_lower[k];
-            upper[k] = rho_upper[k];
-            theta0[k] = if theta0[k].is_finite() {
-                theta0[k].clamp(rho_lower[k], rho_upper[k])
-            } else {
-                0.5 * (rho_lower[k] + rho_upper[k])
-            };
-        }
-        log::info!(
-            "[spatial-kappa] joint rho domain per coordinate: lower={:.3?} upper={:.3?} seed={:.3?}",
-            rho_lower.to_vec(),
-            rho_upper.to_vec(),
-            theta0.iter().take(rho_dim).copied().collect::<Vec<_>>(),
-        );
-    }
+    // penalties (#2812), and the setup projects the incumbent's seed into it.
+    // A coordinate the incumbent's certificate carried onto a face seeds from
+    // where its search stopped (#2954).
+    let rho_seed = best.fit.search_seed_log_lambdas();
+    let (rho_lower, rho_upper) =
+        joint_rho_resolvability_domain(&best.design.design, &best.design.penalties, rho_dim);
+    let setup = ExactJointHyperSetup::new(
+        rho_seed,
+        rho_lower,
+        rho_upper,
+        log_kappa0,
+        log_kappa_lower,
+        log_kappa_upper,
+    );
+    let theta0 = setup.theta0();
+    let lower = setup.lower();
+    let upper = setup.upper();
+    log::debug!(
+        "[spatial-kappa] joint rho domain per coordinate: lower={:.3?} upper={:.3?} seed={:.3?}",
+        lower.iter().take(rho_dim).copied().collect::<Vec<_>>(),
+        upper.iter().take(rho_dim).copied().collect::<Vec<_>>(),
+        theta0.iter().take(rho_dim).copied().collect::<Vec<_>>(),
+    );
     let kind = if use_aniso {
         SpatialHyperKind::Anisotropic
     } else {
@@ -2986,17 +861,22 @@ fn nfree_skip_gate_status_from_parts(
     }
 }
 
-/// Apply the same trial-point classification to the value and derivative lanes.
-/// `Ok(+∞)` means the point is outside the evaluable numerical domain; `Err`
-/// means the evaluation artifact itself could not be constructed and must abort
-/// every outer solver route.
-fn classify_spatial_value_probe_failure(
-    error: EstimationError,
-) -> Result<f64, EstimationError> {
-    if is_recoverable_trial_point_error(&error) {
-        Ok(f64::INFINITY)
+/// Give the value and derivative lanes one typed answer for a failed trial.
+///
+/// A refusal at this trial travels as an error whose variant answers
+/// `is_trial_point_infeasible()`, so every outer consumer classifies it by
+/// variant and the refusal's reason reaches the outer log (#2735). A bare
+/// `BasisError` — the design cannot be built at this hyperparameter — is a
+/// refusal here but graded fatal by `is_trial_point_infeasible`, so it is carried
+/// as `TrialPointRefused` with its own message. Every other error is returned
+/// unchanged and stays fatal.
+fn classify_spatial_value_probe_failure(error: EstimationError) -> EstimationError {
+    if error.is_trial_point_infeasible() || !is_recoverable_trial_point_error(&error) {
+        error
     } else {
-        Err(error)
+        EstimationError::TrialPointRefused {
+            reason: format!("the design cannot be realized at this trial point: {error}"),
+        }
     }
 }
 
@@ -3151,12 +1031,12 @@ impl<'d> SpatialJointContext<'d> {
         self.frozen_glm_tensor_attempted = true;
         if let Some(tensor) = tensor {
             self.frozen_glm_tensor = Some(tensor);
-            log::info!(
+            log::debug!(
                 "[STAGE] {} certified frozen-W GLM ψ tensor over [{psi_lo:.3}, {psi_hi:.3}]",
                 self.kind.label(),
             );
         } else {
-            log::info!(
+            log::debug!(
                 "[STAGE] {} frozen-W GLM ψ tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]",
                 self.kind.label(),
             );
@@ -3199,7 +1079,7 @@ impl<'d> SpatialJointContext<'d> {
                 const FROZEN_GLM_WEIGHT_DRIFT_RTOL: f64 = 1e-3;
                 if tensor.weight_drift_within(current_w.view(), FROZEN_GLM_WEIGHT_DRIFT_RTOL) {
                     staged_gram = Some(tensor.gram_at(psi));
-                    log::debug!(
+                    log::trace!(
                         "[STAGE] {} trial at psi={psi:.6}: serving frozen-W GLM \
                          first-Fisher-step XᵀWX n-free (weight drift within tol)",
                         kind.label(),
@@ -3211,7 +1091,7 @@ impl<'d> SpatialJointContext<'d> {
                         tensor.gradient_pair_if_sound(psi, current_w.view())
                 {
                     staged_deriv = Some((dgram_dpsi, drhs_dpsi));
-                    log::debug!(
+                    log::trace!(
                         "[STAGE] {} trial at psi={psi:.6}: serving frozen-W GLM \
                          ψ-gradient (∂G/∂ψ, ∂b/∂ψ) n-free (gradient weight drift within \
                          tight tol); B_j stays exact",
@@ -3332,7 +1212,7 @@ impl<'d> SpatialJointContext<'d> {
         // n-free gradient/value lane. Removing it routes the gradient eval through
         // the k-space `GaussianFixedCache` + ψ-derivative tensor as intended.
         if skip_design_realization {
-            log::debug!(
+            log::trace!(
                 "[STAGE] {} eval_full at psi={:.6}: skipping n×k design re-realization \
                  + reconditioning — criterion/gradient/inner-solve served n-free from \
                  the certified ψ-gram tensor (GaussianFixedCache + k-space ψ-derivatives)",
@@ -3390,7 +1270,7 @@ impl<'d> SpatialJointContext<'d> {
             {
                 Ok(penalty) => self.evaluator.stage_fast_path_penalty(Some(penalty)),
                 Err(e) => {
-                    log::warn!(
+                    log::debug!(
                         "[STAGE] {} eval_full at psi={:.6}: exact n-free S(ψ) rebuild failed \
                          ({e}); clearing stage (eval falls to slow path)",
                         kind.label(),
@@ -3550,8 +1430,12 @@ impl<'d> SpatialJointContext<'d> {
             && self.evaluator.has_psi_gram_tensor()
             && !self.evaluator.psi_gram_tensor_covers(theta[self.rho_dim])
         {
-            self.cache.store_cost_at(theta, f64::INFINITY);
-            return Ok(f64::INFINITY);
+            return Err(EstimationError::TrialPointRefused {
+                reason: format!(
+                    "psi={:.6e} lies outside the certified psi-Gram tensor window",
+                    theta[self.rho_dim]
+                ),
+            });
         }
         // #2481: preserve the derivative-lane contract. A basis or inner-solve
         // refusal at this trial is a recoverable domain wall; layout, topology,
@@ -3559,18 +1443,13 @@ impl<'d> SpatialJointContext<'d> {
         if !skip_value_realization && let Err(error) = self.cache.ensure_theta(theta) {
             self.value_realization_failures += 1;
             let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, self.rho_dim);
-            if is_recoverable_trial_point_error(&error) {
+            if !is_recoverable_trial_point_error(&error) {
                 log::debug!(
-                    "[STAGE] {} value-probe: design realization makes this trial infeasible at theta_norm={:.4e} log_kappa_norm={:.4e} ({error}); retreating",
-                    self.kind.label(), theta_norm, log_kappa_norm,
-                );
-            } else {
-                log::warn!(
                     "[STAGE] {} value-probe: design realization FAILED fatally at theta_norm={:.4e} log_kappa_norm={:.4e} ({error}); propagating",
                     self.kind.label(), theta_norm, log_kappa_norm,
                 );
             }
-            return classify_spatial_value_probe_failure(error);
+            return Err(classify_spatial_value_probe_failure(error));
         }
         // #1033 penalty lane: stage the EXACT n-free `S(ψ)` for this probe's ψ so
         // the cost-only fast path re-keys the kept surface without `reset_surface`
@@ -3588,7 +1467,7 @@ impl<'d> SpatialJointContext<'d> {
         }
         let warm_beta = self.evaluator.current_beta();
         if let Err(err) = self.ensure_frozen_glm_tensor(theta, warm_beta.as_ref()) {
-            log::warn!(
+            log::debug!(
                 "[STAGE] {} value-probe at psi={:.6}: frozen-W GLM tensor setup failed ({err}); \
                  falling back to exact streamed Gram",
                 self.kind.label(),
@@ -3603,7 +1482,7 @@ impl<'d> SpatialJointContext<'d> {
         } else if let Err(err) =
             self.stage_frozen_glm_trial_statistics(theta, warm_beta.as_ref(), false)
         {
-            log::warn!(
+            log::debug!(
                 "[STAGE] {} value-probe at psi={:.6}: frozen-W GLM staging failed ({err}); \
                  falling back to exact streamed Gram",
                 self.kind.label(),
@@ -3638,7 +1517,7 @@ impl<'d> SpatialJointContext<'d> {
         };
         match result {
             Ok(cost) => {
-                log::debug!(
+                log::trace!(
                     "[STAGE] {cost_label} value-probe (order=Value): elapsed={:.3}s \
                      cost={cost:.6e} trial_theta_distance={psi_distance:.3e}",
                     probe_start.elapsed().as_secs_f64(),
@@ -3651,16 +1530,12 @@ impl<'d> SpatialJointContext<'d> {
             Err(error) => {
                 self.value_evaluation_failures += 1;
                 let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, self.rho_dim);
-                if is_recoverable_trial_point_error(&error) {
+                if !is_recoverable_trial_point_error(&error) {
                     log::debug!(
-                        "[STAGE] {cost_label} value-probe: cost evaluator makes this trial infeasible at theta_norm={theta_norm:.4e} log_kappa_norm={log_kappa_norm:.4e} ({error}); retreating",
-                    );
-                } else {
-                    log::warn!(
                         "[STAGE] {cost_label} value-probe: cost evaluation FAILED fatally at theta_norm={theta_norm:.4e} log_kappa_norm={log_kappa_norm:.4e} ({error}); propagating",
                     );
                 }
-                classify_spatial_value_probe_failure(error)
+                Err(classify_spatial_value_probe_failure(error))
             }
         }
     }
@@ -3829,7 +1704,7 @@ fn run_exact_joint_spatial_optimization(
     let seed_value = ctx
         .eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?
         .0;
-    log::info!(
+    log::debug!(
         "[KAPPA-PHASE-PRIME] n_rows={} order={:?} seed_value={seed_value:.12e} elapsed_s={:.4} slow_path_resets_total={} design_revision={}",
         data.nrows(),
         kphase_prime_order,
@@ -4067,7 +1942,7 @@ fn run_exact_joint_spatial_optimization(
         kphase_eval_calls.set(kphase_eval_calls.get() + 1);
         kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
         let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, rho_dim);
-        log::info!(
+        log::debug!(
             "[KAPPA-PHASE] phase=eval_outer call={} order={:?} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} psi={} elapsed_s={:.4}",
             kphase_eval_calls.get(),
             order,
@@ -4084,23 +1959,21 @@ fn run_exact_joint_spatial_optimization(
                 hessian: hess,
                 inner_beta_hint: None,
             }),
-            // A trial hyperparameter at which the spatial kernel design /
-            // ψ-derivatives are non-constructible is an infeasible point, not
-            // a fatal error: the gradient/Hessian path must retreat exactly as
-            // the cost-only path (which already returns +∞) does. Returning
-            // `OuterEval::infeasible` keeps the two paths symmetric so a single
-            // bad probe — e.g. an anisotropy that overflows the Duchon radial
-            // kernel — no longer aborts the whole REML optimization.
-            Err(err) if is_recoverable_trial_point_error(&err) => {
-                // Each refusal costs the line search a halving and this call's
-                // work; a run that crawls on refusals must say why (#2735).
-                log::info!(
-                    "[{label}] trial point infeasible (kernel design \
-                     not constructible at theta={theta:?}): {err}; retreating",
-                );
-                Ok(OuterEval::infeasible(theta_dim))
+            // A trial hyperparameter at which the spatial kernel design, its
+            // ψ-derivatives or the criterion refuse is an infeasible point, not
+            // a fatal error. The refusal travels typed, through the same
+            // classifier as the value lane, so a single bad probe — e.g. an
+            // anisotropy that overflows the Duchon radial kernel — makes the
+            // search retreat and its reason reaches the outer log (#2735).
+            Err(err) => {
+                let err = classify_spatial_value_probe_failure(err);
+                if err.is_trial_point_infeasible() {
+                    // Each refusal costs the line search a halving and this call's
+                    // work; a run that crawls on refusals must say why (#2735).
+                    log::debug!("[{label}] trial point refused at theta={theta:?}: {err}; retreating");
+                }
+                Err(err)
             }
-            Err(err) => Err(err),
         }
     };
 
@@ -4136,7 +2009,7 @@ fn run_exact_joint_spatial_optimization(
             kphase_cost_calls.set(kphase_cost_calls.get() + 1);
             kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
             let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, rho_dim);
-            log::info!(
+            log::debug!(
                 "[KAPPA-PHASE] phase=cost call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                 kphase_cost_calls.get(),
                 Some(ctx.cache.design_revision()),
@@ -4169,7 +2042,7 @@ fn run_exact_joint_spatial_optimization(
             kphase_efs_calls.set(kphase_efs_calls.get() + 1);
             kphase_efs_total_s.set(kphase_efs_total_s.get() + elapsed_s);
             let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, rho_dim);
-            log::info!(
+            log::debug!(
                 "[KAPPA-PHASE] phase=efs call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                 kphase_efs_calls.get(),
                 Some(ctx.cache.design_revision()),
@@ -4230,7 +2103,7 @@ fn run_exact_joint_spatial_optimization(
                 ctx.evaluator.slow_path_reset_count(),
                 gam_solve::pirls::nfree_skip_row_element_touches(),
             ));
-            log::info!(
+            log::debug!(
                 "[KAPPA-PHASE-POLISH] the certified n-free psi-Gram surrogate is retired at \
                  the search checkpoint; the optimizer continues and certifies on the exact \
                  streamed criterion (gam#2760)"
@@ -4272,14 +2145,14 @@ fn run_exact_joint_spatial_optimization(
     let kphase_nfree_skip_touches =
         search_skip_touches_end.saturating_sub(kphase_nfree_skip_touches_start);
     let kphase_polish_skip_touches = skip_touches_end.saturating_sub(search_skip_touches_end);
-    log::info!(
+    log::debug!(
         "[KAPPA-PHASE-POLISH-SUMMARY] n_rows={} exact_polish_ran={} polish_slow_path_resets={} polish_nfree_skip_row_touches={}",
         data.nrows(),
         ctx.nfree_polish_boundary.is_some(),
         kphase_polish_slow_resets,
         kphase_polish_skip_touches,
     );
-    log::info!(
+    log::debug!(
         "[KAPPA-PHASE-SUMMARY] n_rows={} log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} value_realization_failures={} value_evaluation_failures={} slow_path_resets={} design_revision_delta={} nfree_skip_row_touches={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
         data.nrows(),
         kphase_log_kappa_dim,
@@ -4381,7 +2254,7 @@ fn exact_joint_spatial_inputs(
         offset.view(),
     )?;
     if conditioned_y.is_some() {
-        log::info!(
+        log::debug!(
             "[{label}] outer response conditioned for the joint [rho, psi] search (#2671): the \
              criterion is now formed in the same coordinates as the scalar-rho route it is \
              graded against"
@@ -4451,7 +2324,7 @@ fn prepare_exact_joint_spatial_route<'d>(
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(&family, baseline_design);
     if !analytic_outer_hessian_available {
-        log::info!(
+        log::debug!(
             "[{label}] analytic outer Hessian unavailable for family/design; routing without second-order geometry (coord_dim={coord_dim})"
         );
     }
@@ -4582,7 +2455,7 @@ fn prepare_exact_joint_spatial_route<'d>(
             psi_hi,
         );
         if attached {
-            log::info!(
+            log::debug!(
                 "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
                  in-window trials assemble Gaussian sufficient statistics n-free"
             );
@@ -4602,7 +2475,7 @@ fn prepare_exact_joint_spatial_route<'d>(
             let psi_rank_stable_floor_raw = evaluator.psi_gram_rank_stable_floor(psi_anchor);
             psi_rank_stable_floor = psi_rank_stable_floor_raw
                 .filter(|&f| f.is_finite() && f > psi_lo && f < psi_anchor);
-            log::info!(
+            log::debug!(
                 "[KAPPA-PHASE-FLOOR] n_rows={} psi_lo={psi_lo:.6} psi_anchor={psi_anchor:.6} \
                  rank_stable_floor={psi_rank_stable_floor_raw:?} lifted={} \
                  projector_error_bar={psi_projector_bar:?}",
@@ -4610,7 +2483,7 @@ fn prepare_exact_joint_spatial_route<'d>(
                 psi_rank_stable_floor.is_some(),
             );
             if let Some(floor) = psi_rank_stable_floor {
-                log::info!(
+                log::debug!(
                     "[{label}] rank-stable κ-floor ψ_floor={floor:.6} > window floor \
                      ψ_lo={psi_lo:.6}: lifting the optimizer lower bound to keep every \
                      in-window trial on the n-free design-realization skip (#1033). The \
@@ -4637,7 +2510,7 @@ fn prepare_exact_joint_spatial_route<'d>(
             let psi_rank_stable_ceiling_raw = evaluator.psi_gram_rank_stable_ceiling(psi_anchor);
             psi_rank_stable_ceiling = psi_rank_stable_ceiling_raw
                 .filter(|&c| c.is_finite() && c < psi_hi && c > psi_anchor);
-            log::info!(
+            log::debug!(
                 "[KAPPA-PHASE-CEIL] n_rows={} psi_hi={psi_hi:.6} psi_anchor={psi_anchor:.6} \
                  rank_stable_ceiling={psi_rank_stable_ceiling_raw:?} clamped={} \
                  projector_error_bar={psi_projector_bar:?}",
@@ -4645,7 +2518,7 @@ fn prepare_exact_joint_spatial_route<'d>(
                 psi_rank_stable_ceiling.is_some(),
             );
             if let Some(ceiling) = psi_rank_stable_ceiling {
-                log::info!(
+                log::debug!(
                     "[{label}] rank-stable κ-ceiling ψ_ceil={ceiling:.6} < window ceiling \
                      ψ_hi={psi_hi:.6}: clamping the optimizer upper bound to keep every \
                      in-window trial on the n-free design-realization skip (#1033). The \
@@ -4666,7 +2539,7 @@ fn prepare_exact_joint_spatial_route<'d>(
             if let Some(bar) = psi_projector_bar
                 && bar > gam_solve::psi_gram_tensor::PSI_GRAM_SKIP_PROJ_ATOL
             {
-                log::warn!(
+                log::debug!(
                     "[{label}] ψ-gram range projector at the anchor ψ={psi_anchor:.6} is \
                      UNRESOLVED: Davis–Kahan bar {bar:.3e} exceeds the {:.3e} subspace \
                      tolerance the design-revision skip gates on (#2448). The conditioned \
@@ -4683,12 +2556,12 @@ fn prepare_exact_joint_spatial_route<'d>(
             let gradient_covers_full_window = evaluator.psi_gram_tensor_covers_gradient(psi_lo)
                 && evaluator.psi_gram_tensor_covers_gradient(psi_hi);
             if gradient_covers_full_window {
-                log::info!(
+                log::debug!(
                     "[{label}] certified ψ-gram tensor gradient lane covers the full \
                      optimizer window [{psi_lo:.3}, {psi_hi:.3}]"
                 );
             } else {
-                log::info!(
+                log::debug!(
                     "[{label}] ψ-gram tensor value lane certified, but the gradient lane \
                      does not cover the full optimizer window [{psi_lo:.3}, {psi_hi:.3}]; \
                      keeping exact streamed kappa routing"
@@ -4714,13 +2587,13 @@ fn prepare_exact_joint_spatial_route<'d>(
             // the truth-recovery quality gate, so Matérn stays on one exact
             // streamed objective for value, gradient, and Hessian.
             evaluator.set_supports_nfree_penalty_rekey(true);
-            log::info!(
+            log::debug!(
                 "[{label}] exact n-free ψ-penalty re-key enabled over [{psi_lo:.3}, \
                  {psi_hi:.3}]: in-window fast-path trials rebuild S(ψ) n-free from frozen \
                  geometry (no reset_surface)"
             );
         } else {
-            log::info!(
+            log::debug!(
                 "[{label}] ψ-gram tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
                  keeping the exact per-trial path"
             );
@@ -4752,7 +2625,7 @@ fn prepare_exact_joint_spatial_route<'d>(
             && cache.supports_nfree_gradient_only_routing()
         {
             suppress_outer_hessian_for_nfree = true;
-            log::info!(
+            log::debug!(
                 "[{label}] n-free Gaussian ψ-lane armed; routing the SEARCH gradient-only \
                  (BFGS, fixed-point lane off) so no in-window κ-trial realizes the O(n) \
                  second-order slab — n-independent outer loop (#1033). The terminal \
@@ -4760,7 +2633,7 @@ fn prepare_exact_joint_spatial_route<'d>(
             );
         }
     } else if coord_dim == 1 && family.is_gaussian_identity() {
-        log::info!(
+        log::debug!(
             "[{label}] exact n-free ψ-penalty re-key unavailable; skipping ψ-gram tensor \
              attachment so value, gradient, and Hessian remain on the same exact streamed \
              objective"
@@ -4896,11 +2769,7 @@ fn wrap_local_build_as_realization(
     termspec: &SmoothTermSpec,
 ) -> Result<SingleSmoothTermRealization, String> {
     let p_local = local.dim;
-    let lb_local = if local.box_reparam {
-        shape_lower_bounds_local(termspec.shape, p_local)
-    } else {
-        None
-    };
+    let lb_local = local.shape_lower_bounds.take();
 
     // Stage-2 joint-null absorption rotation, same logic as the main
     // aggregation loop in `build_smooth_design_withworkspace_unvalidated`:
@@ -4955,7 +2824,7 @@ fn wrap_local_build_as_realization(
         collection_gauge: None,
         name: termspec.name.clone(),
         coeff_range: 0..p_local,
-        shape: termspec.shape,
+        shape: termspec.shape.clone(),
         active_penalties: local.active_penalties.clone(),
         dropped_penalties: local.dropped_penalties.clone(),
         metadata: local.metadata.clone(),
@@ -5892,7 +3761,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             "nfree-psi-penalty",
         )
         .map_err(|e| e.to_string())?;
-        log::info!(
+        log::debug!(
             "[STAGE] n-free S(psi) rebuild: {} penalty block(s), p={p_total}, psi_dim={}, elapsed={:.3}s",
             canonical.0.len(),
             psi.len(),
@@ -6303,7 +4172,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // label that named the rebuild (measured on the 6-D isotropic Duchon
         // fit at n=50 000, k=500: 16.6 s per κ trial, of which the splice the
         // old line reported was 1.7 s).
-        log::info!(
+        log::debug!(
             "[STAGE] smooth term realization (term {term_idx}, '{termname}', local_cols={}): {:.3}s",
             local.design.ncols(),
             t_build.elapsed().as_secs_f64(),
@@ -6396,15 +4265,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         dropped_penalties,
                         linear_constraints_local: linear_constraints_local.as_ref(),
                         joint_null_rotation: joint_null_rotation.as_ref(),
+                        duchon_operator_penalties: self
+                            .spec
+                            .smooth_terms
+                            .get(term_idx)
+                            .and_then(gam_terms::smooth::duchon_operator_penalty_request),
                         termname: &name,
                     },
                 )
-                .map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "term '{name}' could not be returned to its collection's identifiability \
-                         gauge after an incremental rebuild: {e}"
-                    ))
-                })?;
+                .map_err(|e| collection_gauge_placement_error(&name, trial_report, e))?;
                 (
                     placed.design,
                     placed.metadata,
@@ -6507,12 +4376,14 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // affine head) and a trial rebuild at a different representer range
         // emits it again, aborting the outer search mid-flight.
         //
-        // Align by `original_index`, which is exactly what that field is for:
-        // keep the candidates the cached topology kept, in cached order, and
-        // record the rest as dropped. Anything the cache holds that the rebuild
-        // did NOT produce is a real inconsistency — a ρ coordinate with no
-        // matrix behind it — and still refuses.
-        let cached_originals: Vec<usize> = self
+        // Align by `(original_index, source)` (`align_rebuilt_penalties`): keep the
+        // candidates the cached topology kept, in cached order, and record the
+        // rest as dropped. Anything the cache holds that the rebuild did NOT
+        // produce, or produced as a different kind of block, is a real
+        // inconsistency — a ρ coordinate with no matrix behind it, or a matrix
+        // of another penalty family — and still refuses, naming both topologies
+        // (#2953).
+        let cached_penalties: Vec<(usize, gam_terms::basis::PenaltySource)> = self
             .design
             .smooth
             .terms
@@ -6520,74 +4391,82 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .map(|term| {
                 term.active_penalties
                     .iter()
-                    .map(|active| active.info.original_index)
+                    .map(|active| (active.info.original_index, active.info.source.clone()))
                     .collect()
             })
             .unwrap_or_default();
-        let (active_penalties, dropped_penalties) = if cached_originals.len()
+        // A rebuild with the same NUMBER of blocks is aligned the same way. Pairing
+        // by position alone let a count-1 Primary cache take an OperatorMass rebuild
+        // without a refusal. An identical topology aligns to the identity.
+        let (active_penalties, dropped_penalties) = if cached_penalties.len()
             == smooth_penalty_range.len()
-            && active_penalties.len() != smooth_penalty_range.len()
         {
-            let mut slots: Vec<Option<gam_terms::basis::ActivePenalty>> =
-                active_penalties.into_iter().map(Some).collect();
-            let mut kept = Vec::with_capacity(cached_originals.len());
-            for original in &cached_originals {
-                let Some(found) = slots
-                    .iter_mut()
-                    .find(|slot| {
-                        slot.as_ref()
-                            .is_some_and(|active| active.info.original_index == *original)
-                    })
-                    .and_then(Option::take)
-                else {
-                    let produced = slots
+            let rebuilt_active: Vec<(usize, gam_terms::basis::PenaltySource)> = active_penalties
+                .iter()
+                .map(|active| (active.info.original_index, active.info.source.clone()))
+                .collect();
+            let rebuilt_dropped: Vec<(
+                usize,
+                gam_terms::basis::PenaltySource,
+                gam_terms::basis::PenaltyDropReason,
+            )> = dropped_penalties
+                .iter()
+                .map(|info| (info.original_index, info.source.clone(), info.reason.clone()))
+                .collect();
+            match align_rebuilt_penalties(&cached_penalties, &rebuilt_active, &rebuilt_dropped) {
+                PenaltyAlignment::Aligned { slots } => {
+                    let mut rebuilt: Vec<Option<gam_terms::basis::ActivePenalty>> =
+                        active_penalties.into_iter().map(Some).collect();
+                    let kept = slots
                         .iter()
-                        .flatten()
-                        .map(|active| active.info.original_index)
+                        .map(|&slot| {
+                            rebuilt[slot]
+                                .take()
+                                .expect("align_rebuilt_penalties hands out each rebuilt slot once")
+                        })
                         .collect::<Vec<_>>();
-                    // A cached block the rebuild DROPPED at this psi is a trial whose
-                    // rho coordinate has no matrix behind it, not a broken invariant.
-                    // The Matérn collocation Grams of odd derivative order are exactly
-                    // zero once every off-diagonal kernel value underflows, which a
-                    // length scale far below the center spacing produces. MSI job
-                    // 602008 (`y ~ matern(x, periodic=true, period=2π)`, n = 400)
-                    // reached this branch at an ARC trial with psi = 9.43, where the
-                    // rebuild kept originals [0, 2] of the 4 cached, and the InvalidInput
-                    // aborted the whole fit. The model does not exist at that trial, so
-                    // it is refused and the search shortens its step or rejects the seed.
-                    // A block missing from both lists is a real inconsistency and stays
-                    // fatal.
-                    if let Some(vacated) = dropped_penalties
-                        .iter()
-                        .find(|info| info.original_index == *original)
-                    {
-                        return Err(EstimationError::TrialPointRefused {
-                            reason: format!(
-                                "incremental realizer: cached penalty {original} ({:?}) of term \
-                                 '{name}' was dropped as {:?} at this psi and the rebuild produced \
-                                 {produced:?}, so its rho coordinate has no matrix at the trial. \
-                                 Trial: {trial_report}",
-                                vacated.source, vacated.reason
-                            ),
-                        });
-                    }
-                    return Err(EstimationError::InvalidInput(SmoothError::dimension_mismatch(format!(
-                        "incremental realizer lost cached penalty {original} for term \
-                         '{name}': the rebuild produced {produced:?}"
-                    )).to_string()));
-                };
-                kept.push(found);
-            }
-            let mut dropped = dropped_penalties;
-            dropped.extend(slots.into_iter().flatten().map(|active| {
-                gam_terms::basis::DroppedPenaltyInfo {
-                    source: active.info.source.clone(),
-                    original_index: active.info.original_index,
-                    reason: gam_terms::basis::PenaltyDropReason::ZeroMatrix,
-                    normalization_scale: active.info.normalization_scale,
+                    let mut dropped = dropped_penalties;
+                    dropped.extend(rebuilt.into_iter().flatten().map(|active| {
+                        gam_terms::basis::DroppedPenaltyInfo {
+                            source: active.info.source.clone(),
+                            original_index: active.info.original_index,
+                            reason: gam_terms::basis::PenaltyDropReason::ZeroMatrix,
+                            normalization_scale: active.info.normalization_scale,
+                        }
+                    }));
+                    (kept, dropped)
                 }
-            }));
-            (kept, dropped)
+                // A cached block the rebuild DROPPED at this psi is a trial whose
+                // rho coordinate has no matrix behind it, not a broken invariant.
+                // The Matérn collocation Grams of odd derivative order are exactly
+                // zero once every off-diagonal kernel value underflows, which a
+                // length scale far below the center spacing produces. MSI job
+                // 602008 (`y ~ matern(x, periodic=true, period=2π)`, n = 400)
+                // reached this branch at an ARC trial with psi = 9.43, where the
+                // rebuild kept originals [0, 2] of the 4 cached, and the InvalidInput
+                // aborted the whole fit. The model does not exist at that trial, so
+                // it is refused and the search shortens its step or rejects the seed.
+                PenaltyAlignment::DroppedAtTrial {
+                    original_index,
+                    source,
+                    reason,
+                } => {
+                    return Err(EstimationError::TrialPointRefused {
+                        reason: format!(
+                            "incremental realizer: cached penalty {original_index} ({source:?}) of \
+                             term '{name}' was dropped as {reason:?} at this psi and the rebuild \
+                             produced {rebuilt_active:?}, so its rho coordinate has no matrix at the \
+                             trial. Trial: {trial_report}"
+                        ),
+                    });
+                }
+                PenaltyAlignment::Inconsistent { detail } => {
+                    return Err(EstimationError::InvalidInput(SmoothError::dimension_mismatch(format!(
+                        "incremental realizer penalty topology for term '{name}' does not match the \
+                         cached topology: {detail}. Trial: {trial_report}"
+                    )).to_string()));
+                }
+            }
         } else {
             (active_penalties, dropped_penalties)
         };
@@ -6684,7 +4563,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             target_term.parametric_residualization = chart;
         }
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
-        log::info!(
+        log::debug!(
             "[STAGE] collection-gauge placement + splice (term {}, '{}', cols={}): {:.3}s",
             term_idx,
             target_term.name,
@@ -6713,7 +4592,7 @@ fn build_term_collection_fixed_blocks(
     spec: &TermCollectionSpec,
 ) -> Result<Vec<DesignBlock>, BasisError> {
     let mut blocks = Vec::<DesignBlock>::new();
-    if !term_collection_has_anchored_bspline(spec) {
+    if term_collection_has_global_intercept(spec) {
         blocks.push(DesignBlock::Intercept(data.nrows()));
     }
 
@@ -6787,11 +4666,11 @@ pub enum SpatialFitProvenance<'a, M> {
 #[derive(Debug, Clone)]
 pub struct ExactJointHyperSetup {
     rho0: Array1<f64>,
-    /// A per-coordinate ρ domain the builder derived from structures the
-    /// driver cannot see (a survival time block's own design and penalties);
-    /// `None` leaves the ρ half of the θ box at the precision box until the
-    /// driver derives it from the blocks' seed designs.
-    rho_domain: Option<(Array1<f64>, Array1<f64>)>,
+    /// The per-coordinate ρ domain its builder derived over every block that
+    /// owns a ρ coordinate (#2812). It is the ρ half of the θ box, and no
+    /// coordinate is searched without one (#2902 item 15).
+    rho_lower: Array1<f64>,
+    rho_upper: Array1<f64>,
     log_kappa0: SpatialLogKappaCoords,
     log_kappa_lower: SpatialLogKappaCoords,
     log_kappa_upper: SpatialLogKappaCoords,
@@ -6801,13 +4680,23 @@ pub struct ExactJointHyperSetup {
 }
 
 impl ExactJointHyperSetup {
-    /// The ρ seed inside the arithmetic envelope. The setup carries no ρ box
-    /// of its own: the searchable domain of each ρ coordinate is derived from
-    /// the seed designs by the driver that builds them (#2812), and until then
-    /// the only bound a coordinate has is the one working precision imposes.
-    fn sanitize_rho_seed(rho0: Array1<f64>) -> Array1<f64> {
-        let (lo, hi) = gam_solve::estimate::rho_domain::precision_box();
-        rho0.mapv(|value| if value.is_finite() { value.clamp(lo, hi) } else { 0.0 })
+    /// A ρ seed inside its derived domain. A finite seed is projected onto the
+    /// domain, and a non-finite one takes the domain's midpoint, the geometric
+    /// mean of the two edge strengths.
+    fn project_rho_seed(
+        rho0: Array1<f64>,
+        lower: &Array1<f64>,
+        upper: &Array1<f64>,
+    ) -> Array1<f64> {
+        Array1::from_iter(rho0.iter().zip(lower.iter().zip(upper.iter())).map(
+            |(&value, (&lo, &hi))| {
+                if value.is_finite() {
+                    value.clamp(lo, hi)
+                } else {
+                    0.5 * (lo + hi)
+                }
+            },
+        ))
     }
 
     /// An auxiliary seed inside the box its caller derived for it.
@@ -6827,16 +4716,27 @@ impl ExactJointHyperSetup {
         }))
     }
 
+    /// The setup of a ρ seed on the domain its builder derived for it, and of
+    /// the κ coordinates on their bounds. The seed is projected into the domain.
     pub(crate) fn new(
         rho0: Array1<f64>,
+        rho_lower: Array1<f64>,
+        rho_upper: Array1<f64>,
         log_kappa0: SpatialLogKappaCoords,
         log_kappa_lower: SpatialLogKappaCoords,
         log_kappa_upper: SpatialLogKappaCoords,
     ) -> Self {
-        let rho0 = Self::sanitize_rho_seed(rho0);
+        assert_eq!(rho_lower.len(), rho0.len(), "rho domain lower length mismatch");
+        assert_eq!(rho_upper.len(), rho0.len(), "rho domain upper length mismatch");
+        assert!(
+            rho_lower.iter().zip(rho_upper.iter()).all(|(lo, hi)| lo <= hi),
+            "rho domain must be ordered: lower={rho_lower:?} upper={rho_upper:?}"
+        );
+        let rho0 = Self::project_rho_seed(rho0, &rho_lower, &rho_upper);
         Self {
             rho0,
-            rho_domain: None,
+            rho_lower,
+            rho_upper,
             log_kappa0,
             log_kappa_lower,
             log_kappa_upper,
@@ -6844,19 +4744,6 @@ impl ExactJointHyperSetup {
             auxiliary_lower: Array1::zeros(0),
             auxiliary_upper: Array1::zeros(0),
         }
-    }
-
-    /// The ρ domain a builder derived for coordinates whose penalties are not
-    /// carried by the blocks' term-collection designs (#2812). The seed is
-    /// projected into it.
-    pub(crate) fn with_rho_domain(mut self, lower: Array1<f64>, upper: Array1<f64>) -> Self {
-        assert_eq!(lower.len(), self.rho0.len(), "rho domain lower length mismatch");
-        assert_eq!(upper.len(), self.rho0.len(), "rho domain upper length mismatch");
-        for k in 0..self.rho0.len() {
-            self.rho0[k] = self.rho0[k].clamp(lower[k], upper[k]);
-        }
-        self.rho_domain = Some((lower, upper));
-        self
     }
 
     pub(crate) fn with_auxiliary(
@@ -6905,17 +4792,11 @@ impl ExactJointHyperSetup {
         out
     }
 
-    /// The θ box with the ρ half at the arithmetic envelope; the driver
-    /// replaces that half with the domain derived from the seed designs.
+    /// The θ box: the derived ρ domain, the κ bounds, then the auxiliary box.
     pub(crate) fn lower(&self) -> Array1<f64> {
         let mut out =
             Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim() + self.auxiliary_dim());
-        match self.rho_domain.as_ref() {
-            Some((lower, _)) => out.slice_mut(s![..self.rho_dim()]).assign(lower),
-            None => out
-                .slice_mut(s![..self.rho_dim()])
-                .fill(gam_solve::estimate::rho_domain::precision_box().0),
-        }
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_lower);
         out.slice_mut(s![self.rho_dim()..self.rho_dim() + self.log_kappa_dim()])
             .assign(self.log_kappa_lower.as_array());
         out.slice_mut(s![self.rho_dim() + self.log_kappa_dim()..])
@@ -6926,12 +4807,7 @@ impl ExactJointHyperSetup {
     pub(crate) fn upper(&self) -> Array1<f64> {
         let mut out =
             Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim() + self.auxiliary_dim());
-        match self.rho_domain.as_ref() {
-            Some((_, upper)) => out.slice_mut(s![..self.rho_dim()]).assign(upper),
-            None => out
-                .slice_mut(s![..self.rho_dim()])
-                .fill(gam_solve::estimate::rho_domain::precision_box().1),
-        }
+        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_upper);
         out.slice_mut(s![self.rho_dim()..self.rho_dim() + self.log_kappa_dim()])
             .assign(self.log_kappa_upper.as_array());
         out.slice_mut(s![self.rho_dim() + self.log_kappa_dim()..])
@@ -6995,7 +4871,11 @@ impl<'d> ExactJointDesignCache<'d> {
         })
     }
 
-    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
+    /// Realize every block at `theta`. The realizers' typed errors pass through
+    /// unchanged, so a trial one of them refuses (`TrialPointRefused`, e.g. a
+    /// cached penalty the rebuild dropped at this ψ) stays a refusal the outer
+    /// search can retreat from (#2953).
+    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), EstimationError> {
         if self
             .current_theta
             .as_ref()
@@ -7007,14 +4887,16 @@ impl<'d> ExactJointDesignCache<'d> {
         let t_ensure = std::time::Instant::now();
         let kappa_theta_len = self.rho_dim + self.log_kappa_dim;
         if theta.len() < kappa_theta_len {
-            return Err(SmoothError::dimension_mismatch(format!(
-                "exact-joint theta length mismatch: got {}, expected at least {} (rho_dim={}, log_kappa_dim={})",
-                theta.len(),
-                kappa_theta_len,
-                self.rho_dim,
-                self.log_kappa_dim
-            ))
-            .into());
+            return Err(EstimationError::InvalidInput(
+                SmoothError::dimension_mismatch(format!(
+                    "exact-joint theta length mismatch: got {}, expected at least {} (rho_dim={}, log_kappa_dim={})",
+                    theta.len(),
+                    kappa_theta_len,
+                    self.rho_dim,
+                    self.log_kappa_dim
+                ))
+                .to_string(),
+            ));
         }
         let theta_kappa = theta.slice(s![..kappa_theta_len]).to_owned();
         let full_log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
@@ -7033,18 +4915,16 @@ impl<'d> ExactJointDesignCache<'d> {
             if block_idx < n - 1 {
                 let (block_lk, rest) = remaining.split_at(count);
                 self.realizers[block_idx]
-                    .apply_log_kappa(&block_lk, &self.block_term_indices[block_idx])
-                    .map_err(|e| e.to_string())?;
+                    .apply_log_kappa(&block_lk, &self.block_term_indices[block_idx])?;
                 remaining = rest;
             } else {
                 // Last block gets the remainder.
                 self.realizers[block_idx]
-                    .apply_log_kappa(&remaining, &self.block_term_indices[block_idx])
-                    .map_err(|e| e.to_string())?;
+                    .apply_log_kappa(&remaining, &self.block_term_indices[block_idx])?;
             }
         }
 
-        log::info!(
+        log::debug!(
             "[STAGE] ensure_theta (n-block, {} blocks, {} realizers): {:.3}s",
             n,
             self.realizers.len(),
@@ -7115,7 +4995,9 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         | ResponseFamily::Tweedie { .. }
         | ResponseFamily::NegativeBinomial { .. }
         | ResponseFamily::Beta { .. }
-        | ResponseFamily::Gamma => gam_problem::SeedRiskProfile::GeneralizedLinear,
+        | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
+        | ResponseFamily::StudentT { .. } => gam_problem::SeedRiskProfile::GeneralizedLinear,
     }
 }
 
@@ -7167,6 +5049,226 @@ fn exact_joint_seed_config(
         config.over_smoothing_probe_rho = None;
     }
     config
+}
+
+/// A term-local rebuild's penalty blocks against the realizer's cached topology
+/// (#2750, #2953).
+#[derive(Debug)]
+enum PenaltyAlignment {
+    /// `slots[i]` indexes the rebuilt active block kept for cached block `i`.
+    Aligned { slots: Vec<usize> },
+    /// The rebuild recorded a cached block as dropped at this psi.
+    DroppedAtTrial {
+        original_index: usize,
+        source: gam_terms::basis::PenaltySource,
+        reason: gam_terms::basis::PenaltyDropReason,
+    },
+    /// The rebuild's blocks are not the cached topology.
+    Inconsistent { detail: String },
+}
+
+/// Align a term-local rebuild's penalty blocks to the cached topology by
+/// `(original_index, source)`.
+///
+/// An `original_index` is a candidate's position in the build that produced it,
+/// so two builds agree on a block only when they agree on its position AND on
+/// what the block is. Matching the index alone pairs blocks of different penalty
+/// families that both number from zero, such as a Primary block with an
+/// OperatorMass one.
+fn align_rebuilt_penalties(
+    cached: &[(usize, gam_terms::basis::PenaltySource)],
+    rebuilt_active: &[(usize, gam_terms::basis::PenaltySource)],
+    rebuilt_dropped: &[(
+        usize,
+        gam_terms::basis::PenaltySource,
+        gam_terms::basis::PenaltyDropReason,
+    )],
+) -> PenaltyAlignment {
+    let topologies = || {
+        format!(
+            "cached active {cached:?}, rebuilt active {rebuilt_active:?}, rebuilt dropped \
+             {rebuilt_dropped:?}"
+        )
+    };
+    let mut taken = vec![false; rebuilt_active.len()];
+    let mut slots = Vec::with_capacity(cached.len());
+    for (original, source) in cached {
+        let at_index = rebuilt_active
+            .iter()
+            .enumerate()
+            .find(|(slot, (index, _))| !taken[*slot] && index == original);
+        if let Some((slot, (_, rebuilt_source))) = at_index {
+            if rebuilt_source != source {
+                return PenaltyAlignment::Inconsistent {
+                    detail: format!(
+                        "cached penalty {original} is {source:?} but the rebuild's block {original} \
+                         is {rebuilt_source:?} ({})",
+                        topologies()
+                    ),
+                };
+            }
+            taken[slot] = true;
+            slots.push(slot);
+            continue;
+        }
+        return match rebuilt_dropped.iter().find(|(index, _, _)| index == original) {
+            Some((_, dropped_source, reason)) if dropped_source == source => {
+                PenaltyAlignment::DroppedAtTrial {
+                    original_index: *original,
+                    source: source.clone(),
+                    reason: reason.clone(),
+                }
+            }
+            Some((_, dropped_source, _)) => PenaltyAlignment::Inconsistent {
+                detail: format!(
+                    "cached penalty {original} is {source:?} but the rebuild dropped block {original} \
+                     as {dropped_source:?} ({})",
+                    topologies()
+                ),
+            },
+            None => PenaltyAlignment::Inconsistent {
+                detail: format!(
+                    "cached penalty {original} ({source:?}) is neither an active nor a dropped block \
+                     of the rebuild ({})",
+                    topologies()
+                ),
+            },
+        };
+    }
+    PenaltyAlignment::Aligned { slots }
+}
+
+#[cfg(test)]
+mod penalty_alignment_2953_tests {
+    use super::*;
+    use gam_terms::basis::{PenaltyDropReason, PenaltySource};
+
+    /// md:550's shape: three cached operator blocks, a rebuild of two, and nothing
+    /// recorded as dropped. The refusal names every block on both sides.
+    #[test]
+    fn a_cached_block_the_rebuild_never_produced_names_both_topologies_2953() {
+        let cached = [
+            (0, PenaltySource::OperatorMass),
+            (1, PenaltySource::OperatorTension),
+            (2, PenaltySource::OperatorStiffness),
+        ];
+        let rebuilt = [
+            (0, PenaltySource::OperatorMass),
+            (1, PenaltySource::OperatorTension),
+        ];
+        let PenaltyAlignment::Inconsistent { detail } = align_rebuilt_penalties(&cached, &rebuilt, &[])
+        else {
+            panic!("a cached block missing from both rebuilt lists must be inconsistent");
+        };
+        assert!(
+            detail.contains("cached penalty 2 (OperatorStiffness)"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("rebuilt active [(0, OperatorMass), (1, OperatorTension)]"),
+            "{detail}"
+        );
+    }
+
+    /// A rebuild on another penalty family numbers its blocks from zero too.
+    /// Matching the index alone pairs Primary with OperatorMass; matching the
+    /// source refuses and names both.
+    #[test]
+    fn a_family_switch_refuses_instead_of_pairing_primary_with_operator_mass_2953() {
+        let cached = [
+            (0, PenaltySource::OperatorMass),
+            (1, PenaltySource::OperatorTension),
+            (2, PenaltySource::OperatorStiffness),
+        ];
+        let rebuilt = [
+            (0, PenaltySource::Primary),
+            (1, PenaltySource::DoublePenaltyNullspace),
+        ];
+        let PenaltyAlignment::Inconsistent { detail } = align_rebuilt_penalties(&cached, &rebuilt, &[])
+        else {
+            panic!("a penalty-family switch must be inconsistent");
+        };
+        assert!(
+            detail.contains("cached penalty 0 is OperatorMass but the rebuild's block 0 is Primary"),
+            "{detail}"
+        );
+    }
+
+    /// A cached block the rebuild recorded as dropped at this psi is a trial the
+    /// search steps away from, not an inconsistency (MSI 602008).
+    #[test]
+    fn a_cached_block_recorded_as_dropped_is_a_trial_refusal_2953() {
+        let cached = [
+            (0, PenaltySource::OperatorMass),
+            (1, PenaltySource::OperatorTension),
+            (2, PenaltySource::OperatorStiffness),
+            (3, PenaltySource::OperatorThirdOrder),
+        ];
+        let rebuilt = [
+            (0, PenaltySource::OperatorMass),
+            (2, PenaltySource::OperatorStiffness),
+        ];
+        let dropped = [
+            (1, PenaltySource::OperatorTension, PenaltyDropReason::ZeroMatrix),
+            (3, PenaltySource::OperatorThirdOrder, PenaltyDropReason::ZeroMatrix),
+        ];
+        assert!(matches!(
+            align_rebuilt_penalties(&cached, &rebuilt, &dropped),
+            PenaltyAlignment::DroppedAtTrial {
+                original_index: 1,
+                source: PenaltySource::OperatorTension,
+                reason: PenaltyDropReason::ZeroMatrix,
+            }
+        ));
+    }
+
+    /// A rebuild that re-emits a block the cached collection dropped keeps the
+    /// cached blocks in cached order (#2750). The caller records the extra block
+    /// as dropped.
+    #[test]
+    fn a_rebuild_re_emitting_a_cached_drop_keeps_the_cached_blocks_2953() {
+        let cached = [(0, PenaltySource::Primary)];
+        let rebuilt = [
+            (0, PenaltySource::Primary),
+            (1, PenaltySource::DoublePenaltyNullspace),
+        ];
+        let PenaltyAlignment::Aligned { slots } = align_rebuilt_penalties(&cached, &rebuilt, &[]) else {
+            panic!("the cached block is present with its own source, so the rebuild aligns");
+        };
+        assert_eq!(slots, vec![0]);
+    }
+
+    /// The same NUMBER of blocks is no license to pair by position. A cached
+    /// double-penalty Matérn without an intercept is [Primary 0]. A rebuild on the
+    /// operator branch at ν = 1/2 is [OperatorMass 0]. The source mismatch refuses.
+    #[test]
+    fn a_same_count_family_switch_refuses_2953() {
+        let cached = [(0, PenaltySource::Primary)];
+        let rebuilt = [(0, PenaltySource::OperatorMass)];
+        let PenaltyAlignment::Inconsistent { detail } = align_rebuilt_penalties(&cached, &rebuilt, &[])
+        else {
+            panic!("a same-count penalty-family switch must be inconsistent");
+        };
+        assert!(
+            detail.contains("cached penalty 0 is Primary but the rebuild's block 0 is OperatorMass"),
+            "{detail}"
+        );
+    }
+
+    /// An identical same-count topology aligns to the identity, so routing the
+    /// equal-count path through the alignment changes nothing where the builds agree.
+    #[test]
+    fn an_identical_same_count_topology_aligns_to_the_identity_2953() {
+        let blocks = [
+            (0, PenaltySource::OperatorMass),
+            (1, PenaltySource::OperatorTension),
+            (2, PenaltySource::OperatorStiffness),
+        ];
+        let PenaltyAlignment::Aligned { slots } = align_rebuilt_penalties(&blocks, &blocks, &[]) else {
+            panic!("an identical topology must align");
+        };
+        assert_eq!(slots, vec![0, 1, 2]);
+    }
 }
 
 #[cfg(test)]
@@ -7246,33 +5348,6 @@ mod joint_rho_resolvability_domain_tests {
                 upper[0]
             );
         }
-    }
-
-    /// Across blocks the coordinates are the blocks' penalties in block
-    /// order, each on its own block's interval; a coordinate count the blocks
-    /// do not account for is not a layout the driver may guess, and every
-    /// coordinate then keeps the precision box.
-    #[test]
-    fn the_joint_domain_is_the_blocks_intervals_in_block_order_2812() {
-        let (design_a, penalties_a) = two_column_block(1.0);
-        let (design_b, penalties_b) = two_column_block(3.0e4);
-        let blocks = [
-            (&design_a, penalties_a.as_slice()),
-            (&design_b, penalties_b.as_slice()),
-        ];
-        let (lower, upper) =
-            joint_rho_resolvability_domain_over_blocks(&blocks, 2).expect("two penalties, two coordinates");
-        assert!(
-            (lower[0] - 0.5 * f64::EPSILON.ln()).abs() < 1e-9
-                && (upper[0] + 0.5 * f64::EPSILON.ln()).abs() < 1e-9
-                && (lower[1] - (0.5 * f64::EPSILON.ln() + 3.0e4_f64.ln())).abs() < 1e-9
-                && (upper[1] - (3.0e4_f64.ln() - 0.5 * f64::EPSILON.ln())).abs() < 1e-9,
-            "block order: lower={lower:?} upper={upper:?}"
-        );
-        assert!(
-            joint_rho_resolvability_domain_over_blocks(&blocks, 3).is_none(),
-            "an unaccounted coordinate is not the driver's to place"
-        );
     }
 
     /// The #2760 incumbents that used to sit on the `±12` wall are interior
@@ -7480,73 +5555,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     Ok(problem)
 }
 
-/// [`optimize_spatial_length_scale_exact_joint_typed`] for callers whose final
-/// coefficient fit still reports text. Their fit failures cross as prose, which
-/// the typed driver records as unclassified; its own failures are rendered to
-/// the text these callers used to receive (#2937).
-pub fn optimize_spatial_length_scale_exact_joint<FitOut, Mode, FitFn, ExactFn, ExactEfsFn, SeedFn>(
-    data: ArrayView2<'_, f64>,
-    block_specs: &[TermCollectionSpec],
-    block_term_indices: &[Vec<usize>],
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-    joint_setup: &ExactJointHyperSetup,
-    seed_risk_profile: gam_problem::SeedRiskProfile,
-    analytic_joint_gradient_available: bool,
-    analytic_joint_hessian_available: bool,
-    disable_fixed_point: bool,
-    screening_cap: Option<Arc<AtomicUsize>>,
-    outer_derivative_policy: gam_model_api::families::custom_family::OuterDerivativePolicy,
-    mut fit_fn: FitFn,
-    exact_fn: ExactFn,
-    exact_efs_fn: ExactEfsFn,
-    seed_inner_beta_fn: SeedFn,
-) -> Result<SpatialLengthScaleOptimizationResult<FitOut>, String>
-where
-    FitFn: FnMut(
-        &Array1<f64>,
-        &[TermCollectionSpec],
-        &[TermCollectionDesign],
-        SpatialFitProvenance<'_, Mode>,
-    ) -> Result<FitOut, String>,
-    ExactFn: FnMut(
-        &Array1<f64>,
-        &[TermCollectionSpec],
-        &[TermCollectionDesign],
-        gam_solve::estimate::reml::reml_outer_engine::EvalMode,
-        Option<Mode>,
-    ) -> Result<ExactJointEvaluation<Mode>, String>,
-    ExactEfsFn: FnMut(
-        &Array1<f64>,
-        &[TermCollectionSpec],
-        &[TermCollectionDesign],
-    ) -> Result<ExactJointEfsEvaluation<Mode>, String>,
-    SeedFn: FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
-{
-    optimize_spatial_length_scale_exact_joint_typed(
-        data,
-        block_specs,
-        block_term_indices,
-        kappa_options,
-        joint_setup,
-        seed_risk_profile,
-        analytic_joint_gradient_available,
-        analytic_joint_hessian_available,
-        disable_fixed_point,
-        screening_cap,
-        outer_derivative_policy,
-        |theta: &Array1<f64>,
-         specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign],
-         provenance: SpatialFitProvenance<'_, Mode>| {
-            fit_fn(theta, specs, designs, provenance).map_err(FitFailure::from)
-        },
-        exact_fn,
-        exact_efs_fn,
-        seed_inner_beta_fn,
-    )
-    .map_err(|failure| failure.to_string())
-}
-
 /// The n-block exact-joint spatial driver. Its final coefficient fit and the
 /// outer search's own verdict both reach the caller as a typed [`FitFailure`]
 /// (#2937).
@@ -7568,6 +5576,7 @@ pub fn optimize_spatial_length_scale_exact_joint_typed<
     analytic_joint_hessian_available: bool,
     disable_fixed_point: bool,
     screening_cap: Option<Arc<AtomicUsize>>,
+    walk_signals: Option<crate::exact_mode_branch::OuterWalkSignals>,
     outer_derivative_policy: gam_model_api::families::custom_family::OuterDerivativePolicy,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
@@ -7630,7 +5639,9 @@ where
             data, block_specs,
         )
         .map_err(|e| {
-            format!("failed to build and freeze joint block designs during exact joint kappa optimization: {e}")
+            FitFailure::from(e).context(
+                "failed to build and freeze joint block designs during exact joint kappa optimization",
+            )
         })?;
         let theta0 = joint_setup.theta0();
 
@@ -7655,9 +5666,9 @@ where
     // -----------------------------------------------------------------------
     // Full optimization path.
     // -----------------------------------------------------------------------
-    let mut theta0 = joint_setup.theta0();
-    let mut lower = joint_setup.lower();
-    let mut upper = joint_setup.upper();
+    let theta0 = joint_setup.theta0();
+    let lower = joint_setup.lower();
+    let upper = joint_setup.upper();
     if theta0.len() < log_kappa_dim || lower.len() != theta0.len() || upper.len() != theta0.len() {
         return Err(FitFailure::raised(
             gam_problem::FailureCategory::Invariant,
@@ -7680,42 +5691,18 @@ where
         block_specs,
     )
     .map_err(|e| {
-        format!(
-            "failed to build and freeze joint block designs during exact joint kappa bootstrap: {e}"
+        FitFailure::from(e).context(
+            "failed to build and freeze joint block designs during exact joint kappa bootstrap",
         )
     })?;
-    // The ρ half of the θ box is the resolvability domain of each coordinate
-    // on its own block's seed design (#2812): nothing the setup's builder could
-    // know before these designs existed, and nothing the driver needs a
-    // hand-supplied box for now that they do.
-    {
-        let seed_blocks: Vec<(&DesignMatrix, &[gam_terms::smooth::BlockwisePenalty])> =
-            boot_designs
-                .iter()
-                .map(|d| (&d.design, d.penalties.as_slice()))
-                .collect();
-        if let Some((rho_lower, rho_upper)) =
-            joint_rho_resolvability_domain_over_blocks(&seed_blocks, rho_dim)
-        {
-            for k in 0..rho_dim {
-                lower[k] = rho_lower[k];
-                upper[k] = rho_upper[k];
-            }
-        }
-        for k in 0..rho_dim {
-            theta0[k] = if theta0[k].is_finite() {
-                theta0[k].clamp(lower[k], upper[k])
-            } else {
-                0.5 * (lower[k] + upper[k])
-            };
-        }
-        log::info!(
-            "[spatial-exact-joint] joint rho domain per coordinate: lower={:.3?} upper={:.3?} seed={:.3?}",
-            lower.iter().take(rho_dim).copied().collect::<Vec<_>>(),
-            upper.iter().take(rho_dim).copied().collect::<Vec<_>>(),
-            theta0.iter().take(rho_dim).copied().collect::<Vec<_>>(),
-        );
-    }
+    // The ρ half of the θ box is the domain the setup's builder derived over
+    // every block that owns a ρ coordinate (#2812, #2902 item 15).
+    log::debug!(
+        "[spatial-exact-joint] joint rho domain per coordinate: lower={:.3?} upper={:.3?} seed={:.3?}",
+        lower.iter().take(rho_dim).copied().collect::<Vec<_>>(),
+        upper.iter().take(rho_dim).copied().collect::<Vec<_>>(),
+        theta0.iter().take(rho_dim).copied().collect::<Vec<_>>(),
+    );
     // Capability vs realized policy: the family may *advertise* an exact
     // analytic outer Hessian, but at this realized (n, psi_dim, rho_dim,
     // p_total) the predicted per-eval cost can still exceed the universal
@@ -7750,7 +5737,11 @@ where
     }
 
     impl<M> NBlockExactJointState<'_, M> {
-        fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
+        /// Realize `theta`. An invalid input gains this driver's context, and every
+        /// other variant passes through typed. A trial the realizer refuses stays a
+        /// `TrialPointRefused` the outer search retreats from, not an InvalidInput
+        /// that aborts the fit (#2953).
+        fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), EstimationError> {
             let theta_changed = !self
                 .cache
                 .current_theta
@@ -7759,7 +5750,12 @@ where
             if theta_changed {
                 self.terminal_mode = None;
             }
-            self.cache.ensure_theta(theta)
+            self.cache.ensure_theta(theta).map_err(|error| match error {
+                EstimationError::InvalidInput(message) => EstimationError::InvalidInput(format!(
+                    "n-block exact-joint spatial design realization failed: {message}"
+                )),
+                other => other,
+            })
         }
 
         fn install_terminal_mode(&mut self, theta: &Array1<f64>, objective: f64, mode: M) {
@@ -7789,7 +5785,9 @@ where
     }
 
     let mut state = NBlockExactJointState {
-        cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
+        // The realizers replay the designs frozen above (#2937).
+        cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())
+            .map_err(FitFailure::invariant)?,
         terminal_mode: None,
     };
 
@@ -7877,6 +5875,8 @@ where
         // certificate, so retain its family-specific seed cascade.
         false,
     )?;
+    let problem =
+        crate::exact_mode_branch::OuterWalkSignals::subscribe(walk_signals.as_ref(), problem);
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
     fn collect_specs(cache: &ExactJointDesignCache<'_>) -> Vec<TermCollectionSpec> {
@@ -7928,11 +5928,7 @@ where
                     });
                 }
             }
-            ctx.ensure_theta(theta).map_err(|err| {
-                EstimationError::InvalidInput(format!(
-                    "n-block exact-joint spatial design realization failed: {err}"
-                ))
-            })?;
+            ctx.ensure_theta(theta)?;
             let design_revision = Some(ctx.cache.design_revision());
             let specs = collect_specs(&ctx.cache);
             let designs = collect_designs(&ctx.cache);
@@ -7971,7 +5967,7 @@ where
             kphase_eval_calls.set(kphase_eval_calls.get() + 1);
             kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
             let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
-            log::info!(
+            log::debug!(
                 "[KAPPA-PHASE] phase=eval_outer call={} order={:?} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                 kphase_eval_calls.get(),
                 order,
@@ -8039,11 +6035,7 @@ where
                 {
                     return Ok(cost);
                 }
-                ctx.ensure_theta(theta).map_err(|err| {
-                    EstimationError::InvalidInput(format!(
-                        "n-block exact-joint spatial design realization failed: {err}"
-                    ))
-                })?;
+                ctx.ensure_theta(theta)?;
                 let design_revision = Some(ctx.cache.design_revision());
                 let specs = collect_specs(&ctx.cache);
                 let designs = collect_designs(&ctx.cache);
@@ -8065,7 +6057,7 @@ where
                 kphase_cost_calls.set(kphase_cost_calls.get() + 1);
                 kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
                 let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
-                log::info!(
+                log::debug!(
                     "[KAPPA-PHASE] phase=cost call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                     kphase_cost_calls.get(),
                     design_revision,
@@ -8103,12 +6095,12 @@ where
             |ctx: &mut &mut NBlockExactJointState<'_, Mode>,
              theta: &Array1<f64>,
              order: OuterEvalOrder| { eval_outer(ctx, theta, order) },
-            None::<fn(&mut &mut NBlockExactJointState<'_, Mode>)>,
+            walk_signals
+                .as_ref()
+                .map(|signals| signals.reset_counter::<&mut NBlockExactJointState<'_, Mode>>()),
             Some(
                 |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
-                    ctx
-                        .ensure_theta(theta)
-                        .map_err(EstimationError::InvalidInput)?;
+                    ctx.ensure_theta(theta)?;
                     let design_revision = Some(ctx.cache.design_revision());
                     let specs = collect_specs(&ctx.cache);
                     let designs = collect_designs(&ctx.cache);
@@ -8122,7 +6114,7 @@ where
                     kphase_efs_calls.set(kphase_efs_calls.get() + 1);
                     kphase_efs_total_s.set(kphase_efs_total_s.get() + elapsed_s);
                     let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
-                    log::info!(
+                    log::debug!(
                         "[KAPPA-PHASE] phase=efs call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                         kphase_efs_calls.get(),
                         design_revision,
@@ -8180,9 +6172,9 @@ where
             // Hessian, and this problem declares `DeclaredHessianForm::Either`
             // from the same `analytic_outer_hessian_available` flag.
             //
-            // No `reset_fn` is added on purpose: `reset()` fires AFTER
-            // finalization, so a reset that dropped the memo would re-open the
-            // hole this closes.
+            // The `reset_fn` above only advances the walk-reset counter. `reset()`
+            // fires AFTER finalization, so a reset that dropped the memo would
+            // re-open the hole this closes.
             .with_terminal_eval_order(if analytic_outer_hessian_available {
                 OuterEvalOrder::ValueGradientHessian
             } else {
@@ -8202,7 +6194,7 @@ where
     // [KAPPA-PHASE] markers (which remain available for
     // attribution).
     let kphase_total_s = kphase_optim_start.elapsed().as_secs_f64();
-    log::info!(
+    log::debug!(
         "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} optim_total_s={:.4}",
         kphase_log_kappa_dim,
         kphase_cost_calls.get(),
@@ -8326,7 +6318,7 @@ fn try_exact_joint_latent_coord_optimization(
     let mut theta0 = Array1::<f64>::zeros(rho_dim + latent_coord_ext_dim);
     theta0
         .slice_mut(s![..rho_dim])
-        .assign(&best.fit.lambdas.mapv(f64::ln));
+        .assign(&best.fit.search_seed_log_lambdas());
     theta0
         .slice_mut(s![rho_dim..rho_dim + latent_flat_dim])
         .assign(latent.values.as_flat());
@@ -8857,7 +6849,7 @@ fn select_isotropic_matern_range_basin(
         }
 
         if endpoint_score < best_score {
-            log::info!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx} selected certified long-range basin: \
                  length_scale={long_length_scale:.6}, profiled REML {endpoint_score:.6} \
                  < short-basin {best_score:.6}"
@@ -8866,7 +6858,7 @@ fn select_isotropic_matern_range_basin(
             best = endpoint;
             best_score = endpoint_score;
         } else {
-            log::info!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx} retained certified short-range basin: \
                  profiled REML {best_score:.6} <= long-endpoint {endpoint_score:.6} \
                  at length_scale={long_length_scale:.6}"
@@ -8946,7 +6938,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             // (the branch above). It is not an unavailability, and turning it
             // into one killed fits the route had just decided were fine
             // (#2748).
-            log::info!(
+            log::debug!(
                 "[spatial-kappa] joint kappa optimization DECLINED its own candidate                  (incumbent={baseline_score:.12e}, candidate={optimized_score:.12e},                  regression={:.3e}); shipping the incumbent scalar-route fit at the                  incumbent κ, which is what the decline means. Not an unavailability.",
                 optimized_score - baseline_score,
             );
@@ -8996,7 +6988,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         log_spatial_aniso_scales(&exact_joint.resolvedspec);
         return Ok(exact_joint);
     }
-    log::info!(
+    log::debug!(
         "[spatial-kappa] the optimized-κ fit scores {exact_score:.12e} against the incumbent's \
          {initial_score:.12e} (regression {:.3e}); shipping the INCUMBENT, which is the better \
          of the two fits this call has in hand. A refinement that does not improve on the fit \
@@ -9271,488 +7263,5 @@ fn spatial_kappa_incumbent(
     })
 }
 
-/// The end-to-end curvature-as-an-estimand report for one `curv(...)` smooth:
-/// the fitted κ̂, its profile-likelihood confidence interval, the interior
-/// κ = 0 likelihood-ratio flatness test, and the topology-free geometry
-/// verdict. This is the #944 headline — it turns "we chose hyperbolic space"
-/// into "κ̂ = −1.8 (95% CI −2.6, −1.1), flat rejected at p = …".
-#[derive(Clone, Debug)]
-pub struct CurvatureInference {
-    /// Smooth-term index of the `curv(...)` term this report is about.
-    pub term_idx: usize,
-    /// The fitted signed sectional curvature κ̂ (the bounded analytic
-    /// curvature profile optimum).
-    pub kappa_hat: f64,
-    /// Profile-likelihood CI for κ and the geometry verdict from its sign.
-    pub ci: gam_geometry::curvature_estimand::KappaProfileCi,
-    /// Interior-point κ = 0 likelihood-ratio flatness test (full χ²₁, no
-    /// half-χ² boundary correction — κ = 0 is an interior point of the
-    /// `S^d ← ℝ^d → H^d` family).
-    pub flatness: gam_geometry::curvature_estimand::FlatnessTest,
-    /// The kernel range `ℓ̂` the criterion profiles to AT `κ̂` — the smooth's
-    /// second outer coordinate (gam#2747).
-    ///
-    /// It is reported rather than hidden because every statistic above is a
-    /// PROFILE over it: `κ̂` is the argmin of `V_p(κ) = min_η V(κ, η)`, the CI
-    /// is a profile-likelihood interval, and the flatness LR compares two
-    /// range-profiled values. A reader who cannot see `ℓ̂` cannot tell an
-    /// estimate anchored at a sensible resolution from one anchored at a
-    /// degenerate corner of the range window.
-    pub length_scale_hat: f64,
-    /// Was `ℓ̂` estimated, or pinned by an explicit `length_scale=`?
-    pub length_scale_estimated: bool,
-    /// WHERE `ℓ̂` sits in the range chart (gam#2747). `length_scale_hat` alone
-    /// cannot distinguish an interior minimum from an arrival at the
-    /// geodesic-distance face from a stop at the evaluability wall, and the
-    /// three support different claims about the magnitude — see
-    /// [`gam_geometry::curvature_estimand::RangeEstimateSupport`]. This is the
-    /// range's version of `ci.kappa_hat_support`, and it exists for the same
-    /// reason: a provenance a reader has to infer is one they will get wrong.
-    pub length_scale_support: gam_geometry::curvature_estimand::RangeEstimateSupport,
-}
-
-/// Compute the #944 curvature inference for the constant-curvature smooth at
-/// `term_idx`, given the already-fitted resolved spec (carrying κ̂) and the same
-/// fit inputs used to produce it.
-///
-/// The point estimate and inference share the same continuously smoothing-
-/// profiled Gaussian REML evidence and its analytic profile score. Each CI
-/// endpoint solves the Wilks likelihood-ratio equation directly inside the
-/// chart-bound bracket with safeguarded Newton steps; bisection is the
-/// guaranteed-progress fallback. A bound is reported as open only when the
-/// analytic score certifies that the connected likelihood set containing κ̂
-/// remains monotone all the way to that bound.
-fn curvature_profile_lr_endpoint<F>(
-    profile: &mut F,
-    kappa_hat: f64,
-    value_hat: f64,
-    bound: f64,
-    half_threshold: f64,
-    x_tolerance: f64,
-    score_tolerance: f64,
-) -> Result<(f64, bool), String>
-where
-    F: FnMut(f64) -> Result<(f64, f64), String>,
-{
-    let direction = (bound - kappa_hat).signum();
-    let span = (bound - kappa_hat).abs();
-    if direction == 0.0 || span <= x_tolerance {
-        return Ok((bound, true));
-    }
-
-    let (bound_value, bound_score) = profile(bound)?;
-    let outward_score = direction * bound_score;
-    if outward_score < -score_tolerance {
-        return Err(format!(
-            "curvature profile is not outward-monotone at chart bound {bound}: \
-             outward score {outward_score:.6e} is below tolerance {score_tolerance:.6e}"
-        ));
-    }
-    let value_tolerance = score_tolerance * span;
-    if bound_value < value_hat - value_tolerance {
-        return Err(format!(
-            "fitted curvature is not the minimum of its inference profile: \
-             V(bound={bound})={bound_value:.6e} < V(kappa_hat)={value_hat:.6e}"
-        ));
-    }
-    let bound_residual = bound_value - value_hat - half_threshold;
-    if bound_residual < 0.0 {
-        return Ok((bound, true));
-    }
-    if bound_residual == 0.0 {
-        return Ok((bound, false));
-    }
-
-    // `inside` is in the connected likelihood set and `outside` is beyond its
-    // first threshold crossing. Newton uses the exact profile score. It is
-    // accepted only in the central half of the current bracket, so every other
-    // iteration is a bisection-quality contraction even on a nearly flat score.
-    let mut inside_x = kappa_hat;
-    let mut outside_x = bound;
-    let mut outside_residual = bound_residual;
-    let mut outside_score = bound_score;
-    while (outside_x - inside_x).abs() > x_tolerance {
-        let lo = inside_x.min(outside_x);
-        let hi = inside_x.max(outside_x);
-        let width = hi - lo;
-        let central_lo = lo + 0.25 * width;
-        let central_hi = hi - 0.25 * width;
-        let newton = outside_x - outside_residual / outside_score;
-        let probe = if newton.is_finite() && newton > central_lo && newton < central_hi {
-            newton
-        } else {
-            lo + 0.5 * width
-        };
-        if !(probe > lo && probe < hi) {
-            break;
-        }
-        let (value, score) = profile(probe)?;
-        let outward_score = direction * score;
-        if outward_score < -score_tolerance {
-            return Err(format!(
-                "curvature profile changed direction before its likelihood crossing at \
-                 kappa={probe}: outward score {outward_score:.6e} is below tolerance \
-                 {score_tolerance:.6e}"
-            ));
-        }
-        let residual = value - value_hat - half_threshold;
-        if residual >= 0.0 {
-            outside_x = probe;
-            outside_residual = residual;
-            outside_score = score;
-        } else {
-            inside_x = probe;
-        }
-    }
-    // The bracket is only contracted to `x_tolerance`, so its midpoint carries
-    // an error of half that width -- a floor the reported endpoint inherits no
-    // matter how exact the profile score is, and `x_tolerance` is itself
-    // floored at `sqrt(EPSILON)` regardless of the tolerance the caller asked
-    // for. `outside_x` already holds the analytic score and residual evaluated
-    // there, so one final Newton step costs no additional profile evaluation
-    // and resolves the crossing to the accuracy of the score itself. It is
-    // taken only when it lands inside the certified bracket; otherwise the
-    // midpoint stands.
-    let midpoint = inside_x + 0.5 * (outside_x - inside_x);
-    let refined = outside_x - outside_residual / outside_score;
-    let lo = inside_x.min(outside_x);
-    let hi = inside_x.max(outside_x);
-    let endpoint = if refined.is_finite() && refined >= lo && refined <= hi {
-        refined
-    } else {
-        midpoint
-    };
-    Ok((endpoint, false))
-}
-
-fn curvature_profile_ci_from_analytic_score<F>(
-    profile: &mut F,
-    kappa_hat: f64,
-    kappa_min: f64,
-    kappa_max: f64,
-    level: f64,
-    relative_tolerance: f64,
-) -> Result<gam_geometry::curvature_estimand::KappaProfileCi, String>
-where
-    F: FnMut(f64) -> Result<(f64, f64), String>,
-{
-    if !(kappa_min < kappa_max && kappa_hat >= kappa_min && kappa_hat <= kappa_max) {
-        return Err("curvature profile requires kappa_hat inside valid chart bounds".to_string());
-    }
-    if !(level > 0.0 && level < 1.0) {
-        return Err("curvature profile level must lie in (0, 1)".to_string());
-    }
-    let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
-        .ok_or_else(|| "curvature profile threshold is not finite".to_string())?;
-    let half_threshold = 0.5 * z * z;
-    let (value_hat, score_hat) = profile(kappa_hat)?;
-    let relative_tolerance = relative_tolerance.max(f64::EPSILON.sqrt());
-    let x_tolerance = relative_tolerance * (1.0 + kappa_min.abs().max(kappa_max.abs()));
-    let score_tolerance = relative_tolerance * (1.0 + value_hat.abs());
-    // These two already exist because the stationarity check has to relax at a
-    // rail: at a bound, "stationary" means the score points OUT of the box, not
-    // that it vanishes. That is the routine knowing κ̂ is a box readout — and
-    // before #2687 it then threw the knowledge away and reported κ̂ as an
-    // estimate. It is now carried on the report.
-    let at_lower = (kappa_hat - kappa_min).abs() <= x_tolerance;
-    let at_upper = (kappa_hat - kappa_max).abs() <= x_tolerance;
-    let kappa_hat_support = if at_lower {
-        gam_geometry::curvature_estimand::KappaEstimateSupport::RailedAtLowerBound
-    } else if at_upper {
-        gam_geometry::curvature_estimand::KappaEstimateSupport::RailedAtUpperBound
-    } else {
-        gam_geometry::curvature_estimand::KappaEstimateSupport::Interior
-    };
-    let stationary = if at_lower {
-        score_hat >= -score_tolerance
-    } else if at_upper {
-        score_hat <= score_tolerance
-    } else {
-        score_hat.abs() <= score_tolerance
-    };
-    if !stationary {
-        // Name what was refused AGAINST, not just that something was refused.
-        // A κ̂ that failed this check is either a genuine interior non-optimum or
-        // a rail the `x_tolerance` did not recognise, and the two need opposite
-        // repairs — so the message has to carry the box, both gaps, and the rail
-        // tolerance that classified it (#2687).
-        return Err(format!(
-            "curvature inference rejected a non-stationary point estimate: \
-             kappa_hat={kappa_hat}, score={score_hat:.6e}, \
-             stationarity_bound={score_tolerance:.6e}; \
-             box=[{kappa_min}, {kappa_max}], gap_to_lower={:.6e}, gap_to_upper={:.6e}, \
-             rail_tolerance={x_tolerance:.6e}, classified={}",
-            kappa_hat - kappa_min,
-            kappa_max - kappa_hat,
-            kappa_hat_support.label()
-        ));
-    }
-
-    let (ci_lo, lo_at_bound) = curvature_profile_lr_endpoint(
-        profile,
-        kappa_hat,
-        value_hat,
-        kappa_min,
-        half_threshold,
-        x_tolerance,
-        score_tolerance,
-    )?;
-    let (ci_hi, hi_at_bound) = curvature_profile_lr_endpoint(
-        profile,
-        kappa_hat,
-        value_hat,
-        kappa_max,
-        half_threshold,
-        x_tolerance,
-        score_tolerance,
-    )?;
-    let verdict = if ci_lo > 0.0 {
-        gam_geometry::curvature_estimand::CurvatureVerdict::Spherical
-    } else if ci_hi < 0.0 {
-        gam_geometry::curvature_estimand::CurvatureVerdict::Hyperbolic
-    } else {
-        gam_geometry::curvature_estimand::CurvatureVerdict::Flat
-    };
-    Ok(gam_geometry::curvature_estimand::KappaProfileCi {
-        kappa_hat,
-        ci_lo,
-        ci_hi,
-        lo_at_bound,
-        hi_at_bound,
-        kappa_hat_support,
-        verdict,
-    })
-}
-
-pub fn curvature_inference_forspec(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    term_idx: usize,
-    family: LikelihoodSpec,
-    options: &FitOptions,
-    level: f64,
-) -> Result<CurvatureInference, EstimationError> {
-    let kappa_hat = get_constant_curvature_kappa(resolvedspec, term_idx).ok_or_else(|| {
-        EstimationError::InvalidInput(format!(
-            "curvature_inference_forspec: term {term_idx} is not a constant-curvature smooth"
-        ))
-    })?;
-    if constant_curvature_kappa_is_fixed(resolvedspec, term_idx) {
-        crate::bail_invalid_estim!(
-            "curvature inference requires an estimated curvature; term {term_idx} has user-pinned kappa={kappa_hat}"
-        );
-    }
-    if y.len() != data.nrows() || weights.len() != data.nrows() || offset.len() != data.nrows() {
-        crate::bail_invalid_estim!(
-            "curvature inference row mismatch: data={}, y={}, weights={}, offset={}",
-            data.nrows(),
-            y.len(),
-            weights.len(),
-            offset.len(),
-        );
-    }
-    validate_constant_curvature_profile_inputs(weights, offset, &family)?;
-    let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
-    let (feature_cols, base_spec) = match resolvedspec
-        .smooth_terms
-        .get(term_idx)
-        .map(|term| &term.basis)
-    {
-        Some(SmoothBasisSpec::ConstantCurvature {
-            feature_cols, spec, ..
-        }) => (feature_cols, spec.clone()),
-        _ => {
-            return Err(EstimationError::InvalidInput(format!(
-                "constant-curvature κ profile: smooth term {term_idx} is not a \
-                 constant-curvature basis"
-            )));
-        }
-    };
-    let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-    let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
-
-    // CI and flatness revisit κ̂ and κ=0. The shared profile caches each joint
-    // value/analytic-score pair so every statistic consumes the same evaluation.
-    let mut v_p = |kappa: f64| -> Result<(f64, f64), String> {
-        if !kappa.is_finite() {
-            return Err(format!("V_p probed a non-finite κ = {kappa}"));
-        }
-        let (value, score, _curvature) = profile.evaluate(kappa).map_err(|error| {
-            format!("analytic curvature profile at kappa={kappa} failed: {error}")
-        })?;
-        Ok((value, score))
-    };
-    let ci = curvature_profile_ci_from_analytic_score(
-        &mut v_p,
-        kappa_hat,
-        kappa_min,
-        kappa_max,
-        level,
-        options.tol,
-    )
-    .map_err(EstimationError::RemlOptimizationFailed)?;
-    let flatness = gam_geometry::curvature_estimand::flatness_lr_test(
-        |kappa| v_p(kappa).map(|(value, _)| value),
-        kappa_hat,
-    )
-    .map_err(EstimationError::RemlOptimizationFailed)?;
-
-    let (eta_hat, _, range_outcome) = profile.minimize_over_eta(kappa_hat)?;
-    Ok(CurvatureInference {
-        term_idx,
-        kappa_hat,
-        ci,
-        flatness,
-        length_scale_hat: eta_hat.exp(),
-        length_scale_estimated: profile.eta_bounds.is_some(),
-        length_scale_support: range_outcome.support(),
-    })
-}
-
-#[cfg(test)]
-mod curvature_profile_score_tests {
-    use super::*;
-
-    #[test]
-    fn analytic_profile_score_finds_exact_quadratic_lr_crossings() {
-        let kappa_hat = -0.37;
-        let curvature = 16.0;
-        let level = 0.95;
-        let mut profile = |kappa: f64| -> Result<(f64, f64), String> {
-            let displacement = kappa - kappa_hat;
-            Ok((
-                7.0 + 0.5 * curvature * displacement * displacement,
-                curvature * displacement,
-            ))
-        };
-        let ci = curvature_profile_ci_from_analytic_score(
-            &mut profile,
-            kappa_hat,
-            -3.0,
-            3.0,
-            level,
-            1.0e-10,
-        )
-        .expect("analytic quadratic profile CI");
-        let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
-            .expect("valid normal quantile");
-        let expected_half_width = z / curvature.sqrt();
-        assert!((ci.ci_lo - (kappa_hat - expected_half_width)).abs() <= 1.0e-8);
-        assert!((ci.ci_hi - (kappa_hat + expected_half_width)).abs() <= 1.0e-8);
-        assert!(!ci.lo_at_bound && !ci.hi_at_bound);
-    }
-
-    #[test]
-    fn analytic_profile_marks_chart_bound_when_wilks_set_never_crosses() {
-        let mut profile =
-            |kappa: f64| -> Result<(f64, f64), String> { Ok((0.5 * kappa * kappa, kappa)) };
-        let ci =
-            curvature_profile_ci_from_analytic_score(&mut profile, 0.0, -0.1, 0.1, 0.95, 1.0e-10)
-                .expect("open bounded profile CI");
-        assert_eq!(ci.ci_lo, -0.1);
-        assert_eq!(ci.ci_hi, 0.1);
-        assert!(ci.lo_at_bound && ci.hi_at_bound);
-        // κ̂ = 0 is interior to [−0.1, 0.1]: an open CI at both bounds is a
-        // statement about the interval, not about the estimate.
-        assert_eq!(
-            ci.kappa_hat_support,
-            gam_geometry::curvature_estimand::KappaEstimateSupport::Interior
-        );
-    }
-
-    /// gam#2687: the analytic-score route already had to KNOW κ̂ was railed —
-    /// its stationarity check relaxes to "the score points out of the box" at a
-    /// bound, which is only sound for a boundary optimum — and then reported κ̂
-    /// as an estimate anyway. Both halves are pinned here: the relaxed check
-    /// still accepts, and the report now carries the rail.
-    #[test]
-    fn a_railed_point_estimate_is_accepted_and_declared_by_the_analytic_route_2687() {
-        // V_p(κ) = −κ, score = −1: strictly decreasing, never stationary in the
-        // interior. κ̂ can only be the upper bound.
-        let kappa_max = 1.388_888_888_888_888_9_f64;
-        let mut monotone = |kappa: f64| -> Result<(f64, f64), String> { Ok((-kappa, -1.0)) };
-        let ci = curvature_profile_ci_from_analytic_score(
-            &mut monotone,
-            kappa_max,
-            -kappa_max,
-            kappa_max,
-            0.95,
-            1.0e-10,
-        )
-        .expect("a boundary optimum with the score pointing out of the box is stationary");
-        assert_eq!(
-            ci.kappa_hat_support,
-            gam_geometry::curvature_estimand::KappaEstimateSupport::RailedAtUpperBound,
-            "κ̂ = {kappa_max} is the box's own upper end"
-        );
-        // The mirrored sign, so the relaxation and the declaration agree on both
-        // sides rather than one of them being written for a single branch.
-        let mut increasing = |kappa: f64| -> Result<(f64, f64), String> { Ok((kappa, 1.0)) };
-        let ci_lo = curvature_profile_ci_from_analytic_score(
-            &mut increasing,
-            -kappa_max,
-            -kappa_max,
-            kappa_max,
-            0.95,
-            1.0e-10,
-        )
-        .expect("the mirrored boundary optimum");
-        assert_eq!(
-            ci_lo.kappa_hat_support,
-            gam_geometry::curvature_estimand::KappaEstimateSupport::RailedAtLowerBound
-        );
-        // An interior non-stationary point is still refused: the relaxation is
-        // tied to the rail, not a blanket loosening.
-        let mut interior_slope = |kappa: f64| -> Result<(f64, f64), String> { Ok((-kappa, -1.0)) };
-        assert!(
-            curvature_profile_ci_from_analytic_score(
-                &mut interior_slope,
-                0.0,
-                -kappa_max,
-                kappa_max,
-                0.95,
-                1.0e-10,
-            )
-            .is_err(),
-            "a non-stationary INTERIOR point is not an optimum and must still be refused"
-        );
-    }
-}
-
-#[cfg(test)]
-mod nfree_gate_tests {
-    use super::nfree_skip_gate_status_from_parts;
-
-    #[test]
-    fn value_only_nfree_gate_does_not_require_basis_skip_witness() {
-        let gate = nfree_skip_gate_status_from_parts(
-            true,  // shape
-            true,  // Chebyshev Gram value covers this ψ
-            false, // reduced-basis skip witness absent across a rotation seam
-            false, // gradient coverage irrelevant for a value-only cost probe
-            true,  // penalty can be re-keyed without rows
-            true,  // design revision is pinned
-            false, // no Hessian request
-            false, // value-only cost probe
-        );
-        assert!(
-            gate.would_skip(false),
-            "value-only κ cost probes must stay n-free when the Gram value is certified; \
-             the reduced-basis skip witness is required only for beta/gradient probes"
-        );
-    }
-
-    #[test]
-    fn gradient_nfree_gate_still_requires_basis_skip_witness() {
-        let gate =
-            nfree_skip_gate_status_from_parts(true, true, false, true, true, true, false, true);
-        assert!(
-            !gate.would_skip(true),
-            "gradient probes return beta/gradient objects in a reduced basis and must not \
-             skip the row lane without the reduced-basis witness"
-        );
-    }
-}
+// Curvature inference for `curv(...)` smooths and the driver's trailing unit tests (moved verbatim, line limit).
+include!("spatial_curvature_inference.rs");

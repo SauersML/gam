@@ -511,17 +511,7 @@ fn insert_coefficient_into_saved_fit(
             precision_diag,
         )?
         .into();
-        if let Some(cov) = inference.beta_covariance.as_mut() {
-            // `beta_covariance` is the `PhiScaledCovariance` newtype.
-            *cov = insert_symmetric_array2(cov.as_array(), index, variance_diag)?.into();
-        }
-        if let Some(se) = inference.beta_standard_errors.as_mut() {
-            *se = insert_array1(se, index, variance_diag.sqrt());
-        }
-        if let Some(cov) = inference.beta_covariance_corrected.as_mut() {
-            *cov = insert_symmetric_array2(cov, index, variance_diag)?;
-        }
-        if let Some(se) = inference.beta_standard_errors_corrected.as_mut() {
+        if let Some(se) = inference.factorized_standard_errors.as_mut() {
             *se = insert_array1(se, index, variance_diag.sqrt());
         }
         if let Some(cov) = inference.beta_covariance_frequentist.as_mut() {

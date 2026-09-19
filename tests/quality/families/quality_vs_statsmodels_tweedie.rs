@@ -195,7 +195,7 @@ fam = sm.families.Tweedie(var_power=1.5, link=sm.families.links.Log())
 # gam already carries its own intercept/constant column in the basis, so do
 # NOT add another constant here — that would make the column space differ.
 m = sm.GLM(yv, X, family=fam).fit(maxiter=200)
-eta = m.predict(X, linear=True)
+eta = m.predict(X, which="linear")
 emit("eta", np.asarray(eta, dtype=float))
 "#
     );
@@ -670,7 +670,7 @@ ytr = np.asarray(df["ytr"], dtype=float)
 fam = sm.families.Tweedie(var_power=1.5, link=sm.families.links.Log())
 # gam carries its own intercept in the basis; do NOT add another constant.
 m = sm.GLM(ytr, Xtr, family=fam).fit(maxiter=300)
-mu_te = m.predict(Xte, linear=False)
+mu_te = m.predict(Xte, which="mean")
 emit("mu_test", np.asarray(mu_te, dtype=float))
 "#
     );

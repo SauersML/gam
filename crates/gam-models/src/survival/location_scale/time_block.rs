@@ -440,7 +440,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
         // float-scale entries from the upstream basis builder. We log
         // warn-level only in the surprising regime.
         if total_subtol_nonzeros > 0 {
-            log::warn!(
+            log::debug!(
                 "structural time coefficient bounds: no value-varying shape column on this candidate's time design ({} rows × {} cols, sub-tolerance derivative nonzero entries (0 < |v| ≤ {:.0e}): {}, max(|.|) of the columns carrying them: {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
                 nrows,
                 p,
@@ -760,8 +760,8 @@ pub(crate) fn validate_linear_constraints(
 }
 
 /// Orthonormal basis `z` (raw `p` × reduced `r`) of the penalty null space —
-/// the affine `{1, log t}` AFT baseline an I-spline 2nd-order difference penalty
-/// leaves unpenalized. The penalized (curvature) directions are exactly the
+/// the affine `{1, log t}` AFT baseline a rank-2-null-space I-spline time
+/// penalty leaves unpenalized. The penalized (curvature) directions are exactly the
 /// non-affine deviation the constant-scale data cannot identify, so the
 /// null-space columns are precisely the identifiable parametric subspace.
 ///
@@ -1030,8 +1030,8 @@ pub(crate) fn unit_log_time_slope(
 
 /// Does the rank-1 reduced parametric-AFT regime apply (issue #892)?
 ///
-/// The real survival time penalty is a 1st-difference penalty, so its null space
-/// is DIMENSION 1: a single monotone log-t trend column `z` (p×1). When it does,
+/// The real survival time penalty (the I-spline value-space curvature Gram) has
+/// a null space of DIMENSION 1: a single monotone log-t trend column `z` (p×1). When it does,
 /// the time warp is REMOVED entirely (`h ≡ 0`) and the `log t` baseline is
 /// carried as a per-row σ-scaled LOCATION offset instead — `u = inv_sigma·(log t
 /// − η_t) = (log t − μ)/σ` — so the event Jacobian gains the `−log σ` term that
@@ -1246,7 +1246,7 @@ pub(crate) fn prepare_identified_time_block(
         ) }.into());
     }
     // Materialize to dense at the location-scale boundary — the hot path
-    // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense).
+    // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense_with_parallelism).
     let design_entry = input.design_entry.to_dense();
     let design_exit = input.design_exit.to_dense();
     let design_derivative_exit = input.design_derivative_exit.to_dense();
@@ -1283,17 +1283,14 @@ pub(crate) fn prepare_identified_time_block(
         // and miscalibrates the absolute survival curve.
         //
         // RANK-1 case (the one that actually fires for real fits): the survival
-        // time penalty is a 1st-difference penalty, so its null space is
-        // DIMENSION 1 — a single monotone log-t trend column. Pin the warp SHAPE
+        // time penalty (the I-spline value-space curvature Gram) has a null space
+        // of DIMENSION 1 — a single monotone log-t trend column. Pin the warp SHAPE
         // to exactly `log t` (built straight from the event times, NOT the
         // I-spline's curved image of it) but keep its SCALE `θ` a single FREE
         // coefficient: `h(t) = θ · log t`. The standardized residual is
-        // `u = h − η_loc/σ` with the warp UN-scaled by σ, so a lognormal/loglogistic
-        // AFT `(log t − μ)/σ` needs the warp to carry slope `1/σ` versus log t;
-        // the MLE drives `θ → 1/σ` and σ recovers to truth (folding `θ ≡ 1` instead
-        // would lock the residual log-t slope at 1 and over-determine σ). `θ` is
-        // identified — no flat ridge — by the event Jacobian's `log|h′| = log θ −
-        // log t` term, so the collapse to one log-t column is well posed. The
+        // `u = (h − η_loc)/σ`, so a free `θ` would co-scale with `(η_loc, σ)`
+        // along the gauge `c·(h, η_loc, σ)`; the branch below instead fixes the
+        // slope at the canonical `log t`, which breaks that gauge and identifies σ. The
         // single free column is the (non-constant) log-t warp, so the threshold
         // keeps its intercept and `pinned_free_row_constant` stays false.
         if r == 1
@@ -1310,11 +1307,9 @@ pub(crate) fn prepare_identified_time_block(
             // Jacobian gains `log_g = −η_ls − log t = −log σ − log t` — the `−log σ`
             // term that IDENTIFIES σ.
             //
-            // Why not a free warp scale θ (the prior attempt): with the warp
-            // un-scaled by σ the pair `(η_t, σ)` co-scaled freely (only `η_t/σ`
-            // identified, no `−log σ` term), so every parameter shrank by a common
-            // factor. Routing `log t` through the σ-scaled `q` channel supplies the
-            // missing `−log σ` Jacobian and pins σ. The warp is gone, so the time
+            // Why not a free warp scale θ: `(θ, η_t, σ)` would co-scale freely along
+            // the gauge `c·(θ, η_t, σ)`. The fixed `log t` offset breaks it and pins σ
+            // against the canonical AFT clock. The warp is gone, so the time
             // block is empty (no free columns, no penalties, no constraints); all
             // the σ-coupling rides the existing `q`-derivative/Hessian stack, with
             // no new time×log_sigma cross-terms.
@@ -1325,7 +1320,7 @@ pub(crate) fn prepare_identified_time_block(
                 p,
             ));
         }
-        // RANK-2 case (2nd-difference penalty `{1, log t}`): kept for correctness
+        // RANK-2 case (a time penalty with null space `{1, log t}`): kept for correctness
         // where it occurs (golden unit test), though real fits use rank-1 above.
         if r == 2
             && z.nrows() == p

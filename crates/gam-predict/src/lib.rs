@@ -2,6 +2,7 @@ pub mod affine_design;
 pub mod alo;
 pub mod conformal;
 pub mod conformal_routes;
+pub mod expectile_curves;
 pub mod generative;
 pub mod input;
 pub mod interval_policy;
@@ -13,6 +14,7 @@ pub mod term_diagnostics;
 pub use affine_design::*;
 pub use alo::*;
 pub use conformal::*;
+pub use expectile_curves::*;
 pub use gam_models::inference::predict_io::{
     BernoulliMarginalSlopePredictor, LatentConditioningSpan, PredictInput, PredictResult,
 };
@@ -38,7 +40,7 @@ use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
 use gam_inference::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
-    negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
+    inverse_gaussian_moment_matched_interval, negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
     tweedie_moment_matched_interval,
 };
 use faer::Side;
@@ -58,8 +60,8 @@ use gam_models::inference::model::{
 use gam_problem::{BlockRole, EstimationError};
 use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::constrained_posterior::{
-    ConstrainedPosteriorGeometry, constrained_posterior_correction_from_covariance,
-    constrained_projection_equal_tailed_interval,
+    ConstrainedPosteriorGeometry, ConstrainedProjectionLaw,
+    constrained_posterior_correction_from_covariance,
 };
 use gam_solve::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
@@ -224,13 +226,13 @@ fn usable_penalized_hessian<'a>(
     let (active_dim, lift) = match gauge {
         Some(gauge) => {
             if let Err(reason) = gauge.validate() {
-                log::warn!(
+                log::debug!(
                     "{label}: ignoring penalized Hessian behind an invalid coefficient gauge: {reason}"
                 );
                 return None;
             }
             if gauge.raw_total() != expected_dim {
-                log::warn!(
+                log::debug!(
                     "{label}: ignoring penalized Hessian whose coefficient gauge lifts to {} \
                      coefficients; expected {expected_dim}",
                     gauge.raw_total()
@@ -243,7 +245,7 @@ fn usable_penalized_hessian<'a>(
     };
     let hessian = fit.penalized_hessian()?;
     if hessian.nrows() != active_dim || hessian.ncols() != active_dim {
-        log::warn!(
+        log::debug!(
             "{label}: ignoring penalized Hessian with shape {}x{}; expected {}x{}",
             hessian.nrows(),
             hessian.ncols(),
@@ -253,10 +255,28 @@ fn usable_penalized_hessian<'a>(
         return None;
     }
     if !hessian.iter().any(|value| value.abs() > 0.0) {
-        log::warn!("{label}: ignoring zero penalized Hessian placeholder");
+        log::debug!("{label}: ignoring zero penalized Hessian placeholder");
         return None;
     }
     Some((hessian, lift))
+}
+
+/// Refuse an interval for a fit that withheld its covariance
+/// (`FitArtifacts::covariance_declined`, gam#2718), with the fit's own reason.
+/// The penalized Hessian such a fit still ships would re-derive exactly the
+/// covariance it declined: uncorrected, too narrow, and on the wire
+/// indistinguishable from a corrected one (gam#2985).
+pub(crate) fn refuse_declined_covariance(
+    fit: &UnifiedFitResult,
+    label: &str,
+) -> Result<(), EstimationError> {
+    match fit.artifacts.covariance_declined.as_ref() {
+        Some(declined) => Err(EstimationError::InvalidInput(format!(
+            "{label}: {}",
+            declined.explain()
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn conditional_prediction_backend<'a>(
@@ -286,7 +306,7 @@ fn conditional_prediction_backend<'a>(
                     covariance.view(),
                 )));
             }
-            Err(reason) => log::warn!("{label}: ignoring invalid conditional {reason}"),
+            Err(reason) => log::debug!("{label}: ignoring invalid conditional {reason}"),
         }
     }
     if let Some((hessian, gauge_lift)) = usable_penalized_hessian(fit, expected_dim, label) {
@@ -322,7 +342,7 @@ fn conditional_prediction_backend<'a>(
         }) {
             Ok(backend) => return Ok(Some(backend)),
             Err(err) => {
-                log::warn!(
+                log::debug!(
                     "{label}: failed to build factorized prediction precision backend: {err}"
                 );
             }
@@ -337,6 +357,7 @@ fn selected_uncertainty_backend<'a>(
     requested_mode: InferenceCovarianceMode,
     label: &str,
 ) -> Result<(PredictionCovarianceBackend<'a>, InferenceCovarianceMode), EstimationError> {
+    refuse_declined_covariance(fit, label)?;
     match requested_mode {
         InferenceCovarianceMode::Conditional => {
             conditional_prediction_backend(fit, expected_dim, label)?
@@ -811,15 +832,8 @@ fn padded_design_standard_errors_from_backend(
 }
 
 /// Posterior mean of `integrand(η₀, η₁)` under `N(mu, cov)`, integrated over
-/// every direction in which `cov` carries variance.
-///
-/// The 2-D rule runs exactly when its Cholesky factor exists without jitter:
-/// the pivots `a` and `b − (c/√a)²` of `cov = [[a, c], [c, b]]`, formed as
-/// `cholesky_static` forms them, are both positive. Any other `cov` is rank one
-/// in floating point or indefinite, and the nearest positive semidefinite
-/// covariance keeps only its major eigenpair: variance `m + r` with
-/// `m = (a + b)/2` and `r = hypot((a − b)/2, c)`, along the major eigenvector.
-/// A covariance with no positive eigenvalue is a point mass.
+/// every direction in which `cov` carries variance
+/// ([`gam_solve::quadrature::BivariateNormalSupport`]).
 fn projected_bivariate_posterior_mean_result<F>(
     quadctx: &gam_solve::quadrature::QuadratureContext,
     mu: [f64; 2],
@@ -834,39 +848,7 @@ where
             "posterior mean requires a finite linear-predictor covariance; got {cov:?}"
         )));
     }
-    let (a, b, c) = (cov[0][0], cov[1][1], cov[1][0]);
-    if a > 0.0 {
-        let below = c / a.sqrt();
-        if b - below * below > 0.0 {
-            return gam_solve::quadrature::normal_expectation_2d_adaptive_result(
-                quadctx, mu, cov, integrand,
-            );
-        }
-    }
-    let half_difference = 0.5 * a - 0.5 * b;
-    let radius = half_difference.hypot(c);
-    let major = 0.5 * a + 0.5 * b + radius;
-    if major <= 0.0 {
-        return integrand(mu[0], mu[1]);
-    }
-    // The major eigenvector is `(r + h, c)` or `(c, r − h)` with `h = (a − b)/2`;
-    // take whichever adds rather than cancels. It is nonzero here: `r + h = 0`
-    // with `h ≥ 0` forces `h = c = 0`, so `a = b = m > 0` and both pivots were
-    // positive.
-    let (u0, u1) = if half_difference >= 0.0 {
-        (radius + half_difference, c)
-    } else {
-        (c, radius - half_difference)
-    };
-    let length = u0.hypot(u1);
-    let axis = [u0 / length, u1 / length];
-    gam_solve::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
-        quadctx,
-        [0.0],
-        [[major]],
-        21,
-        |t| integrand(mu[0] + axis[0] * t[0], mu[1] + axis[1] * t[0]),
-    )
+    gam_solve::quadrature::normal_expectation_2d_projected_result(quadctx, mu, cov, integrand)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1042,6 +1024,7 @@ impl FittedModelPredictExt for FittedModel {
             runtime.latent_z_conditional_calibration,
             // The Bernoulli predictor's primary design IS the marginal design.
             LatentConditioningSpan::PrimaryDesign,
+            runtime.residual_repair,
         )
     }
 
@@ -1135,6 +1118,22 @@ pub trait PredictableModel {
         if input.design.nrows() == 0 {
             return Err(EstimationError::InvalidInput(
                 "predict_noise_scale requires at least one observation".to_string(),
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Posterior mean of the response-side noise scale, `E[σ | data]`,
+    /// integrating the scale block's posterior instead of plugging in its
+    /// mode. `None` for models without a per-observation noise scale.
+    fn predict_posterior_mean_noise_scale(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        if input.design.nrows() == 0 {
+            return Err(EstimationError::InvalidInput(
+                "predict_posterior_mean_noise_scale requires at least one observation"
+                    .to_string(),
             ));
         }
         Ok(None)
@@ -1308,6 +1307,54 @@ pub struct PredictPosteriorMeanResult {
     /// Exact covariance used for the attached SE and interval. `None` for a
     /// point-only request.
     pub uncertainty_covariance_source: Option<InferenceCovarianceMode>,
+    /// What the point is conditional on when its covariance is not one the fit
+    /// published; `None` when the point integrates the fit's own covariance.
+    pub point_covariance_provenance: Option<PointCovarianceProvenance>,
+}
+
+/// Why a posterior-mean point integrates a covariance the fit did not publish.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PointCovarianceProvenance {
+    /// The fit withheld its coefficient covariance (gam#2718, gam#2985), so the
+    /// point integrates the penalized Hessian: the posterior conditional on the
+    /// fitted latent law, without the generated-regressor correction the fit
+    /// declined. That correction only adds variance, so this point lies between
+    /// the plug-in mode and the fully corrected posterior mean.
+    ConditionalOnFittedLatentLaw {
+        declined: gam_solve::model_types::CovarianceDeclined,
+    },
+}
+
+impl PointCovarianceProvenance {
+    /// The provenance of a posterior-mean point integrated from `fit`'s own
+    /// posterior.
+    pub fn of_fit(fit: &UnifiedFitResult) -> Option<Self> {
+        // An expectile fit is identity-link: its posterior-mean point is the
+        // mode Xβ̂ and integrates no covariance, so its declined sandwich
+        // qualifies only the intervals, which `refuse_declined_covariance`
+        // refuses.
+        fit.artifacts
+            .covariance_declined
+            .clone()
+            .filter(|declined| {
+                !matches!(
+                    declined,
+                    gam_solve::model_types::CovarianceDeclined::
+                        ExpectileSandwichRequiresDenseCovariance { .. }
+                )
+            })
+            .map(|declined| Self::ConditionalOnFittedLatentLaw { declined })
+    }
+
+    pub fn explain(&self) -> String {
+        match self {
+            Self::ConditionalOnFittedLatentLaw { declined } => format!(
+                "posterior mean conditional on the fitted latent law; the generated-regressor \
+                 correction was declined: {}",
+                declined.explain()
+            ),
+        }
+    }
 }
 
 /// Options for the posterior-mean prediction path
@@ -1752,6 +1799,7 @@ fn predict_gam_posterior_mean_from_backend(
         observation_upper: None,
         point_covariance_source: InferenceCovarianceMode::Conditional,
         uncertainty_covariance_source: None,
+        point_covariance_provenance: None,
     })
 }
 
@@ -1934,6 +1982,12 @@ fn constrained_linear_predictor_intervals(
         )));
     }
     let law = constrained_law(fit, geometry, covariance_mode)?;
+    // The projection law — including its certified orthant cubature — is a
+    // property of the fit, not of the row, so it is prepared once and every row
+    // reads it. Peak cubature storage is one node set, independent of the
+    // prediction batch, chunk size and worker count.
+    let projection_law = ConstrainedProjectionLaw::new(&law.ambient, &law.geometry)
+        .map_err(EstimationError::InvalidInput)?;
     let n_rows = design.nrows();
     let mut lower = Array1::<f64>::zeros(n_rows);
     let mut upper = Array1::<f64>::zeros(n_rows);
@@ -1941,28 +1995,14 @@ fn constrained_linear_predictor_intervals(
     for start in (0..n_rows).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n_rows);
         let rows = design_row_chunk(design, start..end).map_err(EstimationError::InvalidInput)?;
-        // One projection can retain up to ORTHANT_MOMENT_MAXIMUM_POINTS scalar
-        // node/weight pairs. Evaluate rows serially so peak cubature storage is
-        // O(nodes), independent of prediction batch and chunk size. Parallel
-        // rows would multiply that allocation by the Rayon worker count and
-        // violate the library's bounded-memory contract on hard faces.
-        for local_row in 0..rows.nrows() {
-            let contrast = geometry
-                .coefficient_gauge
-                .t_full
-                .t()
-                .dot(&rows.row(local_row));
-            let (row_lower, row_upper) = constrained_projection_equal_tailed_interval(
-                &law.ambient,
-                &law.geometry,
-                &contrast,
-                level,
-            )
+        // Row r's contrast is `Tᵀx_r`, so the chunk's contrasts are the rows of `X·T`.
+        let contrasts = rows.dot(&geometry.coefficient_gauge.t_full);
+        let intervals = projection_law
+            .equal_tailed_intervals(contrasts.view(), level)
             .map_err(EstimationError::InvalidInput)?;
-            let shift = offset[start + local_row]
-                + rows
-                    .row(local_row)
-                    .dot(&geometry.coefficient_gauge.affine_shift);
+        let shifts = rows.dot(&geometry.coefficient_gauge.affine_shift);
+        for (local_row, (row_lower, row_upper)) in intervals.into_iter().enumerate() {
+            let shift = offset[start + local_row] + shifts[local_row];
             lower[start + local_row] = row_lower + shift;
             upper[start + local_row] = row_upper + shift;
         }
@@ -2228,6 +2268,22 @@ where
                     .map(|(i, &mu)| phi * (mu.powi(2) + v(i))),
             ))
         }
+        // `Var(Y|μ) = φμ³`, so E[Var(Y|μ)] = φE[μ³]. Given only the first two
+        // posterior moments of μ, E[μ³] is closed by the log-normal moment
+        // identity E[μ³] = m³(1 + v/m²)³ — exact under the log link, where μ is
+        // log-normal, and the same closure the Tweedie arm uses.
+        ResponseFamily::InverseGaussian => {
+            let phi = source.observation_phi()?;
+            Some(Array1::from_iter(mean.iter().enumerate().map(|(i, &mu)| {
+                let vi = v(i);
+                let plug = phi * mu.powi(3);
+                if vi > 0.0 && mu > 0.0 {
+                    plug * (1.0 + vi / (mu * mu)).powi(3)
+                } else {
+                    plug
+                }
+            })))
+        }
         ResponseFamily::Beta { .. } => {
             let phi = source.observation_phi()?;
             Some(Array1::from_iter(mean.iter().enumerate().map(
@@ -2239,6 +2295,10 @@ where
         // the Bernoulli indicator 1{T > t} with conditional variance S(1−S) —
         // the Binomial law of total variance below with μ = S: E[S(1−S)] =
         // m(1−m) − v, and total predictive variance exactly m(1−m).
+        // Location-scale t: Var(Y|μ) = σ²ν/(ν−2), finite only for ν > 2.
+        ResponseFamily::StudentT { sigma, nu } => {
+            (*nu > 2.0).then(|| Array1::from_elem(mean.len(), sigma * sigma * nu / (nu - 2.0)))
+        }
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => Some(Array1::from_iter(
             mean.iter().enumerate().map(|(i, &mu)| {
                 let p = mu.clamp(0.0, 1.0);
@@ -2259,8 +2319,6 @@ fn bernoulli_predictive_quantile(success_probability: f64, cumulative_probabilit
 
 pub(crate) fn family_observation_band<S>(
     response: &ResponseFamily,
-    eta: &Array1<f64>,
-    etavar: &Array1<f64>,
     mean: &Array1<f64>,
     mean_standard_error: &Array1<f64>,
     z_lower_per_row: &Array1<f64>,
@@ -2336,24 +2394,25 @@ where
         ResponseFamily::Gaussian => {
             let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
             // Weighted Gaussian: `Var(Y_i|μ_i) = σ̂²/w_i`, so the observation
-            // noise is per-row, not the broadcast pooled scalar (#2077). Identity
-            // link ⇒ η == μ, so this widens the band symmetrically per row.
+            // noise is per-row, not the broadcast pooled scalar (#2077). The band
+            // is centred on the response mean with its posterior variance, so it
+            // is on the response scale under any link (identity: μ = η).
             let obsvar_per_row =
-                gaussian_observation_variance_per_row(obsvar, eta.len(), prior_weights);
+                gaussian_observation_variance_per_row(obsvar, mean.len(), prior_weights);
             let obs_se = Array1::from_iter(
-                etavar
+                mean_variance
                     .iter()
                     .zip(obsvar_per_row.iter())
                     .map(|(&v, &ov)| (v + ov).max(0.0).sqrt()),
             );
             let lower = Array1::from_iter(
-                eta.iter()
+                mean.iter()
                     .zip(obs_se.iter())
                     .zip(z_lower_per_row.iter())
                     .map(|((&e, &s), &zl)| e - zl * s),
             );
             let upper = Array1::from_iter(
-                eta.iter()
+                mean.iter()
                     .zip(obs_se.iter())
                     .zip(z_upper_per_row.iter())
                     .map(|((&e, &s), &zu)| e + zu * s),
@@ -2443,6 +2502,20 @@ where
                 gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
         }
+        ResponseFamily::InverseGaussian => {
+            // `Var(Y|μ) = φμ³`: heavier right skew than the Gamma, so the band
+            // is built from equal-tailed moment-matched inverse-Gaussian
+            // quantiles.
+            if source.observation_phi().is_none() {
+                return (None, None);
+            }
+            let response_var =
+                family_response_variance(response, mean, source, None, Some(&mean_variance))
+                    .expect("phi availability was checked above");
+            skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
+                inverse_gaussian_moment_matched_interval(mu, total_var, p_lo, p_hi)
+            })
+        }
         ResponseFamily::Beta { .. } => {
             // Beta's precision is estimated jointly with the mean (#567/#769)
             // and recorded in `likelihood_scale` (`EstimatedBetaPhi`), NOT on
@@ -2468,6 +2541,11 @@ where
                 beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
         }
+        // The predictive law of a fresh Student-t observation is a Gaussian
+        // (posterior of η) convolved with a scaled t, which has no closed-form
+        // quantile; no observation band is reported rather than a Gaussian
+        // surrogate that would under-cover the heavy tails.
+        ResponseFamily::StudentT { .. } => (None, None),
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
             // Royston–Parmar reports the survival probability S(t) at the
             // requested horizon, so its fresh observation is the Bernoulli
@@ -2741,7 +2819,7 @@ where
     // within-support edge effect.
     let ood_inflation_active = options.ood_inflation && options.extrapolation_variance.is_none();
     if options.ood_inflation && !ood_inflation_active {
-        log::warn!(
+        log::debug!(
             "predict_gamwith_uncertainty: ood_inflation is enabled but an additive \
             extrapolation_variance is supplied; skipping the multiplicative OOD \
             inflation to avoid double-counting off-support uncertainty"
@@ -3006,8 +3084,6 @@ where
     let (observation_lower, observation_upper) = if options.includeobservation_interval {
         family_observation_band(
             &spec.response,
-            &eta,
-            &etavar,
             &mean,
             &mean_standard_error,
             &z_lower_per_row,
@@ -3240,6 +3316,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_solve::constrained_posterior::constrained_projection_equal_tailed_interval;
     use gam_math::probability::normal_pdf;
     use gam_models::bms::LatentMeasureKind;
     use gam_models::inference::model::SavedLatentZNormalization;
@@ -3425,6 +3502,7 @@ mod tests {
         fit.inference = Some(FitInference {
             edf_by_block: vec![0.0],
             penalty_block_trace: vec![0.0],
+            edf_rank_bound: Vec::new(),
             edf_total: 0.0,
             smoothing_correction: Some(smoothing_correction.clone()),
             smoothing_correction_method: Some(
@@ -3445,12 +3523,7 @@ mod tests {
             penalized_hessian: array![[1.0]].into(),
             reparam_qs: None,
             dispersion: gam_problem::Dispersion::UNIT,
-            beta_covariance: Some(array![[1.0 - 2.0 / std::f64::consts::PI]].into()),
-            beta_standard_errors: Some(array![
-                (1.0 - 2.0 / std::f64::consts::PI).sqrt()
-            ]),
-            beta_covariance_corrected: Some(published.clone()),
-            beta_standard_errors_corrected: Some(array![published[[0, 0]].sqrt()]),
+            factorized_standard_errors: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -3709,6 +3782,7 @@ mod tests {
             observation_upper: None,
             point_covariance_source: InferenceCovarianceMode::Conditional,
             uncertainty_covariance_source: None,
+            point_covariance_provenance: None,
         };
         enrich_posterior_mean_bounds(
             &mut result,
@@ -3756,6 +3830,8 @@ mod tests {
             latent_z_calibration: None,
             latent_conditioning_span:
                 gam_inference::predict_io::LatentConditioningSpan::PrimaryDesign,
+            residual_repair: None,
+            beta_residual: None,
             latent_z_conditional_calibration: None,
         };
         let theta = predictor.theta();
@@ -4014,6 +4090,46 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_location_scale_posterior_mean_sigma_integrates_log_sigma_posterior() {
+        // Scale-block variance 0.4 on the single log-σ coefficient: the
+        // posterior mean of σ = f + exp(η_s) is f + exp(m + v/2), strictly
+        // above the plug-in σ(m); without covariance it is the plug-in.
+        let floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+        let mut predictor = GaussianLocationScalePredictor {
+            beta_mu: array![0.0],
+            beta_noise: array![0.3],
+            sigma_floor: floor,
+            response_scale: 2.0,
+            covariance: Some(array![[1.0, 0.0], [0.0, 0.4]]),
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let integrated = predictor
+            .predict_posterior_mean_noise_scale(&input)
+            .expect("posterior-mean sigma")
+            .expect("gaussian location-scale reports sigma");
+        let expected = 2.0 * floor + (0.3_f64 + 0.2).exp();
+        assert!((integrated[0] / expected - 1.0).abs() < 1e-14);
+        predictor.covariance = None;
+        let plugin = predictor
+            .predict_noise_scale(&input)
+            .expect("plug-in sigma")
+            .expect("gaussian location-scale reports sigma");
+        let degraded = predictor
+            .predict_posterior_mean_noise_scale(&input)
+            .expect("posterior-mean sigma")
+            .expect("gaussian location-scale reports sigma");
+        assert_eq!(plugin, degraded);
+    }
+
+    #[test]
     fn gaussian_location_scale_eta_se_pads_scale_block_without_wiggle() {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.5],
@@ -4225,6 +4341,7 @@ mod tests {
             // empty to satisfy the EDF/lambdas count invariant.
             edf_by_block: vec![],
             penalty_block_trace: vec![],
+            edf_rank_bound: Vec::new(),
             edf_total: p as f64,
             smoothing_correction: None,
             smoothing_correction_method: None,
@@ -4235,10 +4352,7 @@ mod tests {
             penalized_hessian: Array2::<f64>::eye(p).into(),
             reparam_qs: None,
             dispersion: gam_problem::Dispersion::UNIT,
-            beta_covariance: Some(covariance.clone().into()),
-            beta_standard_errors: None,
-            beta_covariance_corrected: None,
-            beta_standard_errors_corrected: None,
+            factorized_standard_errors: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -4682,6 +4796,212 @@ mod tests {
         );
     }
 
+    /// gam#2985: a fit that withheld its covariance still ships its penalized
+    /// Hessian. Asked for intervals, it answers with its typed reason in both
+    /// covariance modes, never with a matrix; the same fit without the record is
+    /// served from that Hessian, so the refusal is the record's.
+    #[test]
+    fn a_withheld_covariance_refuses_intervals_with_its_reason_2985() {
+        let mut fit = posterior_band_fixture(array![0.5, -0.3], Array2::eye(2));
+        fit.covariance_conditional = None;
+        let (control, _) = selected_uncertainty_backend(
+            &fit,
+            2,
+            InferenceCovarianceMode::Conditional,
+            "interval without a record",
+        )
+        .expect("without a record the penalized Hessian serves the interval");
+        assert_eq!(control.nrows(), 2);
+        fit.artifacts.covariance_declined = Some(
+            gam_solve::model_types::CovarianceDeclined::
+                BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                    unavailable_channel: "the pin's missing channel".to_string(),
+                },
+        );
+        for mode in [
+            InferenceCovarianceMode::Conditional,
+            InferenceCovarianceMode::SmoothingCorrected,
+        ] {
+            let error = expect_estimation_error(
+                selected_uncertainty_backend(&fit, 2, mode, "withheld interval"),
+                "a withheld covariance must not serve an interval",
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("withheld interval")
+                    && message.contains("gam#2985")
+                    && message.contains("the pin's missing channel"),
+                "the refusal carries the fit's reason ({mode:?}): {message}"
+            );
+        }
+    }
+
+    /// gam#2985: a withheld fit's posterior-mean point is still the posterior
+    /// mean, integrated over the penalized Hessian (the posterior conditional on
+    /// the fitted latent law), and it says so in a typed note. It is not the
+    /// plug-in: it carries the log-normal inflation `exp(se²/2)` that the
+    /// plug-in lacks. A fit that published its covariance carries no note, and
+    /// the withheld fit refuses the point's interval with its reason. This pins
+    /// the dedicated standard engine; the generic driver's half is the test
+    /// after this one.
+    #[test]
+    fn a_withheld_fit_predicts_the_conditional_posterior_mean_with_a_typed_note_2985() {
+        let beta = array![0.4, -0.3];
+        let mut published = posterior_band_fixture(beta.clone(), Array2::eye(2));
+        published.fitted_link = FittedLinkState::Standard(None);
+        let mut withheld = published.clone();
+        withheld.covariance_conditional = None;
+        let declined = gam_solve::model_types::CovarianceDeclined::
+            BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                unavailable_channel: "the pin's missing channel".to_string(),
+            };
+        withheld.artifacts.covariance_declined = Some(declined.clone());
+        let predictor = StandardPredictor {
+            beta: beta.clone(),
+            family: LikelihoodSpec::poisson_log(),
+            link_kind: None,
+            covariance: None,
+            link_wiggle: None,
+        };
+        let design = array![[1.0, 0.5], [1.0, -1.2]];
+        let input = PredictInput {
+            design: DesignMatrix::from(design.clone()),
+            offset: array![0.0, 0.0],
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let point = PosteriorMeanOptions::point_only();
+        let with_level = PosteriorMeanOptions {
+            confidence_level: Some(0.95),
+            ..PosteriorMeanOptions::point_only()
+        };
+        let corrected = predictor
+            .predict_posterior_mean(&input, &published, &point)
+            .expect("a published fit predicts");
+        assert_eq!(
+            corrected.point_covariance_provenance, None,
+            "a fit that published its covariance carries no note"
+        );
+        let conditional = predictor
+            .predict_posterior_mean(&input, &withheld, &point)
+            .expect("a withheld fit predicts its point");
+        let note = conditional
+            .point_covariance_provenance
+            .as_ref()
+            .expect("a withheld fit's point carries the note");
+        assert_eq!(
+            note,
+            &PointCovarianceProvenance::ConditionalOnFittedLatentLaw {
+                declined: declined.clone()
+            }
+        );
+        let text = note.explain();
+        assert!(
+            text.contains("conditional on the fitted latent law")
+                && text.contains("the pin's missing channel"),
+            "the note names what the point is conditional on and why: {text}"
+        );
+        for (row, x) in design.rows().into_iter().enumerate() {
+            let eta = x.dot(&beta);
+            let variance = x.dot(&x);
+            let expected = (eta + 0.5 * variance).exp();
+            let got = conditional.mean[row];
+            assert!(
+                ((got - expected) / expected).abs() <= 1e-9,
+                "row {row}: the conditional posterior mean {got} is exp(η + se²/2) = {expected}"
+            );
+            assert!(
+                (got - eta.exp()).abs() > 0.1 * variance * eta.exp(),
+                "row {row}: {got} must differ from the plug-in {} by the inflation",
+                eta.exp()
+            );
+            assert!(
+                ((got - corrected.mean[row]) / expected).abs() <= 1e-12,
+                "row {row}: the Hessian here is the published covariance's inverse"
+            );
+        }
+        let error = expect_estimation_error(
+            predictor.predict_posterior_mean(&input, &withheld, &with_level),
+            "a withheld fit must not attach an interval to its point",
+        );
+        assert!(
+            error.to_string().contains("the pin's missing channel"),
+            "the interval refusal carries the fit's reason: {error}"
+        );
+        // The presenter-facing columns (what the CLI and the FFI print) carry the
+        // note for the withheld fit and none for the published one.
+        let request = crate::interval_policy::PredictionRequest {
+            interval: None,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            observation_interval: false,
+            observation_prior_weights: None,
+            extrapolation_variance: None,
+        };
+        let columns = |fit: &UnifiedFitResult| {
+            crate::interval_policy::resolve_prediction_request(&predictor, &input, fit, true, &request)
+                .expect("a point-only curved-link prediction resolves")
+        };
+        assert_eq!(
+            columns(&withheld).point_covariance_provenance,
+            Some(PointCovarianceProvenance::ConditionalOnFittedLatentLaw { declined })
+        );
+        assert_eq!(columns(&published).point_covariance_provenance, None);
+    }
+
+    /// gam#2985, the generic driver (Bernoulli marginal-slope, survival,
+    /// location-scale): a withheld fit's posterior-mean point carries the typed
+    /// note, a published fit's carries none, and the withheld fit refuses the
+    /// point's interval with its reason.
+    #[test]
+    fn the_generic_driver_notes_a_withheld_point_and_refuses_its_interval_2985() {
+        let published = posterior_band_fixture(array![0.0], Array2::eye(1));
+        let mut withheld = published.clone();
+        withheld.covariance_conditional = None;
+        let declined = gam_solve::model_types::CovarianceDeclined::
+            BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                unavailable_channel: "the pin's missing channel".to_string(),
+            };
+        withheld.artifacts.covariance_declined = Some(declined.clone());
+        let input = PredictInput {
+            design: DesignMatrix::from(Array2::<f64>::zeros((3, 1))),
+            offset: Array1::zeros(3),
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let point = PosteriorMeanOptions::point_only();
+        let transform = FixedRoystonParmarTransform;
+        let own = predict_posterior_mean_generic(&transform, &input, &published, &point)
+            .expect("a published fit predicts");
+        assert_eq!(own.point_covariance_provenance, None);
+        let conditional = predict_posterior_mean_generic(&transform, &input, &withheld, &point)
+            .expect("a withheld fit predicts its point");
+        assert_eq!(
+            conditional.point_covariance_provenance,
+            Some(PointCovarianceProvenance::ConditionalOnFittedLatentLaw { declined })
+        );
+        assert_eq!(conditional.mean, own.mean, "the note does not move the point");
+        let error = expect_estimation_error(
+            predict_posterior_mean_generic(
+                &transform,
+                &input,
+                &withheld,
+                &PosteriorMeanOptions {
+                    confidence_level: Some(0.95),
+                    ..PosteriorMeanOptions::point_only()
+                },
+            ),
+            "a withheld fit must not attach an interval to its point",
+        );
+        assert!(
+            error.to_string().contains("the pin's missing channel"),
+            "the interval refusal carries the fit's reason: {error}"
+        );
+    }
+
     #[test]
     fn curved_link_posterior_mean_is_identical_after_fit_state_round_trip() {
         let beta = array![0.2];
@@ -4909,8 +5229,6 @@ mod tests {
         let z_per_row = Array1::from_elem(n, z);
         let (lower, upper) = family_observation_band(
             &ResponseFamily::RoystonParmar,
-            &Array1::zeros(n),
-            &Array1::zeros(n),
             &mean,
             &Array1::from_elem(n, 0.01),
             &z_per_row,

@@ -372,10 +372,10 @@ fn dispersion_and_shape_reports_name_the_routing_they_condition_on_2933_f37() {
         .unfactored_reconstruction_dispersion(target.view(), &rho)
         .expect("the unfactored two-center dispersion is defined");
     let route = term
-        .shape_information_route(&rho, target.view(), &cache)
+        .shape_information_route(&rho, target.view(), None, &cache)
         .expect("the two-center state has a shape information route");
     let information = term
-        .shape_information(&route, &rho, target.view(), None, &cache)
+        .shape_information(&route, &rho, target.view(), &cache)
         .expect("the two-center shape information is defined");
     let assembled = term
         .assemble_shape_uncertainty(&information, factored)

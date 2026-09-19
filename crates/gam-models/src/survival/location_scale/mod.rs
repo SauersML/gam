@@ -31,7 +31,7 @@
 
 use gam_terms::basis::BasisOptions;
 
-use crate::custom_family::{BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator, CustomFamilyHyperLayout, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned, first_psi_linear_map, fit_custom_family_arming_on_evidence, fit_custom_family_fixed_log_lambdas_from_owned_mode, resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps};
+use crate::custom_family::{BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator, CustomFamilyHyperLayout, CustomFamilyPsiDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned, fit_custom_family_arming_on_evidence, fit_custom_family_fixed_log_lambdas_from_owned_mode, resolve_custom_family_x_psi_map, shared_dense_arc};
 
 use gam_problem::{
     DenseMatrixHyperOperator, ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms,
@@ -39,7 +39,7 @@ use gam_problem::{
 };
 
 use gam_linalg::faer_ndarray::{
-    FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
+    FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av,
 };
 
 use crate::location_scale_engine::build_location_scale_exact_joint_setup;
@@ -82,7 +82,7 @@ use gam_solve::pirls::LinearInequalityConstraints;
 
 use crate::fit_orchestration::drivers::{
     ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint_typed,
     spatial_length_scale_term_indices,
 };
 use gam_terms::smooth::{
@@ -114,7 +114,7 @@ mod numeric_guards;
 // namespace did. The primitives themselves are `pub(super)` in `numeric_guards`.
 pub(in crate::survival::location_scale) use numeric_guards::{
     compensated_difference, safe_hadamard_product, safe_product, safe_product3, safe_sum2,
-    safe_sum3, sanitize_survival_weight_vector, softplus,
+    sanitize_survival_weight_vector, softplus,
 };
 
 mod constants;

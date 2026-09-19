@@ -14,8 +14,8 @@ theorem actually makes a claim about:
   ``Ddict = 0``; a circle-class chart has span ``s = d + 1 = 2``, so the
   theorem's code term ``(s-d-1)*0.5*log2(lambda/delta)`` is identically zero and
   its matched-recon residual delta is zero; what remains is the support term,
-  which is ``log2 C(G, L0)`` of the two CONFIGURATIONS and contains no fitted
-  quantity. The hybrid's full-linear-span re-score (every atom charged its whole
+  which is the scorer's cardinality-then-subset code ``log2(G+1) + log2 C(G, L0)``
+  of the two CONFIGURATIONS and contains no fitted quantity. The hybrid's full-linear-span re-score (every atom charged its whole
   decoder span rather than the ``d+1`` scalars the theorem's ledger names) is
   drawn as the pessimistic end of the measurement at the acceptance target.
 * **right** — the four-term delta at the acceptance target, so it is visible
@@ -31,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from crossover_theorem_check import selection_bits  # noqa: E402
+from crossover_theorem_check import support_code_bits  # noqa: E402
 
 TARGETS = (0.80, 0.90, 0.95, 0.99)
 ACCEPTANCE_TARGET = 0.99
@@ -95,11 +95,12 @@ def _theorem_support_bits(record: dict) -> tuple[float, float]:
     config spends ``curved_atoms * m`` decoder rows on charts instead of flat
     atoms, and each chart firing consumes ``1 + d`` of the active-scalar budget
     where a flat firing consumes one -- so the hybrid names fewer atoms per token
-    while transmitting the same number of scalars.
+    while transmitting the same number of scalars. Both are priced with the
+    scorer's cardinality-then-subset code at their fixed per-row cardinality.
     """
     flat_actives = int(record["top_k"]) - int(record["curved_k"]) * (1 + int(record["d_atom"]))
-    external = selection_bits(int(record["K"]), int(record["top_k"]))
-    hybrid = selection_bits(
+    external = support_code_bits(int(record["K"]), int(record["top_k"]))
+    hybrid = support_code_bits(
         int(record["k_flat"]) + int(record["curved_atoms"]),
         flat_actives + int(record["curved_k"]),
     )

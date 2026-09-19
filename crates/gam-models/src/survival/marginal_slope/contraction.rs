@@ -6,6 +6,47 @@ use super::*;
 use gam_math::jet_scalar::{JetScalar, OneSeed, TwoSeed};
 
 impl SurvivalMarginalSlopeFamily {
+    /// Resolve one rigid row's inputs and primaries, then evaluate its primary
+    /// tower into `out` through [`Self::write_primary_tower`].
+    pub(crate) fn write_row_primary_tower<
+        const P: usize,
+        G: SlopeRowGeometry<P>,
+        S: JetScalar<P>,
+    >(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        context: &str,
+        out: &mut S,
+    ) -> Result<(), String> {
+        let inputs = rigid_row_inputs(self, block_states, row, context)?;
+        let primaries = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
+        Self::write_primary_tower::<P, G, S>(&primaries, &inputs, out)
+    }
+
+    /// Evaluate one rigid row's primary tower, at the order `S` carries, into `out`.
+    ///
+    /// The one place a primary tower is seeded and evaluated (build.rs refuses a
+    /// tower seed anywhere else in this module's production code). The row
+    /// program keeps all of [`rigid_row_nll`]'s jet intermediates in this
+    /// function's own frame: 64 KiB for the four-primary frames and 276 KiB for
+    /// the six-primary follow-up frame. Inlined into a Rayon closure, that frame
+    /// can be inlined on into the recursive split helper and reserved again at
+    /// every split level, which is how a 2 MiB default worker overflowed
+    /// (gam#2967). Out of line it exists once per thread, at the leaf, and the
+    /// tower leaves through `out`, so the caller holds a pointer rather than a
+    /// tower-sized return slot.
+    #[inline(never)]
+    pub(crate) fn write_primary_tower<const P: usize, G: SlopeRowGeometry<P>, S: JetScalar<P>>(
+        primaries: &[f64; P],
+        inputs: &RigidRowInputs,
+        out: &mut S,
+    ) -> Result<(), String> {
+        let vars: [S; P] = std::array::from_fn(|a| S::variable(primaries[a], a));
+        *out = rigid_row_nll::<P, G, _>(&vars, inputs)?;
+        Ok(())
+    }
+
     /// Evaluate the single-source rigid row program once through order three.
     ///
     /// Three of the four rigid primaries are affine, so static sparsity retains
@@ -16,15 +57,14 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<G::Tower3, String> {
-        let inputs = rigid_row_inputs(
-            self,
-            block_states,
+        let mut tower = G::Tower3::constant(0.0);
+        self.write_row_primary_tower::<P, G, _>(
             row,
+            block_states,
             "survival marginal-slope rigid row helper third",
+            &mut tower,
         )?;
-        let p = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
-        let vars: [G::Tower3; P] = std::array::from_fn(|a| G::Tower3::variable(p[a], a));
-        rigid_row_nll::<P, G, _>(&vars, &inputs)
+        Ok(tower)
     }
 
     /// Contract a previously evaluated sparse row tower with one direction,

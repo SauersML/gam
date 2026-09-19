@@ -548,8 +548,10 @@ impl TruncatedResponseRow {
             }
         }
         let q0 = survival_q0_from_eta(x[1], x[2]);
+        // The scale divides the time transform too (#2695).
+        let time_share = x[0] * exp_sigma_inverse_from_eta_scalar(x[2]);
         let eta = match self.wiggle.as_ref() {
-            None => x[0] + q0,
+            None => time_share + q0,
             Some(wiggle) => {
                 let q0_arr = Array1::from_vec(vec![q0]);
                 let basis = survival_wiggle_basis_with_options(
@@ -584,7 +586,7 @@ impl TruncatedResponseRow {
                 let w_mean = b.dot(&conditional_mean);
                 let w_variance = b.dot(&wiggle.cov_cond.dot(&b)).max(0.0);
                 let w = w_mean + w_variance.sqrt() * tangent[law.tangent_dimension - 1];
-                x[0] + q0 + w
+                time_share + q0 + w
             }
         };
         let probability = inverse_link_survival_prob_checked(&input.inverse_link, eta)?;
@@ -1095,6 +1097,8 @@ mod tests {
                 geometry,
                 penalty_block_trace: Vec::new(),
                 edf_by_block: Vec::new(),
+                edf_rank_bound: Vec::new(),
+                coefficient_mode_selection: Default::default(),
             })
             .expect("valid survival test fit");
             fit.covariance_conditional = Some(sigma_pi.clone());
@@ -1116,7 +1120,10 @@ mod tests {
         let gaussian_fit = make_fit(None);
 
         // Reference. `β_w` is truncated to the cone; `h | β_w` is Gaussian with
-        // the affine conditional mean of the AMBIENT joint; `η = h + q0 + bᵀβ_w`.
+        // the affine conditional mean of the AMBIENT joint; `η = s·h + q0 + bᵀβ_w`
+        // with the deterministic scale `s = e^{−μ_ls}`, which divides the time
+        // transform too (#2695).
+        let time_scale = exp_sigma_inverse_from_eta_scalar(mu_ls);
         let sigma_ww = ambient.slice(s![6..8, 6..8]).to_owned();
         let sigma_hw = a_h.dot(&ambient.slice(s![0..2, 6..8]));
         let var_h_ambient = a_h.dot(&ambient.slice(s![0..2, 0..2]).dot(&a_h));
@@ -1148,7 +1155,7 @@ mod tests {
                 let quadrature = half * weight * (-0.5 * standardized * standardized).exp();
                 let probability = inverse_link_survival_prob_checked(
                     &input.inverse_link,
-                    eta_center + offset,
+                    eta_center + time_scale * offset,
                 )
                 .expect("inverse link");
                 first += quadrature * probability;
@@ -1175,7 +1182,7 @@ mod tests {
             let mut accumulate = |scale: f64, w0: f64, w1: f64| {
                 let value = density(w0, w1);
                 let shift = regression[0] * (w0 - center_w[0]) + regression[1] * (w1 - center_w[1]);
-                let eta_center = mu_h_ambient + shift + q0 + b[0] * w0 + b[1] * w1;
+                let eta_center = time_scale * (mu_h_ambient + shift) + q0 + b[0] * w0 + b[1] * w1;
                 let (m1, m2) = inner(eta_center);
                 reference_mass += scale * value;
                 reference_first += scale * value * m1;

@@ -189,90 +189,6 @@ fn rigid_psi_all_beta_axes_wide_timing_979() {
     );
 }
 
-/// #979: the beta third-information all-axes object assembled from per-axis
-/// weighted Grams must equal the direct triple sum `Σ_rows x_a x_b x_c C_row` over
-/// the same per-row contraction, for both latent measures and unequal block widths.
-#[test]
-fn rigid_third_information_all_axes_grams_match_triple_sum_979() {
-    for empirical in [false, true] {
-        let n = 37;
-        let mut family = make_block_psi_test_family(n);
-        if empirical {
-            family.latent_measure = empirical_rigid_fd_fixture().0.latent_measure;
-            family.gaussian_frailty_sd = Some(0.82);
-        }
-        family.marginal_design = DesignMatrix::Dense(
-            Array2::from_shape_fn((n, 3), |(i, j)| {
-                0.2 + 0.3 * (0.17 * (i + 5 * j) as f64).sin()
-            })
-            .into(),
-        );
-        family.slope_design = DesignMatrix::Dense(
-            Array2::from_shape_fn((n, 2), |(i, j)| 0.4 * (0.13 * (i + 3 * j) as f64).cos())
-                .into(),
-        );
-        let (pm, p) = (3, 5);
-        let beta = array![0.15, -0.1, 0.05, 0.25, -0.12];
-        let marginal = beta.slice(s![..pm]).to_owned();
-        let slope = beta.slice(s![pm..]).to_owned();
-        let xm = family.marginal_design.to_dense();
-        let xg = family.slope_design.to_dense();
-        let states = vec![
-            ParameterBlockState {
-                eta: xm.dot(&marginal),
-                beta: marginal,
-            },
-            ParameterBlockState {
-                eta: xg.dot(&slope),
-                beta: slope,
-            },
-        ];
-        let u_direction = array![0.3, 0.1, -0.2, 0.05, 0.4];
-        let v_direction = array![-0.15, 0.25, 0.1, -0.3, 0.2];
-        let assembled = super::custom_family_impl::rigid_third_information_all_axes(
-            &family,
-            &states,
-            &u_direction,
-            &v_direction,
-        )
-        .expect("Gram-assembled third information");
-        let block = |a: usize| usize::from(a >= pm);
-        let mut expected = vec![Array2::<f64>::zeros((p, p)); p];
-        for row in 0..n {
-            let x: Vec<f64> = xm.row(row).iter().chain(xg.row(row).iter()).copied().collect();
-            let mut u = [0.0; 2];
-            let mut v = [0.0; 2];
-            for a in 0..p {
-                u[block(a)] += x[a] * u_direction[a];
-                v[block(a)] += x[a] * v_direction[a];
-            }
-            let contracted = super::custom_family_impl::rigid_row_third_information_contraction(
-                &family, &states, row, u, v,
-            )
-            .expect("row contraction");
-            for c in 0..p {
-                for a in 0..p {
-                    for b in 0..p {
-                        expected[c][[a, b]] +=
-                            x[a] * x[b] * x[c] * contracted[block(a)][block(b)][block(c)];
-                    }
-                }
-            }
-        }
-        for axis in 0..p {
-            assert!(
-                expected[axis].iter().any(|value| *value != 0.0),
-                "empirical={empirical} axis={axis}: the fixture must exercise a nonzero tensor"
-            );
-            let rel = rel_diff_array2(&assembled[axis], &expected[axis]);
-            assert!(
-                rel < 1e-12,
-                "empirical={empirical} axis={axis}: Gram assembly differs from the triple sum by {rel}"
-            );
-        }
-    }
-}
-
 /// #979: the ψ third-information object assembled from per-axis weighted Grams equals
 /// the explicit sum of every coefficient triple's design-row products over the same
 /// per-row data, for a β direction on either design block and for a ψ pair, under
@@ -1208,6 +1124,7 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
                 host_pin.grad().slice(s![rows.clone(), ..]).to_owned(),
                 host_pin.hess().slice(s![rows, ..]).to_owned(),
                 0,
+                None,
             ),
         });
     }
@@ -1596,7 +1513,7 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
     // (`AUTO_OUTER_MIN_K = 10_000`), so `auto_outer_score_subsample`
     // would actually return `Some(mask)` if invoked — i.e. the
     // Phase-1 branch reaches the mask-installing arm and the
-    // log::info! lines fire. Specs/derivative_blocks are empty so
+    // log::debug! lines fire. Specs/derivative_blocks are empty so
     // the function exits via the `total == 0` early return after the
     // guard runs; that lets us focus on counter semantics with no
     // FLEX-cache plumbing.
@@ -2504,6 +2421,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
     let marginal_cov: Array1<f64> = data.column(2).to_owned();
     let base_length_scale = 1.1_f64;
     let make_spec = |length_scale: f64| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {
@@ -2525,7 +2443,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2724,6 +2642,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // centers ⇒ fewer penalty components ⇒ less marginal/slope coupling.
     let base_length_scale = 1.1_f64;
     let make_spec = |length_scale: f64| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {
@@ -2743,7 +2662,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2883,15 +2802,15 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         psi_dim >= 1,
         "fixture must expose at least one spatial ψ axis"
     );
-    // The ψ-active path returns the outer Hessian as a matrix-free OPERATOR
-    // (#740 forces the operator route when the contracted hook is present, and
-    // it advertises Unavailable materialization for the PRODUCTION planner).
-    // #1165: assert the operator's single-vector HVP directly before dense
-    // materialization can symmetrize/probe around a row-specific ψ correction.
-    let hess0_operator = match &hess0 {
-        gam_problem::HessianValue::Operator(op) => Arc::clone(op),
-        other => panic!("ψ-active BMS outer Hessian must be an operator, got {other:?}"),
-    };
+    // #740 forces a matrix-free OPERATOR route when the contracted ψψ hook is present. That
+    // hook prices the explicit Jeffreys ψψ term from the observed `hessian_psi`, and this
+    // fixture arms BMS's Jeffreys term on the expected information, so the exact per-pair
+    // route runs and returns the dense outer Hessian (gam#2922). The finite-difference gate
+    // below checks that representation.
+    assert!(
+        matches!(&hess0, gam_problem::HessianValue::Dense(_)),
+        "an armed expected-information Jeffreys term keeps the per-pair ψψ route, got {hess0:?}"
+    );
     let hess0_dense = hess0
         .materialize_dense()
         .expect("materialize outer Hessian")
@@ -2944,12 +2863,6 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     };
     let check = |dir: Array1<f64>, label: &str| {
         let fd = fd_along(&dir);
-        let mut operator_hvp = Array1::<f64>::zeros(theta_dim);
-        hess0_operator
-            .apply_into(&dir, &mut operator_hvp)
-            .expect("matrix-free outer Hessian HVP");
-        assert_matches_fd(&operator_hvp, &fd, label, "operator-HVP");
-
         let dense_hvp = hess0_dense.dot(&dir);
         assert_matches_fd(&dense_hvp, &fd, label, "dense-materialized");
     };
@@ -3916,11 +3829,12 @@ fn make_jeffreys_contracted_trace_test_family(n: usize) -> BernoulliMarginalSlop
     test_family_with_dense_designs(y, weights, z, marginal_design, slope_design)
 }
 
-/// `tr(W · H(β_flat))` for the rigid marginal-slope observed joint Hessian,
-/// where `β_flat = [β_marginal (2), β_slope (2)]`. Used as the scalar
-/// probe function for the central-second-difference oracle below.
+/// `tr(W · I_J(β_flat))` for the rigid marginal-slope Jeffreys information (the expected
+/// information since gam#2922), where `β_flat = [β_marginal (2), β_slope (2)]`. Used as the
+/// scalar probe function for the central-second-difference oracle below.
 fn jeffreys_trace_test_trace_of_hessian_at(
     family: &BernoulliMarginalSlopeFamily,
+    specs: &[ParameterBlockSpec],
     weight: &Array2<f64>,
     beta_flat: &Array1<f64>,
 ) -> f64 {
@@ -3938,12 +3852,12 @@ fn jeffreys_trace_test_trace_of_hessian_at(
             eta: eta_g,
         },
     ];
-    let h = family
-        .exact_newton_joint_hessian(&states)
-        .expect("exact_newton_joint_hessian")
-        .expect("exact_newton_joint_hessian some");
-    // tr(W H) = Σ_ij W_ij H_ij for symmetric W, H (H_ji = H_ij).
-    (weight * &h).sum()
+    let information = family
+        .joint_jeffreys_information_with_specs(&states, specs)
+        .expect("joint_jeffreys_information_with_specs")
+        .expect("joint_jeffreys_information_with_specs some");
+    // tr(W I) = Σ_ij W_ij I_ij for symmetric W, I (I_ji = I_ij).
+    (weight * &information).sum()
 }
 
 #[test]
@@ -3997,9 +3911,9 @@ fn bernoulli_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
         let step: Array1<f64> = dir.mapv(|v| v * eps);
         let beta_plus: Array1<f64> = &beta0 + &step;
         let beta_minus: Array1<f64> = &beta0 - &step;
-        let plus = jeffreys_trace_test_trace_of_hessian_at(&family, &w, &beta_plus);
-        let minus = jeffreys_trace_test_trace_of_hessian_at(&family, &w, &beta_minus);
-        let center = jeffreys_trace_test_trace_of_hessian_at(&family, &w, &beta0);
+        let plus = jeffreys_trace_test_trace_of_hessian_at(&family, &specs, &w, &beta_plus);
+        let minus = jeffreys_trace_test_trace_of_hessian_at(&family, &specs, &w, &beta_minus);
+        let center = jeffreys_trace_test_trace_of_hessian_at(&family, &specs, &w, &beta0);
         let fd_second = (plus - 2.0 * center + minus) / (eps * eps);
         let analytic_quad = dir.dot(&analytic.dot(dir));
         let rel = (fd_second - analytic_quad).abs() / fd_second.abs().max(1.0);

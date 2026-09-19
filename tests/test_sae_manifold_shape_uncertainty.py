@@ -13,14 +13,13 @@ def _fit_circle(n: int = 400, noise: float = 0.18, seed: int = 0, n_iter: int = 
     t = rng.uniform(0.0, 1.0, n)
     clean = np.column_stack([np.cos(2 * np.pi * t), np.sin(2 * np.pi * t)])
     x = clean + noise * rng.standard_normal((n, 2))
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=x,
         K=1,
         d_atom=1,
         atom_topology="circle",
         assignment="softmax",
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=n_iter,

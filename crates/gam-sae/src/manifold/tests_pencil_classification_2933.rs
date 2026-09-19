@@ -49,18 +49,22 @@ impl ExactAPencilMetric for DensePencilMetric {
         Ok(self.substituted.dot(&v))
     }
 
-    fn lower_solve(&self, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-        Ok(gam_linalg::triangular::forward_substitution_lower_vector(&self.lower, v))
+    fn lower_solve(&self, v: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        Ok(gam_linalg::triangular::forward_substitution_lower_matrix(&self.lower, v))
     }
 
-    fn lower_transpose_solve(&self, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-        Ok(gam_linalg::triangular::back_substitution_lower_transpose(&self.lower, v))
+    fn lower_transpose_solve(&self, v: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        Ok(gam_linalg::triangular::back_substitution_lower_transpose_matrix(&self.lower, v))
     }
 
     fn log_det(&self) -> Result<f64, String> {
         Ok((0..self.lower.nrows())
             .map(|index| 2.0 * self.lower[[index, index]].ln())
             .sum())
+    }
+
+    fn frobenius_norm(&self) -> Result<f64, String> {
+        Ok(self.metric.iter().map(|value| value * value).sum::<f64>().sqrt())
     }
 }
 
@@ -222,14 +226,15 @@ fn the_audit_congruence_keeps_the_retained_subspace_the_solve_and_the_value_2933
 
 /// #2228 contract. A non-empty band is not a failed solve: the solve steps on the resolvable
 /// complement and lists each direction it held out with its `|μ|` and edge. The root
-/// refinement counts the hold and takes that complement step, and skips only where the band
-/// holds every direction.
+/// refinement counts the hold and takes that complement step, skips where the band holds
+/// every direction, and takes no step where the solve resolves a negative curvature, since
+/// `−A⁺g` moves along it toward a saddle.
 #[test]
 fn a_band_direction_yields_the_complement_step_and_is_counted_by_the_root_refinement_2933() {
     let identity = Array2::<f64>::eye(3);
     let held = 1.0e-13_f64;
-    let block = pencil_block(&Array2::from_diag(&array![3.0, held, -2.0]), &identity, &identity);
-    assert_eq!(census(&block), (1, 1, 1), "the fixture must hold exactly one direction in the band");
+    let block = pencil_block(&Array2::from_diag(&array![3.0, held, 2.0]), &identity, &identity);
+    assert_eq!(census(&block), (2, 1, 0), "the fixture must hold exactly one direction in the band");
 
     let rhs = array![6.0, 5.0, 4.0];
     let solve = block
@@ -237,10 +242,11 @@ fn a_band_direction_yields_the_complement_step_and_is_counted_by_the_root_refine
         .expect("#2228: a non-empty band is not a failed solve");
     let step = flatten(&solve.step);
     assert!(
-        (step[0] - 2.0).abs() <= 1.0e-12 && step[1].abs() <= 1.0e-12 && (step[2] + 2.0).abs() <= 1.0e-12,
+        (step[0] - 2.0).abs() <= 1.0e-12 && step[1].abs() <= 1.0e-12 && (step[2] - 2.0).abs() <= 1.0e-12,
         "the step must be A⁺rhs on the resolvable complement, got {step:?}"
     );
-    assert_eq!(solve.retained_rank, 2, "the complement retains the positive and the negative direction");
+    assert_eq!(solve.retained_rank, 2, "the complement retains both positive directions");
+    assert_eq!(solve.negative_curvature, None, "the fixture resolves no negative curvature");
     assert_eq!(solve.band.len(), 1, "the band list must name the held direction");
     // `dim·ε·‖A‖₂` is the eigensolver's backward error on this fixture.
     assert!(
@@ -250,40 +256,68 @@ fn a_band_direction_yields_the_complement_step_and_is_counted_by_the_root_refine
         solve.band[0]
     );
 
-    // `(band holds, band skips, solve failures)`.
+    // `(band holds, band skips, solve failures, negative-curvature no-steps)`.
     let counts = |term: &SaeManifoldTerm| {
         let counts = term.evidence_root_telemetry.counts();
-        (counts.band_holds, counts.band_skips, counts.solve_failures)
+        (
+            counts.band_holds,
+            counts.band_skips,
+            counts.solve_failures,
+            counts.negative_curvature_no_steps,
+        )
     };
     let term = crate::manifold::tests::trivial_k1_euclidean_term();
-    assert_eq!(counts(&term), (0, 0, 0), "a fresh term starts with an empty ledger");
+    assert_eq!(counts(&term), (0, 0, 0, 0), "a fresh term starts with an empty ledger");
     let root_step = flatten(
         &term
             .evidence_root_step_from_pencil(Ok(solve))
             .expect("the resolvable complement carries a root step"),
     );
     assert_eq!(root_step, -&step, "the root step is −A⁺g on the resolvable complement");
-    assert_eq!(counts(&term), (1, 0, 0), "a band hold that still steps is a hold");
+    assert_eq!(counts(&term), (1, 0, 0, 0), "a band hold that still steps is a hold");
 
-    let resolved = pencil_block(&Array2::from_diag(&array![3.0, 1.0, -2.0]), &identity, &identity);
+    let resolved = pencil_block(&Array2::from_diag(&array![3.0, 1.0, 2.0]), &identity, &identity);
     let resolved_solve = resolved
         .solve_stationarity(&border(&rhs))
         .expect("a full-rank solve");
     assert!(resolved_solve.band.is_empty(), "the resolved fixture must have an empty band");
     term.evidence_root_step_from_pencil(Ok(resolved_solve))
         .expect("a full-rank solve carries a root step");
-    assert_eq!(counts(&term), (1, 0, 0), "an empty band must not be counted");
+    assert_eq!(counts(&term), (1, 0, 0, 0), "an empty band must not be counted");
 
+    // A resolved negative curvature: `A⁺` keeps it with `1/μ < 0`, so `−A⁺g` would climb it.
+    let saddle = pencil_block(&Array2::from_diag(&array![3.0, 1.0, -2.0]), &identity, &identity);
+    let saddle_solve = saddle
+        .solve_stationarity(&border(&rhs))
+        .expect("an indefinite full-rank solve is not a failed solve");
+    let negative = saddle_solve
+        .negative_curvature
+        .expect("the solve must report the resolved negative curvature");
+    // `dim·ε·‖A‖₂` is the eigensolver's backward error on this fixture.
+    assert!(
+        negative.directions == 1
+            && (negative.min_curvature + 2.0).abs() <= 9.0 * f64::EPSILON
+            && negative.edge == sae_exact_a_pencil_floor(),
+        "the report must carry the one negative direction, its μ and its edge, got {negative:?}"
+    );
+    assert!(
+        term.evidence_root_step_from_pencil(Ok(saddle_solve)).is_none(),
+        "a resolved negative curvature leaves no root step"
+    );
+    assert_eq!(counts(&term), (1, 0, 0, 1), "a negative curvature is its own no-step");
+
+    // `−held` sits inside the band, so no direction here is a resolved negative curvature.
     let flat = pencil_block(&Array2::from_diag(&array![held, 2.0 * held, -held]), &identity, &identity);
     let flat_solve = flat
         .solve_stationarity(&border(&rhs))
         .expect("#2228: a band holding every direction is not a failed solve");
     assert_eq!((flat_solve.retained_rank, flat_solve.band.len()), (0, 3));
+    assert_eq!(flat_solve.negative_curvature, None, "an in-band negative μ is not resolved");
     assert!(
         term.evidence_root_step_from_pencil(Ok(flat_solve)).is_none(),
         "a band holding every direction leaves no root step"
     );
-    assert_eq!(counts(&term), (1, 1, 0), "a band holding every direction is a skip, not a hold");
+    assert_eq!(counts(&term), (1, 1, 0, 1), "a band holding every direction is a skip, not a hold");
 
     // The outer objective restores a saved clone after a value probe; the ledger is shared, so
     // an outcome recorded on the clone that runs the probe survives the restore.
@@ -294,7 +328,7 @@ fn a_band_direction_yields_the_complement_step_and_is_counted_by_the_root_refine
             .is_none(),
         "a failed solve leaves no root step"
     );
-    assert_eq!(counts(&term), (1, 1, 1), "a failed solve is counted on the shared ledger");
+    assert_eq!(counts(&term), (1, 1, 1, 1), "a failed solve is counted on the shared ledger");
 }
 
 /// A declared gauge direction keeps its unit pin in both `Φ` and `A` (the raw restoration skips
@@ -724,7 +758,10 @@ fn the_prepared_metric_factors_the_metric_it_applies_2933() {
         let dim = prepared.dim();
         let mut dense = Array2::<f64>::zeros((dim, dim));
         let mut substituted = Array2::<f64>::zeros((dim, dim));
-        let mut whitened = Array2::<f64>::zeros((dim, dim));
+        let half = prepared
+            .lower_transpose_solve(Array2::<f64>::eye(dim).view())
+            .expect("transpose triangular solve");
+        let mut image = Array2::<f64>::zeros((dim, dim));
         let mut unit = Array1::<f64>::zeros(dim);
         for column in 0..dim {
             unit[column] = 1.0;
@@ -734,15 +771,12 @@ fn the_prepared_metric_factors_the_metric_it_applies_2933() {
             substituted
                 .column_mut(column)
                 .assign(&prepared.substituted_image(unit.view()).expect("substituted image"));
-            let half = prepared
-                .lower_transpose_solve(unit.view())
-                .expect("transpose triangular solve");
-            let image = prepared.apply(half.view()).expect("metric apply");
-            whitened
+            image
                 .column_mut(column)
-                .assign(&prepared.lower_solve(image.view()).expect("triangular solve"));
+                .assign(&prepared.apply(half.column(column)).expect("metric apply"));
             unit[column] = 0.0;
         }
+        let whitened = prepared.lower_solve(image.view()).expect("triangular solve");
         let identity_error = (&whitened - &Array2::<f64>::eye(dim))
             .iter()
             .fold(0.0_f64, |m, x| m.max(x.abs()));
@@ -759,6 +793,13 @@ fn the_prepared_metric_factors_the_metric_it_applies_2933() {
             (factored_log_det - dense_log_det).abs() <= f64::EPSILON.sqrt() * (1.0 + dense_log_det.abs()),
             "{label}: log|Φ| from the factor {factored_log_det:.12e} != dense {dense_log_det:.12e}"
         );
+        // #2267: the block builder reads ‖Φ‖_F off the metric's entries, not `dim` applies.
+        let dense_frobenius = dense.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let entries_frobenius = prepared.frobenius_norm().expect("metric Frobenius norm");
+        assert!(
+            (entries_frobenius - dense_frobenius).abs() <= f64::EPSILON.sqrt() * dense_frobenius,
+            "{label}: ‖Φ‖_F from the entries {entries_frobenius:.12e} != dense {dense_frobenius:.12e}"
+        );
         let expected = &dense - &embedding.t().dot(&raw).dot(&embedding);
         let scale = dense.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         let substitution_error = (&substituted - &expected)
@@ -768,6 +809,111 @@ fn the_prepared_metric_factors_the_metric_it_applies_2933() {
             substitution_error <= f64::EPSILON.sqrt() * scale,
             "{label}: the substituted image must be Φ − B_raw, max error {substitution_error:.3e} \
              against scale {scale:.3e}"
+        );
+
+        // #2933 F36/F39: the whitening solves a whole block of right-hand sides at once, so
+        // its sums run in another order than one column at a time, and the result is compared
+        // to rounding, not to the bit. A triangular solve is exact for `L + ΔL`,
+        // `|ΔL| ≤ γ_n|L|` (Higham, Thm 8.5), so each side of one whitening moves `Ã = L⁻¹AL⁻ᵀ`
+        // by at most `γ_n·cond(L)·‖Ã‖₂`, with `cond(L) = ‖|L⁻¹||L|‖ ≤ n·κ₂(Φ)^½`. Two sides
+        // of two whitenings give `4γ_n·n·κ₂(Φ)^½·‖Ã‖₂`.
+        let operator = {
+            let pulled_back = embedding.t().dot(&raw).dot(&embedding);
+            (&pulled_back + &pulled_back.t()) * 0.5
+        };
+        let unit_roundoff = 0.5 * f64::EPSILON;
+        let gamma = dim as f64 * unit_roundoff / (1.0 - dim as f64 * unit_roundoff);
+        let condition = values[dim - 1] / values[0];
+        let solve_band = |whitened_norm: f64| {
+            4.0 * gamma * dim as f64 * condition.sqrt() * whitened_norm
+        };
+        let block = prepared
+            .lower_solve(
+                prepared
+                    .lower_solve(operator.view())
+                    .expect("block triangular solve")
+                    .t(),
+            )
+            .expect("block triangular solve");
+        let columnwise = |rhs: ArrayView2<'_, f64>| -> Array2<f64> {
+            let mut out = Array2::<f64>::zeros(rhs.raw_dim());
+            for column in 0..rhs.ncols() {
+                out.column_mut(column).assign(
+                    &prepared
+                        .lower_solve(rhs.slice(s![.., column..column + 1]))
+                        .expect("one-column triangular solve")
+                        .column(0),
+                );
+            }
+            out
+        };
+        let by_columns = columnwise(columnwise(operator.view()).t());
+        let symmetrized = (&block + &block.t()) * 0.5;
+        let (block_spectrum, _) = symmetrized.eigh(Side::Lower).expect("whitened eigendecomposition");
+        let whitened_norm = block_spectrum.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        assert!(
+            whitened_norm > 0.0,
+            "{label}: non-vacuity, the pulled-back majorizer must whiten to a nonzero operator"
+        );
+        let order_error = (&block - &by_columns).iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        eprintln!(
+            "[2933-F39] {label}: dim={dim} κ₂(Φ)={condition:.3e} ‖Ã‖₂={whitened_norm:.3e}: block vs \
+             column max error {order_error:.3e}, band {:.3e}",
+            solve_band(whitened_norm)
+        );
+        assert!(
+            order_error <= solve_band(whitened_norm),
+            "{label}: the block whitening must be the column-by-column whitening to rounding: \
+             max error {order_error:.3e} against the band {:.3e}",
+            solve_band(whitened_norm)
+        );
+
+        // The pencil spectrum against an independent whitening by the dense Cholesky factor of
+        // the applied `Φ`. A factor with `L⁻¹ΦL⁻ᵀ = I + F` whitens the pencil of `L·Lᵀ`, whose
+        // eigenvalues lie within a factor `[1/(1+‖F‖), 1/(1−‖F‖)]` of the pencil `(A, Φ)`'s
+        // (Ostrowski), so each factor contributes `‖F‖/(1−‖F‖)·|λᵢ|` and its solves the band above.
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        use gam_linalg::triangular::forward_substitution_lower_matrix;
+        let symmetric_metric = (&dense + &dense.t()) * 0.5;
+        let reference_lower = symmetric_metric
+            .cholesky(Side::Lower)
+            .expect("dense Cholesky of the applied metric")
+            .lower_triangular();
+        let reference_whiten = |matrix: &Array2<f64>| {
+            forward_substitution_lower_matrix(
+                &reference_lower,
+                forward_substitution_lower_matrix(&reference_lower, matrix).t(),
+            )
+        };
+        let frobenius = |matrix: &Array2<f64>| matrix.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let block_residual = frobenius(&(&whitened - &Array2::<f64>::eye(dim)));
+        let reference_residual =
+            frobenius(&(&reference_whiten(&symmetric_metric) - &Array2::<f64>::eye(dim)));
+        let reference = reference_whiten(&operator);
+        let (reference_spectrum, _) = ((&reference + &reference.t()) * 0.5)
+            .eigh(Side::Lower)
+            .expect("reference whitened eigendecomposition");
+        let mut worst = (0.0_f64, 0);
+        for index in 0..dim {
+            let (ours, theirs) = (block_spectrum[index], reference_spectrum[index]);
+            let band = block_residual / (1.0 - block_residual) * ours.abs()
+                + reference_residual / (1.0 - reference_residual) * theirs.abs()
+                + solve_band(whitened_norm);
+            if (ours - theirs).abs() / band > worst.0 {
+                worst = ((ours - theirs).abs() / band, index);
+            }
+            assert!(
+                (ours - theirs).abs() <= band,
+                "{label}: pencil eigenvalue {index} of the block whitening {ours:.12e} is not the \
+                 dense metric's {theirs:.12e} within the band {band:.3e} (residuals ‖F‖ = \
+                 {block_residual:.3e}, {reference_residual:.3e})"
+            );
+        }
+        eprintln!(
+            "[2933-F39] {label}: residuals ‖F‖ = {block_residual:.3e} (block), \
+             {reference_residual:.3e} (dense); worst eigenvalue deviation {:.3e} of its band at \
+             index {}",
+            worst.0, worst.1
         );
     }
 }

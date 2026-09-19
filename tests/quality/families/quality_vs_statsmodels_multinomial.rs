@@ -904,8 +904,7 @@ fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
     let true_coef = mn_true_coef();
     let class_name = |c: usize| MN_CLASS_NAMES[c];
 
-    // Large UNPENALIZED-regime fit so the Laplace covariance is the dominant
-    // uncertainty and S_λ is negligible against the data information.
+    // Large UNPENALIZED fit, so the stored covariance is exactly the Laplace H⁻¹.
     let n_train = 4000usize;
     let mut rows: Vec<StringRecord> = Vec::with_capacity(n_train);
     let mut xrows: Vec<[f64; 3]> = Vec::with_capacity(n_train);
@@ -923,15 +922,24 @@ fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
     let headers = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode train dataset");
 
+    // Since b7b874a2a1 a bare `x` carries the null-recovery ridge, and REML keeps
+    // it here (λ ≈ 0.1-3), so the stored (H + S_λ)⁻¹ sits up to 9% off H⁻¹ in
+    // correlation scale, and one near-zero entry flips sign (job 1333433). Both
+    // slopes opt out, which is the configuration this identity describes.
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         data: &data,
-        formula: "y ~ x1 + x2",
+        formula: "y ~ linear(x1, double_penalty=false) + linear(x2, double_penalty=false)",
         config: &FitConfig::default(),
         init_lambda: 1.0,
         max_iter: 100,
         tol: 1e-9,
     })
     .expect("multinomial formula fit");
+    assert!(
+        model.lambdas.is_empty(),
+        "the opted-out fit must carry no penalty, got lambdas {:?}",
+        model.lambdas
+    );
     let p = model.p_per_class;
     let m = model.n_active_classes;
     let d = p * m;
@@ -956,8 +964,10 @@ fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
     let info = multinomial_observed_information(&beta, &xrows);
     let cov_indep = invert_dense(&info).expect("observed information must be invertible");
 
-    // The penalty is tiny but nonzero (FitConfig default ridge), so allow a small
-    // relative tolerance — the identity is exact only in the unpenalized limit.
+    // With no penalty the two covariances differ only by the rounding of two
+    // independent inversions (4.2e-14 in job 1336104). The bar is far above
+    // that and far below the O(1) deviation of a mis-scaled, transposed or
+    // cross-term-dropping covariance.
     let mut max_rel = 0.0_f64;
     for r in 0..d {
         for c in 0..d {

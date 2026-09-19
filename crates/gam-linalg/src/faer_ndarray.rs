@@ -406,7 +406,7 @@ impl Drop for FaerSequentialScope {
 ///
 /// The depth is what distinguishes "faer is sequential because a solve here
 /// asked for it" from "faer is sequential and nobody knows who did it", and it
-/// is readable without a logger, which `log::info!` is not under `cargo test`.
+/// is readable without a logger, which `log::debug!` is not under `cargo test`.
 pub(crate) fn faer_sequential_scope_depth() -> usize {
     FAER_SEQ_STATE
         .lock()
@@ -440,6 +440,10 @@ pub enum FaerLinalgError {
     SelfAdjointEigen(solvers::EvdError),
     #[error("General eigendecomposition failed: {0:?}")]
     GeneralEigen(solvers::EvdError),
+    #[error(
+        "General eigendecomposition certificate refused: {arm} at slot {slot} measured {measured:.3e} against band {band:.3e}"
+    )]
+    GeneralEigenCertificateRefused { arm: &'static str, slot: usize, measured: f64, band: f64 },
     #[error("Cholesky factorization failed: {0:?}")]
     Cholesky(solvers::LltError),
     #[error("LDLT factorization failed: {0:?}")]
@@ -613,6 +617,20 @@ impl FaerLdlt {
     }
 }
 
+/// The inertia of a symmetric matrix read off its Bunch–Kaufman factor (#2901).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SymmetricInertia {
+    pub negative: usize,
+    pub zero: usize,
+    pub positive: usize,
+    /// The smallest eigenvalue of the factor's 1×1 and 2×2 pivot blocks: NaN when any
+    /// pivot is not finite, `+∞` for an empty matrix.
+    pub smallest_pivot: f64,
+    /// `‖L̂‖_F²·‖B̂‖_∞`, a bound on `‖ |L̂||B̂||L̂ᵀ| ‖₂`, the factors' term in the
+    /// factorization's backward error.
+    pub factor_magnitude: f64,
+}
+
 /// `P A Pᵀ = L B Lᵀ` (Bunch-Kaufman) of a symmetric matrix at
 /// [`decomposition_parallelism`].
 #[derive(Clone)]
@@ -659,6 +677,69 @@ impl FaerLblt {
             b_subdiag,
             perm,
         }
+    }
+
+    /// The inertia of the factored matrix, read off `B` (#2901).
+    ///
+    /// `P A Pᵀ = L B Lᵀ` with `L` unit lower triangular is a congruence, so by
+    /// Sylvester's law of inertia `A` has as many negative, zero and positive
+    /// eigenvalues as `B`. `B` is block diagonal: a nonzero subdiagonal entry at `k`
+    /// opens a 2×2 block on `k, k + 1`, and every other index is a 1×1 block. The
+    /// eigenvalues of `B` are those of its blocks.
+    pub fn inertia(&self) -> SymmetricInertia {
+        let n = self.l.nrows();
+        let b_diag = self.b_diag.as_ref();
+        let b_subdiag = self.b_subdiag.as_ref();
+        let mut inertia = SymmetricInertia {
+            negative: 0,
+            zero: 0,
+            positive: 0,
+            smallest_pivot: f64::INFINITY,
+            factor_magnitude: 0.0,
+        };
+        let mut finite = true;
+        let mut block_norm = 0.0_f64;
+        let mut count = |value: f64, inertia: &mut SymmetricInertia| {
+            if !value.is_finite() {
+                finite = false;
+            } else if value < 0.0 {
+                inertia.negative += 1;
+            } else if value > 0.0 {
+                inertia.positive += 1;
+            } else {
+                inertia.zero += 1;
+            }
+            inertia.smallest_pivot = inertia.smallest_pivot.min(value);
+        };
+        let mut k = 0;
+        while k < n {
+            let a = b_diag[k];
+            if k + 1 < n && b_subdiag[k] != 0.0 {
+                let c = b_subdiag[k];
+                let d = b_diag[k + 1];
+                let mean = 0.5 * (a + d);
+                let radius = (0.5 * (a - d)).hypot(c);
+                count(mean - radius, &mut inertia);
+                count(mean + radius, &mut inertia);
+                block_norm = block_norm.max((a.abs() + c.abs()).max(c.abs() + d.abs()));
+                k += 2;
+            } else {
+                count(a, &mut inertia);
+                block_norm = block_norm.max(a.abs());
+                k += 1;
+            }
+        }
+        if !finite {
+            inertia.smallest_pivot = f64::NAN;
+        }
+        let mut lower_frobenius_sq = 0.0_f64;
+        for j in 0..n {
+            for i in j..n {
+                lower_frobenius_sq += self.l[(i, j)] * self.l[(i, j)];
+            }
+        }
+        inertia.factor_magnitude = lower_frobenius_sq * block_norm;
+        inertia
     }
 
     /// The dimension of the factored matrix.
@@ -1008,12 +1089,15 @@ const fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
         && m.saturating_mul(n).saturating_mul(k) >= MIN_FLOP_SCALE
 }
 
+/// Multiply-adds below which a product runs sequentially: the parallel split
+/// costs more than it saves.
+const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
+
 #[inline]
 pub fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     // Prefer a work-based policy over per-dimension thresholds.
     // Tall/skinny products (e.g. N x p with large N, modest p) should still
     // parallelize when total work is high.
-    const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
     const PAR_MIN_LONG_DIM: usize = 256;
     let flop_scale = m.saturating_mul(n).saturating_mul(k);
     let long_dim = m.max(n).max(k);
@@ -1024,6 +1108,115 @@ pub fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
         pool_parallelism()
     } else {
         Par::Seq
+    }
+}
+
+/// Rows per block when the `m×n` product of a `k`-row contraction runs as a
+/// row-block reduction ([`row_block_contraction`]), or `None` when it runs as one
+/// faer GEMM at [`matmul_parallelism`].
+///
+/// faer parallelizes a GEMM over output tiles, and every `k`-block of the
+/// contraction ends in a gang barrier across the whole pool. A reduction-shaped
+/// product — a Gram or cross-product of a tall design, `p×q` output from `n`
+/// rows — has one or two output tiles, so the other workers spin at a barrier
+/// several hundred times per product, and under oversubscription (joblib
+/// `n_jobs=-1`, `cross_val_score(n_jobs=-1)`) the gang waits on descheduled
+/// members: four concurrent `n = 1e5` fits took 3× the wall of one-thread fits.
+/// These products split the rows instead ([`crate::parallel::row_contraction_block_rows`]).
+#[inline]
+fn row_contraction_rows(m: usize, n: usize, k: usize) -> Option<usize> {
+    if m.saturating_mul(n).saturating_mul(k) < PAR_MIN_FLOP_SCALE {
+        return None;
+    }
+    crate::parallel::row_contraction_block_rows(m.saturating_mul(n))
+}
+
+/// `out (+)= lhsᵀ·diag(w)·rhs` (`diag(w)` omitted when `weights` is `None`) as a
+/// row-block reduction: rows `[b·block_rows, (b+1)·block_rows)` form block `b`,
+/// each block is one sequential GEMM into a private partial, and the partials
+/// are combined over [`crate::pairwise_reduce::par_deterministic_block_fold_by_work`].
+///
+/// **Determinism.** The blocks come from the shape alone and the combine tree
+/// from the block count alone, so the product is bit-identical at every pool
+/// width and whichever worker runs which block; faer's sequential GEMM is
+/// deterministic within a block. The rows are summed in a different order than
+/// one faer GEMM over all `k` rows, so the words differ from that path once,
+/// by summation order only, and are invariant across thread counts after.
+///
+/// **Scheduling.** The fold is `rayon::join` work stealing, never a barrier: a
+/// worker that is descheduled delays only the block it holds, and a call from
+/// inside a saturated pool runs its blocks inline. The same holds when the
+/// caller asked for [`Par::Seq`] from an outer parallel region, so no degree is
+/// taken from the caller: the split, and so the bits, never depend on it.
+///
+/// With [`BlockStructure::TriangularLower`] only the lower triangle of each
+/// partial is formed; the caller mirrors.
+fn row_block_contraction(
+    out: &mut Array2<f64>,
+    accum: faer::Accum,
+    lhs: MatRef<'_, f64>,
+    rhs: MatRef<'_, f64>,
+    weights: Option<&[f64]>,
+    structure: faer::linalg::matmul::triangular::BlockStructure,
+    block_rows: usize,
+) {
+    use faer::Accum;
+    use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
+
+    let k = lhs.nrows();
+    let (m, n) = (lhs.ncols(), rhs.ncols());
+    assert_eq!(rhs.nrows(), k, "row-block contraction operands must share rows");
+    assert_eq!(out.dim(), (m, n), "row-block contraction output shape");
+    if let Some(w) = weights {
+        assert_eq!(w.len(), k, "row-block contraction weights must match rows");
+    }
+    let n_blocks = k.div_ceil(block_rows.max(1));
+    let block_product = |part: &mut Array2<f64>, block: usize| {
+        let start = block * block_rows;
+        let rows = block_rows.min(k - start);
+        let lhs_block = lhs.subrows(start, rows).transpose();
+        let rhs_block = rhs.subrows(start, rows);
+        let scaled;
+        let rhs_block = match weights {
+            None => rhs_block,
+            Some(w) => {
+                let w = &w[start..start + rows];
+                scaled = Mat::<f64>::from_fn(rows, n, |i, j| w[i] * rhs_block[(i, j)]);
+                scaled.as_ref()
+            }
+        };
+        tri_matmul(
+            array2_to_matmut(part),
+            structure,
+            Accum::Add,
+            lhs_block,
+            BlockStructure::Rectangular,
+            rhs_block,
+            BlockStructure::Rectangular,
+            1.0,
+            Par::Seq,
+        );
+    };
+    let total = crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        n_blocks,
+        block_rows,
+        |blocks: core::ops::Range<usize>| {
+            let mut part = Array2::<f64>::zeros((m, n));
+            for block in blocks {
+                block_product(&mut part, block);
+            }
+            part
+        },
+        |mut left: Array2<f64>, right: Array2<f64>| {
+            left += &right;
+            left
+        },
+    );
+    match (total, accum) {
+        (Some(total), Accum::Replace) => out.assign(&total),
+        (Some(total), Accum::Add) => *out += &total,
+        (None, Accum::Replace) => out.fill(0.0),
+        (None, Accum::Add) => {}
     }
 }
 
@@ -1101,10 +1294,23 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
         return;
     }
 
-    let mut outview = array2_to_matmut(out);
-
     let aview = FaerArrayView::new(a);
     let a_ref = aview.as_ref();
+    if let Some(block_rows) = row_contraction_rows(p, p, n) {
+        row_block_contraction(
+            out,
+            Accum::Replace,
+            a_ref,
+            a_ref,
+            None,
+            BlockStructure::TriangularLower,
+            block_rows,
+        );
+        mirror_lower_to_upper(out);
+        return;
+    }
+
+    let mut outview = array2_to_matmut(out);
     let a_t = a_ref.transpose();
     let par = matmul_parallelism(p, p, n);
     tri_matmul(
@@ -1118,7 +1324,13 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
         1.0,
         par,
     );
-    // Mirror lower triangle to upper to populate the full symmetric output.
+    mirror_lower_to_upper(out);
+}
+
+/// Copy the lower triangle of a square matrix onto its upper triangle.
+#[inline]
+fn mirror_lower_to_upper(out: &mut Array2<f64>) {
+    let p = out.nrows();
     for i in 0..p {
         for j in (i + 1)..p {
             out[[i, j]] = out[[j, i]];
@@ -1164,12 +1376,28 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return a.t().dot(b);
     }
 
-    let mut result = Mat::<f64>::zeros(p, q);
-
     let aview = FaerArrayView::new(a);
     let bview = FaerArrayView::new(b);
     let a_ref = aview.as_ref();
     let b_ref = bview.as_ref();
+
+    // A reduction-shaped product splits its rows whatever `par` says; see
+    // `row_block_contraction` for why the caller's degree cannot enter.
+    if let Some(block_rows) = row_contraction_rows(p, q, n_a) {
+        let mut out = Array2::<f64>::zeros((p, q));
+        row_block_contraction(
+            &mut out,
+            Accum::Replace,
+            a_ref,
+            b_ref,
+            None,
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            block_rows,
+        );
+        return out;
+    }
+
+    let mut result = Mat::<f64>::zeros(p, q);
 
     // dst = A^T * B
     matmul(
@@ -2150,6 +2378,42 @@ pub fn stream_weighted_crossprod_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>
         return;
     }
 
+    if let Some(block_rows) = row_contraction_rows(p, p, n) {
+        // Row-block reduction: each block row-scales at most `block_rows × p`
+        // cells, the same bound on the working set as the streamed chunk below.
+        let x_view = FaerArrayView::new(x);
+        let x_ref = x_view.as_ref();
+        let w_owned;
+        let w_slice = match w.as_slice() {
+            Some(slice) => slice,
+            None => {
+                w_owned = w.to_vec();
+                w_owned.as_slice()
+            }
+        };
+        let accum = match accum {
+            CrossprodAccum::Replace => Accum::Replace,
+            CrossprodAccum::Add => Accum::Add,
+        };
+        let block_structure = match structure {
+            CrossprodStructure::SymmetricLower => BlockStructure::TriangularLower,
+            CrossprodStructure::Full => BlockStructure::Rectangular,
+        };
+        row_block_contraction(
+            out,
+            accum,
+            x_ref,
+            x_ref,
+            Some(w_slice),
+            block_structure,
+            block_rows,
+        );
+        if structure == CrossprodStructure::SymmetricLower {
+            mirror_lower_to_upper(out);
+        }
+        return;
+    }
+
     // Streaming chunked: peak allocation is chunk_rows × p instead of n × p.
     let chunk_rows = streaming_chunk_rows(p, n);
 
@@ -2292,6 +2556,30 @@ fn fast_xt_diag_y_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem
     if !should_use_faer_matmul(px, q, n) {
         let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
         return x.t().dot(&w_y);
+    }
+
+    if let Some(block_rows) = row_contraction_rows(px, q, n) {
+        let x_view = FaerArrayView::new(x);
+        let y_view = FaerArrayView::new(y);
+        let w_owned;
+        let w_slice = match w.as_slice() {
+            Some(slice) => slice,
+            None => {
+                w_owned = w.to_vec();
+                w_owned.as_slice()
+            }
+        };
+        let mut out = Array2::<f64>::zeros((px, q));
+        row_block_contraction(
+            &mut out,
+            Accum::Replace,
+            x_view.as_ref(),
+            y_view.as_ref(),
+            Some(w_slice),
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            block_rows,
+        );
+        return out;
     }
 
     // Streaming: only allocate chunk_rows × q for the weighted Y slice.
@@ -2991,17 +3279,20 @@ fn frobenius_trace_and_diagonal_mass(a: MatRef<'_, f64>) -> (f64, f64, f64) {
 
 /// The measured backward error `‖Av − λv‖₂ / ((‖A‖_F + |λ|)·‖v‖₂)` of every
 /// slot's eigenpair, with a conjugate pair's two slots carrying the same value.
-/// `None` when a pair is not adjacent with equal real parts and negated imaginary
-/// parts. An exact zero residual measures zero whatever the denominator.
-/// `vectors` holds faer's right eigenvectors: a real eigenvalue's in its own
-/// column, and for `λ = re[i] + i·im[i]` of a conjugate pair,
-/// `col(i) + i·col(i + 1)`.
+/// It bounds each eigenvalue's backward error from above. An exact zero residual
+/// measures zero, whatever the denominator. `vectors` holds faer's right
+/// eigenvectors: a real eigenvalue's in its own column, and for
+/// `λ = re[i] + i·im[i]` of a conjugate pair, `col(i) + i·col(i + 1)`.
+///
+/// `Err((slot, gap))` when the pair starting at `slot` is not adjacent with equal
+/// real parts and negated imaginary parts. `gap` is `|re[i+1] − re[i]| + |im[i+1] + im[i]|`,
+/// or `|im[i]|` when the pair has no second slot.
 fn general_eigenpair_backward_errors(
     a: MatRef<'_, f64>,
     re: &Array1<f64>,
     im: &Array1<f64>,
     vectors: MatRef<'_, f64>,
-) -> Option<Array1<f64>> {
+) -> Result<Array1<f64>, (usize, f64)> {
     let n = a.nrows();
     let (frobenius_sq, _, _) = frobenius_trace_and_diagonal_mass(a);
     let frobenius = frobenius_sq.sqrt();
@@ -3018,8 +3309,11 @@ fn general_eigenpair_backward_errors(
             errors[i] = relative(residual_sq.sqrt(), (frobenius + lambda.abs()) * column_sq(i).sqrt());
             i += 1;
         } else {
-            if i + 1 >= n || re[i + 1] != re[i] || im[i + 1] != -im[i] {
-                return None;
+            if i + 1 >= n {
+                return Err((i, im[i].abs()));
+            }
+            if re[i + 1] != re[i] || im[i + 1] != -im[i] {
+                return Err((i, (re[i + 1] - re[i]).abs() + (im[i + 1] + im[i]).abs()));
             }
             // A(x + iy) = (a + ib)(x + iy) is Ax = a·x − b·y and Ay = b·x + a·y.
             let (real, imag) = (re[i], im[i]);
@@ -3036,7 +3330,79 @@ fn general_eigenpair_backward_errors(
             i += 2;
         }
     }
-    Some(errors)
+    Ok(errors)
+}
+
+/// The exact backward error of the eigenvalue `λ = re + i·im` of `A`, as
+/// `(σ_min(A − λI) / (‖A‖_F + |λ|), band)`, singular values only, at
+/// [`decomposition_parallelism`].
+///
+/// `σ_min(A − λI)` is the norm of the smallest `E` for which `λ` is an eigenvalue
+/// of `A + E`, so it does not depend on how well an eigenvector is determined.
+/// faer's eigenvectors are not evidence at a semisimple repeated eigenvalue. Its
+/// shifted 2×2 quasi-triangular solve computes `adj(M)·r / det(M)` with
+/// `M = B₁ − λI` singular, so the second copy's vector is wrong by an O(1) factor
+/// while the eigenvalue is exact (#2627/#2951, probe job 1209094).
+///
+/// The band charges three things:
+/// - the reduction's backward error: `λ` is an eigenvalue of `A + E` with
+///   `‖E‖₂ ≤ η_A·‖A‖_F` ([`general_eigen_reduction_band`]);
+/// - the SVD's own backward stability ([`crate::roundoff::factor_singular_band`]);
+/// - forming `A − λI`, one rounded subtraction per diagonal entry.
+fn general_eigenvalue_singular_backward_error(
+    a: MatRef<'_, f64>,
+    re: f64,
+    im: f64,
+    reduction: f64,
+) -> Result<(f64, f64), svd::SvdError> {
+    let n = a.nrows();
+    let par = decomposition_parallelism();
+    let (frobenius_sq, _, _) = frobenius_trace_and_diagonal_mass(a);
+    let magnitude = re.hypot(im);
+    let scale = frobenius_sq.sqrt() + magnitude;
+    let diagonal_max = (0..n).fold(0.0_f64, |largest, j| largest.max(a[(j, j)].abs()));
+    let (sigma_min, sigma_max) = if im == 0.0 {
+        let mut shifted = a.to_owned();
+        for j in 0..n {
+            shifted[(j, j)] -= re;
+        }
+        let mut s = Diag::<f64>::zeros(n);
+        let mut mem = MemBuffer::new(svd::svd_scratch::<f64>(
+            n,
+            n,
+            ComputeSvdVectors::No,
+            ComputeSvdVectors::No,
+            par,
+            Default::default(),
+        ));
+        svd::svd(shifted.as_ref(), s.as_mut(), None, None, par, MemStack::new(&mut mem), Default::default())?;
+        (s.as_ref().column_vector()[n - 1], s.as_ref().column_vector()[0])
+    } else {
+        let lambda = faer::c64::new(re, im);
+        let shifted = Mat::<faer::c64>::from_fn(n, n, |i, j| {
+            let value = faer::c64::new(a[(i, j)], 0.0);
+            if i == j { value - lambda } else { value }
+        });
+        let mut s = Diag::<faer::c64>::zeros(n);
+        let mut mem = MemBuffer::new(svd::svd_scratch::<faer::c64>(
+            n,
+            n,
+            ComputeSvdVectors::No,
+            ComputeSvdVectors::No,
+            par,
+            Default::default(),
+        ));
+        svd::svd(shifted.as_ref(), s.as_mut(), None, None, par, MemStack::new(&mut mem), Default::default())?;
+        (s.as_ref().column_vector()[n - 1].re, s.as_ref().column_vector()[0].re)
+    };
+    if scale == 0.0 {
+        return Ok((0.0, 0.0));
+    }
+    let absolute_band = reduction * frobenius_sq.sqrt()
+        + crate::roundoff::factor_singular_band(n, n, sigma_max)
+        + crate::roundoff::UNIT_ROUNDOFF * (diagonal_max + magnitude);
+    let relative = if sigma_min == 0.0 { 0.0 } else { sigma_min / scale };
+    Ok((relative, absolute_band / scale))
 }
 
 /// Certificate (i)'s band, `η = η_A + 2·γ_{n+1}`, over the reduction's counted
@@ -3047,37 +3413,66 @@ fn general_eigen_pair_band(n: usize, reduction: f64) -> f64 {
     reduction + 2.0 * crate::roundoff::accumulation_growth(n + 1)
 }
 
-/// Certificate (ii), the trace, of [`real_general_eigenvalues`]. The computed
-/// spectrum is exactly that of `A + E` with `‖E‖_F ≤ η_A·‖A‖_F`, so
-/// `Σλ = tr A + tr E` with `|tr E| ≤ √n·‖E‖_F`. Both sums are charged their
-/// accumulation bands.
+/// Whether certificate (ii)'s trace arm holds ([`general_spectrum_trace_measure`]).
 fn general_spectrum_trace_consistent(a: MatRef<'_, f64>, re: &Array1<f64>, reduction: f64) -> bool {
+    let (gap, band) = general_spectrum_trace_measure(a, re, reduction);
+    gap <= band
+}
+
+/// Certificate (ii), the trace, of [`real_general_spectrum`], as
+/// `(|Σ re − tr A|, band)`. The computed spectrum is exactly that of `A + E` with
+/// `‖E‖_F ≤ η_A·‖A‖_F`, so `Σλ = tr A + tr E` with `|tr E| ≤ √n·‖E‖_F`. Both sums
+/// are charged their accumulation bands.
+fn general_spectrum_trace_measure(a: MatRef<'_, f64>, re: &Array1<f64>, reduction: f64) -> (f64, f64) {
     let n = a.nrows();
     let (frobenius_sq, trace, diagonal_mass) = frobenius_trace_and_diagonal_mass(a);
     let sum_re: f64 = re.iter().sum();
     let re_mass: f64 = re.iter().map(|value| value.abs()).sum();
     let band = (n as f64).sqrt() * reduction * frobenius_sq.sqrt()
         + crate::roundoff::accumulation_growth(n.saturating_sub(1)) * (diagonal_mass + re_mass);
-    (sum_re - trace).abs() <= band
+    ((sum_re - trace).abs(), band)
 }
 
-/// Certificate (ii), Schur's inequality, of [`real_general_eigenvalues`]:
-/// `Σ|λ|² ≤ ‖A + E‖_F² ≤ (1 + η_A)²·‖A‖_F²`. `‖A‖_F²` is charged the rounding of
-/// its `n²` squares and `Σ|λ|²` that of its `2n`. An unconverged slot that
-/// inflates a magnitude breaks it.
+/// Whether certificate (ii)'s Schur arm holds ([`general_spectrum_schur_measure`]).
 fn general_spectrum_within_schur_bound(
     a: MatRef<'_, f64>,
     re: &Array1<f64>,
     im: &Array1<f64>,
     reduction: f64,
 ) -> bool {
+    let (magnitude_sq, bound) = general_spectrum_schur_measure(a, re, im, reduction);
+    magnitude_sq <= bound
+}
+
+/// Certificate (ii), Schur's inequality, of [`real_general_spectrum`], as
+/// `(Σ|λ|², bound)`: `Σ|λ|² ≤ ‖A + E‖_F² ≤ (1 + η_A)²·‖A‖_F²`. `‖A‖_F²` is charged
+/// the rounding of its `n²` squares and `Σ|λ|²` that of its `2n`. An unconverged
+/// slot that inflates a magnitude breaks it.
+fn general_spectrum_schur_measure(
+    a: MatRef<'_, f64>,
+    re: &Array1<f64>,
+    im: &Array1<f64>,
+    reduction: f64,
+) -> (f64, f64) {
     use crate::roundoff::accumulation_growth;
     let n = a.nrows();
     let (frobenius_sq, _, _) = frobenius_trace_and_diagonal_mass(a);
     let magnitude_sq: f64 = re.iter().zip(im.iter()).map(|(r, j)| r * r + j * j).sum();
-    magnitude_sq
-        <= (1.0 + reduction).powi(2) * frobenius_sq * (1.0 + accumulation_growth(n * n))
-            + accumulation_growth(2 * n) * magnitude_sq
+    let bound = (1.0 + reduction).powi(2) * frobenius_sq * (1.0 + accumulation_growth(n * n))
+        + accumulation_growth(2 * n) * magnitude_sq;
+    (magnitude_sq, bound)
+}
+
+/// #2627 — which measurement certified a slot's eigenvalue in
+/// [`real_general_spectrum`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EigenvalueBackwardErrorSource {
+    /// The residual `‖Av − λv‖` of faer's right eigenvector, an upper bound on the
+    /// eigenvalue's backward error.
+    VectorResidual,
+    /// The exact backward error `σ_min(A − λI)`. It is measured only where faer's
+    /// eigenvector does not certify the eigenvalue, e.g. at a semisimple repeat.
+    SingularValue,
 }
 
 /// #2627 — a real square matrix's certified spectrum ([`real_general_spectrum`])
@@ -3089,15 +3484,21 @@ pub struct CertifiedGeneralSpectrum {
     pub re: Array1<f64>,
     /// Imaginary parts, `0.0` exactly for a real eigenvalue.
     pub im: Array1<f64>,
-    /// Per slot, the measured backward error of its eigenpair,
-    /// `‖Av − λv‖₂ / ((‖A‖_F + |λ|)·‖v‖₂)`. A conjugate pair's two slots carry
+    /// Per slot, the measured backward error of its eigenvalue relative to
+    /// `‖A‖_F + |λ|`, from the source in `sources`. A conjugate pair's two slots carry
     /// the same value.
     pub backward_errors: Array1<f64>,
-    /// The band every backward error was certified against,
-    /// `η = η_A + 2·γ_{n+1}` ([`general_eigen_reduction_band`]). It counts faer's
-    /// iteration cap, not the iterations run, so it grows like `60·n³·u`. A decision
-    /// that needs tighter evidence reads `backward_errors`.
-    pub band: f64,
+    /// Per slot, the band its backward error was certified against.
+    /// - A `VectorResidual` slot's band is `η = η_A + 2·γ_{n+1}`
+    ///   ([`general_eigen_pair_band`]).
+    /// - A `SingularValue` slot's band is `η_A` plus the SVD's and the shift's rounding
+    ///   ([`general_eigenvalue_singular_backward_error`]).
+    ///
+    /// `η_A` counts faer's iteration cap, not the iterations run, so it grows like
+    /// `60·n³·u`. A decision that needs tighter evidence reads `backward_errors`.
+    pub bands: Array1<f64>,
+    /// Per slot, which measurement certified it.
+    pub sources: Vec<EigenvalueBackwardErrorSource>,
 }
 
 /// #2627 — the eigenvalues of a real square matrix at [`evd_parallelism`],
@@ -3111,20 +3512,38 @@ pub struct CertifiedGeneralSpectrum {
 /// Schur QR iteration (`linalg::evd::evd_imp`, mod.rs:1083-1094 in 0.24.0 and
 /// 0.24.4). An iteration that exhausts its cap leaves shift estimates in the
 /// undeflated slots and still returns `Ok(())`, and the iteration itself is
-/// `pub(crate)` in faer. So the helper computes the right eigenvectors internally
-/// and refuses as `GeneralEigen(EvdError::NoConvergence)` unless both hold:
-/// - (i) every eigenpair's measured backward error
-///   ([`general_eigenpair_backward_errors`]) is within the reduction's counted
-///   band plus the vectors' and the residual's rounding
-///   ([`general_eigen_pair_band`]);
-/// - (ii) `Σ re` agrees with `tr A` ([`general_spectrum_trace_consistent`]), and
+/// `pub(crate)` in faer. So the helper computes the right eigenvectors internally.
+/// It refuses as `GeneralEigenCertificateRefused`, naming the arm, the slot, the
+/// measured value and the band, unless all of these hold:
+/// - (i) every eigenvalue's backward error is within its band. First the
+///   residual of faer's eigenvector ([`general_eigenpair_backward_errors`]) is
+///   compared with `η` ([`general_eigen_pair_band`]); it bounds the backward error
+///   from above. Where it does not certify, faer's vector is not evidence either
+///   way, so the exact backward error `σ_min(A − λI)` is measured instead
+///   ([`general_eigenvalue_singular_backward_error`]), one singular-values-only SVD
+///   per such eigenvalue.
+/// - (ii) `Σ re` agrees with `tr A` ([`general_spectrum_trace_measure`]), and
 ///   Schur's inequality `Σ|λ|² ≤ ‖A‖_F²` holds
-///   ([`general_spectrum_within_schur_bound`]), each within its band.
+///   ([`general_spectrum_schur_measure`]), each within its band.
+/// - Conjugate pairs are adjacent with equal real parts and negated imaginary parts.
 ///
-/// An undeflated slot's residual is O(1) relative, far outside the band.
+/// faer's own failures stay `GeneralEigen(EvdError)` and `SvdNoConvergence`.
+///
+/// An undeflated slot has an O(1) relative backward error, far outside the band.
+///
+/// **Semisimple repeats.** At a repeated eigenvalue with a full eigenspace, faer's
+/// second eigenvector is wrong by an O(1) factor while the eigenvalue is exact, so
+/// that slot is certified by `σ_min`.
+///
+/// **What it does not refuse.** Eigenvalues of a defective or nearly defective
+/// matrix, such as a Jordan block with or without a 1e-12 perturbation, are
+/// backward-exact: each is an exact eigenvalue of a matrix within the band of `A`.
+/// They certify, though their forward error can be far larger than the band. A
+/// consumer that needs forward accuracy needs a condition estimate, which this
+/// certificate is not.
 ///
 /// **Known limit.** A multiplicity error with a correct eigenvalue sum passes
-/// both checks: two slots on one eigenvalue while another is missing.
+/// every arm: two slots on one eigenvalue while another is missing.
 ///
 /// **faer dependency.** This reads faer's info-discarding `evd_imp`, its
 /// iteration cap, and its conjugate-pair eigenvector convention. Like
@@ -3144,7 +3563,8 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
             re: Array1::zeros(0),
             im: Array1::zeros(0),
             backward_errors: Array1::zeros(0),
-            band: 0.0,
+            bands: Array1::zeros(0),
+            sources: Vec::new(),
         });
     }
     if owned.iter().any(|value| !value.is_finite()) {
@@ -3158,7 +3578,8 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
             re: Array1::from_elem(1, owned[[0, 0]]),
             im: Array1::zeros(1),
             backward_errors: Array1::zeros(1),
-            band: general_eigen_pair_band(1, general_eigen_reduction_band(1)),
+            bands: Array1::from_elem(1, general_eigen_pair_band(1, general_eigen_reduction_band(1))),
+            sources: vec![EigenvalueBackwardErrorSource::VectorResidual],
         });
     }
     let view = FaerArrayView::new(&owned);
@@ -3169,15 +3590,72 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         .map_err(FaerLinalgError::GeneralEigen)?;
     let reduction = general_eigen_reduction_band(n);
     let band = general_eigen_pair_band(n, reduction);
-    let refused = || FaerLinalgError::GeneralEigen(solvers::EvdError::NoConvergence);
-    let backward_errors = match general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref()) {
-        Some(errors) if errors.iter().all(|error| *error <= band) => errors,
-        _ => return Err(refused()),
-    };
-    if !(general_spectrum_trace_consistent(view.as_ref(), &re, reduction)
-        && general_spectrum_within_schur_bound(view.as_ref(), &re, &im, reduction))
-    {
-        return Err(refused());
+    let mut backward_errors = general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref())
+        .map_err(|(slot, gap)| FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "conjugate pairing",
+            slot,
+            measured: gap,
+            band: 0.0,
+        })?;
+    let mut bands = Array1::from_elem(n, band);
+    let mut sources = vec![EigenvalueBackwardErrorSource::VectorResidual; n];
+    // One SVD per distinct failing eigenvalue. For a real A, σ_min(A − λI) = σ_min(A − λ̄I), so a value and its
+    // conjugate share one measurement, keyed on (re, |im|).
+    let mut measured_shifts: Vec<((f64, f64), (f64, f64))> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let width = if im[i] == 0.0 { 1 } else { 2 };
+        if !(backward_errors[i] <= band) {
+            let key = (re[i], im[i].abs());
+            let (measured, singular_band) = match measured_shifts.iter().find(|(shift, _)| *shift == key) {
+                Some(&(_, outcome)) => outcome,
+                None => {
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        general_eigenvalue_singular_backward_error(view.as_ref(), re[i], im[i], reduction)
+                    }))
+                    .map_err(|_| FaerLinalgError::FactorizationFailed {
+                        context: "general eigenvalue backward-error SVD panic boundary",
+                    })?
+                    .map_err(|_| FaerLinalgError::SvdNoConvergence {
+                        context: "general eigenvalue backward error sigma_min(A - lambda I)",
+                    })?;
+                    measured_shifts.push((key, outcome));
+                    outcome
+                }
+            };
+            if !(measured <= singular_band) {
+                return Err(FaerLinalgError::GeneralEigenCertificateRefused {
+                    arm: "eigenvalue backward error sigma_min(A - lambda I)",
+                    slot: i,
+                    measured,
+                    band: singular_band,
+                });
+            }
+            for k in i..i + width {
+                backward_errors[k] = measured;
+                bands[k] = singular_band;
+                sources[k] = EigenvalueBackwardErrorSource::SingularValue;
+            }
+        }
+        i += width;
+    }
+    if !general_spectrum_trace_consistent(view.as_ref(), &re, reduction) {
+        let (gap, trace_band) = general_spectrum_trace_measure(view.as_ref(), &re, reduction);
+        return Err(FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "trace",
+            slot: 0,
+            measured: gap,
+            band: trace_band,
+        });
+    }
+    if !general_spectrum_within_schur_bound(view.as_ref(), &re, &im, reduction) {
+        let (magnitude_sq, schur_bound) = general_spectrum_schur_measure(view.as_ref(), &re, &im, reduction);
+        return Err(FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "Schur inequality",
+            slot: 0,
+            measured: magnitude_sq,
+            band: schur_bound,
+        });
     }
     let mut im = im;
     let mut i = 0;
@@ -3188,7 +3666,7 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         }
         i += if im[i] == 0.0 { 1 } else { 2 };
     }
-    Ok(CertifiedGeneralSpectrum { re, im, backward_errors, band })
+    Ok(CertifiedGeneralSpectrum { re, im, backward_errors, bands, sources })
 }
 
 /// #2627 — the eigenvalues `(re, im)` of [`real_general_spectrum`], for callers
@@ -3254,7 +3732,7 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             let eigh_nanos_total = EIGH_NANOS
                 .fetch_add(eigh_elapsed.as_nanos() as u64, Ordering::Relaxed)
                 + eigh_elapsed.as_nanos() as u64;
-            log::debug!(
+            log::trace!(
                 "[eigh] dim={} elapsed={:.3}s faer_parallelism={:?} \
                  calls_so_far={eigh_calls} cumulative={:.3}s",
                 matrix.nrows(),
@@ -5346,7 +5824,7 @@ mod general_eigenvalues_2627_tests {
         let eta = general_eigen_pair_band(n, reduction);
         let within_band = |re: &Array1<f64>, im: &Array1<f64>| {
             general_eigenpair_backward_errors(view.as_ref(), re, im, vectors.as_ref())
-                .is_some_and(|errors| errors.iter().all(|error| *error <= eta))
+                .is_ok_and(|errors| errors.iter().all(|error| *error <= eta))
         };
         assert!(within_band(&re, &im));
         assert!(general_spectrum_trace_consistent(view.as_ref(), &re, reduction));
@@ -5362,6 +5840,14 @@ mod general_eigenvalues_2627_tests {
         assert!(
             !within_band(&moved, &im),
             "an eigenvalue moved by {shift:.3e} must fail the backward-error arm"
+        );
+        // The fallback must not rescue it: the exact backward error sigma_min(A - lambda I) of the moved
+        // eigenvalue is outside its own band too.
+        let (measured, singular_band) =
+            general_eigenvalue_singular_backward_error(view.as_ref(), moved[0], im[0], reduction).expect("SVD");
+        assert!(
+            measured > singular_band,
+            "a moved eigenvalue must fail sigma_min too: measured {measured:.3e} against band {singular_band:.3e}"
         );
 
         let mut first_pair = None;
@@ -5404,22 +5890,21 @@ mod general_eigenvalues_2627_tests {
     }
 
     /// The measured backward errors a consumer reads beside the spectrum. Each is
-    /// finite and within the certified band, a conjugate pair's two slots carry one
-    /// value, and `real_general_eigenvalues` returns exactly the spectrum's
-    /// `(re, im)`.
+    /// finite and within its slot's band, and a conjugate pair's two slots carry one
+    /// measurement, one band and one source. `real_general_eigenvalues` returns
+    /// exactly the spectrum's `(re, im)`. These well-separated hashed spectra are
+    /// certified by faer's eigenvector residuals alone, with no SVD.
     #[test]
     fn real_general_spectrum_reports_measured_backward_errors_within_its_band_2627() {
         for &n in &[1_usize, 2, 5, 17, 40] {
             let a = hashed_matrix(n, 11);
             let spectrum = real_general_spectrum(&a).expect("certified spectrum");
-            assert_eq!(spectrum.backward_errors.len(), n);
-            assert!(spectrum.band.is_finite() && spectrum.band > 0.0, "n={n}: band {}", spectrum.band);
-            for (k, error) in spectrum.backward_errors.iter().enumerate() {
-                assert!(
-                    error.is_finite() && *error <= spectrum.band,
-                    "n={n}: slot {k} backward error {error:e} against band {:e}",
-                    spectrum.band
-                );
+            assert_eq!((spectrum.backward_errors.len(), spectrum.bands.len(), spectrum.sources.len()), (n, n, n));
+            for k in 0..n {
+                let (error, band) = (spectrum.backward_errors[k], spectrum.bands[k]);
+                assert!(band.is_finite() && band > 0.0, "n={n}: slot {k} band {band}");
+                assert!(error.is_finite() && error <= band, "n={n}: slot {k} backward error {error:e} against band {band:e}");
+                assert_eq!(spectrum.sources[k], EigenvalueBackwardErrorSource::VectorResidual, "n={n}: slot {k}");
             }
             let mut i = 0;
             while i < n {
@@ -5428,7 +5913,8 @@ mod general_eigenvalues_2627_tests {
                     continue;
                 }
                 assert_eq!(
-                    spectrum.backward_errors[i], spectrum.backward_errors[i + 1],
+                    (spectrum.backward_errors[i], spectrum.bands[i], spectrum.sources[i]),
+                    (spectrum.backward_errors[i + 1], spectrum.bands[i + 1], spectrum.sources[i + 1]),
                     "n={n}: the pair at {i} carries two different measurements"
                 );
                 i += 2;
@@ -5437,5 +5923,307 @@ mod general_eigenvalues_2627_tests {
             assert_eq!(re, spectrum.re, "n={n}: the convenience returns other real parts");
             assert_eq!(im, spectrum.im, "n={n}: the convenience returns other imaginary parts");
         }
+    }
+
+    /// mpd-schur's exact-dyadic n = 8 fixture: T = G·B·G⁻¹ with G = I + N (ones on
+    /// the first superdiagonal, minus ones on the second) and
+    /// B = diag(R(0.5, 0.75), R(0.5, 0.75), 2, −1, R(−0.625, 0.25)),
+    /// R(a, b) = [[a, −b], [b, a]]. T·G = G·B holds bitwise.
+    fn semisimple_fixture() -> (Array2<f64>, Array2<f64>) {
+        let n = 8;
+        let mut g = Array2::<f64>::eye(n);
+        for i in 0..n {
+            if i + 1 < n {
+                g[[i, i + 1]] = 1.0;
+            }
+            if i + 2 < n {
+                g[[i, i + 2]] = -1.0;
+            }
+        }
+        let mut g_inverse = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            for i in (0..n).rev() {
+                let mut s = if i == j { 1.0 } else { 0.0 };
+                for k in i + 1..n {
+                    s -= g[[i, k]] * g_inverse[[k, j]];
+                }
+                g_inverse[[i, j]] = s;
+            }
+        }
+        let mut b = Array2::<f64>::zeros((n, n));
+        for (o, re, im) in [(0_usize, 0.5_f64, 0.75_f64), (2, 0.5, 0.75), (6, -0.625, 0.25)] {
+            b[[o, o]] = re;
+            b[[o, o + 1]] = -im;
+            b[[o + 1, o]] = im;
+            b[[o + 1, o + 1]] = re;
+        }
+        b[[4, 4]] = 2.0;
+        b[[5, 5]] = -1.0;
+        assert_eq!(g.dot(&g_inverse), Array2::<f64>::eye(n), "G⁻¹ must be exact");
+        let t = g.dot(&b).dot(&g_inverse);
+        assert_eq!(t.dot(&g), g.dot(&b), "T·G = G·B must hold bitwise");
+        (t, g)
+    }
+
+    /// A semisimple repeated pair certifies (#2627/#2951). faer's eigenvector for the
+    /// repeat is wrong by an O(1) factor, so its residual refuses; that is the control
+    /// showing the fixture exercises the fallback. The exact backward error
+    /// `σ_min(T − λI)` certifies the exact eigenvalue instead. Every returned eigenvalue
+    /// is within `κ₂(G)·‖E‖₂` of a planted one (Bauer–Fike for the diagonalizable
+    /// `T = (G·W)·D·(G·W)⁻¹`, with `W` the unitary 2×2 block rotations). `‖E‖₂` is the
+    /// slot's band times `‖T‖_F + |λ|`.
+    #[test]
+    fn real_general_spectrum_certifies_a_semisimple_repeated_pair_2627() {
+        let (t, g) = semisimple_fixture();
+        let n = t.nrows();
+        let view = FaerArrayView::new(&t);
+        let (re, im, vectors) = general_evd(view.as_ref()).expect("faer eigendecomposition");
+        let vector_band = general_eigen_pair_band(n, general_eigen_reduction_band(n));
+        let vector_errors = general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref()).expect("pairing");
+        assert!(
+            vector_errors.iter().any(|error| *error > vector_band),
+            "the fixture must defeat faer's eigenvector residual, or this pin does not reach sigma_min: {vector_errors:?}"
+        );
+
+        let spectrum = real_general_spectrum(&t).expect("a semisimple repeated pair certifies");
+        let singular: Vec<usize> =
+            (0..n).filter(|&k| spectrum.sources[k] == EigenvalueBackwardErrorSource::SingularValue).collect();
+        assert!(!singular.is_empty(), "no slot was certified by sigma_min: {:?}", spectrum.sources);
+        for k in 0..n {
+            assert!(
+                spectrum.backward_errors[k] <= spectrum.bands[k],
+                "slot {k}: {:e} against band {:e} ({:?})",
+                spectrum.backward_errors[k],
+                spectrum.bands[k],
+                spectrum.sources[k]
+            );
+        }
+
+        let (_, g_singular, _) = g.svd(false, false).expect("G's singular values");
+        let condition = g_singular.iter().fold(0.0_f64, |m, s| m.max(*s)) / g_singular.iter().fold(f64::INFINITY, |m, s| m.min(*s));
+        let scale = frobenius(&t);
+        let mut planted = vec![(0.5, 0.75), (0.5, 0.75), (2.0, 0.0), (-1.0, 0.0), (-0.625, 0.25)];
+        let mut i = 0;
+        while i < n {
+            let found = (spectrum.re[i], spectrum.im[i]);
+            let bar = condition * spectrum.bands[i] * (scale + found.0.hypot(found.1));
+            let position = planted
+                .iter()
+                .position(|&(pr, pi)| (pr - found.0).hypot(pi - found.1) <= bar)
+                .unwrap_or_else(|| panic!("eigenvalue {found:?} is within {bar:.3e} of no planted one: {planted:?}"));
+            planted.remove(position);
+            i += if spectrum.im[i] == 0.0 { 1 } else { 2 };
+        }
+        assert!(planted.is_empty(), "planted eigenvalues left unrecovered: {planted:?}");
+    }
+
+    /// Jordan blocks certify. A 4×4 Jordan block, and the same block with 1e-12 added
+    /// at (3, 0), have computed eigenvalues that are exact eigenvalues of a matrix
+    /// within the band, so no backward-error certificate refuses them, whatever their
+    /// forward error. The perturbed block's eigenvalues split by about 1e-3
+    /// (probe job 1209094). A consumer that needs forward accuracy needs a condition
+    /// estimate, not this certificate.
+    #[test]
+    fn real_general_spectrum_certifies_backward_exact_jordan_blocks_2627() {
+        let mut jordan = Array2::<f64>::zeros((4, 4));
+        for i in 0..4 {
+            jordan[[i, i]] = 1.0;
+            if i + 1 < 4 {
+                jordan[[i, i + 1]] = 1.0;
+            }
+        }
+        let mut perturbed = jordan.clone();
+        perturbed[[3, 0]] = 1.0e-12;
+        for (label, a) in [("jordan", &jordan), ("perturbed jordan", &perturbed)] {
+            let spectrum = real_general_spectrum(a).unwrap_or_else(|error| panic!("{label}: {error}"));
+            for k in 0..4 {
+                assert!(spectrum.backward_errors[k] <= spectrum.bands[k], "{label}: slot {k}");
+            }
+        }
+        let refusal = FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "eigenvalue backward error sigma_min(A - lambda I)",
+            slot: 2,
+            measured: 4.5e-2,
+            band: 4.7e-12,
+        };
+        let text = refusal.to_string();
+        assert!(text.contains("sigma_min") && text.contains("slot 2"), "the refusal names its arm and slot: {text}");
+    }
+}
+
+#[cfg(test)]
+mod lblt_inertia_2901_tests {
+    use super::*;
+
+    /// #2901: the inertia counts a 2×2 pivot block by its eigenvalues. `[[0, 1], [1, 0]]`
+    /// admits no 1×1 pivot and has eigenvalues ±1, and `diag(3, −2, 0)` has one
+    /// eigenvalue of each sign.
+    #[test]
+    fn the_bunch_kaufman_inertia_counts_each_pivot_block_by_its_eigenvalues_2901() {
+        let swap = Mat::<f64>::from_fn(2, 2, |i, j| if i == j { 0.0 } else { 1.0 });
+        let inertia = FaerLblt::new(swap.as_ref(), Side::Lower).inertia();
+        assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 0, 1), "{inertia:?}");
+        assert!((inertia.smallest_pivot + 1.0).abs() <= 4.0 * f64::EPSILON, "{inertia:?}");
+
+        let diagonal = [3.0, -2.0, 0.0];
+        let mixed = Mat::<f64>::from_fn(3, 3, |i, j| if i == j { diagonal[i] } else { 0.0 });
+        let inertia = FaerLblt::new(mixed.as_ref(), Side::Lower).inertia();
+        assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 1, 1), "{inertia:?}");
+        assert_eq!(inertia.smallest_pivot, -2.0, "{inertia:?}");
+    }
+}
+
+#[cfg(test)]
+mod pool_width_invariance_tests {
+    use super::*;
+
+    /// A deterministic `n × p` design whose entries span several binades, so a
+    /// change of summation order moves low-order bits.
+    fn design(n: usize, p: usize, seed: u64) -> Array2<f64> {
+        let mut state = seed;
+        Array2::from_shape_fn((n, p), |_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = (state >> 11) as f64 / (1_u64 << 53) as f64;
+            (unit - 0.5) * (1.0 + 7.0 * unit)
+        })
+    }
+
+    fn signed_weights(n: usize) -> Array1<f64> {
+        Array1::from_shape_fn(n, |i| (0.37 * i as f64).sin() + 0.25)
+    }
+
+    fn words(a: &Array2<f64>) -> Vec<u64> {
+        a.iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn assert_same_words_at_every_pool_width(
+        label: &str,
+        product: impl Fn() -> Array2<f64> + Sync,
+    ) {
+        let at_width = |width: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
+            pool.install(|| words(&product()))
+        };
+        let single = at_width(1);
+        for width in [2, 3, 8] {
+            assert!(
+                single == at_width(width),
+                "{label}: pool width {width} changed the words"
+            );
+        }
+    }
+
+    fn naive_xt_diag_y(x: &Array2<f64>, w: Option<&Array1<f64>>, y: &Array2<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+        for i in 0..x.nrows() {
+            let wi = w.map_or(1.0, |w| w[i]);
+            for a in 0..x.ncols() {
+                for b in 0..y.ncols() {
+                    out[[a, b]] += x[[i, a]] * wi * y[[i, b]];
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_close(label: &str, got: &Array2<f64>, want: &Array2<f64>) {
+        let scale = want.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+        let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            err <= 1e-11 * scale,
+            "{label}: max error {err:e} against scale {scale:e}"
+        );
+    }
+
+    /// Every reduction-shaped product — Gram, cross-product and their weighted
+    /// forms of a tall design — carries the same words on pools of width 1, 2, 3
+    /// and 8, on both sides of the row-split output bound: `p·q ≤ 31 250` runs
+    /// as shape-sized row blocks, `200 × 200` as faer's output-tiled GEMM.
+    #[test]
+    fn reduction_products_carry_the_same_words_at_every_pool_width() {
+        for &(n, p, q) in &[
+            (50_000usize, 10usize, 7usize),
+            (50_000, 50, 50),
+            (12_000, 200, 200),
+        ] {
+            let x = design(n, p, 0x5EED ^ p as u64);
+            let y = design(n, q, 0xBEEF ^ q as u64);
+            let w = signed_weights(n);
+            let shape = format!("n={n} p={p} q={q}");
+
+            assert_same_words_at_every_pool_width(&format!("fast_ata {shape}"), || fast_ata(&x));
+            assert_same_words_at_every_pool_width(&format!("fast_atb {shape}"), || {
+                fast_atb(&x, &y)
+            });
+            assert_same_words_at_every_pool_width(&format!("fast_xt_diag_x {shape}"), || {
+                fast_xt_diag_x(&x, &w)
+            });
+            assert_same_words_at_every_pool_width(&format!("fast_xt_diag_y {shape}"), || {
+                fast_xt_diag_y(&x, &w, &y)
+            });
+            assert_same_words_at_every_pool_width(&format!("stream Full/Add {shape}"), || {
+                let mut out = Array2::<f64>::from_elem((p, p), 0.5);
+                stream_weighted_crossprod_into(
+                    &x,
+                    &w,
+                    &mut out,
+                    CrossprodStructure::Full,
+                    CrossprodAccum::Add,
+                    matmul_parallelism(p, p, n),
+                );
+                out
+            });
+
+            assert_close(
+                &format!("fast_ata {shape}"),
+                &fast_ata(&x),
+                &naive_xt_diag_y(&x, None, &x),
+            );
+            assert_close(
+                &format!("fast_atb {shape}"),
+                &fast_atb(&x, &y),
+                &naive_xt_diag_y(&x, None, &y),
+            );
+            assert_close(
+                &format!("fast_xt_diag_y {shape}"),
+                &fast_xt_diag_y(&x, &w, &y),
+                &naive_xt_diag_y(&x, Some(&w), &y),
+            );
+            let gram = fast_xt_diag_x(&x, &w);
+            assert_close(
+                &format!("fast_xt_diag_x {shape}"),
+                &gram,
+                &naive_xt_diag_y(&x, Some(&w), &x),
+            );
+            assert!(
+                gram == gram.t(),
+                "fast_xt_diag_x {shape} must be exactly symmetric"
+            );
+        }
+    }
+
+    /// A caller inside an outer parallel region asks for `Par::Seq`; the row
+    /// split is taken from the shape, not from that degree, so the nested call
+    /// and the top-level call agree word for word.
+    #[test]
+    fn a_sequential_caller_gets_the_same_words_as_the_pool() {
+        let (n, p, q) = (50_000usize, 12usize, 9usize);
+        let x = design(n, p, 11);
+        let y = design(n, q, 13);
+        let w = signed_weights(n);
+        assert!(
+            words(&fast_atb_with_parallelism(&x, &y, Par::Seq)) == words(&fast_atb(&x, &y)),
+            "fast_atb must not depend on the caller's degree"
+        );
+        assert!(
+            words(&fast_xt_diag_x_with_parallelism(&x, &w, Par::Seq))
+                == words(&fast_xt_diag_x(&x, &w)),
+            "fast_xt_diag_x must not depend on the caller's degree"
+        );
     }
 }

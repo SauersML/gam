@@ -33,7 +33,7 @@
 //! and the second and third orders likewise.
 //!
 //! This module owns two things and nothing else: the root itself
-//! ([`solve_anchor`], and [`solve_anchor_in_slot`] through a row's warm-start
+//! ([`solve_anchor`], and [`solve_anchor_in_slot`] through a row's root
 //! slot), and its Taylor table through order five ([`AnchorTaylor`], and
 //! [`anchor_taylor_in_slot`] through the same slot), whose orders through
 //! three are the implicit derivatives the direct order-two lowering reads
@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gam_linalg::utils::splitmix64_hash;
 use gam_math::nested_dual::JetField;
 use gam_math::probability::{
-    normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
+    normal_cdf_and_pdf, normal_logcdf, signed_probit_logcdf_and_mills_ratio,
 };
 use smallvec::SmallVec;
 
@@ -156,6 +156,18 @@ struct StoredAnchor {
     taylor: Option<AnchorTaylor>,
 }
 
+/// The inputs and root of one completed write of a [`RootSlot`], without its
+/// table: what deciding a hit and seeding a solve read (gam#2928).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StoredRoot {
+    /// The sequence the write left, so a later table read can tell whether it
+    /// still reads the same write.
+    sequence: u64,
+    q: u64,
+    slope: u64,
+    root: f64,
+}
+
 impl RootSlot {
     fn empty() -> Self {
         let nan = f64::NAN.to_bits();
@@ -168,9 +180,11 @@ impl RootSlot {
         }
     }
 
-    /// The stored anchor from one completed write, or `None` while a writer
-    /// holds the slot or finished a write during the read.
-    fn read(&self) -> Option<StoredAnchor> {
+    /// The stored inputs and root from one completed write, or `None` while a
+    /// writer holds the slot or finished a write during the read. Most slot
+    /// calls only compare inputs or read the root, so the table is not loaded
+    /// here (gam#2928).
+    fn read_root(&self) -> Option<StoredRoot> {
         let before = self.sequence.load(Ordering::Acquire);
         if before & 1 == 1 {
             return None;
@@ -178,24 +192,41 @@ impl RootSlot {
         let q = self.q.load(Ordering::Acquire);
         let slope = self.slope.load(Ordering::Acquire);
         let root = f64::from_bits(self.root.load(Ordering::Acquire));
-        let mut coefficients = [[0.0; TAYLOR_SLOTS]; TAYLOR_SLOTS];
-        coefficients[0][0] = root;
-        for (cell, (i, j)) in self.table.iter().zip(AnchorTaylor::stored_entries()) {
-            coefficients[i][j] = f64::from_bits(cell.load(Ordering::Acquire));
-        }
-        if self.sequence.load(Ordering::Acquire) != before {
-            return None;
-        }
-        let taylor = coefficients
-            .iter()
-            .flatten()
-            .all(|value| value.is_finite())
-            .then_some(AnchorTaylor { coefficients });
-        Some(StoredAnchor {
+        (self.sequence.load(Ordering::Acquire) == before).then_some(StoredRoot {
+            sequence: before,
             q,
             slope,
             root,
-            taylor,
+        })
+    }
+
+    /// The table the write `stored` read published, or `None` while that write
+    /// published none or another write has begun since.
+    fn read_table(&self, stored: &StoredRoot) -> Option<AnchorTaylor> {
+        let mut coefficients = [[0.0; TAYLOR_SLOTS]; TAYLOR_SLOTS];
+        coefficients[0][0] = stored.root;
+        for (cell, (i, j)) in self.table.iter().zip(AnchorTaylor::stored_entries()) {
+            coefficients[i][j] = f64::from_bits(cell.load(Ordering::Acquire));
+        }
+        if self.sequence.load(Ordering::Acquire) != stored.sequence {
+            return None;
+        }
+        coefficients
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+            .then_some(AnchorTaylor { coefficients })
+    }
+
+    /// The stored anchor from one completed write, with its table where the
+    /// same write published one, or `None` while a writer holds the slot.
+    fn read(&self) -> Option<StoredAnchor> {
+        let stored = self.read_root()?;
+        Some(StoredAnchor {
+            q: stored.q,
+            slope: stored.slope,
+            root: stored.root,
+            taylor: self.read_table(&stored),
         })
     }
 
@@ -215,11 +246,65 @@ impl RootSlot {
         self.q.store(anchor.q, Ordering::Release);
         self.slope.store(anchor.slope, Ordering::Release);
         self.root.store(anchor.root.to_bits(), Ordering::Release);
-        for (cell, (i, j)) in self.table.iter().zip(AnchorTaylor::stored_entries()) {
-            let value = anchor.taylor.map_or(f64::NAN, |taylor| taylor.coefficients[i][j]);
-            cell.store(value.to_bits(), Ordering::Release);
+        match &anchor.taylor {
+            Some(taylor) => {
+                for (cell, (i, j)) in self.table.iter().zip(AnchorTaylor::stored_entries()) {
+                    cell.store(taylor.coefficients[i][j].to_bits(), Ordering::Release);
+                }
+            }
+            None => {
+                let nan = f64::NAN.to_bits();
+                for cell in &self.table {
+                    cell.store(nan, Ordering::Release);
+                }
+            }
         }
         self.sequence.store(before + 2, Ordering::Release);
+    }
+}
+
+/// What a law's root slots answered with (gam#2943 part 3(iii)). A hit answers
+/// from a stored root of bitwise the same equation; every other equation is
+/// solved from the closed form (gam#2983). Evaluations are residual
+/// evaluations, one per Halley or bisection step.
+#[derive(Debug, Default)]
+struct AnchorSolveCounters {
+    hits: AtomicU64,
+    cold_solves: AtomicU64,
+    cold_evaluations: AtomicU64,
+}
+
+/// A snapshot of a law's [`AnchorSolveCounters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnchorSolveCounts {
+    pub(crate) hits: u64,
+    pub(crate) cold_solves: u64,
+    pub(crate) cold_evaluations: u64,
+}
+
+impl AnchorSolveCounters {
+    fn snapshot(&self) -> AnchorSolveCounts {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        AnchorSolveCounts {
+            hits: load(&self.hits),
+            cold_solves: load(&self.cold_solves),
+            cold_evaluations: load(&self.cold_evaluations),
+        }
+    }
+}
+
+impl std::fmt::Display for AnchorSolveCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let per_solve = if self.cold_solves == 0 {
+            0.0
+        } else {
+            self.cold_evaluations as f64 / self.cold_solves as f64
+        };
+        write!(
+            f,
+            "{} hits, {} solves from the closed form ({per_solve:.2} residual evaluations each)",
+            self.hits, self.cold_solves,
+        )
     }
 }
 
@@ -232,7 +317,11 @@ impl RootSlot {
 /// already applied), and the row's grid, which is fixed for the life of the
 /// law that owns this cache — a re-estimated law is a new law with a new
 /// cache. A hash selects a cross-row entry; equality of the stored inputs
-/// decides a hit, and any other stored root is only a seed. The cross-row
+/// decides a hit, and a root stored under any other inputs answers nothing,
+/// not even as a seed (gam#2983). Every stored root was solved from the
+/// closed form, so it is the one root its equation defines, and a hit from
+/// any slot, whichever row or thread published it, is bitwise what a solve
+/// would return. The cross-row
 /// table keeps its own entries per slot kind: every row entering at the time
 /// origin asks one entry equation, and the row-specific exit equation every
 /// row publishes at each iterate would otherwise evict it (gam#2928).
@@ -246,6 +335,7 @@ pub(crate) struct AnchorRootCache {
     /// Slot kind `s`'s entries at `s·SHARED_ROOT_SLOTS + hash`.
     shared: Option<Vec<RootSlot>>,
     shared_index: fn(u64, u64) -> u64,
+    counters: AnchorSolveCounters,
 }
 
 impl AnchorRootCache {
@@ -268,7 +358,24 @@ impl AnchorRootCache {
             slots_per_row,
             shared: shared_across_rows.then(|| slots(slots_per_row * SHARED_ROOT_SLOTS)),
             shared_index,
+            counters: AnchorSolveCounters::default(),
         }
+    }
+
+    /// A cache of the same shape holding nothing: what a search that must not
+    /// read another search's roots starts from (gnomon#2359).
+    pub(crate) fn empty_like(&self) -> Self {
+        Self::with_shared_index(
+            self.slots.len() / self.slots_per_row.max(1),
+            self.slots_per_row,
+            self.shared.is_some(),
+            self.shared_index,
+        )
+    }
+
+    /// What the slots have answered with so far.
+    pub(crate) fn counts(&self) -> AnchorSolveCounts {
+        self.counters.snapshot()
     }
 
     /// Row `row`'s slot `slot`; `None` for a slot the cache does not keep.
@@ -298,14 +405,15 @@ impl AnchorRootCache {
 /// asks for the root of bitwise the same equation, so the row's slot answers
 /// without evaluating the residual. On a global law, rows asking the same
 /// equation — every row entering at the time origin shares its entry index —
-/// find one row's root in the cross-row table. At a new iterate the slot's
-/// anchor seeds the solve: its root moved to the new inputs along its stored
-/// table where a consumer has differentiated it ([`AnchorTaylor::predict`]),
-/// the bare root otherwise. A seed stored by a rejected trial far from this
-/// iterate can
-/// mislead the solve, so a refused warm solve retries from the closed form,
-/// which depends only on `(q, b)` and cannot be poisoned; however it is
-/// seeded, a solve returns only a root meeting [`anchor_residual_resolution`].
+/// find one row's root in the cross-row table. An equation no slot holds is
+/// solved from the closed form, which depends only on `(q, b)` (gam#2983). A
+/// solve accepts any `α` whose residual meets [`anchor_residual_resolution`],
+/// so where it stops depends on where it started: seeded from a slot that
+/// other rows and threads publish into, the root depended on the order they
+/// ran in, and 12-thread fits of one input diverged run to run (truth2370,
+/// 57% of warm-seeded roots off the closed-form root by up to 6e5 ulps).
+/// Seeded from the closed form, the root is a function of its equation alone,
+/// whatever the slots hold and however many threads fill them.
 pub(crate) fn solve_anchor_in_slot(
     q: f64,
     observed_slope: f64,
@@ -351,21 +459,12 @@ pub(crate) fn anchor_derivatives_in_slot(
     anchor_taylor_in_slot(q, observed_slope, context, row, slot).map(|taylor| taylor.derivatives())
 }
 
-/// The warm seed a stored anchor gives for `(q, b)`: its table's series at the
-/// new inputs ([`AnchorTaylor::predict`]), or the bare root while it holds
-/// none. It is only a seed — the solve certifies whatever it starts from.
-fn predicted_seed(stored: &StoredAnchor, q: f64, observed_slope: f64) -> f64 {
-    let Some(taylor) = stored.taylor else {
-        return stored.root;
-    };
-    taylor.predict(
-        q - f64::from_bits(stored.q),
-        observed_slope - f64::from_bits(stored.slope),
-    )
-}
-
 /// The slot path both entries share: the anchor for `(q, b)`, carrying
 /// derivatives whenever `differentiate` asks for them.
+///
+/// The row's own slot is asked first, by its inputs and root alone: its table
+/// is loaded only where a consumer differentiates, and the cross-row table is
+/// hashed only where the row's slot does not answer (gam#2928).
 fn anchor_in_slot(
     q: f64,
     observed_slope: f64,
@@ -392,44 +491,66 @@ fn anchor_in_slot(
         });
     };
     let own = cache.slot(row, slot);
-    let own_stored = own
-        .and_then(RootSlot::read)
+    let own_root = own
+        .and_then(RootSlot::read_root)
         .filter(|stored| stored.root.is_finite());
-    let shared = cache.shared_slot(slot, inputs.0, inputs.1);
-    let own_match = own_stored.filter(|stored| (stored.q, stored.slope) == inputs);
-    let shared_match = if own_match.is_some() {
-        None
-    } else {
-        shared
-            .and_then(RootSlot::read)
-            .filter(|stored| stored.root.is_finite() && (stored.q, stored.slope) == inputs)
+    let publish = |anchor: &StoredAnchor| {
+        if let Some(own) = own {
+            own.write(anchor);
+        }
+        if let Some(shared) = cache.shared_slot(slot, inputs.0, inputs.1) {
+            shared.write(anchor);
+        }
     };
-    let root = match own_match.or(shared_match) {
+    let counters = &cache.counters;
+    let cold = || -> Result<f64, String> {
+        let (root, evaluations) =
+            solve_anchor_counted(q, observed_slope, context.grid, gaussian_anchor(q, observed_slope))?;
+        counters.cold_solves.fetch_add(1, Ordering::Relaxed);
+        counters
+            .cold_evaluations
+            .fetch_add(evaluations as u64, Ordering::Relaxed);
+        Ok(root)
+    };
+    if let (Some(own), Some(stored)) = (own, own_root)
+        && (stored.q, stored.slope) == inputs
+    {
+        counters.hits.fetch_add(1, Ordering::Relaxed);
+        let taylor = if differentiate { own.read_table(&stored) } else { None };
+        if taylor.is_some() || !differentiate {
+            return Ok(StoredAnchor {
+                q: inputs.0,
+                slope: inputs.1,
+                root: stored.root,
+                taylor,
+            });
+        }
+        let anchor = StoredAnchor {
+            q: inputs.0,
+            slope: inputs.1,
+            root: stored.root,
+            taylor: differentiated(stored.root)?,
+        };
+        publish(&anchor);
+        return Ok(anchor);
+    }
+    let shared_match = cache
+        .shared_slot(slot, inputs.0, inputs.1)
+        .and_then(RootSlot::read)
+        .filter(|stored| stored.root.is_finite() && (stored.q, stored.slope) == inputs);
+    let root = match shared_match {
         Some(stored) if stored.taylor.is_some() || !differentiate => {
-            if shared_match.is_some()
-                && let Some(own) = own
-            {
+            counters.hits.fetch_add(1, Ordering::Relaxed);
+            if let Some(own) = own {
                 own.write(&stored);
             }
             return Ok(stored);
         }
-        Some(stored) => stored.root,
-        None => match own_stored {
-            Some(stored) => {
-                let seed = predicted_seed(&stored, q, observed_slope);
-                match solve_anchor_from(q, observed_slope, context.grid, seed) {
-                    Ok(root) => root,
-                    Err(warm_failure) => {
-                        log::debug!(
-                            "[survival-marginal-slope anchor] row {row}: the slot's seed {seed} did \
-                             not solve ({warm_failure}); retrying from the closed form"
-                        );
-                        solve_anchor(q, observed_slope, context.grid)?
-                    }
-                }
-            }
-            None => solve_anchor(q, observed_slope, context.grid)?,
-        },
+        Some(stored) => {
+            counters.hits.fetch_add(1, Ordering::Relaxed);
+            stored.root
+        }
+        None => cold()?,
     };
     let anchor = StoredAnchor {
         q: inputs.0,
@@ -437,12 +558,7 @@ fn anchor_in_slot(
         root,
         taylor: differentiated(root)?,
     };
-    if let Some(own) = own {
-        own.write(&anchor);
-    }
-    if let Some(shared) = shared {
-        shared.write(&anchor);
-    }
+    publish(&anchor);
     Ok(anchor)
 }
 
@@ -476,6 +592,16 @@ pub(crate) fn solve_anchor_from(
     grid: AnchorGrid<'_>,
     seed: f64,
 ) -> Result<f64, String> {
+    solve_anchor_counted(q, observed_slope, grid, seed).map(|(root, _)| root)
+}
+
+/// [`solve_anchor_from`], with the residual evaluations the solve spent.
+fn solve_anchor_counted(
+    q: f64,
+    observed_slope: f64,
+    grid: AnchorGrid<'_>,
+    seed: f64,
+) -> Result<(f64, usize), String> {
     solve_anchor_with(q, observed_slope, grid, seed, anchor_log_residual)
 }
 
@@ -491,7 +617,7 @@ fn solve_anchor_with(
     grid: AnchorGrid<'_>,
     seed: f64,
     residual: AnchorResidual,
-) -> Result<f64, String> {
+) -> Result<(f64, usize), String> {
     if !(q.is_finite() && observed_slope.is_finite() && seed.is_finite()) {
         return Err(format!(
             "survival marginal-slope anchor requires finite q, slope and seed, got q={q}, b={observed_slope}, seed={seed}"
@@ -513,10 +639,28 @@ fn solve_anchor_with(
     let mut step_cap = (0.25 * (1.0 + seed.abs())).max(1.0);
     let mut last_step = f64::INFINITY;
     let rounding = anchor_residual_rounding(log_target, grid.len());
-    for _ in 0..ANCHOR_SOLVE_MAX_EVALUATIONS {
+    for evaluation in 0..ANCHOR_SOLVE_MAX_EVALUATIONS {
         let (value, first, second) = residual(alpha, observed_slope, grid, survival_side, log_target)?;
         if value.abs() <= anchor_residual_resolution(alpha, first, rounding) {
-            return Ok(alpha);
+            // The accepted `α` still carries a residual up to the tolerance,
+            // and where it stops depends on the seed, so it moves irregularly
+            // with the coefficients: summed over 3e5 rows it floored the inner
+            // solver's KKT residual at ~3e-11 against its 1e-11 target, and
+            // the joint Newton spun its whole cycle budget (gam#2928). Newton's
+            // step from the accepted point costs no evaluation and removes it
+            // to second order; it is taken only where Newton's model holds
+            // (`|F·F″| ≤ F′²`, the rule the step below uses) and inside the
+            // bracket, else the accepted point stands.
+            let polished = alpha - value / first;
+            let in_model = (value * second).abs() <= first * first;
+            return Ok((
+                if in_model && polished.is_finite() && polished > below && polished < above {
+                    polished
+                } else {
+                    alpha
+                },
+                evaluation + 1,
+            ));
         }
         let root_is_above = if increasing { value < 0.0 } else { value > 0.0 };
         if root_is_above {
@@ -624,9 +768,10 @@ const LINEAR_RESIDUAL_FLOOR: f64 = 1e-250;
 /// subtracts nearly equal survival probabilities where `S` sits near one.
 /// `T` is summed in linear space whenever it sits above
 /// [`LINEAR_RESIDUAL_FLOOR`]: every node term is a positive probability from
-/// its own `erfc`, so the sum keeps each term's relative accuracy, at one
-/// `erfc` and one density per node where the log-space form pays a scaled
-/// complementary error function, its logarithm and a log-sum-exp exponential.
+/// the table route [`normal_cdf_and_pdf`], so the sum keeps each term's
+/// relative accuracy, at one exponential per node for both `Φ` and `φ` where
+/// the log-space form pays a scaled complementary error function, its
+/// logarithm and a log-sum-exp exponential.
 /// The two forms agree to rounding, and deep tails keep the log-space form.
 fn anchor_log_residual(
     alpha: f64,
@@ -641,8 +786,10 @@ fn anchor_log_residual(
     let mut density_eta = 0.0;
     for (&u, &w) in grid.nodes.iter().zip(grid.weights.iter()) {
         let eta = alpha + observed_slope * u;
-        tail += w * normal_cdf(if survival_side { -eta } else { eta });
-        let weighted_pdf = w * normal_pdf(eta);
+        // φ is even, and the table's φ is bitwise normal_pdf at ±η.
+        let (cdf, pdf) = normal_cdf_and_pdf(if survival_side { -eta } else { eta });
+        tail += w * cdf;
+        let weighted_pdf = w * pdf;
         density += weighted_pdf;
         density_eta += weighted_pdf * eta;
     }
@@ -870,6 +1017,16 @@ const TAYLOR_SLOTS: usize = ANCHOR_TAYLOR_ORDER + 1;
 /// derivative stack a carrier composes.
 const FACTORIAL: [f64; TAYLOR_SLOTS] = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0];
 
+/// Slices of `δα^r` the table's solve reads: degree `e` for `2 ≤ r ≤ e ≤ 5`.
+const POWER_SLICES: usize = 10;
+
+/// Where the degree-`e` part of `δα^r` sits among the [`POWER_SLICES`]
+/// (`2 ≤ r ≤ e ≤ 5`): degrees in order, powers ascending within each.
+#[inline]
+fn power_slice(r: usize, degree: usize) -> usize {
+    (degree - 1) * (degree - 2) / 2 + (r - 2)
+}
+
 /// `[·, F′, F″, F‴, F⁗, F⁽⁵⁾](x)` with `F(x) = Φ(−x)`, `F^{(n)} = (−1)^n
 /// He_{n−1}(x) φ(x)`, with `φ(x)` replaced by the caller's `density` — a
 /// normalized node weight or the ratio `φ(q)/Σ w φ(η)` (gam#2941). The value
@@ -944,10 +1101,12 @@ impl AnchorTaylor {
             ));
         }
         let target = survival_cdf_derivative_stack(q, density.log_density_ratio(q).exp());
-        // parts[d][i]: the coefficient of δq^i·δb^(d−i) in δα. powers[r][e]:
-        // the degree-e part of δα^r, for r ≥ 2.
+        // parts[d][i]: the coefficient of δq^i·δb^(d−i) in δα. powers holds the
+        // degree-e part of δα^r for 2 ≤ r ≤ e ≤ 5 only — the ten slices the
+        // solve reads — at `power_slice(r, e)`, so a table zeroes 480 bytes of
+        // scratch instead of the whole 6·6·6 cube (gam#2928).
         let mut parts = [[0.0_f64; TAYLOR_SLOTS]; TAYLOR_SLOTS];
-        let mut powers = [[[0.0_f64; TAYLOR_SLOTS]; TAYLOR_SLOTS]; TAYLOR_SLOTS];
+        let mut powers = [[0.0_f64; TAYLOR_SLOTS]; POWER_SLICES];
         for degree in 1..TAYLOR_SLOTS {
             // [δα^r]_degree = Σ_j A_j·[δα^(r−1)]_(degree−j) reads parts below
             // `degree` only.
@@ -955,14 +1114,14 @@ impl AnchorTaylor {
                 let mut power = [0.0_f64; TAYLOR_SLOTS];
                 for j in 1..=degree + 1 - r {
                     let lower = degree - j;
-                    let right = if r == 2 { &parts[lower] } else { &powers[r - 1][lower] };
+                    let right = if r == 2 { &parts[lower] } else { &powers[power_slice(r - 1, lower)] };
                     for i1 in 0..=j {
                         for i2 in 0..=lower {
                             power[i1 + i2] += parts[j][i1] * right[i2];
                         }
                     }
                 }
-                powers[r][degree] = power;
+                powers[power_slice(r, degree)] = power;
             }
             // Everything of degree `degree` in the expanded equation except
             // `H_10·A_degree`: the slope moment `H_{0,degree}·δb^degree / degree!`,
@@ -977,7 +1136,7 @@ impl AnchorTaylor {
                         continue;
                     }
                     let scale = moments[r + s][s] / (FACTORIAL[r] * FACTORIAL[s]);
-                    let source = if r == 1 { &parts[lower] } else { &powers[r][lower] };
+                    let source = if r == 1 { &parts[lower] } else { &powers[power_slice(r, lower)] };
                     for i in 0..=lower {
                         rest[i] += scale * source[i];
                     }
@@ -1017,40 +1176,6 @@ impl AnchorTaylor {
             a_qqb: 2.0 * c[2][1],
             a_qbb: 2.0 * c[1][2],
             a_bbb: 6.0 * c[0][3],
-        }
-    }
-
-    /// The root the table's series gives at `(q* + δq, b* + δb)`, summed by
-    /// total degree and stopped before the first degree whose part exceeds
-    /// the largest part already summed: where the step outruns the series the
-    /// parts grow, and a longer sum only extrapolates further. One part that
-    /// cancels to near zero does not end the sum. The bare root where nothing
-    /// finite remains.
-    pub(crate) fn predict(&self, delta_q: f64, delta_b: f64) -> f64 {
-        let mut q_powers = [1.0; TAYLOR_SLOTS];
-        let mut b_powers = [1.0; TAYLOR_SLOTS];
-        for degree in 1..TAYLOR_SLOTS {
-            q_powers[degree] = q_powers[degree - 1] * delta_q;
-            b_powers[degree] = b_powers[degree - 1] * delta_b;
-        }
-        let root = self.coefficients[0][0];
-        let mut sum = root;
-        let mut largest = f64::INFINITY;
-        for degree in 1..TAYLOR_SLOTS {
-            let mut part = 0.0;
-            for i in 0..=degree {
-                part += self.coefficients[i][degree - i] * q_powers[i] * b_powers[degree - i];
-            }
-            if !(part.abs() <= largest) {
-                break;
-            }
-            sum += part;
-            largest = if degree == 1 { part.abs() } else { largest.max(part.abs()) };
-        }
-        if sum.is_finite() {
-            sum
-        } else {
-            root
         }
     }
 
@@ -1103,6 +1228,7 @@ mod anchor_tests {
     use super::*;
     use gam_math::jet_scalar::{JetScalar, Order2};
     use gam_math::jet_tower::Tower4;
+    use gam_math::probability::{normal_cdf, normal_pdf};
 
     // ── The closed-form implicit derivatives the table's orders ≤ 3 are pinned against ──
 
@@ -1598,11 +1724,12 @@ mod anchor_tests {
 
     /// A row's slot answers only for bitwise the inputs its root was solved
     /// for: a sentinel stored under `(q, b)` comes back for exactly `(q, b)`,
-    /// one bit off in either input is a different equation and is solved, a
-    /// warm solve is published under its own inputs, and a root stored far
-    /// away cannot poison the solve it seeds.
+    /// one bit off in either input is a different equation and is solved, and
+    /// a root stored under other inputs, near or far, seeds nothing: every
+    /// solve through the slot is bitwise the closed-form-seeded root, and is
+    /// published under its own inputs (gam#2983).
     #[test]
-    fn anchor_slot_answers_only_its_own_equation_and_survives_a_poisoned_seed() {
+    fn anchor_slot_answers_only_its_own_equation_and_seeds_nothing_2983() {
         let grid = skewed_grid();
         let cache = AnchorRootCache::new(4, 2, false);
         let context = AnchorRowContext {
@@ -1632,32 +1759,51 @@ mod anchor_tests {
             own.write(&sentinel(q, b, 123.0));
             let nudged = solve_anchor_in_slot(nudged_q, nudged_b, context, 2, slot).expect("nudged");
             let fresh = solve_anchor(nudged_q, nudged_b, grid.view()).expect("fresh nudged");
-            assert!(
-                nudged != 123.0 && (nudged - fresh).abs() <= 1e-10 * (1.0 + fresh.abs()),
+            assert_eq!(
+                nudged.to_bits(),
+                fresh.to_bits(),
                 "a one-bit-different equation must be solved: {nudged} vs {fresh}"
             );
         }
 
-        cache.slot(1, slot).expect("row 1 slot").write(&sentinel(q, b, cold));
-        let warm = solve_anchor_in_slot(0.7003, 1.0996, context, 1, slot).expect("warm solve");
-        let fresh = solve_anchor(0.7003, 1.0996, grid.view()).expect("fresh solve");
-        assert!((warm - fresh).abs() <= 1e-10 * (1.0 + fresh.abs()), "warm {warm} vs fresh {fresh}");
-        assert_eq!(
-            cache
-                .slot(1, slot)
-                .and_then(RootSlot::read)
-                .map(|stored| (stored.q, stored.slope, stored.root.to_bits())),
-            Some((0.7003_f64.to_bits(), 1.0996_f64.to_bits(), warm.to_bits())),
-            "the warm solve is published under its own inputs"
-        );
+        // An iterate walk, each equation a small step from the last, through a
+        // slot holding the previous equation's root and table: every root is
+        // bitwise the closed-form-seeded root of its own equation. A root the
+        // slot seeded would be one of the many floats its residual accepts, set
+        // by where the seed sat; warm-seeded, 57% of truth2370's anchor roots
+        // were off the closed-form root (gam#2983).
+        let mut previous = (q, b, cold);
+        for step in 1..=64 {
+            let (next_q, next_b) = (q + 3e-4 * f64::from(step), b - 4e-4 * f64::from(step));
+            let table = AnchorTaylor::at(previous.2, previous.0, previous.1, grid.view()).expect("table");
+            cache.slot(1, slot).expect("row 1 slot").write(&StoredAnchor {
+                q: previous.0.to_bits(),
+                slope: previous.1.to_bits(),
+                root: previous.2,
+                taylor: Some(table),
+            });
+            let through_slot = solve_anchor_in_slot(next_q, next_b, context, 1, slot).expect("slot solve");
+            let fresh = solve_anchor(next_q, next_b, grid.view()).expect("fresh solve");
+            assert_eq!(
+                through_slot.to_bits(),
+                fresh.to_bits(),
+                "step {step}: the slot solve {through_slot:+.17e} is not the closed-form root {fresh:+.17e}"
+            );
+            assert_eq!(
+                cache
+                    .slot(1, slot)
+                    .and_then(RootSlot::read)
+                    .map(|stored| (stored.q, stored.slope, stored.root.to_bits())),
+                Some((next_q.to_bits(), next_b.to_bits(), fresh.to_bits())),
+                "step {step}: the solve is published under its own inputs"
+            );
+            previous = (next_q, next_b, through_slot);
+        }
 
         cache.slot(3, slot).expect("row 3 slot").write(&sentinel(5.0, 0.2, 1e6));
-        let poisoned = solve_anchor_in_slot(-0.4, 0.9, context, 3, slot).expect("poisoned seed");
+        let poisoned = solve_anchor_in_slot(-0.4, 0.9, context, 3, slot).expect("poisoned slot");
         let reference = solve_anchor(-0.4, 0.9, grid.view()).expect("reference");
-        assert!(
-            (poisoned - reference).abs() <= 1e-10 * (1.0 + reference.abs()),
-            "poisoned {poisoned} vs reference {reference}"
-        );
+        assert_eq!(poisoned.to_bits(), reference.to_bits(), "poisoned {poisoned} vs reference {reference}");
     }
 
     /// A point-mass law at `u₀ = 0` anchors at `α = q` for every slope, so
@@ -1857,10 +2003,9 @@ mod anchor_tests {
     /// consumer adds `AnchorTaylor::at` of that root and the order-two lowering
     /// reads its derivatives from it, a sentinel table stored under `(q, b)`
     /// answers for `(q, b)` alone, and a one-bit change in either input is
-    /// solved and differentiated afresh. The table's series lands near the
-    /// root a small step away, and a seed predicted from a stored table —
-    /// sound or poisoned — reaches a root meeting the resolution criterion,
-    /// within what the residuals allow of a cold solve.
+    /// solved and differentiated afresh. A table stored under other inputs,
+    /// sound or poisoned, seeds nothing: the slot's root is bitwise the
+    /// closed-form-seeded root (gam#2983).
     #[test]
     fn anchor_slot_keeps_the_table_of_exactly_its_own_equation() {
         let grid = skewed_grid();
@@ -1913,53 +2058,30 @@ mod anchor_tests {
             );
         }
 
-        // The series at a step of 1e-2 carries the sixth-order remainder of a
-        // table whose coefficients are O(1) on this law: within 1e-8 of the
-        // root, four orders above it, where the first order alone misses by
-        // the curvature term `c[2][0]·δq²`.
-        let (near_q, near_b) = (q + 0.01, b - 0.01);
-        let near = solve_anchor(near_q, near_b, grid.view()).expect("near root");
-        let series = taylor.predict(near_q - q, near_b - b);
-        assert!((series - near).abs() <= 1e-8, "series {series:+.17e} vs root {near:+.17e}");
-
-        // A seed predicted from a sound and from a poisoned table.
-        let (warm_q, warm_b) = (1.05_f64, 1.21_f64);
-        let log_target = normal_logcdf(-warm_q);
-        let residual = |alpha: f64| {
-            anchor_log_residual(alpha, warm_b, grid.view(), true, log_target).expect("residual")
-        };
-        let cold = solve_anchor(warm_q, warm_b, grid.view()).expect("cold");
+        // A table stored under other inputs, sound or poisoned, seeds nothing
+        // (gam#2983): the slot's root is bitwise the closed-form-seeded root.
+        // The nearby equations are where a sound table's series would land a
+        // seed inside the residual resolution, so a solve started there could
+        // stop on other bits. The far one is where the series outruns itself.
         let mut poisoned = taylor;
         poisoned.coefficients[1][0] = 1e6;
         poisoned.coefficients[0][1] = -1e6;
-        for (row, table) in [(1, taylor), (2, poisoned)] {
-            cache.slot(row, slot).expect("slot").write(&store(table));
-            let warm = solve_anchor_in_slot(warm_q, warm_b, context, row, slot).expect("predicted warm solve");
-            let (f_warm, d_warm, _) = residual(warm);
-            let (f_cold, d_cold, _) = residual(cold);
-            assert!(
-                f_warm.abs()
-                    <= anchor_residual_resolution(
-                        warm,
-                        d_warm,
-                        anchor_residual_rounding(log_target, grid.view().len())
-                    ),
-                "row {row}: warm root {warm:+.17e} has residual {f_warm:.3e}"
-            );
-            // `F` is monotone, so by the mean value theorem the roots differ by
-            // at most their residuals over the smallest slope between them,
-            // each residual allowed the rounding of its own evaluation — a sum
-            // of `m` positive terms and a logarithm — as in
-            // `linear_space_roots_match_the_log_space_roots_across_both_tails`:
-            // two roots a float apart can both evaluate to a residual of zero.
-            let noise = (grid.view().len() as f64 + 4.0) * f64::EPSILON * (1.0 + log_target.abs());
-            let (_, d_mid, _) = residual(warm + 0.5 * (cold - warm));
-            let bound =
-                (f_warm.abs() + f_cold.abs() + 2.0 * noise) / d_warm.abs().min(d_cold.abs()).min(d_mid.abs());
-            assert!(
-                (warm - cold).abs() <= bound,
-                "row {row}: warm {warm:+.17e} vs cold {cold:+.17e} exceeds the residual bound {bound:.3e}"
-            );
+        let others = (1..=16)
+            .map(|step| (q + 3e-4 * f64::from(step), b - 4e-4 * f64::from(step)))
+            .chain(std::iter::once((1.05_f64, 1.21_f64)));
+        for (other_q, other_b) in others {
+            let cold = solve_anchor(other_q, other_b, grid.view()).expect("cold");
+            for (row, table) in [(1, taylor), (2, poisoned)] {
+                cache.slot(row, slot).expect("slot").write(&store(table));
+                let through_slot =
+                    solve_anchor_in_slot(other_q, other_b, context, row, slot).expect("slot solve");
+                assert_eq!(
+                    through_slot.to_bits(),
+                    cold.to_bits(),
+                    "({other_q}, {other_b}) row {row}: the slot solve {through_slot:+.17e} is not the \
+                     closed-form root {cold:+.17e}"
+                );
+            }
         }
     }
 
@@ -2146,9 +2268,9 @@ mod anchor_tests {
                 let noise = (grid.view().len() as f64 + 4.0) * f64::EPSILON * (1.0 + log_target.abs());
                 for &b in &[-4.0, -1.6, -0.5, 0.0, 0.5, 1.6, 4.0] {
                     let seed = gaussian_anchor(q, b);
-                    let linear = solve_anchor_with(q, b, grid.view(), seed, anchor_log_residual)
+                    let (linear, _) = solve_anchor_with(q, b, grid.view(), seed, anchor_log_residual)
                         .unwrap_or_else(|e| panic!("{label} q={q} b={b}: linear solve: {e}"));
-                    let logged =
+                    let (logged, _) =
                         solve_anchor_with(q, b, grid.view(), seed, anchor_log_residual_in_log_space)
                             .unwrap_or_else(|e| panic!("{label} q={q} b={b}: log solve: {e}"));
                     let reference = |alpha: f64| {

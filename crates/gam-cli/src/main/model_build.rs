@@ -27,12 +27,19 @@ pub(crate) fn write_payload_json(path: &Path, payload: FittedModelPayload) -> Re
     write_model_json(path, &model)
 }
 
-pub(crate) fn print_inference_summary(notes: &[String]) {
-    if notes.is_empty() {
+/// Report a fit's notes. Advisories (the model differs from the literal
+/// request) go to stderr; informational notes (defaults chosen on the user's
+/// behalf) are logged at debug level, shown with `-v`, and stay in the saved
+/// model either way.
+pub(crate) fn print_inference_summary(advisories: &[String], informational: &[String]) {
+    for note in informational {
+        log::debug!("fit note: {note}");
+    }
+    if advisories.is_empty() {
         return;
     }
-    cli_err!("Auto-discovery summary:");
-    for note in notes {
+    cli_err!("Fit notes:");
+    for note in advisories {
         cli_err!("  - {}", note);
     }
 }

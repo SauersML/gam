@@ -1,7 +1,7 @@
 # #2502 — unsupervised overcomplete manifold dictionary on Qwen3.5-4B-Base
 
 Campaign scripts (A10 lane, `~/i2502`). The dictionary itself is the Rust
-manifold SAE (`gamfit.sae_manifold_fit`, hard-TopK support lane at K > P);
+manifold SAE (`gamfit.sae.sae_manifold_fit`, hard-TopK support lane at K > P);
 Python here is orchestration, plotting, and the LLM harness only.
 
 Data path: `harvest_qwen35.py` (residual stream after blocks 8/16/22,

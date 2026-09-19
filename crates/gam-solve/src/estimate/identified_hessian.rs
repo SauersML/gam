@@ -312,25 +312,36 @@ pub(crate) struct HessianSpectrumBounds {
 
 impl HessianSpectrumBounds {
     /// The bounds for the penalized `hessian`, which carries the engine's
-    /// `penalty` `S̃`, over a step of at most `step[k]` in coordinate `k`, for the
-    /// curvature weights' `motion` over that step. `penalties` yields one
-    /// `(range, block)` per coordinate, in coordinate order: `block` is
-    /// `λ_k S̃_k` on `hessian`'s rows and columns `range`, zero elsewhere.
-    pub(crate) fn over_step(
+    /// `penalty` `S̃`, over a step that moves coordinate `k` down by at most
+    /// `down[k]` and up by at most `up[k]`, so `λ_k S̃_k` ranges over
+    /// `[e^{−down_k}, e^{up_k}]·λ_k S̃_k`, for the curvature weights' `motion`
+    /// over that step. `penalties` yields one `(range, block)` per coordinate,
+    /// in coordinate order: `block` is `λ_k S̃_k` on `hessian`'s rows and
+    /// columns `range`, zero elsewhere.
+    pub(crate) fn over_reach(
         hessian: &Array2<f64>,
         penalty: &Array2<f64>,
         penalties: impl IntoIterator<Item = (std::ops::Range<usize>, Array2<f64>)>,
-        step: ArrayView1<'_, f64>,
+        down: ArrayView1<'_, f64>,
+        up: ArrayView1<'_, f64>,
         motion: HessianSpectrumMotion,
     ) -> Result<Self, EstimationError> {
         let dimension = hessian.nrows();
+        let nonnegative = |reach: &ArrayView1<'_, f64>| {
+            reach
+                .iter()
+                .all(|&radius| radius.is_finite() && radius >= 0.0)
+        };
         if hessian.ncols() != dimension
             || penalty.dim() != (dimension, dimension)
-            || step.iter().any(|&radius| !(radius.is_finite() && radius >= 0.0))
+            || down.len() != up.len()
+            || !nonnegative(&down)
+            || !nonnegative(&up)
         {
             return Err(EstimationError::InvalidInput(format!(
                 "Hessian spectrum bounds need a square Hessian, a penalty of its shape and \
-                 finite nonnegative steps: {}x{} Hessian, {}x{} penalty, steps {step}",
+                 finite nonnegative reaches of one length: {}x{} Hessian, {}x{} penalty, \
+                 reach down {down}, reach up {up}",
                 hessian.nrows(),
                 hessian.ncols(),
                 penalty.nrows(),
@@ -344,10 +355,10 @@ impl HessianSpectrumBounds {
         let mut upper_unbounded = false;
         let mut coordinates = 0usize;
         for (range, block) in penalties {
-            let Some(&radius) = step.get(coordinates) else {
+            let (Some(&fall), Some(&rise)) = (down.get(coordinates), up.get(coordinates)) else {
                 return Err(EstimationError::InvalidInput(format!(
                     "Hessian spectrum bounds: more penalties than the {} step coordinates",
-                    step.len()
+                    down.len()
                 )));
             };
             if range.end > dimension || block.dim() != (range.len(), range.len()) {
@@ -365,8 +376,8 @@ impl HessianSpectrumBounds {
                 .scaled_add(1.0, &block);
             shrunk
                 .slice_mut(s![range.clone(), range.clone()])
-                .scaled_add((-radius).exp(), &block);
-            let growth = radius.exp();
+                .scaled_add((-fall).exp(), &block);
+            let growth = rise.exp();
             if growth.is_finite() {
                 grown
                     .slice_mut(s![range.clone(), range])
@@ -376,10 +387,10 @@ impl HessianSpectrumBounds {
             }
             coordinates += 1;
         }
-        if coordinates != step.len() {
+        if coordinates != down.len() {
             return Err(EstimationError::InvalidInput(format!(
                 "Hessian spectrum bounds: {coordinates} penalties for {} step coordinates",
-                step.len()
+                down.len()
             )));
         }
         let difference = penalty - &total;
@@ -533,6 +544,7 @@ pub(crate) struct IdentifiedRankCertificate {
 /// on ρ.
 pub(crate) fn certify_identified_rank_locally_constant(
     eigenvalues: &[f64],
+    rank: usize,
     penalty_rank: usize,
     bounds: &HessianSpectrumBounds,
 ) -> Result<IdentifiedRankCertificate, EstimationError> {
@@ -544,7 +556,6 @@ pub(crate) fn certify_identified_rank_locally_constant(
             bounds.upper.len()
         )));
     }
-    let rank = DenseSpectralOperator::identified_rank(eigenvalues, penalty_rank);
     let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues);
     let mut descending = eigenvalues.to_vec();
     descending.sort_by(|left, right| right.total_cmp(left));
@@ -620,13 +631,33 @@ impl FittedHessianSpectrum {
             .map_err(EstimationError::EigendecompositionFailed)?;
         let eigenvalues = eigenvalues.to_vec();
         let rank = DenseSpectralOperator::identified_rank(&eigenvalues, penalty_rank);
-        Ok(Self {
-            hessian: symmetric,
+        Ok(Self::from_eigensystem(
+            symmetric,
             eigenvalues,
             eigenvectors,
             penalty_rank,
             rank,
-        })
+        ))
+    }
+
+    /// The spectrum a criterion builder already decomposed `hessian` into and
+    /// priced at `rank`, for a penalty of rank `penalty_rank` (#2959 D1). The
+    /// certificate then judges the eigenpairs and the rank the criterion priced,
+    /// not a second decomposition and a second call to the predicate.
+    pub(crate) fn from_eigensystem(
+        hessian: Array2<f64>,
+        eigenvalues: Vec<f64>,
+        eigenvectors: Array2<f64>,
+        penalty_rank: usize,
+        rank: usize,
+    ) -> Self {
+        Self {
+            hessian,
+            eigenvalues,
+            eigenvectors,
+            penalty_rank,
+            rank,
+        }
     }
 
     /// The number of identified coefficient directions.
@@ -648,13 +679,26 @@ impl FittedHessianSpectrum {
     }
 }
 
+/// The outer certificate at ρ̂, as the identified-rank certificate reads it:
+/// its curvature `hessian_rho` and `gradient`, the coordinates it certified on
+/// a rail, ρ̂ itself, and the resolvability domain `[lower, upper]` the outer
+/// search ran in.
+pub(crate) struct OuterCertificatePoint<'a> {
+    pub(crate) hessian_rho: &'a Array2<f64>,
+    pub(crate) gradient: &'a Array1<f64>,
+    pub(crate) railed: &'a [usize],
+    pub(crate) rho: &'a Array1<f64>,
+    pub(crate) lower: &'a Array1<f64>,
+    pub(crate) upper: &'a Array1<f64>,
+}
+
 /// Certify at finalization that the fitted Hessian's identified rank is constant
 /// over the outer certificate's own Newton step (#2901 V22), and return that
 /// certificate with the step's largest coordinate.
 ///
 /// `spectrum` is PIRLS's dense penalized Hessian's, in its transformed basis;
-/// `hessian_rho` and `gradient` are the outer certificate's curvature and
-/// gradient at ρ̂, and `railed` lists the coordinates it certified on a rail. The
+/// `outer` carries the outer certificate's curvature and gradient at ρ̂ and the
+/// coordinates it certified on a rail. The
 /// curvature weights move through `β̂`: `ΔW_i = c_i·x_iᵀΔβ` with
 /// `Δβ = Σ_k δρ_k·∂β̂/∂ρ_k` and `∂β̂/∂ρ_k = −H⁺λ_kS_kβ̂` over the identified
 /// subspace the criterion priced, so row `i` moves by at most
@@ -663,17 +707,51 @@ impl FittedHessianSpectrum {
 /// bounds are taken at this certified state, the one the criterion priced. Both
 /// channels read the same penalties: the engine's projections `S̃_k = Π S_k Π`
 /// that sum to the `S̃` in `H` ([`HessianSpectrumBounds`]).
+///
+/// The stationary point the certificate vouches for is the outer search's, and
+/// that search runs inside its resolvability domain `[lo, hi]`. So coordinate
+/// `k` reaches down by `min(t_k, ρ̂_k − lo_k)` and up by `min(t_k, hi_k − ρ̂_k)`
+/// for the Newton displacement `t_k`: a flat coordinate just inside the λ→∞
+/// face has a long Newton step toward that face, and the step ends on the face,
+/// not beyond it.
 pub(crate) fn certify_fitted_identified_rank(
     pirls: &crate::pirls::PirlsResult,
     spectrum: &FittedHessianSpectrum,
     lambdas: &Array1<f64>,
     design: &gam_linalg::matrix::DesignMatrix,
-    hessian_rho: &Array2<f64>,
-    gradient: &Array1<f64>,
-    railed: &[usize],
+    outer: OuterCertificatePoint<'_>,
 ) -> Result<(IdentifiedRankCertificate, f64), EstimationError> {
+    let OuterCertificatePoint {
+        hessian_rho,
+        gradient,
+        railed,
+        rho,
+        lower,
+        upper,
+    } = outer;
+    if rho.len() != gradient.len() || lower.len() != rho.len() || upper.len() != rho.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "identified-rank certificate: {} gradient coordinates at a {}-coordinate rho in a \
+             [{}, {}]-coordinate domain",
+            gradient.len(),
+            rho.len(),
+            lower.len(),
+            upper.len()
+        )));
+    }
     let displacement = certificate_newton_displacement(hessian_rho, gradient, railed)?;
-    let step_radius = displacement.iter().fold(0.0_f64, |acc, value| acc.max(*value));
+    let down: Array1<f64> = ndarray::Zip::from(&displacement)
+        .and(rho)
+        .and(lower)
+        .map_collect(|&step, &at, &floor| step.min((at - floor).max(0.0)));
+    let up: Array1<f64> = ndarray::Zip::from(&displacement)
+        .and(rho)
+        .and(upper)
+        .map_collect(|&step, &at, &ceiling| step.min((ceiling - at).max(0.0)));
+    let reach: Array1<f64> = ndarray::Zip::from(&down)
+        .and(&up)
+        .map_collect(|&fall, &rise| fall.max(rise));
+    let step_radius = reach.iter().fold(0.0_f64, |acc, value| acc.max(*value));
     let penalties = pirls.reparam_result.applied_penalties().map_err(|error| {
         EstimationError::LayoutError(format!(
             "projecting the rank certificate's penalty blocks onto the reparameterization's \
@@ -683,9 +761,9 @@ pub(crate) fn certify_fitted_identified_rank(
     let eigenvalues = &spectrum.eigenvalues;
     let eigenvectors = &spectrum.eigenvectors;
     let penalty_rank = spectrum.penalty_rank;
+    let rank = spectrum.rank;
     let rows = design.nrows();
     let weight_motion = if pirls.solve_c_nontrivial && step_radius > 0.0 {
-        let rank = DenseSpectralOperator::identified_rank(&eigenvalues, penalty_rank);
         let mut order: Vec<usize> = (0..eigenvalues.len()).collect();
         order.sort_by(|&left, &right| eigenvalues[right].total_cmp(&eigenvalues[left]));
         let beta: &Array1<f64> = pirls.beta_transformed.as_ref();
@@ -694,7 +772,7 @@ pub(crate) fn certify_fitted_identified_rank(
         for ((penalty, &lambda), &step) in penalties
             .iter()
             .zip(lambdas.iter())
-            .zip(displacement.iter())
+            .zip(reach.iter())
         {
             if step == 0.0 {
                 continue;
@@ -745,7 +823,7 @@ pub(crate) fn certify_fitted_identified_rank(
             Ok(qs.t().dot(&gram).dot(qs))
         },
     )?;
-    let bounds = HessianSpectrumBounds::over_step(
+    let bounds = HessianSpectrumBounds::over_reach(
         &spectrum.hessian,
         &pirls.reparam_result.s_transformed,
         penalties.iter().zip(lambdas.iter()).map(|(penalty, &lambda)| {
@@ -754,10 +832,11 @@ pub(crate) fn certify_fitted_identified_rank(
                 penalty.root.t().dot(&penalty.root) * lambda,
             )
         }),
-        displacement.view(),
+        down.view(),
+        up.view(),
         motion,
     )?;
-    certify_identified_rank_locally_constant(eigenvalues, penalty_rank, &bounds)
+    certify_identified_rank_locally_constant(eigenvalues, rank, penalty_rank, &bounds)
         .map(|certificate| (certificate, step_radius))
 }
 
@@ -765,6 +844,20 @@ pub(crate) fn certify_fitted_identified_rank(
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// The certificate at the rank the identified-subspace predicate prices.
+    fn certify_at_identified_rank(
+        eigenvalues: &[f64],
+        penalty_rank: usize,
+        bounds: &HessianSpectrumBounds,
+    ) -> Result<IdentifiedRankCertificate, EstimationError> {
+        certify_identified_rank_locally_constant(
+            eigenvalues,
+            DenseSpectralOperator::identified_rank(eigenvalues, penalty_rank),
+            penalty_rank,
+            bounds,
+        )
+    }
 
     /// A rank-2 PSD Hessian in three dimensions, rotated off the axes: the
     /// identified inverse is its Moore–Penrose pseudo-inverse, and a right-hand
@@ -819,12 +912,13 @@ mod tests {
             Array2::<f64>::zeros((hessian.len(), hessian.len())),
             |sum, entry| sum + diagonal(entry.0),
         );
-        HessianSpectrumBounds::over_step(
+        HessianSpectrumBounds::over_reach(
             &diagonal(hessian),
             &engine,
             penalties
                 .iter()
                 .map(|entry| (0..hessian.len(), diagonal(entry.0))),
+            steps.view(),
             steps.view(),
             still_weights(),
         )
@@ -837,7 +931,7 @@ mod tests {
     fn a_resolved_spectrum_certifies_its_rank_over_the_step() {
         let spectrum = [3.0, 1.0, 0.5, 0.0];
         let bounds = diagonal_bounds(&spectrum, &[(&[0.0, 1.0, 0.5, 0.0], 0.1)]);
-        let certificate = certify_identified_rank_locally_constant(&spectrum, 2, &bounds).unwrap();
+        let certificate = certify_at_identified_rank(&spectrum, 2, &bounds).unwrap();
         assert_eq!(certificate.rank, 3);
         assert_eq!(certificate.largest_unidentified, Some(0.0));
     }
@@ -849,14 +943,14 @@ mod tests {
         let band = 3.0 * f64::EPSILON;
         let spectrum = [1.0, 0.3, 0.6 * band];
         let penalty: &[f64] = &[0.0, 0.3, 0.6 * band];
-        let pointwise = certify_identified_rank_locally_constant(
+        let pointwise = certify_at_identified_rank(
             &spectrum,
             2,
             &diagonal_bounds(&spectrum, &[(penalty, 0.0)]),
         )
         .unwrap();
         assert_eq!(pointwise.rank, 2);
-        let refusal = certify_identified_rank_locally_constant(
+        let refusal = certify_at_identified_rank(
             &spectrum,
             2,
             &diagonal_bounds(&spectrum, &[(penalty, 1.0)]),
@@ -871,6 +965,32 @@ mod tests {
         );
     }
 
+    /// The certificate judges the rank it is handed, the one the criterion priced,
+    /// not the identified-subspace predicate's (#2959 D1). The predicate drops a
+    /// direction under the band, and the dropped set is certified. The same
+    /// spectrum priced at full rank, as the root prices it, keeps that direction,
+    /// and bounds judged at the assembled band cannot hold it above that band.
+    #[test]
+    fn the_certificate_judges_the_rank_the_criterion_priced_2959() {
+        let band = 3.0 * f64::EPSILON;
+        let spectrum = [1.0, 0.3, 0.6 * band];
+        let penalty: &[f64] = &[0.0, 0.3, 0.6 * band];
+        let bounds = diagonal_bounds(&spectrum, &[(penalty, 0.0)]);
+        assert_eq!(DenseSpectralOperator::identified_rank(&spectrum, 2), 2);
+        let dropped = certify_identified_rank_locally_constant(&spectrum, 2, 2, &bounds).unwrap();
+        assert_eq!(dropped.rank, 2);
+        assert_eq!(dropped.largest_unidentified, Some(0.6 * band));
+        let priced_in_full =
+            certify_identified_rank_locally_constant(&spectrum, 3, 2, &bounds).unwrap_err();
+        assert!(
+            matches!(
+                priced_in_full,
+                EstimationError::IdentifiedRankNotLocallyConstant { rank: 3, .. }
+            ),
+            "{priced_in_full}"
+        );
+    }
+
     /// A penalized direction just over the band, above the penalty-rank floor,
     /// is certified at a zero step and refused once its penalty's step can push
     /// it under the band.
@@ -879,14 +999,14 @@ mod tests {
         let band = 3.0 * f64::EPSILON;
         let spectrum = [1.0, 1.5 * band, 0.0];
         let penalty: &[f64] = &[0.0, 1.5 * band, 0.0];
-        let pointwise = certify_identified_rank_locally_constant(
+        let pointwise = certify_at_identified_rank(
             &spectrum,
             1,
             &diagonal_bounds(&spectrum, &[(penalty, 0.0)]),
         )
         .unwrap();
         assert_eq!(pointwise.rank, 2);
-        let refusal = certify_identified_rank_locally_constant(
+        let refusal = certify_at_identified_rank(
             &spectrum,
             1,
             &diagonal_bounds(&spectrum, &[(penalty, 1.0)]),
@@ -908,7 +1028,7 @@ mod tests {
     fn a_railed_penalty_does_not_charge_the_directions_it_does_not_reach() {
         let spectrum = [1.0e15, 5.0e14, 1.0e3, 0.0];
         let bounds = diagonal_bounds(&spectrum, &[(&[1.0e15, 5.0e14, 0.0, 0.0], 0.05)]);
-        let certificate = certify_identified_rank_locally_constant(&spectrum, 2, &bounds).unwrap();
+        let certificate = certify_at_identified_rank(&spectrum, 2, &bounds).unwrap();
         assert_eq!(certificate.rank, 3);
     }
 
@@ -926,11 +1046,11 @@ mod tests {
         let spectrum = [4.9713e12, 1.0e5, 132.36];
         let flat: (&[f64], f64) = (&[0.0, 4.68e3, 0.0], 5.48);
         let certificate =
-            certify_identified_rank_locally_constant(&spectrum, 1, &diagonal_bounds(&spectrum, &[flat]))
+            certify_at_identified_rank(&spectrum, 1, &diagonal_bounds(&spectrum, &[flat]))
                 .unwrap();
         assert_eq!(certificate.rank, 3);
         let reaching: (&[f64], f64) = (&[0.0, 0.0, 132.36], 14.66);
-        let refusal = certify_identified_rank_locally_constant(
+        let refusal = certify_at_identified_rank(
             &spectrum,
             2,
             &diagonal_bounds(&spectrum, &[flat, reaching]),
@@ -943,6 +1063,42 @@ mod tests {
             ),
             "{refusal}"
         );
+    }
+
+    /// pyGAM audit F1: a flat coordinate just inside the λ→∞ face of its
+    /// resolvability domain carries a long Newton step toward that face, and the
+    /// step ends on the face. On `y ~ s(x0) + … + s(x19)` (binomial, n = 10000) the
+    /// displacement was 11 at ρ = 23.5 with the face at 25.4; its penalty sets
+    /// `‖H‖₂`, so growing it by `e^{11}` lifted the band past the data direction's
+    /// σ_r = 63.6 and refused a rank that cannot move inside the domain. Growing it
+    /// by the `e^{1.9}` that reaches the face certifies; the same step shrinking the
+    /// penalty by `e^{−11}` leaves the data direction where it is.
+    #[test]
+    fn a_step_toward_the_domain_face_is_clipped_at_the_face() {
+        let spectrum = [2.0e15 + 1.0, 63.6];
+        let hessian = diagonal(&spectrum);
+        let engine = diagonal(&[2.0e15, 0.0]);
+        let bounds_for = |down: f64, up: f64| {
+            HessianSpectrumBounds::over_reach(
+                &hessian,
+                &engine,
+                [(0..2, engine.clone())],
+                array![down].view(),
+                array![up].view(),
+                still_weights(),
+            )
+            .unwrap()
+        };
+        let refusal = certify_at_identified_rank(&spectrum, 1, &bounds_for(11.0, 11.0)).unwrap_err();
+        assert!(
+            matches!(
+                refusal,
+                EstimationError::IdentifiedRankNotLocallyConstant { rank: 2, .. }
+            ),
+            "{refusal}"
+        );
+        let certificate = certify_at_identified_rank(&spectrum, 1, &bounds_for(11.0, 1.9)).unwrap();
+        assert_eq!(certificate.rank, 2);
     }
 
     /// #2901 V22: a rotated penalty root can leak onto the structural null
@@ -964,7 +1120,7 @@ mod tests {
             .project_out_null_directions(array![[0.0], [1.0]].view())
             .unwrap();
         let bounds_for = |penalty: &gam_terms::construction::CanonicalPenalty| {
-            HessianSpectrumBounds::over_step(
+            HessianSpectrumBounds::over_reach(
                 &hessian,
                 &engine,
                 [(
@@ -972,15 +1128,16 @@ mod tests {
                     penalty.root.t().dot(&penalty.root) * 1.0e8,
                 )],
                 array![1.0].view(),
+                array![1.0].view(),
                 still_weights(),
             )
             .unwrap()
         };
         let certificate =
-            certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(&projected)).unwrap();
+            certify_at_identified_rank(&spectrum, 1, &bounds_for(&projected)).unwrap();
         assert_eq!(certificate.rank, 2);
         let refusal =
-            certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(&leaking)).unwrap_err();
+            certify_at_identified_rank(&spectrum, 1, &bounds_for(&leaking)).unwrap_err();
         assert!(
             matches!(
                 refusal,
@@ -1000,16 +1157,17 @@ mod tests {
     fn an_engine_penalty_the_blocks_do_not_reproduce_is_charged_its_residual_2901() {
         let spectrum = [1.0, 0.3];
         let bounds_for = |engine: &[f64]| {
-            HessianSpectrumBounds::over_step(
+            HessianSpectrumBounds::over_reach(
                 &diagonal(&spectrum),
                 &diagonal(engine),
                 [(0..2, diagonal(&[0.0, 0.2]))],
+                array![0.0].view(),
                 array![0.0].view(),
                 still_weights(),
             )
             .unwrap()
         };
-        let matching = certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(&[0.0, 0.2]))
+        let matching = certify_at_identified_rank(&spectrum, 1, &bounds_for(&[0.0, 0.2]))
             .unwrap();
         assert_eq!(matching.rank, 2);
         let charged = bounds_for(&[0.0, 0.6]);
@@ -1025,7 +1183,7 @@ mod tests {
             );
         }
         let refusal =
-            certify_identified_rank_locally_constant(&spectrum, 1, &charged).unwrap_err();
+            certify_at_identified_rank(&spectrum, 1, &charged).unwrap_err();
         assert!(
             matches!(
                 refusal,
@@ -1158,10 +1316,11 @@ mod tests {
         let second = rotation.dot(&diagonal(&[0.0, 3.0, 1.0])).dot(&rotation.t());
         let hessian = &data + &first + &second;
         let steps = array![1.3, 0.4];
-        let bounds = HessianSpectrumBounds::over_step(
+        let bounds = HessianSpectrumBounds::over_reach(
             &hessian,
             &(&first + &second),
             [(0..3, first.clone()), (0..3, second.clone())],
+            steps.view(),
             steps.view(),
             still_weights(),
         )
@@ -1238,22 +1397,23 @@ mod tests {
                     Ok(Array2::from_diag(mass))
                 })
                 .unwrap();
-            HessianSpectrumBounds::over_step(
+            HessianSpectrumBounds::over_reach(
                 &diagonal(&spectrum),
                 &diagonal(&[0.0, 0.5]),
                 [penalty.clone()],
+                array![0.0].view(),
                 array![0.0].view(),
                 motion,
             )
             .unwrap()
         };
-        let still = certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(array![0.0, 0.0]))
+        let still = certify_at_identified_rank(&spectrum, 1, &bounds_for(array![0.0, 0.0]))
             .unwrap();
         assert_eq!(still.rank, 2);
         let displaced = [1.0, -0.4 - 0.1 + 0.5];
         assert_eq!(DenseSpectralOperator::identified_rank(&displaced, 1), 1);
         let refusal =
-            certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(array![0.0, 0.1]))
+            certify_at_identified_rank(&spectrum, 1, &bounds_for(array![0.0, 0.1]))
                 .unwrap_err();
         assert!(
             matches!(
