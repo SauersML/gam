@@ -11,7 +11,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Sequence, cast
+from typing import Any, Iterator, Literal, Sequence, cast, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -140,7 +140,7 @@ class Model:
         self,
         data: Any,
         *,
-        interval: float | str | None = None,
+        interval: float | Literal["conformal"] | None = None,
         conformal_level: float = 0.9,
         calibration: Any | None = None,
         covariance_mode: str | None = None,
@@ -321,8 +321,6 @@ class Model:
                 raise map_exception(exc) from exc
             return shape_predict_response(
                 raw,
-                headers=headers,
-                rows=rows,
                 table_kind=table_kind,
                 training_table_kind=self._training_table_kind,
                 interval=conformal_level,
@@ -346,8 +344,6 @@ class Model:
             raise map_exception(exc) from exc
         return shape_predict_response(
             raw,
-            headers=headers,
-            rows=rows,
             table_kind=table_kind,
             training_table_kind=self._training_table_kind,
             interval=interval,
@@ -379,7 +375,7 @@ class Model:
         named ``score`` (plus the requested identifier).
         """
         required = rust_module().required_model_columns(self._model_bytes, True)
-        if id_column is not None:
+        if required is not None and id_column is not None:
             required = sorted(set(required) | {id_column})
         headers, rows, table_kind = normalize_table(data, required_columns=required)
         row_ids = extract_row_ids(headers, rows, id_column)
@@ -1140,7 +1136,8 @@ class Model:
 
     @property
     def group_metadata(self) -> dict[str, Any] | None:
-        return rust_module().model_group_metadata(self._model_bytes)
+        metadata: dict[str, Any] | None = rust_module().model_group_metadata(self._model_bytes)
+        return metadata
 
     @property
     def deployment_extensions(self) -> tuple[dict[str, Any], ...]:
@@ -1157,9 +1154,12 @@ class Model:
     def _coefficient_state(self) -> dict[str, Any]:
         """Decode the Rust coefficient-state JSON payload."""
         try:
-            return json.loads(rust_module().coefficient_state_json(self._model_bytes))
+            state: dict[str, Any] = json.loads(
+                rust_module().coefficient_state_json(self._model_bytes)
+            )
         except Exception as exc:
             raise map_exception(exc) from exc
+        return state
 
     def partial_dependence(
         self,
@@ -1356,7 +1356,16 @@ class MultinomialPrediction:
 
     __slots__ = ("classes", "mean", "std_error", "mean_lower", "mean_upper", "level")
 
-    def __init__(self, *, classes, mean, std_error, mean_lower, mean_upper, level):
+    def __init__(
+        self,
+        *,
+        classes: Sequence[Any],
+        mean: NDArray[np.float64],
+        std_error: NDArray[np.float64],
+        mean_lower: NDArray[np.float64],
+        mean_upper: NDArray[np.float64],
+        level: float,
+    ) -> None:
         self.classes = list(classes)
         self.mean = mean
         self.std_error = std_error
@@ -1455,7 +1464,19 @@ class MultinomialModel:
         return self._model_bytes
 
     # ------------------------------------------------------------------ predict
-    def predict(self, data: Any, *, interval: str | None = None, level: float = 0.95) -> Any:
+    @overload
+    def predict(
+        self, data: Any, *, interval: None = None, level: float = 0.95
+    ) -> NDArray[np.float64]: ...
+
+    @overload
+    def predict(
+        self, data: Any, *, interval: Literal["confidence"], level: float = 0.95
+    ) -> MultinomialPrediction: ...
+
+    def predict(
+        self, data: Any, *, interval: Literal["confidence"] | None = None, level: float = 0.95
+    ) -> NDArray[np.float64] | MultinomialPrediction:
         """Predict class probabilities for new rows.
 
         With ``interval=None`` (default) returns an ``(N, K)`` numpy array whose
@@ -1565,7 +1586,7 @@ class MultinomialModel:
             labels[idx == c] = name
         return labels
 
-    def smooth_significance(self) -> list[dict]:
+    def smooth_significance(self) -> list[dict[str, Any]]:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 
         One row per ``(active class, smooth term)`` with keys ``class``,
