@@ -225,8 +225,8 @@ They differ in two ways only:
 
 | Spelling | Numeric column | Level unseen in training |
 | --- | --- | --- |
-| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
-| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
+| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
+| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
 | `group(site)`, `re(site)` | forced to categorical levels | predicted at the population level (the level effect is 0) |
 
 So `factor(year)` treats `year` as levels rather than as a slope, and a

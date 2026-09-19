@@ -39,7 +39,7 @@ gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
 gamfit.fit(df, "prop ~ s(x)", family="gamma", link="log")     # explicit
 try:
     gamfit.fit(df, "prop ~ s(x)", link="log")
-except gamfit.errors.GamError as err:          # name one with family=
+except gamfit.errors.FormulaError as err:      # name one with family=
     print(err)
 ```
 
