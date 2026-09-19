@@ -33,9 +33,9 @@ def test_latent_reml_fit_prices_ard_descriptor_energy_2933() -> None:
     t, args, kwargs = _problem()
     w = 0.7
     n, dim = t.shape
-    bare = gamfit.gaussian_reml_fit_latent(t.ravel(), *args, **kwargs)
-    priced = gamfit.gaussian_reml_fit_latent(
-        t.ravel(), *args, penalties=[gamfit.ARDPenalty(weight=w)], **kwargs
+    bare = gamfit.reml.gaussian_reml_fit_latent(t.ravel(), *args, **kwargs)
+    priced = gamfit.reml.gaussian_reml_fit_latent(
+        t.ravel(), *args, penalties=[gamfit.penalties.ARDPenalty(weight=w)], **kwargs
     )
     energy = sum(
         0.5 * w * float(np.sum(t[:, j] ** 2)) - 0.5 * n * float(np.log(w))
@@ -59,16 +59,16 @@ def test_latent_reml_backward_carries_ard_descriptor_gradient_2933() -> None:
     t, args, kwargs = _problem()
     w = 0.7
     bare = np.asarray(
-        gamfit.gaussian_reml_fit_latent_backward(
+        gamfit.reml.gaussian_reml_fit_latent_backward(
             t.ravel(), *args, grad_reml_score=1.0, **kwargs
         )["grad_t"]
     )
     priced = np.asarray(
-        gamfit.gaussian_reml_fit_latent_backward(
+        gamfit.reml.gaussian_reml_fit_latent_backward(
             t.ravel(),
             *args,
             grad_reml_score=1.0,
-            penalties=[gamfit.ARDPenalty(weight=w)],
+            penalties=[gamfit.penalties.ARDPenalty(weight=w)],
             **kwargs,
         )["grad_t"]
     )

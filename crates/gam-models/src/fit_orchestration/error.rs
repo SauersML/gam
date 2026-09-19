@@ -120,7 +120,7 @@ pub enum WorkflowError {
     },
     /// A formula referenced a column that does not exist in the input data.
     /// Carries the structured payload through to the FFI boundary so the
-    /// Python side can raise `gamfit.ColumnNotFoundError` with `column`,
+    /// Python side can raise `gamfit.errors.ColumnNotFoundError` with `column`,
     /// `role`, `available`, `similar`, and `tsv_hint` attributes — issue
     /// #305 / #343 (typed-dispatch migration; no string classification at
     /// the boundary).
@@ -140,13 +140,17 @@ pub enum WorkflowError {
     TransformationNormalConflict {
         conflict: TransformationNormalConflict,
     },
-    /// Term construction refused the formula's terms or their data. The typed
-    /// source keeps its category ([`TermBuilderError::error_category`]), so a
-    /// categorical column used as a smooth coordinate reaches every front end
-    /// as a formula error naming the column.
+    /// A formula term could not be built as written: a malformed or unknown
+    /// option (`s(x, k=ten)`, `penalty_order` above the degree), a `domain=`
+    /// that excludes the data, a categorical column used as a smooth
+    /// coordinate, or data degenerate for the requested basis. The typed
+    /// source keeps its category ([`TermBuilderError::error_category`]) and
+    /// the `in term ...:` label, so every front end classifies it the same.
     ///
     /// [`TermBuilderError::error_category`]: gam_terms::term_builder::TermBuilderError::error_category
-    TermBuilder(gam_terms::term_builder::TermBuilderError),
+    TermBuilder {
+        source: gam_terms::term_builder::TermBuilderError,
+    },
     /// The data layer refused a cell or table (unparseable, non-finite, empty).
     Data(gam_data::DataError),
     /// A `warm_start_from` model this fit cannot resume (gam#3002).
@@ -175,6 +179,7 @@ impl std::fmt::Display for WorkflowError {
                  centers: the {attempted_centers}-center certification refit failed ({reason})"
             ),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
+            WorkflowError::TermBuilder { source } => std::fmt::Display::fmt(source, f),
             // Reconstruct the display text from the structured payload so
             // CLI / `to_string()` consumers see the same prose the legacy
             // `missing_column_message` produced. The text is a function of
@@ -241,7 +246,6 @@ impl std::fmt::Display for WorkflowError {
                 };
                 write!(f, "transformation_normal cannot be combined with {control}")
             }
-            WorkflowError::TermBuilder(source) => std::fmt::Display::fmt(source, f),
             WorkflowError::Data(source) => std::fmt::Display::fmt(source, f),
             WorkflowError::WarmStartRefused { refusal } => match refusal {
                 WarmStartRefusal::RefitRequired { payload_version } => write!(
@@ -283,7 +287,7 @@ impl std::error::Error for WorkflowError {
             | WorkflowError::TransformationNormalConflict { .. }
             | WorkflowError::WarmStartRefused { .. } => None,
             // Render exactly their source, so they are transparent to the chain.
-            WorkflowError::TermBuilder(source) => source.source(),
+            WorkflowError::TermBuilder { source } => source.source(),
             WorkflowError::Data(source) => source.source(),
         }
     }
@@ -323,7 +327,7 @@ impl WorkflowError {
             Self::SpatialUnderresolved { refit_failure, .. } => refit_failure
                 .as_deref()
                 .map_or(ErrorCategory::Convergence, Self::error_category),
-            Self::TermBuilder(source) => source.error_category(),
+            Self::TermBuilder { source } => source.error_category(),
             Self::Data(source) => source.error_category(),
             Self::SchemaMismatch { .. } | Self::InvalidData { .. } => ErrorCategory::Data,
             Self::InvalidConfig { .. }
@@ -359,7 +363,7 @@ impl WorkflowError {
             | Self::TransformationNormalConflict { .. }
             // A warm start the fit cannot resume: a configuration refusal.
             | Self::WarmStartRefused { .. }
-            | Self::TermBuilder(_)
+            | Self::TermBuilder { .. }
             | Self::Data(_) => FailureCategory::Input,
         }
     }
@@ -389,7 +393,7 @@ impl WorkflowError {
             Self::TransformationNormalConflict { .. } => {
                 "WorkflowError::TransformationNormalConflict"
             }
-            Self::TermBuilder(source) => source.variant_name(),
+            Self::TermBuilder { source } => source.variant_name(),
             Self::Data(source) => source.variant_name(),
             Self::WarmStartRefused { .. } => "WorkflowError::WarmStartRefused",
         }
@@ -1174,7 +1178,7 @@ impl From<gam_terms::inference::formula_dsl::FormulaDslError> for WorkflowError 
 /// Typed lift from term-builder errors. `TermBuilderError::ColumnNotFound`
 /// preserves the structured fields (name, role, available, similar,
 /// tsv_hint) through to the FFI boundary so `gam-pyffi` can raise a
-/// `gamfit.ColumnNotFoundError` with attributes set from the payload —
+/// `gamfit.errors.ColumnNotFoundError` with attributes set from the payload —
 /// not from re-parsed prose. Every other variant is kept whole, so its
 /// [`ErrorCategory`] survives to the front ends.
 impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
@@ -1194,7 +1198,7 @@ impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
                 similar,
                 tsv_hint,
             },
-            other => Self::TermBuilder(other),
+            source => Self::TermBuilder { source },
         }
     }
 }

@@ -3,7 +3,7 @@
 //! Every error type that can reach a user (data ingestion, formula
 //! resolution, term construction, estimation, workflow orchestration)
 //! reports exactly one [`ErrorCategory`]. The Python bindings map the
-//! category 1:1 onto `gamfit.FormulaError` / `DataError` /
+//! category 1:1 onto `gamfit.errors.FormulaError` / `DataError` /
 //! `ConvergenceError` / `NotFittedError` / `InternalError`, and the CLI maps
 //! it onto its process exit code, so the two front ends classify every
 //! failure identically without inspecting message text.

@@ -8,18 +8,84 @@
   `FormulaError(GamfitError, ValueError)`, `DataError(GamfitError, ValueError)`,
   `ConvergenceError(GamfitError, RuntimeError)`, `NotFittedError` (the bases of
   scikit-learn's `NotFittedError`) and `InternalError(GamfitError, RuntimeError)`.
-  Every other class sits under exactly one of them. Classes that no engine path
-  raised are removed. `gamfit.sklearn` estimators raise `gamfit.NotFittedError`
-  before `fit`. **Migration:** `GamError` is now `GamfitError` and no longer a
-  `ValueError`. Code that caught `ValueError` for a solver failure should catch
-  `ConvergenceError`, and code that caught `FitError` should catch `ConvergenceError`
-  or the category it means.
+  Every other class sits under exactly one of them, and all live in `gamfit.errors`.
+  Classes that no engine path raised are removed. `gamfit.sklearn` estimators raise
+  `gamfit.errors.NotFittedError` before `fit`. **Migration:** `GamError` is now
+  `GamfitError` and no longer a `ValueError`. Code that caught `ValueError` for a
+  solver failure should catch `ConvergenceError`, and code that caught `FitError`
+  should catch `ConvergenceError` or the category it means.
 - **`s()` / `te()` / `linear()` on a string or categorical column is a formula error.**
   These fits used to succeed silently on the column's level codes, and a stray string in
   a numeric column raised pyarrow's `ArrowInvalid`. Formula resolution in Rust now refuses it,
   for the CLI and Python alike. The message names the column and its first
   non-numeric value and row, and lists the terms that accept the column:
   `factor(g)` / `group(g)`, `s(x, by=g)`, `fs(x, g)` and `s(g, bs="re")`.
+- **The top-level `gamfit` namespace is 19 names** (PKG-06). `import gamfit` exposed about
+  340 names: the core API next to every research helper, basis primitive, result class and
+  error type, several under two names. The top level now holds the fit and load entry
+  points and the fitted-model classes: `fit`, `fit_array`, `load`, `loads`,
+  `validate_formula`, `explain_error`, `build_info`, `compare_models`,
+  `competing_risks_cif`, `fit_event_history`, `fit_joint_event_model`,
+  `load_joint_event_model`, `Model`, `MultinomialModel`, `EventHistoryModel`,
+  `JointEventModel`, `ResponseGeometryModel`, `CtnStage1` and `__version__`. Everything else
+  lives in one public submodule, loaded on first access: `basis`, `cuda`, `diagnostics`,
+  `errors`, `examples`, `geometry`, `identifiability`, `inference`, `kernels`, `manifolds`,
+  `penalties`, `plot`, `reml`, `response_geometry`, `results`, `sae`, `sklearn`, `smooth`,
+  `topology`, `torch` (and `kernels_jax` / `kernels_torch`). Every other module is private.
+  `import gamfit` no longer loads the SAE, topology-selection or plotting code.
+  **Migration:** `gamfit.X` becomes `gamfit.<submodule>.X`, for example
+  `gamfit.FormulaError` → `gamfit.errors.FormulaError`, `gamfit.Diagnostics` →
+  `gamfit.results.Diagnostics`, `gamfit.bspline_basis` → `gamfit.basis.bspline_basis`,
+  `gamfit.sae_manifold_fit` → `gamfit.sae.sae_manifold_fit`,
+  `gamfit.select_topology` → `gamfit.topology.select_topology`. Duplicates were removed
+  rather than aliased: `gamfit.save(m, path)` → `m.save(path)`;
+  `gamfit.identifiability_check` → `gamfit.identifiability.check`;
+  `gamfit.TopologySphere` → `gamfit.topology.Sphere`; `gamfit.SmoothSpec` →
+  `gamfit.smooth.Smooth`; `gamfit.plot_atom` / `gamfit.plot_fit` →
+  `gamfit.plot.sae_atom` / `gamfit.plot.sae_fit`; `gamfit.PoincareAtoms` /
+  `gamfit.InterchangeSwapDecoder` → `gamfit.torch.PoincareAtoms` /
+  `gamfit.torch.InterchangeSwapDecoder`. The research modules `structure_discovery`,
+  `layer_transport`, `manifold_crosscoder`, `manifold_behavior`, `checkpoint_dynamics`,
+  `intervention_calibration`, `parameter_decomposition`, `bartlett` and `full_conformal`
+  are now private; their public functions are in `gamfit.sae` and `gamfit.inference`.
+- **`gamfit.plot` is a plotting module.** `gamfit.plot.model`, `trace`, `sae_atom` and
+  `sae_fit` import matplotlib when called. Without it they raise an `ImportError` naming
+  the `gamfit[plot]` extra, as do `Model.plot` and `PosteriorSamples.plot_trace`.
+- **Weighted chi-square, F and t tails are accurate relative to the tail itself** (pyGAM
+  audit pv-tails-numerics, inference L4). The signed weighted chi-square survival function
+  used Imhof's `½ + (1/π)∫`, which cancels once the tail falls below about `1e-16`. It
+  also had its tolerance clamped to `[1e-13, 1e-3]` by the smooth-term LR driver, and its
+  result clamped to `[0, 1]`. Its equal-weights shortcut read negative weights as
+  `1 − chi_square_sf`. Together these put a floor under small p-values: a profiled-scale
+  tail at `1e-200` came back as `5e-16`, and an all-negative spectrum near `1e-16` was off
+  by `0.11` while claiming a bound of zero. `signed_weighted_chi_square_sf` now inverts
+  the moment generating function along a hyperbolic contour through its saddle point, and
+  returns a `TailProbability { probability, relative_error }`. The error bound is derived
+  from the arithmetic that produced the value: level difference, truncation, per-node
+  conditioning and pairwise-summed rounding. There is no tolerance argument;
+  `signed_weighted_chi_square_sf_to_tolerance` is removed. Against 25-digit mpmath
+  references from `1 − 1e-12` down to `1e-300`, the worst error is `1.1e-13`, and the
+  bound is honest and below `1e-10` everywhere.
+  `fisher_snedecor_sf` and `student_t_two_sided_probability` returned `1` when the beta
+  argument `x` rounded to one. For example, `F(0.001, 1)` at `f = 1.3e-48` should be
+  `0.0575`. They now carry `ln(1 − x)` exactly and use the complement series there. The
+  smooth-term LR driver drops `SmoothLrReferenceDf::statistic_resolution` and its
+  tolerance floor and ceiling. `p_value_bound` is now the inversion's own bound.
+
+- **Several expectile levels fit jointly and never cross** (pyGAM audit F5b). A list of
+  levels (`expectile_tau=[0.1, 0.5, 0.9]` in Python, `--expectile-tau 0.1,0.5,0.9` on the
+  CLI, a list `expectile_tau` in a fit request document) could not be requested, and
+  levels fitted one at a time can cross, most visibly where the spread is small or past
+  the data. A multi-level request now fits ONE Gaussian location-scale GAM `(μ, σ)`, with
+  REML/LAML smoothing on both surfaces, and reports the level-`τ` curve as
+  `μ(x) + c_τ·E[σ(x)]`, where `c_τ` is the closed-form weighted `τ`-expectile of the
+  standardized residuals. `c_τ` increases strictly with `τ` and `σ > 0`, so the curves are
+  ordered at every `x`, including under extrapolation; nothing is sorted afterwards.
+  Python `predict` returns an `(n, K)` array (one column per level), and the CLI and the
+  prediction table add one `expectile_{τ}` column per level. A single level, as a scalar
+  or a one-element list, is still the single-level LAWS fit. Saved joint models refuse
+  estimator metadata whose levels or standardized expectiles are not strictly increasing.
+  They do not sample (no observation law is claimed) and do not take conformal intervals.
 - **Model comparison ranks on the smoothing-corrected AIC, in one Rust function** (pyGAM
   audit d11). `gamfit.compare_models`, `Model.evidence_ratio_vs` and the new `gam compare`
   used to rank on an uncorrected `−2·loglik + 2·edf` that the Python FFI assembled from
@@ -45,7 +111,6 @@
   `criterion = "aic_corrected"`; `criterion_gap` is now `log_evidence_ratio`. The pyffi
   bindings `model_conditional_aic` and `compare_reml_fits` and the helper
   `ranking_score_from_summary_payload` are deleted.
-
 - **Fitted models pickle, copy and cross process boundaries** (pyGAM audit api F1 / PKG-02).
   `pickle.dumps`, `copy.deepcopy`, `joblib.dump` and `joblib.Parallel` refused a fitted
   `Model`, `MultinomialModel` or sklearn `GAMRegressor`/`GAMClassifier` with

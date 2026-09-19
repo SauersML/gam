@@ -93,6 +93,7 @@ fn bspline_spec() -> TermCollectionSpec {
             shape: gam::terms::smooth::ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

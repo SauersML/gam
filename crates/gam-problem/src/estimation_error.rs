@@ -601,7 +601,8 @@ pub enum EstimationError {
 
     #[error(
         "Pre-fit linear separation detected in the realized binomial inverse-link design: \
-        {num_unpenalized_columns} parametric columns (unpenalized, or penalized only by a one-column ridge) admit a separating direction \
+        {num_unpenalized_columns} directions no roughness penalty bounds (parametric columns, and a smooth's penalty null space, \
+        unpenalized or penalized only by a ridge) admit a separating direction \
         with minimum signed margin {min_signed_margin:.6e} (columns {column_indices:?}). \
         The likelihood has no finite maximizer along that direction; enable Firth/Jeffreys bias reduction or \
         remove/reparameterize the separating columns."
@@ -1962,7 +1963,7 @@ mod tests {
     #[test]
     fn block_quadrature_correction_refusals_back_off_only_at_rho_local_stages_784() {
         use crate::laplace_sampler_contract::{BlockQuadratureOrderRefusal, BlockQuadratureRefusal};
-        // The five stages that are facts about the trial point back the outer search off it,
+        // The six stages that are facts about the trial point back the outer search off it,
         // as a convergence-class refusal (#784 ruling A).
         let rho_local = [
             BlockQuadratureCorrectionStage::OrderSearchRefused(BlockQuadratureOrderRefusal {
@@ -1990,6 +1991,7 @@ mod tests {
                 gap: 1e-12,
                 tolerance: 1e-10,
             },
+            BlockQuadratureCorrectionStage::AxisSplitWithoutExactCurvature { block_dim: 2 },
         ];
         for stage in rho_local {
             let error = EstimationError::BlockQuadratureCorrectionRefused { stage };
@@ -2089,6 +2091,10 @@ pub enum BlockQuadratureCorrectionStage {
         gap: f64,
         tolerance: f64,
     },
+    /// The admission latched the axis-by-axis block marginal, whose analytic mixed-axis term
+    /// requires the Laplace Hessian weights to be the likelihood's own second derivative, and
+    /// this rho's inner solve converged under the expected-information surrogate instead.
+    AxisSplitWithoutExactCurvature { block_dim: usize },
 }
 
 impl BlockQuadratureCorrectionStage {
@@ -2102,7 +2108,8 @@ impl BlockQuadratureCorrectionStage {
             | Self::UnresolvedAtAdmission { .. }
             | Self::NonPositivePenalizedCurvature { .. }
             | Self::EigenpairResolutionUnavailable { .. }
-            | Self::EigenframeNearDegeneracy { .. } => true,
+            | Self::EigenframeNearDegeneracy { .. }
+            | Self::AxisSplitWithoutExactCurvature { .. } => true,
             Self::CorrectorReturnedNoMoments { .. } => false,
         }
     }
@@ -2148,6 +2155,12 @@ impl std::fmt::Display for BlockQuadratureCorrectionStage {
                 "block eigenvalue {block_eigenvalue:.6e} and eigenvalue {other_eigenvalue:.6e} \
                  differ by {gap:.3e}, within their summed resolution {tolerance:.3e}, where the \
                  eigenframe is not differentiable"
+            ),
+            Self::AxisSplitWithoutExactCurvature { block_dim } => write!(
+                f,
+                "the {block_dim}-direction block was admitted axis by axis, whose mixed-axis term \
+                 needs the observed Hessian, and this rho's inner solve converged under the \
+                 expected-information surrogate"
             ),
         }
     }

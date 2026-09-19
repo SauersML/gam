@@ -45,7 +45,7 @@ def _logit_model():
 
 
 def _assert_clean_config_error(rows, model, **bad_cfg) -> None:
-    with pytest.raises(gamfit.GamfitError) as exc_info:
+    with pytest.raises(gamfit.errors.GamfitError) as exc_info:
         model.sample(rows, **bad_cfg)
     message = str(exc_info.value)
     assert "panicked inside Rust boundary" not in message, (

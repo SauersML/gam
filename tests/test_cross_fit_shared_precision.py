@@ -25,9 +25,9 @@ def test_cross_fit_shared_precision_groups_pool_closed_form() -> None:
     left = gamfit.fit(_table(1.0), "y ~ x + group(g)", family="gaussian")
     right = gamfit.fit(_table(0.35), "y ~ x + group(g)", family="gaussian")
 
-    pooled = gamfit.cross_fit_shared_precision_groups(
+    pooled = gamfit.inference.cross_fit_shared_precision_groups(
         {"left": left, "right": right},
-        [gamfit.SharedPrecisionGroup("g", shape=3.0, rate=0.5)],
+        [gamfit.inference.SharedPrecisionGroup("g", shape=3.0, rate=0.5)],
     )
 
     update = pooled["g"]
@@ -46,7 +46,7 @@ def test_cross_fit_shared_precision_groups_pool_closed_form() -> None:
 def test_cross_fit_shared_precision_groups_accept_per_model_labels() -> None:
     model = gamfit.fit(_table(1.0), "y ~ x + group(g)", family="gaussian")
 
-    pooled = gamfit.cross_fit_shared_precision_groups(
+    pooled = gamfit.inference.cross_fit_shared_precision_groups(
         {"disease_a": model},
         {
             "publication_level": {
@@ -67,7 +67,7 @@ def test_cross_fit_shared_precision_groups_skip_fits_where_group_is_absent() -> 
     grouped = gamfit.fit(_table(1.0), "y ~ x + group(g)", family="gaussian")
     ungrouped = gamfit.fit(_table(1.0), "y ~ x", family="gaussian")
 
-    pooled = gamfit.cross_fit_shared_precision_groups(
+    pooled = gamfit.inference.cross_fit_shared_precision_groups(
         [grouped, ungrouped],
         [{"name": "g", "shape": 1.5, "rate": 0.25}],
     )
@@ -84,7 +84,7 @@ def test_cross_fit_shared_precision_groups_reject_bad_hyperpriors() -> None:
         {"name": "g", "shape": 1.0, "rate": -0.1},
     ):
         try:
-            gamfit.cross_fit_shared_precision_groups([model], [group])
+            gamfit.inference.cross_fit_shared_precision_groups([model], [group])
         except ValueError as exc:
             assert "shared precision group" in str(exc)
         else:
@@ -95,11 +95,11 @@ def test_cross_fit_shared_precision_groups_reject_duplicate_names() -> None:
     model = gamfit.fit(_table(1.0), "y ~ x + group(g)", family="gaussian")
 
     try:
-        gamfit.cross_fit_shared_precision_groups(
+        gamfit.inference.cross_fit_shared_precision_groups(
             [model],
             [
-                gamfit.SharedPrecisionGroup("g"),
-                gamfit.SharedPrecisionGroup("g"),
+                gamfit.inference.SharedPrecisionGroup("g"),
+                gamfit.inference.SharedPrecisionGroup("g"),
             ],
         )
     except ValueError as exc:
@@ -112,7 +112,7 @@ def test_cross_fit_shared_precision_groups_reject_no_matches() -> None:
     model = gamfit.fit(_table(1.0), "y ~ x + group(g)", family="gaussian")
 
     try:
-        gamfit.cross_fit_shared_precision_groups([model], [gamfit.SharedPrecisionGroup("missing")])
+        gamfit.inference.cross_fit_shared_precision_groups([model], [gamfit.inference.SharedPrecisionGroup("missing")])
     except ValueError as exc:
         assert "did not match any model coefficients" in str(exc)
     else:
@@ -127,9 +127,9 @@ def test_cross_fit_shared_precision_groups_reject_dimension_mismatch() -> None:
     two_levels = gamfit.fit(two_level_data, "y ~ x + group(g)", family="gaussian")
 
     try:
-        gamfit.cross_fit_shared_precision_groups(
+        gamfit.inference.cross_fit_shared_precision_groups(
             [three_levels, two_levels],
-            [gamfit.SharedPrecisionGroup("g")],
+            [gamfit.inference.SharedPrecisionGroup("g")],
         )
     except ValueError as exc:
         assert "inconsistent dimensions" in str(exc)
@@ -141,7 +141,7 @@ def test_cross_fit_shared_precision_groups_do_not_match_provenance_source() -> N
     model = gamfit.fit(_table(1.0), "y ~ x + group(g)", family="gaussian")
 
     try:
-        gamfit.cross_fit_shared_precision_groups([model], [gamfit.SharedPrecisionGroup("group")])
+        gamfit.inference.cross_fit_shared_precision_groups([model], [gamfit.inference.SharedPrecisionGroup("group")])
     except ValueError as exc:
         assert "did not match any model coefficients" in str(exc)
     else:

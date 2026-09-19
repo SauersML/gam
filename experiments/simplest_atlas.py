@@ -121,7 +121,7 @@ def _fit_worker(name, seed, queue):
     x, kwargs, truth = builder(rng)
     t0 = time.time()
     try:
-        m = gamfit.sae_manifold_fit(x, n_iter=15, random_state=0, **kwargs)
+        m = gamfit.sae.sae_manifold_fit(x, n_iter=15, random_state=0, **kwargs)
         fitted = np.asarray(m.fitted)
         ev = 1.0 - ((x - fitted) ** 2).sum() / ((x - x.mean(0)) ** 2).sum()
         out = dict(

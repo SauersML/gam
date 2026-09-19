@@ -1,8 +1,8 @@
 """Public exception hierarchy for gamfit.
 
 Every gamfit exception is defined in Rust (``crates/gam-pyffi/src/ffi/ffi_errors.rs``)
-and re-exported here under its public ``gamfit.*`` name. The class caught by
-``except gamfit.RemlConvergenceError`` is the same type object the Rust extension
+and re-exported by ``gamfit.errors`` under its public name. The class caught by
+``except gamfit.errors.RemlConvergenceError`` is the same type object the Rust extension
 constructs; there is no parallel Python-defined class.
 
 The engine classifies every failure into one ``ErrorCategory``

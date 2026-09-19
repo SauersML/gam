@@ -106,7 +106,8 @@ The dispatch is in `crates/gam-inference/src/sample.rs::sample_saved_model`:
 | --- | --- |
 | Gaussian-identity standard GLM | Laplace (closed form; see note below) |
 | Standard GLM (binomial probit/cloglog/latent-cloglog, Poisson, Tweedie, negative-binomial, Gamma) | NUTS |
-| Bernoulli-logit standard GLM (no Firth, no offset, unit weights) | Polya-Gamma Gibbs |
+| Bernoulli-logit standard GLM (no offset, unit weights) | Polya-Gamma Gibbs |
+| Bernoulli-logit standard GLM under the Jeffreys prior (Firth fit; no offset, unit weights) | Polya-Gamma Gibbs with a Jeffreys Metropolis step |
 | Bounded-coefficient standard GLM | Laplace (latent logit scale) |
 | Standard GLM with beta regression or binomial SAS / beta-logistic / blended links | Not implemented; raises |
 | Standard GLM with link-wiggle | NUTS (joint link-wiggle path) |
@@ -139,6 +140,7 @@ model class, so it is always one of:
 | --- | --- | --- |
 | `"nuts"` | No-U-Turn HMC on the exact posterior | `True` |
 | `"polya-gamma"` | Polya-Gamma Gibbs on the exact Bernoulli-logit posterior | `True` |
+| `"polya-gamma-jeffreys"` | Polya-Gamma Gibbs on the exact Bernoulli-logit posterior under the Jeffreys prior `det I(β)^½` (a Firth fit): each Gibbs coefficient draw is an independence proposal accepted with probability `min(1, det I(β')^½ / det I(β)^½)`; `acceptance_rate` is reported | `True` |
 | `"laplace"` | Independent draws from the Gaussian (Laplace) approximation, including the Gaussian-identity closed form, the bounded latent-chart draws, and the transformation-normal rejection draws | `False` |
 | `"truncated-laplace"` | Reflective HMC on the inequality-truncated Gaussian approximation (shape-constrained standard fits); `rhat` / `ess` are measured | `False` |
 
@@ -178,7 +180,8 @@ Frozen dataclass holding the draws and convergence diagnostics.
 | `rhat` | `float` | Maximum split-Rhat. `1.0` exactly for Laplace draws. |
 | `ess` | `float` | Minimum effective sample size across coefficients. For Laplace draws this is `2 * samples`. |
 | `converged` | `bool` | Sampler convergence flag. Laplace draws set this to `True`; NUTS and Gibbs paths require `rhat < 1.1` and `ess > 100`. |
-| `method` | `str` | `"nuts"`, `"polya-gamma"`, `"laplace"`, or `"truncated-laplace"` — the sampler that ran (table above). |
+| `method` | `str` | `"nuts"`, `"polya-gamma"`, `"polya-gamma-jeffreys"`, `"laplace"`, or `"truncated-laplace"` — the sampler that ran (table above). |
+| `acceptance_rate` | `float \| None` | Fraction of Metropolis proposals accepted over the kept draws, for a sampler with an accept/reject step (`"polya-gamma-jeffreys"`); `None` otherwise. |
 | `exact` | `bool` | Whether `method` targets the exact posterior; the value behind `is_exact`. |
 | `covariance_source` | `str` | `"conditional"` (MCMC routes, and Laplace draws on a fit without a smoothing correction) or `"smoothing-corrected"` (Laplace draws from the published `Vp`). Same vocabulary as `predict()`. |
 | `model_class` | `str` | Saved-model predictive class. |
@@ -247,7 +250,7 @@ pp.summary(level=0.95)   # same dict as posterior.predict
 large prediction sets prefer `posterior.predict(...)`.
 
 The response-scale inverse link supports `identity`, `logit`, `probit`,
-`cloglog`, and `log`; other tags raise a `gamfit.GamfitError`.
+`cloglog`, and `log`; other tags raise a `gamfit.errors.GamfitError`.
 
 ### Trace plots
 
@@ -269,7 +272,12 @@ use `Model.predict(...)` for those.
 
 `rhat < 1.01` is typical for well-mixed NUTS chains; `rhat < 1.1` is
 the split-Rhat threshold used by `converged`. NUTS and Polya-Gamma Gibbs
-paths also require `ess > 100`. The same two targets end warmup. NUTS warms
+paths also require `ess > 100`. The same two targets end warmup. Under the
+Jeffreys prior a coefficient draw changes only when its proposal is
+accepted, so the kept draws hold at most `accepted + chains` distinct
+vectors; when that bound cannot exceed the `ess > 100` target the run ends
+with an error naming the acceptance count rather than returning draws that
+cannot mix. NUTS warms
 up in doubling windows until its step size and metric have stabilized and a
 window meets both targets; Gibbs burns in the same way. When two consecutive
 windows have chains that each mix on their own but disagree with one

@@ -12,8 +12,7 @@ def test_standalone_ctn_schema_uses_fit_request(tmp_path):
     data = pd.DataFrame({"pgs": 2 + .4 * x + rng.normal(size=160), "x": x,
                          "irrelevant_date": pd.Timestamp("2020-01-01")})
     config = {"transformation_normal_config": {"response_num_internal_knots": 2}}
-    model = gamfit.fit(data, "pgs ~ x", config=config, transformation_normal=True,
-                       persistent_warm_start_root=tmp_path / "warm")
+    model = gamfit.fit(data, "pgs ~ x", config=config, transformation_normal=True)
     assert np.isfinite(model.transformation_score(data)).all()
     posterior = json.loads(model.dumps())["payload"]["unified"]["geometry"]["constrained_posterior"]
     assert posterior["moment_status"] == "Available"
@@ -28,7 +27,7 @@ def test_standalone_ctn_schema_uses_fit_request(tmp_path):
         geometry["correction"] = None
         fit["covariance_conditional"] = None
         fit["covariance_corrected"] = None
-    with pytest.raises(gamfit.GamfitError, match="posterior-mean"):
+    with pytest.raises(gamfit.errors.GamfitError, match="posterior-mean"):
         gamfit.loads(json.dumps(declined).encode()).transformation_score(data)
 
 
@@ -50,8 +49,7 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
         data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
         transformation_normal_stage1=gamfit.CtnStage1(
             "pgs", "x", group_column="group", folds=2,
-            response_num_internal_knots=2),
-        persistent_warm_start_root=tmp_path / "warm")
+            response_num_internal_knots=2))
     test = data[["pgs", "x"]].iloc[:8].copy()
     before = np.asarray(model.predict(test))
     assert np.isfinite(before).all() and ((before >= 0) & (before <= 1)).all()
@@ -75,8 +73,7 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
         transformation_normal_stage1=transform)
     attached = gamfit.fit(
         data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
-        transformation_normal_stage1=transform,
-        persistent_warm_start_root=tmp_path / "warm-attached")
+        transformation_normal_stage1=transform)
     np.testing.assert_allclose(attached.transformation_score(test), transform.transformation_score(test),
                                rtol=1e-8, atol=1e-10)
     attached.save(tmp_path / "attached.gamfit")
@@ -91,8 +88,7 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
         survival_data, "Surv(entry, exit, event) ~ x",
         survival_likelihood="marginal-slope", slope_formula="1",
         transformation_normal_stage1=transform,
-        config={"time_num_internal_knots": 2},
-        persistent_warm_start_root=tmp_path / "warm-survival")
+        config={"time_num_internal_knots": 2})
     prospective = test.assign(entry=0., exit=2., event=0)
     times = [.1, .5, 1., 2.]
     probabilities = np.asarray(survival.predict(prospective).survival_at(times))

@@ -1,7 +1,7 @@
 # Exceptions
 
 `gamfit` raises Rust-defined Python exception classes and re-exports them
-from `gamfit`. Every engine error is a `GamfitError`; the Rust extension
+from `gamfit.errors`. Every engine error is a `GamfitError`; the Rust extension
 unavailable case remains an `ImportError`.
 
 ## Hierarchy
@@ -10,7 +10,7 @@ The engine classifies every failure into one `ErrorCategory`
 (`crates/gam-spec/src/error_category.rs`): formula, data, convergence,
 not-fitted or internal. The classes are defined in Rust
 (`crates/gam-pyffi/src/ffi/ffi_errors.rs`) and re-exported by
-`gamfit/_exceptions.py`. The FFI boundary raises a class under the base of the
+`gamfit.errors`. The FFI boundary raises a class under the base of the
 failure's category, chosen from the typed engine error and never from its
 message. The CLI exits with the same category's code, so both front ends
 classify a failure identically.
@@ -102,7 +102,7 @@ The formula or an option is invalid or unsupported. Common causes:
 ```python
 try:
     gamfit.fit(df, "y ~ s(x, k=10")
-except gamfit.FormulaError as e:
+except gamfit.errors.FormulaError as e:
     print(gamfit.explain_error(e))
 ```
 
@@ -154,11 +154,11 @@ and category after the unchanged engine message:
 ```python
 try:
     model = gamfit.fit(df, "y ~ s(x)")
-except gamfit.FitSeedError as e:
+except gamfit.errors.FitSeedError as e:
     print("no admissible start:", e.variant, e.causes[-1])
-except gamfit.FitConvergenceError as e:
+except gamfit.errors.FitConvergenceError as e:
     print("did not converge:", e.variant)
-except gamfit.ConvergenceError as e:
+except gamfit.errors.ConvergenceError as e:
     print(e.category, e.variant, str(e))
 ```
 
@@ -182,7 +182,7 @@ installing from source without a Rust toolchain.
 ```python
 try:
     gamfit.fit(df, "y ~ s(x)")
-except gamfit.RustExtensionUnavailableError as e:
+except gamfit.errors.RustExtensionUnavailableError as e:
     print(gamfit.explain_error(e))
 ```
 
@@ -231,7 +231,7 @@ formula = "y ~ s(x)"
 
 try:
     model = gamfit.fit(df, formula)
-except gamfit.GamfitError as e:
+except gamfit.errors.GamfitError as e:
     log.error("gamfit failed: %s — %s", type(e).__name__, gamfit.explain_error(e))
     raise
 ```

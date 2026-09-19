@@ -3,7 +3,7 @@
 Exercises the full magic-by-default wiring: a tiny synthetic torch model is
 harvested for per-token output-Fisher factors (``gamfit.torch.harvest``), and the
 resulting ``(X, U, mass_residual)`` shard is fed to the public
-``gamfit.sae_manifold_fit`` via ``fisher_factors=``. The *presence* of the shard
+``gamfit.sae.sae_manifold_fit`` via ``fisher_factors=``. The *presence* of the shard
 activates ``RowMetric::OutputFisher`` in the Rust core -- there is no flag.
 
 The amended contract (#980) says the metric is installed for the gauge / lens
@@ -110,7 +110,7 @@ def _harvest_shard(n: int, p: int, classes: int, rank: int) -> HarvestShard:
 def _fit(x: np.ndarray, fisher_factors=None):
     # Default isometry_weight=0.0 (gauge off): the output-Fisher metric drives
     # only the gauge, so the DATA-FIT is identical to the Euclidean run.
-    return gamfit.sae_manifold_fit(
+    return gamfit.sae.sae_manifold_fit(
         X=x,
         K=1,
         d_atom=1,

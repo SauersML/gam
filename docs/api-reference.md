@@ -3,7 +3,40 @@
 Generated from docstrings and type hints in the `gamfit` source. See the
 topical guides for narrative explanations.
 
-## Top-level functions
+## Namespace layout
+
+`import gamfit` exposes only the fit / load entry points and the fitted-model
+classes (`gamfit.__all__`):
+
+`fit`, `fit_array`, `load`, `loads`, `validate_formula`, `explain_error`,
+`compare_models`, `build_info`, `competing_risks_cif`, `fit_event_history`,
+`fit_joint_event_model`, `load_joint_event_model`, `Model`,
+`MultinomialModel`, `ResponseGeometryModel`, `EventHistoryModel`,
+`JointEventModel`, `CtnStage1`, `__version__`.
+
+Everything else lives in a public submodule, imported on first access
+(`gamfit.errors.GamfitError`, or `from gamfit.errors import GamfitError`):
+
+| Submodule | Contents |
+| --- | --- |
+| `gamfit.errors` | exception hierarchy rooted at `GamfitError`, plus `GamInferenceWarning` |
+| `gamfit.results` | prediction, summary, diagnostics, and posterior-sample result types |
+| `gamfit.plot` | matplotlib plotting (optional `gamfit[plot]` extra) |
+| `gamfit.smooth` | formula term specifications (`BSpline`, `Duchon`, `LatentCoord`, ...) |
+| `gamfit.basis` | raw basis / penalty matrix builders and compositional `Smooth` |
+| `gamfit.penalties` | analytic latent-coordinate penalties |
+| `gamfit.reml` | array-level Gaussian / GLM REML and ridge primitives |
+| `gamfit.topology` | latent topologies and topology selection |
+| `gamfit.manifolds`, `gamfit.geometry` | manifold descriptors |
+| `gamfit.sae` | sparse-dictionary and manifold-SAE tools |
+| `gamfit.identifiability` | identifiable latent-factor fits and checks |
+| `gamfit.inference` | conformal, Bartlett, and shared-precision inference helpers |
+| `gamfit.response_geometry` | compositional / spherical response transforms |
+| `gamfit.cuda` | CUDA runtime diagnostics |
+| `gamfit.diagnostics`, `gamfit.kernels`, `gamfit.examples` | diagnostic tools, kernels, worked examples |
+| `gamfit.sklearn`, `gamfit.torch` | scikit-learn and PyTorch integrations (optional extras) |
+
+## Entry points
 
 ::: gamfit.fit
     options:
@@ -25,11 +58,6 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.save
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.competing_risks_cif
     options:
       show_root_heading: true
@@ -40,7 +68,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.cross_fit_shared_precision_groups
+::: gamfit.inference.cross_fit_shared_precision_groups
     options:
       show_root_heading: true
       heading_level: 3
@@ -55,22 +83,22 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.cuda_diagnostics
+::: gamfit.cuda.cuda_diagnostics
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.format_cuda_diagnostics
+::: gamfit.cuda.format_cuda_diagnostics
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.cuda_subprocess_env
+::: gamfit.cuda.cuda_subprocess_env
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.cuda_subprocess_library_dirs
+::: gamfit.cuda.cuda_subprocess_library_dirs
     options:
       show_root_heading: true
       heading_level: 3
@@ -80,47 +108,47 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.mechanism_sparsity_jacobian
+::: gamfit.identifiability.mechanism_sparsity_jacobian
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.linear_dictionary_fit
+::: gamfit.sae.linear_dictionary_fit
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.conditional_prior_ivae
+::: gamfit.identifiability.conditional_prior_ivae
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.glm_full_conformal
+::: gamfit.inference.glm_full_conformal
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.lawley_bartlett_factor
+::: gamfit.inference.lawley_bartlett_factor
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.layer_transport_fit
+::: gamfit.sae.layer_transport_fit
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.layer_transport_ladder
+::: gamfit.sae.layer_transport_ladder
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.sae_checkpoint_dynamics
+::: gamfit.sae.sae_checkpoint_dynamics
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.audit_sae
+::: gamfit.sae.audit_sae
     options:
       show_root_heading: true
       heading_level: 3
@@ -137,25 +165,25 @@ topical guides for narrative explanations.
         - "^__init__$"
         - "^__repr__$"
 
-::: gamfit.SurvivalPrediction
+::: gamfit.results.SurvivalPrediction
     options:
       show_root_heading: true
       heading_level: 3
       members_order: source
 
-::: gamfit.PredictionResult
+::: gamfit.results.PredictionResult
     options:
       show_root_heading: true
       heading_level: 3
       members_order: source
 
-::: gamfit.CompetingRisksPrediction
+::: gamfit.results.CompetingRisksPrediction
     options:
       show_root_heading: true
       heading_level: 3
       members_order: source
 
-::: gamfit.CompetingRisksCIF
+::: gamfit.results.CompetingRisksCIF
     options:
       show_root_heading: true
       heading_level: 3
@@ -167,7 +195,7 @@ topical guides for narrative explanations.
       heading_level: 3
       members_order: source
 
-::: gamfit.MultinomialPrediction
+::: gamfit.results.MultinomialPrediction
     options:
       show_root_heading: true
       heading_level: 3
@@ -175,30 +203,30 @@ topical guides for narrative explanations.
 
 ## Posterior sampling
 
-::: gamfit.SamplingConfig
+::: gamfit.results.SamplingConfig
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PosteriorSamples
-    options:
-      show_root_heading: true
-      heading_level: 3
-      members_order: source
-
-::: gamfit.PairedPosteriorSamples
+::: gamfit.results.PosteriorSamples
     options:
       show_root_heading: true
       heading_level: 3
       members_order: source
 
-::: gamfit.PosteriorPredictive
+::: gamfit.results.PairedPosteriorSamples
     options:
       show_root_heading: true
       heading_level: 3
       members_order: source
 
-::: gamfit.CumulativeIncidenceDraws
+::: gamfit.results.PosteriorPredictive
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
+::: gamfit.results.CumulativeIncidenceDraws
     options:
       show_root_heading: true
       heading_level: 3
@@ -206,186 +234,186 @@ topical guides for narrative explanations.
 
 ## Diagnostics and metadata
 
-::: gamfit.Summary
+::: gamfit.results.Summary
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.Diagnostics
+::: gamfit.results.Diagnostics
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SchemaCheck
+::: gamfit.results.SchemaCheck
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SchemaIssue
+::: gamfit.results.SchemaIssue
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FormulaValidation
+::: gamfit.results.FormulaValidation
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SharedPrecisionGroup
+::: gamfit.inference.SharedPrecisionGroup
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.LinearDictionaryFit
+::: gamfit.sae.LinearDictionaryFit
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Basis and ridge primitives
 
-::: gamfit.bspline_basis
+::: gamfit.basis.bspline_basis
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.bspline_basis_derivative
+::: gamfit.basis.bspline_basis_derivative
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.duchon_basis
+::: gamfit.basis.duchon_basis
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.duchon_function_norm_penalty
+::: gamfit.basis.duchon_function_norm_penalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.matern_basis
+::: gamfit.basis.matern_basis
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.periodic_spline_curve_basis
+::: gamfit.basis.periodic_spline_curve_basis
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.sphere_basis
+::: gamfit.basis.sphere_basis
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.sphere_basis_jet
+::: gamfit.basis.sphere_basis_jet
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.smoothness_penalty
+::: gamfit.basis.smoothness_penalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_weighted_ridge
+::: gamfit.reml.gaussian_weighted_ridge
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_weighted_ridge_batch
+::: gamfit.reml.gaussian_weighted_ridge_batch
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Gaussian REML primitives
 
-::: gamfit.gaussian_reml_fit
+::: gamfit.reml.gaussian_reml_fit
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_backward
+::: gamfit.reml.gaussian_reml_fit_backward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_batched
+::: gamfit.reml.gaussian_reml_fit_batched
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_batched_backward
+::: gamfit.reml.gaussian_reml_fit_batched_backward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_positions
+::: gamfit.reml.gaussian_reml_fit_positions
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_positions_backward
+::: gamfit.reml.gaussian_reml_fit_positions_backward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_positions_batched
+::: gamfit.reml.gaussian_reml_fit_positions_batched
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_positions_batched_backward
+::: gamfit.reml.gaussian_reml_fit_positions_batched_backward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_blocks_forward
+::: gamfit.reml.gaussian_reml_fit_blocks_forward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_blocks_backward
+::: gamfit.reml.gaussian_reml_fit_blocks_backward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_with_constraints_forward
+::: gamfit.reml.gaussian_reml_fit_with_constraints_forward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_with_constraints_backward
+::: gamfit.reml.gaussian_reml_fit_with_constraints_backward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_formula
+::: gamfit.reml.gaussian_reml_fit_formula
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_latent
+::: gamfit.reml.gaussian_reml_fit_latent
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_fit_latent_backward
+::: gamfit.reml.gaussian_reml_fit_latent_backward
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gaussian_reml_optimize_latent
+::: gamfit.reml.gaussian_reml_optimize_latent
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.glm_reml_fit_latent
+::: gamfit.reml.glm_reml_fit_latent
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.glm_reml_fit_latent_backward
+::: gamfit.reml.glm_reml_fit_latent_backward
     options:
       show_root_heading: true
       heading_level: 3
@@ -452,183 +480,183 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TermBlock
+::: gamfit.results.TermBlock
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Topology and smooth descriptors
 
-::: gamfit.Circle
+::: gamfit.topology.Circle
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.Cylinder
+::: gamfit.topology.Cylinder
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.Torus
+::: gamfit.topology.Torus
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TopologySphere
+::: gamfit.topology.Sphere
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.EuclideanPatch
+::: gamfit.topology.EuclideanPatch
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PeriodicHarmonic
+::: gamfit.basis.PeriodicHarmonic
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Penalties and latent-coordinate tools
 
-::: gamfit.ARDPenalty
+::: gamfit.penalties.ARDPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.OrderedBetaBernoulliPenalty
+::: gamfit.penalties.OrderedBetaBernoulliPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.OrthogonalityPenalty
+::: gamfit.penalties.OrthogonalityPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.BlockOrthogonalityPenalty
+::: gamfit.penalties.BlockOrthogonalityPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SparsityPenalty
+::: gamfit.penalties.SparsityPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SoftmaxAssignmentSparsityPenalty
+::: gamfit.penalties.SoftmaxAssignmentSparsityPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TopKActivationPenalty
+::: gamfit.penalties.TopKActivationPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SmoothThresholdPenalty
+::: gamfit.penalties.SmoothThresholdPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.NuclearNormPenalty
+::: gamfit.penalties.NuclearNormPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ScadMcpPenalty
+::: gamfit.penalties.ScadMcpPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.CompositePenalty
+::: gamfit.penalties.CompositePenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.Penalty
+::: gamfit.penalties.Penalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.AnalyticPenaltyKind
+::: gamfit.penalties.AnalyticPenaltyKind
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ScalarWeightSchedule
+::: gamfit.penalties.ScalarWeightSchedule
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PENALTY_MANIFEST
+::: gamfit.penalties.PENALTY_MANIFEST
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.AuxConditionalPriorPenalty
+::: gamfit.penalties.AuxConditionalPriorPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ParametricAuxConditionalPriorPenalty
+::: gamfit.penalties.ParametricAuxConditionalPriorPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.BlockSparsityPenalty
+::: gamfit.penalties.BlockSparsityPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.OrderedBetaBernoulliPenalty
+::: gamfit.penalties.OrderedBetaBernoulliPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.IsometryPenalty
+::: gamfit.penalties.IsometryPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.IvaeRidgeMeanGauge
+::: gamfit.penalties.IvaeRidgeMeanGauge
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.MechanismSparsityPenalty
+::: gamfit.penalties.MechanismSparsityPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TotalVariationPenalty
+::: gamfit.penalties.TotalVariationPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SheafConsistencyPenalty
+::: gamfit.penalties.SheafConsistencyPenalty
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.GatedSAEDecoder
+::: gamfit.penalties.GatedSAEDecoder
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Descriptor protocol
 
-::: gamfit.BasisDescriptor
+::: gamfit.basis.BasisDescriptor
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ManifoldDescriptor
+::: gamfit.manifolds.ManifoldDescriptor
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PenaltyDescriptor
+::: gamfit.penalties.PenaltyDescriptor
     options:
       show_root_heading: true
       heading_level: 3
@@ -651,192 +679,192 @@ topical guides for narrative explanations.
 
 See [Exceptions](exceptions.md) for the hierarchy and when each is raised.
 
-::: gamfit.GamfitError
+::: gamfit.errors.GamfitError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FormulaError
+::: gamfit.errors.FormulaError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.DataError
+::: gamfit.errors.DataError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ConvergenceError
+::: gamfit.errors.ConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.NotFittedError
+::: gamfit.errors.NotFittedError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.InternalError
+::: gamfit.errors.InternalError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.RustExtensionUnavailableError
+::: gamfit.errors.RustExtensionUnavailableError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.BasisError
+::: gamfit.errors.BasisError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.CalibratorError
+::: gamfit.errors.CalibratorError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ColumnNotFoundError
+::: gamfit.errors.ColumnNotFoundError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.DictionaryConvergenceError
+::: gamfit.errors.DictionaryConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.EigendecompositionError
+::: gamfit.errors.EigendecompositionError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FitConvergenceError
+::: gamfit.errors.FitConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FitInputError
+::: gamfit.errors.FitInputError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FitInvariantError
+::: gamfit.errors.FitInvariantError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FitNumericalError
+::: gamfit.errors.FitNumericalError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FitSeedError
+::: gamfit.errors.FitSeedError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.GeometryError
+::: gamfit.errors.GeometryError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.GradientUnavailableError
+::: gamfit.errors.GradientUnavailableError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.HessianNotPositiveDefiniteError
+::: gamfit.errors.HessianNotPositiveDefiniteError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.IllConditionedError
+::: gamfit.errors.IllConditionedError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.InnerModeConvergenceError
+::: gamfit.errors.InnerModeConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.IntegrationError
+::: gamfit.errors.IntegrationError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.InvalidConfigurationError
+::: gamfit.errors.InvalidConfigurationError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.InvalidInputError
+::: gamfit.errors.InvalidInputError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.InvalidSpecificationError
+::: gamfit.errors.InvalidSpecificationError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.LayoutError
+::: gamfit.errors.LayoutError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.LinearSystemSolveError
+::: gamfit.errors.LinearSystemSolveError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.MissingDependencyError
+::: gamfit.errors.MissingDependencyError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ModelOverparameterizedError
+::: gamfit.errors.ModelOverparameterizedError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.MonotoneRootError
+::: gamfit.errors.MonotoneRootError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ParameterConstraintError
+::: gamfit.errors.ParameterConstraintError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PenaltySpectrumError
+::: gamfit.errors.PenaltySpectrumError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PerfectSeparationError
+::: gamfit.errors.PerfectSeparationError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PirlsConvergenceError
+::: gamfit.errors.PirlsConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PredictionError
+::: gamfit.errors.PredictionError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.RemlConvergenceError
+::: gamfit.errors.RemlConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SchemaMismatchError
+::: gamfit.errors.SchemaMismatchError
     options:
       show_root_heading: true
       heading_level: 3
@@ -845,22 +873,22 @@ See [Exceptions](exceptions.md) for the hierarchy and when each is raised.
 
 See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
 
-::: gamfit.sae_manifold_fit
+::: gamfit.sae.sae_manifold_fit
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.atom_trust_scores
+::: gamfit.sae.atom_trust_scores
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.sae_trust_diagnostics
+::: gamfit.sae.sae_trust_diagnostics
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ManifoldSAE
+::: gamfit.sae.ManifoldSAE
     options:
       show_root_heading: true
       heading_level: 3
@@ -870,256 +898,265 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
         - "^__init__$"
         - "^__repr__$"
 
-::: gamfit.GumbelTemperatureSchedule
+::: gamfit.sae.GumbelTemperatureSchedule
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gumbel_geometric_schedule
+::: gamfit.sae.gumbel_geometric_schedule
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gumbel_linear_schedule
+::: gamfit.sae.gumbel_linear_schedule
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gumbel_reciprocal_iter_schedule
+::: gamfit.sae.gumbel_reciprocal_iter_schedule
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Equivariant smooths
 
-::: gamfit.GaugeCompanion
+::: gamfit.sae.GaugeCompanion
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.gauge_companion
+::: gamfit.sae.gauge_companion
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.rho_so2
+::: gamfit.sae.rho_so2
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.rho_so2_jvp
+::: gamfit.sae.rho_so2_jvp
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.rho_so3
+::: gamfit.sae.rho_so3
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.rho_so3_jvp
+::: gamfit.sae.rho_so3_jvp
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Manifolds
 
-::: gamfit.CircleManifold
+::: gamfit.geometry.CircleManifold
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.EuclideanManifold
+::: gamfit.geometry.EuclideanManifold
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.GrassmannManifold
+::: gamfit.geometry.GrassmannManifold
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ProductManifold
+::: gamfit.geometry.ProductManifold
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SpdManifold
+::: gamfit.geometry.SpdManifold
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SphereManifold
+::: gamfit.geometry.SphereManifold
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.StiefelManifold
+::: gamfit.geometry.StiefelManifold
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TorusManifold
+::: gamfit.geometry.TorusManifold
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Topology selection
 
-::: gamfit.BasisSpec
+::: gamfit.topology.BasisSpec
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ScoreKind
+::: gamfit.topology.ScoreKind
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ScoreScale
+::: gamfit.topology.ScoreScale
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SelectTopologyResult
+::: gamfit.topology.SelectTopologyResult
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TopologyAutoSelector
+::: gamfit.topology.TopologyAutoSelector
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TopologyAutoSelectorRank
+::: gamfit.topology.TopologyAutoSelectorRank
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TopologyAutoSelectorResult
+::: gamfit.topology.TopologyAutoSelectorResult
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.TopologyStack
+::: gamfit.topology.TopologyStack
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.select_topology
+::: gamfit.topology.select_topology
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.stack_topologies
+::: gamfit.topology.stack_topologies
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Identifiability
 
-::: gamfit.IdentifiabilityReport
+::: gamfit.identifiability.IdentifiabilityReport
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.IdentifiabilityTheoremResult
+::: gamfit.identifiability.IdentifiabilityTheoremResult
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.IdentifiableFactorFitResult
+::: gamfit.identifiability.IdentifiableFactorFitResult
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.identifiability_check
+::: gamfit.identifiability.check
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.identifiable_factor_fit
+::: gamfit.identifiability.identifiable_factor_fit
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Structure discovery
 
-::: gamfit.atom_birth_gate
+::: gamfit.sae.atom_birth_gate
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.e_bh_dictionary_certificate
+::: gamfit.sae.e_bh_dictionary_certificate
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.expected_resolution_budget
+::: gamfit.sae.expected_resolution_budget
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.log_e_from_p_value
+::: gamfit.sae.log_e_from_p_value
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.plan_probe_for_contested_claim
+::: gamfit.sae.plan_probe_for_contested_claim
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.select_probe_by_expected_evidence
+::: gamfit.sae.select_probe_by_expected_evidence
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.split_likelihood_log_e
+::: gamfit.sae.split_likelihood_log_e
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Partial supervision
 
-::: gamfit.PartialSupervisionExample
+::: gamfit.examples.PartialSupervisionExample
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PartialSupervisionFit
+::: gamfit.examples.PartialSupervisionFit
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SaeSupervisedFit
+::: gamfit.examples.SaeSupervisedFit
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.partial_supervision
+::: gamfit.examples.partial_supervision
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.sae_supervised
+::: gamfit.examples.sae_supervised
     options:
       show_root_heading: true
       heading_level: 3
 
-## Manifold SAE helpers
+## Plotting
 
-::: gamfit.plot
+`gamfit.plot` needs the optional matplotlib extra (`pip install 'gamfit[plot]'`);
+the module imports without it and each function raises `ImportError` naming
+the extra when matplotlib is missing.
+
+::: gamfit.plot.model
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.plot_atom
+::: gamfit.plot.trace
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.plot_fit
+::: gamfit.plot.sae_atom
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.plot.sae_fit
     options:
       show_root_heading: true
       heading_level: 3
@@ -1133,26 +1170,26 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
 
 ## Compositional smooth specs
 
-::: gamfit.Smooth
+::: gamfit.basis.Smooth
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SmoothSum
+::: gamfit.basis.SmoothSum
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SmoothSpec
+::: gamfit.smooth.Smooth
     options:
       show_root_heading: true
       heading_level: 3
 
 ## Torch-optional primitives
 
-These symbols are re-exported at the top level for convenience but their
-implementations live behind the optional `torch` dependency; accessing them
-without torch installed raises `AttributeError`. See [torch.md](torch.md).
+These live in `gamfit.torch`, behind the optional `torch` dependency;
+accessing `gamfit.torch` without torch installed raises `AttributeError`.
+See [torch.md](torch.md).
 
 ::: gamfit.torch.interchange.InterchangeSwapDecoder
     options:
@@ -1172,27 +1209,27 @@ without torch installed raises `AttributeError`. See [torch.md](torch.md).
       heading_level: 3
       inherited_members: false
 
-::: gamfit.clr
+::: gamfit.response_geometry.clr
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.alr
+::: gamfit.response_geometry.alr
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.closure
+::: gamfit.response_geometry.closure
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.simplex_frechet_mean
+::: gamfit.response_geometry.simplex_frechet_mean
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.sphere_frechet_mean
+::: gamfit.response_geometry.sphere_frechet_mean
     options:
       show_root_heading: true
       heading_level: 3

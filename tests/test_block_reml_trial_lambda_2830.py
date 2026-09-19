@@ -1,8 +1,8 @@
-"""Bug hunt: ``gamfit.gaussian_reml_fit_blocks_forward`` turns a *point-local*
+"""Bug hunt: ``gamfit.reml.gaussian_reml_fit_blocks_forward`` turns a *point-local*
 numerical breakdown at one trial ``lambda`` into a fatal, whole-fit abort.
 
 The multi-block Gaussian-REML driver (documented at ``docs/api-reference.md:348``
-and exported as ``gamfit.gaussian_reml_fit_blocks_forward``) profiles the REML
+and exported as ``gamfit.reml.gaussian_reml_fit_blocks_forward``) profiles the REML
 score over ``rho = log(lambda)`` with an outer ARC search.  Every trial ``rho``
 the search visits is evaluated by ``GaussianRemlBlocksProfile::evaluate``
 (``crates/gam-solve/src/gaussian_reml.rs:385``), which assembles the penalized
@@ -92,7 +92,7 @@ def _spline_block(
     certificate would -- correctly -- reject as unidentified).
     """
     basis = np.asarray(
-        gamfit.bspline_basis(t, _K_INTERNAL_KNOTS, degree=_DEGREE), dtype=np.float64
+        gamfit.basis.bspline_basis(t, _K_INTERNAL_KNOTS, degree=_DEGREE), dtype=np.float64
     )
     interior = np.quantile(t, np.linspace(0.0, 1.0, _K_INTERNAL_KNOTS + 2)[1:-1])
     knots = np.concatenate(
@@ -103,7 +103,7 @@ def _spline_block(
         ]
     )
     penalty = np.asarray(
-        gamfit.smoothness_penalty(knots, degree=_DEGREE, order=_PENALTY_ORDER)[0],
+        gamfit.basis.smoothness_penalty(knots, degree=_DEGREE, order=_PENALTY_ORDER)[0],
         dtype=np.float64,
     )
     if not constrain:
@@ -137,7 +137,7 @@ def _fit(
     weights: npt.NDArray[np.float64],
     init_rhos: npt.NDArray[np.float64] | None = None,
 ) -> dict[str, object]:
-    return gamfit.gaussian_reml_fit_blocks_forward(
+    return gamfit.reml.gaussian_reml_fit_blocks_forward(
         designs, penalties, y, weights=weights, init_rhos=init_rhos
     )
 

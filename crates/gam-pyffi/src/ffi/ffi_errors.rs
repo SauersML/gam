@@ -3,7 +3,7 @@
 //! This module owns the gamfit exception classes and every adaptor that turns a
 //! typed engine error into one of them. The class is chosen from the error's
 //! type, never from its message (issue #343). `gamfit/_exceptions.py`
-//! re-exports the classes under their public `gamfit.*` names, so the class a
+//! re-exports the classes under their public `gamfit.errors.*` names, so the class a
 //! user catches is the type object this module constructs.
 //!
 //! The hierarchy has one base and one class per [`ErrorCategory`], the
@@ -721,7 +721,7 @@ where
 /// `estimation_error_to_pyerr`. This is the principled engine→Python
 /// adaptor: no `err.to_string()` flattening, no message-regex
 /// reclassification on the Python side. Each `EstimationError` variant
-/// surfaces as a specific `gamfit.GamfitError` subclass (see issue #343).
+/// surfaces as a specific `gamfit.errors.GamfitError` subclass (see issue #343).
 pub(crate) fn detach_estimation_result<T, F>(
     py: Python<'_>,
     context: &'static str,
@@ -740,7 +740,7 @@ where
 
 /// Variant-dispatch the engine's top-level `WorkflowError` into the matching
 /// Python exception class. The key entry is `WorkflowError::ColumnNotFound`,
-/// which surfaces as `gamfit.ColumnNotFoundError` with the structured
+/// which surfaces as `gamfit.errors.ColumnNotFoundError` with the structured
 /// fields attached as Python attributes (`column`, `role`, `available`,
 /// `similar`, `tsv_hint`) — issue #305 / #343. Other variants degrade to
 /// the most appropriate existing gamfit exception type; new variants can
@@ -848,7 +848,7 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
         // Term construction and the data layer name no finer class than their
         // category; the typed source decides which (a categorical column
         // used as a smooth coordinate is a `FormulaError`).
-        WorkflowError::TermBuilder(_) | WorkflowError::Data(_) => {
+        WorkflowError::TermBuilder { .. } | WorkflowError::Data(_) => {
             let advice = err.advice();
             category_error(err.error_category(), message_with_advice(&err, advice))
         }
@@ -993,10 +993,10 @@ where
 }
 
 /// Variant-dispatch the engine's `GeometryError` into the typed Python
-/// `gamfit.GeometryError`. All three variants — `DimensionMismatch`,
+/// `gamfit.errors.GeometryError`. All three variants — `DimensionMismatch`,
 /// `InvalidPoint`, `Singular` — share the same Python class because the
 /// distinction matters only in the message text; the typed class makes
-/// `except gamfit.GeometryError` actionable without parsing the prose.
+/// `except gamfit.errors.GeometryError` actionable without parsing the prose.
 pub(crate) fn geometry_error_to_pyerr(err: EngineGeometryError) -> PyErr {
     GeometryError::new_err(err.to_string())
 }
@@ -1028,7 +1028,7 @@ where
 //
 // One trivial converter per typed engine→Python boundary actually used.
 // Each helper picks the class from the error's type, so `except
-// gamfit.BasisError` (etc.) is actionable without the user parsing the prose.
+// gamfit.errors.BasisError` (etc.) is actionable without the user parsing the prose.
 // A call site that does `.map_err(|e| e.to_string())?` against a
 // `Result<_, EngineError>` in a `PyResult<_>` function should swap to
 // `.map_err(<engine>_error_to_pyerr)?`: the message text is identical, only the
@@ -1210,7 +1210,7 @@ mod fit_failure_dispatch_tests {
     }
 
     /// Every class the boundary raises lies under the class of the error's
-    /// own `ErrorCategory`, so `except gamfit.DataError` catches exactly the
+    /// own `ErrorCategory`, so `except gamfit.errors.DataError` catches exactly the
     /// failures the CLI reports with the data exit code.
     #[test]
     fn every_raised_class_lies_under_its_error_category_class() {

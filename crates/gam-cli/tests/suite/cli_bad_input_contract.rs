@@ -141,7 +141,7 @@ fn diagnose_rejects_removed_no_op_alo_flag() {
 /// a number line. It is refused while the formula is resolved, exits with the
 /// formula code, and names the column, the first non-numeric value and the
 /// terms that do take a factor. The same refusal reaches Python as
-/// `gamfit.FormulaError`.
+/// `gamfit.errors.FormulaError`.
 #[test]
 fn a_smooth_of_a_string_column_is_a_formula_error_naming_the_column() {
     let scratch = tempfile::tempdir().expect("scratch directory");
