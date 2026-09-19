@@ -164,8 +164,6 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "re".to_string(),
             feature_col: 2,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: Some(vec![0, 1]),
             lenient_unseen: true,
         }],
@@ -1919,8 +1917,6 @@ fn term_collection_design_adds_random_effect_dummy_blockwithridge() {
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "id".to_string(),
             feature_col: 1,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
         }],
@@ -2088,7 +2084,6 @@ fn centered_tensor_penalties_canonicalize_in_transformed_basis_width() {
                 double_penalty: false,
                 identifiability: TensorBSplineIdentifiability::default(),
                 penalty_decomposition: Default::default(),
-                adaptive: false,
             },
         },
         shape: ShapeConstraint::None.into(),
@@ -2202,7 +2197,6 @@ fn tensor_bspline_supports_two_periodic_margins_as_torus() {
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::None,
                     penalty_decomposition: Default::default(),
-                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),
@@ -3481,8 +3475,6 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "grp".to_string(),
             feature_col: 2,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
         }],

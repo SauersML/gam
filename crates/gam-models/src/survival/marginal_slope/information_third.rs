@@ -828,7 +828,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             }
             tensors.push(tensor);
         }
-        self.all_axes_primary_tensor_pullback(&tensors)
+        self.all_axes_primary_tensor_pullback(&crate::row_kernel::RowSet::All, &tensors)
     }
 
     /// `{D_β_a D_β ∂_ψ H[v]}` along every coefficient axis `a` for a design

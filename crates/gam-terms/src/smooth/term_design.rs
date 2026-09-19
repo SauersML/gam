@@ -322,9 +322,6 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     }
 
     for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
-        if range.is_empty() || !spec.random_effect_terms[re_idx].penalized {
-            continue;
-        }
         let block_size = range.len();
         let global_index = penalties.len();
         penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));
@@ -3109,7 +3106,6 @@ mod sparse_transform_tests {
             double_penalty: false,
             identifiability: crate::smooth::TensorBSplineIdentifiability::None,
             penalty_decomposition: Default::default(),
-            adaptive: false,
         };
         let built = crate::smooth::build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
             .expect("te(x, h) basis");

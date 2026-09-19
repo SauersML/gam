@@ -1036,13 +1036,10 @@ pub(crate) fn run_outer_with_plan(
                     // own, so a boundary-limited crawl buying sub-resolution
                     // descent ended only when its iteration count ran out. The
                     // same progress certificate the dense route uses ends it
-                    // instead (#2817); its floor and band are derived exactly as
-                    // the ARC arm below derives them.
+                    // instead (#2817); its resolution is the criterion's
+                    // statistical resolution, exactly as the ARC arm below uses.
                     let mut cost_stall_guard = CostStallGuard::new(
-                        config
-                            .rel_cost_tolerance
-                            .unwrap_or(config.tolerance * 1.0e-2)
-                            .max(COST_STALL_REL_TOL_FLOOR),
+                        super::run::outer_criterion_resolution(config),
                         ARC_COST_STALL_WINDOW,
                         config,
                         Arc::new(Mutex::new(None)),
@@ -1083,8 +1080,8 @@ pub(crate) fn run_outer_with_plan(
                         // Stop the search on the test that will judge it.
                         //
                         // The certificate accepts a point when the Newton
-                        // decrement ½gᵀH⁻¹g at it is below the criterion's own
-                        // resolution `rel_cost_floor·(1 + |V|)` — the
+                        // decrement ½gᵀH⁻¹g at it is below the criterion's
+                        // statistical resolution `τ_stat = 1/(2n)` — the
                         // curvature-resolvability rung, which is what mgcv
                         // means by convergence and which the certificate
                         // computes for itself at the end. The solver was
@@ -1103,12 +1100,14 @@ pub(crate) fn run_outer_with_plan(
                         // decrement: on an interior step its predicted decrease
                         // IS ½gᵀH⁻¹g. Handing it the certificate's tolerance
                         // makes the stopping rule and the acceptance rule one
-                        // standard. Anchored on the seed's own cost, so the
-                        // threshold is fixed for the run rather than drifting
-                        // with the iterate.
-                        .with_model_decrement_tolerance(
-                            outer_rel_cost_floor(config) * (1.0 + seed_eval.cost.abs()),
-                        );
+                        // standard. τ_stat is absolute, so the threshold is
+                        // fixed for the run and does not depend on the units
+                        // of y or an additive constant in V. A route that
+                        // declares no size passes 0, which opt reads as "no
+                        // decrement stop"; the certificate then decides.
+                        .with_model_decrement_tolerance(super::run::outer_criterion_resolution(
+                            config,
+                        ));
                     // Installed unconditionally now that it also carries the
                     // trajectory census (#2735): a walk that ends on its budget
                     // has to be able to say whether it crawled or thrashed, and
@@ -1284,10 +1283,7 @@ pub(crate) fn run_outer_with_plan(
                     // KKT-stationary even though its raw ∂V/∂ρ never vanishes).
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
-                    let cost_stall_rel_tol = config
-                        .rel_cost_tolerance
-                        .unwrap_or(config.tolerance * 1.0e-2)
-                        .max(COST_STALL_REL_TOL_FLOOR);
+                    let cost_stall_resolution = super::run::outer_criterion_resolution(config);
 
                     // Build the exact seed Hessian before enrolling the seed in
                     // the stall guard. The guard must know whether its incumbent
@@ -1310,10 +1306,8 @@ pub(crate) fn run_outer_with_plan(
                     // Judged at the same criterion curvature resolution the
                     // bridge's later verdicts use (#1082), so the seed is not a
                     // strict saddle by a standard the iterates never face.
-                    let seed_curvature_resolution = super::run::criterion_curvature_resolution(
-                        outer_rel_cost_floor(config),
-                        seed_eval.cost,
-                    );
+                    let seed_curvature_resolution =
+                        super::run::criterion_curvature_resolution(cost_stall_resolution);
                     let seed_hessian_psd = seed_hessian.as_ref().and_then(|dense| {
                         reduced_hessian_psd_at_point(
                             &seed,
@@ -1325,7 +1319,7 @@ pub(crate) fn run_outer_with_plan(
                     });
 
                     let mut cost_stall_guard = CostStallGuard::new(
-                        cost_stall_rel_tol,
+                        cost_stall_resolution,
                         ARC_COST_STALL_WINDOW,
                         config,
                         cost_stall_exit.clone(),
@@ -1364,24 +1358,24 @@ pub(crate) fn run_outer_with_plan(
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
                         // #2817 — the search stops on the test that judges it.
                         // The certificate accepts a point whose Newton
-                        // decrement ½gᵀH⁻¹g is at or below the criterion's own
-                        // resolution `rel_cost_floor·(1 + |V|)`; the dense ARC
+                        // decrement ½gᵀH⁻¹g is at or below the criterion's
+                        // statistical resolution `τ_stat = 1/(2n)`; the dense ARC
                         // route was driven instead to an absolute
                         // projected-gradient band, which on a flat REML valley
                         // is a far stricter and unrelated standard, so no seed
                         // could stop itself and every fit ran to its iteration
-                        // cap. Handing the bridge the same floor the
+                        // cap. Handing the bridge the same resolution the
                         // certificate uses makes the stopping rule and the
                         // acceptance rule one standard. The matrix-free route
                         // already does this through opt's own decrement rung
                         // (`with_model_decrement_tolerance` above); this is the
                         // dense route's half of the same repair.
-                        curvature_stationary_floor: Some(outer_rel_cost_floor(config)),
+                        curvature_stationary_resolution: Some(cost_stall_resolution),
                         accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
                         // #2954 — and on the rung it judges on. Where the route
                         // declares its size the certificate decides on the
                         // Newton-decrement verdict on rounding bands, not on
-                        // `floor·(1 + |V|)`; without the config the loop kept
+                        // a relative `(1 + |V|)` rung; without the config the loop kept
                         // stopping on the older rung at points the certificate
                         // then refused.
                         decrement_verdict_config: Some(config),
@@ -1689,13 +1683,10 @@ pub(crate) fn run_outer_with_plan(
                         bounds: bounds_dev,
                         gradient_tolerance: grad_tol_dev,
                         max_iterations: config.max_iter,
-                        // The host BFGS arm's cost-stall floor and band, derived the
-                        // same way, so the device walk ends on the same progress
-                        // test instead of its iteration count (#2817).
-                        cost_stall_rel_tol: config
-                            .rel_cost_tolerance
-                            .unwrap_or(config.tolerance * 1.0e-2)
-                            .max(COST_STALL_REL_TOL_FLOOR),
+                        // The host BFGS arm's cost-stall resolution, so the device
+                        // walk ends on the same progress test instead of its
+                        // iteration count (#2817).
+                        cost_stall_resolution: super::run::outer_criterion_resolution(config),
                         // opt's cost stall takes one number before the walk
                         // starts, so it gets the solver band this walk was driven
                         // to; the 1e-3 floor it used to add had no derivation, and
@@ -1900,9 +1891,9 @@ pub(crate) fn run_outer_with_plan(
                         // Cost-stall convergence shared cell (#1089). The bridge is
                         // moved into `opt::Bfgs`, so the best iterate it captures on
                         // a flat-valley stall is handed back through this `Arc`.
-                        // Relative score-change floor is derived from the outer
-                        // tolerance but has a numerical floor so very tight user
-                        // tolerances do not disable the mgcv-style flat-valley stop.
+                        // A window of accepted steps that each improve the best
+                        // value by at most the criterion's statistical resolution
+                        // bought no resolvable descent.
                         let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                             Arc::new(Mutex::new(None));
                         // Accepted-outer-step channel from the observer back into
@@ -1910,10 +1901,6 @@ pub(crate) fn run_outer_with_plan(
                         // exit cell above and for the same reason: the observer and
                         // the objective are two values both moved into `opt::Bfgs`.
                         let accepted_steps: Arc<AcceptedStepLedger> = Arc::default();
-                        let cost_stall_rel_tol = config
-                            .rel_cost_tolerance
-                            .unwrap_or(config.tolerance * 1.0e-2)
-                            .max(COST_STALL_REL_TOL_FLOOR);
                         // Convergence must mean stationarity, not cost-flatness: a
                         // cost stall claims a converged optimum only when the
                         // projected gradient at its best iterate is inside the
@@ -1922,7 +1909,7 @@ pub(crate) fn run_outer_with_plan(
                         let seed_grad_norm =
                             stratum_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                         let mut cost_stall_guard = CostStallGuard::new(
-                            cost_stall_rel_tol,
+                            super::run::outer_criterion_resolution(config),
                             COST_STALL_WINDOW,
                             config,
                             cost_stall_exit.clone(),

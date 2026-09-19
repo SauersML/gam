@@ -1,7 +1,7 @@
 //! #3078 regression: a smooth's default basis size is a data-derived pilot that
 //! the fit grows on its own REML evidence, for every smooth family — not a
-//! fixed per-family constant (factor-smooth `k = 10`, mgcv-like tensor margins,
-//! heuristic cyclic knots, harmonic degree caps).
+//! fixed per-family constant (factor-smooth `k = 10`, heuristic cyclic knots,
+//! harmonic degree caps).
 //!
 //! Each recovery test draws a seeded signal whose resolution exceeds what the
 //! old constant could represent, fits it through the public `fit_from_formula`
@@ -153,36 +153,6 @@ fn factor_smooth_resolves_group_curves_beyond_a_fixed_basis_dimension() {
     assert!(
         err < RECOVERY_BOUND,
         "factor-smooth recovery RMSE {err:.4} (width {width}) must sit below {RECOVERY_BOUND}"
-    );
-}
-
-fn tensor_signal(x: f64, z: f64) -> f64 {
-    (2.0 * PI * 3.0 * x).sin() * (2.0 * PI * 3.0 * z).sin()
-}
-
-#[test]
-fn tensor_smooth_margins_grow_to_resolve_an_oscillating_surface() {
-    let mut rng = StdRng::seed_from_u64(30782);
-    let ux = Uniform::new(0.0, 1.0).unwrap();
-    let noise = Normal::new(0.0, NOISE_SD).unwrap();
-    let n = 3000;
-    let mut rows = Vec::with_capacity(n);
-    let mut truth = Vec::with_capacity(n);
-    for _ in 0..n {
-        let (x, z): (f64, f64) = (ux.sample(&mut rng), ux.sample(&mut rng));
-        truth.push(tensor_signal(x, z));
-        rows.push(vec![
-            num(x),
-            num(z),
-            num(tensor_signal(x, z) + noise.sample(&mut rng)),
-        ]);
-    }
-    let data = dataset(&["x", "z", "y"], &rows);
-    let (width, fitted) = fit("y ~ te(x, z)", &data);
-    let err = centered_rmse(&fitted, &truth);
-    assert!(
-        err < RECOVERY_BOUND,
-        "tensor recovery RMSE {err:.4} (width {width}) must sit below {RECOVERY_BOUND}"
     );
 }
 

@@ -60,14 +60,11 @@ pub fn canonical_standard_fit_options(
         // works for every family (the `COV_MAX_P` diagonal fallback caps cost).
         compute_inference: true,
         // Formula/CLI fits are the interactive/default path: keep coefficient
-        // covariance and the smoothing correction, and emit the CHEAP Tier-0
-        // live-rho posterior adequacy diagnostic (a handful of outer-criterion
-        // evaluations), which the optimizer surfaces regardless of this flag
-        // whenever it is cheaply available (#1810). This flag only suppresses the
-        // EXPENSIVE escalation tiers (Tier-1 quadrature / Tier-2 NUTS over rho),
-        // which could otherwise launch NUTS and turn ordinary fits into sampler
-        // benchmarks. Lower-level callers that explicitly need the escalation opt
-        // in elsewhere (`skip_rho_posterior_inference: false`).
+        // covariance and the analytic first-order smoothing correction, which
+        // the returned fit needs. The rho-posterior adequacy diagnostic (Tier-0
+        // PSIS over dozens of refits, and its Tier-1/Tier-2 escalations) is not
+        // needed to build that fit, so it runs only for lower-level callers that
+        // request it (`skip_rho_posterior_inference: false`).
         skip_rho_posterior_inference: true,
         // The count for the loops that still take one: the negative-binomial
         // alternation, the expectile LAWS iterations, the bounded-effect
@@ -2001,9 +1998,9 @@ fn refinement_spanning(
             gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
         };
     let base = width(current);
-    let mut target = gam_terms::smooth::refined_adaptive_resolution(basis, current);
+    let mut target = gam_terms::smooth::refined_adaptive_resolution(current);
     while width(&target).saturating_sub(base) < directions {
-        let next = gam_terms::smooth::refined_adaptive_resolution(basis, &target)
+        let next = gam_terms::smooth::refined_adaptive_resolution(&target)
             .clamped(support, current);
         if !next.exceeds(&target) {
             break;
@@ -2225,7 +2222,6 @@ mod adaptive_spatial_resolution_tests {
     fn knots_width(resolution: &AdaptiveResolution) -> usize {
         match resolution {
             AdaptiveResolution::InternalKnots(k) => k + 4,
-            AdaptiveResolution::MarginDims(dims) => dims.iter().product(),
             AdaptiveResolution::Centers(c) | AdaptiveResolution::PeriodicBasis(c) => *c,
             AdaptiveResolution::HarmonicDegree(l) => (l + 1).pow(2),
         }
@@ -2259,7 +2255,7 @@ mod adaptive_spatial_resolution_tests {
 
     #[test]
     fn refinement_is_bounded_by_covariate_support_not_a_constant() {
-        use AdaptiveResolution::{Centers, MarginDims};
+        use AdaptiveResolution::{Centers, InternalKnots};
         // Far beyond any fixed default: only the data's distinct rows bound it.
         assert_eq!(
             adaptive_term_decision(&Centers(4096), &Centers(8192), &Centers(6000), true, false),
@@ -2267,13 +2263,13 @@ mod adaptive_spatial_resolution_tests {
         );
         assert_eq!(
             adaptive_term_decision(
-                &MarginDims(vec![5, 5]),
-                &MarginDims(vec![9, 9]),
-                &MarginDims(vec![7, 40]),
+                &InternalKnots(8),
+                &InternalKnots(17),
+                &InternalKnots(12),
                 false,
                 true
             ),
-            AdaptiveTermDecision::Refine(MarginDims(vec![7, 9]))
+            AdaptiveTermDecision::Refine(InternalKnots(12))
         );
     }
 
@@ -2313,16 +2309,16 @@ mod adaptive_spatial_resolution_tests {
     }
 
     #[test]
-    fn tensor_refinement_is_shortened_along_its_monotone_path() {
-        use AdaptiveResolution::MarginDims;
+    fn harmonic_refinement_is_shortened_along_its_monotone_path() {
+        use AdaptiveResolution::HarmonicDegree;
         let accepted = fit_refinements_to_rank(
-            vec![request(0, MarginDims(vec![5, 5]), MarginDims(vec![9, 9]), true)],
+            vec![request(0, HarmonicDegree(3), HarmonicDegree(8), true)],
             30,
             |_, resolution: &AdaptiveResolution| knots_width(resolution),
         )
-        .expect("a partial tensor refinement fits");
-        // 7x7 adds 24 columns; 8x8 would add 39.
-        assert_eq!(accepted[0].proposed, MarginDims(vec![7, 7]));
+        .expect("a partial harmonic refinement fits");
+        // Degree 5 adds 20 columns to degree 3's 16; degree 6 would add 33.
+        assert_eq!(accepted[0].proposed, HarmonicDegree(5));
     }
 
     #[test]
@@ -2544,7 +2540,6 @@ fn attach_basis_adequacy(
     standard.fit.artifacts.random_effect_tests =
         crate::fit_orchestration::drivers::random_effect_test_records(
             &standard.design,
-            &standard.resolvedspec,
             &standard.fit,
         );
     if let Some(inputs) = covariate_frame {

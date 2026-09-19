@@ -85,7 +85,7 @@ fn apply_adaptive_resolution_plan(
         if adaptive_resolution_of(&term.basis).as_ref() == Some(&target) {
             continue;
         }
-        apply_adaptive_resolution(&mut term.basis, data.values.view(), &target).map_err(
+        apply_adaptive_resolution(&mut term.basis, &target).map_err(
             |error| WorkflowError::InvalidConfig {
                 reason: format!(
                     "failed to set the adaptive resolution of smooth term '{}': {error}",

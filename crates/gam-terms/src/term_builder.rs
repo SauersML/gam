@@ -19,7 +19,7 @@ use crate::basis::{
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
     default_spatial_center_strategy, default_spherical_harmonic_degree,
-    SPHERICAL_HARMONIC_MAX_DEGREE, penalized_resolution_rank, per_axis_resolution_rank,
+    SPHERICAL_HARMONIC_MAX_DEGREE, penalized_resolution_rank,
     select_r_uniform_subsample_centers,
     starting_num_centers, thin_plate_penalty_order,
 };
@@ -519,8 +519,6 @@ pub fn build_termspec(
                             random_terms.push(RandomEffectTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
-                                drop_first_level: false,
-                                penalized: true,
                                 frozen_levels: None,
                                 // A BARE categorical main effect (`+ g`) is a FIXED
                                 // parametric factor. Although it is auto-promoted to
@@ -576,8 +574,6 @@ pub fn build_termspec(
                 random_terms.push(RandomEffectTermSpec {
                     name: name.clone(),
                     feature_col: col,
-                    drop_first_level: false,
-                    penalized: true,
                     frozen_levels: None,
                     // Unseen-level policy is fixed by the wrapper the user wrote
                     // (`formula_dsl`): a genuine random effect
@@ -680,12 +676,11 @@ pub fn build_termspec(
                             // `+ factor` does — the latter is auto-promoted to a
                             // penalized random-effect block (see the
                             // `ParsedTerm::Linear` / `ColumnKindTag::Categorical`
-                            // arm above, `penalized: true`). Both representations
-                            // carry the same per-level offsets, so #1457: the
-                            // `by=` branch must NOT additionally add its own
-                            // unpenalized treatment-coded main effect, which would
-                            // double-represent the factor (two `g` design blocks +
-                            // a spurious extra smoothing parameter).
+                            // arm above). Both representations carry the same
+                            // per-level offsets, so #1457: the `by=` branch must
+                            // NOT additionally add its own main effect, which
+                            // would double-represent the factor (two `g` design
+                            // blocks + a spurious extra smoothing parameter).
                             let penalized_group_owner_present =
                                 terms.iter().any(|other| match other {
                                     ParsedTerm::RandomEffect { name, .. } => name == &by_name,
@@ -716,12 +711,10 @@ pub fn build_termspec(
                                 random_terms.push(RandomEffectTermSpec {
                                     name: by_name.clone(),
                                     feature_col: by_col,
-                                    drop_first_level: false,
-                                    penalized: true,
                                     frozen_levels: None,
-                                    // A FIXED factor main effect, like a bare `+ g`:
-                                    // an unseen level is out of contract and must
-                                    // raise, not center (#2102).
+                                    // Strict like a bare `+ g`: an unseen level is
+                                    // out of contract and must raise, not center
+                                    // (#2102).
                                     lenient_unseen: false,
                                 });
                             }
@@ -1966,13 +1959,12 @@ fn is_tensor_k_axis_option_key(key: &str) -> bool {
 
 /// Parse a per-margin basis dimension list (`k=<scalar>`, `k=[k0, k1, ...]`,
 /// or axis aliases like `k_x=...` / `k_0=...`). A scalar is broadcast across
-/// all axes; when no size is given the `pilot` per-margin sizes are returned
-/// and flagged as inferred.
+/// all axes; `None` returns the default sizes for `sizing_rows` rows.
 fn parse_tensor_k_list(
     options: &BTreeMap<String, String>,
     cols: &[usize],
     ds: &Dataset,
-    pilot: impl FnOnce() -> Vec<usize>,
+    sizing_rows: usize,
 ) -> Result<(Vec<usize>, bool), String> {
     let mut axis_values = vec![None; cols.len()];
     let mut saw_axis_alias = false;
@@ -2020,7 +2012,8 @@ fn parse_tensor_k_list(
         ));
     }
     let Some(raw) = raw else {
-        return Ok((pilot(), true));
+        let inferred = heuristic_tensor_margin_knots(cols, ds, sizing_rows);
+        return Ok((inferred, true));
     };
     let entries = split_list_option(raw);
     if entries.len() == 1 {
@@ -4004,38 +3997,14 @@ pub(crate) fn build_smooth_basis(
             for axis in 0..dim {
                 validate_spline_degree(&format!("degree[{axis}]"), axis_degree(axis))?;
             }
-            // Default margin sizes come from the joint resolution rate: an
-            // order-`m` tensor smoother of `dim` margins resolves
-            // `n^{dim/(2m+dim)}` penalized directions in total, split evenly
-            // over the margins, so each margin carries its `m`-dimensional null
-            // space plus `per_axis_resolution_rank(n, dim, m)` penalized
-            // functions. The penalty controls smoothness; the adaptive formula
-            // workflow grows the margins while the fit's REML evidence prefers
-            // the richer tensor. A margin holds at least one polynomial piece
-            // but never more functions than its column's distinct values (and
-            // never fewer than the linear pair a tensor margin requires).
-            let tensor_pilot = || {
-                (0..dim)
-                    .map(|axis| {
-                        let degree = axis_degree(axis);
-                        let m = requested_penalty_orders[axis]
-                            .unwrap_or(DEFAULT_PENALTY_ORDER)
-                            .min(degree)
-                            .max(1);
-                        let unique = unique_count_column(ds.values.column(cols[axis]));
-                        pilot_tensor_margin_dim(sizing_rows, dim, m)
-                            .max(degree + 1)
-                            .min(unique.max(2))
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let (k_list, k_inferred) = parse_tensor_k_list(options, cols, ds, tensor_pilot)?;
+            let (k_list, k_inferred) = parse_tensor_k_list(options, cols, ds, sizing_rows)?;
             if k_inferred {
                 inference_notes.inform(format!(
                     "Automatically set per-margin basis sizes {:?} for tensor smooth '{}' \
-                     (each margin: its penalty null space plus its share of the joint \
-                     penalized resolution rate at this sample size, capped by the column's \
-                     distinct values). Override with k=<int> or k=[k0,k1,...].",
+                     (the default basis dimension of a smooth of this many covariates on \
+                     this many rows, distributed geometrically across margins and capped per \
+                     margin by each column's distinct values; the penalty sets the \
+                     smoothness). Override with k=<int> or k=[k0,k1,...].",
                     k_list,
                     vars.join(",")
                 ));
@@ -4204,7 +4173,7 @@ pub(crate) fn build_smooth_basis(
                         BSplineKnotSpec::PeriodicUniform {
                             data_range: (domain_start, domain_end),
                             num_basis: k_axis,
-                            // The tensor owns its margins' refinement.
+                            // A tensor margin is never refined on its own.
                             adaptive: false,
                         },
                         OneDimensionalBoundary::Cyclic {
@@ -4319,12 +4288,6 @@ pub(crate) fn build_smooth_basis(
             // shrinkable by default, so REML can recover an unsupported surface
             // as zero. Explicit `double_penalty=false` remains the MLE opt-out.
             let tensor_double_penalty = smooth_double_penalty;
-            // Nobody chose the margin sizes (and no domain or knot placement
-            // pins their knots), so they are the penalized-resolution pilot the
-            // formula workflow refines jointly from the converged fit.
-            let adaptive = k_inferred
-                && requested_knot_placement.is_none()
-                && domains.iter().all(Option::is_none);
             Ok(SmoothBasisSpec::TensorBSpline {
                 feature_cols: canon_cols,
                 spec: TensorBSplineSpec {
@@ -4348,7 +4311,6 @@ pub(crate) fn build_smooth_basis(
                     } else {
                         TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
                     },
-                    adaptive,
                 },
             })
         }
@@ -4768,6 +4730,86 @@ pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>) -> usize {
     }
 }
 
+/// Default per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
+///
+/// A tensor smooth of `d` covariates is a `d`-dimensional smooth, so its total
+/// column count `p = ∏_d k_d` is the same default basis dimension every other
+/// `d`-covariate smooth on these rows receives ([`default_num_centers`]); the
+/// roughness penalty, not the basis size, then sets the smoothness. The budget
+/// is split geometrically across the margins by [`tensor_margin_sizes`], each
+/// margin capped by the distinct values of its covariate
+/// ([`tensor_margin_support`]), so a low-cardinality margin hands its unused
+/// share to the margins that can resolve more. The product never exceeds the
+/// distinct coordinate rows: a tensor surface is identified only at the
+/// locations the data occupy, so repeated rows sharpen those values without
+/// adding columns the data can pin down.
+fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset, sizing_rows: usize) -> Vec<usize> {
+    let caps: Vec<usize> = cols
+        .iter()
+        .map(|&c| tensor_margin_support(ds.values.column(c)))
+        .collect();
+    let budget = default_num_centers(sizing_rows, cols.len().max(1))
+        .min(count_unique_coordinate_rows(ds.values.view(), cols));
+    tensor_margin_sizes(&caps, budget)
+}
+
+/// Smallest default tensor margin that carries a roughness penalty beyond its
+/// null space: a cubic margin with one interior degree of freedom.
+fn tensor_margin_min_k() -> usize {
+    DEFAULT_BSPLINE_DEGREE + 2
+}
+
+/// The largest basis a default tensor margin on `col` can identify: one
+/// function per distinct covariate value (a cr margin places one value-knot per
+/// function, and a function observed at `u` distinct values has at most `u`
+/// identifiable values), floored at the 2-function linear margin every tensor
+/// axis carries.
+pub(crate) fn tensor_margin_support(col: ArrayView1<'_, f64>) -> usize {
+    unique_count_column(col).max(2)
+}
+
+/// Per-margin basis sizes `k_d` whose product stays within `budget`, each
+/// margin inside `[min(min_k, cap_d), cap_d]` (`cap_d` is the margin's
+/// identifiable support, [`tensor_margin_support`]).
+///
+/// The budget is split geometrically (the integer `d`-th root), then any
+/// headroom left by a margin whose support is below the geometric share goes
+/// to the margins that can still grow, one function at a time toward the axis
+/// with the most remaining support, while `∏ k_d ≤ budget`. The only way the
+/// product exceeds the budget is the per-margin floor, which a tensor margin
+/// cannot go below.
+pub(crate) fn tensor_margin_sizes(caps: &[usize], budget: usize) -> Vec<usize> {
+    let d = caps.len().max(1);
+    let min_k = tensor_margin_min_k();
+    let product = |k: &[usize]| -> usize { k.iter().fold(1usize, |p, &k| p.saturating_mul(k)) };
+    let mut geo = ((budget.max(1) as f64).powf(1.0 / d as f64).round() as usize).max(1);
+    while geo > 1 && geo.saturating_pow(d as u32) > budget {
+        geo -= 1;
+    }
+    while (geo + 1).saturating_pow(d as u32) <= budget {
+        geo += 1;
+    }
+    let mut k_list: Vec<usize> = caps
+        .iter()
+        .map(|&cap| geo.min(cap).max(min_k.min(cap)))
+        .collect();
+    loop {
+        let current = product(&k_list);
+        let Some(idx) = k_list
+            .iter()
+            .zip(caps.iter())
+            .enumerate()
+            .filter(|&(_, (&k, &cap))| k < cap && current / k * (k + 1) <= budget)
+            .max_by_key(|&(_, (&k, &cap))| (cap - k, cap))
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        k_list[idx] += 1;
+    }
+    k_list
+}
+
 /// Pilot basis dimension of a default degree-`degree` cyclic B-spline with an
 /// order-`penalty_order` cyclic roughness penalty on `n` rows.
 ///
@@ -4786,23 +4828,6 @@ pub(crate) fn pilot_cyclic_basis_dim(n: usize, degree: usize, penalty_order: usi
 pub(crate) fn cyclic_basis_dim_for_column(col: ArrayView1<'_, f64>, degree: usize) -> usize {
     pilot_cyclic_basis_dim(col.len(), degree, DEFAULT_PENALTY_ORDER.min(degree).max(1))
         .min(unique_count_column(col).max(degree + 1))
-}
-
-/// Pilot per-margin basis dimension of a default `d`-margin tensor-product
-/// smooth on `n` rows, each margin carrying an order-`penalty_order` penalty.
-///
-/// An order-`m` smoother of a `d`-dimensional function resolves
-/// `n^{d/(2m+d)}` penalized directions; a tensor product spreads them evenly
-/// across its margins, `r` per axis with `r^d ≥ n^{d/(2m+d)}`, i.e. the least
-/// `r` with `r^{2m+d} ≥ n` ([`crate::basis::per_axis_resolution_rank`]). Each
-/// margin then carries its own `m`-dimensional null space plus those `r`
-/// directions. The product basis therefore grows with the joint rate rather
-/// than the `d`-th power of a univariate default, which is what keeps a
-/// high-dimensional tensor from requesting more coefficients than the data can
-/// identify.
-pub(crate) fn pilot_tensor_margin_dim(n: usize, d: usize, penalty_order: usize) -> usize {
-    let m = penalty_order.max(1);
-    m.saturating_add(per_axis_resolution_rank(n, d, m))
 }
 
 // ---------------------------------------------------------------------------

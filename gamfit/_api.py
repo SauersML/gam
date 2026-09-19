@@ -213,16 +213,29 @@ def build_info() -> dict[str, Any]:
     """Return build/runtime metadata for the Rust extension.
 
     Reports whether ``gamfit._rust`` was importable and, when available, the
-    build-time information exposed by the extension (version, commit, feature
-    flags). Useful for bug reports and for confirming a development build is
-    being used.
+    build-time information the extension exposes. The package ``version`` is
+    shared by every commit between releases, so ``commit``, ``dirty`` and
+    ``model_payload_version`` are what tell two engines apart.
 
     Returns
     -------
     dict
         Always contains ``available`` (bool) and ``module`` (str). When the
-        extension loaded, additional engine-specific keys are merged in;
-        otherwise ``reason`` describes why import failed.
+        extension loaded it also contains:
+
+        - ``version`` (str): the engine's package version.
+        - ``commit`` (str or None): the full hash of the gam commit the
+          extension was built from; None when the build had no gam git tree
+          to read, as for a build from an unpacked sdist.
+        - ``dirty`` (bool or None): whether the tracked files differed from
+          ``commit`` at build time, so that the extension is not exactly that
+          commit's engine; None when ``commit`` is None.
+        - ``model_payload_version`` (int): the saved-model format this engine
+          writes. A model saved with a newer payload version is refused by name.
+        - ``capabilities`` and ``supported_model_classes`` (lists of str), and
+          ``cuda_diagnostics`` (dict).
+
+        When the extension did not load, ``reason`` describes why.
 
     Examples
     --------

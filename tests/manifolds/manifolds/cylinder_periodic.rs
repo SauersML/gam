@@ -50,7 +50,6 @@ fn tensor_periodic_margin_is_exactly_cyclic_at_period_boundary() {
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::None,
                     penalty_decomposition: Default::default(),
-                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),

@@ -264,6 +264,7 @@ __all__ = [
     "intervention_calibration_plan",
     "is_multinomial_family_name",
     "label_shuffle_permutation",
+    "latent_conditional_residual_table",
     "lawley_bartlett_factor",
     "lawley_bartlett_factor_estimated_lambda",
     "layer_transport_fit",
@@ -1945,6 +1946,8 @@ def intervention_calibration_plan(row_id: NDArray[np.int64], atom: NDArray[np.in
 def is_multinomial_family_name(family: str) -> bool: ...
 
 def label_shuffle_permutation(n_rows: int, seed: int, draw: int) -> NDArray[np.uint64]: ...
+
+def latent_conditional_residual_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable) -> NDArray[np.float64] | None: ...
 
 def lawley_bartlett_factor(design: NDArray[np.float64], family: str, eta: NDArray[np.float64], tested_start: int, tested_end: int, ref_df: float, penalty: NDArray[np.float64] | None = ..., dispersion: float = ..., prior_weights: NDArray[np.float64] | None = ..., lr_statistic: float | None = ...) -> dict[Any, Any]: ...
 

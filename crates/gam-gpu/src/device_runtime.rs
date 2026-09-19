@@ -40,6 +40,10 @@ pub enum GpuAbsence {
     UnsupportedPlatform,
     DriverUnavailable { reason: String },
     NoDevice { reason: String },
+    /// The driver is present, but a CUDA userspace library the device path
+    /// loads (cuBLAS, cuSOLVER, cuSPARSE, or one cudarc opens by name) has no
+    /// candidate on this host: the CUDA runtime is not installed here.
+    RuntimeLibraryUnavailable { reason: String },
 }
 
 impl std::fmt::Display for GpuAbsence {
@@ -48,7 +52,9 @@ impl std::fmt::Display for GpuAbsence {
             Self::UnsupportedPlatform => {
                 f.write_str("CUDA support is unavailable on this platform")
             }
-            Self::DriverUnavailable { reason } | Self::NoDevice { reason } => f.write_str(reason),
+            Self::DriverUnavailable { reason }
+            | Self::NoDevice { reason }
+            | Self::RuntimeLibraryUnavailable { reason } => f.write_str(reason),
         }
     }
 }
@@ -111,6 +117,34 @@ impl GpuRuntime {
         }
     }
 
+    /// Admit one CUDA userspace library the device path loads, by the loader's
+    /// own verdict (`driver::load_library_names`), the rule the libcuda
+    /// preflight already follows. A library with no candidate on this host is
+    /// typed absence: the CUDA runtime is not installed here, which is where a
+    /// CPU-only install lands on a machine that carries only the NVIDIA driver,
+    /// so `auto` selects the CPU and `required` refuses naming the library. A
+    /// candidate that exists but does not load is a fault of a present
+    /// installation under every policy (#3000). `describe` words the refusal.
+    #[cfg(target_os = "linux")]
+    fn runtime_library_admission(
+        loaded: Result<(), GpuError>,
+        describe: impl FnOnce(&GpuError) -> String,
+    ) -> Result<Option<GpuAbsence>, GpuError> {
+        let Err(error) = loaded else {
+            return Ok(None);
+        };
+        let reason = describe(&error);
+        Self::record_cpu_reason(reason.clone());
+        log::debug!("[GPU] CUDA acceleration disabled: {reason}");
+        diagnostics::log_cuda_disabled(&reason);
+        match error {
+            GpuError::DriverLibraryUnavailable { .. } => {
+                Ok(Some(GpuAbsence::RuntimeLibraryUnavailable { reason }))
+            }
+            _ => Err(GpuError::RuntimeDependencyUnavailable { reason }),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn probe_loaded_driver() -> Result<GpuAvailability, GpuError> {
         // #1017 probe-first fix: establish cudarc's primary context P and
@@ -148,14 +182,14 @@ impl GpuRuntime {
         // cuSPARSE site under `src/gpu/` calls `CudaBlas::new` /
         // `DnHandle::new` / cusparse handle creation eagerly during
         // workspace allocation), so we refuse to advertise GPU unless all
-        // three load cleanly here.
+        // three load cleanly here. How a refusal counts is the loader's own
+        // verdict (`runtime_library_admission`).
         for stem in ["cublas", "cusolver", "cusparse"] {
-            if let Err(error) = crate::driver::require_cuda_compute_library(stem) {
-                let reason = format!("lib{stem} unavailable: {error}");
-                Self::record_cpu_reason(reason.clone());
-                log::debug!("[GPU] CUDA acceleration disabled: {reason}");
-                diagnostics::log_cuda_disabled(&reason);
-                return Err(GpuError::RuntimeDependencyUnavailable { reason });
+            let loaded = crate::driver::require_cuda_compute_library(stem);
+            if let Some(absence) = Self::runtime_library_admission(loaded, |error| {
+                format!("lib{stem} unavailable: {error}")
+            })? {
+                return Ok(GpuAvailability::Absent(absence));
             }
         }
 
@@ -164,12 +198,11 @@ impl GpuRuntime {
         // panics when none opens, so advertise the runtime only when those names
         // open too (#2972).
         for library in [CudarcLibrary::Runtime, CudarcLibrary::Blas, CudarcLibrary::Solver] {
-            if let Err(error) = require_cudarc_library(library) {
-                let reason = format!("cudarc cannot open lib{}: {error}", library.name());
-                Self::record_cpu_reason(reason.clone());
-                log::debug!("[GPU] CUDA acceleration disabled: {reason}");
-                diagnostics::log_cuda_disabled(&reason);
-                return Err(GpuError::RuntimeDependencyUnavailable { reason });
+            let loaded = require_cudarc_library(library);
+            if let Some(absence) = Self::runtime_library_admission(loaded, |error| {
+                format!("cudarc cannot open lib{}: {error}", library.name())
+            })? {
+                return Ok(GpuAvailability::Absent(absence));
             }
         }
 
@@ -649,6 +682,68 @@ mod policy_resolution_contract_tests {
             GpuAvailability::Absent(GpuAbsence::UnsupportedPlatform)
         ));
         assert_eq!(cudarc_calls, 1, "a loadable driver must reach the cudarc probe");
+    }
+
+    /// #3000: a CUDA runtime library is admitted by the loader's verdict, the
+    /// rule the libcuda preflight follows. No candidate on the host is
+    /// absence, so `auto` resolves to the CPU and `required` refuses naming
+    /// the library; a candidate that exists but does not load is a fault under
+    /// every policy. The verdicts come from the real candidate walk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_runtime_library_is_absence_and_an_unloadable_one_is_a_fault_3000() {
+        let temp = tempfile::tempdir().expect("temporary runtime directory");
+        let absent = temp.path().join("libcublas.so.12");
+        let unloadable = temp.path().join("libcublas.so.3000");
+        std::fs::write(&unloadable, b"not an ELF object").expect("write unloadable library");
+        let walk = |candidate: &std::path::Path| {
+            crate::driver::load_library_names(&[candidate.display().to_string()]).map(|_| ())
+        };
+        let describe = |error: &GpuError| format!("libcublas unavailable: {error}");
+
+        let absence = GpuRuntime::runtime_library_admission(walk(&absent), describe)
+            .expect("a runtime library with no candidate is absence, not a probe fault")
+            .expect("a library that did not open must not admit the runtime");
+        assert!(
+            matches!(absence, GpuAbsence::RuntimeLibraryUnavailable { .. }),
+            "a missing libcublas must be typed RuntimeLibraryUnavailable: {absence:?}"
+        );
+        let auto = GpuRuntime::resolve_availability(
+            GpuPolicy::Auto,
+            Ok(GpuAvailabilityRef::Absent(&absence)),
+        )
+        .expect("auto resolves a host without the CUDA runtime to the CPU");
+        assert!(auto.is_none(), "auto must select the CPU without the CUDA runtime");
+        let required = GpuRuntime::resolve_availability(
+            GpuPolicy::Required,
+            Ok(GpuAvailabilityRef::Absent(&absence)),
+        )
+        .expect_err("required refuses a host without the CUDA runtime");
+        let searched = absent.display().to_string();
+        assert!(
+            matches!(
+                &required,
+                GpuError::RequiredDeviceUnavailable { reason }
+                    if reason.contains("libcublas unavailable") && reason.contains(&searched)
+            ),
+            "required must name the missing library and where it was looked for: {required}"
+        );
+
+        let fault = GpuRuntime::runtime_library_admission(walk(&unloadable), describe)
+            .expect_err("a present but unloadable runtime library is a probe fault");
+        let present = unloadable.display().to_string();
+        assert!(
+            matches!(
+                &fault,
+                GpuError::RuntimeDependencyUnavailable { reason } if reason.contains(&present)
+            ),
+            "an unloadable libcublas must stay a fault naming the candidate: {fault}"
+        );
+
+        // Positive control: a library that opens admits the runtime.
+        let admitted = GpuRuntime::runtime_library_admission(Ok(()), describe)
+            .expect("an opened library is no refusal");
+        assert!(admitted.is_none(), "an opened library must not report absence");
     }
 
     #[test]

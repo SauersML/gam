@@ -1,7 +1,7 @@
 //! The resolution of a formula-default smooth basis that nobody chose.
 //!
-//! A formula default (`s(x)`, `s(x, bs="cc")`, `fs(x, g)`, `te(x, z)`, an
-//! auto-sized radial or sphere smooth) starts at the penalized-resolution
+//! A formula default (`s(x)`, `s(x, bs="cc")`, `fs(x, g)`, an auto-sized
+//! radial or sphere smooth) starts at the penalized-resolution
 //! pilot and is refined by the standard formula workflow from the converged
 //! fit's own evidence (#1689, #3078). This module is the one place that knows,
 //! per basis family, what that resolution is, how one level of nested
@@ -17,7 +17,7 @@ use crate::basis::{
     BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary, SPHERICAL_HARMONIC_MAX_DEGREE,
     SphereMethod, center_strategy_is_auto, center_strategy_with_num_centers,
     count_unique_coordinate_rows, refined_harmonic_degree, refined_internal_knots,
-    refined_num_centers, refined_periodic_basis, select_cr_knots,
+    refined_num_centers, refined_periodic_basis,
 };
 
 /// The resolution coordinate of one adaptive smooth basis.
@@ -31,102 +31,63 @@ pub enum AdaptiveResolution {
     InternalKnots(usize),
     /// Basis dimension of a formula-default cyclic smooth.
     PeriodicBasis(usize),
-    /// Per-margin basis dimensions of a formula-default tensor product, in
-    /// the tensor's (canonical) margin order.
-    MarginDims(Vec<usize>),
     /// Maximum degree of a formula-default spherical-harmonic basis.
     HarmonicDegree(usize),
 }
 
 impl AdaptiveResolution {
-    fn components(&self) -> Vec<usize> {
+    fn value(&self) -> usize {
         match self {
             Self::Centers(v)
             | Self::InternalKnots(v)
             | Self::PeriodicBasis(v)
-            | Self::HarmonicDegree(v) => vec![*v],
-            Self::MarginDims(dims) => dims.clone(),
+            | Self::HarmonicDegree(v) => *v,
         }
     }
 
-    fn with_components(&self, values: Vec<usize>) -> Self {
-        let scalar = || values.first().copied().unwrap_or(0);
+    fn with_value(&self, value: usize) -> Self {
         match self {
-            Self::Centers(_) => Self::Centers(scalar()),
-            Self::InternalKnots(_) => Self::InternalKnots(scalar()),
-            Self::PeriodicBasis(_) => Self::PeriodicBasis(scalar()),
-            Self::HarmonicDegree(_) => Self::HarmonicDegree(scalar()),
-            Self::MarginDims(_) => Self::MarginDims(values),
+            Self::Centers(_) => Self::Centers(value),
+            Self::InternalKnots(_) => Self::InternalKnots(value),
+            Self::PeriodicBasis(_) => Self::PeriodicBasis(value),
+            Self::HarmonicDegree(_) => Self::HarmonicDegree(value),
         }
     }
 
-    fn same_shape(&self, other: &Self) -> bool {
+    fn same_kind(&self, other: &Self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(other)
-            && self.components().len() == other.components().len()
     }
 
-    /// `self` bounded above by `bound` component-wise, but never below
-    /// `floor`: a proposal is limited by what the data can identify, and a
-    /// basis that already converged is never shrunk. A `bound` of another
-    /// shape leaves `self` unchanged.
+    /// `self` bounded above by `bound`, but never below `floor`: a proposal
+    /// is limited by what the data can identify, and a basis that already
+    /// converged is never shrunk. A `bound` of another kind leaves `self`
+    /// unchanged.
     pub fn clamped(&self, bound: &Self, floor: &Self) -> Self {
-        if !self.same_shape(bound) || !self.same_shape(floor) {
+        if !self.same_kind(bound) || !self.same_kind(floor) {
             return self.clone();
         }
-        let values = self
-            .components()
-            .into_iter()
-            .zip(bound.components())
-            .zip(floor.components())
-            .map(|((value, bound), floor)| value.min(bound).max(floor))
-            .collect();
-        self.with_components(values)
+        self.with_value(self.value().min(bound.value()).max(floor.value()))
     }
 
-    /// The number of monotone steps between `self` and `target`: the largest
-    /// component increase. Zero when `target` does not exceed `self`.
+    /// The number of unit steps from `self` up to `target`. Zero when
+    /// `target` does not exceed `self`.
     pub fn steps_to(&self, target: &Self) -> usize {
-        if !self.same_shape(target) {
+        if !self.same_kind(target) {
             return 0;
         }
-        self.components()
-            .into_iter()
-            .zip(target.components())
-            .map(|(from, to)| to.saturating_sub(from))
-            .max()
-            .unwrap_or(0)
+        target.value().saturating_sub(self.value())
     }
 
-    /// The point `step` of [`Self::steps_to`]`(target)` on the monotone path
-    /// from `self` to `target`: every component advances by
-    /// `⌈step · (to − from) / steps⌉`, so step 0 is `self`, the last step is
-    /// `target`, and each component is non-decreasing along the path.
+    /// The point `step` of [`Self::steps_to`]`(target)` on the path from
+    /// `self` to `target`: step 0 is `self` and the last step is `target`.
     pub fn toward(&self, target: &Self, step: usize) -> Self {
-        let steps = self.steps_to(target);
-        if steps == 0 {
-            return self.clone();
-        }
-        let step = step.min(steps);
-        let values = self
-            .components()
-            .into_iter()
-            .zip(target.components())
-            .map(|(from, to)| {
-                let gap = to.saturating_sub(from);
-                from + (step * gap).div_ceil(steps)
-            })
-            .collect();
-        self.with_components(values)
+        let step = step.min(self.steps_to(target));
+        self.with_value(self.value() + step)
     }
 
-    /// Whether any component of `self` exceeds the matching one of `other`.
+    /// Whether `self` exceeds `other`.
     pub fn exceeds(&self, other: &Self) -> bool {
-        self.same_shape(other)
-            && self
-                .components()
-                .into_iter()
-                .zip(other.components())
-                .any(|(a, b)| a > b)
+        self.same_kind(other) && self.value() > other.value()
     }
 }
 
@@ -136,10 +97,6 @@ impl std::fmt::Display for AdaptiveResolution {
             Self::Centers(c) => write!(f, "{c} centers"),
             Self::InternalKnots(k) => write!(f, "{k} internal knots"),
             Self::PeriodicBasis(b) => write!(f, "cyclic basis dimension {b}"),
-            Self::MarginDims(dims) => {
-                let dims: Vec<String> = dims.iter().map(usize::to_string).collect();
-                write!(f, "tensor margin dimensions {}", dims.join("x"))
-            }
             Self::HarmonicDegree(l) => write!(f, "harmonic degree {l}"),
         }
     }
@@ -158,7 +115,9 @@ fn radial_center_strategy(basis: &SmoothBasisSpec) -> Option<(&CenterStrategy, &
         B::Duchon {
             feature_cols, spec, ..
         } => Some((&spec.center_strategy, feature_cols.as_slice())),
-        B::ConstantCurvature { feature_cols, spec } => Some((&spec.center_strategy, feature_cols.as_slice())),
+        B::ConstantCurvature { feature_cols, spec } => {
+            Some((&spec.center_strategy, feature_cols.as_slice()))
+        }
         B::MeasureJet {
             feature_cols, spec, ..
         } => Some((&spec.center_strategy, feature_cols.as_slice())),
@@ -197,18 +156,6 @@ fn radial_center_strategy_mut(
         B::Sphere { feature_cols, spec } if matches!(spec.method, SphereMethod::Wahba) => {
             Some((&mut spec.center_strategy, feature_cols.clone()))
         }
-        _ => None,
-    }
-}
-
-/// Basis dimension of one tensor margin, and the knots of an NCR margin.
-fn margin_dim(margin: &crate::basis::BSplineBasisSpec) -> Option<usize> {
-    match &margin.knotspec {
-        BSplineKnotSpec::NaturalCubicRegression { knots } => Some(knots.len()),
-        BSplineKnotSpec::Generate {
-            num_internal_knots, ..
-        } => Some(num_internal_knots + margin.degree + 1),
-        BSplineKnotSpec::PeriodicUniform { num_basis, .. } => Some(*num_basis),
         _ => None,
     }
 }
@@ -257,20 +204,10 @@ pub fn adaptive_resolution_of(basis: &SmoothBasisSpec) -> Option<AdaptiveResolut
                     num_internal_knots, ..
                 }
                 | BSplineKnotSpec::Automatic {
-                    num_internal_knots,
-                    ..
+                    num_internal_knots, ..
                 } => Some(AdaptiveResolution::InternalKnots(*num_internal_knots)),
                 _ => None,
             }
-        }
-        B::TensorBSpline { feature_cols, spec }
-            if spec.adaptive && spec.marginalspecs.len() == feature_cols.len() =>
-        {
-            spec.marginalspecs
-                .iter()
-                .map(margin_dim)
-                .collect::<Option<Vec<_>>>()
-                .map(AdaptiveResolution::MarginDims)
         }
         B::Sphere { spec, .. }
             if spec.adaptive_degree && matches!(spec.method, SphereMethod::Harmonic) =>
@@ -284,10 +221,7 @@ pub fn adaptive_resolution_of(basis: &SmoothBasisSpec) -> Option<AdaptiveResolut
 /// One level of uniform nested refinement of `current` for `basis`: every
 /// knot interval split once, every center cell given one new center, the
 /// harmonic span paired with one new direction per existing one.
-pub fn refined_adaptive_resolution(
-    basis: &SmoothBasisSpec,
-    current: &AdaptiveResolution,
-) -> AdaptiveResolution {
+pub fn refined_adaptive_resolution(current: &AdaptiveResolution) -> AdaptiveResolution {
     match current {
         AdaptiveResolution::Centers(c) => AdaptiveResolution::Centers(refined_num_centers(*c)),
         AdaptiveResolution::InternalKnots(k) => {
@@ -298,28 +232,6 @@ pub fn refined_adaptive_resolution(
         }
         AdaptiveResolution::HarmonicDegree(l) => {
             AdaptiveResolution::HarmonicDegree(refined_harmonic_degree(*l))
-        }
-        AdaptiveResolution::MarginDims(dims) => {
-            let SmoothBasisSpec::TensorBSpline { spec, .. } = basis else {
-                return current.clone();
-            };
-            AdaptiveResolution::MarginDims(
-                dims.iter()
-                    .zip(&spec.marginalspecs)
-                    .map(|(&dim, margin)| match &margin.knotspec {
-                        // `k` value-knots bound `k − 1` intervals; splitting
-                        // each once gives `2k − 1` knots.
-                        BSplineKnotSpec::NaturalCubicRegression { .. } => {
-                            dim.saturating_mul(2).saturating_sub(1)
-                        }
-                        BSplineKnotSpec::PeriodicUniform { .. } => refined_periodic_basis(dim),
-                        _ => {
-                            let order = margin.degree + 1;
-                            refined_internal_knots(dim.saturating_sub(order)) + order
-                        }
-                    })
-                    .collect(),
-            )
         }
     }
 }
@@ -340,7 +252,7 @@ fn column(data: ArrayView2<'_, f64>, col: usize) -> Option<ArrayView1<'_, f64>> 
 /// values, so each family's interpolating limit is its support bound.
 ///
 /// * open B-spline (and the shared factor-smooth marginal): `K + d + 1 ≤ u`;
-/// * cyclic basis and every tensor margin: dimension `≤ u` on its axis;
+/// * cyclic basis: dimension `≤ u`;
 /// * radial centers: at most one per distinct coordinate row;
 /// * harmonic degree: the non-constant span `L(L + 2)` leaves the constant
 ///   direction to the intercept, `L(L + 2) ≤ u − 1`, within the engine's
@@ -380,11 +292,6 @@ pub fn adaptive_resolution_support(
                 u.saturating_sub(spec.marginal.degree + 1),
             ))
         }
-        (B::TensorBSpline { feature_cols, .. }, AdaptiveResolution::MarginDims(_)) => feature_cols
-            .iter()
-            .map(|&c| column(data, c).map(distinct_finite))
-            .collect::<Option<Vec<_>>>()
-            .map(AdaptiveResolution::MarginDims),
         (B::Sphere { feature_cols, .. }, AdaptiveResolution::HarmonicDegree(_)) => {
             if feature_cols.iter().any(|&c| c >= data.ncols()) {
                 return None;
@@ -413,9 +320,6 @@ pub fn adaptive_resolution_width(
         (_, AdaptiveResolution::Centers(c)) => *c,
         (_, AdaptiveResolution::PeriodicBasis(b)) => *b,
         (_, AdaptiveResolution::HarmonicDegree(l)) => l.saturating_mul(l + 2),
-        (_, AdaptiveResolution::MarginDims(dims)) => {
-            dims.iter().fold(1usize, |acc, &d| acc.saturating_mul(d))
-        }
         (B::FactorSmooth { spec }, AdaptiveResolution::InternalKnots(k)) => {
             let levels = match &spec.group_frozen_levels {
                 Some(levels) => levels.len(),
@@ -432,13 +336,13 @@ pub fn adaptive_resolution_width(
 /// refit stays owned by the same loop.
 pub fn apply_adaptive_resolution(
     basis: &mut SmoothBasisSpec,
-    data: ArrayView2<'_, f64>,
     resolution: &AdaptiveResolution,
 ) -> Result<(), String> {
     use SmoothBasisSpec as B;
-    let current = adaptive_resolution_of(basis)
-        .ok_or_else(|| "adaptive resolution requested for a basis nobody left unsized".to_string())?;
-    if !current.same_shape(resolution) {
+    let current = adaptive_resolution_of(basis).ok_or_else(|| {
+        "adaptive resolution requested for a basis nobody left unsized".to_string()
+    })?;
+    if !current.same_kind(resolution) {
         return Err(format!(
             "adaptive resolution {resolution:?} does not match the basis resolution {current:?}"
         ));
@@ -454,16 +358,20 @@ pub fn apply_adaptive_resolution(
         format!("adaptive resolution {resolution:?} cannot be written into a {basis} basis")
     };
     match (basis, resolution) {
-        (B::BSpline1D { spec, .. }, AdaptiveResolution::InternalKnots(k)) => match &mut spec.knotspec {
-            BSplineKnotSpec::Automatic {
-                num_internal_knots, ..
-            } => *num_internal_knots = *k,
-            other => return Err(unsupported(&format!("B-spline {other:?}"))),
-        },
-        (B::BSpline1D { spec, .. }, AdaptiveResolution::PeriodicBasis(b)) => match &mut spec.knotspec {
-            BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis = *b,
-            other => return Err(unsupported(&format!("B-spline {other:?}"))),
-        },
+        (B::BSpline1D { spec, .. }, AdaptiveResolution::InternalKnots(k)) => {
+            match &mut spec.knotspec {
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots, ..
+                } => *num_internal_knots = *k,
+                other => return Err(unsupported(&format!("B-spline {other:?}"))),
+            }
+        }
+        (B::BSpline1D { spec, .. }, AdaptiveResolution::PeriodicBasis(b)) => {
+            match &mut spec.knotspec {
+                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis = *b,
+                other => return Err(unsupported(&format!("B-spline {other:?}"))),
+            }
+        }
         (B::FactorSmooth { spec }, AdaptiveResolution::InternalKnots(k)) => {
             match &mut spec.marginal.knotspec {
                 BSplineKnotSpec::Generate {
@@ -473,30 +381,6 @@ pub fn apply_adaptive_resolution(
                     num_internal_knots, ..
                 } => *num_internal_knots = *k,
                 other => return Err(unsupported(&format!("factor-smooth {other:?}"))),
-            }
-        }
-        (B::TensorBSpline { feature_cols, spec }, AdaptiveResolution::MarginDims(dims)) => {
-            for ((margin, &dim), &col) in spec.marginalspecs.iter_mut().zip(dims).zip(feature_cols.iter()) {
-                match &mut margin.knotspec {
-                    BSplineKnotSpec::NaturalCubicRegression { knots } => {
-                        let values = column(data, col).ok_or_else(|| {
-                            format!("tensor margin column {col} is missing from the data")
-                        })?;
-                        *knots = select_cr_knots(values, dim).map_err(|e| e.to_string())?;
-                    }
-                    BSplineKnotSpec::Generate {
-                        num_internal_knots, ..
-                    } => {
-                        *num_internal_knots = dim.checked_sub(margin.degree + 1).ok_or_else(|| {
-                            format!(
-                                "tensor margin dimension {dim} is below its degree-{} order",
-                                margin.degree
-                            )
-                        })?;
-                    }
-                    BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis = dim,
-                    other => return Err(unsupported(&format!("tensor margin {other:?}"))),
-                }
             }
         }
         (B::Sphere { spec, .. }, AdaptiveResolution::HarmonicDegree(l)) => {
@@ -512,22 +396,26 @@ mod tests {
     use super::AdaptiveResolution as R;
 
     #[test]
-    fn monotone_path_reaches_the_target_and_never_retreats() {
-        let from = R::MarginDims(vec![5, 5]);
-        let to = R::MarginDims(vec![9, 7]);
+    fn path_reaches_the_target_and_never_retreats() {
+        let from = R::InternalKnots(5);
+        let to = R::InternalKnots(9);
         assert_eq!(from.steps_to(&to), 4);
         assert_eq!(from.toward(&to, 0), from);
-        assert_eq!(from.toward(&to, 1), R::MarginDims(vec![6, 6]));
-        assert_eq!(from.toward(&to, 4), to);
+        assert_eq!(from.toward(&to, 1), R::InternalKnots(6));
+        assert_eq!(from.toward(&to, 7), to);
+        assert_eq!(to.steps_to(&from), 0);
     }
 
     #[test]
     fn clamp_bounds_by_support_but_never_shrinks() {
-        let proposal = R::MarginDims(vec![9, 9]);
-        let support = R::MarginDims(vec![3, 20]);
-        let current = R::MarginDims(vec![5, 5]);
-        assert_eq!(proposal.clamped(&support, &current), R::MarginDims(vec![5, 9]));
+        let current = R::Centers(5);
+        assert_eq!(
+            R::Centers(9).clamped(&R::Centers(7), &current),
+            R::Centers(7)
+        );
+        assert_eq!(R::Centers(9).clamped(&R::Centers(3), &current), current);
         assert!(!R::Centers(4).exceeds(&R::Centers(4)));
         assert!(R::Centers(5).exceeds(&R::Centers(4)));
+        assert!(!R::Centers(5).exceeds(&R::InternalKnots(4)));
     }
 }

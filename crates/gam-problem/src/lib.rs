@@ -78,7 +78,7 @@ pub mod types;
 pub use riemannian_retraction::LatentRetractionRegistry;
 pub use row_measure::RowSubsampleMask;
 
-pub use basis_error::BasisError;
+pub use basis_error::{BasisError, CovariateSpan};
 pub use block_count_error::BlockCountMismatch;
 pub use block_role::BlockRole;
 pub use block_spec::{

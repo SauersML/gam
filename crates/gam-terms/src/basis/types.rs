@@ -29,7 +29,7 @@ impl SendPtr {
 /// Re-export of the neutral basis-error contract. #1521: `BasisError` lives
 /// in `gam-problem` so `EstimationError` can wrap it (`#[from]`) without a
 /// back-edge; gam-terms re-exports it to preserve `gam_terms::basis::BasisError`.
-pub use gam_problem::BasisError;
+pub use gam_problem::{BasisError, CovariateSpan};
 
 // ============================================================================
 // Unified Basis Generation API
@@ -562,15 +562,6 @@ pub fn penalized_resolution_rank(n: usize, d: usize, m: usize) -> usize {
     let d = d.max(1) as u32;
     let q = 2u32.saturating_mul(m.max(1) as u32).saturating_add(d);
     least_root_bound(n, d, q)
-}
-
-/// Per-axis share of [`penalized_resolution_rank`] for a `d`-margin tensor
-/// product: the least integer `r` with `r^d >= n^{d/(2m+d)}`, i.e.
-/// `r^{2m+d} >= n`, so the product of `d` equal margins holds the joint rank.
-pub fn per_axis_resolution_rank(n: usize, d: usize, m: usize) -> usize {
-    let d = d.max(1) as u32;
-    let q = 2u32.saturating_mul(m.max(1) as u32).saturating_add(d);
-    least_root_bound(n, 1, q)
 }
 
 /// The least integer `r >= 1` with `r^den >= n^num` (`n` itself for `n <= 1`),
@@ -3344,23 +3335,6 @@ mod saturation_escalation_tests {
         let rank = penalized_resolution_rank(1_000_000, 16, 9);
         assert!((rank as f64).ln() * 34.0 >= 16.0 * (1.0e6f64).ln() - 1e-9);
         assert!(((rank - 1) as f64).ln() * 34.0 < 16.0 * (1.0e6f64).ln());
-    }
-
-    #[test]
-    fn per_axis_rank_splits_the_joint_tensor_rate() {
-        // Two cubic-penalty margins (m = 2, d = 2): least r with r^6 >= n.
-        assert_eq!(per_axis_resolution_rank(100, 2, 2), 3);
-        assert_eq!(per_axis_resolution_rank(10_000, 2, 2), 5);
-        assert_eq!(per_axis_resolution_rank(15_625, 2, 2), 5);
-        assert_eq!(per_axis_resolution_rank(15_626, 2, 2), 6);
-        // The product of the per-axis ranks holds the joint rank.
-        for n in [50usize, 999, 12_345, 400_000] {
-            for d in 2..=4 {
-                let r = per_axis_resolution_rank(n, d, 2);
-                assert!(r.pow(d as u32) >= penalized_resolution_rank(n, d, 2));
-                assert!((r - 1).pow(d as u32) < penalized_resolution_rank(n, d, 2));
-            }
-        }
     }
 
     #[test]
