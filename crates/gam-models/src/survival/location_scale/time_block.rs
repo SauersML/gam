@@ -526,7 +526,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle
 /// dim` and the `&beta + &corrections.row(i)` add panicked with
 /// `IncompatibleShape`). A length mismatch is a caller contract violation,
 /// so it is surfaced as a structured `Result::Err` that the marginal-slope /
-/// location-scale pipelines turn into a clean `GamError` instead of a panic
+/// location-scale pipelines turn into a clean `GamfitError` instead of a panic
 /// crossing the Rust/Python boundary.
 pub fn project_onto_linear_constraints(
     dim: usize,

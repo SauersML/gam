@@ -882,7 +882,11 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+                let sigma_floor =
+                    gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(
+                        self.payload(),
+                    )
+                    .ok()?;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
@@ -4037,7 +4041,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: None,
             link_wiggle: None,
@@ -4055,7 +4059,7 @@ mod tests {
             .predict_noise_scale(&input)
             .expect("gaussian location-scale sigma")
             .expect("sigma should be returned");
-        // σ = LOGB_SIGMA_FLOOR + exp(η + offset).
+        // σ = sigma_floor + exp(η + offset).
         assert!((sigma[0] - 3.01).abs() <= 1e-12);
         assert!((sigma[1] - 5.01).abs() <= 1e-12);
         let out = predictor
@@ -4071,7 +4075,7 @@ mod tests {
         // posterior mean of σ = f + exp(η_s) is f + exp(m + v/2), strictly
         // above the plug-in σ(m). Without covariance the posterior moment
         // does not exist, so it is refused, never degraded to the plug-in.
-        let floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+        let floor = 0.01;
         let mut predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.3],
@@ -4108,7 +4112,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
@@ -4138,7 +4142,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,

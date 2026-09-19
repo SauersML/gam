@@ -897,29 +897,6 @@ pub(super) fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
     ]
 }
 
-/// Streaming log-sum-exp update: accumulate `exp(log_term)` into a running
-/// `(log_max, sum)` pair representing `Σ exp(log_term_i) = exp(log_max) · sum`.
-///
-/// When `log_term` exceeds the running max, the partial sum is rescaled in
-/// place so the new max becomes the reference point. This keeps everything
-/// inside the dynamic range of f64 with no allocation.
-#[inline]
-pub(super) fn lse_accumulate(log_max: &mut f64, sum: &mut f64, log_term: f64) {
-    if !log_term.is_finite() {
-        return;
-    }
-    if log_term > *log_max {
-        if log_max.is_finite() {
-            *sum = *sum * (*log_max - log_term).exp() + 1.0;
-        } else {
-            *sum = 1.0;
-        }
-        *log_max = log_term;
-    } else {
-        *sum += (log_term - *log_max).exp();
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarginalSlopeCovarianceShape {
     Diagonal,
@@ -1450,275 +1427,24 @@ pub fn marginal_slope_covariance_from_scores(
     }
 }
 
-/// Log-space residual evaluator for the empirical-frailty intercept calibration.
+/// The empirical-law intercept `a(q, g)`: the root of
+/// `Σᵢ wᵢ Φ(a + s·g·zᵢ) = Φ(q)` at the observed slope `s·g`.
 ///
-/// Solves, in log-space, the strictly-increasing equation
-///
-///   F(a) = log Σᵢ wᵢ Φ(a + b·zᵢ) − log μ★ = 0,
-///
-/// where `b = rigid_observed_slope(slope, probit_scale)` and `(zᵢ, wᵢ)` are
-/// the supplied quadrature nodes and (positive) weights.
-///
-/// Mathematical structure of `F`:
-///   • `F ∈ C^∞(ℝ)`.
-///   • `F` is strictly increasing: `F'(a) = (Σ wᵢ φᵢ) / (Σ wᵢ Φᵢ) > 0` everywhere.
-///   • `F(a) → −∞` as `a → −∞`; `F(a) → log(Σ wᵢ) − log μ★ ≥ 0` as `a → +∞`.
-///   • Unique root `a★ ∈ ℝ` exists for every `μ★ ∈ (0, 1)`.
-///
-/// Why log-space: the linear-space residual `Σ wᵢ Φᵢ − μ★` and its derivative
-/// `Σ wᵢ φᵢ` are sums of strictly-positive `exp(−η²/2)`-scaled terms. When the
-/// seed `a` puts every quadrature node `ηᵢ = a + b·zᵢ` into the deep tail
-/// (|ηᵢ| ≳ 38), every term rounds to 0.0 in IEEE-754 and the derivative
-/// underflows to exactly zero — destroying Newton's update direction.  The
-/// log-space formulation evaluates `log φ(η) = −η²/2 − ½ log 2π` (always finite
-/// for any finite η) and `log Φ(η)` via the `erfcx`-based `normal_logcdf`
-/// (also always finite for any finite η).  All sums are accumulated by
-/// streaming log-sum-exp, so `F`, `F'`, and `F''` are finite for every finite
-/// `a` and the global Newton/Halley iteration converges from any seed.
-///
-/// Returns `(F, F', F'')`.  In the deep left tail Newton converges linearly
-/// (Mills ratio: `F'(a) ≈ |a|`, step ≈ `|a|/2`); near the root convergence is
-/// quadratic with Newton or cubic with Halley.
-pub(super) fn empirical_rigid_calibration_eval(
-    intercept: f64,
-    log_target_mu: f64,
+/// Since the weights sum to one this is the anchoring equation
+/// `Σᵢ wᵢ Φ(−(a + s·g·zᵢ)) = Φ(−q)`, solved by the anchor's bracketed Halley
+/// iteration on the log of whichever marginal tail is the smaller
+/// ([`crate::latent_anchor::solve_anchor`]). It is read from the marginal
+/// index `q` alone, never from a probability, so every finite `q` has a
+/// certified root however deep into a tail it sits (gam#2978).
+pub(crate) fn empirical_intercept(
+    q: f64,
     slope: f64,
     probit_scale: f64,
     nodes: &[f64],
     weights: &[f64],
-) -> Result<(f64, f64, f64), String> {
-    if !intercept.is_finite() {
-        return Err(format!(
-            "empirical latent calibration: non-finite intercept {intercept}"
-        ));
-    }
-    let observed_slope = rigid_observed_slope(slope, probit_scale);
-    const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
-
-    // Streaming LSE accumulators for log Σ wᵢ φᵢ and log Σ wᵢ Φᵢ.
-    let mut log_max_phi = f64::NEG_INFINITY;
-    let mut sum_phi = 0.0_f64;
-    let mut log_max_cdf = f64::NEG_INFINITY;
-    let mut sum_cdf = 0.0_f64;
-
-    // Streaming signed LSE for Σ wᵢ ηᵢ φᵢ, split into positive and negative
-    // legs so the cancellation `pos − neg` happens once at the end on a
-    // finite, well-scaled remainder.
-    let mut log_max_pos = f64::NEG_INFINITY;
-    let mut sum_pos = 0.0_f64;
-    let mut log_max_neg = f64::NEG_INFINITY;
-    let mut sum_neg = 0.0_f64;
-
-    for (&node, &weight) in nodes.iter().zip(weights.iter()) {
-        if !(weight.is_finite() && weight > 0.0) {
-            continue;
-        }
-        let eta = intercept + observed_slope * node;
-        if !eta.is_finite() {
-            return Err(format!(
-                "empirical latent calibration: non-finite η at intercept={intercept}, slope={slope}, node={node}"
-            ));
-        }
-        let log_w = weight.ln();
-        let log_phi = -0.5 * eta * eta - HALF_LOG_2PI;
-        let log_term_phi = log_w + log_phi;
-        let log_term_cdf = log_w + normal_logcdf(eta);
-
-        lse_accumulate(&mut log_max_phi, &mut sum_phi, log_term_phi);
-        lse_accumulate(&mut log_max_cdf, &mut sum_cdf, log_term_cdf);
-
-        if eta != 0.0 {
-            let log_term_eta_phi = log_term_phi + eta.abs().ln();
-            if eta > 0.0 {
-                lse_accumulate(&mut log_max_pos, &mut sum_pos, log_term_eta_phi);
-            } else {
-                lse_accumulate(&mut log_max_neg, &mut sum_neg, log_term_eta_phi);
-            }
-        }
-    }
-
-    if !(sum_phi.is_finite() && sum_cdf.is_finite() && sum_phi > 0.0 && sum_cdf > 0.0) {
-        return Err(format!(
-            "empirical latent calibration: log-space accumulation failed (sum_phi={sum_phi}, sum_cdf={sum_cdf}, intercept={intercept})"
-        ));
-    }
-
-    let log_s_phi = log_max_phi + sum_phi.ln();
-    let log_s_cdf = log_max_cdf + sum_cdf.ln();
-
-    // F = log Σ wᵢ Φᵢ − log μ★
-    let f = log_s_cdf - log_target_mu;
-    // F' = exp(log Σ wᵢ φᵢ − log Σ wᵢ Φᵢ).
-    //
-    // F' is mathematically strictly positive everywhere — `Σ wᵢ φᵢ` and
-    // `Σ wᵢ Φᵢ` are both sums of strictly-positive terms with positive weights.
-    // In the far right tail, Mills ratio gives `φᵢ/Φᵢ → 0` exponentially, so
-    // `log F' → −∞` and `(log F').exp()` IEEE-underflows to 0.0. Mathematically
-    // it is a tiny positive number; floor it at `f64::MIN_POSITIVE` so the
-    // monotone-root solver sees a strictly-positive derivative and routes
-    // through its bracket-by-doubling phase (which only needs the *sign* of
-    // `F'`, not its magnitude). Newton would propose `Δa = −F/F' = ±∞`, the
-    // solver detects that and falls through to bracketing automatically.
-    let log_f_prime = log_s_phi - log_s_cdf;
-    let f_prime = if log_f_prime > -740.0 {
-        log_f_prime.exp()
-    } else {
-        f64::MIN_POSITIVE
-    };
-
-    // F'' = (d/da)(S_φ/S_Φ) = (S_φ' S_Φ − S_φ²)/S_Φ²
-    //     = −(Σ wᵢ ηᵢ φᵢ)/S_Φ − (F')²
-    // The η-weighted sum is cancellation-prone; combine its positive and
-    // negative legs against the same `log_s_cdf` reference so the subtraction
-    // happens on dimensionless quantities of bounded magnitude. When the ratio
-    // also underflows (deep tail), the result is a clean numerical zero —
-    // Halley reduces to Newton, which is what the solver does anyway.
-    let exp_safe = |log_x: f64| -> f64 { if log_x > -740.0 { log_x.exp() } else { 0.0 } };
-    let pos_over_cdf = if sum_pos > 0.0 {
-        exp_safe(log_max_pos + sum_pos.ln() - log_s_cdf)
-    } else {
-        0.0
-    };
-    let neg_over_cdf = if sum_neg > 0.0 {
-        exp_safe(log_max_neg + sum_neg.ln() - log_s_cdf)
-    } else {
-        0.0
-    };
-    let s_etaphi_over_s_cdf = pos_over_cdf - neg_over_cdf;
-    let f_double_prime = -s_etaphi_over_s_cdf - f_prime * f_prime;
-
-    if !(f.is_finite() && f_prime.is_finite() && f_prime > 0.0 && f_double_prime.is_finite()) {
-        return Err(format!(
-            "empirical latent calibration: non-finite log-space state f={f}, f'={f_prime}, f''={f_double_prime} at intercept={intercept}"
-        ));
-    }
-    Ok((f, f_prime, f_double_prime))
-}
-
-pub(crate) fn empirical_intercept_from_marginal(
-    target_mu: f64,
-    target_q: f64,
-    slope: f64,
-    probit_scale: f64,
-    nodes: &[f64],
-    weights: &[f64],
-    initial: Option<f64>,
 ) -> Result<f64, String> {
-    // Convergence is on the log-space residual |F| = |log Σ wᵢ Φᵢ − log μ★|.
-    // Near the root this is the relative error in the calibrated probability,
-    // so 1e-13 in log-space corresponds to absolute residual μ★ · 1e-13 in
-    // linear space — strictly tighter than the legacy 1e-13 absolute tolerance
-    // for every μ★ ∈ (0, 1). The 4·ε floor keeps the contract meaningful when
-    // μ★ approaches 1 (where log Σ Φᵢ approaches 0).
-    let abs_tol = 1e-13_f64.max(4.0 * f64::EPSILON);
-    empirical_intercept_from_marginal_within(
-        target_mu,
-        target_q,
-        slope,
-        probit_scale,
-        nodes,
-        weights,
-        initial,
-        abs_tol,
-    )
-}
-
-/// The log-space tolerance the calibration residual can actually be driven to
-/// at target `μ★`: the fit's `1e-13` where that is attainable, widened to the
-/// roundoff floor of the streaming log-sum-exp `log Σ wᵢ Φᵢ` deep in the tail.
-///
-/// The floor is set by `normal_logcdf` at the grid's extreme node, whose
-/// magnitude `|log Φ(a + s·b·z_min)| ≈ (a + s·b·z_min)²/2` grows like `|log μ★|`
-/// times the kernel's own scale factors, evaluated to a relative accuracy of
-/// order `1e-12` in the far tail. Measured floors on a 41-node heavy-tailed
-/// grid: `3e-13` at `μ★ = 3e-6`, `1.4e-12` at `μ★ = 1.6e-5`, `1.7e-10` at the
-/// `μ★ = 1e-12` link clamp (`a ≈ −17.8`). A quadratic envelope in `log μ★`
-/// covers all of them with margin. Chasing `1e-13` there burns the solver's
-/// whole refinement budget on an unattainable target, and the clamp floor
-/// sits above even the fit's `1e3·abs_tol` acceptance, so roots correct to
-/// every representable digit were refused.
-///
-/// Training rows sit at moderate `μ★`, where this is the fit's own tolerance;
-/// posterior-integration nodes several standard deviations into the tail are
-/// where the widening engages. Even at the clamp the widened tolerance is a
-/// relative error in the calibrated probability below `1e-9`, i.e. an error in
-/// the intercept below `1e-10` (the residual divided by `F'(a) ≈ |a|`).
-pub(crate) fn empirical_intercept_tail_tolerance(target_mu: f64) -> f64 {
-    let fit_tol = 1e-13_f64.max(4.0 * f64::EPSILON);
-    let log_mu = target_mu.ln();
-    fit_tol.max(4096.0 * f64::EPSILON * (log_mu * log_mu).max(1.0))
-}
-
-/// [`empirical_intercept_from_marginal`] accepting the root when its log-space
-/// residual is within an explicit `abs_tol`.
-pub(crate) fn empirical_intercept_from_marginal_within(
-    target_mu: f64,
-    target_q: f64,
-    slope: f64,
-    probit_scale: f64,
-    nodes: &[f64],
-    weights: &[f64],
-    initial: Option<f64>,
-    abs_tol: f64,
-) -> Result<f64, String> {
-    if !(target_mu.is_finite() && target_mu > 0.0 && target_mu < 1.0) {
-        return Err(format!(
-            "empirical latent calibration requires target mu in (0,1), got {target_mu}"
-        ));
-    }
-    let log_target_mu = target_mu.ln();
-    let closed_form_seed = rigid_intercept_from_marginal(target_q, slope, probit_scale);
-    let seed = initial.unwrap_or(closed_form_seed);
-    let eval = |a: f64| {
-        empirical_rigid_calibration_eval(a, log_target_mu, slope, probit_scale, nodes, weights)
-    };
-    let solve_from = |s: f64| {
-        crate::monotone_root::solve_monotone_root(
-            eval,
-            s,
-            "empirical latent intercept",
-            abs_tol,
-            64,
-            48,
-        )
-        // Enclosing fn emits its own format!() rejection errors as String,
-        // so the public return type stays Result<_, String>.
-        .map_err(|e| e.to_string())
-    };
-    // A cached warm start can be poisoned across iterations: the per-row
-    // `intercept_warm_starts` slot is shared by reference across line-search
-    // trials and across outer-search seed validations, and is written after
-    // every successful row-solve — including from rejected line-search trials
-    // whose β/slope was wild. When that stale `a` is paired with the current
-    // (much smaller) slope, the bracket-by-doubling phase can exhaust its
-    // budget without crossing zero. Fall back to the deterministic
-    // closed-form seed, which depends only on the current `(target_q, slope)`
-    // and is bounded by the analytic rigid-probit geometry, so the cache
-    // remains a pure speedup that cannot poison correctness.
-    let (root, _, f_best) = match solve_from(seed) {
-        Ok(v) => v,
-        Err(first_err) => {
-            if seed == closed_form_seed {
-                return Err(first_err);
-            }
-            solve_from(closed_form_seed).map_err(|retry_err| {
-                format!("{first_err}; closed-form retry from a={closed_form_seed:.6}: {retry_err}")
-            })?
-        }
-    };
-    // The shared solver also stops on bracket width, so a converged root can
-    // carry a residual a few multiples of `abs_tol·|F′|` above the target it
-    // refined to (a 41-node law at slope 1.6 returned `−1.2e-13` against the
-    // `1e-13` target, gam#2923). What this guards against is a root handed
-    // back with a residual that is not small at all: `1e-10` in log space is
-    // a relative error of `1e-10` on the calibrated probability, three orders
-    // above the refinement target and far below anything a fit can resolve.
-    if f_best.abs() > 1e3 * abs_tol {
-        return Err(format!(
-            "empirical latent intercept solve failed: log-residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
-        ));
-    }
-    Ok(root)
+    let grid = crate::latent_anchor::AnchorGridOwned::new(nodes.to_vec(), weights.to_vec());
+    crate::latent_anchor::solve_anchor(q, rigid_observed_slope(slope, probit_scale), grid.view())
 }
 
 #[inline]
@@ -3164,6 +2890,7 @@ mod flex_primary_hessian_oracle_tests {
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
             cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),

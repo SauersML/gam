@@ -229,8 +229,8 @@ They differ in two ways only:
 
 | Spelling | Numeric column | Level unseen in training |
 | --- | --- | --- |
-| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
-| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
+| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
+| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
 | `group(site)`, `re(site)` | forced to categorical levels | predicted at the population level (the level effect is 0) |
 
 So `factor(year)` treats `year` as levels rather than as a slope, and a
@@ -245,8 +245,8 @@ points to `factor(site)`. A categorical column is also
 refused inside a term that treats its inputs as numeric axes (`linear()`,
 `s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
 non-factor bases): the error points to `factor(site)` or `group(site)` for
-the level effect, or `s(x, site, bs="fs")` for a per-level smooth of a
-numeric `x`.
+the level effect, or `s(x, by=site)` / `fs(x, site)` for a per-level
+smooth of a numeric `x`.
 
 Why estimate the penalty rather than leave the levels unpenalized? The
 penalized estimate is the random-effect (partial-pooling) estimate, and

@@ -826,12 +826,20 @@ fn slack_horizon() -> Result<f64, ConeNormalizerRefusal> {
 /// `v = dβ̂/dθ`, the KKT gradient's total derivative `ġ`, and the precision's motion `Ṁ` applied to
 /// `y = M⁻¹g` ([`ConeNormalizer::solved_gradient`]) and to each column of the covariance basis `N`
 /// ([`ConeNormalizer::covariance_basis`]).
+///
+/// Where `M⁻¹` is the criterion's kept-spectrum pseudo-inverse `M⁺`, its derivative is not
+/// `−M⁺ṀM⁺` alone: the kept eigenvectors rotate into the dropped ones. That part of `D(M⁺)[Ṁ]`
+/// is applied to `g` and to each column of the basis generator `C` with `N = M⁺C`
+/// ([`ConeNormalizer::covariance_generator`]) in `inverse_rotation_on_gradient` and
+/// `inverse_rotation_on_generator`, zero where `M⁻¹` is an inverse (gam#2952).
 #[derive(Clone, Debug)]
 pub struct ConeCoordinateMotion {
     pub mode_response: Array1<f64>,
     pub gradient_rate: Array1<f64>,
     pub precision_rate_on_y: Array1<f64>,
     pub precision_rate_on_basis: Array2<f64>,
+    pub inverse_rotation_on_gradient: Array1<f64>,
+    pub inverse_rotation_on_generator: Array2<f64>,
 }
 
 /// One coordinate pair's second-order motion: `v_kl`, `g̈_kl`, and `M̈_kl` applied to `y` and to
@@ -865,6 +873,8 @@ pub struct ConeNormalizer {
     y: Array1<f64>,
     /// `N`, `p × r`, with `K = NᵀMN` the orthant's covariance and `A M⁻¹ = B Nᵀ`.
     basis: Array2<f64>,
+    /// `C`, `p × r`, with `N = M⁻¹C`.
+    generator: Array2<f64>,
     gradient: Array1<f64>,
     orthant: OrthantLogMass,
 }
@@ -964,14 +974,14 @@ impl ConeNormalizer {
             m0[i] = *mean;
         }
         let row_coordinates = q <= kept_support.len();
-        let (loadings, basis, k) = if row_coordinates {
+        let (loadings, basis, generator, k) = if row_coordinates {
             // Row coordinates: B = I, N = R = M⁻¹Aᵀ, K = W = AR.
             let mut r = Array2::<f64>::zeros((p, q));
             for (i, (_, solved, _)) in kept.iter().enumerate() {
                 r.column_mut(i).assign(solved);
             }
             let w = symmetrized(&a.dot(&r));
-            (Array2::<f64>::eye(q), r, w)
+            (Array2::<f64>::eye(q), r, a.t().to_owned(), w)
         } else {
             // Supported-column coordinates: B = A on them, N = M⁻¹ on them, K = N on them.
             let mut basis = Array2::<f64>::zeros((p, kept_support.len()));
@@ -988,7 +998,11 @@ impl ConeNormalizer {
             let r = kept_support.len();
             let k = symmetrized(&Array2::from_shape_fn((r, r), |(i, j)| basis[[kept_support[i], j]]));
             let loadings = Array2::from_shape_fn((q, r), |(i, j)| a[[i, kept_support[j]]]);
-            (loadings, basis, k)
+            let mut generator = Array2::<f64>::zeros((p, r));
+            for (index, &column) in kept_support.iter().enumerate() {
+                generator[[column, index]] = 1.0;
+            }
+            (loadings, basis, generator, k)
         };
         if basis.iter().any(|value| !value.is_finite()) {
             return Err(ConeNormalizerRefusal::NonFinite { what: "covariance basis" });
@@ -1002,7 +1016,7 @@ impl ConeNormalizer {
         if !value.is_finite() {
             return Err(ConeNormalizerRefusal::NonFinite { what: "normalizer value" });
         }
-        Ok(Self { value, rows: a, y, basis, gradient: gradient.clone(), orthant })
+        Ok(Self { value, rows: a, y, basis, generator, gradient: gradient.clone(), orthant })
     }
 
     /// `C = −½gᵀM⁻¹g − ln P(u ≥ 0)`.
@@ -1019,6 +1033,12 @@ impl ConeNormalizer {
     /// whichever are fewer.
     pub fn orthant_dimension(&self) -> usize {
         self.orthant.dimension()
+    }
+
+    /// The generator `C`, `p × r`, of the covariance basis `N = M⁻¹C` and `K = CᵀM⁻¹C`: the unit
+    /// normals `Aᵀ` in row coordinates, the unit vectors of the supported columns otherwise.
+    pub fn covariance_generator(&self) -> &Array2<f64> {
+        &self.generator
     }
 
     /// EP sweeps at this mode.
@@ -1054,9 +1074,13 @@ impl ConeNormalizer {
         motion: &ConeCoordinateMotion,
         solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
     ) -> ConeFirstOrder {
-        let y_rate = solve(&(&motion.gradient_rate - &motion.precision_rate_on_y));
+        let y_rate = solve(&(&motion.gradient_rate - &motion.precision_rate_on_y))
+            + &motion.inverse_rotation_on_gradient;
         let m0_rate = self.rows.dot(&motion.mode_response) - self.rows.dot(&y_rate);
-        let k_rate = symmetrized(&(-self.basis.t().dot(&motion.precision_rate_on_basis)));
+        let k_rate = symmetrized(
+            &(self.generator.t().dot(&motion.inverse_rotation_on_generator)
+                - self.basis.t().dot(&motion.precision_rate_on_basis)),
+        );
         let derivative = -0.5 * (motion.gradient_rate.dot(&self.y) + self.gradient.dot(&y_rate))
             - self.orthant.mean_gradient().dot(&m0_rate)
             - frobenius(&self.orthant.covariance_gradient(), &k_rate);
@@ -1465,6 +1489,114 @@ mod tests {
         );
     }
 
+    /// gam#2952: where the criterion prices the kept-spectrum pseudo-inverse `M⁺` of an
+    /// indefinite precision, the first derivative of `C` is the derivative of `C` priced with
+    /// `M⁺`. `M(t) = R(t) Λ(t) R(t)ᵀ` rotates its eigenvectors, so the kept pair turns into the
+    /// dropped negative direction, which `−M⁺ṀM⁺` alone does not see. The kernel is written down
+    /// exactly at every `t`, the way the criterion's producers build it from one eigendecomposition.
+    #[test]
+    fn the_normalizer_derivative_follows_a_kept_spectrum_pseudo_inverse_2952() {
+        use crate::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
+        let rows = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8]];
+        let bounds = array![0.0, 0.0, -0.05];
+        let axis = array![0.3_f64, -0.5, 0.8];
+        let axis = &axis / axis.dot(&axis).sqrt();
+        let generator = array![
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0]
+        ];
+        let q0 = array![[0.8, -0.6, 0.0], [0.36, 0.48, -0.8], [0.48, 0.64, 0.6]];
+        // Eigenvalues 2.0 and 0.9 are kept; −0.3 is dropped, like the #2894 wiggle optimum's
+        // −0.12 against a kept 0.45.
+        let spectrum = |t: f64| array![2.0 + 0.4 * t, 0.9 - 0.3 * t, -0.3 + 0.1 * t];
+        let rotation = |t: f64| {
+            let angle = 0.7 * t;
+            Array2::<f64>::eye(3)
+                + &(&generator * angle.sin())
+                + &(generator.dot(&generator) * (1.0 - angle.cos()))
+        };
+        let kernel_at = |t: f64| {
+            let basis = rotation(t).dot(&q0);
+            let values = spectrum(t);
+            PenaltySubspaceTrace {
+                u_s: basis.slice(s![.., 0..2]).to_owned(),
+                h_proj_inverse: Array2::from_diag(&values.slice(s![0..2]).mapv(|value| 1.0 / value)),
+                dropped_basis: basis.slice(s![.., 2..3]).to_owned(),
+                dropped_eigenvalues: values.slice(s![2..3]).to_owned(),
+                logdet_correction: 0.0,
+            }
+        };
+        let precision_at = |t: f64| {
+            let basis = rotation(t).dot(&q0);
+            basis.dot(&Array2::from_diag(&spectrum(t))).dot(&basis.t())
+        };
+        let (b0, b1) = (array![0.01, 0.02, 0.3], array![-0.2, 0.1, 0.05]);
+        let (g0, g1) = (array![0.4, 0.3, 0.0], array![0.1, -0.2, 0.05]);
+        let normalizer_at = |t: f64| {
+            let kernel = kernel_at(t);
+            let solve = |v: &Array1<f64>| kernel.apply_pseudo_inverse(v);
+            ConeNormalizer::evaluate(&rows, &bounds, &(&b0 + &(&b1 * t)), &(&g0 + &(&g1 * t)), &solve)
+                .expect("normalizer")
+        };
+        let kernel = kernel_at(0.0);
+        let solve = |v: &Array1<f64>| kernel.apply_pseudo_inverse(v);
+        let normalizer = normalizer_at(0.0);
+        assert!(normalizer.retained_rows() >= 2, "at least two correlated rows are near their bounds");
+        // `Ṁ(0) = 0.7·(Ω M₀ − M₀ Ω) + Q₀ Λ̇ Q₀ᵀ`, since `Ṙ(0) = 0.7·Ω` and `Ω` is skew.
+        let m0 = precision_at(0.0);
+        let precision_rate = (generator.dot(&m0) - m0.dot(&generator)) * 0.7
+            + q0.dot(&Array2::from_diag(&array![0.4, -0.3, 0.1])).dot(&q0.t());
+        let fd_precision = (precision_at(1.0e-5) - precision_at(-1.0e-5)) / 2.0e-5;
+        let rate_gap = (&precision_rate - &fd_precision).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(rate_gap <= 1.0e-8, "the path's precision rate: gap {rate_gap:e} to its central difference");
+        let rotation_on_dropped = precision_rate.dot(&kernel.dropped_basis);
+        let turn = kernel
+            .pseudo_inverse_rotation(&rotation_on_dropped)
+            .expect("spectral kernel");
+        let motion_with = |turn_on_gradient: Array1<f64>, turn_on_generator: Array2<f64>| {
+            ConeCoordinateMotion {
+                mode_response: b1.clone(),
+                gradient_rate: g1.clone(),
+                precision_rate_on_y: precision_rate.dot(normalizer.solved_gradient()),
+                precision_rate_on_basis: precision_rate.dot(normalizer.covariance_basis()),
+                inverse_rotation_on_gradient: turn_on_gradient,
+                inverse_rotation_on_generator: turn_on_generator,
+            }
+        };
+        let exact = motion_with(turn.apply(&g0), turn.apply_columns(normalizer.covariance_generator()));
+        let derivative = normalizer.first_order(&exact, &solve).derivative;
+        let (fd, bar) = richardson(&|t: f64| normalizer_at(t).value(), 1.0e-3);
+        assert!(
+            (derivative - fd).abs() <= bar,
+            "dC {derivative} against central difference {fd} (bar {bar})"
+        );
+        // The rotation is the derivative of the pseudo-inverse itself: along the same path,
+        // `d(M⁺v)/dt = −M⁺ṀM⁺v + rotation(v)` for a fixed `v`.
+        let probe = array![0.7, -0.2, 0.4];
+        let (fd_solve, _) = {
+            let h = 1.0e-5;
+            (
+                (kernel_at(h).apply_pseudo_inverse(&probe) - kernel_at(-h).apply_pseudo_inverse(&probe))
+                    / (2.0 * h),
+                h,
+            )
+        };
+        let analytic_solve = -solve(&precision_rate.dot(&solve(&probe))) + turn.apply(&probe);
+        let solve_gap = (&analytic_solve - &fd_solve).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(solve_gap <= 1.0e-7, "d(M⁺v) against central difference: gap {solve_gap:e}");
+        // Positive control: without the rotation the derivative is the inverse's, and it misses.
+        let inverse_only = motion_with(
+            Array1::zeros(3),
+            Array2::zeros(normalizer.covariance_generator().raw_dim()),
+        );
+        let missed = normalizer.first_order(&inverse_only, &solve).derivative;
+        assert!(
+            (missed - fd).abs() > 1.0e3 * bar,
+            "positive control: −M⁺ṀM⁺ alone gives {missed} against {fd} (bar {bar})"
+        );
+    }
+
     /// The quadratic path `β(t), g(t), M(t)` of the derivative checks, `(x₀, x₁, x₂)` its
     /// coefficients.
     struct NormalizerPath {
@@ -1504,6 +1636,9 @@ mod tests {
                 gradient_rate: g1 + &(g2 * (2.0 * t)),
                 precision_rate_on_y: m_rate.dot(normalizer.solved_gradient()),
                 precision_rate_on_basis: m_rate.dot(normalizer.covariance_basis()),
+                // `dense_solve` is an inverse: nothing rotates.
+                inverse_rotation_on_gradient: Array1::zeros(b1.len()),
+                inverse_rotation_on_generator: Array2::zeros(normalizer.covariance_generator().raw_dim()),
             }
         };
         let derivative_at = |t: f64| {

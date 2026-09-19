@@ -199,20 +199,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         true
     }
 
-    /// The survival marginal-slope NLL carries the change-of-variables
-    /// Jacobian `−d·log(∂η/∂t)` on every event row, with the time-derivative
-    /// `∂η/∂t` AFFINE in β (a derivative-design row plus offset) — a canonical
-    /// self-concordant barrier, exactly the transformation-normal `−log h'`
-    /// structure. The probit log-CDF censoring terms are convex but not
-    /// standard-self-concordant; like the CTN endpoint normalizer they are
-    /// left to the retained trust-ratio acceptance gate. Declaring the flag
-    /// lets the coupled-joint inner Newton take the damped `α = 1/(1+λ_N)`
-    /// first trial instead of grinding the barrier's `1/(∂η/∂t)²` curvature
-    /// through the trust-region radius — the measured #979 survival
-    /// marginal-slope inner-solve crawl/hang.
-    fn inner_objective_is_self_concordant(&self) -> bool {
-        true
-    }
+    // `inner_objective_is_self_concordant` keeps its `false` default (#3003).
+    // The event-row barrier `−log q̇` is self-concordant, but the damped-Newton
+    // guarantee (Nesterov Thm 4.1.12) needs the WHOLE objective convex, and
+    // this one is not: `η = q·√(1+b²) + b·z` couples the time and slope
+    // coefficients nonlinearly, and the refused certificates measure
+    // `λ_min(H_lik)` down to −1.6e8.
 
     fn persistent_warm_start_fingerprint(
         &self,

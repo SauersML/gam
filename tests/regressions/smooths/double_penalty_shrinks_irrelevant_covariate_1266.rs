@@ -71,7 +71,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam::test_support::reference::{RESOLUTION_TAIL, student_t_upper_quantile};
-use gam_solve::estimate::smooth_term_summary_rows;
+use gam_solve::estimate::{SummaryBlockOffset, smooth_term_summary_rows};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -109,7 +109,12 @@ fn standard(fit: &FitResult) -> &gam::StandardFitResult {
 /// `smooth_start` offset; a block-local `coeff_range` is not a column index).
 fn smooth_term_edf(fit: &FitResult, needle: &str) -> f64 {
     let std_fit = standard(fit);
-    let rows = smooth_term_summary_rows(&std_fit.design, &std_fit.fit, None);
+    let rows = smooth_term_summary_rows(
+        &std_fit.design,
+        &std_fit.fit,
+        None,
+        SummaryBlockOffset::default(),
+    );
     rows.iter()
         .find(|row| row.name.contains(needle))
         .map(|row| row.edf)

@@ -12,7 +12,7 @@ It does not. Predicting on a held-out frame that carries only covariate columns
 (the realistic case: you are predicting, so you do **not** have the response)
 aborts before returning anything with::
 
-    GamError: table must have at least one column
+    GamfitError: table must have at least one column
 
 The abort is a column-projection defect in the Python (PyFFI) predict path, not
 a data problem. ``dataset_with_model_schema``

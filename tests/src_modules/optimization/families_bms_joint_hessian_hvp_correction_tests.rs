@@ -805,6 +805,7 @@ fn bernoulli_value_cell_moments_use_shared_lru() {
         jeffreys_armed: true,
         cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(16 * 1024 * 1024)),
         cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         ..default_test_family()
     };
     let cell = exact_kernel::DenestedCubicCell {
