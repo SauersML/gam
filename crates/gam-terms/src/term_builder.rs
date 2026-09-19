@@ -17,8 +17,9 @@ use crate::basis::{
     MaternLengthScale, MaternNu, MeasureJetBasisSpec, MeasureJetIdentifiability,
     OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
-    default_spherical_harmonic_degree, low_rank_center_resolution, thin_plate_penalty_order,
+    auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
+    default_spatial_center_strategy, default_spherical_harmonic_degree, low_rank_center_resolution,
+    thin_plate_penalty_order,
 };
 use crate::fit_notes::FitNoteSink;
 use crate::inference::formula_dsl::{

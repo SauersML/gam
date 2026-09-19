@@ -1,4 +1,31 @@
 use super::*;
+use std::collections::HashSet;
+
+/// Canonical dedup key for one coordinate row: each value goes through
+/// `gam_data::canonical_level_bits`, so `+0.0` / `-0.0` collapse to one key.
+fn coordinate_row_key<'a>(values: impl Iterator<Item = &'a f64>) -> Vec<u64> {
+    values
+        .map(|&value| gam_data::canonical_level_bits(value))
+        .collect()
+}
+
+/// Number of distinct coordinate rows over `cols`.
+///
+/// A basis budget sized from the raw row count can exceed the number of
+/// distinct design points on data with repeated coordinate rows, so budgets
+/// that must be realizable by distinct points are capped by this count.
+pub(crate) fn count_unique_coordinate_rows(values: ArrayView2<'_, f64>, cols: &[usize]) -> usize {
+    let mut seen = HashSet::<Vec<u64>>::with_capacity(values.nrows());
+    let mut unique = 0usize;
+    for row in 0..values.nrows() {
+        if seen.insert(coordinate_row_key(
+            cols.iter().map(|&col| &values[[row, col]]),
+        )) {
+            unique += 1;
+        }
+    }
+    unique
+}
 
 #[derive(Debug, Clone)]
 pub struct CollocationOperatorMatrices {
