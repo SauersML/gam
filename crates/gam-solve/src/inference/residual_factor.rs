@@ -27,8 +27,9 @@
 //! "no factor" and on the null activity law `c ≡ 1`, and scored by its Laplace
 //! log marginal likelihood (see [`evidence`]). The **factor count `r`** is the
 //! evidence maximizer over every rank the model identifies,
-//! `0 ≤ r ≤ min(max_factor_rank, Ledermann bound)`; a higher rank is taken only
-//! on strictly larger evidence.
+//! `0 ≤ r ≤ L(p)` with `L(p)` the Ledermann bound; a higher rank is taken only
+//! on strictly larger evidence. The candidate set is fixed by identifiability
+//! alone, so no caller-supplied cap can truncate the model comparison.
 //!
 //! # What it produces
 //!
@@ -97,12 +98,6 @@ pub struct ResidualFactorInput<'a> {
     pub residuals: ArrayView2<'a, f64>,
     /// Activity coordinate `z ∈ ℝ^n` the scale law is smooth in.
     pub activity: ArrayView1<'a, f64>,
-    /// Maximum factor rank the evidence search may consider. The search
-    /// scores every `r = 0, 1, …, min(max_factor_rank, L(p))`, with `L(p)` the
-    /// Ledermann bound (the largest rank a `p`-channel factor model
-    /// identifies), and keeps the evidence maximizer. `0` forces the
-    /// pure-diagonal model.
-    pub max_factor_rank: usize,
 }
 
 /// A persistent, evidence-earning residual factor direction — a promotion
@@ -134,7 +129,8 @@ pub struct FactorPromotion {
 
 impl StructuredResidualModel {
     /// Fit the structured residual-covariance model: every identifiable rank
-    /// up to `max_factor_rank` is fitted to its certified posterior mode and
+    /// `r = 0, 1, …, L(p)` (`L(p)` the Ledermann bound, the largest rank a
+    /// `p`-channel factor model identifies) is fitted to its certified posterior mode and
     /// scored by its Laplace evidence, and the maximizer is kept (the lower rank
     /// on a tie). Errors on shape / non-finite input, on a residual channel that
     /// is identically zero, and on any rank whose mode the solver cannot certify:
@@ -182,7 +178,7 @@ impl StructuredResidualModel {
             .collect();
 
         let moments = evidence::binned_moments(r, &row_bin, bins)?;
-        let max_rank = input.max_factor_rank.min(evidence::ledermann_bound(p));
+        let max_rank = evidence::ledermann_bound(p);
         let mut best: Option<(usize, evidence::RankFit)> = None;
         for rank in 0..=max_rank {
             let candidate = evidence::fit_rank(&moments, rank)?;
@@ -892,7 +888,6 @@ mod tests {
         let model = StructuredResidualModel::fit(ResidualFactorInput {
             residuals: residuals.view(),
             activity: activity.view(),
-            max_factor_rank: 3,
         })
         .expect("fit");
         assert_eq!(model.factor_rank(), 1);
@@ -914,7 +909,6 @@ mod tests {
         let model = StructuredResidualModel::fit(ResidualFactorInput {
             residuals: residuals.view(),
             activity: activity.view(),
-            max_factor_rank: 3,
         })
         .expect("fit");
         let (n, p) = residuals.dim();
@@ -974,7 +968,6 @@ mod tests {
             let model = StructuredResidualModel::fit(ResidualFactorInput {
                 residuals: residuals.view(),
                 activity: activity.view(),
-                max_factor_rank: 5,
             })
             .expect("fit");
             assert_eq!(
@@ -1043,7 +1036,6 @@ mod tests {
         let model = StructuredResidualModel::fit(ResidualFactorInput {
             residuals: residuals.view(),
             activity: activity.view(),
-            max_factor_rank: 4,
         })
         .expect("fit");
 
@@ -1089,7 +1081,6 @@ mod tests {
         let model = StructuredResidualModel::fit(ResidualFactorInput {
             residuals: residuals.view(),
             activity: activity.view(),
-            max_factor_rank: 2,
         })
         .expect("fit");
         (n, model)

@@ -191,7 +191,6 @@ fn fitted_factor_recovers_planted_interference_subspace() {
     let model = StructuredResidualModel::fit(ResidualFactorInput {
         residuals: residuals.view(),
         activity: activity.view(),
-        max_factor_rank: 3,
     })
     .expect("estimator fits");
 
@@ -271,7 +270,6 @@ fn structured_likelihood_removes_spurious_topology_preference() {
     let model = StructuredResidualModel::fit(ResidualFactorInput {
         residuals: residuals.view(),
         activity: activity.view(),
-        max_factor_rank: 2,
     })
     .expect("structured covariance fits");
     let metric = model.row_metric(n).expect("structured metric builds");

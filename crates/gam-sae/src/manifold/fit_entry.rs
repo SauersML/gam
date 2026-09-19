@@ -179,13 +179,11 @@ fn sae_structured_residual_model(
     // the fit tail's own assignment read).
     let assignments = term.assignment.assignments();
     let activity: ndarray::Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
-    // Let the evidence pick the rank; `fit` caps the search at the Ledermann
-    // bound, the largest rank a p-channel factor model identifies.
-    let max_factor_rank = p.saturating_sub(1);
+    // Let the evidence pick the rank over every rank a p-channel factor model
+    // identifies (up to the Ledermann bound).
     match StructuredResidualModel::fit(ResidualFactorInput {
         residuals: residuals.view(),
         activity: activity.view(),
-        max_factor_rank,
     }) {
         Ok(m) => Ok(Some(m)),
         // Propagate a genuine fit failure instead of swallowing it (#2070/#2021).

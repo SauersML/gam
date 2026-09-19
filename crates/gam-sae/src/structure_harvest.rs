@@ -746,11 +746,12 @@ pub fn harvest_move_proposals(
     let mut birth_skipped_reason: Option<String> = None;
     if params.max_births > 0 && n > 0 && residuals.ncols() > 0 {
         let p = residuals.ncols();
-        let max_rank = params.max_births.min(p.saturating_sub(1));
+        // The evidence ranks every identifiable factor count; `max_births` is a
+        // per-round admission budget applied to the scored proposals below, not
+        // a cap on the model comparison.
         match StructuredResidualModel::fit(ResidualFactorInput {
             residuals,
             activity: activity.view(),
-            max_factor_rank: max_rank,
         }) {
             Ok(model) => {
                 let factor = model.factor();
@@ -7587,7 +7588,6 @@ fn build_residual_factor_births(
     }
     let assignments = term.assignment.assignments();
     let activity: Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
-    let max_rank = params.max_births.min(p.saturating_sub(1));
     // Propagate a genuine fit failure instead of degrading to "no births".
     // The rank search always scores rank 0, so a true "no structure to
     // harvest" outcome returns `Ok` (an empty/zero-rank factor); an `Err` here
@@ -7598,7 +7598,6 @@ fn build_residual_factor_births(
     let model = StructuredResidualModel::fit(ResidualFactorInput {
         residuals,
         activity: activity.view(),
-        max_factor_rank: max_rank,
     })
     .map_err(|e| format!("build_residual_factor_births: structured-residual fit failed: {e}"))?;
     let factor = model.factor();

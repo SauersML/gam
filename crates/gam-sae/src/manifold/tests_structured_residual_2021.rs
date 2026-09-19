@@ -126,7 +126,6 @@ fn fit_structured_metric(n: usize, p: usize) -> gam_problem::RowMetric {
     let model = StructuredResidualModel::fit(ResidualFactorInput {
         residuals: residuals.view(),
         activity: activity.view(),
-        max_factor_rank: 2,
     })
     .expect("StructuredResidualModel::fit");
     assert!(
