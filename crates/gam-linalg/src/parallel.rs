@@ -88,6 +88,32 @@ pub fn row_reduction_chunk_count(n_rows: usize, chunk_rows: usize) -> usize {
     }
 }
 
+/// Run `op` on the global pool's worker when that pool has exactly one thread
+/// and the caller is not already one of its workers; otherwise run it here.
+///
+/// A parallel iterator started from a thread outside the pool injects its job
+/// into the pool, wakes a sleeping worker and parks the caller on a latch until
+/// the worker finishes. With one worker nothing ever runs concurrently with
+/// the caller, so that round trip is pure latency: about 13 µs per call against
+/// 0.04 µs for the same call made on the worker, where the job runs in place.
+/// A small-n fit issues thousands of such calls, one per penalty block, pair of
+/// penalties, or reparameterization step. At n = 100 with five smooths, the
+/// driver thread spent 48% of its samples parked on those latches while the
+/// worker was busy for 8% of them. Running the whole driver on the worker
+/// executes exactly the same work in the same order and removes every
+/// handoff.
+///
+/// A wider pool is left alone: there the handoff buys real concurrency, and the
+/// code's `current_thread_index()` guards, which run nested loops sequentially
+/// on a worker, would turn parallel loops serial.
+pub fn run_on_single_worker_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    if rayon::current_thread_index().is_none() && rayon::current_num_threads() == 1 {
+        rayon::scope(|_| op())
+    } else {
+        op()
+    }
+}
+
 fn reduction_task_cap(reduction_cells: usize) -> usize {
     let bytes = reduction_cells.saturating_mul(std::mem::size_of::<f64>());
     if bytes <= 64 * 1024 {

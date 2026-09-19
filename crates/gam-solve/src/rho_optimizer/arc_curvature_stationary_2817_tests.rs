@@ -42,7 +42,6 @@ fn claim_band_config_2817(band: f64) -> OuterConfig {
     OuterConfig {
         tolerance: band,
         rel_cost_tolerance: Some(0.0),
-        objective_scale: None,
         ..OuterConfig::default()
     }
 }

@@ -35,6 +35,14 @@ and asks for one with `family=`. A variance function is a modelling choice, so
 gamfit does not read it off whether `y` happens to be integer-valued:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+df = {"x": x, "count": rng.poisson(np.exp(1 + np.sin(2 * np.pi * x))),
+      "prop": rng.gamma(5.0, np.exp(0.5 * np.cos(2 * np.pi * x)) / 5.0)}
+
 gamfit.fit(df, "count ~ s(x)")                 # integer counts -> Poisson/log (auto)
 gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
 gamfit.fit(df, "prop ~ s(x)", family="gamma", link="log")     # explicit
@@ -62,6 +70,14 @@ links with the `link=` kwarg. In the CLI, set them in the formula via
 `link(type=...)`.
 
 ```python
+import numpy as np
+import gamfit
+from scipy.stats import norm
+
+rng = np.random.default_rng(0)
+age = rng.uniform(30, 80, 400)
+df = {"age": age, "case": (rng.uniform(size=age.size) < norm.cdf((age - 55) / 12)).astype(float)}
+
 gamfit.fit(df, "case ~ s(age)", link="probit")
 ```
 
@@ -101,6 +117,14 @@ mean `exp(eta)` is a probability only on `eta < 0` (see
 [Feasibility sets](#feasibility-sets)).
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+time, exposure = rng.uniform(0, 10, 400), rng.uniform(0.5, 2.0, 400)
+df = {"time": time, "log_exposure": np.log(exposure),
+      "count": rng.poisson(exposure * np.exp(0.5 + 0.5 * np.sin(time)))}
+
 gamfit.fit(df, "count ~ s(time)",
            family="poisson", link="log", offset="log_exposure")
 gamfit.fit(df, "case ~ s(age)", family="binomial", link="log")  # relative risk
@@ -120,6 +144,14 @@ Inverse link `1 / eta` (alias `1/mu`), canonical for the Gamma family. The
 mean is only defined on `eta > 0`.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+mu = 1.0 / (0.9 + 0.3 * np.sin(2 * np.pi * x))   # eta = 1/mu > 0 everywhere
+df = {"x": x, "y": rng.gamma(5.0, mu / 5.0)}
+
 gamfit.fit(df, "y ~ s(x)", family="gamma", link="inverse")
 ```
 
@@ -214,6 +246,14 @@ Gaussian posterior of `eta`, not the plug-in `mu(eta_hat)`), and prediction inte
 inverse Gaussian law with the estimated `phi`.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+mu = np.exp(0.5 + 0.4 * np.sin(2 * np.pi * x))
+df = {"x": x, "y": rng.wald(mu, 20.0)}             # inverse Gaussian, mean mu
+
 gamfit.fit(df, "y ~ s(x)", family="inverse-gaussian")              # 1/mu^2
 gamfit.fit(df, "y ~ s(x)", family="inverse-gaussian", link="log")
 ```
@@ -226,6 +266,19 @@ For the dispersion path, the secondary formula models Gamma shape, Beta
 precision, negative-binomial size, or Tweedie inverse dispersion.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+x, age, year = rng.uniform(0, 1, n), rng.uniform(20, 70, n), rng.integers(2000, 2012, n).astype(float)
+mean_rate, mean_prop = np.exp(1 + 0.02 * (age - 45)), 1 / (1 + np.exp(-np.sin(2 * np.pi * x)))
+df = {"x": x, "age": age, "year": year,
+      "rate": rng.negative_binomial(5, 5 / (5 + mean_rate)).astype(float),
+      "prop": rng.beta(20 * mean_prop, 20 * (1 - mean_prop)),
+      "claim": np.where(rng.uniform(size=n) < 0.3, 0.0,
+                        rng.gamma(2.0, np.exp(0.02 * (age - 45) + 0.05 * (year - 2005)) / 2))}
+
 gamfit.fit(df, "rate ~ s(age)", family="negative-binomial", link="log")
 gamfit.fit(df, "prop ~ s(x)", family="beta", noise_formula="s(x)")
 gamfit.fit(df, "claim ~ te(age, year)", family="tweedie(p=1.5)", link="log")
@@ -274,6 +327,13 @@ f(x_i))^2` plus the usual smoothing penalties. `tau = 0.5` is the conditional
 mean; `tau` near 0 or 1 tracks the lower or upper tail.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+df = {"x": x, "y": np.sin(2 * np.pi * x) + rng.normal(0, 0.2 + 0.3 * x)}
+
 gamfit.fit(df, "y ~ s(x)", family="expectile", expectile_tau=0.9)
 gamfit.fit(df, "y ~ s(x)", family="expectile(0.9)")      # same fit
 ```
@@ -409,12 +469,27 @@ Firth is not compatible with survival models, location-scale fitting, or
 the Bernoulli marginal-slope family.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+df = {"x": x, "rare_event": (rng.uniform(size=x.size) < 0.1 / (1 + np.exp(-4 * (x - 0.5)))).astype(float)}
+
 gamfit.fit(df, "rare_event ~ s(x)", family="binomial-logit", firth=True)
 ```
 
 ## Offsets and weights
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age, exposure = rng.uniform(20, 80, 400), rng.uniform(0.5, 2.0, 400)
+df = {"age": age, "log_exposure": np.log(exposure), "freq": rng.integers(1, 4, 400).astype(float),
+      "count": rng.poisson(exposure * np.exp(0.3 + 0.03 * (age - 50)))}
+
 gamfit.fit(df,
     "count ~ s(age)",
     family="poisson",

@@ -725,7 +725,7 @@ const LOGISTIC_NORMAL_CRVZ_RATE: f64 = 3.0 + 2.0 * SQRT_2;
 const LOGISTIC_NORMAL_SERIES_TERMS: usize = logistic_normal_series_terms();
 
 const fn logistic_normal_series_terms() -> usize {
-    let unit_roundoff = 0.5 * f64::EPSILON;
+    let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
     let mut n = 1usize;
     let mut rate_pow = LOGISTIC_NORMAL_CRVZ_RATE;
     loop {
@@ -834,7 +834,7 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
     }
     const N: usize = LOGISTIC_NORMAL_SERIES_TERMS;
     let weights = &LOGISTIC_NORMAL_SERIES_WEIGHTS;
-    let unit_roundoff = 0.5 * f64::EPSILON;
+    let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
     let s2 = sigma * sigma;
     let sqrt2_s = SQRT_2 * sigma;
     let standardized = mu / sigma;
