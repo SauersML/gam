@@ -3802,6 +3802,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             smoothing_correction_first_order: None,
             smoothing_correction_method_first_order: None,
             smoothing_correction_absence: None,
+            smoothing_marginal: None,
             penalized_hessian: hessian.clone().into(),
             reparam_qs: Some(Array2::eye(2)),
             dispersion: gam::estimate::Dispersion::known(1.0)

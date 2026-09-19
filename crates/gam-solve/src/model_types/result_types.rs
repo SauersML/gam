@@ -159,6 +159,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_marginal: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(36)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -270,6 +271,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_marginal: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -343,6 +345,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_marginal: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -546,6 +549,7 @@ mod per_term_edf_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_marginal: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -3012,6 +3016,100 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
     }
 }
 
+/// The smoothing-parameter measure the fit's smoothing correction integrated
+/// over, persisted so a posterior sampler draws from the SAME `ρ`-marginal
+/// posterior the corrected covariance `Vp` summarises instead of conditioning
+/// on `ρ̂`.
+///
+/// By the law of total covariance,
+/// `Vp = E_ρ[φ H(ρ)⁻¹] + Cov_ρ[β̂(ρ)] + Σ_k c_k c_kᵀ`, where the last sum is the
+/// first-order term of the active `ρ` directions the cubature did not upgrade.
+/// A mixture of exact `β | ρ_m` draws over the nodes, with the nodes' normalised
+/// weights, reproduces the first two terms; an independent `N(0, Σ c_k c_kᵀ)`
+/// displacement reproduces the third.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SmoothingMarginalMeasure {
+    /// The correction stayed first-order: `β(ρ) ≈ β̂(ρ̂) + J (ρ − ρ̂)` with
+    /// `ρ ~ N(ρ̂, V_ρ)`, whose `β`-marginal is `β | ρ̂` convolved with
+    /// `N(0, smoothing_correction)`. `reason` is why the cubature upgrade was
+    /// not taken, carried verbatim from the correction.
+    Linearised { reason: String },
+    /// The sigma-point cubature nodes and normalised weights the correction
+    /// integrated, plus the first-order covariance of the non-upgraded active
+    /// directions in the fit's coefficient frame (`None` when every active
+    /// direction was upgraded).
+    Cubature {
+        nodes: Vec<SmoothingMarginalNode>,
+        residual_linear_covariance: Option<Array2<f64>>,
+    },
+}
+
+/// One cubature node of a [`SmoothingMarginalMeasure::Cubature`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SmoothingMarginalNode {
+    /// `ρ_m − ρ̂` on the log-smoothing-parameter scale, aligned 1:1 with the
+    /// fit's `lambdas`. An offset rather than an absolute `ρ_m` so it is
+    /// invariant under every coefficient-frame change a saved fit undergoes.
+    pub log_lambda_offset: Array1<f64>,
+    /// Normalised posterior weight of the node; the weights sum to one.
+    pub weight: f64,
+}
+
+impl SmoothingMarginalMeasure {
+    /// The residual first-order covariance, the measure's only
+    /// coefficient-frame-dependent part. Wherever the fit's
+    /// `smoothing_correction` is mapped to another frame, map this with it.
+    pub fn residual_linear_covariance_mut(&mut self) -> Option<&mut Array2<f64>> {
+        match self {
+            Self::Cubature {
+                residual_linear_covariance,
+                ..
+            } => residual_linear_covariance.as_mut(),
+            Self::Linearised { .. } => None,
+        }
+    }
+
+    fn validate(&self, coefficient_dim: usize, rho_dim: usize) -> Result<(), String> {
+        let Self::Cubature {
+            nodes,
+            residual_linear_covariance,
+        } = self
+        else {
+            return Ok(());
+        };
+        if nodes.is_empty() {
+            return Err("smoothing marginal measure has no cubature nodes".to_string());
+        }
+        if nodes.iter().any(|node| {
+            node.log_lambda_offset.len() != rho_dim
+                || node.log_lambda_offset.iter().any(|value| !value.is_finite())
+                || !node.weight.is_finite()
+                || node.weight <= 0.0
+        }) {
+            return Err(format!(
+                "smoothing marginal nodes need finite length-{rho_dim} offsets and positive finite weights"
+            ));
+        }
+        let mass: f64 = nodes.iter().map(|node| node.weight).sum();
+        // Normalised weights sum to one up to the rounding of a length-`n` sum.
+        if (mass - 1.0).abs() > nodes.len() as f64 * f64::EPSILON {
+            return Err(format!(
+                "smoothing marginal node weights must sum to one; got {mass}"
+            ));
+        }
+        if let Some(covariance) = residual_linear_covariance
+            && (covariance.dim() != (coefficient_dim, coefficient_dim)
+                || covariance.iter().any(|value| !value.is_finite()))
+        {
+            return Err(format!(
+                "smoothing marginal residual covariance must be finite {coefficient_dim}x{coefficient_dim}; got {:?}",
+                covariance.dim()
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(from = "FitInferenceWire")]
 pub struct FitInference {
@@ -3069,6 +3167,12 @@ pub struct FitInference {
     /// fit has no smoothing coordinate.
     #[serde(default)]
     pub smoothing_correction_absence: Option<SmoothingCorrectionAbsence>,
+    /// The smoothing-parameter measure `smoothing_correction` integrated over,
+    /// for samplers that must draw from the same `ρ`-marginal posterior.
+    /// `None` exactly when no correction was retained (see
+    /// `smoothing_correction_absence`) or the fit predates this field.
+    #[serde(default)]
+    pub smoothing_marginal: Option<SmoothingMarginalMeasure>,
     /// Penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
     /// When [`UnifiedFitResult::geometry`] is present, this matrix shares its
     /// exact active coefficient frame and therefore has dimension
@@ -3149,6 +3253,8 @@ struct FitInferenceWire {
     smoothing_correction_method_first_order: Option<SmoothingCorrectionMethod>,
     #[serde(default)]
     smoothing_correction_absence: Option<SmoothingCorrectionAbsence>,
+    #[serde(default)]
+    smoothing_marginal: Option<SmoothingMarginalMeasure>,
     penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision,
     reparam_qs: Option<Array2<f64>>,
     dispersion: Dispersion,
@@ -3186,6 +3292,7 @@ impl From<FitInferenceWire> for FitInference {
             smoothing_correction_first_order: wire.smoothing_correction_first_order,
             smoothing_correction_method_first_order: wire.smoothing_correction_method_first_order,
             smoothing_correction_absence: wire.smoothing_correction_absence,
+            smoothing_marginal: wire.smoothing_marginal,
             penalized_hessian: wire.penalized_hessian,
             reparam_qs: wire.reparam_qs,
             dispersion: wire.dispersion,
@@ -3752,6 +3859,7 @@ mod assembly_inner_status_gate_tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_marginal: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(hessian),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0)
@@ -5440,6 +5548,11 @@ impl UnifiedFitResult {
                     p
                 );
             }
+            if let Some(measure) = inf.smoothing_marginal.as_ref()
+                && let Err(detail) = measure.validate(p, lambdas.len())
+            {
+                bail_fit_result_invariant!("UnifiedFitResult {detail}");
+            }
             if let Some(qs) = inf.reparam_qs.as_ref()
                 && (qs.nrows() != p || qs.ncols() != p)
             {
@@ -5977,6 +6090,13 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inference| inference.smoothing_correction_absence.as_ref())
+    }
+
+    /// The smoothing-parameter measure [`Self::smoothing_correction`] integrated over.
+    pub fn smoothing_marginal(&self) -> Option<&SmoothingMarginalMeasure> {
+        self.inference
+            .as_ref()
+            .and_then(|inference| inference.smoothing_marginal.as_ref())
     }
 
     /// Total effective degrees of freedom.

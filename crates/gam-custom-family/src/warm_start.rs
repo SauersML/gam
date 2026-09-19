@@ -1061,6 +1061,12 @@ pub fn blockwise_fit_from_parts(
         // channel keeps reading a populated value from this lane too.
         smoothing_correction_first_order: smoothing_correction.clone(),
         smoothing_correction_method_first_order: smoothing_correction_method,
+        smoothing_marginal: smoothing_correction.as_ref().map(|_| {
+            gam_solve::model_types::SmoothingMarginalMeasure::Linearised {
+                reason: "the custom-family lane computes the first-order correction only"
+                    .to_string(),
+            }
+        }),
         smoothing_correction,
         smoothing_correction_method,
         smoothing_correction_absence,

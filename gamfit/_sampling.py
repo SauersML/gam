@@ -175,6 +175,11 @@ class PosteriorSamples:
     config: SamplingConfig
     # Serialized exact inverse-link identity (JSON); see PosteriorPredictive.
     link_spec: str
+    # Smoothing-parameter cubature nodes the draws were mixed over
+    # ("smoothing-marginalised" draws only).
+    rho_nodes: int | None = None
+    # Why the draws are not smoothing-marginalised, when they are not.
+    covariance_reason: str | None = None
     # Compiled fitted model (the ``Model``'s Rust handle) that drew these samples.
     _model: Any = field(repr=False, compare=False, default=None)
     _name_index: Mapping[str, int] = field(repr=False, compare=False, default_factory=dict)
@@ -209,6 +214,8 @@ class PosteriorSamples:
                                     else float(p["acceptance_rate"])),
                    exact=bool(p["exact"]),
                    covariance_source=str(p["covariance_source"]),
+                   rho_nodes=None if p.get("rho_nodes") is None else int(p["rho_nodes"]),
+                   covariance_reason=p.get("covariance_reason"),
                    model_class=str(p.get("model_class", "standard")),
                    family_kind=str(p.get("family_kind", "identity")),
                    link_spec=_required_link_spec(p, source="FFI sample payload"),
@@ -272,6 +279,8 @@ class PosteriorSamples:
             "acceptance_rate": self.acceptance_rate,
             "exact": self.exact,
             "covariance_source": self.covariance_source,
+            "rho_nodes": self.rho_nodes,
+            "covariance_reason": self.covariance_reason,
             "model_class": self.model_class,
             "family_kind": self.family_kind,
             "n_draws": self.n_draws,

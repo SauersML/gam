@@ -339,10 +339,18 @@ struct SamplePayload {
     /// the closed-form conjugate Gaussian route) rather than a Gaussian
     /// approximation of it (every Laplace form).
     exact: bool,
-    /// Which coefficient covariance the draws describe, in the same
-    /// vocabulary `predict()` reports (`"conditional"` or
-    /// `"smoothing-corrected"`).
+    /// How the draws treat smoothing-parameter uncertainty, in the same
+    /// vocabulary `predict()` reports: `"conditional"` (`β | ρ̂`),
+    /// `"smoothing-corrected"` (`β | ρ̂` displaced by the first-order
+    /// correction), or `"smoothing-marginalised"` (exact `β | ρ_k` mixed over
+    /// the fit's smoothing-parameter nodes).
     covariance_source: String,
+    /// Number of smoothing-parameter nodes a `"smoothing-marginalised"` draw
+    /// integrated over; `None` for every other source.
+    rho_nodes: Option<usize>,
+    /// Why the draws are not smoothing-marginalised, as recorded by the fit
+    /// when its smoothing correction fell back or was unavailable.
+    covariance_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2254,6 +2262,8 @@ fn sample_table(
     out.set_item("acceptance_rate", payload.acceptance_rate)?;
     out.set_item("exact", payload.exact)?;
     out.set_item("covariance_source", payload.covariance_source)?;
+    out.set_item("rho_nodes", payload.rho_nodes)?;
+    out.set_item("covariance_reason", payload.covariance_reason)?;
     Ok(out.unbind())
 }
 

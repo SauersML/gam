@@ -523,6 +523,13 @@ fn insert_coefficient_into_saved_fit(
         if let Some(correction) = inference.smoothing_correction.as_mut() {
             *correction = insert_symmetric_array2(correction, index, 0.0)?;
         }
+        if let Some(residual) = inference
+            .smoothing_marginal
+            .as_mut()
+            .and_then(|measure| measure.residual_linear_covariance_mut())
+        {
+            *residual = insert_symmetric_array2(residual, index, 0.0)?;
+        }
         if let Some(qs) = inference.reparam_qs.as_mut() {
             *qs = insert_symmetric_array2(qs, index, 1.0)?;
         }

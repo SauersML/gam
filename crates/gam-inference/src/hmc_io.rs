@@ -36,7 +36,6 @@ use gam_problem::types::{
 };
 use gam_solve::estimate::reml::{FirthDenseOperator, JeffreysHalfLogDet};
 use gam_solve::estimate::{UnifiedFitResult, validate_explicit_dense_hessian_for_whitening};
-use gam_solve::model_types::InferenceCovarianceMode;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 pub use general_mcmc::generic_nuts::NUTSMassMatrixConfig;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, MixingTargets};
@@ -1135,7 +1134,7 @@ mod tests {
     };
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use crate::sample::PosteriorSampler;
-    use gam_solve::model_types::InferenceCovarianceMode;
+    use super::SampleCovarianceSource;
     use ndarray::{Array1, Array2, Axis, array};
     use std::sync::Arc;
 
@@ -1171,7 +1170,7 @@ mod tests {
             converged: true,
             warmup_transitions: 0,
             sampler: PosteriorSampler::Nuts,
-            covariance: InferenceCovarianceMode::Conditional,
+            covariance: SampleCovarianceSource::Conditional { reason: None },
         };
 
         let (lower, upper) = result.posterior_interval_of(|row| row[0], 25.0, 75.0);
@@ -1291,6 +1290,7 @@ mod tests {
                 smoothing_correction_first_order: None,
                 smoothing_correction_method_first_order: None,
                 smoothing_correction_absence: None,
+                smoothing_marginal: None,
                 penalized_hessian: hessian.clone().into(),
                 reparam_qs: None,
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
@@ -4311,7 +4311,7 @@ fn validate_nuts_target_accept(target_accept: f64) -> Result<(), HmcError> {
 /// total. Below this the engine `.expect(...)` calls (empty-stack / "split
 /// R-hat and ESS require at least 2 split chains and 2 draws per split chain")
 /// panic across the FFI boundary instead of returning a typed error.
-const MIN_NUTS_SAMPLES: usize = 4;
+pub(crate) const MIN_NUTS_SAMPLES: usize = 4;
 
 /// Chains per sampler run: two, the fewest from which a between-chain variance
 /// exists, which split R-hat needs to tell chains that sample different regions
@@ -4639,11 +4639,48 @@ pub struct NutsResult {
     pub warmup_transitions: usize,
     /// Which sampler produced the draws.
     pub sampler: PosteriorSampler,
-    /// Which coefficient covariance the draws describe. MCMC on the exact
-    /// likelihood is conditional on the fitted smoothing parameters; the
-    /// Laplace path draws from the fit's PUBLISHED covariance, which is the
-    /// smoothing-corrected `Vp` whenever the fit carries one (gam#2777).
-    pub covariance: InferenceCovarianceMode,
+    /// How the draws treat smoothing-parameter uncertainty.
+    pub covariance: SampleCovarianceSource,
+}
+
+/// How a set of posterior draws treats the smoothing parameters `ρ = log λ`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SampleCovarianceSource {
+    /// `β | ρ̂` only. `reason` is the fit's own account of why it carries no
+    /// smoothing-parameter measure, when it gives one.
+    Conditional { reason: Option<String> },
+    /// `ρ` integrated through the smoothing correction's first-order measure,
+    /// so the draws' covariance is `Vp = Vb + J·Vρ·Jᵀ` — the covariance
+    /// `predict()` and `summary()` publish. `reason` is why the correction
+    /// did not escalate to cubature, when it is known.
+    SmoothingCorrected { reason: Option<String> },
+    /// `ρ` drawn from the smoothing correction's cubature nodes and weights,
+    /// `β` drawn exactly given each node.
+    SmoothingMarginalised { rho_nodes: usize },
+}
+
+impl SampleCovarianceSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Conditional { .. } => "conditional",
+            Self::SmoothingCorrected { .. } => "smoothing-corrected",
+            Self::SmoothingMarginalised { .. } => "smoothing-marginalised",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Conditional { reason } | Self::SmoothingCorrected { reason } => reason.as_deref(),
+            Self::SmoothingMarginalised { .. } => None,
+        }
+    }
+
+    pub fn rho_nodes(&self) -> Option<usize> {
+        match self {
+            Self::SmoothingMarginalised { rho_nodes } => Some(*rho_nodes),
+            Self::Conditional { .. } | Self::SmoothingCorrected { .. } => None,
+        }
+    }
 }
 
 /// Every coordinate's split R-hat below 1.1 and ESS above 100: when a sampler run
@@ -4655,7 +4692,7 @@ const NUTS_CONVERGENCE: MixingTargets = MixingTargets {
 };
 
 #[inline]
-fn mixing_converged(rhat: f64, ess: f64) -> bool {
+pub(crate) fn mixing_converged(rhat: f64, ess: f64) -> bool {
     rhat < NUTS_CONVERGENCE.max_rhat && ess > NUTS_CONVERGENCE.min_ess
 }
 
@@ -4741,7 +4778,7 @@ fn summarize_unwhitened_nuts_samples(
         converged: mixing_converged(rhat, ess),
         warmup_transitions,
         sampler: PosteriorSampler::Nuts,
-        covariance: InferenceCovarianceMode::Conditional,
+        covariance: SampleCovarianceSource::Conditional { reason: None },
     }
 }
 
@@ -5114,7 +5151,7 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
         converged: mixing_converged(rhat, ess),
         warmup_transitions: burn_in,
         sampler,
-        covariance: InferenceCovarianceMode::Conditional,
+        covariance: SampleCovarianceSource::Conditional { reason: None },
     })
 }
 
@@ -5310,7 +5347,7 @@ fn run_conjugate_gaussian_sampling(
         converged: true,
         warmup_transitions: 0,
         sampler: PosteriorSampler::ConjugateGaussian,
-        covariance: InferenceCovarianceMode::Conditional,
+        covariance: SampleCovarianceSource::Conditional { reason: None },
     })
 }
 

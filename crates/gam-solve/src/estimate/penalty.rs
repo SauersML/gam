@@ -521,6 +521,13 @@ impl ParametricColumnConditioning {
                 .smoothing_correction
                 .take()
                 .map(|cov| self.backtransform_covariance(&cov));
+            if let Some(cov) = inf
+                .smoothing_marginal
+                .as_mut()
+                .and_then(|measure| measure.residual_linear_covariance_mut())
+            {
+                *cov = self.backtransform_covariance(cov);
+            }
             // The RETAINED first-order correction `J·Var(ρ)·Jᵀ` is the same kind
             // of object as the primary one above — a coefficient-space covariance
             // — and takes the same congruence. It was left in the INTERNAL basis

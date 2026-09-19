@@ -331,6 +331,8 @@ fn build_sample_payload(
         acceptance_rate: nuts.sampler.acceptance_rate(),
         exact: nuts.sampler.targets_exact_posterior(),
         covariance_source: nuts.covariance.as_str().to_string(),
+        rho_nodes: nuts.covariance.rho_nodes(),
+        covariance_reason: nuts.covariance.reason().map(str::to_string),
     })
 }
 

@@ -15,12 +15,15 @@ use ndarray::{Array1, Array2, ArrayView2, s};
 use rand::{RngExt, SeedableRng};
 
 use super::hmc_io::{
-    FamilyNutsInputs, GlmFlatInputs, SurvivalFlatInputs, chain_stream_seed,
-    explicit_fit_hessian_for_whitening,
+    FamilyNutsInputs, GlmFlatInputs, MIN_NUTS_SAMPLES, SurvivalFlatInputs, chain_stream_seed,
+    explicit_fit_hessian_for_whitening, mixing_converged,
     run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened, validate_nuts_config,
 };
-pub use super::hmc_io::{NUTS_CHAINS, NutsConfig, NutsResult, PosteriorSampler};
-use gam_solve::model_types::InferenceCovarianceMode;
+pub use super::hmc_io::{
+    NUTS_CHAINS, NutsConfig, NutsResult, PosteriorSampler, SampleCovarianceSource,
+};
+use gam_linalg::faer_ndarray::FaerEigh;
+use gam_solve::model_types::{InferenceCovarianceMode, SmoothingMarginalMeasure};
 use crate::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
 use crate::model::{
     FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
@@ -481,8 +484,41 @@ pub(crate) fn laplace_gaussian_fallback(
         converged: true,
         warmup_transitions: 0,
         sampler: PosteriorSampler::Laplace,
-        covariance: factor.covariance_source(),
+        covariance: match factor.covariance_source() {
+            InferenceCovarianceMode::SmoothingCorrected => {
+                SampleCovarianceSource::SmoothingCorrected {
+                    reason: match fit.smoothing_marginal() {
+                        Some(SmoothingMarginalMeasure::Linearised { reason }) => {
+                            Some(reason.clone())
+                        }
+                        _ => None,
+                    },
+                }
+            }
+            InferenceCovarianceMode::Conditional => SampleCovarianceSource::Conditional {
+                reason: Some(conditional_reason(&fit)),
+            },
+        },
     })
+}
+
+/// Why a fit's posterior draws cannot carry smoothing-parameter uncertainty:
+/// the typed reason the fit recorded when it retained no smoothing correction,
+/// or the structural fact that leaves nothing to integrate over.
+fn conditional_reason(fit: &gam_solve::estimate::UnifiedFitResult) -> String {
+    if fit.lambdas.is_empty() {
+        return "the fit has no smoothing parameters".to_string();
+    }
+    match fit.smoothing_correction_absence() {
+        Some(absence) => absence.to_string(),
+        None => "the fit carries no smoothing-parameter measure".to_string(),
+    }
+}
+
+/// The reason a sampler that draws `β | ρ̂` by construction reports alongside
+/// its conditional covariance source.
+fn fixed_rho_sampler_reason(sampler: &str) -> String {
+    format!("the {sampler} draws β conditional on the fitted smoothing parameters")
 }
 
 /// The linear map that turns a standard-normal vector into a zero-mean draw
@@ -719,7 +755,9 @@ fn sample_transformation_normal_constrained(
         converged: true,
         warmup_transitions: 0,
         sampler: PosteriorSampler::Laplace,
-        covariance: InferenceCovarianceMode::Conditional,
+        covariance: SampleCovarianceSource::Conditional {
+            reason: Some(fixed_rho_sampler_reason(RATIONALE)),
+        },
     })
 }
 
@@ -1038,12 +1076,6 @@ fn sample_standard(
             design.penalties.len(),
         ));
     }
-    let penalty =
-        weighted_blockwise_penalty_sum(&design.penalties, fit
-            .lambdas
-            .as_slice()
-            .expect("owned Array1 is contiguous, so as_slice always succeeds"), p);
-
     let saved_offset_vec = saved_offset(model, data, col_map)?;
     let base_offset =
         saved_offset_vec.unwrap_or_else(|| Array1::<f64>::zeros(design.design.nrows()));
@@ -1061,25 +1093,307 @@ fn sample_standard(
         .any(|value| *value != 0.0)
         .then(|| offset_vec.view());
 
-    let result = run_nuts_sampling_flattened_family(
-        likelihood,
-        FamilyNutsInputs::Glm(GlmFlatInputs {
-            x: dense_design_hmc.view(),
-            y: y.view(),
-            weights: weights.view(),
-            penalty_matrix: penalty.view(),
-            mode: fit.beta.view(),
-            hessian: explicit_fit_hessian_for_whitening(&fit, p, "saved standard model")?.view(),
-            likelihood_scale: fit.likelihood_scale,
-            dispersion: resolved_fit_dispersion(&fit, "standard saved-model NUTS")?,
-            firth_bias_reduction: fit.artifacts.firth_bias_reduction,
-            offset,
+    let hessian = explicit_fit_hessian_for_whitening(&fit, p, "saved standard model")?;
+    let dispersion = resolved_fit_dispersion(&fit, "standard saved-model NUTS")?;
+    // One exact sampler run of `β | ρ` at the smoothing parameters
+    // `log λ = log λ̂ + offset`: Pólya-Gamma Gibbs or NUTS, whichever the
+    // family routes to. The fitted mode and Hessian only initialise and
+    // precondition the chains; the target is the posterior at `ρ` itself.
+    let run_at_offset = |offset_rho: Option<&Array1<f64>>,
+                         node_cfg: &NutsConfig|
+     -> Result<NutsResult, String> {
+        let lambdas = match offset_rho {
+            Some(offset_rho) => {
+                if offset_rho.len() != fit.lambdas.len() {
+                    return Err(format!(
+                        "standard sample: smoothing node has {} log-λ coordinates but the fit \
+                         has {} smoothing parameters",
+                        offset_rho.len(),
+                        fit.lambdas.len(),
+                    ));
+                }
+                &fit.lambdas * &offset_rho.mapv(f64::exp)
+            }
+            None => fit.lambdas.clone(),
+        };
+        let penalty = weighted_blockwise_penalty_sum(
+            &design.penalties,
+            lambdas
+                .as_slice()
+                .expect("owned Array1 is contiguous, so as_slice always succeeds"),
+            p,
+        );
+        run_nuts_sampling_flattened_family(
+            likelihood.clone(),
+            FamilyNutsInputs::Glm(GlmFlatInputs {
+                x: dense_design_hmc.view(),
+                y: y.view(),
+                weights: weights.view(),
+                penalty_matrix: penalty.view(),
+                mode: fit.beta.view(),
+                hessian: hessian.view(),
+                likelihood_scale: fit.likelihood_scale,
+                dispersion,
+                firth_bias_reduction: fit.artifacts.firth_bias_reduction,
+                offset,
+            }),
+            node_cfg,
+        )
+        .map_err(|e| format!("NUTS sampling failed: {e}"))
+    };
+    let result = match smoothing_draw_plan(&fit)? {
+        SmoothingDrawPlan::Marginalised { nodes, residual } => {
+            let weights: Vec<f64> = nodes.iter().map(|node| node.weight).collect();
+            sample_smoothing_mixture(
+                &weights,
+                residual,
+                cfg,
+                p,
+                |k, node_cfg| run_at_offset(Some(&nodes[k].log_lambda_offset), node_cfg),
+                SampleCovarianceSource::SmoothingMarginalised {
+                    rho_nodes: nodes.len(),
+                },
+            )
+        }
+        SmoothingDrawPlan::Linearised { correction, reason } => sample_smoothing_mixture(
+            &[1.0],
+            Some(correction),
+            cfg,
+            p,
+            |_, node_cfg| run_at_offset(None, node_cfg),
+            SampleCovarianceSource::SmoothingCorrected {
+                reason: Some(reason),
+            },
+        ),
+        SmoothingDrawPlan::Unpenalised => run_at_offset(None, cfg).map(|mut result| {
+            result.covariance = SampleCovarianceSource::Conditional {
+                reason: Some(conditional_reason(&fit)),
+            };
+            result
         }),
-        cfg,
-    )
-    .map_err(|e| format!("NUTS sampling failed: {e}"));
+    };
     drop(sampler_design_copy_reservation);
     result
+}
+
+/// How a sampler integrates the smoothing-parameter uncertainty the fit
+/// recorded, read off the measure its smoothing correction was built from.
+enum SmoothingDrawPlan<'a> {
+    /// The correction integrated `ρ` over these weighted nodes: draw `β | ρ_k`
+    /// exactly at each, plus the residual first-order directions the cubature
+    /// did not upgrade.
+    Marginalised {
+        nodes: &'a [gam_solve::model_types::SmoothingMarginalNode],
+        residual: Option<&'a Array2<f64>>,
+    },
+    /// The correction is the first-order `J·V_ρ·Jᵀ`: draw `β | ρ̂` exactly and
+    /// displace it by the linearised response of `β̂` to `ρ ~ N(ρ̂, V_ρ)`.
+    Linearised {
+        correction: &'a Array2<f64>,
+        reason: String,
+    },
+    /// The fit has no smoothing parameters, so `β | ρ̂` is the whole posterior.
+    Unpenalised,
+}
+
+/// The ρ-marginal draw plan the fit's recorded measure supports, or a typed
+/// refusal. Draws conditional on `ρ̂` are not the posterior `predict()` prices
+/// for a fit with smoothing parameters, so a fit that recorded no measure to
+/// integrate over is refused with the reason it recorded, never sampled at `ρ̂`
+/// under a label.
+fn smoothing_draw_plan(
+    fit: &gam_solve::estimate::UnifiedFitResult,
+) -> Result<SmoothingDrawPlan<'_>, String> {
+    if fit.lambdas.is_empty() {
+        return Ok(SmoothingDrawPlan::Unpenalised);
+    }
+    Ok(match (fit.smoothing_marginal(), fit.smoothing_correction()) {
+        (
+            Some(SmoothingMarginalMeasure::Cubature {
+                nodes,
+                residual_linear_covariance,
+            }),
+            _,
+        ) => SmoothingDrawPlan::Marginalised {
+            nodes,
+            residual: residual_linear_covariance.as_ref(),
+        },
+        (Some(SmoothingMarginalMeasure::Linearised { reason }), Some(correction)) => {
+            SmoothingDrawPlan::Linearised {
+                correction,
+                reason: reason.clone(),
+            }
+        }
+        (None, Some(_)) => {
+            return Err("sample(): the fit carries a smoothing correction but no record of the \
+                        smoothing-parameter measure it integrates, so its draws cannot be \
+                        marginalised over the smoothing parameters; refit to record the measure"
+                .to_string());
+        }
+        (_, None) => {
+            return Err(format!(
+                "sample(): the fit carries no smoothing-parameter measure to marginalise the \
+                 draws over ({}), and draws conditional on the fitted smoothing parameters are \
+                 not its posterior",
+                conditional_reason(fit),
+            ));
+        }
+    })
+}
+
+/// Seed stream of the node allocation of a smoothing-marginalised draw.
+const RHO_ALLOCATION_STREAM: u64 = 0x3E1F_92B4_07C6_D55A;
+/// Seed stream of the per-node sampler runs.
+const RHO_NODE_STREAM: u64 = 0x9A42_6D1C_E8F3_0B77;
+/// Seed stream of the residual linear displacement.
+const RHO_DISPLACEMENT_STREAM: u64 = 0x61D8_C5A0_3F9E_24B1;
+
+/// Allocate `n_draws` draws to nodes with probabilities `weights` by
+/// stratified multinomial sampling: draw `i` sits at `(i + u_i) / n_draws`
+/// with `u_i ~ U[0, 1)` and goes to the node whose cumulative-weight interval
+/// contains it. Each unit stratum holds exactly one point, so a node's count
+/// differs from `n_draws · w_k` by less than two, where plain multinomial
+/// sampling would scatter it by `√(n_draws · w_k)`. Deterministic in `seed`.
+fn stratified_node_allocation(weights: &[f64], n_draws: usize, seed: u64) -> Vec<usize> {
+    let total: f64 = weights.iter().sum();
+    let mut cumulative = Vec::with_capacity(weights.len());
+    let mut running = 0.0;
+    for weight in weights {
+        running += weight / total;
+        cumulative.push(running);
+    }
+    let last = weights.len() - 1;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut counts = vec![0usize; weights.len()];
+    for i in 0..n_draws {
+        let position = (i as f64 + rng.random::<f64>()) / n_draws as f64;
+        let node = cumulative.partition_point(|&edge| edge <= position).min(last);
+        counts[node] += 1;
+    }
+    counts
+}
+
+/// A factor `L` with `L Lᵀ = V` for a covariance that is a Gram matrix by
+/// construction (`J·V_ρ·Jᵀ`, or `Σ c cᵀ` over the residual directions), so it
+/// is positive semidefinite of rank at most its column count. An eigenvalue
+/// within the symmetric eigensolver's backward error `p·ε·λ_max` of zero is
+/// round-off of a null direction and carries no displacement.
+fn gram_covariance_factor(covariance: &Array2<f64>, p: usize) -> Result<Array2<f64>, String> {
+    if covariance.dim() != (p, p) {
+        return Err(format!(
+            "smoothing displacement covariance is {}x{}, expected {p}x{p}",
+            covariance.nrows(),
+            covariance.ncols(),
+        ));
+    }
+    let (values, vectors) = covariance
+        .eigh(Side::Lower)
+        .map_err(|err| format!("smoothing displacement eigendecomposition failed: {err:?}"))?;
+    let largest = values.iter().fold(0.0_f64, |acc, &value| acc.max(value));
+    let null_level = p as f64 * f64::EPSILON * largest;
+    let kept: Vec<usize> = (0..values.len())
+        .filter(|&i| values[i] > null_level)
+        .collect();
+    Ok(Array2::from_shape_fn((p, kept.len()), |(row, col)| {
+        vectors[(row, kept[col])] * values[kept[col]].sqrt()
+    }))
+}
+
+/// Draw from the smoothing-parameter-marginalised posterior
+/// `p(β | y) = Σ_k w_k p(β | y, ρ_k)`, optionally convolved with a Gaussian
+/// displacement `N(0, D)` for the smoothing directions the measure carries
+/// only to first order.
+///
+/// Draws are allocated to nodes by [`stratified_node_allocation`] (no
+/// importance weights: every draw is an exact draw of its node's conditional
+/// posterior), node `k` is sampled by `run_node(k, cfg_k)`, and the per-node
+/// rows are taken alternating across chains so every chain contributes. By the
+/// law of total covariance the draws have covariance
+/// `Σ_k w_k Cov(β | ρ_k) + Cov_k[E(β | ρ_k)] + D`, the matrix the fit's
+/// smoothing-corrected `Vp` integrates.
+fn sample_smoothing_mixture(
+    weights: &[f64],
+    displacement: Option<&Array2<f64>>,
+    cfg: &NutsConfig,
+    p: usize,
+    mut run_node: impl FnMut(usize, &NutsConfig) -> Result<NutsResult, String>,
+    covariance: SampleCovarianceSource,
+) -> Result<NutsResult, String> {
+    validate_nuts_config(cfg).map_err(String::from)?;
+    if weights.is_empty() {
+        return Err("smoothing-marginalised sampling requires at least one node".to_string());
+    }
+    let n_total = cfg.n_samples.saturating_mul(NUTS_CHAINS);
+    let counts = stratified_node_allocation(
+        weights,
+        n_total,
+        chain_stream_seed(cfg.seed, 0, RHO_ALLOCATION_STREAM),
+    );
+    let mut samples = Array2::<f64>::zeros((n_total, p));
+    let mut next_row = 0usize;
+    let mut rhat = 1.0_f64;
+    let mut ess = 0.0_f64;
+    let mut warmup_transitions = 0usize;
+    let mut sampler = None;
+    for (k, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let node_cfg = NutsConfig {
+            n_samples: count.div_ceil(NUTS_CHAINS).max(MIN_NUTS_SAMPLES),
+            target_accept: cfg.target_accept,
+            seed: chain_stream_seed(cfg.seed, k, RHO_NODE_STREAM),
+        };
+        let node = run_node(k, &node_cfg)?;
+        let per_chain = node_cfg.n_samples;
+        if node.samples.dim() != (per_chain * NUTS_CHAINS, p) {
+            return Err(format!(
+                "smoothing node {k} returned {}x{} draws, expected {}x{p}",
+                node.samples.nrows(),
+                node.samples.ncols(),
+                per_chain * NUTS_CHAINS,
+            ));
+        }
+        for j in 0..count {
+            let row = (j % NUTS_CHAINS) * per_chain + j / NUTS_CHAINS;
+            samples.row_mut(next_row).assign(&node.samples.row(row));
+            next_row += 1;
+        }
+        rhat = rhat.max(node.rhat);
+        // The node's ESS describes all of its collected draws; the mixture
+        // keeps `count` of them.
+        ess += node.ess * count as f64 / (per_chain * NUTS_CHAINS) as f64;
+        warmup_transitions = warmup_transitions.max(node.warmup_transitions);
+        sampler.get_or_insert(node.sampler);
+    }
+    if let Some(displacement) = displacement {
+        let factor = gram_covariance_factor(displacement, p)?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(chain_stream_seed(
+            cfg.seed,
+            0,
+            RHO_DISPLACEMENT_STREAM,
+        ));
+        let mut eps = Array1::<f64>::zeros(factor.ncols());
+        for mut draw in samples.rows_mut() {
+            eps.mapv_inplace(|_| sample_standard_normal(&mut rng));
+            draw += &factor.dot(&eps);
+        }
+    }
+    let posterior_mean = samples
+        .mean_axis(ndarray::Axis(0))
+        .unwrap_or_else(|| Array1::<f64>::zeros(p));
+    let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat,
+        ess,
+        converged: mixing_converged(rhat, ess),
+        warmup_transitions,
+        sampler: sampler.expect("the allocation assigns every draw to some node"),
+        covariance,
+    })
 }
 
 /// Exact posterior draws for a standard GLM with `bounded()` coefficients.
@@ -1145,7 +1459,9 @@ fn sample_standard_bounded(
         converged: true,
         warmup_transitions: 0,
         sampler: PosteriorSampler::Laplace,
-        covariance: InferenceCovarianceMode::Conditional,
+        covariance: SampleCovarianceSource::Conditional {
+            reason: Some(fixed_rho_sampler_reason("standard bounded-coefficient posterior")),
+        },
     })
 }
 
@@ -1262,7 +1578,9 @@ fn sample_standard_truncated(
         converged,
         warmup_transitions: 0,
         sampler: PosteriorSampler::TruncatedLaplaceHmc,
-        covariance: InferenceCovarianceMode::Conditional,
+        covariance: SampleCovarianceSource::Conditional {
+            reason: Some(fixed_rho_sampler_reason("standard constrained-coefficient posterior")),
+        },
     })
 }
 
@@ -1698,6 +2016,143 @@ mod tests {
     use super::*;
     use gam_linalg::matrix::{DenseDesignMatrix, DenseDesignOperator, LinearOperator};
     use gam_problem::types::LikelihoodScaleMetadata;
+
+    fn seeded_weights(n_nodes: usize, seed: u64) -> Vec<f64> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        // Log-uniform over several decades, like `exp(min_rise - rise)`.
+        let raw: Vec<f64> = (0..n_nodes)
+            .map(|_| (-6.0 * rng.random::<f64>()).exp())
+            .collect();
+        let total: f64 = raw.iter().sum();
+        raw.into_iter().map(|w| w / total).collect()
+    }
+
+    #[test]
+    fn stratified_allocation_tracks_node_weights_within_one_stratum() {
+        for (case, (n_nodes, n_draws)) in [(1, 8), (2, 9), (6, 1000), (10, 257), (4, 4)]
+            .into_iter()
+            .enumerate()
+        {
+            let weights = seeded_weights(n_nodes, 17 + case as u64);
+            let seed = 99 + case as u64;
+            let counts = stratified_node_allocation(&weights, n_draws, seed);
+            assert_eq!(counts.iter().sum::<usize>(), n_draws);
+            assert_eq!(
+                counts,
+                stratified_node_allocation(&weights, n_draws, seed),
+                "the allocation must be deterministic under its seed",
+            );
+            for (k, (&count, &weight)) in counts.iter().zip(&weights).enumerate() {
+                // An interval of cumulative weight `w` spans `n·w` unit strata;
+                // the strata it covers completely hold one draw each, and the
+                // two it only touches at its ends hold at most one each.
+                let expected = n_draws as f64 * weight;
+                assert!(
+                    (count as f64 - expected).abs() < 2.0,
+                    "case {case} node {k}: {count} draws for expected {expected}",
+                );
+            }
+        }
+    }
+
+    /// A stand-in node sampler whose draws record which node and chain made
+    /// them: column 0 is the node index, column 1 the chain.
+    fn node_marker_run(k: usize, cfg: &NutsConfig) -> Result<NutsResult, String> {
+        let rows = cfg.n_samples * NUTS_CHAINS;
+        let samples = Array2::from_shape_fn((rows, 2), |(row, col)| match col {
+            0 => k as f64,
+            _ => (row / cfg.n_samples) as f64,
+        });
+        Ok(NutsResult {
+            posterior_mean: samples.mean_axis(ndarray::Axis(0)).expect("rows"),
+            posterior_std: samples.std_axis(ndarray::Axis(0), 1.0),
+            samples,
+            rhat: 1.0,
+            ess: rows as f64,
+            converged: true,
+            warmup_transitions: 0,
+            sampler: PosteriorSampler::PolyaGammaGibbs,
+            covariance: SampleCovarianceSource::Conditional { reason: None },
+        })
+    }
+
+    #[test]
+    fn smoothing_mixture_draws_follow_the_node_weights() {
+        let weights = seeded_weights(6, 5);
+        let cfg = NutsConfig {
+            n_samples: 500,
+            target_accept: 0.8,
+            seed: 11,
+        };
+        let result = sample_smoothing_mixture(
+            &weights,
+            None,
+            &cfg,
+            2,
+            node_marker_run,
+            SampleCovarianceSource::SmoothingMarginalised {
+                rho_nodes: weights.len(),
+            },
+        )
+        .expect("mixture draw");
+        let n_total = cfg.n_samples * NUTS_CHAINS;
+        assert_eq!(result.samples.nrows(), n_total);
+        assert_eq!(result.covariance.as_str(), "smoothing-marginalised");
+        assert_eq!(result.covariance.rho_nodes(), Some(weights.len()));
+        assert_eq!(result.sampler, PosteriorSampler::PolyaGammaGibbs);
+        let mut per_node = vec![[0usize; NUTS_CHAINS]; weights.len()];
+        for draw in result.samples.rows() {
+            per_node[draw[0] as usize][draw[1] as usize] += 1;
+        }
+        for (k, (chains, &weight)) in per_node.iter().zip(&weights).enumerate() {
+            let count: usize = chains.iter().sum();
+            let expected = n_total as f64 * weight;
+            assert!(
+                (count as f64 - expected).abs() < 2.0,
+                "node {k}: {count} draws for expected {expected}",
+            );
+            // Rows alternate chains, so the chains' shares differ by at most one.
+            assert!(chains[0].abs_diff(chains[1]) <= 1, "node {k}: chains {chains:?}");
+        }
+    }
+
+    #[test]
+    fn smoothing_mixture_displacement_has_the_recorded_covariance() {
+        // A rank-one Gram matrix `c cᵀ`: its null direction must stay exact.
+        let c = ndarray::array![0.6, -0.8];
+        let displacement = Array2::from_shape_fn((2, 2), |(i, j)| c[i] * c[j]);
+        let cfg = NutsConfig {
+            n_samples: 4000,
+            target_accept: 0.8,
+            seed: 3,
+        };
+        let zero_run = |_: usize, node_cfg: &NutsConfig| -> Result<NutsResult, String> {
+            let mut result = node_marker_run(0, node_cfg)?;
+            result.samples.fill(0.0);
+            Ok(result)
+        };
+        let result = sample_smoothing_mixture(
+            &[1.0],
+            Some(&displacement),
+            &cfg,
+            2,
+            zero_run,
+            SampleCovarianceSource::SmoothingCorrected { reason: None },
+        )
+        .expect("displaced draw");
+        let n = result.samples.nrows() as f64;
+        let along = result.samples.dot(&c);
+        let across = result.samples.dot(&ndarray::array![0.8, 0.6]);
+        let variance = along.mapv(|v| v * v).sum() / n;
+        // Var(s²) = 2σ⁴/n for a zero-mean normal; σ² = |c|² = 1 here.
+        let standard_error = (2.0 / n).sqrt();
+        assert!(
+            (variance - 1.0).abs() < 4.0 * standard_error,
+            "displacement variance {variance} along c, standard error {standard_error}",
+        );
+        let leak = across.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(leak <= 16.0 * f64::EPSILON, "null direction moved by {leak}");
+    }
 
     #[test]
     fn link_wiggle_dispatch_requires_and_consumes_the_persisted_cone() {
