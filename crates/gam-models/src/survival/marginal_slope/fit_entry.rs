@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::fit_orchestration::FitFailure;
+use crate::inference::predict_io::FittedLatentScoreMap;
 use std::cell::Cell;
 use crate::latent_law_compression::{CompressedLaw, DesignPoint, default_design};
 
@@ -534,8 +535,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                              the marginal conditioning block",
                         )
                     })?;
-                    let calibrated = cal
-                        .apply(raw_scores.column(col), a_block.view())
+                    let calibrated = FittedLatentScoreMap::conditional_only(cal)
+                        .calibrate(raw_scores.column(col), Some(a_block.view()))
                         .map_err(FitFailure::invariant)?;
                     spec.z.column_mut(col).assign(&calibrated);
                 }
