@@ -95,7 +95,7 @@ def test_advisory_warning_points_at_the_callers_line() -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         gamfit.fit(data, "y ~ s(x, bs='cr', k=10)")
-    advisories = [w for w in caught if issubclass(w.category, gamfit.GamInferenceWarning)]
+    advisories = [w for w in caught if issubclass(w.category, gamfit.errors.GamInferenceWarning)]
     assert advisories, "a capped cr basis must still warn"
     for warning in advisories:
         assert warning.filename == __file__, (

@@ -91,9 +91,9 @@ def fit(gamfit, x, k, arm, args):
         isometry_weight=0.0, learning_rate=args.learning_rate,
     )
     if arm == "linear":
-        return gamfit.sae_manifold_fit(x, d_atom=1, atom_topology="linear", **kw)
+        return gamfit.sae.sae_manifold_fit(x, d_atom=1, atom_topology="linear", **kw)
     bases, dims = portfolio(k)
-    return gamfit.sae_manifold_fit(x, d_atom=dims, atom_basis=bases, **kw)
+    return gamfit.sae.sae_manifold_fit(x, d_atom=dims, atom_basis=bases, **kw)
 
 
 def main():

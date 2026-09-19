@@ -42,7 +42,7 @@
 //!
 //! * **Formula → design integration** — `build_formula_design_for_multinomial`
 //!   parses the Wilkinson formula and assembles `X` and the per-term `S`
-//!   blocks; the `fit_multinomial_formula_pyfunc` FFI shim wires the Python
+//!   blocks; the `fit_table` FFI entry point wires the Python
 //!   `gamfit.fit(..., family='multinomial')` entry straight to this path.
 //!
 //! # Convergence

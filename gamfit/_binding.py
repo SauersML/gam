@@ -34,7 +34,7 @@ class RustExtensionUnavailableError(ImportError):
     --------
     >>> try:
     ...     gamfit.fit(df, "y ~ s(x)")
-    ... except gamfit.RustExtensionUnavailableError as exc:
+    ... except gamfit.errors.RustExtensionUnavailableError as exc:
     ...     print("build the extension first:", exc)
     """
 

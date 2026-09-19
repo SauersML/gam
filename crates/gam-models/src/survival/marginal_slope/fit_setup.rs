@@ -690,6 +690,7 @@ pub(crate) fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollec
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     };
     for spec in specs {
         out.linear_terms.extend(spec.linear_terms.clone());

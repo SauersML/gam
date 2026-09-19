@@ -132,8 +132,6 @@ __all__ = [
     "atlas_nerve_diagram",
     "auc_from_predictions",
     "audit_sae",
-    "auto_centers_1d",
-    "auto_knots_1d",
     "basis_adequacy_json",
     "basis_with_jet",
     "block_coordinate_chart_compose_ffi",
@@ -215,7 +213,6 @@ __all__ = [
     "fit_array",
     "fit_event_history",
     "fit_joint_event_model",
-    "fit_multinomial_formula_pyfunc",
     "fit_notes_from_model",
     "fit_penalized_multinomial_pyfunc",
     "fit_table",
@@ -265,6 +262,7 @@ __all__ = [
     "interchange_swap_forward",
     "interpolate_rows",
     "intervention_calibration_plan",
+    "is_multinomial_family_name",
     "label_shuffle_permutation",
     "lawley_bartlett_factor",
     "lawley_bartlett_factor_estimated_lambda",
@@ -353,6 +351,7 @@ __all__ = [
     "report_html",
     "required_model_columns",
     "required_saved_model_payload_string",
+    "resolve_basis_locations_1d",
     "response_column_name",
     "response_geometry_aitchison_metric",
     "response_geometry_alr",
@@ -438,7 +437,6 @@ __all__ = [
     "stacked_predictive_mean",
     "stacking_weights_from_log_density",
     "student_t_parameters_from_model",
-    "summary_criterion_row",
     "summary_html",
     "summary_json",
     "summary_payload_from_model",
@@ -1673,10 +1671,6 @@ def auc_from_predictions(observed: Sequence[float], predicted_mean: Sequence[flo
 
 def audit_sae(decoder: NDArray[np.float32], route_indices: NDArray[np.uint32], route_values: NDArray[np.float32], data: NDArray[np.float32], donor_indices: NDArray[np.uint32], donor_values: NDArray[np.float32], options: dict[Any, Any] | None = ...) -> dict[Any, Any]: ...
 
-def auto_centers_1d(t: NDArray[np.float64], num_centers: int) -> NDArray[np.float64]: ...
-
-def auto_knots_1d(t: NDArray[np.float64], num_internal_knots: int, degree: int = ...) -> tuple[NDArray[np.float64], int, int, bool]: ...
-
 def basis_adequacy_json(model_bytes: Sequence[int], headers: Sequence[str], rows: _EncodedTable) -> str: ...
 
 def basis_with_jet(kind: str, t: NDArray[np.float64], params: dict[Any, Any]) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]: ...
@@ -1737,7 +1731,7 @@ def check_parameter_use_site_reads(edits: Sequence[tuple[str, int, str, str]], r
 
 def check_payload_from_model(model_bytes: Sequence[int], headers: Sequence[str], rows: _EncodedTable) -> Any: ...
 
-def classification_metrics(observed: Sequence[float], predicted_mean: Sequence[float], train_prev: float) -> dict[Any, Any]: ...
+def classification_metrics(observed: Sequence[float], predicted_mean: Sequence[float], null_mean: float | None = ...) -> dict[Any, Any]: ...
 
 def coefficient_state_json(model_bytes: Sequence[int]) -> str: ...
 
@@ -1839,8 +1833,6 @@ def fit_event_history(declared_marks: Sequence[tuple[str, str]] | None, covariat
 
 def fit_joint_event_model(declared_marks: Sequence[tuple[str, str]] | None, subject_ids: Sequence[str], entry: Sequence[float], exit: Sequence[float], event_subject: Sequence[str], event_time: Sequence[float], event_marks: Sequence[str]) -> _JointEventModel: ...
 
-def fit_multinomial_formula_pyfunc(headers: Sequence[str], rows: _EncodedTable, formula: str, config_json: str | None = ...) -> bytes: ...
-
 def fit_notes_from_model(model_bytes: Sequence[int]) -> tuple[list[str], list[str]]: ...
 
 def fit_penalized_multinomial_pyfunc(design: NDArray[np.float64], y_one_hot: NDArray[np.float64], penalty: NDArray[np.float64], lambdas: NDArray[np.float64], row_weights: NDArray[np.float64] | None = ..., max_iter: int = ..., tol: float = ...) -> dict[Any, Any]: ...
@@ -1938,6 +1930,8 @@ def interchange_swap_forward(z_a: NDArray[np.float64], z_b: NDArray[np.float64],
 def interpolate_rows(grid: NDArray[np.float64], surface: NDArray[np.float64], query: NDArray[np.float64], kind: str) -> NDArray[np.float64]: ...
 
 def intervention_calibration_plan(row_id: NDArray[np.int64], atom: NDArray[np.int64], dose: NDArray[np.float64], nu_hat_1: NDArray[np.float64], nu_hat_2: NDArray[np.float64] | None, nu_measured: NDArray[np.float64], logit_max_abs: NDArray[np.float64], logit_max_abs_change: NDArray[np.float64], group: NDArray[np.int64], is_control: NDArray[np.bool_], layer: int, seed: int, logit_format: str, vocab_size: int, prediction: str, split_seed: int, floor_quantile: float) -> _InterventionCalibrationPlan: ...
+
+def is_multinomial_family_name(family: str) -> bool: ...
 
 def label_shuffle_permutation(n_rows: int, seed: int, draw: int) -> NDArray[np.uint64]: ...
 
@@ -2115,6 +2109,8 @@ def required_model_columns(model_bytes: Sequence[int], observed_score: bool) -> 
 
 def required_saved_model_payload_string(model_bytes: Sequence[int], key: str) -> str: ...
 
+def resolve_basis_locations_1d(t: NDArray[np.float64], basis_kind: str, knots_or_centers: object | None = ..., order: int = ..., periodic: bool = ...) -> tuple[NDArray[np.float64], int, bool]: ...
+
 def response_column_name(formula: str) -> str | None: ...
 
 def response_geometry_aitchison_metric(parts: int) -> NDArray[np.float64]: ...
@@ -2284,8 +2280,6 @@ def stacked_predictive_mean(weights: Sequence[float], means: Sequence[Sequence[f
 def stacking_weights_from_log_density(names: Sequence[str], log_density_rows: Sequence[Sequence[float]]) -> str: ...
 
 def student_t_parameters_from_model(model_bytes: Sequence[int]) -> tuple[float, float] | None: ...
-
-def summary_criterion_row(payload: dict[Any, Any]) -> str: ...
 
 def summary_html(payload: dict[Any, Any]) -> str: ...
 

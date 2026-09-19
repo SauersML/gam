@@ -29,7 +29,7 @@ class GamInferenceWarning(UserWarning):
     Subclasses :class:`UserWarning` so it is shown by default (the whole point
     is that the adjustment must not be silent), and so callers can route it with
     the standard :mod:`warnings` machinery — e.g. ``warnings.simplefilter(
-    "error", gamfit.GamInferenceWarning)`` to turn a silent basis reduction into
+    "error", gamfit.errors.GamInferenceWarning)`` to turn a silent basis reduction into
     a hard failure, or ``"ignore"`` to suppress it.
     """
 

@@ -2211,6 +2211,7 @@ pub(crate) fn simple_matern_term_collection(
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 
@@ -2219,6 +2220,7 @@ pub(crate) fn empty_term_collection() -> TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 

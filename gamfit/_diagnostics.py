@@ -191,10 +191,7 @@ class Diagnostics:
         mean = _point_series(predicted, point_column)
         try:
             rust = rust_module()
-            import numpy as np
-
-            train_prev = float(np.mean(observed)) if len(observed) else 0.0
-            metrics = dict(rust.classification_metrics(observed, mean, train_prev))
+            metrics = dict(rust.classification_metrics(observed, mean))
             metrics["n_obs"] = float(len(observed))
             residuals = list(rust.diagnostics_from_predictions(observed, mean)["residuals"])
         except Exception as exc:
