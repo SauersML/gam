@@ -195,11 +195,11 @@ fn fitted_factor_recovers_planted_interference_subspace() {
     })
     .expect("estimator fits");
 
-    // The evidence ladder must recover exactly the planted rank.
+    // The Laplace evidence must recover exactly the planted rank.
     assert_eq!(
         model.factor_rank(),
         r0,
-        "evidence ladder must select the planted factor rank {r0}, got {}",
+        "the evidence must select the planted factor rank {r0}, got {}",
         model.factor_rank()
     );
 
