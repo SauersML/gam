@@ -3876,25 +3876,17 @@ pub fn parse_link_choice(
     }))
 }
 
+/// Parse a link name through the canonical vocabulary in
+/// [`LinkFunction::from_name`]; the error lists [`LinkFunction::ALL`].
 pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
-    match v.trim() {
-        "identity" => Ok(LinkFunction::Identity),
-        "log" => Ok(LinkFunction::Log),
-        "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
-        "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
-        "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
-        "loglog" => Ok(LinkFunction::LogLog),
-        "cauchit" => Ok(LinkFunction::Cauchit),
-        "sas" => Ok(LinkFunction::Sas),
-        "beta-logistic" => Ok(LinkFunction::BetaLogistic),
-        other => Err(FormulaDslError::UnknownIdentifier {
-            reason: format!(
-                "unsupported link type '{other}'; \
-                 use one of identity|log|logit|probit|cloglog|loglog|cauchit|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
-                 Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
-            ),
-        }),
-    }
+    LinkFunction::from_name(v).ok_or_else(|| FormulaDslError::UnknownIdentifier {
+        reason: format!(
+            "{}, blended(...)/mixture(...) or flexible(...). \
+             The formula term `link(type=<type>)`, the mgcv-style `family(<type>)` and \
+             Python's `link=` accept the same set.",
+            gam_problem::types::UnknownLinkName(v.trim().to_string())
+        ),
+    })
 }
 
 pub(crate) fn parse_link_component(v: &str) -> Result<LinkComponent, String> {

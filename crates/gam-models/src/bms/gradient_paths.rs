@@ -77,7 +77,7 @@ pub(crate) fn standardize_latent_z_with_policy(
     if mean.abs() > mean_tol || (sd - 1.0).abs() > sd_tol {
         match policy.check_mode {
             LatentZCheckMode::Strict => return Err(check_msg()),
-            LatentZCheckMode::WarnOnly => log::warn!("{}", check_msg()),
+            LatentZCheckMode::WarnOnly => log::debug!("{}", check_msg()),
             LatentZCheckMode::Off => {}
         }
     }
@@ -130,12 +130,12 @@ pub(crate) fn standardize_latent_z_with_policy(
         );
         match policy.check_mode {
             LatentZCheckMode::Strict => return Err(msg),
-            LatentZCheckMode::WarnOnly => log::warn!("{}", msg),
+            LatentZCheckMode::WarnOnly => log::debug!("{}", msg),
             LatentZCheckMode::Off => {}
         }
     }
     if skew.abs() > 0.75 || kurt.abs() > 2.0 {
-        log::warn!(
+        log::debug!(
             "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; latent-measure auto-selection will use empirical calibration unless stricter diagnostics pass"
         );
     }

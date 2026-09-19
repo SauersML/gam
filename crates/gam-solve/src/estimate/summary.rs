@@ -376,21 +376,32 @@ pub(crate) fn compute_continuous_smoothness_order(
 mod pvalue_unavailable_tests {
     use super::*;
     use crate::estimate::smooth_pvalue_unavailable;
-    use gam_terms::smooth::ShapeConstraint;
+    use gam_terms::smooth::{ShapeConstraint, ShapeSet, ShapeSpec};
 
-    /// Every shape constraint withholds the p-value with the typed reason, and
-    /// only the unconstrained smooth is testable.
+    /// Every shape request (atom, conjunction, per-margin tensor) withholds
+    /// the p-value with the typed reason, and only the unconstrained smooth is
+    /// testable.
     #[test]
     fn every_shape_constraint_withholds_the_smooth_pvalue() {
-        assert_eq!(smooth_pvalue_unavailable(ShapeConstraint::None), None);
+        assert_eq!(smooth_pvalue_unavailable(&ShapeSpec::None), None);
+        let mut conjunction = ShapeSet::single(ShapeConstraint::MonotoneIncreasing);
+        conjunction
+            .insert(ShapeConstraint::Concave)
+            .expect("increasing and concave are compatible");
+        let per_margin = ShapeSpec::PerMargin(vec![
+            ShapeSet::single(ShapeConstraint::MonotoneIncreasing),
+            ShapeSet::default(),
+        ]);
         for shape in [
-            ShapeConstraint::MonotoneIncreasing,
-            ShapeConstraint::MonotoneDecreasing,
-            ShapeConstraint::Convex,
-            ShapeConstraint::Concave,
+            ShapeConstraint::MonotoneIncreasing.into(),
+            ShapeConstraint::MonotoneDecreasing.into(),
+            ShapeConstraint::Convex.into(),
+            ShapeConstraint::Concave.into(),
+            ShapeSpec::Joint(conjunction),
+            per_margin,
         ] {
             assert_eq!(
-                smooth_pvalue_unavailable(shape),
+                smooth_pvalue_unavailable(&shape),
                 Some(SmoothPValueUnavailable::ShapeConstrained),
                 "{shape:?}"
             );

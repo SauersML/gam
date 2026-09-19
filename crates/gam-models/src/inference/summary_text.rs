@@ -116,6 +116,12 @@ pub fn render_summary_text(summary: &SummaryPayload) -> String {
             convergence_text,
         ),
     );
+    if !summary.notes.is_empty() {
+        out.push_str("\n  Notes:");
+        for note in &summary.notes {
+            write!(out, "\n    - {note}").expect("writing to a String cannot fail");
+        }
+    }
     out
 }
 
@@ -425,6 +431,7 @@ mod tests {
                     text: "penalized likelihood".to_string(),
                 },
             }),
+            notes: Vec::new(),
         }
     }
 

@@ -76,6 +76,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "group_metadata",
     "deployment_extensions",
     "convergence",
+    "notes",
     "text",
 )
 
@@ -364,6 +365,12 @@ class Summary:
         gauge, so a caller can impose a tolerance of their own without reading a
         log. ``None`` for routes that certify no optimizer (the O(n) spline
         scan).
+    notes : list of str
+        The notes the fit recorded, as in :attr:`gamfit.Model.notes`:
+        advisories (the model differs from the literal request, also raised as
+        :class:`gamfit.errors.GamInferenceWarning`) first, then informational notes
+        on defaults the engine chose (e.g. the knot count of a default
+        B-spline smooth). Empty when the fit recorded none.
     text : str or None
         The rendered report ``print(summary)`` shows: the same string
         ``gam summary MODEL`` prints, rendered in Rust from these fields.
@@ -462,6 +469,9 @@ class Summary:
     #: Jeffreys prior"``), ``reason`` (why the Jeffreys prior is in it, else
     #: ``None``) and ``text`` (the line every surface prints).
     convergence: dict[str, Any] | None = None
+    #: The fit's notes, advisories first, then informational notes on defaults
+    #: the engine chose (see :attr:`gamfit.Model.notes`).
+    notes: list[str] = field(default_factory=list)
     #: The rendered report ``print(summary)`` shows: the same string
     #: ``gam summary MODEL`` prints, rendered in Rust from these fields.
     #: ``None`` for summaries that are not of a fitted model.

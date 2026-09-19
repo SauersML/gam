@@ -391,7 +391,7 @@ pub(crate) fn reml_laml_evaluate(
     // One-shot structured log of the IFT gate. Debug-level so it doesn't
     // spam normal runs but is immediately greppable when debugging an
     // envelope-gradient consistency failure (search for `[ift-gate]`).
-    log::debug!(
+    log::trace!(
         "[ift-gate] kkt_residual.is_some()={} kkt_residual.subspace={:?} dispersion={} correction_active={} subspace_trace.is_some()={} hop.dim()={} k={}",
         solution.kkt_residual.is_some(),
         solution
@@ -433,9 +433,9 @@ pub(crate) fn reml_laml_evaluate(
                 reason: format!("inner-mode fold verdict (gam#2765): {reason}"),
             },
         )?;
-        log::info!("[inner-mode fold] {fold}");
+        log::debug!("[inner-mode fold] {fold}");
         if !fold.is_valid() {
-            log::warn!("[inner-mode fold] refusing this trial point: {fold}");
+            log::debug!("[inner-mode fold] refusing this trial point: {fold}");
             return Err(RemlLamlError::InnerModeFold(fold));
         }
     }
@@ -537,7 +537,7 @@ pub(crate) fn reml_laml_evaluate(
         let cost_correction = cost_correction + moving_hessian_logdet_response;
         inner_polish_step = polish_step_for_warm_start;
         let residual_energy = -cost_correction;
-        log::info!(
+        log::debug!(
             "[IFT-ENERGY] residual_energy={:.3e} cost_correction={:.3e} branch={}",
             residual_energy,
             cost_correction,
@@ -631,7 +631,7 @@ pub(crate) fn reml_laml_evaluate(
                 &cone_solve,
             )
             .map_err(RemlLamlError::ConeNormalizer)?;
-            log::info!(
+            log::debug!(
                 "[2765-CONE] value={:.9e} log_mass={:.9e} retained_rows={} ep_sweeps={} ep_fraction={:e}",
                 normalizer.value(),
                 normalizer.log_mass(),
@@ -676,7 +676,7 @@ pub(crate) fn reml_laml_evaluate(
         });
     }
 
-    log::info!(
+    log::debug!(
         "[STAGE] reml_laml cost_only_done k={} ext_dim={} dim={} elapsed={:.3}s",
         k,
         solution.ext_coords.len(),
@@ -695,7 +695,7 @@ pub(crate) fn reml_laml_evaluate(
         {
             Ok(bdp) => Some(bdp),
             Err(e) => {
-                log::warn!("BarrierDerivativeProvider skipped (infeasible): {e}");
+                log::debug!("BarrierDerivativeProvider skipped (infeasible): {e}");
                 None
             }
         }
@@ -866,7 +866,7 @@ pub(crate) fn reml_laml_evaluate(
         // (`active_threads=0`) while each thin single-direction crossproduct
         // failed to fill the pool — into one wide, fully-occupied pass.
         if effective_deriv.has_batched_hessian_derivative_corrections() {
-            log::info!(
+            log::debug!(
                 "[STAGE] reml_laml coord_corrections mode=batched(row-parallel) k={} ext_dim={} n={} dim={} work={}",
                 k,
                 ext_dim,
@@ -902,7 +902,7 @@ pub(crate) fn reml_laml_evaluate(
                     .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                     .collect::<Result<Vec<_>, _>>()?
             } else {
-                log::info!(
+                log::debug!(
                     "[STAGE] reml_laml coord_corrections mode=serial(inner-parallel) k={} ext_dim={} n={} dim={} work={}",
                     k,
                     ext_dim,
@@ -1627,7 +1627,7 @@ pub(crate) fn reml_laml_evaluate(
                 "[EXT-GRAD] ext_idx={} value={:+.6e} coord.a={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e} incl_h={} incl_s={}",
                 ext_idx, value, coord.a, trace_logdet_i, coord.ld_s, incl_logdet_h, incl_logdet_s
             );
-            log::info!(
+            log::debug!(
                 "[STAGE] reml_laml ext_coord_trace ext_idx={} elapsed={:.3}s",
                 ext_idx,
                 ext_coord_start.elapsed().as_secs_f64(),
@@ -1836,7 +1836,7 @@ pub(crate) fn reml_laml_evaluate(
                 &mode_kernel,
                 cone_scale,
             )?;
-            log::info!(
+            log::debug!(
                 "[OUTER hessian-elapsed] constrained normalizer k={} ext={} elapsed={:.3}s",
                 k,
                 ext_dim,
@@ -1867,7 +1867,7 @@ pub(crate) fn reml_laml_evaluate(
                 .unwrap_or(solution.n_observations);
             let p_dim = hop.dim();
             let k_outer = k + solution.ext_coords.len();
-            log::info!(
+            log::debug!(
                 "[OUTER hessian-route] choice=operator reason=family_op \
                  n={n_obs} p={p_dim} k={k_outer} \
                  callback_kernel=false subspace_trace={subspace} \
@@ -1900,7 +1900,7 @@ pub(crate) fn reml_laml_evaluate(
             if let Some(ref normalizer_hessian) = cone_hessian {
                 crate::objective_base::add_rho_block_dense_to_hessian(&mut hessian, normalizer_hessian)?;
             }
-            log::info!(
+            log::debug!(
                 "[OUTER hessian-elapsed] choice=operator reason=family_op \
                  n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
                 assembly_start.elapsed().as_secs_f64(),
@@ -1955,7 +1955,7 @@ pub(crate) fn reml_laml_evaluate(
             || (solution.contracted_psi_second_order.is_some() && hessian_kernel.is_some());
         let route_choice = route_plan.choice();
         let route_reason = route_plan.reason;
-        log::info!(
+        log::debug!(
             "[OUTER hessian-route] choice={route_choice} reason={route_reason} \
              n={n_obs} p={p_dim} k={k_outer} \
              callback_kernel={callback_operator_kernel} subspace_trace={has_subspace_trace} \
@@ -2071,7 +2071,7 @@ pub(crate) fn reml_laml_evaluate(
                 Err(err) => return Err(err.into()),
             }
         };
-        log::info!(
+        log::debug!(
             "[OUTER hessian-elapsed] choice={route_choice} reason={route_reason} \
              n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
             assembly_start.elapsed().as_secs_f64(),
@@ -2103,7 +2103,7 @@ pub(crate) fn reml_laml_evaluate(
                 DispersionHandling::ProfiledGaussian => "ProfiledGaussian",
             };
             let kernel_present = solution.penalty_subspace_trace.is_some();
-            log::warn!(
+            log::debug!(
                 "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
                  |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
                  Envelope formula contaminated by inner KKT residual on ill-conditioned H block; \

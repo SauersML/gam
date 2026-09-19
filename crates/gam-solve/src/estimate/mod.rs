@@ -133,6 +133,8 @@ mod inner_residual_charge_2954_tests;
 #[cfg(test)]
 mod ridge_continuity_tests;
 #[cfg(test)]
+mod wide_design_reml_derivatives_tests;
+#[cfg(test)]
 mod continuous_order_tests;
 #[cfg(test)]
 mod estimate_policy_tests;

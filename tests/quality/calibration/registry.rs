@@ -239,12 +239,15 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
                          + bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
         },
         // Wood smooth Wald test + Bartlett/Lawley LR correction (#1873).
+        // The family sweep gates the size per response family (IRLS weights,
+        // scale predicate, χ²/F reference all change with the family).
         CalibrationTarget {
             name: "wood_smooth_test_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
             guards: &[1873],
-            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
+            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test \
+                         + sbc_wood_smooth_test_family_size_curve",
         },
         // Multinomial per-class Wood smooth test (#1891 follow-up): the SAME
         // shared `wood_smooth_test` primitive as `wood_smooth_test_pvalue`

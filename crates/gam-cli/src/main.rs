@@ -59,7 +59,7 @@ pub(crate) use gam_predict::{
 
 pub(crate) use gam::report;
 
-pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
+pub(crate) use gam::probability::{inverse_gaussian_cdf, normal_cdf, standard_normal_quantile};
 
 pub(crate) use gam::smooth::{SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
@@ -262,13 +262,8 @@ fn run() -> CliResult<()> {
     // Parse first so `--help` / `--version` exit cleanly without spawning the
     // runtime-threads INFO line clap can't suppress.
     let cli = Cli::parse();
-    // Honor an explicit `--log-level`; otherwise the logger installs at its
-    // quiet `Warn` default (#1688). Clap has already validated an explicit
-    // level, so initialization cannot reinterpret or guess at the request.
-    match cli.log_level {
-        Some(level) => gam::progress_log::init_logging_at(level),
-        None => gam::progress_log::init_logging(),
-    }
+    // Solver diagnostics reach stderr only when asked for with `-v`/`-vv`.
+    gam::progress_log::init_logging_at(log_level_for_verbosity(cli.verbose));
     // #2738 — a SETTING and a CAPACITY are not enough; report the policy too.
     //
     // This line used to print `rayon_current_num_threads` beside
@@ -284,12 +279,12 @@ fn run() -> CliResult<()> {
     // so the two cannot drift: a field dropped from the log is a field dropped
     // from the data, and `parallelism_snapshot_2738_tests` fails.
     let threads = gam::faer_ndarray::ParallelismSnapshot::capture();
-    log::info!("[STAGE] runtime threads | {threads}");
+    log::debug!("[STAGE] runtime threads | {threads}");
     if let Some(disagreement) = threads.inconsistency() {
         // Not fatal — the run is still the run — but a perf number taken under a
         // configuration that disagrees with itself is un-denominated, and that
         // has to be said at the top of the log rather than inferred later.
-        log::warn!("[STAGE] runtime threads | INCONSISTENT: {disagreement}");
+        log::debug!("[STAGE] runtime threads | INCONSISTENT: {disagreement}");
     }
     match cli.command {
         Command::Fit(args) => run_fit(args).map_err(CliError::from),

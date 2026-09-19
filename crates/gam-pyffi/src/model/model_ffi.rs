@@ -1514,29 +1514,33 @@ fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Optio
     }))
 }
 
-/// Human-readable inference advisories recorded while the model was fit — the
-/// mgcv-style "k reduced to the data support" / basis-degradation notes from the
-/// cr/cs/sz cap (#1541, #1542), and any other materialization advisory. The CLI
-/// prints these; this accessor lets gamfit surface the SAME notes as
-/// `GamInferenceWarning`s and via `model.notes` rather than dropping them at the
-/// FFI boundary (#1543). Returns an empty list for older payloads that predate
-/// the field (it deserializes via `#[serde(default)]`).
+/// The notes recorded while the model was fit, as `(advisories,
+/// informational)`. Advisories say the fitted model differs from the literal
+/// request — the "k reduced to the data support" / basis-degradation notes of
+/// the cr/cs/sz cap (#1541, #1542), a dropped scalar term, a failed basis
+/// adequacy check; gamfit raises them as `GamInferenceWarning`s. Informational
+/// notes record defaults the engine chose (the auto knot count of a default
+/// B-spline, per-margin tensor sizes); gamfit exposes them via `model.notes`
+/// and the summary but does not warn. Both lists are empty for payloads that
+/// predate the fields (they deserialize via `#[serde(default)]`).
 #[pyfunction]
-fn inference_notes_from_model(model_bytes: Vec<u8>) -> PyResult<Vec<String>> {
+fn fit_notes_from_model(model_bytes: Vec<u8>) -> PyResult<(Vec<String>, Vec<String>)> {
     let saved: serde_json::Value = serde_json::from_slice(&model_bytes)
         .map_err(|err| PyValueError::new_err(format!("saved model payload must be JSON: {err}")))?;
-    let notes = saved
-        .get("payload")
-        .and_then(|payload| payload.get("inference_notes"))
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
-    Ok(notes)
+    let payload = saved.get("payload");
+    let notes = |key: &str| -> Vec<String> {
+        payload
+            .and_then(|payload| payload.get(key))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok((notes("inference_notes"), notes("informational_notes")))
 }
 
 /// The LAML-estimated `(σ, ν)` of a scaled Student-t fit, read off the saved
