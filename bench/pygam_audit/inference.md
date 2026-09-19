@@ -1,6 +1,6 @@
 # Inference & uncertainty quantification audit: gamfit vs pyGAM
 
-Axis: inference / UQ, measured empirically. Versions: the previously released gamfit wheel (repo HEAD was not buildable in the audit sandbox), pyGAM 0.12.0.
+Axis: inference / UQ, measured empirically. Versions: gamfit 0.1.267 wheel (the installed build; repo HEAD is 0.1.268, not buildable here), pyGAM 0.12.0.
 All scripts and raw results: `scratchpad/audit/inference/` (`mc.py`, `mc_sample.py`, `lr_null.py`, `analyze.py`, `repro_*.py`, `results/*.json`).
 
 ## 1. Output map: pyGAM inference output -> gamfit counterpart
@@ -13,7 +13,7 @@ All scripts and raw results: `scratchpad/audit/inference/` (`mc.py`, `mc_sample.
 | `sample(X, y, quantity, n_draws, n_bootstraps=5)` | `sample(data, samples, seed)` (Gaussian: Laplace on smoothing-corrected cov; binomial: exact Polya-Gamma on **conditional** cov), `sample_replicates`, `iter_replicates` | Gaussian already-better; non-Gaussian **gap** (G3) |
 | `statistics_['edof_per_coef']`, summary EDoF per term | `summary().smooth_terms[*].edf`, `edf_total` | parity |
 | `statistics_['p_values']` | `summary().smooth_terms[*].p_value` (Wood rank-truncated Wald, ref_df) + `smooth_significance(data)` (LR, Imhof null spectrum, selection replay, Lawley) | already-better (power 2x) |
-| `statistics_['AIC']` | `compare_models` cAIC ranking; `Model.conditional_aic` exists at HEAD (`gamfit/_model.py:1257`) but **not in the audited wheel** | partial; not in `summary()` (G1) |
+| `statistics_['AIC']` | `compare_models` cAIC ranking; `Model.conditional_aic` exists at HEAD (`gamfit/_model.py:1257`) but **not in the 0.1.267 wheel** | partial; not in `summary()` (G1) |
 | `statistics_['AICc']` | none | do NOT add (pyGAM applies the Gaussian small-sample formula to every family: slop S6) |
 | `statistics_['pseudo_r2']` (McFadden, explained_deviance) | none in Python `summary()`; CLI summary has `deviance_explained` (`crates/gam-cli/src/main/model_summary.rs:85`); `diagnose(data).metrics.r_squared` (response-scale R² only) | **gap** (G1) |
 | `statistics_['GCV']`, `['UBRE']` | none | correct to omit (SPEC: REML/LAML only) |
@@ -63,7 +63,7 @@ Coverage is averaged over test points and replicates (MCSE for a 0.95 rate at th
 | binom | pyGAM default | 0.945 | 0.351 | - | 0.961 / 0.963 / 0.961 | 0.57 / 0.59 / 0.57 | 0.06 |
 | binom | pyGAM gridsearch | 0.869 | 0.238 | - | 0.782 / 0.960 / 0.911 | 0.34 / 0.73 / 0.55 | 0.70 |
 
-pyGAM has no observation interval for Poisson/binomial (`prediction_intervals` is LinearGAM-only). pyGAM default reaches ~0.95 by carrying edof 23-34 (vs gamfit ~5-7), so its bands are 40-75% wider. pyGAM gridsearch is the "tuned" pyGAM and under-covers everywhere (0.84-0.89), worst on the strong term x1 (0.74-0.84) because one lam is shared across terms.
+pyGAM has no observation interval for Poisson/binomial (`prediction_intervals` is LinearGAM-only). pyGAM default reaches ~0.95 by carrying edof 23-34 (vs gamfit ~5-7), so its mean bands are 34-75% wider. pyGAM gridsearch is the "tuned" pyGAM and under-covers everywhere (0.84-0.89), worst on the strong term x1 (0.74-0.84) because one lam is shared across terms.
 
 ### 3.2 Smooth-term tests: size under H0 (null term s(x2)) and power (weak term s(x3))
 
@@ -98,11 +98,22 @@ gamfit null-term edf: median 0.17 (gauss), 0.48 (gauss_small), 0.60 (pois), 0.27
 
 ### 3.3 Posterior `sample()` coverage of E[y|x] (95% percentile interval, 500 draws)
 
-(Monte Carlo still running when this report was committed; see G3 for the finding.)
+| cell | method | reps usable | coverage | mean width | time per call |
+|---|---|---|---|---|---|
+| gauss | gamfit `sample()` (laplace, smoothing-corrected) | 100 | **0.967** | 0.880 | 0.017 s |
+| gauss | gamfit `predict(interval=.95)` (same fits) | 100 | 0.968 | 0.884 | - |
+| gauss | pyGAM `sample(quantity="mu", n_bootstraps=5)` after gridsearch | 100 | 0.916 | 0.898 | 1.76 s |
+| binom | gamfit `sample()` (polya-gamma **conditional**; 3/19 routed to NUTS) | 19 of 22 (3 fit errors) | **0.912** | 0.224 | 2-4 s PG; **373-424 s NUTS** |
+| binom | gamfit `predict(interval=.95)` (same fits, smoothing-corrected) | 19 | 0.947 | 0.257 | - |
+| binom | pyGAM `sample()` | 22 (paired 19: 0.904) | 0.910 | 0.270 | 0.83 s |
+
+Binomial paired difference predict - sample coverage: **+0.035 (SE 0.009)**; predict/sample width ratio 1.15. This is G3: the non-Gaussian sampler ignores rho uncertainty that `predict()` includes. The binomial study was cut to 22 replicates (`mc_sample_stream.py binom 1 200` under a 25-min cap) because 3/19 `sample()` calls took 6-7 minutes (B5); the original 60-replicate run (`mc_sample.py binom 60 1`) produced nothing in 2 h (py-spy: stuck in a slow `fit`, `_api.py:1291`).
 
 ## 4. Findings
 
-Kinds: gap | bug | pyGAM-slop-to-avoid | already-better. Every item below was reproduced (script named) or pinned to file:line.
+Kinds: gap | bug | pyGAM-slop-to-avoid | already-better.
+
+Headline: gamfit's default intervals are the only ones near nominal at sensible width in all four cells (mean coverage 0.93-0.98 vs pyGAM tuned 0.84-0.89 / pyGAM default 0.94-0.95 at 1.3-1.8x the width), and its LR test has 1.6-2.7x pyGAM's power. It does **not** yet dominate, because the released wheel fails 58% of Poisson and 20% of binomial fits (B1/B2), the LR is missing for most binomial terms (B3), binomial `sample()` is rho-conditional and occasionally 6 min (G3/B5), and PD bands have no level or simultaneous option (G2). Every item below was reproduced (script named) or pinned to file:line.
 
 ### Bugs / gaps in gamfit
 
@@ -123,6 +134,16 @@ Kinds: gap | bug | pyGAM-slop-to-avoid | already-better. Every item below was re
 - Inconsistently, `lr_null.py binom` shows 15/100 cases where `smooth_significance` **raises** (`smooth_term_lr_inference: ...`) instead of returning None.
 - Fix: the null refit needs only `log_likelihood` and eta. Run it with `compute_inference: false` (no correction, which removes the failure source and the cost). Carry a structured `unavailable_reason` per term instead of NaN/None, and make the raise-vs-None behaviour uniform (always a per-term reason). Files: `smooth_term_lr.rs`, `crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:1024-1285` (row marshaling). Size S.
 
+**B5 — The automatic Firth/Jeffreys rescue silently changes the estimator, and then sends `sample()` to a 6-minute NUTS run (bug, med).**
+- Evidence: on well-posed binomial data (n=400, no separation), `sample()` reported `method='nuts'` in 3/19 replicates (reps 13/16/21) and took 373/378/424 s, against 2-4 s for Polya-Gamma (`sample_binom.jsonl`). `repro_nuts_firth2.py`: the serialized rep-21 model has `"firth_bias_reduction": true` (rep 14: `false`). `repro_firth_summary.py`: neither `summary()`, `summary().convergence` nor `predict()` mentions Firth/Jeffreys, and the model repr doesn't either. Those fits are also the slow ones (25-70 s vs 1.2 s).
+- Code: `crates/gam-models/src/fit_orchestration/fit.rs:562-587` retries with `firth_bias_reduction = true` after a base failure with "separation/non-convergence evidence" and adopts it with only a `log::info!`. `crates/gam-inference/src/hmc_io.rs:5258` then routes any Firth fit off Polya-Gamma to NUTS.
+- So the user gets a Jeffreys-penalised posterior without being told, triggered here on data with no separation (the base fit's failure is the B1/B2 kind). The adoption is certified, which is SPEC-legal, but invisible.
+- Fix:
+  1. Surface `firth_bias_reduction` and the retry reason in the summary payload's convergence block (`crates/gam-pyffi/src/model/model_ffi.rs:4482`).
+  2. Fixing B1/B2 removes the spurious triggers on non-separated data.
+  3. Under Firth, sample with the Polya-Gamma conditional as an independence proposal plus an MH correction for the Jeffreys factor `|I(beta')|^{1/2}/|I(beta)|^{1/2}`. That is exact, costs one log-det per draw and needs no tuning knob, and it replaces NUTS on this route (`hmc_io.rs:5258-5290`, `run_logit_polya_gamma_gibbs` at `:4562`).
+- Size: S (surface) + M (PG-MH).
+
 **G1 — Summary lacks scale/dispersion, deviance explained and (c)AIC (gap, med).**
 - Evidence: `Summary` attributes are basis_checks, coefficient_se_source, coefficients, ..., deviance, edf_total, log_likelihood, n_obs, reml_score, and so on. There is no phi/scale, no deviance_explained or pseudo-R², and no AIC (probe in session; `crates/gam-pyffi/src/model/model_ffi.rs:4482 summary_payload_from_model_bytes`).
 - phi is already serialised (`payload/fit_result/inference/dispersion {source, phi}`). The CLI computes `deviance_explained` from data (`crates/gam-cli/src/main/model_summary.rs:85`). `Model.conditional_aic` exists at HEAD `gamfit/_model.py:1257` but not in the wheel. compare_models gives cAIC-based ranking only across models.
@@ -135,7 +156,7 @@ Kinds: gap | bug | pyGAM-slop-to-avoid | already-better. Every item below was re
 
 **G3 — Non-Gaussian `sample()` draws from the rho-conditional posterior, unlike `predict()` (gap, med).**
 - Evidence: the binomial `sample()` reports `method='polya-gamma'`, `covariance_source='conditional'`, `is_exact=True` (probe6). The Gaussian path uses `laplace` + `smoothing-corrected`.
-- So for binomial and Poisson, `sample()` intervals are narrower than `predict()` intervals and silently omit rho uncertainty. Measured in `mc_sample.py binom`: see §3.3.
+- So for binomial and Poisson, `sample()` intervals are narrower than `predict()` intervals and silently omit rho uncertainty. Measured (§3.3, `mc_sample_stream.py binom`): binomial `sample()` covers 0.912 vs `predict()` 0.947 on the same 19 fits (paired +0.035, SE 0.009), i.e. no better than pyGAM's 0.904/0.910; widths 0.224 vs 0.257.
 - Fix: draw rho first, from the same measure the smoothing correction integrates (the certified SigmaPointCubature nodes and importance weights, or the Tier-1 Gauss-Hermite rule when K<=4), then run exact PG given rho. That gives a proper mixture over rho with no new options. `is_exact` must then describe the beta|rho step only, and `covariance_source` should report `smoothing-marginalised`. Files: `crates/gam-inference/src/sample.rs`, `polya_gamma.rs`, `crates/gam-solve/src/reml/eval.rs` (expose nodes/weights from `SmoothingCorrectionOutcome`). Size M.
 
 **G4 — Rho-posterior adequacy tiers exist but are never surfaced (gap, low-med).**
@@ -182,7 +203,7 @@ Kinds: gap | bug | pyGAM-slop-to-avoid | already-better. Every item below was re
 - **A1** Smoothing-corrected covariance by default. Mean coverage corrected vs conditional: 0.969 vs 0.935 (gauss), 0.934 vs 0.921 (gauss_small), 0.978 vs 0.952 (pois), 0.952 vs 0.921 (binom). pyGAM gridsearch: 0.887/0.839/0.862/0.869. pyGAM default reaches ~0.95 only by overfitting (edof 31 vs gamfit ~7), which makes its intervals 60% wider.
 - **A2** Observation intervals for all families. pyGAM `prediction_intervals` exists only on LinearGAM (`pygam.py:2477`).
 - **A3** Null recovery by double penalty: gamfit edf for the null term has median 0.17 (gauss) and 0.27 (binom), below 0.05 in 45% / 41% of fits. pyGAM always carries ~full edof, and its levels are unidentified (EPS ridge).
-- **A4** Gaussian `sample()`: coverage 0.967 in 17 ms vs pyGAM `sample()` 0.916 in 1.76 s (`mc_sample.py gauss`, 100 reps).
+- **A4** Gaussian `sample()`: coverage 0.967 in 17 ms vs pyGAM `sample()` 0.916 in 1.76 s (`mc_sample.py gauss`, 100 reps). Binomial `sample()` is **not** better (0.912 vs pyGAM 0.910; G3/B5).
 - **A5** Test power: the LR test has about twice pyGAM's power at equal or better size.
 
 ### pyGAM slop to avoid (verified in pyGAM 0.12.0 source or by run)
