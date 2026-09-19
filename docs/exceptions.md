@@ -124,6 +124,13 @@ The formula is invalid or unsupported. Common causes:
   `available`, and `similar` when available.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
 try:
     gamfit.fit(df, "y ~ s(x, k=10")
 except gamfit.errors.FormulaError as e:
@@ -138,10 +145,21 @@ needs, violates the saved schema, or introduces unseen categorical levels.
 encoder failures as issues without raising:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+train = pd.DataFrame({"x": rng.uniform(0, 10, 300), "site": rng.choice(["A", "B", "C"], 300)})
+train["y"] = np.sin(train.x) + (train.site == "B") + rng.normal(0, 0.3, 300)
+model = gamfit.fit(train, "y ~ s(x) + group(site)")
+test_df = pd.DataFrame({"x": [1.5, 2.5]})   # no "site" column
+
 check = model.check(test_df)
 if not check.ok:
     for issue in check.issues:
         print(issue.kind, issue.column, issue.message)
+# missing_column site missing required column 'site'
 ```
 
 ### `FitError` and its subclasses
@@ -174,6 +192,13 @@ and category after the unchanged engine message:
   that exposes none.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
 try:
     model = gamfit.fit(df, "y ~ s(x)")
 except gamfit.errors.FitSeedError as e:
@@ -202,6 +227,13 @@ The compiled extension `gamfit._rust` failed to load. Occurs when
 installing from source without a Rust toolchain.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
 try:
     gamfit.fit(df, "y ~ s(x)")
 except gamfit.errors.RustExtensionUnavailableError as e:
@@ -247,6 +279,12 @@ def safe_predict(model, data):
 
 ```python
 import logging
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
 
 log = logging.getLogger("my_app")
 formula = "y ~ s(x)"

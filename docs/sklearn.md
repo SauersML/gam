@@ -50,7 +50,14 @@ bound to `X` under the response name implied by the formula (defaulting to
 `y`). If `y` is `None`, `X` must already contain the response.
 
 ```python
+import numpy as np
+import pandas as pd
 from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 200)})
+y = np.sin(X["x"]) + rng.normal(0, 0.3, len(X))
+df = X.assign(y=y)
 
 GAMRegressor(formula="y ~ s(x)").fit(X, y)        # array y
 GAMRegressor(formula="y ~ s(x)").fit(df)          # df contains "y"
@@ -68,7 +75,13 @@ term is penalized and can shrink to zero. `formula_` holds the formula actually
 fitted.
 
 ```python
+import numpy as np
+import pandas as pd
 from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 200)})
+y = np.sin(X["x"]) + rng.normal(0, 0.3, len(X))
 
 est = GAMRegressor().fit(X, y)
 print(est.formula_)            # y ~ s(x)
@@ -177,9 +190,15 @@ delegating to the underlying `gamfit.Model` (scalar models only).
 ## Pipeline
 
 ```python
+import numpy as np
 from gamfit.sklearn import GAMRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+X = rng.uniform(0, 10, (300, 2))
+y = np.sin(X[:, 0]) + 0.1 * X[:, 1] ** 2 + rng.normal(0, 0.3, 300)
+X_test = rng.uniform(0, 10, (5, 2))
 
 pipe = Pipeline([
     ("scaler", StandardScaler()),
@@ -197,7 +216,13 @@ sequence. Numpy arrays and 2-D row sequences use generated feature names
 ## Cross-validation
 
 ```python
+import numpy as np
+import pandas as pd
 from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 200)})
+y = np.sin(X["x"]) + rng.normal(0, 0.3, len(X))
 from sklearn.model_selection import cross_val_score
 
 scores = cross_val_score(

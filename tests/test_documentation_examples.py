@@ -3,15 +3,15 @@
 A ``python`` fence is executable documentation, not pseudocode.  API signatures
 belong in ``text`` fences.  Examples which require external models, accelerators,
 or large user-owned activation arrays use ``python no-exec`` and therefore are
-not executable examples.
+not executable examples; their number is capped so the tag stays an exception.
 
-Most fences run against a shared namespace of synthetic data (``df``,
-``model``, ...).  The pages a reader copies whole, and the first example of each
-README, run in an empty namespace instead: they must import and load everything
-they use.
+Every ``python`` fence runs in a fresh namespace holding only the builtins, as
+it would when a reader pastes it into a new interpreter: it imports, loads or
+simulates everything it uses.  The harness injects no data and no model.
 """
 from __future__ import annotations
 
+import builtins
 import os
 from pathlib import Path
 import re
@@ -24,28 +24,65 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 READMES = (ROOT / "README.md", ROOT / "README_PYPI.md")
 DOCS = (*READMES, *sorted((ROOT / "docs").glob("*.md")))
-# Every fence on these pages is a complete program.
-SELF_CONTAINED_PAGES = frozenset({ROOT / "docs" / "tour.md", ROOT / "docs" / "migrating-from-pygam.md"})
 FENCE = re.compile(r"^```(?P<language>python|bash|sh)[ \t]*\n(?P<body>.*?)^```[ \t]*$", re.MULTILINE | re.DOTALL)
+# Every fence opening whose info string names Python, at any indentation.
+PYTHON_INFO = re.compile(r"^(?P<indent>[ \t]*)```(?P<info>py(?:thon|con)?\b[^\n]*)$", re.MULTILINE)
+NOT_EXECUTED = "python no-exec"
+# The fences that cannot run here: pyGAM itself, external models, accelerators
+# and user-owned activation arrays.  Raising this number needs a reason.
+NOT_EXECUTED_CAP = 24
 
 
 def examples(language: str):
     for path in DOCS:
         source = path.read_text(encoding="utf-8")
-        first_python = True
         for match in FENCE.finditer(source):
             if match["language"] != language:
                 continue
-            self_contained = path in SELF_CONTAINED_PAGES or (path in READMES and first_python)
-            first_python = False
             line = source.count("\n", 0, match.start()) + 2
-            yield pytest.param(path, line, match["body"], self_contained, id=f"{path.relative_to(ROOT)}:{line}")
+            yield pytest.param(path, line, match["body"], id=f"{path.relative_to(ROOT)}:{line}")
+
+
+def python_fence_infos():
+    for path in DOCS:
+        source = path.read_text(encoding="utf-8")
+        for match in PYTHON_INFO.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            yield f"{path.relative_to(ROOT)}:{line}", match["indent"], match["info"].rstrip()
+
+
+def test_python_fences_are_executed_or_explicitly_not():
+    """A Python fence either runs or says it does not, and few say it does not.
+
+    An unrecognised info string such as ``python skip``, or an indented
+    ``python`` fence, would otherwise drop an example from the run without
+    anyone deciding so.
+    """
+    infos = list(python_fence_infos())
+    unknown = [
+        (where, indent + info) for where, indent, info in infos
+        if info != NOT_EXECUTED and (info != "python" or indent)
+    ]
+    assert not unknown, f"python fences that neither run nor say they do not: {unknown}"
+    not_executed = [where for where, _, info in infos if info == NOT_EXECUTED]
+    assert len(not_executed) <= NOT_EXECUTED_CAP, (
+        f"{len(not_executed)} `{NOT_EXECUTED}` fences exceed the cap of {NOT_EXECUTED_CAP}; "
+        f"make the new ones runnable: {not_executed}"
+    )
+
+
+@pytest.mark.parametrize("path,line,code", list(examples("python")))
+def test_python_documentation_example(path, line, code, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    namespace = {"__name__": "__main__", "__builtins__": builtins}
+    compiled = compile(code, f"{path.relative_to(ROOT)}:{line}", "exec")
+    exec(compiled, namespace)
 
 
 def synthetic_data() -> pd.DataFrame:
-    """One small, deterministic frame covering names used by introductory snippets.
+    """One small, deterministic frame behind the CSV files the CLI examples read.
 
-    Every response carries signal and noise, so a snippet's fit has something to
+    Every response carries signal and noise, so an example's fit has something to
     identify. A noiseless response, a binary label with no covariate effect or a
     constant composition makes an example refuse because of the data, not because
     of the API it documents.
@@ -102,35 +139,12 @@ def synthetic_data() -> pd.DataFrame:
 
 
 @pytest.fixture(scope="session")
-def python_context():
+def cli_inputs():
+    """The rows and the saved model behind the files the CLI examples name."""
     import gamfit
 
-    df = synthetic_data()
-    train = df.copy()
-    test = df.head(4).drop(columns=[
-        "y", "outcome", "case", "disease", "event", "death", "cause", "count", "rate", "claim", "rare_event",
-    ])
-    model = gamfit.fit(train, "y ~ x")
-    posterior = model.sample(train, samples=20, seed=42)
-    x_matrix = train[["x", "x2"]]
-    return {
-        "gamfit": gamfit, "np": np, "pd": pd, "df": df, "data": df,
-        "train": train, "train_df": train, "test": test, "test_df": test,
-        "cal_df": train.head(10), "held_out": train.head(10),
-        "model": model, "model_a": model, "model_b": model,
-        "loaded": model, "posterior": posterior,
-        "X": x_matrix, "X_train": x_matrix.to_numpy(), "X_test": x_matrix.head(4).to_numpy(),
-        "y": train["y"].to_numpy(),
-        "consume": lambda value: None, "process": lambda value: None,
-    }
-
-
-@pytest.mark.parametrize("path,line,code,self_contained", list(examples("python")))
-def test_python_documentation_example(path, line, code, self_contained, python_context, tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    namespace = {"__name__": "__main__"} if self_contained else dict(python_context)
-    compiled = compile(code, f"{path.relative_to(ROOT)}:{line}", "exec")
-    exec(compiled, namespace)
+    frame = synthetic_data()
+    return frame, gamfit.fit(frame, "y ~ x")
 
 
 def _cli_binary() -> Path:
@@ -147,18 +161,18 @@ def cli_examples():
     for language in ("bash", "sh"):
         for parameter in examples(language):
             # pytest.param stores positional values in ``values``.
-            path, line, code, _ = parameter.values
+            path, line, code = parameter.values
             if code.lstrip().startswith("gam "):
                 yield pytest.param(path, line, code, id=parameter.id)
 
 
 @pytest.mark.parametrize("path,line,code", list(cli_examples()))
-def test_cli_documentation_example(path, line, code, tmp_path, python_context):
-    frame = python_context["train"]
+def test_cli_documentation_example(path, line, code, tmp_path, cli_inputs):
+    frame, model = cli_inputs
     for name in ("train.csv", "data.csv", "new.csv", "new_data.csv", "labelled.csv", "held_out.csv"):
         frame.to_csv(tmp_path / name, index=False)
     for name in ("model.gam", "model.json"):
-        python_context["model"].save(tmp_path / name)
+        model.save(tmp_path / name)
     np.save(tmp_path / "layer0.npy", np.arange(48, dtype=float).reshape(12, 4))
     np.save(tmp_path / "layer1.npy", np.arange(48, dtype=float).reshape(12, 4) + 0.1)
     pd.DataFrame({"id": ["subject-17", "subject-18"], "entry": [0.0, 0.0], "exit": [5.0, 5.0]}).to_csv(

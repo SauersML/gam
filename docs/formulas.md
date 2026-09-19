@@ -718,6 +718,17 @@ so naming an option never changes a fit by itself.
 Examples:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+space, time, x, z, h = (rng.uniform(0, 1, n) for _ in range(5))
+theta, u, v = (rng.uniform(0, 2 * np.pi, n) for _ in range(3))
+df = {"space": space, "time": time, "x": x, "z": z, "h": h, "theta": theta, "u": u, "v": v,
+      "y": np.sin(2 * np.pi * space) * time + np.sin(theta) * h + np.cos(u) + np.sin(v)
+           + x * z + rng.normal(0, 0.3, n)}
+
 gamfit.fit(df, "y ~ te(space, time, k=[12, 8])")
 gamfit.fit(df, "y ~ te(space, time, k=(12, 8))")
 gamfit.fit(df, "y ~ te(space, time, k_space=12, k_time=8)")
@@ -772,6 +783,14 @@ per-axis shrinkage. Setting `scale_dimensions=True` on `fit()`
 enables it globally across compatible spatial smooths.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+pc = rng.normal(0, 1, (400, 4))
+df = {"pc1": pc[:, 0], "pc2": pc[:, 1], "pc3": pc[:, 2], "pc4": pc[:, 3],
+      "y": np.sin(pc[:, 0]) + 0.5 * pc[:, 1] ** 2 + rng.normal(0, 0.3, 400)}
+
 gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
@@ -822,6 +841,13 @@ y ~ x + link(type=flexible(probit))
 The formula value wins if both are set.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age = rng.uniform(30, 80, 400)
+df = {"age": age, "case": (rng.uniform(size=age.size) < 1 / (1 + np.exp(-(age - 55) / 8))).astype(float)}
+
 gamfit.fit(df, "case ~ s(age)", link="logit")
 ```
 
