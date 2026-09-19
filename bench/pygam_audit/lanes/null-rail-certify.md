@@ -1,0 +1,9 @@
+# null-rail-certify
+
+TITLE: Certify outer optimum when a null-space rho rails toward infinity (Poisson/binomial non-convergence); delete the rho-domain box
+WORK ITEM: Read audit/inference.md B2 and audit/api.md (robustness note on sklearn check data). outer-certify covers general certification; this asymptote-rail failure mode has no repro or test there.
+Evidence: 15/200 Poisson and 5/200 binomial MC fits fail with `railed=[4] theta=29.86 box=[-30,30]`, `|Pg|=1.331e-4 > bound=1.010e-4`, "asymptote-rail declined: interior not stationary", `line_search=StepSizeTooSmall after 50 attempts`. repro_binom0.py fails after 198 s. 17/160 successful binomial fits take > 60 s (max 446 s, median 2.4 s).
+The api audit found that tiny n=10 sklearn check data (check_estimators_nan_inf, make_blobs) also fails outer certification. GAMClassifier takes 2.6 s vs pyGAM's 1.5 s at n=400.
+Fix (SPEC: a fit only from a converged optimization; no wall-clock budgets; general outer work goes in the opt crate): replace a railed null-space coordinate by its analytic limit model (penalty -> infinity projects the function onto the null space). Fix it, then certify stationarity of the reduced face with the projected gradient. Do not loosen the bound. Delete the hand box=[-30,30] on rho (SPEC: no hand boxes or bounds): rho is unbounded and the rho -> infinity limit is reached analytically, not by hitting an edge. Rail/asymptote code is in crates/gam-solve/src/reml/reml_outer_engine/*; the face-reduction primitive goes in crates/opt.
+Coordinate: outer-certify (same engine files; land after it or on top), many-smooths, basis-size, glm-hessian, seed-cascade.
+Acceptance: new Rust tests replay the B2 Poisson seed and repro_binom0 data and assert certified convergence in < 10 s. A Python test runs sklearn check_estimators_nan_inf-style n=10 data and a blobs GAMClassifier and asserts a fit without ConvergenceError. All fail at HEAD.
