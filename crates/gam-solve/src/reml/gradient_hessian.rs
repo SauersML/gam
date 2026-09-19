@@ -4431,60 +4431,9 @@ impl<'a> RemlState<'a> {
         let Some(kkt) = pr.constraint_kkt.as_ref() else {
             return Ok(());
         };
-        // On a genuinely degenerate boundary face (linearly-dependent active
-        // rows), the active-row multipliers are non-unique and a strict 5e-6
-        // stationarity check is unreachable by construction. The inner
-        // active-set solver already certifies such iterates via its
-        // `degenerate_boundary_ok` clause at the relaxed
-        // `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` tolerance — without
-        // matching that here, the outer startup gate would refuse a
-        // legitimately converged constrained optimum. This relaxation is gated
-        // strictly on `working_set_rank_deficient`; it does NOT fire for
-        // `shape=concave`/`shape=convex`, whose active rows are independent
-        // coordinate lower bounds `γ_j ≥ 0` (full rank). Those converge from a
-        // strictly-interior cold seed (`project_point_strictly_into_feasible_cone`)
-        // and are held to the strict tolerance — their cold-vs-warm cache
-        // divergence (#873) was a seed problem, not a degeneracy. Primal / dual
-        // / complementarity stay on their strict tolerances; only the
-        // stationarity channel — the one mathematically unreachable on a
-        // rank-deficient face — gets the matching relaxation.
-        let stationarity_tol = if kkt.working_set_rank_deficient {
-            crate::active_set::ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL
-        } else {
-            KKT_TOL_STAT
-        };
-        // Scale-invariant stationarity, matching the inner active-set solver's
-        // own acceptance contract (`stationarity_rel` in
-        // `solve_newton_direction_with_linear_constraints_impl`): the
-        // stationarity residual `‖grad − Aᵀλ‖∞` is certified relative to the
-        // gradient scale `‖grad‖∞`, not against a bare absolute floor. The
-        // profiled-REML / least-squares gradient is O(n) in magnitude even at a
-        // genuine constrained optimum (issue #879), so the residual bottoms out
-        // at an absolute value (≈5.8e-5 on the n=400 #989 repro) that the fixed
-        // `5e-6` gate can never meet — even though the inner solver already
-        // converged on the relative ratio. We accept when EITHER the absolute
-        // residual is below the gate OR the relative ratio
-        // `stationarity / max(‖grad‖∞, 1)` is, so the outer gate stops on the
-        // same point the solver does instead of spuriously aborting a reachable
-        // constrained optimum (issue #989). `bounded()`, which solves via the
-        // exact-interval path rather than this active-set gate, was unaffected —
-        // hence the two documented ways to bound a coefficient disagreed.
-        //
-        // The dual-feasibility and complementarity channels carry the same
-        // gradient units (`λ` solves `g = Aᵀλ` on unit rows) and are judged in
-        // the same frame. Held to a bare absolute bar they made convergence
-        // depend on the response's units: `y → 1e6·y` on a monotone smooth
-        // scales `g` and `λ` by 1e6 and was refused at `comp = 9.65e-5` under
-        // `‖g‖∞ = 1.5e6` — a relative complementarity of 6e-11.
-        let gradient_scale = kkt.gradient_scale;
-        let exceeds = |residual: f64, tolerance: f64| {
-            crate::active_set::exceeds_at_gradient_scale(residual, tolerance, gradient_scale)
-        };
-        if kkt.primal_feasibility > KKT_TOL_PRIMAL
-            || exceeds(kkt.dual_feasibility, KKT_TOL_DUAL)
-            || exceeds(kkt.complementarity, KKT_TOL_COMP)
-            || exceeds(kkt.stationarity, stationarity_tol)
-        {
+        let stationarity_tol = constraint_kkt_gate_stationarity_tol(kkt);
+        let gradient_scale = constraint_kkt_gate_gradient_scale(kkt, pr.gradient_natural_scale);
+        if constraint_kkt_gate_refuses(kkt, pr.gradient_natural_scale) {
             let mut worstrow_msg = String::new();
             if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
                 let mut worst = 0.0_f64;
@@ -4530,7 +4479,7 @@ impl<'a> RemlState<'a> {
                 })
                 .unwrap_or_default();
             return Err(EstimationError::ParameterConstraintViolation(format!(
-                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (stat_rel={:.3e} vs tol={:.3e}{}; ‖grad‖∞={:.3e}); active={}/{}{}{}{}",
+                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (stat_rel={:.3e} vs tol={:.3e}{}; ‖grad‖∞={:.3e}, natural scale={:.3e}); active={}/{}{}{}{}",
                 kkt.primal_feasibility,
                 kkt.dual_feasibility,
                 kkt.complementarity,
@@ -4543,6 +4492,7 @@ impl<'a> RemlState<'a> {
                     ""
                 },
                 kkt.gradient_scale,
+                pr.gradient_natural_scale,
                 kkt.n_active,
                 kkt.n_constraints,
                 worstrow_msg,
@@ -7909,6 +7859,153 @@ pub(crate) fn inner_budget_exhaustion_was_scheduled(
         && scheduled_cap > 0
         && scheduled_cap < configured_cap
         && iteration <= scheduled_cap
+}
+
+/// Stationarity tolerance of the outer constraint-KKT gate.
+///
+/// On a genuinely degenerate boundary face (linearly-dependent active rows),
+/// the active-row multipliers are non-unique and a strict 5e-6 stationarity
+/// check is unreachable by construction. The inner active-set solver already
+/// certifies such iterates via its `degenerate_boundary_ok` clause at the
+/// relaxed `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` tolerance — without
+/// matching that here, the outer startup gate would refuse a legitimately
+/// converged constrained optimum. This relaxation is gated strictly on
+/// `working_set_rank_deficient`; it does NOT fire for
+/// `shape=concave`/`shape=convex`, whose active rows are independent
+/// coordinate lower bounds `γ_j ≥ 0` (full rank). Those converge from a
+/// strictly-interior cold seed (`project_point_strictly_into_feasible_cone`)
+/// and are held to the strict tolerance — their cold-vs-warm cache divergence
+/// (#873) was a seed problem, not a degeneracy. Primal / dual /
+/// complementarity stay on their strict tolerances; only the stationarity
+/// channel — the one mathematically unreachable on a rank-deficient face —
+/// gets the matching relaxation.
+fn constraint_kkt_gate_stationarity_tol(kkt: &crate::active_set::ConstraintKktDiagnostics) -> f64 {
+    if kkt.working_set_rank_deficient {
+        crate::active_set::ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL
+    } else {
+        KKT_TOL_STAT
+    }
+}
+
+/// The scale the outer constraint-KKT gate judges its gradient-unit channels
+/// (stationarity, dual feasibility, complementarity) against.
+///
+/// Scale-invariant stationarity, matching the inner active-set solver's own
+/// acceptance contract (`stationarity_rel` in
+/// `solve_newton_direction_with_linear_constraints_impl`): the stationarity
+/// residual `‖grad − Aᵀλ‖∞` is certified relative to the gradient's scale, not
+/// against a bare absolute floor. The profiled-REML / least-squares gradient is
+/// O(n) in magnitude even at a genuine constrained optimum (issue #879), so the
+/// residual bottoms out at an absolute value (≈5.8e-5 on the n=400 #989 repro)
+/// that the fixed `5e-6` gate can never meet. The dual-feasibility and
+/// complementarity channels carry the same gradient units (`λ` solves
+/// `g = Aᵀλ` on unit rows) and are judged in the same frame: held to a bare
+/// absolute bar they made convergence depend on the response's units.
+///
+/// `‖grad‖∞` alone is that scale only when constraints absorb the gradient. At
+/// an iterate with NO active row the stationarity residual IS `‖grad‖∞`, so
+/// `stationarity / max(‖grad‖∞, 1)` is `1` whenever the residual exceeds one
+/// and the "relative" branch collapses into the bare absolute `5e-6` — exactly
+/// the unit dependence the relative branch exists to remove. P-IRLS certified
+/// that same free-direction residual relative to the gradient's natural scale
+/// `‖Xᵀ(weighted residual)‖₂ + ‖Sβ‖₂` (`WorkingState::certifies_kkt`): the
+/// magnitude of the terms whose cancellation the residual measures, which
+/// scales with the response like the residual does. A binomial
+/// `s(x, by=z) + s(a, b) + s(x, shape=monotone_increasing)` fit on 500 rows
+/// (pyGAM-audit term fuzzer `fz0003`) had its interior, inner-certified optimum
+/// refused at `stat = 5.8e-6` for that reason. The gate therefore takes the
+/// larger of the two scales: the constrained one where rows absorb the
+/// gradient, the natural one where they do not.
+fn constraint_kkt_gate_gradient_scale(
+    kkt: &crate::active_set::ConstraintKktDiagnostics,
+    gradient_natural_scale: f64,
+) -> f64 {
+    // `f64::max` keeps the finite operand when the other is NaN, so a missing
+    // natural scale falls back to the constrained one rather than poisoning it.
+    kkt.gradient_scale.max(gradient_natural_scale)
+}
+
+/// Whether the outer constraint-KKT gate refuses an inner iterate.
+///
+/// Primal feasibility is a coefficient-space distance and keeps its absolute
+/// bound; the gradient-unit channels are judged absolutely OR relative to
+/// [`constraint_kkt_gate_gradient_scale`], through the one predicate the inner
+/// solver also uses (`exceeds_at_gradient_scale`).
+fn constraint_kkt_gate_refuses(
+    kkt: &crate::active_set::ConstraintKktDiagnostics,
+    gradient_natural_scale: f64,
+) -> bool {
+    let gradient_scale = constraint_kkt_gate_gradient_scale(kkt, gradient_natural_scale);
+    let exceeds = |residual: f64, tolerance: f64| {
+        crate::active_set::exceeds_at_gradient_scale(residual, tolerance, gradient_scale)
+    };
+    kkt.primal_feasibility > KKT_TOL_PRIMAL
+        || exceeds(kkt.dual_feasibility, KKT_TOL_DUAL)
+        || exceeds(kkt.complementarity, KKT_TOL_COMP)
+        || exceeds(kkt.stationarity, constraint_kkt_gate_stationarity_tol(kkt))
+}
+
+#[cfg(test)]
+mod constraint_kkt_gate_tests {
+    use super::constraint_kkt_gate_refuses;
+    use crate::active_set::compute_constraint_kkt_diagnostics;
+    use gam_problem::LinearInequalityConstraints;
+    use ndarray::{Array1, Array2, array};
+
+    /// A monotone-style system `γ_j ≥ 0` with every coordinate strictly
+    /// interior, so no row is active and no multiplier can absorb the gradient.
+    fn interior_iterate(gradient: Array1<f64>) -> crate::active_set::ConstraintKktDiagnostics {
+        let p = gradient.len();
+        let constraints = LinearInequalityConstraints::new(Array2::eye(p), Array1::zeros(p))
+            .expect("finite rows");
+        let beta = Array1::from_elem(p, 1.0);
+        let kkt = compute_constraint_kkt_diagnostics(&beta, &gradient, &constraints);
+        assert_eq!(kkt.n_active, 0, "the iterate must be interior");
+        kkt
+    }
+
+    /// The fz0003 residual: `‖g‖∞ = 5.832e-6` on a gradient whose natural
+    /// scale is O(1). P-IRLS certifies it relative to that scale; the gate used
+    /// to refuse it as an absolute `5e-6` breach.
+    #[test]
+    fn interior_residual_certified_on_the_natural_scale_is_admitted() {
+        let gradient = array![5.832e-6, -1.0e-6, 2.0e-7];
+        let natural_scale = 3.0;
+        let kkt = interior_iterate(gradient);
+        assert!(!constraint_kkt_gate_refuses(&kkt, natural_scale));
+    }
+
+    /// The verdict is invariant under a response rescale `y → c·y`, which
+    /// scales the residual and its natural scale alike.
+    #[test]
+    fn interior_verdict_is_invariant_under_response_rescaling() {
+        let base = array![4.0e-6, -2.5e-6, 1.0e-7];
+        let natural_scale = 2.0;
+        for c in [1.0e-3, 1.0, 1.0e3, 1.0e6] {
+            let kkt = interior_iterate(&base * c);
+            assert!(
+                !constraint_kkt_gate_refuses(&kkt, natural_scale * c),
+                "scale {c:e}: a relatively converged interior iterate was refused"
+            );
+        }
+        // Not converged at any scale: the residual is a tenth of the scale.
+        for c in [1.0e-3, 1.0, 1.0e3, 1.0e6] {
+            let kkt = interior_iterate(array![0.2, 0.0, 0.0] * c);
+            assert!(
+                constraint_kkt_gate_refuses(&kkt, natural_scale * c),
+                "scale {c:e}: an unconverged interior iterate was admitted"
+            );
+        }
+    }
+
+    /// Without a natural scale (a model saved before it existed reports `0`,
+    /// a missing one `NaN`) the gate keeps its previous verdict.
+    #[test]
+    fn missing_natural_scale_recovers_the_constrained_scale() {
+        let kkt = interior_iterate(array![5.832e-6, 0.0, 0.0]);
+        assert!(constraint_kkt_gate_refuses(&kkt, 0.0));
+        assert!(constraint_kkt_gate_refuses(&kkt, f64::NAN));
+    }
 }
 
 #[cfg(test)]
