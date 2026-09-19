@@ -183,6 +183,47 @@ impl CubicRegressionBasis {
         }
     }
 
+    /// Dense `n × k` first-derivative rows `f'(x) = row · β` for points inside
+    /// `[x*_1, x*_k]`, the interval the spline's function metrics integrate over.
+    ///
+    /// On knot interval `j` the design row is
+    /// `a₋e_j + a₊e_{j+1} + c₋F[j,:] + c₊F[j+1,:]`; differentiating
+    /// `a± = ±(x − x*_{j or j+1})/h_j` and `c± = (a±³ − a±)h_j²/6` gives
+    /// `(e_{j+1} − e_j)/h_j − (3a₋² − 1)h_j/6 · F[j,:] + (3a₊² − 1)h_j/6 · F[j+1,:]`.
+    pub(crate) fn interior_derivative_design(
+        &self,
+        data: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, BasisError> {
+        let k = self.knots.len();
+        let (x1, xk) = (self.knots[0], self.knots[k - 1]);
+        let mut rows = Array2::<f64>::zeros((data.len(), k));
+        for (i, &x) in data.iter().enumerate() {
+            if !(x >= x1 && x <= xk) {
+                crate::bail_invalid_basis!(
+                    "cubic regression derivative row requested at {x}, outside the knot range [{x1}, {xk}]"
+                );
+            }
+            let upper = self
+                .knots
+                .iter()
+                .position(|&knot| knot > x)
+                .unwrap_or(k - 1);
+            let j = upper.saturating_sub(1).min(k - 2);
+            let hj = self.knots[j + 1] - self.knots[j];
+            let a_minus = (self.knots[j + 1] - x) / hj;
+            let a_plus = (x - self.knots[j]) / hj;
+            let dc_minus = -(3.0 * a_minus * a_minus - 1.0) * hj / 6.0;
+            let dc_plus = (3.0 * a_plus * a_plus - 1.0) * hj / 6.0;
+            let mut row = rows.row_mut(i);
+            row[j] -= 1.0 / hj;
+            row[j + 1] += 1.0 / hj;
+            for c in 0..k {
+                row[c] += dc_minus * self.f_matrix[[j, c]] + dc_plus * self.f_matrix[[j + 1, c]];
+            }
+        }
+        Ok(rows)
+    }
+
     /// Dense `n × k` design matrix for a column of evaluation points.
     pub fn design(&self, data: ArrayView1<'_, f64>) -> Array2<f64> {
         let k = self.knots.len();
