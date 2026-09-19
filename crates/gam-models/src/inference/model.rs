@@ -115,7 +115,16 @@ use std::path::Path;
 // loads: a zero log-σ predictor makes σ ≡ 1, and an all-zero warp (the reduced
 // parametric-AFT lift, the σ-scaled log-t baseline of #892) fits `h ≡ 0`, where the two
 // kernels agree.
-pub const MODEL_PAYLOAD_VERSION: u32 = 26;
+// v27 records which rule selected a custom-family fit's coefficient mode
+// (`FitArtifacts::coefficient_mode_selection`, gam#2661): the #2661 anchored continuation, a
+// family objective homotopy, a unique mode, or the caller's seed when no rule applied. The field
+// carries a serde default, so an older payload loads as `NotRecorded`, which claims nothing; a
+// v26 binary refuses a v27 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 27;
+
+/// The schema before the coefficient-mode record (gam#2661), whose only difference is that
+/// field's absence.
+const MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 26;
 
 /// The first payload version whose survival location-scale kernel divides the whole
 /// residual by σ (#2695).
@@ -159,8 +168,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 9] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 10] = [
     MODEL_PAYLOAD_VERSION,
+    MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
     LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
     OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
     RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
@@ -6637,6 +6647,8 @@ mod tests {
                 covariance_declined: None,
                 jeffreys_arming_evidence: None,
                 outer_warm_start: None,
+                coefficient_mode_selection:
+                    gam_solve::model_types::CoefficientModeSelection::NotRecorded,
             },
             inner_cycles: 0,
         })
@@ -7473,6 +7485,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
             RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
@@ -7487,8 +7500,18 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION);
-        assert_eq!(LOCATION_ONLY_SCALE_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
+            MODEL_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION
+        );
+        assert_eq!(
+            LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION - 1
