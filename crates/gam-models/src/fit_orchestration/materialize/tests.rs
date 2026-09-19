@@ -4461,3 +4461,72 @@ fn multinomial_family_names_are_one_predicate() {
         assert!(!is_multinomial_family_name(name), "{name}");
     }
 }
+
+/// gam#3014: on the standard, location-scale and survival paths every link spelling
+/// is read. `flexible_link` flexes the formula's `link(...)` as it flexes a `link`
+/// argument, a `flexible(...)` in either place makes the choice flexible, and a `link`
+/// argument naming a different base link from the formula's is refused by name.
+#[test]
+fn every_link_spelling_is_read_and_a_disagreeing_link_argument_is_refused_3014() {
+    use gam_terms::inference::formula_dsl::LinkMode;
+    let resolve = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let parsed =
+            gam_terms::inference::formula_dsl::parse_formula(formula).expect("main formula");
+        super::validation::resolve_link_spellings(parsed.linkspec.as_ref(), link, flexible_link)
+    };
+    let choice = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        resolve(formula, link, flexible_link)
+            .unwrap_or_else(|err| {
+                panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}")
+            })
+            .map(|choice| (choice.link, matches!(choice.mode, LinkMode::Flexible)))
+    };
+    assert_eq!(choice("y ~ x", None, false), None);
+    assert_eq!(choice("y ~ x", None, true), Some((LinkFunction::Probit, true)));
+    for (formula, link, flexible_link, expected) in [
+        ("y ~ x + link(type=probit)", None, false, (LinkFunction::Probit, false)),
+        ("y ~ x + link(type=probit)", None, true, (LinkFunction::Probit, true)),
+        ("y ~ x + link(type=logit)", None, true, (LinkFunction::Logit, true)),
+        ("y ~ x + link(type=probit)", Some("probit"), false, (LinkFunction::Probit, false)),
+        ("y ~ x + link(type=probit)", Some("probit"), true, (LinkFunction::Probit, true)),
+        (
+            "y ~ x + link(type=probit)",
+            Some("flexible(probit)"),
+            false,
+            (LinkFunction::Probit, true),
+        ),
+        (
+            "y ~ x + link(type=flexible(probit))",
+            Some("probit"),
+            false,
+            (LinkFunction::Probit, true),
+        ),
+        ("y ~ x", Some("logit"), false, (LinkFunction::Logit, false)),
+        ("y ~ x", Some("logit"), true, (LinkFunction::Logit, true)),
+    ] {
+        assert_eq!(
+            choice(formula, link, flexible_link),
+            Some(expected),
+            "{formula} link={link:?} flexible_link={flexible_link}"
+        );
+    }
+    for (formula, link) in [
+        ("y ~ x + link(type=probit)", "logit"),
+        ("y ~ x + link(type=probit)", "flexible(logit)"),
+        ("y ~ x + link(type=flexible(probit))", "cloglog"),
+        ("y ~ x + link(type=logit)", "blended(logit,probit)"),
+    ] {
+        let err = resolve(formula, Some(link), false)
+            .expect_err("a link argument that disagrees with the formula must be refused");
+        let message = err.to_string();
+        assert!(
+            matches!(err, WorkflowError::InvalidConfig { .. })
+                && message.contains("link(type=")
+                && message.contains(&format!("link=\"{link}\"")),
+            "{formula} link={link}: {message}"
+        );
+    }
+    // A flexible request of a link the joint wiggle cannot flex is still refused,
+    // now also when the link is named in the formula.
+    assert!(resolve("y ~ x + link(type=sas)", None, true).is_err());
+}
