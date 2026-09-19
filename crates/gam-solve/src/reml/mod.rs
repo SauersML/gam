@@ -4923,7 +4923,7 @@ pub(crate) fn applied_canonical_penalties_for(
     let projected = canonical_penalties
         .iter()
         .map(|penalty| {
-            split.project_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
+            split.projected_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -4932,18 +4932,19 @@ pub(crate) fn applied_canonical_penalties_for(
                  subspace failed: {error}"
             ))
         })?;
-    // `project_canonical` returns the penalty itself when the projection is
-    // below the root's own noise, so an all-unchanged result IS the identity
-    // and is handed back as the original `Arc` rather than as a copy.
-    if projected
-        .iter()
-        .zip(canonical_penalties.iter())
-        .all(|(a, b)| a.root == b.root && a.col_range == b.col_range)
-    {
-        Ok(Arc::clone(canonical_penalties))
-    } else {
-        Ok(Arc::new(projected))
+    // `projected_canonical` returns `None` when the projection is below the
+    // root's own noise, so an all-`None` result IS the identity and is handed
+    // back as the original `Arc` rather than as a copy.
+    if projected.iter().all(Option::is_none) {
+        return Ok(Arc::clone(canonical_penalties));
     }
+    Ok(Arc::new(
+        projected
+            .into_iter()
+            .zip(canonical_penalties.iter())
+            .map(|(projected, penalty)| projected.unwrap_or_else(|| penalty.clone()))
+            .collect(),
+    ))
 }
 
 impl EvalShared {

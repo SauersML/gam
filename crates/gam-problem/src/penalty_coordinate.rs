@@ -15,13 +15,19 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 /// `log|S|₊` cannot end up on three slightly different projections of the same
 /// subspace.
 ///
-/// Returns the FULL-WIDTH projected root (`rank × total_dim`) together with
-/// whether its support stayed inside the original `[start, end)` block. Block
-/// locality survives whenever the null basis is itself block-local — which is
-/// the case for the non-overlapping reparameterization, whose balanced penalty
-/// sum is block-diagonal and whose eigenvectors therefore are too. The caller
-/// uses the flag to keep its block chart (and every block-local trace fast
-/// path) instead of widening to a dense `p`-column root for nothing.
+/// The root is block-local, so `R Π = R − (R N_b) Nᵀ` with `N_b` the rows of
+/// `N` inside `[start, end)`: only the `rank × m` coefficient matrix `R N_b`
+/// is ever formed, and a zero-filled full-width copy of the root exists only
+/// when the projection genuinely leaves the block. When `R N_b` is exactly
+/// zero — every null direction supported outside the block, the ordinary case
+/// for a random-effect factor beside unpenalized fixed columns — `R Π = R`
+/// and nothing is allocated.
+///
+/// Block locality survives whenever the null basis is itself block-local —
+/// which is the case for the non-overlapping reparameterization, whose
+/// balanced penalty sum is block-diagonal and whose eigenvectors therefore
+/// are too. The caller keeps its block chart (and every block-local trace
+/// fast path) instead of widening to a dense `p`-column root for nothing.
 ///
 /// "Stayed inside the block" is decided against the projected root's OWN
 /// magnitude: an out-of-block entry at `‖R Π‖_max · ε · total_dim` is the
@@ -32,30 +38,80 @@ pub fn project_block_root_out_of_null_directions(
     end: usize,
     total_dim: usize,
     null_basis: ArrayView2<'_, f64>,
-) -> (Array2<f64>, bool) {
-    let mut projected = Array2::<f64>::zeros((root.nrows(), total_dim));
-    projected
-        .slice_mut(ndarray::s![.., start..end])
-        .assign(&root);
-    if null_basis.ncols() > 0 {
-        let coefficients = projected.dot(&null_basis);
-        projected -= &coefficients.dot(&null_basis.t());
+) -> ProjectedBlockRoot {
+    if null_basis.ncols() == 0 {
+        return ProjectedBlockRoot::Unchanged;
     }
+    let block_null = null_basis.slice(ndarray::s![start..end, ..]);
+    let coefficients = root.dot(&block_null);
+    if coefficients.iter().all(|value| *value == 0.0) {
+        return ProjectedBlockRoot::Unchanged;
+    }
+    let block_correction = coefficients.dot(&block_null.t());
+    let block = &root - &block_correction;
+    let mut moved = max_abs(block_correction.iter());
+    let mut root_scale = max_abs(block.iter());
 
-    let root_scale = projected
-        .iter()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    // `−(R N_b) Nᵀ` on the columns outside the block, in the order
+    // `[0, start) ++ [end, total_dim)`.
+    let outside_null = ndarray::concatenate(
+        ndarray::Axis(0),
+        &[
+            null_basis.slice(ndarray::s![..start, ..]),
+            null_basis.slice(ndarray::s![end.., ..]),
+        ],
+    )
+    .expect("null-basis row slices share their column count");
+    let outside = -coefficients.dot(&outside_null.t());
+    let outside_max = max_abs(outside.iter());
+    moved = moved.max(outside_max);
+    root_scale = root_scale.max(outside_max);
+
     let column_support_tolerance = root_scale * f64::EPSILON * (total_dim as f64);
-    let stays_block_local = (start > 0 || end < total_dim)
-        && (0..total_dim)
-            .filter(|column| *column < start || *column >= end)
-            .all(|column| {
-                projected
-                    .column(column)
-                    .iter()
-                    .all(|value| value.abs() <= column_support_tolerance)
-            });
-    (projected, stays_block_local)
+    let spans_every_column = start == 0 && end == total_dim;
+    if !spans_every_column && outside_max <= column_support_tolerance {
+        return ProjectedBlockRoot::BlockLocal { block, moved };
+    }
+    let mut projected = Array2::<f64>::zeros((root.nrows(), total_dim));
+    projected.slice_mut(ndarray::s![.., start..end]).assign(&block);
+    projected
+        .slice_mut(ndarray::s![.., ..start])
+        .assign(&outside.slice(ndarray::s![.., ..start]));
+    projected
+        .slice_mut(ndarray::s![.., end..])
+        .assign(&outside.slice(ndarray::s![.., start..]));
+    ProjectedBlockRoot::FullWidth {
+        root: projected,
+        moved,
+    }
+}
+
+fn max_abs<'a>(values: impl Iterator<Item = &'a f64>) -> f64 {
+    values.fold(0.0_f64, |acc, value| acc.max(value.abs()))
+}
+
+/// `R Π` for a block-local root `R`, from
+/// [`project_block_root_out_of_null_directions`].
+#[derive(Clone, Debug)]
+pub enum ProjectedBlockRoot {
+    /// `R N = 0` exactly, so `R Π = R`.
+    Unchanged,
+    /// `R Π` is supported inside `[start, end)`; `block` is its
+    /// `rank × (end − start)` restriction.
+    BlockLocal { block: Array2<f64>, moved: f64 },
+    /// `R Π` leaves the block (or the block spans every column); `root` is the
+    /// full `rank × total_dim` projection.
+    FullWidth { root: Array2<f64>, moved: f64 },
+}
+
+impl ProjectedBlockRoot {
+    /// `‖R Π − R‖_max` over the full width.
+    pub fn moved(&self) -> f64 {
+        match self {
+            Self::Unchanged => 0.0,
+            Self::BlockLocal { moved, .. } | Self::FullWidth { moved, .. } => *moved,
+        }
+    }
 }
 
 /// The diagonal of `RᵀR` when that Gram is diagonal by structure: every row
@@ -296,32 +352,31 @@ impl PenaltyCoordinate {
         };
         // `R Π = R − (R N) Nᵀ`, through the shared primitive so this coordinate
         // and the term layer's `CanonicalPenalty` project identically.
-        let (projected, stays_block_local) = project_block_root_out_of_null_directions(
+        let prior_mean = self.prior_mean_block();
+        match project_block_root_out_of_null_directions(
             root.view(),
             start,
             end,
             total_dim,
             null_basis,
-        );
-
-        let prior_mean = self.prior_mean_block();
-        if stays_block_local {
-            let block = projected.slice(ndarray::s![.., start..end]).to_owned();
-            match prior_mean {
+        ) {
+            ProjectedBlockRoot::Unchanged => self.clone(),
+            ProjectedBlockRoot::BlockLocal { block, .. } => match prior_mean {
                 Some(mean) => {
                     Self::from_block_root_with_mean(block, start, end, total_dim, mean.to_owned())
                 }
                 None => Self::from_block_root(block, start, end, total_dim),
-            }
-        } else {
-            match prior_mean {
+            },
+            ProjectedBlockRoot::FullWidth {
+                root: projected, ..
+            } => match prior_mean {
                 Some(mean) => {
                     let mut full_mean = Array1::<f64>::zeros(total_dim);
                     full_mean.slice_mut(ndarray::s![start..end]).assign(&mean);
                     Self::from_dense_root_with_mean(projected, full_mean)
                 }
                 None => Self::from_dense_root(projected),
-            }
+            },
         }
     }
 
@@ -995,6 +1050,82 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The block-local projection primitive reproduces the dense
+    /// `R_full − (R_full N) Nᵀ` in each of its three outcomes, without ever
+    /// being handed the full-width root.
+    #[test]
+    fn projected_block_root_matches_the_dense_projection() {
+        let root = array![[1.0_f64, 0.5, -0.25], [0.0, 2.0, 0.75]];
+        let (start, end, total) = (2, 5, 7);
+        let mut full = Array2::<f64>::zeros((2, total));
+        full.slice_mut(ndarray::s![.., start..end]).assign(&root);
+        let dense = |null_basis: &Array2<f64>| &full - &full.dot(null_basis).dot(&null_basis.t());
+        let n = 1.0_f64 / 2.0_f64.sqrt();
+
+        // Null directions only on columns outside the block: `R N = 0`.
+        let outside = array![[n], [n], [0.0], [0.0], [0.0], [0.0], [0.0]];
+        let unchanged = project_block_root_out_of_null_directions(
+            root.view(),
+            start,
+            end,
+            total,
+            outside.view(),
+        );
+        assert!(matches!(unchanged, ProjectedBlockRoot::Unchanged));
+        assert_eq!(dense(&outside), full);
+
+        // Null direction inside the block: the projection stays block-local.
+        let inside = array![[0.0_f64], [0.0], [n], [0.0], [-n], [0.0], [0.0]];
+        let local = project_block_root_out_of_null_directions(
+            root.view(),
+            start,
+            end,
+            total,
+            inside.view(),
+        );
+        let expected = dense(&inside);
+        let ProjectedBlockRoot::BlockLocal { block, moved } = &local else {
+            panic!("a block-supported null basis must stay block-local, got {local:?}");
+        };
+        let gap = (&expected.slice(ndarray::s![.., start..end]) - block)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(gap <= 1e-15, "block-local projection gap {gap:e}");
+        assert!(
+            expected
+                .slice(ndarray::s![.., ..start])
+                .iter()
+                .chain(expected.slice(ndarray::s![.., end..]).iter())
+                .all(|value| *value == 0.0)
+        );
+        let dense_moved = (&expected - &full)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!((moved - dense_moved).abs() <= 1e-15);
+
+        // Null direction straddling the block edge: full-width support.
+        let straddling = array![[0.0_f64], [n], [n], [0.0], [0.0], [0.0], [0.0]];
+        let wide = project_block_root_out_of_null_directions(
+            root.view(),
+            start,
+            end,
+            total,
+            straddling.view(),
+        );
+        let expected = dense(&straddling);
+        let ProjectedBlockRoot::FullWidth { root: projected, moved } = &wide else {
+            panic!("a straddling null basis must widen the root, got {wide:?}");
+        };
+        let gap = (&expected - projected)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(gap <= 1e-15, "full-width projection gap {gap:e}");
+        let dense_moved = (&expected - &full)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!((moved - dense_moved).abs() <= 1e-15);
     }
 
     /// A centered coordinate keeps its prior mean under projection: the

@@ -653,11 +653,23 @@ impl PenaltyNullSplit {
         penalty: &CanonicalPenalty,
         frame: PenaltyFrame,
     ) -> Result<CanonicalPenalty, EstimationError> {
+        Ok(self
+            .projected_canonical(penalty, frame)?
+            .unwrap_or_else(|| penalty.clone()))
+    }
+
+    /// [`Self::project_canonical`], returning `None` where the projection
+    /// leaves `penalty` as it is.
+    pub fn projected_canonical(
+        &self,
+        penalty: &CanonicalPenalty,
+        frame: PenaltyFrame,
+    ) -> Result<Option<CanonicalPenalty>, EstimationError> {
         match self.basis(frame) {
             Some(n) if n.nrows() == penalty.total_dim => {
-                penalty.project_out_null_directions(n.view())
+                penalty.projected_out_of_null_directions(n.view())
             }
-            _ => Ok(penalty.clone()),
+            _ => Ok(None),
         }
     }
 
@@ -1057,8 +1069,21 @@ impl CanonicalPenalty {
         &self,
         null_basis: ndarray::ArrayView2<'_, f64>,
     ) -> Result<Self, EstimationError> {
+        Ok(self
+            .projected_out_of_null_directions(null_basis)?
+            .unwrap_or_else(|| self.clone()))
+    }
+
+    /// [`Self::project_out_null_directions`], returning `None` where that
+    /// returns the penalty itself, so a caller that keeps the original need
+    /// not copy its root to learn that nothing moved.
+    pub fn projected_out_of_null_directions(
+        &self,
+        null_basis: ndarray::ArrayView2<'_, f64>,
+    ) -> Result<Option<Self>, EstimationError> {
+        use gam_problem::ProjectedBlockRoot;
         if null_basis.ncols() == 0 || self.rank() == 0 {
-            return Ok(self.clone());
+            return Ok(None);
         }
         if null_basis.nrows() != self.total_dim {
             return Err(EstimationError::LayoutError(format!(
@@ -1068,37 +1093,24 @@ impl CanonicalPenalty {
                 self.total_dim
             )));
         }
-        let root_scale = self.root.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
-        let (projected_full, stays_block_local) =
-            gam_problem::project_block_root_out_of_null_directions(
-                self.root.view(),
-                self.col_range.start,
-                self.col_range.end,
-                self.total_dim,
-                null_basis,
-            );
+        let projected = gam_problem::project_block_root_out_of_null_directions(
+            self.root.view(),
+            self.col_range.start,
+            self.col_range.end,
+            self.total_dim,
+            null_basis,
+        );
         // How much the projection actually moved, against the root's own
         // representation noise.
-        let mut moved = 0.0_f64;
-        {
-            let original_full = self.full_width_root();
-            for (a, b) in projected_full.iter().zip(original_full.iter()) {
-                moved = moved.max((a - b).abs());
-            }
-        }
-        if moved <= root_scale * f64::EPSILON * (self.total_dim as f64) {
-            return Ok(self.clone());
+        let root_scale = self.root.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        if projected.moved() <= root_scale * f64::EPSILON * (self.total_dim as f64) {
+            return Ok(None);
         }
 
-        let (root, col_range) = if stays_block_local {
-            (
-                projected_full
-                    .slice(s![.., self.col_range.start..self.col_range.end])
-                    .to_owned(),
-                self.col_range.clone(),
-            )
-        } else {
-            (projected_full, 0..self.total_dim)
+        let (root, col_range) = match projected {
+            ProjectedBlockRoot::Unchanged => return Ok(None),
+            ProjectedBlockRoot::BlockLocal { block, .. } => (block, self.col_range.clone()),
+            ProjectedBlockRoot::FullWidth { root, .. } => (root, 0..self.total_dim),
         };
         let prior_mean = if col_range == self.col_range {
             self.prior_mean.clone()
@@ -1128,7 +1140,7 @@ impl CanonicalPenalty {
             }
         };
         let local = root.t().dot(&root);
-        Ok(Self {
+        Ok(Some(Self {
             root,
             col_range,
             total_dim: self.total_dim,
@@ -1139,7 +1151,7 @@ impl CanonicalPenalty {
             prior_mean,
             positive_eigenvalues,
             op: None,
-        })
+        }))
     }
 
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
