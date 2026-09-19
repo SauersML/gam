@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, overload
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,11 +35,11 @@ class CtnStage1:
     weights: str | None = None
     offset: str | None = None
 
-    def response_config(self):
+    def response_config(self) -> dict[str, int | bool | tuple[int, ...]]:
         return {key: value for key, value in asdict(self).items()
                 if (key.startswith("response_") or key == "double_penalty") and value is not None}
 
-    def native_document(self):
+    def native_document(self) -> dict[str, object]:
         """Marshal the shared Rust fit-request schema without fitting in Python."""
         return {"response_column": self.response, "covariate_formula_rhs": self.covariates,
                 "fold_column": self.fold_column, "group_column": self.group_column,
@@ -47,7 +47,15 @@ class CtnStage1:
                 "offset_column": self.offset, "config": self.response_config()}
 
 
-def normalize_ctn_stage1(value: Any) -> CtnStage1 | None:
+@overload
+def normalize_ctn_stage1(value: None) -> None: ...
+
+
+@overload
+def normalize_ctn_stage1(value: CtnStage1 | Mapping[str, Any]) -> CtnStage1: ...
+
+
+def normalize_ctn_stage1(value: object) -> CtnStage1 | None:
     if value is None or isinstance(value, CtnStage1):
         return value
     if isinstance(value, Mapping):

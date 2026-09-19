@@ -582,17 +582,25 @@ use gam::families::multinomial::MultinomialModelEnvelope;
 /// on. `fit_config` is the canonical fit-config document every formula family
 /// consumes; the typed core request honors `weights` as per-row case weights
 /// and rejects fields the softmax family cannot consume (offsets, noise
-/// formulas, manual Firth, ...) instead of silently dropping them.
+/// formulas, manual Firth, ...) instead of silently dropping them. An automatic
+/// `.` term is expanded with the engine rule every front door shares.
 fn fit_multinomial_dataset(
     dataset: &EncodedDataset,
     formula: &str,
     fit_config: &FitConfig,
 ) -> PyResult<Vec<u8>> {
+    let automatic =
+        gam::families::fit_orchestration::expand_automatic_fit_formula(formula, dataset, fit_config)
+            .map_err(|err| py_value_error(err.to_string()))?;
     // Typed engine path: `EstimationError` → matching `gamfit.*Error`
     // subclass via `estimation_error_to_pyerr` (issue #343). The request
     // carries the same defaults the CLI's `run_fit_multinomial` uses.
     let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
-        &gam::families::multinomial::MultinomialFitRequest::new(dataset, formula, fit_config),
+        &gam::families::multinomial::MultinomialFitRequest::new(
+            dataset,
+            &automatic.formula,
+            fit_config,
+        ),
     )
     .map_err(estimation_error_to_pyerr)?;
     MultinomialModelEnvelope::new(saved)

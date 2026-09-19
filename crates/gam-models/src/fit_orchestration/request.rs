@@ -728,11 +728,11 @@ pub struct FitConfig {
     /// declares why (see `CovarianceDeclined`). This only avoids paying for one
     /// that is never read.
     pub compute_covariance: Option<bool>,
-    /// A saved model's certified outer point to resume from (`warm_start_from`).
-    /// Runtime only: the request document cannot carry a model, so the Python and
-    /// Rust front ends build it with
-    /// [`OuterWarmStart::from_model`](crate::fit_orchestration::OuterWarmStart::from_model).
-    pub outer_warm_start: Option<crate::fit_orchestration::OuterWarmStart>,
+    /// A saved model's certified outer point to start from (`warm_start_from`,
+    /// gam#3002). Runtime only: the request document cannot carry a model, so the
+    /// front ends resolve one with
+    /// [`resolve_warm_start`](crate::fit_orchestration::resolve_warm_start).
+    pub warm_start: Option<gam_model_api::WarmStart>,
 }
 
 impl Default for FitConfig {
@@ -740,7 +740,7 @@ impl Default for FitConfig {
         Self {
             precompute_conformal: None,
             compute_covariance: None,
-            outer_warm_start: None,
+            warm_start: None,
             family: None,
             negative_binomial_theta: None,
             link: None,

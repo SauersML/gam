@@ -8,6 +8,7 @@ model.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any, Mapping, Sequence
 
 from ._binding import rust_module
@@ -22,13 +23,13 @@ def _ffi(name: str, *args: Any) -> Any:
         raise map_exception(exc) from exc
 
 
-def _np():
+def _np() -> ModuleType:
     import numpy as np
 
     return np
 
 
-def _composition_rows(np: Any, values: Any) -> tuple[Any, bool]:
+def _composition_rows(np: ModuleType, values: Any) -> tuple[Any, bool]:
     """Marshal a composition argument to the ``(rows, parts)`` 2-D layout the
     Rust FFI requires, recording whether the caller passed a single composition.
 

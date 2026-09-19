@@ -4090,17 +4090,6 @@ fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult
     Ok(out.unbind().into_any())
 }
 
-#[pyfunction]
-fn model_conditional_aic(model_bytes: Vec<u8>) -> PyResult<f64> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
-    // Report the SAME Occam-penalised conditional-AIC ranking score that
-    // `gamfit.compare_models` ranks on (`-2·loglik + 2·edf`), not the raw
-    // REML/LAML criterion, so `Model.conditional_aic` ordering agrees with the
-    // winner `compare_models` declares. Lower is still better (issue #2079). It
-    // is a cost on the −2·log scale and no marginal likelihood (#2946 T12).
-    ranking_score_from_summary_payload(&payload)
-}
-
 fn summary_payload_value_from_model_bytes(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
     let summary_json = summary_json_impl(model_bytes)?;
     serde_json::from_str(&summary_json).map_err(|err| format!("invalid model summary JSON: {err}"))

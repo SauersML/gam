@@ -253,7 +253,8 @@ def _MaternJetFn_apply(
     diagonal-plus-rank-1 assembly) lives in Rust; this wrapper only routes
     tensors through autograd.
     """
-    torch = _torch()
+    _torch()  # clean ImportError when torch is missing
+    import torch
 
     class _JetFn(torch.autograd.Function):
         @staticmethod
@@ -289,7 +290,9 @@ def _MaternRustFn_apply(
     aniso_log_scales: Any,
 ) -> Any:
     """Autograd boundary for Matern. Forward + analytic backward via Rust."""
-    torch = _torch()
+    _torch()  # clean ImportError when torch is missing
+    import torch
+
     from . import _api
 
     aniso_arg = (
