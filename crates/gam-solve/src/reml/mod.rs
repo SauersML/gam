@@ -4506,6 +4506,9 @@ pub(crate) struct SparseRemlDecision {
 pub(crate) struct SparseExactEvalData {
     pub(crate) factor: Arc<SparseExactFactor>,
     pub(crate) takahashi: Option<Arc<gam_linalg::sparse_exact::TakahashiInverse>>,
+    /// The upper-triangular penalized Hessian `factor` factors, so trace
+    /// kernels can read its sparsity pattern.
+    pub(crate) hessian: Arc<faer::sparse::SparseColMat<usize, f64>>,
     pub(crate) logdet_h: f64,
     pub(crate) logdet_s_pos: f64,
     pub(crate) penalty_rank: usize,
@@ -4802,9 +4805,9 @@ pub(crate) struct EvalShared {
     /// hold the bare `RemlGeometry` label, so every consumer that reported
     /// `backend {:?}` reported a two-valued enum and nothing that could
     /// falsify it: `select_reml_geometry` measures a penalized-Hessian
-    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its six routes
-    /// and never measures it on the other five, and the label is identical
-    /// across all six. Storing the decision rather than its outcome makes a
+    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its routes
+    /// and never measures it on the others, and the label is identical
+    /// across all of them. Storing the decision rather than its outcome makes a
     /// bundle unrepresentable without the basis for its own label.
     pub(crate) geometry: SparseRemlDecision,
     /// The exact H_total matrix used for LAML cost computation.
@@ -4933,7 +4936,7 @@ pub(crate) fn applied_canonical_penalties_for(
     let projected = canonical_penalties
         .iter()
         .map(|penalty| {
-            split.project_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
+            split.projected_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -4942,18 +4945,19 @@ pub(crate) fn applied_canonical_penalties_for(
                  subspace failed: {error}"
             ))
         })?;
-    // `project_canonical` returns the penalty itself when the projection is
-    // below the root's own noise, so an all-unchanged result IS the identity
-    // and is handed back as the original `Arc` rather than as a copy.
-    if projected
-        .iter()
-        .zip(canonical_penalties.iter())
-        .all(|(a, b)| a.root == b.root && a.col_range == b.col_range)
-    {
-        Ok(Arc::clone(canonical_penalties))
-    } else {
-        Ok(Arc::new(projected))
+    // `projected_canonical` returns `None` when the projection is below the
+    // root's own noise, so an all-`None` result IS the identity and is handed
+    // back as the original `Arc` rather than as a copy.
+    if projected.iter().all(Option::is_none) {
+        return Ok(Arc::clone(canonical_penalties));
     }
+    Ok(Arc::new(
+        projected
+            .into_iter()
+            .zip(canonical_penalties.iter())
+            .map(|(projected, penalty)| projected.unwrap_or_else(|| penalty.clone()))
+            .collect(),
+    ))
 }
 
 impl EvalShared {
@@ -5602,9 +5606,8 @@ pub(crate) struct RemlState<'a> {
     /// This is the single canonical penalty representation — no full-width
     /// `rank × p` roots are stored separately.
     pub(crate) canonical_penalties: Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
-    pub(crate) balanced_penalty_root: Array2<f64>,
     pub(crate) reparam_invariant: ReparamInvariant,
-    pub(crate) sparse_penalty_block_count: Option<usize>,
+    pub(crate) sparse_penalty_block_count: usize,
     pub(crate) p: usize,
     pub(crate) config: Arc<RemlConfig>,
     pub(crate) runtime_mixture_link_state: Option<gam_problem::MixtureLinkState>,

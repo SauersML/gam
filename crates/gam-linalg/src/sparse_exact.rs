@@ -36,6 +36,31 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
 }
 
 impl SparseExactFactor {
+    /// Stored nonzeros of the Cholesky factor `L`, which fixes the cost of
+    /// one triangular solve pair (`≈ 4·nnz(L)` flops).
+    pub fn factor_nnz(&self) -> usize {
+        self.simplicial.l_values.len()
+    }
+
+    /// Multiply-adds of the Takahashi recurrence on this factor: every pair of
+    /// off-diagonal rows in a column of `L` costs one, so this is
+    /// `Σ_j c_j²` over the off-diagonal counts `c_j`, the same order as the
+    /// numeric factorization itself.
+    pub fn selected_inverse_flops(&self) -> usize {
+        self.simplicial
+            .l_col_ptr
+            .windows(2)
+            .map(|w| {
+                let off_diagonal = w[1] - w[0] - 1;
+                off_diagonal * off_diagonal
+            })
+            .sum()
+    }
+
+    /// `H⁻¹` on the filled pattern of this factor (see [`TakahashiInverse`]).
+    pub fn selected_inverse(&self) -> Result<TakahashiInverse, LinalgError> {
+        TakahashiInverse::compute(&self.simplicial)
+    }
 }
 
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
@@ -1228,6 +1253,36 @@ impl TakahashiInverse {
         } else {
             self.exact_permuted_column(col)[row]
         }
+    }
+
+    /// `tr(H⁻¹ RᵀR)` for a root `R` whose columns are the coefficients
+    /// `col_offset..col_offset + R.ncols()`, as `Σ_r r H⁻¹ rᵀ` over the rows
+    /// `r` of `R`, each row contracted on its own support.
+    ///
+    /// A pair `(j, k)` inside one row's support is a nonzero of `RᵀR`; when
+    /// `RᵀR` is a summand of `H` that pair is on `H`'s pattern and therefore on
+    /// the selected-inverse pattern, so no column solve is needed. A
+    /// random-effect ridge root (one nonzero per row) costs one lookup per level
+    /// instead of forming `RᵀR` or solving against its rows.
+    pub fn trace_root_gram(&self, root: ArrayView2<'_, f64>, col_offset: usize) -> f64 {
+        let mut support: Vec<(usize, f64)> = Vec::new();
+        let mut trace = 0.0;
+        for row in root.outer_iter() {
+            support.clear();
+            support.extend(
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &value)| value != 0.0)
+                    .map(|(col, &value)| (col_offset + col, value)),
+            );
+            for (a, &(j, r_j)) in support.iter().enumerate() {
+                trace += r_j * r_j * self.get(j, j);
+                for &(k, r_k) in &support[a + 1..] {
+                    trace += 2.0 * r_j * r_k * self.get(j, k);
+                }
+            }
+        }
+        trace
     }
 
     /// Diagonal of H⁻¹ in original ordering.

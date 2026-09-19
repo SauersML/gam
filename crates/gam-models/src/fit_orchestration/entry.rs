@@ -205,77 +205,16 @@ pub(crate) fn resolved_resource_policy(
 /// Parse, materialize, and fit a model in one call.
 /// Resolve the expectile levels requested by `config`, if any.
 ///
-/// Returns `Ok(Some(levels))` when `config.family` is `"expectile"` (optionally
-/// with inline levels, `"expectile(0.9)"` or `"expectile(0.1, 0.9)"`),
-/// `Ok(None)` for every other family, and `Err` when an expectile request is
-/// malformed: a level outside `(0, 1)`, levels that are not strictly
-/// increasing, or inline levels that contradict [`FitConfig::expectile_tau`].
-/// When neither spelling pins the levels, the single median level `[0.5]` (the
-/// ordinary mean fit) is the default.
+/// Thin typed-error wrapper over [`FitConfig::resolved_expectile_levels`],
+/// the one rule [`FitConfig::resolve`] also enforces: `Some(levels)` for the
+/// expectile family, `None` for every other family, and `Err` for a malformed
+/// expectile request or an `expectile_tau` given with a non-expectile family.
 pub fn expectile_levels_for_config(
     config: &FitConfig,
 ) -> Result<Option<Vec<f64>>, WorkflowError> {
-    let Some(raw) = config.family.as_deref() else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower == "expectile" || lower.starts_with("expectile(")) {
-        return Ok(None);
-    }
-    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    // Optional inline levels: `expectile(0.9)` or `expectile(0.1, 0.5, 0.9)`.
-    let inline_levels = if let Some(rest) = lower.strip_prefix("expectile(") {
-        let inner = rest.strip_suffix(')').ok_or_else(|| {
-            invalid(format!(
-                "expectile family levels must be written as `expectile(τ)` or \
-                 `expectile(τ₁, τ₂, …)`; got `{trimmed}`"
-            ))
-        })?;
-        let levels = inner
-            .split(',')
-            .map(|item| {
-                item.trim().parse::<f64>().map_err(|_| {
-                    invalid(format!(
-                        "expectile level `{}` is not a finite number",
-                        item.trim()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<f64>, _>>()?;
-        Some(levels)
-    } else {
-        None
-    };
-    let levels = match (inline_levels, config.expectile_tau.clone()) {
-        (Some(a), Some(b)) if a != b => {
-            return Err(invalid(format!(
-                "expectile levels given both inline (`{trimmed}`) and via expectile_tau \
-                 ({b:?}); supply exactly one"
-            )));
-        }
-        (Some(a), _) => a,
-        (None, Some(b)) => b,
-        (None, None) => vec![0.5],
-    };
-    if levels.is_empty() {
-        return Err(invalid(
-            "expectile_tau must name at least one expectile level".to_string(),
-        ));
-    }
-    for &tau in &levels {
-        if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
-            return Err(invalid(format!(
-                "expectile level τ must be finite and strictly in (0, 1); got {tau}"
-            )));
-        }
-    }
-    if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(invalid(format!(
-            "expectile levels must be strictly increasing with no duplicates; got {levels:?}"
-        )));
-    }
-    Ok(Some(levels))
+    config
+        .resolved_expectile_levels()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })
 }
 
 /// Prior-weighted empirical `τ`-expectile of `z` in closed form.
@@ -1698,6 +1637,44 @@ fn try_deterministic_gaussian_standard_fit(
     deterministic_gaussian_standard_fit(request, Some(boundary))
 }
 
+/// The training table with every zero-weight row removed.
+///
+/// A prior weight of zero removes the row from the likelihood, and it must
+/// remove it from everything else the fit derives from the rows as well —
+/// knots, covariate ranges, identifiability constraints, standardization,
+/// factor levels, column kinds — so that weight zero is exactly row deletion.
+/// Every fitting entry point runs its data through this one seam. The table
+/// is borrowed unchanged when no weight column is configured or no weight is
+/// exactly zero; rows with a missing or negative weight are kept so the weight
+/// validator still reports them.
+pub fn drop_zero_weight_rows<'a>(
+    data: &'a Dataset,
+    config: &FitConfig,
+) -> Result<std::borrow::Cow<'a, Dataset>, WorkflowError> {
+    use std::borrow::Cow;
+    let Some(name) = config.weight_column.as_deref().map(str::trim) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let Some(column) = data.headers.iter().position(|header| header == name) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let weights = data.values.column(column);
+    let keep: Vec<usize> = (0..weights.len()).filter(|&row| weights[row] != 0.0).collect();
+    if keep.len() == weights.len() {
+        return Ok(Cow::Borrowed(data));
+    }
+    if keep.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
+        });
+    }
+    data.select_rows(&keep)
+        .map(Cow::Owned)
+        .map_err(|error| WorkflowError::InvalidConfig {
+            reason: error.to_string(),
+        })
+}
+
 pub fn fit_from_formula(
     formula: &str,
     data: &Dataset,
@@ -1726,6 +1703,7 @@ pub fn fit_from_formula_with_notes(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    let data = &*drop_zero_weight_rows(data, config)?;
     let automatic = expand_automatic_fit_formula(formula, data, config)?;
     if automatic.notes.is_empty() {
         return fit_expanded_formula_with_notes(formula, data, config);
@@ -2412,6 +2390,14 @@ fn attach_basis_adequacy(
             unidentified_scalar_terms,
         };
     };
+    // The random-effect test needs only the design and the converged fit, so
+    // it runs whether or not the covariate frame is available.
+    standard.fit.artifacts.random_effect_tests =
+        crate::fit_orchestration::drivers::random_effect_test_records(
+            &standard.design,
+            &standard.resolvedspec,
+            &standard.fit,
+        );
     if let Some(data) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
             data.view(),

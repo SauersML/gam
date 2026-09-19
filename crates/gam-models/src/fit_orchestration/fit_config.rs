@@ -185,6 +185,7 @@ impl FitConfig {
             let value = value.trim();
             (!value.is_empty()).then(|| value.to_string())
         });
+        self.resolved_expectile_levels()?;
         self.offset_column = normalize_optional_column(self.offset_column, "offset_column")?;
         self.noise_offset_column =
             normalize_optional_column(self.noise_offset_column, "noise_offset_column")?;
@@ -293,6 +294,82 @@ impl FitConfig {
         Ok(self)
     }
 
+    /// The expectile levels this config requests, if any.
+    ///
+    /// `Ok(Some(levels))` when `family` is `"expectile"` (optionally with
+    /// inline levels, `"expectile(0.9)"` or `"expectile(0.1, 0.9)"`);
+    /// `Ok(None)` for every other family with `expectile_tau` unset. The levels
+    /// are a parameter of the expectile family and never select it, so
+    /// `expectile_tau` with any other family (including an inferred one) is an
+    /// error rather than an ignored field. `Err` also when an expectile request
+    /// is malformed: a level outside `(0, 1)`, levels that are not strictly
+    /// increasing, or inline levels that contradict `expectile_tau`. When
+    /// neither spelling pins the levels, the single median level `[0.5]` (the
+    /// ordinary mean fit) is the default.
+    pub fn resolved_expectile_levels(&self) -> Result<Option<Vec<f64>>, String> {
+        let trimmed = self.family.as_deref().map(str::trim).unwrap_or("");
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower == "expectile" || lower.starts_with("expectile(")) {
+            return match &self.expectile_tau {
+                None => Ok(None),
+                Some(levels) => Err(format!(
+                    "expectile_tau = {levels:?} requires family = \"expectile\"; got family = {}",
+                    self.family
+                        .as_deref()
+                        .map_or_else(|| "auto".to_string(), |family| format!("\"{family}\""))
+                )),
+            };
+        }
+        // Optional inline levels: `expectile(0.9)` or `expectile(0.1, 0.5, 0.9)`.
+        let inline_levels = match lower.strip_prefix("expectile(") {
+            Some(rest) => {
+                let inner = rest.strip_suffix(')').ok_or_else(|| {
+                    format!(
+                        "expectile family levels must be written as `expectile(τ)` or \
+                         `expectile(τ₁, τ₂, …)`; got `{trimmed}`"
+                    )
+                })?;
+                let levels = inner
+                    .split(',')
+                    .map(|item| {
+                        item.trim().parse::<f64>().map_err(|_| {
+                            format!("expectile level `{}` is not a finite number", item.trim())
+                        })
+                    })
+                    .collect::<Result<Vec<f64>, _>>()?;
+                Some(levels)
+            }
+            None => None,
+        };
+        let levels = match (inline_levels, self.expectile_tau.clone()) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(format!(
+                    "expectile levels given both inline (`{trimmed}`) and via expectile_tau \
+                     ({b:?}); supply exactly one"
+                ));
+            }
+            (Some(a), _) => a,
+            (None, Some(b)) => b,
+            (None, None) => vec![0.5],
+        };
+        if levels.is_empty() {
+            return Err("expectile_tau must name at least one expectile level".to_string());
+        }
+        for &tau in &levels {
+            if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+                return Err(format!(
+                    "expectile level τ must be finite and strictly in (0, 1); got {tau}"
+                ));
+            }
+        }
+        if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(format!(
+                "expectile levels must be strictly increasing with no duplicates; got {levels:?}"
+            ));
+        }
+        Ok(Some(levels))
+    }
+
     /// The survival likelihood mode this config resolves to for a `Surv(...)`
     /// fit.
     ///
@@ -332,6 +409,42 @@ mod tests {
             Some("transformation")
         );
         assert_eq!(resolved.baseline_target, "linear");
+    }
+
+    /// `expectile_tau` is a parameter of the expectile family and never selects
+    /// it: with any other family it is refused rather than ignored, and `τ` is
+    /// held to the open unit interval (pyGAM audit F10).
+    #[test]
+    fn resolve_holds_expectile_tau_to_the_expectile_family_and_the_open_unit_interval() {
+        let config = |family: Option<&str>, levels: Option<&[f64]>| FitConfig {
+            family: family.map(str::to_string),
+            expectile_tau: levels.map(<[f64]>::to_vec),
+            ..FitConfig::default()
+        };
+        for family in [None, Some("auto"), Some("gaussian"), Some("poisson")] {
+            for levels in [&[0.9][..], &[0.1, 0.9]] {
+                let error = config(family, Some(levels)).resolve().unwrap_err();
+                assert!(
+                    error.contains("requires family = \"expectile\""),
+                    "{family:?} {levels:?}: {error}"
+                );
+            }
+            assert!(config(family, None).resolve().is_ok());
+        }
+        for tau in [0.0, 1.0, 1.5, -0.1, f64::NAN, f64::INFINITY] {
+            let error = config(Some("expectile"), Some(&[tau])).resolve().unwrap_err();
+            assert!(error.contains("strictly in (0, 1)"), "{tau}: {error}");
+            let error = config(Some("expectile"), Some(&[0.5, tau])).resolve().unwrap_err();
+            assert!(error.contains("strictly"), "{tau}: {error}");
+        }
+        assert!(config(Some("expectile(1.5)"), None).resolve().is_err());
+        assert!(config(Some("expectile(0.9)"), Some(&[0.8])).resolve().is_err());
+        let resolved = config(Some("Expectile"), Some(&[0.9])).resolve().unwrap();
+        assert_eq!(resolved.resolved_expectile_levels(), Ok(Some(vec![0.9])));
+        let inline = config(Some("expectile(0.25, 0.75)"), None).resolve().unwrap();
+        assert_eq!(inline.resolved_expectile_levels(), Ok(Some(vec![0.25, 0.75])));
+        let median = config(Some("expectile"), None).resolve().unwrap();
+        assert_eq!(median.resolved_expectile_levels(), Ok(Some(vec![0.5])));
     }
 
     #[test]

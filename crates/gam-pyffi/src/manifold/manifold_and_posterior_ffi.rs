@@ -3201,46 +3201,36 @@ mod batch_tests {
         // columns plus `noise_scale`; the ordered schema must interleave it
         // right after `mean_upper` (the last preferred mean column) and keep any
         // non-preferred extras behind the preferred block.
-        let columns_json = r#"{
-            "mean_upper": [2.0],
-            "noise_scale": [0.7],
-            "linear_predictor": [1.0],
-            "row_id": [42.0],
-            "mean": [1.1],
-            "std_error": [0.2],
-            "mean_lower": [0.1]
-        }"#;
-        let ordered_json = ordered_prediction_columns(columns_json).expect("ordering must succeed");
-        // `ordered_prediction_columns` serialises keys in emission order via the
-        // manual `ordered_json_object_string` writer, so the textual byte order
-        // of the `"key":` tokens is the authoritative column order (round-trip
-        // through serde_json::Value would re-sort and lose it).
-        let expected = [
-            "linear_predictor",
-            "mean",
-            "std_error",
-            "mean_lower",
-            "mean_upper",
-            "noise_scale",
-            "row_id",
-        ];
-        let positions: Vec<usize> = expected
-            .iter()
-            .map(|key| {
-                ordered_json
-                    .find(&format!("\"{key}\":"))
-                    .unwrap_or_else(|| {
-                        panic!("emitted JSON must contain key {key}: {ordered_json}")
-                    })
-            })
+        let columns: BTreeMap<String, Vec<f64>> = [
+            ("mean_upper", 2.0),
+            ("noise_scale", 0.7),
+            ("linear_predictor", 1.0),
+            ("row_id", 42.0),
+            ("mean", 1.1),
+            ("std_error", 0.2),
+            ("mean_lower", 0.1),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), vec![value]))
+        .collect();
+        let ordered: Vec<String> = ordered_prediction_column_entries(columns)
+            .into_iter()
+            .map(|(key, _)| key)
             .collect();
-        for w in positions.windows(2) {
-            assert!(
-                w[0] < w[1],
-                "noise_scale must be ordered immediately after the mean columns and \
-                 before non-preferred extras; got JSON {ordered_json}"
-            );
-        }
+        assert_eq!(
+            ordered,
+            [
+                "linear_predictor",
+                "mean",
+                "std_error",
+                "mean_lower",
+                "mean_upper",
+                "noise_scale",
+                "row_id",
+            ],
+            "noise_scale must be ordered immediately after the mean columns and \
+             before non-preferred extras"
+        );
     }
 
     #[test]
@@ -3775,17 +3765,18 @@ fn predict_table_survival(
     model: &FittedModel,
     dataset: &EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<String, String> {
+) -> Result<TablePrediction, String> {
     if model
         .payload()
         .survival_cause_count
         .is_some_and(|cause_count| cause_count > 1)
     {
         let result = predict_competing_risks_survival_result(model, dataset, options)?;
-        return serialize_competing_risks_prediction_payload(result, options.interval);
+        return serialize_competing_risks_prediction_payload(result, options.interval)
+            .map(TablePrediction::CompetingRisks);
     }
     let result = predict_survival_result(model, dataset, options)?;
-    serialize_survival_prediction_payload(model, result)
+    serialize_survival_prediction_payload(model, result).map(TablePrediction::Survival)
 }
 
 fn predict_competing_risks_survival_result(

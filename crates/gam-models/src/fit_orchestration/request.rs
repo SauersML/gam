@@ -661,7 +661,8 @@ pub struct FitConfig {
     /// cross anywhere (see `fit_expectile_location_scale`). `None` defaults to
     /// the single median level `[0.5]`. The levels may also be written inline
     /// as `family = "expectile(0.9)"` or `family = "expectile(0.1, 0.9)"`;
-    /// both spellings together must agree.
+    /// both spellings together must agree. Setting it with any other family is
+    /// rejected by [`FitConfig::resolve`].
     pub expectile_tau: Option<Vec<f64>>,
     /// Cross-fitted predictive CTN, saved with an ordinary marginal-slope outcome.
     pub ctn_stage1: Option<CtnStage1Recipe>,
