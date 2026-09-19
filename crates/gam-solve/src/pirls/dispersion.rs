@@ -25,11 +25,7 @@ impl NegbinThetaScore {
 }
 
 fn certified_log_means(eta: &Array1<f64>) -> Result<Vec<f64>, EstimationError> {
-    let rows: Vec<Result<f64, EstimationError>> = eta
-        .par_iter()
-        .map(|&eta_i| crate::mixture_link::log_link_solver_exp(eta_i))
-        .collect();
-    rows.into_iter().collect()
+    super::par_certified_rows(eta.len(), |i| crate::mixture_link::log_link_solver_exp(eta[i]))
 }
 
 #[inline]
@@ -41,10 +37,7 @@ fn certified_prior_weight(row: usize, eta: f64, weight: f64) -> Result<f64, Esti
     }
 }
 
-fn certified_pairs_sum(
-    rows: Vec<Result<(f64, f64), EstimationError>>,
-) -> Result<(f64, f64), EstimationError> {
-    let rows: Vec<(f64, f64)> = rows.into_iter().collect::<Result<_, _>>()?;
+fn certified_pairs_sum(rows: &[(f64, f64)]) -> Result<(f64, f64), EstimationError> {
     let sum = gam_linalg::pairwise_reduce::par_pairwise_map_reduce(
         rows.len(),
         |i| rows[i],
@@ -100,30 +93,27 @@ pub(crate) fn estimate_gamma_shape_from_eta(
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<f64, EstimationError> {
     let means = certified_log_means(eta)?;
-    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
-            if wi == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            if !(y[i].is_finite() && y[i] > 0.0) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Gamma response", eta[i], y[i]));
-            }
-            let target = gamma_shape_statistic(y[i], means[i]);
-            let contribution = wi * target;
-            if !(target.is_finite() && target >= 0.0 && contribution.is_finite()) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                    i,
-                    "Gamma shape statistic",
-                    eta[i],
-                    contribution,
-                ));
-            }
-            Ok((contribution, wi))
-        })
-        .collect();
-    let (weighted_target, total_weight) = certified_pairs_sum(rows)?;
+    let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok((0.0, 0.0));
+        }
+        if !(y[i].is_finite() && y[i] > 0.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Gamma response", eta[i], y[i]));
+        }
+        let target = gamma_shape_statistic(y[i], means[i]);
+        let contribution = wi * target;
+        if !(target.is_finite() && target >= 0.0 && contribution.is_finite()) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "Gamma shape statistic",
+                eta[i],
+                contribution,
+            ));
+        }
+        Ok((contribution, wi))
+    })?;
+    let (weighted_target, total_weight) = certified_pairs_sum(&rows)?;
     if !(total_weight > 0.0) {
         crate::bail_invalid_estim!("Gamma shape profiling requires positive total prior weight");
     }
@@ -198,42 +188,39 @@ pub(crate) fn estimate_beta_phi_from_eta(
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<f64, EstimationError> {
-    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
-            if wi == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            if !(y[i].is_finite() && y[i] > 0.0 && y[i] < 1.0) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Beta response", eta[i], y[i]));
-            }
-            if !eta[i].is_finite() {
-                return Err(EstimationError::InverseLinkDomainViolation {
-                    link: "standard logit inverse link",
-                    eta: eta[i],
-                    lower: -f64::MAX,
-                    upper: f64::MAX,
-                });
-            }
-            let jet = logit_inverse_link_jet5(eta[i]);
-            if !(jet.mu > 0.0 && jet.mu < 1.0 && jet.d1.is_finite() && jet.d1 > 0.0) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Beta mean/variance", eta[i], jet.d1));
-            }
-            let resid = y[i] - jet.mu;
-            let statistic = wi * resid * resid / jet.d1;
-            if !(statistic.is_finite() && statistic >= 0.0) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                    i,
-                    "Beta precision statistic",
-                    eta[i],
-                    statistic,
-                ));
-            }
-            Ok((statistic, wi))
-        })
-        .collect();
-    let (weighted_pearson, total_weight) = certified_pairs_sum(rows)?;
+    let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok((0.0, 0.0));
+        }
+        if !(y[i].is_finite() && y[i] > 0.0 && y[i] < 1.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Beta response", eta[i], y[i]));
+        }
+        if !eta[i].is_finite() {
+            return Err(EstimationError::InverseLinkDomainViolation {
+                link: "standard logit inverse link",
+                eta: eta[i],
+                lower: -f64::MAX,
+                upper: f64::MAX,
+            });
+        }
+        let jet = logit_inverse_link_jet5(eta[i]);
+        if !(jet.mu > 0.0 && jet.mu < 1.0 && jet.d1.is_finite() && jet.d1 > 0.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Beta mean/variance", eta[i], jet.d1));
+        }
+        let resid = y[i] - jet.mu;
+        let statistic = wi * resid * resid / jet.d1;
+        if !(statistic.is_finite() && statistic >= 0.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "Beta precision statistic",
+                eta[i],
+                statistic,
+            ));
+        }
+        Ok((statistic, wi))
+    })?;
+    let (weighted_pearson, total_weight) = certified_pairs_sum(&rows)?;
     if !(total_weight > 0.0 && weighted_pearson > 0.0) {
         crate::bail_invalid_estim!(
             "Beta precision MLE is not finite and positive (Pearson={weighted_pearson:?}, weight={total_weight:?})"
@@ -258,37 +245,34 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
         crate::bail_invalid_estim!("invalid Tweedie variance power {p:?}");
     }
     let means = certified_log_means(eta)?;
-    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
-            if wi == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            if !(y[i].is_finite() && y[i] >= 0.0) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Tweedie response", eta[i], y[i]));
-            }
-            let resid = y[i] - means[i];
-            // Form the complete Pearson term before exponentiating. Both
-            // residual² and mu^p may exceed the float range while their
-            // weighted ratio remains finite and informative.
-            let statistic = if resid == 0.0 {
-                0.0
-            } else {
-                (wi.ln() + 2.0 * resid.abs().ln() - p * means[i].ln()).exp()
-            };
-            if !(statistic.is_finite() && statistic >= 0.0) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                    i,
-                    "Tweedie dispersion statistic",
-                    eta[i],
-                    statistic,
-                ));
-            }
-            Ok((statistic, wi))
-        })
-        .collect();
-    let (weighted_pearson, total_weight) = certified_pairs_sum(rows)?;
+    let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok((0.0, 0.0));
+        }
+        if !(y[i].is_finite() && y[i] >= 0.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Tweedie response", eta[i], y[i]));
+        }
+        let resid = y[i] - means[i];
+        // Form the complete Pearson term before exponentiating. Both
+        // residual² and mu^p may exceed the float range while their
+        // weighted ratio remains finite and informative.
+        let statistic = if resid == 0.0 {
+            0.0
+        } else {
+            (wi.ln() + 2.0 * resid.abs().ln() - p * means[i].ln()).exp()
+        };
+        if !(statistic.is_finite() && statistic >= 0.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "Tweedie dispersion statistic",
+                eta[i],
+                statistic,
+            ));
+        }
+        Ok((statistic, wi))
+    })?;
+    let (weighted_pearson, total_weight) = certified_pairs_sum(&rows)?;
     if !(total_weight > 0.0 && weighted_pearson > 0.0) {
         crate::bail_invalid_estim!(
             "Tweedie dispersion is not finite and positive (Pearson={weighted_pearson:?}, weight={total_weight:?})"
@@ -483,57 +467,54 @@ fn negbin_theta_score_and_info_from_means(
     let trigamma_theta = trigamma(theta);
     let ln_theta = theta.ln();
     let inv_theta = theta.recip();
-    let rows: Vec<Result<(f64, f64, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
-            if wi == 0.0 {
-                return Ok((0.0, 0.0, 0.0));
-            }
-            let yi = y[i];
-            if !valid_count_response(yi) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                    i,
-                    "negative-binomial response",
-                    eta[i],
-                    yi,
-                ));
-            }
-            let theta_plus_mu = theta + means[i];
-            let theta_plus_y = theta + yi;
-            let digamma_y = digamma(yi + theta);
-            let ln_theta_plus_mu = theta_plus_mu.ln();
-            let ratio = theta_plus_y / theta_plus_mu;
-            let s = digamma_y - psi_theta + ln_theta + 1.0 - ln_theta_plus_mu - ratio;
-            // Avoid forming `(theta + mu)^2`, which can overflow even when the
-            // information term itself is representable.
-            let info_row = -trigamma(yi + theta) + trigamma_theta - inv_theta + 2.0 / theta_plus_mu
-                - (theta_plus_y / theta_plus_mu) / theta_plus_mu;
-            let score = wi * s;
-            let info = wi * info_row;
-            let magnitude = wi
-                * (digamma_y.abs()
-                    + psi_theta.abs()
-                    + ln_theta.abs()
-                    + 1.0
-                    + ln_theta_plus_mu.abs()
-                    + ratio.abs());
-            if !(score.is_finite() && info.is_finite() && magnitude.is_finite()) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                    i,
-                    "negative-binomial theta score/information",
-                    eta[i],
-                    score,
-                ));
-            }
-            Ok((score, info, magnitude))
-        })
-        .collect();
-    let rows: Vec<(f64, f64, f64)> = rows.into_iter().collect::<Result<_, _>>()?;
-    let (score, info) =
-        certified_pairs_sum(rows.iter().map(|&(score, info, _)| Ok((score, info))).collect())?;
-    let (magnitude, _) =
-        certified_pairs_sum(rows.iter().map(|&(_, _, magnitude)| Ok((magnitude, 0.0))).collect())?;
+    let rows: Vec<(f64, f64, f64)> = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok((0.0, 0.0, 0.0));
+        }
+        let yi = y[i];
+        if !valid_count_response(yi) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial response",
+                eta[i],
+                yi,
+            ));
+        }
+        let theta_plus_mu = theta + means[i];
+        let theta_plus_y = theta + yi;
+        let digamma_y = digamma(yi + theta);
+        let ln_theta_plus_mu = theta_plus_mu.ln();
+        let ratio = theta_plus_y / theta_plus_mu;
+        let s = digamma_y - psi_theta + ln_theta + 1.0 - ln_theta_plus_mu - ratio;
+        // Avoid forming `(theta + mu)^2`, which can overflow even when the
+        // information term itself is representable.
+        let info_row = -trigamma(yi + theta) + trigamma_theta - inv_theta + 2.0 / theta_plus_mu
+            - (theta_plus_y / theta_plus_mu) / theta_plus_mu;
+        let score = wi * s;
+        let info = wi * info_row;
+        let magnitude = wi
+            * (digamma_y.abs()
+                + psi_theta.abs()
+                + ln_theta.abs()
+                + 1.0
+                + ln_theta_plus_mu.abs()
+                + ratio.abs());
+        if !(score.is_finite() && info.is_finite() && magnitude.is_finite()) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial theta score/information",
+                eta[i],
+                score,
+            ));
+        }
+        Ok((score, info, magnitude))
+    })?;
+    let score_info: Vec<(f64, f64)> = rows.iter().map(|&(score, info, _)| (score, info)).collect();
+    let (score, info) = certified_pairs_sum(&score_info)?;
+    let magnitudes: Vec<(f64, f64)> =
+        rows.iter().map(|&(_, _, magnitude)| (magnitude, 0.0)).collect();
+    let (magnitude, _) = certified_pairs_sum(&magnitudes)?;
     // Each row's score is formed with fourteen rounded operations (three argument
     // sums, two digammas, two logarithms, the quotient, five additions and the
     // weight) over a cancelling sum of magnitude `magnitude`, and the rows are
@@ -570,36 +551,33 @@ pub(crate) fn estimate_negbin_theta_from_eta(
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<f64, EstimationError> {
     let means = certified_log_means(eta)?;
-    let seed_rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
-            if wi == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            if !valid_count_response(y[i]) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                    i,
-                    "negative-binomial response",
-                    eta[i],
-                    y[i],
-                ));
-            }
-            let resid = y[i] - means[i];
-            let pearson = wi * resid * resid / means[i];
-            let weighted_mu = wi * means[i];
-            if !(pearson.is_finite() && pearson >= 0.0 && weighted_mu.is_finite()) {
-                return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                    i,
-                    "negative-binomial seed statistic",
-                    eta[i],
-                    pearson,
-                ));
-            }
-            Ok((weighted_mu, pearson))
-        })
-        .collect();
-    let (wmu, wpearson) = certified_pairs_sum(seed_rows)?;
+    let seed_rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok((0.0, 0.0));
+        }
+        if !valid_count_response(y[i]) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial response",
+                eta[i],
+                y[i],
+            ));
+        }
+        let resid = y[i] - means[i];
+        let pearson = wi * resid * resid / means[i];
+        let weighted_mu = wi * means[i];
+        if !(pearson.is_finite() && pearson >= 0.0 && weighted_mu.is_finite()) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial seed statistic",
+                eta[i],
+                pearson,
+            ));
+        }
+        Ok((weighted_mu, pearson))
+    })?;
+    let (wmu, wpearson) = certified_pairs_sum(&seed_rows)?;
     let total_weight = priorweights.iter().try_fold(0.0, |sum, &w| {
         if w.is_finite() && w >= 0.0 {
             let next = sum + w;

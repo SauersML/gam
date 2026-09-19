@@ -861,7 +861,7 @@ pub(crate) fn beta_logit_working_curvature_eta_derivatives(
     (c, d)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ExactBetaLogitRow {
     pub(crate) mu: f64,
     pub(crate) weight: f64,
@@ -1103,11 +1103,9 @@ pub(crate) fn write_beta_logit_working_state(
         crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
     }
     validate_beta_responses(&y, &priorweights)?;
-    let certified: Vec<Result<ExactBetaLogitRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| exact_beta_logit_row(i, eta[i], Some(y[i]), priorweights[i], phi))
-        .collect();
-    let certified: Vec<ExactBetaLogitRow> = certified.into_iter().collect::<Result<_, _>>()?;
+    let certified: Vec<ExactBetaLogitRow> = super::par_certified_rows(eta.len(), |i| {
+        exact_beta_logit_row(i, eta[i], Some(y[i]), priorweights[i], phi)
+    })?;
     if let Some(mut derivs) = derivatives {
         let WorkingSlices {
             mu: mu_s,

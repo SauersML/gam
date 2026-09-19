@@ -26,6 +26,7 @@ mod penalty;
 mod pls_solver;
 mod residuals;
 mod reweight;
+mod row_pass;
 mod sparse_system;
 mod state;
 mod student_t;
@@ -65,6 +66,7 @@ pub use family_state::{
     valid_count_response,
 };
 pub(crate) use gam_working_model::*;
+pub(crate) use row_pass::*;
 pub use glm_update::*;
 pub use low_rank::*;
 pub use newton_solve::*;
@@ -131,5 +133,3 @@ pub use loop_driver::{
     nfree_skip_row_element_touches,
 };
 
-/// Allow up to 128MB per thread for cached L-BFGS/PIRLS history.
-pub(crate) const PIRLS_CACHE_BYTE_BUDGET: usize = 128 * 1024 * 1024;

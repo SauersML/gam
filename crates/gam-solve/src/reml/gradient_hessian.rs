@@ -3937,6 +3937,7 @@ impl<'a> RemlState<'a> {
 
         let runtime_mixture_link_state = config.link_kind.mixture_state().cloned();
         let runtime_sas_link_state = config.link_kind.sas_state().copied();
+        let pirls_cache_budget = pirls_cache_byte_budget(&x);
 
         Ok(Self {
             y,
@@ -3955,7 +3956,7 @@ impl<'a> RemlState<'a> {
             coefficient_lower_bounds,
             linear_constraints,
             rho_prior: RhoPrior::Flat,
-            cache_manager: EvalCacheManager::new(),
+            cache_manager: EvalCacheManager::new(pirls_cache_budget),
             arena: RemlArena::new(),
             warm_start_beta: RwLock::new(None),
             warm_start_rho: RwLock::new(None),

@@ -1,6 +1,5 @@
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
-use crate::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::pirls::assemble_and_factor_sparse_penalized_system;
 use gam_linalg::sparse_exact::SparseExactFactor;
 use gam_problem::OuterEval;
@@ -1020,7 +1019,7 @@ mod tests {
 
     #[test]
     pub(crate) fn eval_cache_manager_stores_first_order_outer_eval() {
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let rho = array![0.25, -0.0];
         let rho_key = super::rho_key::sanitized_rhokey(&rho);
         let eval = OuterEval {
@@ -1076,7 +1075,7 @@ mod tests {
                     .all(|(x, y)| x.to_bits() == y.to_bits())
         };
 
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
 
         // (1) Round-trip fidelity: store at rho_a, then a forced hit must equal
         // the stored eval bit-for-bit (the "hit == miss" guarantee).
@@ -1124,7 +1123,7 @@ mod tests {
         // (3) Honest eviction: overflow the LRU with fresh keys. The
         // least-recently-used entry must be evicted and then MISS (forcing a
         // recompute), while a still-resident key returns its exact stored bits.
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let mut keys = Vec::new();
         let mut evals = Vec::new();
         for i in 0..OUTER_EVAL_LRU_CAPACITY {
@@ -5105,9 +5104,11 @@ impl SparseRemlDecision {
 /// Eviction is byte-budgeted rather than entry-count-budgeted: each entry
 /// records its own estimated footprint (the surviving n-length vectors plus
 /// the two p×p Hessians plus per-entry overhead) and the cache evicts in
-/// LRU order until the running total fits under the budget. An entry that
-/// individually exceeds the budget is rejected silently rather than poisoning
-/// the cache.
+/// LRU order until the running total fits under the budget. The newest entry
+/// is always kept, alone if it alone exceeds the budget, so the next
+/// evaluation at its ρ (a gradient after a value) reuses the solve: the cache
+/// holds at most the larger of its budget and one solve, which the evaluation
+/// that produced it held anyway.
 pub(crate) struct PirlsLruCache {
     // Stored tuple: (compacted result, last-touched clock, estimated bytes).
     pub(crate) map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
@@ -5139,19 +5140,10 @@ impl PirlsLruCache {
     pub(crate) fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
         self.clock += 1;
         let bytes = pirls_result_cache_bytes(&value);
-        // Refuse entries that on their own already exceed the entire budget;
-        // caching one would force eviction of every other entry without
-        // leaving room for the new one anyway.
-        if bytes > self.byte_budget {
-            if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
-                self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
-            }
-            return;
-        }
         if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
             self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
         }
-        while self.current_bytes + bytes > self.byte_budget {
+        while !self.map.is_empty() && self.current_bytes + bytes > self.byte_budget {
             let evict_key = self
                 .map
                 .iter()
@@ -5230,6 +5222,27 @@ impl PenaltySubspaceCacheKey {
             penalty_matrix_fingerprint: hasher.finish(),
         }
     }
+}
+
+/// Byte budget of one fit's PIRLS result cache.
+///
+/// A cache hit saves one P-IRLS solve, and a solve costs passes over the
+/// design, so the memo may hold as many bytes as the dense design it
+/// memoizes and no more: at any `n` and any number of outer evaluations it is
+/// one further design-sized store, or the newest solve alone where one solve
+/// outgrows the design (see [`PirlsLruCache::insert`]). The
+/// host bound is the governor's stationary per-operation ceiling rather than
+/// live availability, so which evaluations hit the cache never depends on
+/// what else the machine is doing (SPEC-20).
+///
+/// A fixed budget was pyGAM audit speed F11: 128 MiB regardless of the
+/// design, so a Poisson fit at n = 1e5 with an 8.8 MB design pinned 133 MB of
+/// cached solves.
+pub(crate) fn pirls_cache_byte_budget(x: &DesignMatrix) -> usize {
+    let host_ceiling =
+        gam_runtime::resource::MemoryGovernor::global().single_materialization_cap_bytes();
+    gam_runtime::resource::dense_f64_bytes(x.nrows(), x.ncols())
+        .map_or(host_ceiling, |design_bytes| design_bytes.min(host_ceiling))
 }
 
 /// Estimate the in-cache footprint of a (compacted) PIRLS result.
@@ -5392,9 +5405,11 @@ pub(crate) struct EvalCacheManager {
 }
 
 impl EvalCacheManager {
-    pub(crate) fn new() -> Self {
+    /// `pirls_cache_byte_budget` is the fit's PIRLS result-cache budget,
+    /// derived once per fit by [`pirls_cache_byte_budget`].
+    pub(crate) fn new(pirls_cache_byte_budget: usize) -> Self {
         Self {
-            pirls_cache: RwLock::new(PirlsLruCache::new(PIRLS_CACHE_BYTE_BUDGET)),
+            pirls_cache: RwLock::new(PirlsLruCache::new(pirls_cache_byte_budget)),
             penalty_subspace_cache: RwLock::new(PenaltySubspaceCache::new()),
             current_eval_bundle: RwLock::new(None),
             current_outer_eval: RwLock::new(None),
