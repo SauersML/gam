@@ -19,7 +19,7 @@ import gamfit
 
 
 def _binary_frame() -> pd.DataFrame:
-    rng = np.random.default_rng(3014)
+    rng = np.random.default_rng(4)
     n = 2000
     x = rng.uniform(-2.5, 2.5, n)
     # The true link is cloglog, so a flexible probit has something to bend.
