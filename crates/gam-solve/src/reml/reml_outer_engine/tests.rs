@@ -3080,6 +3080,47 @@ pub(crate) fn test_dense_spectral_operator_rotated_logdet_cross_matches_dense_pa
 }
 
 #[test]
+pub(crate) fn test_dense_spectral_operator_batched_logdet_crosses_match_pairwise() {
+    // The batched GEMM contraction regroups the same Σ_{a,b} sum the pairwise
+    // kernel evaluates, so the two agree to rounding for every (i, j).
+    let p = 7usize;
+    let m = 5usize;
+    let mut state = 0xC205_5EED_u64;
+    let mut unit = || {
+        let bits = gam_linalg::utils::splitmix64(&mut state) >> 11;
+        (bits as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+    };
+    let mut root = Array2::<f64>::zeros((p, p));
+    root.mapv_inplace(|_| unit());
+    let mut h = root.t().dot(&root);
+    for d in 0..p {
+        h[[d, d]] += 0.5;
+    }
+    let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+    let rotated: Vec<Array2<f64>> = (0..m)
+        .map(|_| {
+            let mut drift = Array2::<f64>::zeros((p, p));
+            drift.mapv_inplace(|_| unit());
+            let drift = &drift + &drift.t();
+            op.rotate_to_eigenbasis(&drift)
+        })
+        .collect();
+
+    let batched = op.trace_logdet_hessian_crosses_rotated(&rotated);
+    for i in 0..m {
+        for j in 0..m {
+            let pairwise = op.trace_logdet_hessian_cross_rotated(&rotated[i], &rotated[j]);
+            assert_relative_eq!(
+                batched[[i, j]],
+                pairwise,
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+        }
+    }
+}
+
+#[test]
 pub(crate) fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
     // streaming and dense paths differ only by reordering the sum that builds v;
     // with n=64, p=8 the gap is bounded by O(εn) ≈ 1e-14.
