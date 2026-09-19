@@ -4596,5 +4596,13 @@
     },
     "reason": "#3036 follow-up to 16db27c9a8: the gam-local NegativeCurvatureClaim and negative_curvature_claim move to opt (SauersML/opt 17dea8b4539a526ec311bc312945bb0d8a1f761f, SPEC 24: general outer-optimizer work lives in opt), beside opt::unresolvable_curvature_magnitude(alpha_max, res) = 2*res/alpha_max^2, which the predicate reads. gam re-exports both from opt under their old paths (rho_optimizer/run.rs `pub(crate) use opt::{...}`, next to certificate_curvature_shift), so every call site and the #3036 tests resolve unchanged, and gam's criterion_curvature_resolution now calls the same magnitude at NEGATIVE_CURVATURE_LADDER_LARGEST_STEP. One number decides resolvability for the adjudication and for the definiteness, seed and decrement verdicts.",
     "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
+  },
+  {
+    "base": "9580f2c1bfa0efa51d16e67a181ec09476782d7f",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs::gate_duchon_operator_penalties_for_family": 1
+    },
+    "reason": "Duchon operator penalties: one penalty structure for every family. gate_duchon_operator_penalties_for_family (with its helper disable_duchon_operator_penalties_in_basis) stripped the Duchon mass and tension operator penalties from every standard fit that was not Gaussian-identity (#1074), on the claim that fixed-dispersion LAML mis-rewards those blocks. Both LAML arms keep log|H| and log|S|+ (the Fixed arm sets include_logdet_h and include_logdet_s exactly as ProfiledGaussian does), so the claim has no criterion basis. What the gate did in practice was make scale_dimensions a no-op for GLMs: the promoted anisotropic s=0 Duchon carries per-axis relevance only through the tension-ARD penalties it removed. The gate and its call in materialize/standard.rs are deleted; every family now fits the resolved Duchon operator penalties as specified.",
+    "evidence": "Removed with no replacement: no caller should rewrite the Duchon penalty structure by family. In the landing tree the name occurs 0 times (git grep -c); its only caller, materialize/standard.rs, drops the call in the same change."
   }
 ]
