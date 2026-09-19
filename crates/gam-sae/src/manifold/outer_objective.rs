@@ -1353,7 +1353,13 @@ impl SaeManifoldOuterObjective {
             // The block weights are NOT the last sub-vector: #2604 appends
             // per-atom curvature after them, so the range comes from the layout.
             let range = rho.block_flat_range();
-            debug_assert_eq!(range.len(), block_grad.len());
+            if range.len() != block_grad.len() {
+                return Err(OuterGradientError::internal(format!(
+                    "block gradient carries {} entries for the {} block coordinates of rho",
+                    block_grad.len(),
+                    range.len()
+                )));
+            }
             for (coord, value) in range.zip(block_grad) {
                 gradient[coord] += value;
             }
