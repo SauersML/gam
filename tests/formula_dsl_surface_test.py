@@ -6,8 +6,8 @@ Pins the user-visible contract of:
   slope without the intercept is ordinary least squares through the origin,
   and a term that spans the constant (``0 + g``, ``0 + g:h``, ``0 + s(x)``)
   keeps the intercept, so only the constant is unpenalized;
-* backtick-quoted, non-identifier column names and ``C()`` as a ``factor()``
-  alias;
+* backtick-quoted, non-identifier column names (``C()`` is refused in favour
+  of ``factor()``);
 * ``domain=[a, b]`` on ``s()`` (validated against the data, linear
   extrapolation past it at predict time);
 * strict option parsing: a malformed value, an unknown option, or
@@ -131,13 +131,13 @@ def test_no_intercept_model_round_trips_through_save_and_load(tmp_path):
     np.testing.assert_allclose(_predict(reloaded, grid), _predict(model, grid), rtol=1e-12)
 
 
-def test_backtick_columns_and_c_alias_match_plain_names():
+def test_backtick_columns_match_plain_names():
     x, y = _linear_data()
     site = np.resize(np.array(["north", "south", "east"]), N)
     y = y + np.where(site == "south", 0.5, 0.0)
     quoted = gamfit.fit(
         {"y": y, "dose (mg)": x, "site-id": site},
-        "y ~ `dose (mg)` + C(`site-id`)",
+        "y ~ `dose (mg)` + factor(`site-id`)",
         family="gaussian",
     )
     plain = gamfit.fit(
@@ -150,6 +150,12 @@ def test_backtick_columns_and_c_alias_match_plain_names():
         _predict(plain, {"dose": x, "site": site}),
         rtol=1e-8,
     )
+    with pytest.raises(gamfit.errors.FormulaError, match=r"`C\(\)` is not a term function.*factor\(`site-id`\)"):
+        gamfit.fit(
+            {"y": y, "dose (mg)": x, "site-id": site},
+            "y ~ `dose (mg)` + C(`site-id`)",
+            family="gaussian",
+        )
 
 
 def test_domain_must_contain_the_data():

@@ -322,9 +322,6 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     }
 
     for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
-        if range.is_empty() || !spec.random_effect_terms[re_idx].penalized {
-            continue;
-        }
         let block_size = range.len();
         let global_index = penalties.len();
         penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));

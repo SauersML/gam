@@ -4893,11 +4893,7 @@ fn assert_keeps_only_the_constant_free(ds: &Dataset, formula: &str, with_interce
 #[test]
 fn no_intercept_factor_keeps_its_ridge_and_frees_only_the_constant() {
     let ds = two_factor_dataset();
-    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)", "y ~ 0 + C(f)"] {
-        let spec = build_formula(formula, &ds);
-        let re = &spec.random_effect_terms[0];
-        assert!(!re.drop_first_level, "`{formula}` keeps every level");
-        assert!(re.penalized, "`{formula}`: the level contrasts keep their ridge");
+    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)"] {
         assert_keeps_only_the_constant_free(&ds, formula, "y ~ f");
     }
     assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f + g", "y ~ f + g");
@@ -4913,7 +4909,6 @@ fn no_intercept_genuine_random_effect_does_not_span_the_constant() {
 
     let spec = build_formula("y ~ 0 + x + group(f)", &ds);
     assert_eq!(spec.level, ModelLevel::NoIntercept);
-    assert!(spec.random_effect_terms[0].penalized);
     let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
         .expect("design builds");
     assert!(design.intercept_range.is_empty(), "no all-ones column without a spanning term");
