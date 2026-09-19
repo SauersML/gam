@@ -49,7 +49,7 @@ The engine also provides, past fitting and point prediction (see
   intervals (split, jackknife+, and full conformal), and posterior draws
   via NUTS or a Laplace approximation, with posterior-predictive checks.
 - **Model comparison** — per-term Wald and likelihood-ratio tests, and
-  AIC / approximate-leave-one-out comparison via `compare_models`.
+  ranking on the smoothing-corrected AIC via `compare_models`.
 - **Difference smooths** — covariance-aware contrasts between by-group
   smooths, with optional simultaneous bands.
 - **Diagnostics and reports** — `summary` (coefficient table, effective
@@ -111,7 +111,7 @@ gam report model.json data.csv
 ```
 
 CLI subcommands: `fit`, `predict`, `report`, `diagnose`, `sample`,
-`generate`. Run `gam <command> --help` for options.
+`generate`, `compare`. Run `gam <command> --help` for options.
 
 ## Examples
 
@@ -159,8 +159,8 @@ against the frozen dictionary, memory `O(N·top_k)` — the LLM-scale path).
 Fits mint only from a converged, certificate-checked optimization.
 
 ```python no-exec
-fit = gamfit.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
-                              assignment="topk", top_k=8)   # K >> p, topology=auto
+fit = gamfit.sae.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
+                                  assignment="topk", top_k=8)   # K >> p, topology=auto
 census = Counter(fit.atom_topologies)     # which shapes the evidence kept
 codes = fit.encode(acts_new)              # sparse support + amplitude + coordinate
 curve = fit.atom_curve(k, ts)             # the atom's decoded manifold, sampled
@@ -314,8 +314,9 @@ gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=["sand
 gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=["nx", "ny", "nz"])
 ```
 
-Model comparison. `compare_models` reports AIC and approximate
-leave-one-out (elpd), corrected for smoothing-parameter selection.
+Model comparison. `compare_models` ranks fits on the Wood-Pya-Saefken AIC,
+corrected for smoothing-parameter selection (`gam compare` prints the same
+document from saved models).
 
 ```python
 gamfit.compare_models([model_a, model_b])
@@ -360,7 +361,7 @@ print the calibrated thresholds:
 
 ```python
 import gamfit
-print(gamfit.format_cuda_diagnostics())
+print(gamfit.cuda.format_cuda_diagnostics())
 ```
 
 The wheel is compiled against the CUDA 12 driver/userspace ABI. If PyTorch has

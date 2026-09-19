@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from ._binding import rust_module
 from ._penalty_bridge import GumbelTemperatureSchedule
 
-ManifoldSAE = rust_module().ManifoldSAE
-Tier0SAE = rust_module().Tier0SAE
+if TYPE_CHECKING:
+    from ._rust import ManifoldSAE as ManifoldSAE, Tier0SAE as Tier0SAE
+else:
+    ManifoldSAE = rust_module().ManifoldSAE
+    Tier0SAE = rust_module().Tier0SAE
 _FISHER_SHARD_SCHEMA = "gamfit.FisherHarvest/v1"
 
 
@@ -208,7 +211,9 @@ def sae_manifold_fit(
             for group in decoder_feature_sparsity_groups
         ]
     )
-    return rust_module().sae_manifold_fit_model(
+    # The native front door returns a ``Tier0SAE`` when the fit resolves to the
+    # null (no-atom) outcome and a ``ManifoldSAE`` otherwise.
+    model: ManifoldSAE | Tier0SAE = rust_module().sae_manifold_fit_model(
         x,
         int(K),
         _atom_dimensions(d_atom),
@@ -254,6 +259,7 @@ def sae_manifold_fit(
             structured_residual_passes
         ),
     )
+    return model
 
 
 def sae_manifold_certify_external(
@@ -360,13 +366,6 @@ def flat_block_assignment(gating: str) -> str:
     return str(rust_module().sae_flat_block_assignment(str(gating)))
 
 
-def plot(atom: Any, **kwargs: Any) -> Any:
-    """Plot SAE atoms through the visualization-only Python helper."""
-    from . import _sae_viz
-
-    return _sae_viz.plot(atom, **kwargs)
-
-
 __all__ = [
     "GumbelTemperatureSchedule",
     "ManifoldSAE",
@@ -375,7 +374,6 @@ __all__ = [
     "gumbel_geometric_schedule",
     "gumbel_linear_schedule",
     "gumbel_reciprocal_iter_schedule",
-    "plot",
     "sae_manifold_certify_external",
     "sae_manifold_fit",
 ]

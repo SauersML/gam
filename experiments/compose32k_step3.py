@@ -156,10 +156,10 @@ try:
 except Exception:
     pcb = None
 _kw = {}
-if pcb is not None and "progress_callback" in inspect.signature(gamfit.sae_manifold_fit).parameters:
+if pcb is not None and "progress_callback" in inspect.signature(gamfit.sae.sae_manifold_fit).parameters:
     _kw["progress_callback"] = pcb
 z = np.load(sys.argv[1])
-chart = gamfit.sae_manifold_fit(np.ascontiguousarray(z, dtype=np.float64), K=1,
+chart = gamfit.sae.sae_manifold_fit(np.ascontiguousarray(z, dtype=np.float64), K=1,
     d_atom=int(sys.argv[3]), atom_topology=sys.argv[4], n_iter=int(sys.argv[5]),
     random_state=int(sys.argv[6]), **_kw)
 recon = np.asarray(chart.reconstruct(z), dtype=np.float64)

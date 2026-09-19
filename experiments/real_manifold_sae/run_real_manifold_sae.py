@@ -1,6 +1,6 @@
 """Real gamfit ManifoldSAE fit on REAL Qwen3-8B L18 activations (pos0 sink-peeled).
 
-This is the actual product path -- ``gamfit.sae_manifold_fit`` on the SAME
+This is the actual product path -- ``gamfit.sae.sae_manifold_fit`` on the SAME
 pos0-null-gated peeled input as curved_vs_linear.py Run-2 -- NOT the
 numpy kmeans+PCA proxy atlas. We compare the real fitter's reconstruction EV to the
 Run-2 references at matched capacity (linear PCA d=1, proxy atlas K32 d=1).
@@ -231,7 +231,7 @@ def main():
         print(f"=== REAL sae_manifold_fit K={K} d_atom={args.d_atom} n_iter={n_iter} ===", flush=True)
         t0 = time.time()
         try:
-            model = gamfit.sae_manifold_fit(Xp, K=K, d_atom=args.d_atom, n_iter=n_iter, random_state=0)
+            model = gamfit.sae.sae_manifold_fit(Xp, K=K, d_atom=args.d_atom, n_iter=n_iter, random_state=0)
             wall = time.time() - t0
             rec = extract(model, Xp, tot, f"sae_manifold_fit K={K} d_atom={args.d_atom}")
             rec["K_requested"] = K
@@ -242,7 +242,7 @@ def main():
                   f"topo={rec.get('atom_topology_counts')} wall={wall:.1f}s", flush=True)
             # trust diagnostics
             try:
-                td = gamfit.sae_trust_diagnostics(model.to_dict())
+                td = gamfit.sae.sae_trust_diagnostics(model.to_dict())
                 rec["trust_diagnostics"] = _jsonable(td)
             except Exception as e:
                 rec["trust_diagnostics"] = f"<err {e}>"

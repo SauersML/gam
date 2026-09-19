@@ -19,16 +19,22 @@ already-migrated ``sphere_frechet_mean`` seam.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from .._binding import rust_module
 from . import _torch_compat as _tc
 from ._coerce import from_numpy_like, to_numpy_f64
 
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
-def _rust() -> Any:
+    from .._rust_module import RustModule
+
+
+def _rust() -> RustModule:
     return rust_module()
 
 
@@ -61,7 +67,7 @@ def _as_tangent(value: torch.Tensor, *, label: str) -> torch.Tensor:
     return value
 
 
-def _base_numpy(base: torch.Tensor) -> Any:
+def _base_numpy(base: torch.Tensor) -> NDArray[np.float64]:
     """Marshal a base point to a contiguous 1-D f64 NumPy array (detached)."""
     if not isinstance(base, torch.Tensor):
         raise TypeError("base must be a torch.Tensor")
@@ -82,21 +88,25 @@ def _contract(jac: torch.Tensor, grad_output: torch.Tensor) -> torch.Tensor:
 
 class _ClrFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx: Any, values: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+    def forward(ctx: Any, values: torch.Tensor) -> torch.Tensor:
         value_np, jac_np = _rust().response_geometry_clr_jet(to_numpy_f64(values))
         ctx.save_for_backward(from_numpy_like(jac_np, values))
         return from_numpy_like(value_np, values)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
         (jac,) = ctx.saved_tensors
         return _contract(jac, grad_output)
 
 
 class _SimplexLogMapFn(torch.autograd.Function):
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx: Any, values: torch.Tensor, base_np: Any, coordinates: str, reference: int
+    def forward(
+        ctx: Any,
+        values: torch.Tensor,
+        base_np: NDArray[np.float64],
+        coordinates: str,
+        reference: int,
     ) -> torch.Tensor:
         value_np, jac_np = _rust().response_geometry_simplex_log_map_jet(
             to_numpy_f64(values), base_np, coordinates, int(reference)
@@ -105,15 +115,21 @@ class _SimplexLogMapFn(torch.autograd.Function):
         return from_numpy_like(value_np, values)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
         (jac,) = ctx.saved_tensors
         return _contract(jac, grad_output), None, None, None
 
 
 class _SimplexExpMapFn(torch.autograd.Function):
     @staticmethod
-    def forward(  # type: ignore[override]
-        ctx: Any, tangent: torch.Tensor, base_np: Any, coordinates: str, reference: int
+    def forward(
+        ctx: Any,
+        tangent: torch.Tensor,
+        base_np: NDArray[np.float64],
+        coordinates: str,
+        reference: int,
     ) -> torch.Tensor:
         value_np, jac_np = _rust().response_geometry_simplex_exp_map_jet(
             to_numpy_f64(tangent), base_np, coordinates, int(reference)
@@ -122,14 +138,18 @@ class _SimplexExpMapFn(torch.autograd.Function):
         return from_numpy_like(value_np, tangent)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
         (jac,) = ctx.saved_tensors
         return _contract(jac, grad_output), None, None, None
 
 
 class _SphereExpMapFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx: Any, tangent: torch.Tensor, base_np: Any) -> torch.Tensor:  # type: ignore[override]
+    def forward(
+        ctx: Any, tangent: torch.Tensor, base_np: NDArray[np.float64]
+    ) -> torch.Tensor:
         value_np, jac_np = _rust().response_geometry_sphere_exp_map_jet(
             to_numpy_f64(tangent), base_np
         )
@@ -137,7 +157,7 @@ class _SphereExpMapFn(torch.autograd.Function):
         return from_numpy_like(value_np, tangent)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor):  # type: ignore[override]
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         (jac,) = ctx.saved_tensors
         return _contract(jac, grad_output), None
 
@@ -154,7 +174,8 @@ def closure(values: torch.Tensor) -> torch.Tensor:
 def clr(values: torch.Tensor) -> torch.Tensor:
     """Centered log-ratio coordinates for positive compositions."""
     v = _as_matrix(values, label="simplex values")
-    return _ClrFn.apply(v)
+    out: torch.Tensor = _ClrFn.apply(v)
+    return out
 
 
 def alr(values: torch.Tensor, *, reference: int = -1) -> torch.Tensor:
@@ -192,7 +213,10 @@ def inverse_ilr(coords: torch.Tensor) -> torch.Tensor:
 
 
 def aitchison_metric(
-    d: int, *, dtype: Any = None, device: Any = None
+    d: int,
+    *,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """Aitchison Gram matrix ``G = I_{d-1} − (1/d)·11ᵀ`` for ALR coordinates.
 
@@ -235,7 +259,10 @@ def simplex_log_map(
     identity).
     """
     v = _as_matrix(values, label="simplex values")
-    return _SimplexLogMapFn.apply(v, _base_numpy(base), str(coordinates).lower(), int(reference))
+    out: torch.Tensor = _SimplexLogMapFn.apply(
+        v, _base_numpy(base), str(coordinates).lower(), int(reference)
+    )
+    return out
 
 
 def simplex_exp_map(
@@ -252,7 +279,10 @@ def simplex_exp_map(
     :func:`simplex_log_map`. ILR/ALR tangents have ``D-1`` columns, CLR has ``D``.
     """
     z = _as_tangent(tangent, label="tangent")
-    return _SimplexExpMapFn.apply(z, _base_numpy(base), str(coordinates).lower(), int(reference))
+    out: torch.Tensor = _SimplexExpMapFn.apply(
+        z, _base_numpy(base), str(coordinates).lower(), int(reference)
+    )
+    return out
 
 
 # ─────────────────────────── sphere charts ──────────────────────────────────
@@ -292,4 +322,5 @@ def sphere_log_map(values: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
 def sphere_exp_map(tangent: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
     """Exponential map from the ambient tangent space at ``base`` to the sphere."""
     z = _as_tangent(tangent, label="tangent")
-    return _SphereExpMapFn.apply(z, _base_numpy(base))
+    out: torch.Tensor = _SphereExpMapFn.apply(z, _base_numpy(base))
+    return out

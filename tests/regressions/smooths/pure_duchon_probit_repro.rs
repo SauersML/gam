@@ -137,11 +137,13 @@ fn build_problem(
         linear_terms: vec![linear("sex", 0)],
         random_effect_terms: vec![],
         smooth_terms: vec![nuisance("nuisance_mean")],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![nuisance("nuisance_slope")],
+        level: Default::default(),
     };
 
     (

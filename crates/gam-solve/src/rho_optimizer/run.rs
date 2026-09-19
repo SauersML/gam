@@ -33,6 +33,34 @@ pub(crate) fn outer_theta_bitwise_eq(left: &Array1<f64>, right: &Array1<f64>) ->
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
+/// Why a search on the parent's own inputs did not take the parent's point.
+pub(crate) const RESUME_DECLINED: &str = "the parent's certified point is not certified for this search's criterion (a pilot, an \
+     evidence fit or an alternation round, or a criterion this version computes differently), \
+     so this search ran as it runs cold";
+
+/// `config` as the resume attempt for a warm start on the parent's own inputs
+/// (gam#3002): the parent's point as the one seed, its inner mode installed
+/// there, and its recorded criterion value, so the search accepts the point
+/// where it stands or declines (`resume_prior_certificate`).
+pub(crate) fn resume_config(
+    config: &OuterConfig,
+    warm_start: &gam_model_api::WarmStart,
+) -> OuterConfig {
+    let mut resume = config.clone();
+    resume.initial_rho = Some(warm_start.theta.clone());
+    resume.initial_rho_candidates.clear();
+    resume.sole_seed = true;
+    resume.screen_initial_rho = false;
+    resume.screening_cap = None;
+    resume.initial_inner_seed = Some(BoundInnerSeed {
+        theta: warm_start.theta.clone(),
+        beta: warm_start.beta.clone(),
+    });
+    resume.initial_rho_is_prior_terminal_certificate = true;
+    resume.resume_value = Some(warm_start.value);
+    resume
+}
+
 /// Install cached inner state only at the exact outer coordinate that owns it.
 ///
 /// This function is called after a seed-attempt reset and immediately before
@@ -190,6 +218,13 @@ pub(crate) struct OuterConfig {
     /// about it: a terminal certificate is a rho a previous outer run already
     /// certified as stationary, so re-deriving it can only move it.
     pub(crate) initial_rho_is_prior_terminal_certificate: bool,
+    /// A resume attempt (gam#3002): the criterion value a prior fit certified at
+    /// `initial_rho`. The search then accepts `initial_rho` where it stands when
+    /// it is certified for THIS search's criterion (its value agrees within the
+    /// rounding envelope and its projected gradient is inside the band), and
+    /// otherwise declines with an error. It never searches
+    /// (`resume_prior_certificate`).
+    pub(crate) resume_value: Option<f64>,
     /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
     /// When set, the BFGS bridge drives this atomic on every accepted
     /// gradient eval to coarsen the inner Newton solve at early outer iters
@@ -386,6 +421,7 @@ impl Default for OuterConfig {
             screening_cap: None,
             screen_initial_rho: false,
             initial_rho_is_prior_terminal_certificate: false,
+            resume_value: None,
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
@@ -450,6 +486,15 @@ pub struct OuterProblem {
     problem_size: OuterProblemSize,
     rho_canonical_keys: Option<Vec<u64>>,
     sole_seed: bool,
+    /// The inner mode at one joined multistart seed: installed only at that
+    /// exact point (`install_matching_initial_inner_seed`).
+    warm_start: Option<BoundInnerSeed>,
+    /// A prior fit's certified point (`with_warm_start`, gam#3002).
+    warm_start_source: Option<gam_model_api::WarmStart>,
+    /// This problem is a multistart's resume attempt: a declined prior
+    /// certificate is returned as the error, and the multistart runs the cold
+    /// seeds itself.
+    resume_only: bool,
 }
 
 impl OuterProblem {
@@ -491,6 +536,9 @@ impl OuterProblem {
             problem_size: OuterProblemSize::default(),
             rho_canonical_keys: None,
             sole_seed: false,
+            warm_start: None,
+            warm_start_source: None,
+            resume_only: false,
         }
     }
 
@@ -617,6 +665,44 @@ impl OuterProblem {
         self.initial_rho_candidates.clear();
         self.sole_seed = true;
         self
+    }
+    /// Offer this search a prior fit's certified outer point (gam#3002). Every
+    /// warm-start source reaches every outer search through this one rule, and
+    /// [`Self::run`] and [`Self::run_certified_multistart`] derive from it what
+    /// the point may do without changing the point the search reports for its
+    /// own criterion (see [`gam_model_api::WarmStart`]):
+    /// - on the parent's own inputs the point is offered as a prior certificate
+    ///   first. The search accepts it with no outer iteration where it is
+    ///   certified for this search's criterion (`resume_prior_certificate`), and
+    ///   otherwise runs exactly as it runs cold, from a reset objective;
+    /// - on other inputs the independent multistart adds it as one more seed, so
+    ///   its argmin is taken over a superset of the cold seeds; the cascade,
+    ///   which certifies its first certifiable seed, runs cold and records why.
+    /// A point of another outer dimension belongs to another search: this one
+    /// runs cold.
+    pub fn with_warm_start(mut self, warm_start: &gam_model_api::WarmStart) -> Self {
+        self.warm_start_source = Some(warm_start.clone());
+        self
+    }
+    /// This problem with no warm start: the search a cold fit runs.
+    fn without_warm_start(&self) -> Self {
+        let mut cold = self.clone();
+        cold.warm_start = None;
+        cold.warm_start_source = None;
+        cold.resume_only = false;
+        cold
+    }
+    /// The warm start this search can take, if its point has this search's outer
+    /// dimension. A point of another dimension is recorded as not used here.
+    fn warm_start_for_this_search(&self) -> Option<&gam_model_api::WarmStart> {
+        let warm_start = self.warm_start_source.as_ref()?;
+        if warm_start.theta.len() != self.n_params {
+            warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
+                "the parent's certified point has another outer dimension than this search",
+            ));
+            return None;
+        }
+        Some(warm_start)
     }
     /// Wire the bidirectional inner-PIRLS feedback channel.
     ///
@@ -847,13 +933,15 @@ impl OuterProblem {
             initial_rho_candidates: self.initial_rho_candidates.clone(),
             previously_refused_seed_points: Vec::new(),
             carried_checkpoint: None,
-            initial_inner_seed: None,
+            initial_inner_seed: self.warm_start.clone(),
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
             screen_initial_rho: self.screen_initial_rho,
-            // Only the cache's final-hit path can establish this, and it says
-            // so where it sets `initial_rho`.
+            // Only a prior fit's certified point can establish these: the resume
+            // attempt `Self::run` derives from a warm start, and the cache's final
+            // hit, which says so where it sets `initial_rho`.
             initial_rho_is_prior_terminal_certificate: false,
+            resume_value: None,
             outer_inner_cap: self.outer_inner_cap.clone(),
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
@@ -1014,6 +1102,40 @@ impl OuterProblem {
         let objective_upper = obj.outer_domain_upper_bound()?;
         if objective_lower.is_some() || objective_upper.is_some() {
             install_objective_domain(&mut config, self.n_params, objective_lower, objective_upper)?;
+        }
+        // A warm start (`with_warm_start`): on the parent's inputs the point is
+        // offered as a prior certificate, and a decline leaves this search to run
+        // exactly as it runs cold; on other inputs this cascade, which certifies
+        // its first certifiable seed, runs cold. One warm-start source per
+        // search, so the cold run takes no cache session either.
+        if self.warm_start_source.is_some() {
+            if let Some(warm_start) = self.warm_start_for_this_search() {
+                if warm_start.same_inputs {
+                    match run_outer(obj, &resume_config(&config, warm_start), context) {
+                        Ok(result) => {
+                            warm_start.record(gam_model_api::WarmStartOutcome::Resumed);
+                            return Ok(result);
+                        }
+                        Err(decline) if self.resume_only => return Err(decline),
+                        Err(decline) => {
+                            log::info!(
+                                "[OUTER] {context}: the parent's certified point is not certified \
+                                 for this search's criterion ({decline}); running the cold search"
+                            );
+                            warm_start
+                                .record(gam_model_api::WarmStartOutcome::NotUsed(RESUME_DECLINED));
+                            obj.reset();
+                        }
+                    }
+                } else {
+                    warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
+                        "the fit's inputs differ from the parent's, and this search certifies its \
+                         first certifiable seed, so a new first seed would change the point it \
+                         reports",
+                    ));
+                }
+            }
+            return run_outer(obj, &config, context);
         }
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);
@@ -7869,6 +7991,11 @@ pub(crate) fn run_outer_uncertified(
                     err,
                 )
             })?;
+    }
+    // A resume attempt (gam#3002) accepts the prior certificate where it stands
+    // or declines; it runs no plan, so no fallback can search from the point.
+    if config.resume_value.is_some() {
+        return resume_prior_certificate(obj, config, &cap, context);
     }
     // Frontier ρ-scaling auto-switch (#986): at per-atom-EFS-eligible frontier
     // rho dimension the decoupled per-atom fixed point is the primary outer

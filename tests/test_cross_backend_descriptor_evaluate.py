@@ -40,7 +40,7 @@ def test_bspline_cross_backend_identical():
     rng = np.random.default_rng(0)
     x = rng.uniform(-1.0, 1.0, size=64)
 
-    spec = gamfit.BSpline(degree=3, periodic=False)
+    spec = gamfit.smooth.BSpline(degree=3, periodic=False)
 
     out_numpy = spec.evaluate(x, backend="numpy")
     out_torch = spec.evaluate(x, backend="torch")
@@ -72,7 +72,7 @@ def test_sphere_cross_backend_identical():
     lon = rng.uniform(-180.0, 180.0, size=32)
     pts = np.column_stack([lat, lon])
 
-    spec = gamfit.Sphere(n_centers=20, penalty_order=2, kernel="sobolev")
+    spec = gamfit.smooth.Sphere(n_centers=20, penalty_order=2, kernel="sobolev")
 
     # evaluate accepts *coords — but Sphere is naturally 2D so pass two 1D
     # columns separately.
@@ -89,7 +89,7 @@ def test_matern_supports_numpy_and_jax():
     (n, n_centers) basis (the obsolete torch-only premise is gone), and the
     jax path matches it numerically when jax is installed."""
     centers = np.linspace(0.0, 1.0, 8).reshape(-1, 1)
-    spec = gamfit.Matern(centers=centers, nu=1.5, length_scale=0.3)
+    spec = gamfit.smooth.Matern(centers=centers, nu=1.5, length_scale=0.3)
     x = np.linspace(0.0, 1.0, 16)
 
     out_numpy = _to_numpy(spec.evaluate(x, backend="numpy"))
@@ -108,13 +108,13 @@ def test_matern_supports_numpy_and_jax():
 def test_capability_matrix_declared():
     """Each descriptor declares SUPPORTED_BACKENDS — none missing."""
     matrix = {
-        gamfit.BSpline: {"torch", "numpy", "jax"},
-        gamfit.Duchon: {"torch", "numpy", "jax"},
-        gamfit.TensorBSpline: {"torch", "numpy", "jax"},
-        gamfit.Sphere: {"torch", "numpy", "jax"},
-        gamfit.PeriodicSplineCurve: {"torch", "numpy", "jax"},
-        gamfit.Pca: {"torch", "numpy", "jax"},
-        gamfit.Matern: {"torch", "numpy", "jax"},
+        gamfit.smooth.BSpline: {"torch", "numpy", "jax"},
+        gamfit.smooth.Duchon: {"torch", "numpy", "jax"},
+        gamfit.smooth.TensorBSpline: {"torch", "numpy", "jax"},
+        gamfit.smooth.Sphere: {"torch", "numpy", "jax"},
+        gamfit.smooth.PeriodicSplineCurve: {"torch", "numpy", "jax"},
+        gamfit.smooth.Pca: {"torch", "numpy", "jax"},
+        gamfit.smooth.Matern: {"torch", "numpy", "jax"},
     }
     for cls, expected in matrix.items():
         got = set(cls.SUPPORTED_BACKENDS)
@@ -124,7 +124,7 @@ def test_capability_matrix_declared():
 
 
 def test_unknown_backend_raises():
-    spec = gamfit.BSpline(degree=3)
+    spec = gamfit.smooth.BSpline(degree=3)
     x = np.linspace(0.0, 1.0, 8)
     with pytest.raises(ValueError, match="unknown backend"):
         spec.evaluate(x, backend="tensorflow")

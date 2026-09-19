@@ -77,6 +77,7 @@ fn spec_1d(length_scale: f64) -> TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![term_spec(length_scale)],
+        level: Default::default(),
     }
 }
 

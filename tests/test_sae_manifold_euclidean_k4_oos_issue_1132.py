@@ -54,7 +54,7 @@ def test_euclidean_k4_fit_and_oos_reconstruct_issue_1132():
 
     # K=4 is the regime that tripped the empty-Schur log-det and the OOS
     # M-mismatch; if either bug is live the fit or reconstruct raises here.
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=x_train,
         K=4,
         atom_basis="euclidean",

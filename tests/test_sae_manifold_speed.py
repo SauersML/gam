@@ -57,7 +57,7 @@ def test_periodic_atom_fit_recovers_one_harmonic_within_iteration_cap():
 
     # Work bound: the fit runs at most MAX_ITER outer iterations (deterministic),
     # no wall-clock budget (#2055).
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=4,
         atom_basis="periodic",

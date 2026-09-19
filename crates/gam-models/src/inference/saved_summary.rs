@@ -363,6 +363,7 @@ fn summary_smooth_terms(
             ref_df: row.ref_df,
             chi_sq: row.chi_sq,
             p_value: row.pvalue,
+            p_value_unavailable: row.pvalue_unavailable.map(|reason| reason.label()),
         })
         .collect())
 }
@@ -483,7 +484,10 @@ pub fn scan_smooth_label(scan: &ScanIntrospection) -> String {
 /// parametric coefficient block is empty (the smoother absorbs the polynomial
 /// null space) and no dense covariance is emitted — keeping `summary()` O(1) in
 /// `n` regardless of how many knots the smoother spans.
-fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> SummaryPayload {
+fn scan_summary_payload(
+    model: &FittedModel,
+    scan: &ScanIntrospection,
+) -> Result<SummaryPayload, String> {
     let smooth_terms = vec![SummarySmoothTermRow {
         name: scan_smooth_label(scan),
         edf: scan.edf,
@@ -493,8 +497,9 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         // as `summary.gam` does for terms whose Wald test is unavailable.
         chi_sq: None,
         p_value: None,
+        p_value_unavailable: None,
     }];
-    SummaryPayload {
+    Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
         family_name: model.display_family_name(),
         model_class: prediction_model_class_label(model),
@@ -524,6 +529,7 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         iterations: 0,
         edf_total: Some(scan.edf),
         edf_rank_bound: Vec::new(),
+        information_criteria: scan_information_criteria(scan)?,
         lambdas: vec![scan.lambda],
         coefficients: Vec::new(),
         smooth_terms,
@@ -540,7 +546,7 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         // fabricated "certified" block here would be the exact confusion
         // #2411 exists to remove.
         convergence: None,
-    }
+    })
 }
 
 /// Project the fit's sealed convergence evidence onto the summary surface
@@ -579,6 +585,7 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         inner_status: evidence.inner_status().label().to_string(),
         outer_iterations: evidence.outer_iterations(),
         outer,
+        estimator: SummaryEstimator::of(fit),
     }
 }
 
@@ -605,6 +612,108 @@ fn summary_basis_checks(model: &FittedModel) -> Vec<SummaryBasisCheckRow> {
         .collect()
 }
 
+/// Why an O(n) spline-scan model reports no corrected AIC.
+pub const NO_CORRECTED_AIC_ON_SPLINE_SCAN: &str =
+    "the O(n) spline-scan smoother retains no coefficient-space weighted Gram or \
+     smoothing-parameter covariance correction, so the Wood-Pya-Safken corrected AIC \
+     is not formed; refit the smooth with double_penalty=true to compare it";
+
+/// Why a fit at the exact zero-dispersion boundary reports no AIC at all.
+pub const NO_AIC_AT_EXACT_FIT: &str =
+    "the fit interpolates the response exactly (zero dispersion), so it has no \
+     normalized log-likelihood and no AIC";
+
+/// The information criteria a model summary publishes (#946, slop G2).
+///
+/// Both AICs are formed by the single owner
+/// [`gam_solve::inference::information_criteria`]; this is only their summary
+/// shape. `aic_corrected` is the criterion `compare_models` ranks on.
+#[derive(Clone, Debug, Serialize)]
+pub struct SummaryInformationCriteria {
+    /// `−2ℓ + 2·(edf_total + scale_dof)`: AIC conditional on `λ̂`.
+    pub aic_conditional: Option<f64>,
+    /// Wood–Pya–Säfken EDF `τ = tr(F) + tr(X'WX·C)/s`, which adds the
+    /// complexity the REML/LAML smoothing-parameter uncertainty spends.
+    pub edf_corrected: Option<f64>,
+    /// `−2ℓ + 2·(edf_corrected + scale_dof)`: the smoothing-corrected AIC.
+    pub aic_corrected: Option<f64>,
+    /// Estimated dispersion parameters counted in both AICs.
+    pub scale_dof: Option<f64>,
+    /// Why `aic_corrected` is `null`. Present iff it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aic_corrected_unavailable: Option<&'static str>,
+}
+
+impl SummaryInformationCriteria {
+    fn unavailable(reason: &'static str) -> Self {
+        Self {
+            aic_conditional: None,
+            edf_corrected: None,
+            aic_corrected: None,
+            scale_dof: None,
+            aic_corrected_unavailable: Some(reason),
+        }
+    }
+
+    /// `missing_correction` names why the correction was never attempted; a
+    /// dense fit passes `None` and the typed reason the EDF carries is used.
+    fn from_criteria(
+        criteria: gam_solve::inference::information_criteria::InformationCriteria,
+        missing_correction: Option<&'static str>,
+    ) -> Result<Self, String> {
+        let aic_corrected_unavailable = match criteria.aic_corrected {
+            Some(_) => None,
+            None => Some(
+                missing_correction
+                    .or(criteria.edf.unavailable_reason.map(|reason| reason.describe()))
+                    .ok_or_else(|| {
+                        "corrected AIC is absent without a recorded reason".to_string()
+                    })?,
+            ),
+        };
+        Ok(Self {
+            aic_conditional: Some(criteria.aic_conditional),
+            edf_corrected: criteria.edf.corrected,
+            aic_corrected: criteria.aic_corrected,
+            scale_dof: Some(criteria.scale_dof),
+            aic_corrected_unavailable,
+        })
+    }
+}
+
+fn summary_information_criteria(
+    fit: &UnifiedFitResult,
+) -> Result<SummaryInformationCriteria, String> {
+    let Some(log_likelihood) = fit.reported_log_likelihood() else {
+        return Ok(SummaryInformationCriteria::unavailable(NO_AIC_AT_EXACT_FIT));
+    };
+    let criteria = gam_solve::inference::information_criteria::information_criteria(
+        fit,
+        log_likelihood,
+    )
+    .map_err(|err| format!("failed to compute information criteria: {err}"))?;
+    SummaryInformationCriteria::from_criteria(criteria, None)
+}
+
+/// The scan fits a Gaussian identity smooth with a profiled σ̂², so it spends
+/// one scale degree of freedom beside its EDF; it retains nothing the
+/// corrected EDF is formed from.
+fn scan_information_criteria(
+    scan: &ScanIntrospection,
+) -> Result<SummaryInformationCriteria, String> {
+    use gam_solve::inference::information_criteria::{
+        CorrectedEdf, information_criteria_from_parts,
+    };
+    let edf = CorrectedEdf {
+        conditional: scan.edf,
+        corrected: None,
+        unavailable_reason: None,
+    };
+    let criteria = information_criteria_from_parts(scan.log_likelihood, edf, 1.0)
+        .map_err(|err| format!("failed to compute spline-scan information criteria: {err}"))?;
+    SummaryInformationCriteria::from_criteria(criteria, Some(NO_CORRECTED_AIC_ON_SPLINE_SCAN))
+}
+
 /// The summary payload of a saved model: its scalar fitted quantities, the
 /// coefficient table and covariance, the per-smooth significance table, the
 /// curvature and basis-adequacy rows the fit recorded, and the fit's own
@@ -612,7 +721,7 @@ fn summary_basis_checks(model: &FittedModel) -> Vec<SummaryBasisCheckRow> {
 /// retained.
 pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String> {
     if let Some(scan) = scan_introspection(model)? {
-        return Ok(scan_summary_payload(model, &scan));
+        return scan_summary_payload(model, &scan);
     }
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let (smooth_terms, smooth_terms_unavailable) = match summary_smooth_terms(model, &fit) {
@@ -649,6 +758,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     let reml_score = fit
         .comparable_reml_score()
         .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
+    let information_criteria = summary_information_criteria(&fit)?;
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
         family_name: model.display_family_name(),
@@ -674,6 +784,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
         edf_rank_bound: fit.edf_rank_bound().to_vec(),
+        information_criteria,
         lambdas: fit.lambdas.to_vec(),
         coefficients,
         smooth_terms,
@@ -686,6 +797,63 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         coefficient_se_source: display_uncertainty.map(|view| view.definition.as_str().to_string()),
         convergence: Some(summary_convergence(&fit)),
     })
+}
+
+/// The comparison candidate a saved model's summary defines, or the summary's
+/// own reason it has no corrected AIC to rank on.
+fn comparison_candidate(
+    name: String,
+    summary: SummaryPayload,
+) -> Result<gam_solve::evidence::ComparisonCandidate, String> {
+    let criteria = summary.information_criteria;
+    let (Some(aic_corrected), Some(edf_corrected), Some(aic_conditional)) = (
+        criteria.aic_corrected,
+        criteria.edf_corrected,
+        criteria.aic_conditional,
+    ) else {
+        let reason = criteria
+            .aic_corrected_unavailable
+            .unwrap_or("its summary publishes no corrected AIC");
+        return Err(format!(
+            "compare_models: model '{name}' cannot be ranked on aic_corrected: {reason}"
+        ));
+    };
+    let edf_conditional = summary
+        .edf_total
+        .ok_or_else(|| format!("compare_models: model '{name}' publishes no edf_total"))?;
+    let n_obs = summary
+        .n_obs
+        .ok_or_else(|| format!("compare_models: model '{name}' publishes no n_obs"))?;
+    Ok(gam_solve::evidence::ComparisonCandidate {
+        name,
+        family: summary.family_name,
+        n_obs,
+        aic_corrected,
+        aic_conditional,
+        edf_corrected,
+        edf_conditional,
+        reml_score: summary.reml_score,
+    })
+}
+
+/// Rank saved models on their smoothing-corrected AIC. The one comparison
+/// every front door (`gam compare`, `gamfit.compare_models`) serializes.
+pub fn compare_saved_models(
+    models: &[(String, &FittedModel)],
+) -> Result<gam_solve::evidence::ModelComparison, String> {
+    let candidates = models
+        .iter()
+        .map(|(name, model)| comparison_candidate(name.clone(), saved_model_summary(model)?))
+        .collect::<Result<Vec<_>, String>>()?;
+    gam_solve::evidence::compare_models(candidates)
+}
+
+/// Log Akaike evidence ratio of model `a` over model `b` on the corrected AIC,
+/// `½·(AIC_c(b) − AIC_c(a))`: the pairwise form of [`compare_saved_models`].
+pub fn saved_models_log_evidence_ratio(a: &FittedModel, b: &FittedModel) -> Result<f64, String> {
+    let a = comparison_candidate("a".to_string(), saved_model_summary(a)?)?;
+    let b = comparison_candidate("b".to_string(), saved_model_summary(b)?)?;
+    gam_solve::evidence::log_evidence_ratio(&a, &b)
 }
 
 #[derive(Serialize)]
@@ -718,6 +886,11 @@ pub struct SummarySmoothTermRow {
     pub chi_sq: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value: Option<f64>,
+    /// Why `p_value` is absent when the term has no valid reference law
+    /// (`"shape_constrained"`); see
+    /// [`gam_solve::estimate::SmoothPValueUnavailable`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_value_unavailable: Option<&'static str>,
 }
 
 /// The fitted curvature estimate for one `curv(...)` constant-curvature smooth
@@ -851,6 +1024,9 @@ pub struct SummaryPayload {
     /// recorded none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub edf_rank_bound: Vec<gam_solve::estimate::EdfRankBound>,
+    /// Conditional and smoothing-corrected AIC, flattened into the summary.
+    #[serde(flatten)]
+    pub information_criteria: SummaryInformationCriteria,
     pub lambdas: Vec<f64>,
     pub coefficients: Vec<SummaryCoefficientRow>,
     /// Per-smooth significance table (mgcv-style). Empty when the model has no
@@ -920,6 +1096,53 @@ pub struct SummaryConvergence {
     /// stationarity equation to solve, which is a different statement from a
     /// projected gradient that happened to be zero.
     pub outer: Option<SummaryOuterCertificate>,
+    /// Which objective the coefficients are the mode of, and why.
+    pub estimator: SummaryEstimator,
+}
+
+/// The objective a fit optimized, named once in Rust so every surface — the
+/// Python summary, the model repr and `gam summary` — prints the same words.
+///
+/// A fit whose estimator changed from the one requested (the separation rescue,
+/// the custom-family arming lifecycle) carries the typed evidence that forced
+/// the change; the reason is rendered from that evidence, never inferred from
+/// the coefficients.
+#[derive(Serialize)]
+pub struct SummaryEstimator {
+    /// `"penalized likelihood"` or `"penalized likelihood with Jeffreys prior"`.
+    pub name: String,
+    /// Why the Jeffreys prior is in the objective; `None` when it is not.
+    pub reason: Option<String>,
+    /// `name`, followed by the reason in parentheses when there is one.
+    pub text: String,
+}
+
+impl SummaryEstimator {
+    const PENALIZED_LIKELIHOOD: &'static str = "penalized likelihood";
+    const WITH_JEFFREYS_PRIOR: &'static str = "penalized likelihood with Jeffreys prior";
+
+    fn of(fit: &gam_solve::estimate::UnifiedFitResult) -> Self {
+        let artifacts = &fit.artifacts;
+        let reason = match &artifacts.jeffreys_arming_evidence {
+            Some(evidence) => Some(evidence.reason()),
+            None if artifacts.firth_bias_reduction => Some("requested by the caller".to_string()),
+            None => None,
+        };
+        let name = if reason.is_some() {
+            Self::WITH_JEFFREYS_PRIOR
+        } else {
+            Self::PENALIZED_LIKELIHOOD
+        };
+        let text = match &reason {
+            Some(reason) => format!("{name} ({reason})"),
+            None => name.to_string(),
+        };
+        Self {
+            name: name.to_string(),
+            reason,
+            text,
+        }
+    }
 }
 
 /// The outer (smoothing-parameter) stationarity certificate.
