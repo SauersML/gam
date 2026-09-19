@@ -3660,6 +3660,14 @@ where
                 )
             }))
             .collect();
+            // The ρ-block rails (native order), not the theta-wide
+            // `railed_facts`: the Hessian judged below is the ρ-Hessian, and a
+            // railed link-shape coordinate is not one of its axes.
+            let certificate_railed_coordinates: Vec<usize> = outer_result
+                .criterion_certificate
+                .as_ref()
+                .map(|certificate| certificate.lambdas_railed.clone())
+                .unwrap_or_default();
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
                 // The box the outer arm searched and the shipped-point
@@ -3679,6 +3687,13 @@ where
                 outer_result
                     .final_gradient()
                     .unwrap_or(&no_outer_gradient),
+                // The coordinates the certificate railed and judged the
+                // ρ-Hessian OFF. They are boundary estimates with
+                // `∂β̂/∂ρ_k = 0`; judging their axes here on a curvature the
+                // certificate never looked at refused the correction for every
+                // direction over a roundoff-negative `H_kk` on a saturated
+                // coordinate, and the fit shipped with no correction at all.
+                &certificate_railed_coordinates,
                 // #2748: the rho-Hessian the CERTIFICATE judged, so the
                 // correction can measure how far its own fresh assembly of the
                 // same object at the same point is from it. The gate inside
@@ -3707,8 +3722,11 @@ where
                     // defect. Ship the certified fit with the plug-in
                     // covariance and no correction; the downstream corrected
                     // EDF/AIC channels report the typed absence (#946/#1027)
-                    // instead of the whole fit dying over an enhancement. A
-                    // fit WITHOUT rail evidence keeps the fail-loud error: an
+                    // instead of the whole fit dying over an enhancement. The
+                    // railed axes themselves no longer land here — they are
+                    // excluded above with zero variance — so this is reached
+                    // only when an interior direction of such a fit is refused.
+                    // A fit WITHOUT rail evidence keeps the fail-loud error: an
                     // unexpectedly uninvertible outer Hessian on a
                     // well-conditioned interior optimum is a real defect.
                     let rail_certified =

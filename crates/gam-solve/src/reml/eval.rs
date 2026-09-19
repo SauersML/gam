@@ -1105,6 +1105,7 @@ impl<'a> RemlState<'a> {
         dispersion_phi: f64,
         finalgrad_norm: f64,
         outer_gradient: &Array1<f64>,
+        railed: &[usize],
         outer_hessian: Option<&Array2<f64>>,
         caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
     ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
@@ -1117,6 +1118,7 @@ impl<'a> RemlState<'a> {
             final_lambdas,
             final_fit,
             outer_gradient,
+            railed,
             outer_hessian,
             caller_measured_hessian_error,
         );
@@ -2181,6 +2183,8 @@ mod smoothing_correction_outcome_tests {
                     dispersion_phi,
                     finalgrad_norm,
                     &finalgrad,
+                    // No outer certificate, so no railed coordinate.
+                    &[],
                     // This harness has no outer solver behind it, so there is no
                     // second assembly of the rho-Hessian to compare against: an
                     // absent measurement, not a zero (#2748).

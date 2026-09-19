@@ -371,6 +371,9 @@ pub struct InvertedRhoHessian {
     /// the above: not certified flat, not a chain-rule term — just not
     /// resolved.
     pub unresolvable_curvature: usize,
+    /// Coordinate axes the outer certificate railed and therefore never judged
+    /// (see [`EigenClassification::Railed`]). Zero whenever no rail is passed.
+    pub railed: usize,
     pub used_structural_pseudoinverse: bool,
     /// The MEASURED curvature resolution the classification above was taken
     /// at: `‖δH‖₂` under Weyl, as the largest of this site's measured
@@ -416,6 +419,19 @@ pub enum EigenClassification {
     /// assert a certificate from the penalty map that the penalty map had not
     /// issued.
     UnresolvableCurvature,
+    /// A coordinate axis `e_k` the outer certificate RAILED: `ρ̂_k` sits on a
+    /// box face, so it is a boundary estimate, not an interior mode. The
+    /// certificate judged definiteness off these coordinates, and this site
+    /// does the same.
+    ///
+    /// It carries zero variance, and that is exact rather than a convenience.
+    /// A rail face is where the term's effective degrees of freedom sit at their
+    /// `λ → ∞` or `λ → 0` limit to within the gradient's resolution, so
+    /// `∂β̂/∂ρ_k = −H⁻¹ λ_k S_k β̂` vanishes there: `J e_k = 0`, and no value of
+    /// `V_ρ` along `e_k` changes `J V_ρ Jᵀ`. The curvature `H_kk` is reported,
+    /// never judged: it is the Hessian of a criterion that is flat toward the
+    /// limit, and its sign at roundoff scale is not a statement about the fit.
+    Railed,
 }
 
 /// Assemble `Q J Vρ Jᵀ Qᵀ` through a rectangular square-root factor.
@@ -635,15 +651,49 @@ pub(crate) fn eigenpair_residual_bounds(
 ///   on a point the certificate passed. When it does, what disagreed is the two
 ///   subsystems' evaluations, not the fit.
 ///
-/// The other difference — that the certificate excludes railed coordinates and
-/// this site excluded nothing — is gone as of #2676: both sites now deflate the
-/// same invariance through `crate::penalty_invariance::judged_subspace_basis`,
-/// and the certificate's rail exclusion is expressed through the same call.
+/// Both sites deflate the same invariance through
+/// `crate::penalty_invariance::judged_subspace_basis` (#2676). This entry point
+/// excludes no coordinate; [`invert_identified_rho_hessian_off_railed`] takes
+/// the certificate's railed set and excludes it through that same call, which
+/// is what the fitted-model correction does.
 pub fn invert_identified_rho_hessian(
     hessian_rho: &Array2<f64>,
     expected_structural_nullity: usize,
     outer_gradient: &Array1<f64>,
     invariance: Option<&Array2<f64>>,
+    caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
+) -> Result<InvertedRhoHessian, String> {
+    invert_identified_rho_hessian_off_railed(
+        hessian_rho,
+        expected_structural_nullity,
+        outer_gradient,
+        invariance,
+        &[],
+        caller_measured_hessian_error,
+    )
+}
+
+/// [`invert_identified_rho_hessian`] judged off the coordinates the outer
+/// certificate railed, the face the certificate itself judged on.
+///
+/// The certificate accepts ρ̂ by testing `H + diag(|g|)` for PSD on
+/// `judged_subspace_basis(n, railed, invariance)`: a railed `ρ̂_k` is a
+/// boundary estimate and its axis is not part of the curvature verdict. Judging
+/// the full matrix here instead re-decides those axes on a curvature the
+/// certificate never looked at, and a roundoff-negative `H_kk` on a coordinate
+/// saturated at `λ → ∞` then refused the correction for EVERY direction — the
+/// fit shipped with no smoothing correction at all although only the railed
+/// axes were in question. Each railed axis is accounted as
+/// [`EigenClassification::Railed`] with zero variance, which is exact because
+/// `J e_k = 0` on a rail face; every other direction is judged by the rule
+/// below, unchanged. An empty `railed` is [`invert_identified_rho_hessian`]
+/// bit for bit.
+pub fn invert_identified_rho_hessian_off_railed(
+    hessian_rho: &Array2<f64>,
+    expected_structural_nullity: usize,
+    outer_gradient: &Array1<f64>,
+    invariance: Option<&Array2<f64>>,
+    railed: &[usize],
     caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
 ) -> Result<InvertedRhoHessian, String> {
     let n = hessian_rho.nrows();
@@ -670,36 +720,84 @@ pub fn invert_identified_rho_hessian(
     // as the structural zeros the penalty map certifies. With no invariance
     // (`deflation = None`) every line below runs on `hessian_rho` itself, so a
     // model without a redundant penalty map does not move by an ulp.
+    let railed: Vec<usize> = railed
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<usize>>()
+        .into_iter()
+        .collect();
+    if let Some(&index) = railed.iter().find(|&&index| index >= n) {
+        return Err(format!(
+            "railed coordinate {index} is outside the {n}-dimensional rho Hessian"
+        ));
+    }
+    let railed_dimension = railed.len();
+
     let deflation = invariance.filter(|basis| basis.nrows() == n && basis.ncols() > 0);
-    let judged = deflation
-        .and_then(|basis| crate::penalty_invariance::judged_subspace_basis(n, &[], Some(basis)))
-        // A basis that spans everything deflates nothing, and compressing
-        // against it would only re-symmetrize `hessian_rho` in the last bits.
-        // Drop back to the untouched path instead.
-        .filter(|basis| basis.ncols() < n);
-    let deflated_dimension = judged.as_ref().map_or(0, |basis| n - basis.ncols());
+    let judged = if railed.is_empty() {
+        deflation
+            .and_then(|basis| crate::penalty_invariance::judged_subspace_basis(n, &[], Some(basis)))
+            // A basis that spans everything deflates nothing, and compressing
+            // against it would only re-symmetrize `hessian_rho` in the last
+            // bits. Drop back to the untouched path instead.
+            .filter(|basis| basis.ncols() < n)
+    } else {
+        // `None` here means nothing is left to judge: every coordinate is
+        // railed, or the invariance spans the whole interior face.
+        Some(
+            crate::penalty_invariance::judged_subspace_basis(n, &railed, deflation)
+                .unwrap_or_else(|| Array2::<f64>::zeros((n, 0))),
+        )
+    };
     let compressed = judged
         .as_ref()
         .map(|basis| crate::penalty_invariance::compress_to_judged_subspace(hessian_rho, basis));
     let work = compressed.as_ref().unwrap_or(hessian_rho);
     let judged_dimension = work.nrows();
 
-    let (judged_eigenvalues, judged_eigenvectors) = work
-        .eigh(faer::Side::Lower)
-        .map_err(|error| format!("rho-Hessian eigendecomposition failed: {error}"))?;
+    let (judged_eigenvalues, judged_eigenvectors) = if judged_dimension == 0 {
+        (Array1::<f64>::zeros(0), Array2::<f64>::zeros((0, 0)))
+    } else {
+        work.eigh(faer::Side::Lower)
+            .map_err(|error| format!("rho-Hessian eigendecomposition failed: {error}"))?
+    };
 
     // Every direction, in ρ coordinates and in one order: the deflated
     // invariance first (its Rayleigh quotient reported as measured, never
-    // judged), then the judged complement.
+    // judged), then the railed axes (likewise reported, never judged), then
+    // the judged complement.
     //
     // The deflated block is read back OUT of the judged basis rather than taken
     // from `deflation`'s own columns. Those are not the same set in general:
     // `judged_subspace_basis` can shrink the deflation (the railed-face
     // restriction, the dependence drop), and reporting the input's columns here
-    // would name a subspace the verdict was not taken on.
-    let removed = judged
-        .as_ref()
-        .and_then(|basis| crate::penalty_invariance::deflated_directions(n, basis));
+    // would name a subspace the verdict was not taken on. With rails it is the
+    // complement of the judged basis AND the railed axes — the judged basis is
+    // zero on every railed row, so the two stack to an orthonormal set — so
+    // the invariance residual below is measured on invariance directions only:
+    // its identity `T'H_ρT = T'diag(g_ρ)T` does not hold on a railed axis.
+    let railed_axes = {
+        let mut axes = Array2::<f64>::zeros((n, railed_dimension));
+        for (column, &index) in railed.iter().enumerate() {
+            axes[[index, column]] = 1.0;
+        }
+        axes
+    };
+    let removed = judged.as_ref().and_then(|basis| {
+        let mut kept = Array2::<f64>::zeros((n, basis.ncols() + railed_dimension));
+        kept.slice_mut(ndarray::s![.., ..basis.ncols()]).assign(basis);
+        kept.slice_mut(ndarray::s![.., basis.ncols()..])
+            .assign(&railed_axes);
+        crate::penalty_invariance::deflated_directions(n, &kept)
+    });
+    let deflated_dimension = removed.as_ref().map_or(0, |directions| directions.ncols());
+    if deflated_dimension + railed_dimension + judged_dimension != n {
+        return Err(format!(
+            "rho-space split does not partition R^{n}: {deflated_dimension} deflated + \
+             {railed_dimension} railed + {judged_dimension} judged"
+        ));
+    }
+    let unjudged_dimension = deflated_dimension + railed_dimension;
 
     // `hessian_rho` is an ANALYTIC Hessian, so the applicable curvature law is
     // Weyl's `‖δH‖₂` (#2690), not the finite-difference `(2/√3)·√(ε_f·M₄)`.
@@ -730,9 +828,13 @@ pub fn invert_identified_rho_hessian(
             directions,
         )
     });
-    let eigensolver_backward_error =
+    // Nothing judged, nothing decomposed: the eigensolver made no error.
+    let eigensolver_backward_error = if judged_dimension == 0 {
+        0.0
+    } else {
         eigenpair_backward_error_bound(work, &judged_eigenvalues, &judged_eigenvectors)?
-            .resolution();
+            .resolution()
+    };
     let mut measured_hessian_error = vec![gam_linalg::curvature_resolution::MeasuredHessianError::new(
         "eigensolver backward error",
         eigensolver_backward_error,
@@ -769,8 +871,13 @@ pub fn invert_identified_rho_hessian(
         eigenvalues[column] = direction.dot(&hessian_rho.dot(&direction));
         eigenvectors.column_mut(column).assign(&direction);
     }
+    for (offset, &index) in railed.iter().enumerate() {
+        let column = deflated_dimension + offset;
+        eigenvalues[column] = hessian_rho[[index, index]];
+        eigenvectors[[index, column]] = 1.0;
+    }
     for index in 0..judged_dimension {
-        let target = deflated_dimension + index;
+        let target = unjudged_dimension + index;
         eigenvalues[target] = judged_eigenvalues[index];
         match judged.as_ref() {
             Some(basis) => eigenvectors
@@ -828,7 +935,7 @@ pub fn invert_identified_rho_hessian(
     // certificate itself applied, does not.
     let refusal_bar = |i: usize| -> f64 { chain_rule_term(i) + zero_bound };
 
-    for i in deflated_dimension..n {
+    for i in unjudged_dimension..n {
         let sigma = eigenvalues[i];
         let floor = refusal_bar(i);
         if sigma < -floor {
@@ -845,8 +952,9 @@ pub fn invert_identified_rho_hessian(
                  analytically-formed eigenvalue, which is Weyl's ||dH||_2, measured here as \
                  {curvature_resolution} from [{components}] \
                  -- #2690, #2748); the penalty map certified {expected_structural_nullity} null \
-                 direction(s) and {deflated_dimension} were deflated before judging, so the \
-                 direction above was judged; the outer loop certified this point as a minimum, \
+                 direction(s) and {deflated_dimension} were deflated and {railed_dimension} \
+                 railed axis/axes excluded before judging, so the direction above was judged; \
+                 the outer loop certified this point as a minimum, \
                  and the curvature is larger than everything this assembly's own exactly-zero \
                  identities say it could have got wrong, so this is a genuine contradiction \
                  rather than an unresolvable direction",
@@ -862,6 +970,7 @@ pub fn invert_identified_rho_hessian(
     let mut structural_zero = 0usize;
     let mut below_gradient_floor = 0usize;
     let mut unresolvable_curvature = 0usize;
+    let mut railed_count = 0usize;
 
     for i in 0..n {
         let sigma = eigenvalues[i];
@@ -873,6 +982,10 @@ pub fn invert_identified_rho_hessian(
             // are three readings of one rounding residual. It IS the penalty
             // map's certified null, so it is accounted as one.
             EigenClassification::StructuralZero
+        } else if i < unjudged_dimension {
+            // A railed axis: a boundary estimate with `J e_k = 0`, excluded
+            // from the verdict exactly as the certificate excluded it.
+            EigenClassification::Railed
         } else if sigma > floor {
             EigenClassification::Active
         } else if sigma.abs() <= zero_bound {
@@ -908,6 +1021,7 @@ pub fn invert_identified_rho_hessian(
             EigenClassification::StructuralZero => structural_zero += 1,
             EigenClassification::BelowGradientFloor => below_gradient_floor += 1,
             EigenClassification::UnresolvableCurvature => unresolvable_curvature += 1,
+            EigenClassification::Railed => railed_count += 1,
         }
     }
     // The penalty map certifies HOW MANY directions must be null; it cannot say
@@ -923,11 +1037,13 @@ pub fn invert_identified_rho_hessian(
     // lands on, and a direction can fail to be active for any of the three
     // reasons above. Excluding the resolution-excused ones would make the
     // identity refuse a fit for having MORE evidence about its own Hessian,
-    // which is backwards.
-    let identified_null = structural_zero + below_gradient_floor + unresolvable_curvature;
+    // which is backwards. A railed axis is non-active for the same reason: it
+    // carries no variance, and a certified null can land on it.
+    let identified_null =
+        structural_zero + below_gradient_floor + unresolvable_curvature + railed_count;
     if identified_null < expected_structural_nullity {
         return Err(format!(
-            "rho Hessian has only {identified_null} null direction(s) ({structural_zero} certified by the penalty map, {unresolvable_curvature} under the measured curvature resolution {curvature_resolution}, {below_gradient_floor} under the outer gradient floor), but the penalty map certifies {expected_structural_nullity}"
+            "rho Hessian has only {identified_null} null direction(s) ({structural_zero} certified by the penalty map, {unresolvable_curvature} under the measured curvature resolution {curvature_resolution}, {below_gradient_floor} under the outer gradient floor, {railed_count} railed), but the penalty map certifies {expected_structural_nullity}"
         ));
     }
 
@@ -946,6 +1062,7 @@ pub fn invert_identified_rho_hessian(
             structural_zero: 0,
             below_gradient_floor: 0,
             unresolvable_curvature: 0,
+            railed: 0,
             used_structural_pseudoinverse: false,
             curvature_resolution: zero_bound,
             eigenvalues,
@@ -955,6 +1072,23 @@ pub fn invert_identified_rho_hessian(
     }
 
     gam_linalg::matrix::symmetrize_in_place(&mut inverse);
+    // Nothing was judged, so nothing was inverted: `V_ρ = 0` exactly and there
+    // is no product to certify.
+    if judged_dimension == 0 {
+        return Ok(InvertedRhoHessian {
+            inverse,
+            active_rank,
+            structural_zero,
+            below_gradient_floor,
+            unresolvable_curvature,
+            railed: railed_count,
+            used_structural_pseudoinverse: true,
+            curvature_resolution: zero_bound,
+            eigenvalues,
+            eigenvectors,
+            classifications,
+        });
+    }
     // Certify `H V = P` in the coordinates the spectrum was actually taken in.
     // Without a deflation those are the ρ coordinates themselves, verbatim.
     // With one they are the judged complement, and they have to be: the lifted
@@ -993,6 +1127,7 @@ pub fn invert_identified_rho_hessian(
         structural_zero,
         below_gradient_floor,
         unresolvable_curvature,
+        railed: railed_count,
         used_structural_pseudoinverse: true,
         curvature_resolution: zero_bound,
         eigenvalues,
@@ -1163,13 +1298,15 @@ fn dump_indefinite_rho_hessian_diagnostic(
                     EigenClassification::UnresolvableCurvature => "R",
                     EigenClassification::StructuralZero => "Z",
                     EigenClassification::BelowGradientFloor => "G",
+                    EigenClassification::Railed => "B",
                 })
                 .collect();
             log::warn!(
                 "[INDEF-HESS] classifications={:?} (A=active; Z=certified null of the penalty \
                  map, excused by STRUCTURE; R=under the measured curvature resolution ||dH||_2, \
                  excused by RESOLUTION; G=under the outer loop's own gradient floor, i.e. a \
-                 saturation null, excused by the CHAIN RULE)",
+                 saturation null, excused by the CHAIN RULE; B=a railed coordinate axis, a \
+                 boundary estimate the certificate did not judge)",
                 labels,
             );
         }
@@ -1446,12 +1583,18 @@ fn dump_indefinite_rho_hessian_diagnostic(
 /// per coordinate (empty when unavailable). It is the resolution floor the
 /// ρ-Hessian's definiteness must be judged against — see
 /// [`invert_identified_rho_hessian`] and #2428.
+///
+/// `railed` names the ρ coordinates the outer certificate railed (empty when
+/// none): they are boundary estimates with `∂β̂/∂ρ_k = 0`, excluded from the
+/// ρ-Hessian's verdict exactly as the certificate excluded them — see
+/// [`invert_identified_rho_hessian_off_railed`].
 pub(crate) fn compute_smoothing_correction(
     reml_state: &RemlState<'_>,
     final_rho: &Array1<f64>,
     lambdas: &Array1<f64>,
     final_fit: &pirls::PirlsResult,
     outer_gradient: &Array1<f64>,
+    railed: &[usize],
     outer_hessian: Option<&Array2<f64>>,
     caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
 ) -> SmoothingCorrectionComputation {
@@ -1824,11 +1967,12 @@ pub(crate) fn compute_smoothing_correction(
     // Step 3: invert the exact, unperturbed Hessian on its explicitly
     // identified spectral subspace. A diagonal ridge would change V_rho and
     // therefore the covariance estimand while being invisible in the result.
-    let inverted = match invert_identified_rho_hessian(
+    let inverted = match invert_identified_rho_hessian_off_railed(
         &hessian_rho,
         structural_nullity,
         outer_gradient,
         lifted_invariance.as_ref(),
+        railed,
         &{
             let mut components =
                 vec![gam_linalg::curvature_resolution::MeasuredHessianError::new(
@@ -1883,12 +2027,14 @@ pub(crate) fn compute_smoothing_correction(
 
     let n_rho_total = hessian_rho.nrows();
     if inverted.active_rank == 0 {
-        // Every direction is independently certified as a structural zero of
-        // the penalty map, so J·V_ρ·Jᵀ is mathematically zero.
+        // Every direction is a structural zero of the penalty map, a railed
+        // axis (`J e_k = 0`), or carries no resolvable curvature, so
+        // J·V_ρ·Jᵀ is zero.
         log::info!(
-            "LAML rho Hessian has no identified directions (active_rank=0/{}, structural_zero={}, curvature_resolution={:.3e}); smoothing correction is exactly zero.",
+            "LAML rho Hessian has no identified directions (active_rank=0/{}, structural_zero={}, railed={}, curvature_resolution={:.3e}); smoothing correction is exactly zero.",
             n_rho_total,
             inverted.structural_zero,
+            inverted.railed,
             inverted.curvature_resolution,
         );
         dump_indefinite_rho_hessian_diagnostic(
@@ -1912,12 +2058,13 @@ pub(crate) fn compute_smoothing_correction(
 
     if inverted.active_rank < n_rho_total {
         log::info!(
-            "LAML rho Hessian is not fully identified (active_rank={}/{}, structural_zero={}, below_gradient_floor={}, unresolvable_curvature={}, curvature_resolution={:.3e}); using its certified structural pseudoinverse. `below_gradient_floor` counts saturation nulls: directions whose curvature is under the outer loop\'s own residual gradient, so they carry no resolvable rho-variance (#2428).",
+            "LAML rho Hessian is not fully identified (active_rank={}/{}, structural_zero={}, below_gradient_floor={}, unresolvable_curvature={}, railed={}, curvature_resolution={:.3e}); using its certified structural pseudoinverse. `below_gradient_floor` counts saturation nulls: directions whose curvature is under the outer loop\'s own residual gradient, so they carry no resolvable rho-variance (#2428).",
             inverted.active_rank,
             n_rho_total,
             inverted.structural_zero,
             inverted.below_gradient_floor,
             inverted.unresolvable_curvature,
+            inverted.railed,
             inverted.curvature_resolution,
         );
         dump_indefinite_rho_hessian_diagnostic(
