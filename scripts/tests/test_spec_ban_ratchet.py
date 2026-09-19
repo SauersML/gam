@@ -143,6 +143,10 @@ class Rules(unittest.TestCase):
         self.assertEqual(tokens("jitter", "const MASS_MATRIX_JITTER: f64 = 1e-5;"), ["const MASS_MATRIX_JITTER"])
         self.assertEqual(tokens("jitter", "fn f() { h[[i, i]] += jitter; }"), ["diag += jitter"])
         self.assertEqual(tokens("jitter", "fn f() { h[[i, j]] += jitter; }"), [])
+        self.assertEqual(tokens("jitter", "fn f() { g[[i, i]] += 1e-10 * scale; }"), ["diag += 1e-10"])
+        self.assertEqual(tokens("jitter", "fn f() { g[[i, i]] += (2.5e-8 * s); }"), ["diag += 2.5e-8"])
+        self.assertEqual(tokens("jitter", "fn f() { g[[i, j]] += 1e-10; }"), [])
+        self.assertEqual(tokens("jitter", "fn f() { g[[i, i]] += 2.0 * w; }"), [])
 
     def test_unconverged(self):
         self.assertEqual(tokens("unconverged", "fn f() -> R { Ok(Fit { beta: b, converged: false }) }"),

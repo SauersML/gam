@@ -122,7 +122,6 @@ fn gamma_observation_interval_covers_each_tail_not_just_the_total() {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )
