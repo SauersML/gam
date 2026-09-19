@@ -746,6 +746,25 @@ pub enum ResponseFamily {
 }
 
 impl ResponseFamily {
+    /// One value of every variant, for walking the legality table by family.
+    /// [`LikelihoodSpec::is_legal_cell`] matches on the variant alone, so the
+    /// parameters carried here (Tweedie `p`, NB `theta`, Beta `phi`) are any
+    /// valid value and are never read.
+    pub const LEGALITY_PROBES: [ResponseFamily; 9] = [
+        Self::Gaussian,
+        Self::Binomial,
+        Self::Poisson,
+        Self::Tweedie { p: 1.5 },
+        Self::NegativeBinomial {
+            theta: 1.0,
+            theta_fixed: false,
+        },
+        Self::Beta { phi: 1.0 },
+        Self::Gamma,
+        Self::InverseGaussian,
+        Self::RoystonParmar,
+    ];
+
     #[inline]
     pub const fn name(&self) -> &'static str {
         match self {
@@ -1669,6 +1688,19 @@ impl LikelihoodSpec {
             response.name(),
             LinkFunction::join_names(&Self::legal_links_for(response))
         )
+    }
+
+    /// The response families whose legal links include `link`, in declaration
+    /// order, generated from [`LikelihoodSpec::is_legal_cell`]. A link that more
+    /// than one family admits (`log`, `inverse`) does not determine the family,
+    /// and the error that says so names these.
+    pub fn families_admitting(link: LinkFunction) -> Vec<&'static str> {
+        let probe = legality_probe(link);
+        ResponseFamily::LEGALITY_PROBES
+            .iter()
+            .filter(|response| Self::is_legal_cell(response, &probe))
+            .map(ResponseFamily::name)
+            .collect()
     }
 
     /// Fallible constructor over an arbitrary `(response, link)` pair. Validates

@@ -318,19 +318,46 @@ pub(crate) const COST_STALL_REL_TOL_FLOOR: f64 = 1.0e-7;
 /// two non-finite incumbents match only when their payloads match, and `-0.0`
 /// is not `0.0` — both errors, when made, are made on the safe side (grant the
 /// escape, do not cut the budget).
+///
+/// The state is the incumbent AND the trials of the window that filled. The
+/// incumbent alone is not the search's state: ARC's regularization weight is
+/// part of it and the guard cannot see it. A rejected cubic trial leaves the
+/// incumbent bit-identical while it raises that weight, so the next window
+/// proposes shorter steps to new points. That window is not a replay of the
+/// previous one, and cutting it stopped ARC mid-adaptation: F4 SAS-link fits
+/// of the pyGAM audit probe halted at strict saddles this way (seed 1: six
+/// rejected trials whose steps shrank from 3.77 to 0.58 while the model's
+/// predicted change still disagreed with the measured one by two orders of
+/// magnitude; seed 7 halted short of stationarity and now certifies). Only a
+/// window that revisits the same points from the same incumbent proves the
+/// procedure repeats.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct EscapeIncumbent {
     rho: Vec<u64>,
     value: u64,
     grad_norm: u64,
+    window_trials: Vec<(Vec<u64>, u64)>,
 }
 
 impl EscapeIncumbent {
-    fn new(rho: &Array1<f64>, value: f64, grad_norm: f64) -> Self {
+    fn new<'a>(
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        window_trials: impl Iterator<Item = &'a (Array1<f64>, f64)>,
+    ) -> Self {
         Self {
             rho: rho.iter().map(|value| value.to_bits()).collect(),
             value: value.to_bits(),
             grad_norm: grad_norm.to_bits(),
+            window_trials: window_trials
+                .map(|(trial_rho, trial_value)| {
+                    (
+                        trial_rho.iter().map(|value| value.to_bits()).collect(),
+                        trial_value.to_bits(),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -651,6 +678,17 @@ impl CostStallGuard {
         })
     }
 
+    /// The escape state at a filled window: the incumbent and the finite
+    /// trials the window visited (see [`EscapeIncumbent`]). An infeasible trial
+    /// is not recorded in [`Self::recent`], so a window of infeasible probes
+    /// carries the trials of the window before it, as it carries no new finite
+    /// evidence.
+    fn escape_incumbent(&self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> EscapeIncumbent {
+        let skip = self.recent.len().saturating_sub(self.window);
+        EscapeIncumbent::new(rho, value, grad_norm, self.recent.iter().skip(skip))
+    }
+
+
     /// Record one trusted accepted iterate into the #2241 noise-evidence
     /// buffer, keeping only the latest `window + 1` (⇒ `window` consecutive
     /// differences).
@@ -939,7 +977,7 @@ impl CostStallGuard {
         if self.best_hessian_psd == Some(false) {
             let (best_rho, best_value, best_grad_norm) =
                 self.best_iterate_or(rho, value, grad_norm);
-            let incumbent = EscapeIncumbent::new(&best_rho, best_value, best_grad_norm);
+            let incumbent = self.escape_incumbent(&best_rho, best_value, best_grad_norm);
             if self.grant_escape_unless_replay(incumbent) {
                 log::warn!(
                     "[OUTER] ARC cost-stall window filled at a strict-saddle incumbent \
@@ -958,9 +996,9 @@ impl CostStallGuard {
             self.replay_proven = true;
             log::info!(
                 "[OUTER] ARC strict-saddle stall refusal cut at escape {}: the previous \
-                 refusal reopened a full {}-step window and left the incumbent \
-                 bit-identical (best={:.9e}, |g|={:.3e}), so refusing again replays the \
-                 same window from the same state; halting.",
+                 refusal reopened a full {}-step window that revisited the same trials and \
+                 left the incumbent bit-identical (best={:.9e}, |g|={:.3e}), so refusing \
+                 again replays the same window from the same state; halting.",
                 self.stuck_escapes,
                 self.window,
                 best_value,
@@ -1216,7 +1254,7 @@ impl CostStallGuard {
         // incumbent did not improve, and #2392 is what keying this on the
         // value alone cost: a still-descending run halted at escape 1 of 8
         // carrying |g| = 2.479e2 against a keep-descending threshold of 1.5.
-        let escape_incumbent = EscapeIncumbent::new(&best_rho, best_value, best_grad_norm);
+        let escape_incumbent = self.escape_incumbent(&best_rho, best_value, best_grad_norm);
         if non_stationary_stall && self.grant_escape_unless_replay(escape_incumbent.clone()) {
             // The grant already reopened the no-improvement window. Reset the
             // infeasible streak too: the optimizer should be allowed a fresh
@@ -1236,7 +1274,7 @@ impl CostStallGuard {
             // The replay is proven, so nothing continues past this stall (#2817).
             self.replay_proven = true;
             log::info!(
-                "[OUTER] cost-stall escape streak cut at {}: escape {} reopened a full                  {}-step window and left the incumbent bit-identical (best={:.9e}, |g|={:.3e}),                  so reopening it again replays the same window from the same state; halting.",
+                "[OUTER] cost-stall escape streak cut at {}: escape {} reopened a full                  {}-step window that revisited the same trials and left the incumbent                  bit-identical (best={:.9e}, |g|={:.3e}), so reopening it again replays the                  same window from the same state; halting.",
                 self.stuck_escapes,
                 self.stuck_escapes,
                 self.window,

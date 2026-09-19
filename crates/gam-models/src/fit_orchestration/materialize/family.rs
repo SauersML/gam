@@ -600,34 +600,29 @@ pub fn resolve_family(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(StandardLink::Identity),
                 ),
-                LinkFunction::Log => {
-                    if y.iter()
-                        .all(|&yi| yi.is_finite() && yi >= 0.0 && yi == yi.round())
-                    {
-                        LikelihoodSpec::new(
-                            ResponseFamily::Poisson,
-                            InverseLink::Standard(StandardLink::Log),
-                        )
-                    } else {
-                        LikelihoodSpec::new(
-                            ResponseFamily::Gamma,
-                            InverseLink::Standard(StandardLink::Log),
-                        )
-                    }
-                }
-                // `1/μ` is legal for both Gaussian and Gamma, and nothing in
-                // the link alone distinguishes them; the caller must name
+                // `log` (Poisson, Gamma, Tweedie, NB, Inverse-Gaussian) and
+                // `1/μ` (Gaussian, Gamma) are each legal for several families,
+                // and nothing in the link distinguishes them: a variance
+                // function is a modelling choice, not something to read off
+                // whether `y` happens to be integer-valued. The caller names
                 // the family. With an explicit family only `from_link.link`
                 // is carried below, so the response here is immaterial.
+                LinkFunction::Log if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::Log),
+                ),
                 LinkFunction::Inverse if explicit.is_some() => LikelihoodSpec::new(
-                    ResponseFamily::Gaussian,
+                    ResponseFamily::Gamma,
                     InverseLink::Standard(StandardLink::Inverse),
                 ),
-                LinkFunction::Inverse => {
+                link @ (LinkFunction::Log | LinkFunction::Inverse) => {
                     return Err(WorkflowError::InvalidConfig {
-                        reason: "link 'inverse' does not determine a response family; \
-                                 name one, e.g. family='gamma' or family='gaussian'"
-                            .to_string(),
+                        reason: format!(
+                            "link '{}' does not determine a response family; name one \
+                             with family=: {}",
+                            link.name(),
+                            LikelihoodSpec::families_admitting(link).join("|")
+                        ),
                     }
                     .into());
                 }
@@ -872,6 +867,64 @@ mod tweedie_power_tests {
                 want,
                 "{raw}: expected {want:?} link"
             );
+        }
+    }
+
+    /// pyGAM audit families.md F11: `link="log"` with no family once picked
+    /// Poisson when every `y` was a non-negative integer and Gamma otherwise, so
+    /// a positive cost column rounded to whole dollars got a Poisson variance
+    /// function from a data coincidence. A link several families admit does not
+    /// determine the family; the caller names one, and the error lists the
+    /// families the legality table admits for that link.
+    #[test]
+    fn a_link_several_families_admit_requires_the_family() {
+        use gam_terms::inference::formula_dsl::{LinkChoice, LinkMode};
+        let integer_valued = array![1.0, 3.0, 7.0, 2.0, 12.0];
+        for (link, admitting) in [
+            (
+                LinkFunction::Log,
+                "poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
+            ),
+            (LinkFunction::Inverse, "gaussian|gamma"),
+        ] {
+            let choice = LinkChoice {
+                mode: LinkMode::Strict,
+                link,
+                mixture_components: None,
+            };
+            let error = resolve_family(
+                None,
+                None,
+                Some(&choice),
+                integer_valued.view(),
+                ResponseColumnKind::Numeric,
+                "y",
+            )
+            .expect_err("a link alone must not choose between variance functions");
+            assert!(
+                error.contains(&format!("name one with family=: {admitting}")),
+                "{} error must list the admitting families: {error}",
+                link.name()
+            );
+            for family in admitting.split('|') {
+                // A Tweedie family is named with its variance power.
+                let requested = if family == "tweedie" {
+                    "tweedie(1.5)"
+                } else {
+                    family
+                };
+                let spec = resolve_family(
+                    Some(requested),
+                    None,
+                    Some(&choice),
+                    integer_valued.view(),
+                    ResponseColumnKind::Numeric,
+                    "y",
+                )
+                .unwrap_or_else(|err| panic!("{requested} + {link:?}: {err}"));
+                assert_eq!(spec.response.name(), family);
+                assert_eq!(spec.link.link_function(), link);
+            }
         }
     }
 

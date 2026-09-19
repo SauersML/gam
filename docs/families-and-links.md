@@ -27,13 +27,17 @@ count; the `>= 2` requirement is what separates counts from a binary column.)
 > signature and therefore auto-routes to Poisson/log. If you want it treated as
 > a continuous/Gaussian response, pass `family="gaussian"` explicitly.
 
-When `link="log"` is pinned *without* a `family=`, Poisson vs Gamma is chosen
-automatically by whether the response is integer-valued — `family=` is optional:
+A link that several families admit does not choose the family. `log` is legal for
+Poisson, Tweedie, negative binomial, Gamma and inverse Gaussian, and `inverse` for
+Gaussian and Gamma. Pinning either link without a `family=` is an error that lists
+those families. A variance function is a modelling choice, so gamfit does not read
+it off whether `y` happens to be integer-valued:
 
 ```python
 gamfit.fit(df, "count ~ s(x)")                 # integer counts -> Poisson/log (auto)
-gamfit.fit(df, "count ~ s(x)", link="log")     # log pinned: Poisson (integer) / Gamma (else)
 gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
+gamfit.fit(df, "cost ~ s(x)", family="gamma", link="log")     # explicit
+gamfit.fit(df, "cost ~ s(x)", link="log")      # error: name one with family=
 ```
 
 ## Setting family and link
@@ -187,6 +191,21 @@ materialization preflight, so it is not a multinomial validator.
 Sinh-arcsinh inverse link with learned skewness (`epsilon`) and
 tail-weight (`delta`) parameters. Cannot be combined with `linkwiggle(...)`
 or with blended/mixture links.
+
+At `epsilon = 0`, `delta = 1` the SAS link is the probit, not the logit.
+`epsilon` and `delta` describe the link's tails, so they are identified only
+when the fitted means reach those tails. When every mean stays near 1/2, as in
+`tests/sas_link_logistic_data_regression_test.py`, where the means lie within
+about [0.27, 0.73], the two shape parameters are weakly identified. The
+REML/LAML path then tends to drift toward small `delta`. On many such draws it
+converges and the fitted mean is as accurate as the `logit` fit's. On others it
+reaches an inner-mode fold, a point where the penalized likelihood's softest
+curvature vanishes and past which there is no inner mode. There the Laplace
+normalizer breaks down, and the fit is refused with "did not certify a
+stationary optimum" or "all 1 seed candidates failed" rather than returned
+uncertified. If the data do not reach the tails, use `logit` or `probit`, or
+`beta-logistic` (whose shape parameters leave logit's location and scale
+fixed).
 
 ### `beta-logistic`
 

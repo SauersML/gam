@@ -29,15 +29,14 @@ formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
 | --- | --- |
 | `y` continuous | Gaussian family, identity link. |
 | `y` binary `{0, 1}` | Binomial family, logit link. |
-| `y` non-negative integer, with `link(type=log)` | Poisson. |
-| `y` positive continuous, with `link(type=log)` | Gamma. |
+| `y` non-negative integer count (at least one value `>= 2`) | Poisson family, log link. |
 | `Surv(entry, exit, event)` | Survival model. See [survival.md](survival.md). |
 
-The family is inferred from the response. When `link(type=log)` is set,
-Poisson vs Gamma is chosen by whether `y` is integer-valued — `family=`
-is optional in that case. `family=` accepts `gaussian`, `binomial`
+The family is inferred from the response. A link that several families admit
+(`link(type=log)`, `link(type=inverse)`) does not choose the family: set with
+no `family=`, it is an error that names the admitting families. `family=` accepts `gaussian`, `binomial`
 (aliases `binomial-logit`, `binomial-probit`, `binomial-cloglog`),
-`latent-cloglog-binomial`, `poisson`, `negative-binomial`, `gamma`,
+`latent-cloglog-binomial`, `poisson`, `negative-binomial`, `gamma`, `inverse-gaussian`,
 `beta`, `tweedie`, `royston-parmar`, and `multinomial`. Survival,
 transformation-normal, and Bernoulli
 marginal-slope families are selected through `Surv(...)` or dedicated
