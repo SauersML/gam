@@ -3317,9 +3317,9 @@ pub(crate) enum StationarityBoundSource {
     /// certified this and the caller would not" -- a distinction that matters
     /// because the second is not a defect in the fit.
     CallerRequirement,
-    /// `|Pg|·√((band_f − band_λ²)/(½λ̂²))` (#2954): the Newton-decrement verdict
+    /// `|Pg|·√((band_f − band_λ²)/λ̂²)` (#2954): the Newton-decrement verdict
     /// on rounding bands only, rendered as a gradient bound along the measured
-    /// direction. It certifies iff `½λ̂² + band_λ² ≤ band_f`, so no caller
+    /// direction. It certifies iff `λ̂² + band_λ² ≤ band_f`, so no caller
     /// tolerance and no scale anchor enters, and it may TIGHTEN every rung above.
     NewtonDecrement,
     /// The decrement verdict was taken and could not certify anything: its own
