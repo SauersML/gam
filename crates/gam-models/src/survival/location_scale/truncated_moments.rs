@@ -1098,6 +1098,7 @@ mod tests {
                 penalty_block_trace: Vec::new(),
                 edf_by_block: Vec::new(),
                 edf_rank_bound: Vec::new(),
+                coefficient_mode_selection: Default::default(),
             })
             .expect("valid survival test fit");
             fit.covariance_conditional = Some(sigma_pi.clone());
