@@ -171,8 +171,79 @@ pub enum BasisError {
         minimum_power: usize,
     },
 
+    /// A cold thin-plate basis cannot bend across the bulk of its rows: an
+    /// outlying span dominates the global r-power kernel, so every bending
+    /// direction that varies inside the covariate's middle half falls below the
+    /// double-precision rank floor and the smooth would be silently linear there.
+    #[error(
+        "{}",
+        thin_plate_bulk_message(term.as_deref(), *axis, *bulk_fraction, *resolvable_fraction, *retained, *available, spans)
+    )]
+    ThinPlateBulkUnresolvable {
+        /// The smooth's name, once the term builder attaches it.
+        term: Option<String>,
+        /// The (standardized) axis whose middle half cannot be resolved.
+        axis: usize,
+        /// That axis's interquartile width as a fraction of the covariate span.
+        bulk_fraction: f64,
+        /// The finest scale, as a fraction of the span, a retained bending
+        /// direction can vary at.
+        resolvable_fraction: f64,
+        /// Bending directions that clear the rank floor.
+        retained: usize,
+        /// Bending directions the centres span.
+        available: usize,
+        /// Each covariate's range and middle half in its original units, once
+        /// the term builder attaches them.
+        spans: Vec<CovariateSpan>,
+    },
+
     #[error("{0}")]
     Other(String),
+}
+
+/// A covariate's full range next to its interquartile range, in its own units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CovariateSpan {
+    pub column: usize,
+    pub min: f64,
+    pub lower_quartile: f64,
+    pub upper_quartile: f64,
+    pub max: f64,
+}
+
+const THIN_PLATE_BULK_ADVICE: &str = "Transform the covariate (e.g. log or rank), remove the \
+     outlying rows, or use a local basis such as bs='cr' or bs='ps'.";
+
+fn thin_plate_bulk_message(
+    term: Option<&str>,
+    axis: usize,
+    bulk_fraction: f64,
+    resolvable_fraction: f64,
+    retained: usize,
+    available: usize,
+    spans: &[CovariateSpan],
+) -> String {
+    let subject = match term {
+        Some(term) => format!("thin-plate smooth '{term}'"),
+        None => "thin-plate basis".to_string(),
+    };
+    let spans = spans
+        .iter()
+        .map(|s| {
+            format!(
+                "column {} spans [{:.6e}, {:.6e}] but its middle half spans [{:.6e}, {:.6e}]; ",
+                s.column, s.min, s.max, s.lower_quartile, s.upper_quartile
+            )
+        })
+        .collect::<String>();
+    format!(
+        "{subject} cannot resolve the bulk of its data: {spans}axis {axis}'s middle half is \
+         {bulk_fraction:.3e} of the covariate span, below the finest scale \
+         {resolvable_fraction:.3e} the global r-power kernel resolves in double precision at \
+         that span, so only {retained} of {available} bending directions survive and the fit \
+         would be silently linear across the bulk. {THIN_PLATE_BULK_ADVICE}"
+    )
 }
 
 fn duchon_smoothness_message(
@@ -232,6 +303,7 @@ impl BasisError {
                 "Raise the Duchon smooth's `power=...` to at least {minimum_power}, or reduce \
                  the joint smooth's dimension."
             )),
+            Self::ThinPlateBulkUnresolvable { .. } => Some(THIN_PLATE_BULK_ADVICE.to_string()),
             Self::InvalidDegree(_)
             | Self::InsufficientDegreeForDerivative { .. }
             | Self::InvalidRange(..)

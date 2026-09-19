@@ -337,6 +337,43 @@ pub(crate) fn fit_survival_location_scale_terms_with_selected_wiggle(
     fit_survival_location_scale_terms(data, spec, kappa_options)
 }
 
+/// Whether this term fit removes the I-spline time warp and carries `−log t` on
+/// the location channel (#892).
+///
+/// This is the time-block identification [`prepare_survival_location_scale_model`]
+/// runs, on the two facts it reads: a constant scale (the log-σ design carries no
+/// penalty) and no time wiggle. The collapsed block reads none of the time
+/// block's offsets, so a baseline target's parameters do not enter the fit.
+pub(crate) fn survival_location_scale_terms_collapse_time_warp(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: &SurvivalLocationScaleTermSpec,
+) -> Result<bool, FitFailure> {
+    let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
+    if protected_timewiggle_cols != 0
+        || !build_term_collection_design(data, &spec.log_sigmaspec)?
+            .penalties
+            .is_empty()
+    {
+        return Ok(false);
+    }
+    let log_time = |times: &Array1<f64>| {
+        times.mapv(|t| {
+            t.max(crate::survival::construction::SURVIVAL_TIME_FLOOR)
+                .ln()
+        })
+    };
+    let time_block = prepare_identified_time_block(
+        &spec.time_block,
+        spec.derivative_guard,
+        protected_timewiggle_cols,
+        true,
+        log_time(&spec.age_entry).view(),
+        log_time(&spec.age_exit).view(),
+    )
+    .map_err(SurvivalLocationScaleError::from)?;
+    Ok(time_block.location_log_time_offset)
+}
+
 pub(crate) fn fit_survival_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: SurvivalLocationScaleTermSpec,

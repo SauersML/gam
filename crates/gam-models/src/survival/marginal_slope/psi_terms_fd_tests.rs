@@ -1755,6 +1755,71 @@ fn design_psi_by_beta_third_information_matches_finite_difference_2765() {
     }
 }
 
+/// `D_β ∂_ψ H[v]` for a design ψ on a declared latent law (gam#3123).
+///
+/// The drift reads the fourth likelihood derivatives of the row program. Under a
+/// declared law the location channel is the anchor `α(q, b)`, the root of
+/// `Σ_k w_k Φ(−(α + b u_k)) = Φ(−q)`, not the Gaussian lowering's `q·√(1 + b²)`;
+/// a fourth-order contraction that dispatched on follow-up variation alone read
+/// the lowering's tower and differentiated a different model. The oracle is the
+/// family's own `∂_ψ H`, differenced along `v`, so both sides are the anchored
+/// frame by construction.
+#[test]
+fn anchored_design_psi_hessian_drift_matches_finite_difference_3123() {
+    let options = BlockwiseFitOptions::default();
+    let direction = ndarray::array![0.23, 0.17, 0.41, -0.27, 0.33, 0.19];
+    for axis in [PsiAxis::MarginalDesign, PsiAxis::SlopeDesign] {
+        let layout = hyper_layout(axis);
+        let (family, beta) = drift_family_and_states(SlopeFrame::Anchored);
+        assert!(
+            family.anchored_law_active(),
+            "{axis:?}: the fixture must run the anchored frame"
+        );
+        let analytic = family
+            .psi_hessian_directional_derivative_with_options(
+                &states_at_beta(&family, &beta),
+                layout.design_derivative_blocks(),
+                0,
+                &direction,
+                &options,
+            )
+            .expect("design ψ Hessian drift")
+            .expect("a design ψ axis on a supported block publishes its Hessian drift");
+        let dim = beta.len();
+        assert_eq!(analytic.dim(), (dim, dim), "{axis:?}: D_beta dpsi H shape");
+        let psi_hessian_at = |t: f64| {
+            let displaced = &beta + &(&direction * t);
+            let states = states_at_beta(&family, &displaced);
+            let terms = family
+                .psi_terms(&states, layout.design_derivative_blocks(), 0)
+                .expect("analytic design ψ terms")
+                .expect("a design ψ axis on a supported block publishes terms");
+            match terms.hessian_psi_operator.as_ref() {
+                Some(operator) => operator.mul_mat(&Array2::<f64>::eye(dim)),
+                None => terms.hessian_psi.clone(),
+            }
+        };
+        let h = 1e-3;
+        let (coarse_plus, coarse_minus) = (psi_hessian_at(h), psi_hessian_at(-h));
+        let (fine_plus, fine_minus) = (psi_hessian_at(0.5 * h), psi_hessian_at(-0.5 * h));
+        let scale = max_abs(analytic.iter()).max(1e-12);
+        for row in 0..dim {
+            for column in 0..dim {
+                let oracle = ridders(
+                    (coarse_plus[[row, column]] - coarse_minus[[row, column]]) / (2.0 * h),
+                    (fine_plus[[row, column]] - fine_minus[[row, column]]) / h,
+                );
+                assert_matches(
+                    &format!("anchored/{axis:?} D_beta dpsi H[{row},{column}]"),
+                    analytic[[row, column]],
+                    &oracle,
+                    scale,
+                );
+            }
+        }
+    }
+}
+
 /// Two design ψ axes: a marginal length scale, then a slope length scale.
 fn two_design_axis_blocks() -> Vec<Vec<CustomFamilyBlockPsiDerivative>> {
     let axis = |x_psi: Array2<f64>| {

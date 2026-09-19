@@ -308,6 +308,7 @@ fn standard_conformal_penalty(
         crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
             &gram,
             normal_matrix,
+            fit.lambdas.len(),
         )
     });
     match penalty {
