@@ -73,8 +73,7 @@ Suggested CI gate:
 The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
 - **Complete:** n=1e3 (all families), n=1e4 core (all families), n=1e5 Gaussian p1 and p5, and
   the n=1e6 subset (Gaussian p1 and p5, Poisson p1; 1 rep each).
-- **Still in progress when this was written:** the rest of n=1e5, meaning Gaussian p20 rep 3,
-  pyGAM p20, and the GLM/te blocks. At 0.2 core each config takes 3 fits × tens of minutes.
+- **n=1e5 is now complete** (122 records). gamfit Gaussian p20 rep 3 and gamfit binomial/Poisson p20 timed out at 1500 s wall. The driver then skipped the remaining reps.
 - **Spot checks instead:** where the matrix had not reached a config, I ran 1-rep spot checks
   (marked †) with the same worker.
 
@@ -92,7 +91,7 @@ The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
 | gaussian | 1e5 | p1 | 1.40 [1.39-1.67] | 2.16 | 0.52 | 5.03 | 2.7x | 0.28x |
 | gaussian | 1e5 | p5 | 15.9 [14.3-19.8] | - | 4.78 [4.58-5.36] | 50.0 [48.1-51.9] (2 reps) | 3.3x | 0.32x |
 | gaussian | 1e6 | p1 | 31.8 (1 rep) | - | 12.1 (1 rep) | - | 2.6x | - |
-| gaussian | 1e5 | **p20** | 249 [165-333] (2 reps; 818-1400 s wall) | - | pending | - | - | - |
+| gaussian | 1e5 | **p20** | 249 [165-333] (2 reps; rep 3 timed out at 1500 s wall) | - | 27.1 | 235 | 9.2x | 1.06x |
 | gaussian | 1e6 | **p5** | **memcap 6 GB, no fit (F11)** | - | memcap 6 GB | - | both fail | - |
 | binomial | 1e3 | p1 | 0.53 [0.51-0.58] | 0.75 | 0.0127 | 0.098 | 41x | 5.4x |
 | binomial | 1e3 | p5 | 3.66 [3.66-4.40] | 12.2 [9.6-13.0] | 0.053 | 0.38 | 69x | 9.8x |
@@ -113,6 +112,26 @@ The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
 Wall time at the observed load is about 4-6x the CPU time. For example, binomial 1e4 p5 took
 **177 s wall** for gamfit against 4.6 s CPU / about 20 s wall for gridsearch.
 
+### 3.1b n=1e5 complete (3 reps, `n1e5.jsonl`; the load fell to 2-4 for the last half, so wall ≈ CPU there)
+
+| family | design | gamfit CPU s | pyGAM | pyGAM gs | vs pyGAM | vs gs | RSS vs pyGAM | predict vs pyGAM |
+|---|---|---|---|---|---|---|---|---|
+| gaussian | te | 10.7 [6.2-12.7] | 4.06 | 35.7 | 2.6x | **0.30x** | 1.51x | 1.18x |
+| binomial | p1 | 32.6 [32.4-33.3] | 1.33 | 6.20 | **24.5x** | **5.3x** | 1.57x | **33.9x** |
+| binomial | p5 | 291 [284-294] | 9.75 | 50.2 | **29.8x** | **5.8x** | 0.85x | 8.4x |
+| binomial | te | 99.2 [96.4-107] | 7.81 | 53.4 | **12.7x** | **1.9x** | 0.99x | **29.2x** |
+| binomial | **p20** | **timeout 1500 s wall, load about 2 (1 of 1)** | 40.5 | 253 | ∞ | ∞ | - | - |
+| poisson | p1 | 31.5 [30.7-33.4] | 1.30 | 5.65 | **24.2x** | **5.6x** | 1.35x | 3.4x |
+| poisson | p5 | 302 [294-311] | 10.5 | 45.1 | **28.9x** | **6.7x** | 0.78x | 1.17x |
+| poisson | te | 106 [105-113] | 11.4 | 56.7 | **9.3x** | **1.9x** | 0.77x | 2.3x |
+| poisson | **p20** | **timeout 1500 s wall, load about 2 (1 of 1)** | 50.2 | 239 | ∞ | ∞ | - | - |
+
+- rmse_mu for gamfit is at parity with gridsearch or better everywhere at 1e5. For example,
+  binomial p5 is 0.0085 against 0.0081, Poisson te is 0.0338 against 0.0347, and Gaussian p20 is
+  0.0203 against 0.0204.
+- **The GLM loss is 5-7x even against gridsearch at 1e5, and p20 GLM does not finish.** That is
+  F2/F3/F4/F5 compounding: at n=1e5 every outer evaluation is a full PIRLS pass.
+
 ### 3.2 Peak RSS (driver-polled, MB, median)
 
 | family | n | design | gamfit | pyGAM | pyGAM gs | gamfit/pyGAM |
@@ -122,7 +141,8 @@ Wall time at the observed load is about 4-6x the CPU time. For example, binomial
 | gaussian | 1e4 | p1 / p5 / te | 156 / 280 / 260 | 126 / 181 / 179 | 129 / 191 / 189 | 1.2-1.55x |
 | gaussian | 1e5 | p1 | 465 | 275 | 278 | 1.69x |
 | gaussian | 1e5 | p5 | **1398** | 800 | 821 | **1.75x** |
-| gaussian | 1e5 | p20 | **4802 [4781-4823]** (2 reps, converged) | pending | - | 27x the dense n×p design (177 MB) |
+| gaussian | 1e5 | p20 | **4802 [4781-4823]** (2 reps, converged) | 2735 | 2778 | **1.76x**; 27x the dense n×p design (177 MB) |
+| binomial / poisson | 1e5 | p5 / te | 678 / 760 · 637 / 595 | 798 / 768 · 814 / 768 | - | **0.77-0.99x (gamfit wins)** |
 | gaussian | 1e6 | p1 | **2708** (ru_maxrss 2688; 15.9 s of sys CPU) | 1587 | - | **1.71x** |
 | gaussian | 1e6 | p5 | **memcap 6 GB after 1478 s wall, no fit** (F11) | memcap 6 GB after 388 s | - | both fail |
 | poisson | 1e6 | p1 | 1412 (492 s CPU, **219 s of it sys**) | 1643 | - | **0.86x (gamfit wins)** |
@@ -132,7 +152,7 @@ Wall time at the observed load is about 4-6x the CPU time. For example, binomial
 | poisson | 1e4 | p1 / p5 / te | 166 / 246 / 242 | 126 / 188 / 184 | 129 / 199 / 194 | 1.31-1.32x |
 
 The import baseline is about 107 MB for gamfit and about 112 MB for pyGAM. **gamfit uses more
-memory than pyGAM in every measured config except Poisson 1e6 p1 (0.86x).**
+memory than pyGAM in every measured config except GLMs at n≥1e5 (0.77-0.99x, A6).**
 
 ### 3.3 Predict CPU (n fresh rows)
 
@@ -203,7 +223,12 @@ That is **linear at about 48 µs/row**, against about 3 µs/row for Gaussian and
     suspects.
 - **n dependence (new data, `n1e5.jsonl`).** Gaussian p20 at **n=1e5 does converge**, in 2 of 2
   finished reps: 165-333 s CPU, 818-1400 s wall, edf 180. So the crawl is a small-n problem
-  (n/p ≈ 4.5 at n=1e3), where the REML surface is flat in many directions.
+  (n/p ≈ 4.5 at n=1e3), where the REML surface is flat in many directions. That holds for
+  Gaussian only:
+  - rep 3 timed out at 1500 s;
+  - **binomial and Poisson p20 at n=1e5 also time out at 1500 s wall with load about 2**, so close
+    to 1500 s of CPU, against 239-253 s for pyGAM gridsearch.
+  So p20 is still a blocker for GLMs at every n.
   Memory at 1e5 is covered by F11.
 - The developers already know about the budget exhaustion: `rho_optimizer/run_plan.rs:1560-1625`
   (#2817) says "All six runs ... burned their 200-iteration budget, 1200 outer evaluations". The
@@ -505,7 +530,8 @@ byte-bounded, to use as the pattern), `pirls/loop_driver.rs:747-795`, `pirls/new
   or better rmse_mu, while doing REML with certified convergence.
 - **A3: Gaussian p5 predict at 1e5.** 0.41 s against 0.58 s.
 - **A4: accuracy.** rmse_mu is never worse than pyGAM default, and is at parity with gridsearch.
-- **A6: Poisson 1e6 p1 peak RSS.** 1412 MB against pyGAM's 1643 MB (0.86x), with better rmse_mu. This is the only measured config where gamfit uses less memory.
+- **A6: GLM peak RSS at large n.** Poisson 1e6 p1 uses 1412 MB against 1643 MB (0.86x), and binomial/Poisson p5/te at 1e5 use 0.77-0.99x pyGAM. rmse_mu is equal or better. These are the only configs where gamfit uses less memory, and the Gaussian path (F11) does not share the property.
+- **A7: Gaussian vs gridsearch at 1e5.** p1/p5/te cost 0.28-0.32x gridsearch; p20 costs 1.06x (parity) at equal rmse_mu.
 - **A5 (partial): no BLAS thread explosion.** With the env pinned to 1, pyGAM ran 1 thread and gamfit 6 (polled max). gamfit keeps a few helper threads even with `RAYON_NUM_THREADS=1`, but it does not spawn nproc BLAS threads per process.
 
 ### pyGAM slop to avoid (do not copy to "win" benchmarks)
@@ -529,5 +555,5 @@ byte-bounded, to use as the pattern), `pirls/loop_driver.rs:747-795`, `pirls/new
   - Gaussian p1: gamfit takes 31.8 s CPU and 2.7 GB; pyGAM takes 12.1 s CPU and 1.59 GB. gamfit's rmse_mu is better (0.0018 against 0.0024).
   - Gaussian p5: both libraries hit the 6 GB memcap (F11).
   - Poisson p1: gamfit takes 492 s CPU and 1.41 GB; pyGAM takes 28.2 s CPU and 1.64 GB, so gamfit is 17.4x slower. gamfit's rmse_mu is better (0.0055 against 0.0070).
-- n=1e5: Gaussian p1, p5 and p20 are done (p20 has 2 of 3 reps). pyGAM p20 and the GLM/te blocks were still running.
+- n=1e5 is complete. See 3.1b.
 - The record files are appendable, and `analyze.py` regenerates every table from them.
