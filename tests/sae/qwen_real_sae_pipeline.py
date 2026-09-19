@@ -14,7 +14,7 @@ This is the un-forced division of labor:
       (the #977 latent_seed co-activation idea). Each group is a bundle of
       features whose joint code lives in a low-D subspace.
 
-  Stage 1b (gam adjudicates, gamfit.adjudicate_atom_shape):
+  Stage 1b (gam adjudicates, gamfit.sae.adjudicate_atom_shape):
       For each group, factor its activation-space decoder contribution through
       a thin group-width QR/PCA, search variance-normalized PC pairs on
       discovery-only rows with a label-free circle score, and project disjoint
@@ -23,7 +23,7 @@ This is the un-forced division of labor:
       free-mixture class on HELD-OUT predictive loglik. Discrete orders are
       selected inside each outer training fold. NO topology is forced.
 
-  Full-pipeline controls (gamfit.run_shape_controlled_census):
+  Full-pipeline controls (gamfit.sae.run_shape_controlled_census):
       Repeat the complete Stage-0 -> Stage-1b callback from scratch on an
       independent per-dimension shuffle and covariance-matched Gaussian of the
       original activations, with the identical pipeline seed. The reported
@@ -348,7 +348,7 @@ def adjudicate_groups(
             continue
         coords, subspace = projected
         try:
-            v = gamfit.adjudicate_atom_shape(
+            v = gamfit.sae.adjudicate_atom_shape(
                 coords,
                 folds=5,
                 seed=seed + 11 + gi,
@@ -616,7 +616,7 @@ def main() -> int:
             train_sae=train_sae,
         )
 
-    controlled = gamfit.run_shape_controlled_census(
+    controlled = gamfit.sae.run_shape_controlled_census(
         activations,
         complete_pipeline,
         control_seed=args.control_seed,

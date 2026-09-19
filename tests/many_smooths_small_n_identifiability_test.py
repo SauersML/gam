@@ -98,7 +98,7 @@ def test_unpenalized_space_at_least_n_is_a_clear_error():
     data = {f"x{j}": rng.uniform(size=n) for j in range(n_terms)}
     data["y"] = rng.normal(size=n)
     formula = "y ~ " + " + ".join(f"s(x{j}, double_penalty=false)" for j in range(n_terms))
-    with pytest.raises(gamfit.FitInputError) as info:
+    with pytest.raises(gamfit.errors.FitInputError) as info:
         gamfit.fit(data, formula)
     assert info.value.variant == "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
     message = str(info.value)

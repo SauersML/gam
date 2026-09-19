@@ -52,7 +52,7 @@ def _predictions(model) -> np.ndarray:
 
 @pytest.mark.parametrize("link", ["logit", "cloglog", "sas", "cauchit", "flexible(logit)"])
 def test_a_non_probit_link_keyword_is_refused_by_name(link: str) -> None:
-    with pytest.raises(gamfit.InvalidConfigurationError, match=re.escape(f"the link argument names '{link}'")):
+    with pytest.raises(gamfit.errors.InvalidConfigurationError, match=re.escape(f"the link argument names '{link}'")):
         _fit("y ~ s(x, k=5)", link=link)
 
 
@@ -84,7 +84,7 @@ def test_survival_marginal_slope_refuses_a_non_probit_link_keyword() -> None:
         "bmi": rng.normal(0.0, 1.0, n),
         "prs_z": rng.normal(0.0, 1.0, n),
     }
-    with pytest.raises(gamfit.InvalidConfigurationError, match=re.escape("the link argument names 'logit'")):
+    with pytest.raises(gamfit.errors.InvalidConfigurationError, match=re.escape("the link argument names 'logit'")):
         gamfit.fit(
             data,
             "Surv(entry, exit, event) ~ bmi",

@@ -64,8 +64,8 @@ def test_sae_supervised_end_to_end_returns_uniform_result(synthetic):
     result = gamfit.examples.sae_supervised(
         X, y, mask, K=4, d_atom=2, atom_topology="circle",
     )
-    assert isinstance(result, gamfit.SaeSupervisedFit)
-    assert isinstance(result.sae, gamfit.ManifoldSAE)
+    assert isinstance(result, gamfit.examples.SaeSupervisedFit)
+    assert isinstance(result.sae, gamfit.sae.ManifoldSAE)
     assert result.n_train == X.shape[0]
     assert result.n_supervised == int(mask.sum())
     assert len(result.latent_names) == 4

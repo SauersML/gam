@@ -96,7 +96,7 @@ def test_design_matrix_coef_reproduces_linear_predictor_all_links() -> None:
         coef = _coef(model)
         eta_engine = _engine_eta(model, df)
 
-        assert isinstance(affine, gamfit.AffineDesign)
+        assert isinstance(affine, gamfit.results.AffineDesign)
         assert affine.coefficient_frame == "full"
         assert affine.coefficient_slice == slice(0, coef.shape[0])
         assert x_design.shape[1] == coef.shape[0], (

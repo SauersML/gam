@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turnkey a flat K x P decoder.npy for the #1942 frozen-dictionary audit arm.
 
-`gamfit.audit_sae` audits a *linear* dictionary: it takes a `K x P` decoder
+`gamfit.sae.audit_sae` audits a *linear* dictionary: it takes a `K x P` decoder
 (rows = atoms, cols = residual dims), the `N x P` activations, and (optionally)
 `N x K` external codes. This script produces that `decoder.npy` from whichever
 input actually exists, so `saebench_full_pass.sbatch --decoder ... --activations`
@@ -151,7 +151,7 @@ def fit_topk_decoder(
 
     Returns ``(W_enc (K,P), W_dec (K,P), b_dec (P,), held_out_ev)``. Decoder rows
     are unit-norm (the trained invariant) — exactly the K x P dictionary
-    ``gamfit.audit_sae`` expects."""
+    ``gamfit.sae.audit_sae`` expects."""
     import torch
 
     torch.set_float32_matmul_precision("high")
