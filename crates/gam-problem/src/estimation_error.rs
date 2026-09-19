@@ -1022,8 +1022,8 @@ pub enum EstimationError {
         "The {link} link's likelihood maximum lies on the boundary of its feasibility set: \
          after {iterations} P-IRLS iteration(s) the gradient norm is still \
          {gradient_norm:.6e}, and the step toward the maximum leaves the feasible linear \
-         predictor (eta={eta:?} is outside [{lower}, {upper}]). There is no interior \
-         maximum to report."
+         predictor (eta={eta:?}, feasible set {}). There is no interior maximum to report.",
+        feasible_eta_set(*.lower, *.upper)
     )]
     LinkFeasibilityBoundaryOptimum {
         link: &'static str,
@@ -1089,6 +1089,18 @@ pub enum EstimationError {
 
     #[error("Prediction error")]
     PredictionError,
+}
+
+/// The open feasibility interval `(lower, upper)` of a link's linear predictor,
+/// written as the inequality it imposes. An endpoint at `±f64::MAX` or beyond
+/// is the unbounded side, so `(0, f64::MAX)` reads `eta > 0`.
+fn feasible_eta_set(lower: f64, upper: f64) -> String {
+    match (lower > -f64::MAX, upper < f64::MAX) {
+        (true, true) => format!("{lower} < eta < {upper}"),
+        (true, false) => format!("eta > {lower}"),
+        (false, true) => format!("eta < {upper}"),
+        (false, false) => "every finite eta".to_string(),
+    }
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
@@ -1685,6 +1697,29 @@ impl From<LinalgError> for EstimationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boundary optimum is an input-class, trial-infeasible refusal whose
+    /// message states the feasible set as an inequality, not as an interval
+    /// with a `f64::MAX` endpoint spelled out in full.
+    #[test]
+    fn link_feasibility_boundary_optimum_reads_its_feasible_set() {
+        let boundary = |lower, upper| EstimationError::LinkFeasibilityBoundaryOptimum {
+            link: "identity",
+            eta: 0.0,
+            lower,
+            upper,
+            iterations: 2,
+            gradient_norm: 282.8,
+        };
+        let above = boundary(0.0, f64::MAX);
+        assert!(above.is_trial_point_infeasible());
+        assert_eq!(above.failure_category(), FailureCategory::Input);
+        let message = above.to_string();
+        assert!(message.contains("feasible set eta > 0)"), "{message}");
+        assert!(!message.contains("1797693"), "{message}");
+        assert!(boundary(-f64::MAX, 0.0).to_string().contains("feasible set eta < 0)"));
+        assert!(boundary(0.0, 1.0).to_string().contains("feasible set 0 < eta < 1)"));
+    }
 
     // ── stationarity rung provenance (#2458) ─────────────────────────────────
 
