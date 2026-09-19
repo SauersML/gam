@@ -265,6 +265,7 @@ fn inverse_link_with_shape(
 
 pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
     pilot: &SurvivalLocationScaleTermFitResult,
+    age_exit: ArrayView1<'_, f64>,
     wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
 ) -> Result<SelectedWiggleBasis, FitFailure> {
@@ -279,11 +280,28 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
         .log_sigma_design
         .apply(pilot.fit.beta_log_sigma().view())
         .map_err(|error| pilot_invariant(error.to_string()))?;
+    // The seed is the index the wiggle is composed on. In the reduced
+    // parametric-AFT regime the `−log t` baseline rides the location before
+    // `q₀` (`LocationLogTimeOffset`), so the wiggle sees `q₀(η_t − log t, η_ls)`;
+    // seeding on `η_t` alone places the knots over the wrong range, and over a
+    // single point once the location is constant (#3006).
+    let reduced_parametric_aft = matches!(
+        pilot.time_parameterization,
+        SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+    );
     let q_seed = Array1::from_iter(
         eta_threshold
             .iter()
             .zip(eta_log_sigma.iter())
-            .map(|(&threshold, &ls)| survival_q0_from_eta(threshold, ls)),
+            .zip(age_exit.iter())
+            .map(|((&threshold, &ls), &t)| {
+                let location = if reduced_parametric_aft {
+                    threshold - t.max(crate::survival::construction::SURVIVAL_TIME_FLOOR).ln()
+                } else {
+                    threshold
+                };
+                survival_q0_from_eta(location, ls)
+            }),
     );
     // The composed link warp: `q = q₀ + Σ βw_j·I_j(q₀)` with `q₀` moving with β,
     // so the inner objective differentiates the basis and a clamped boundary
@@ -381,11 +399,17 @@ pub(crate) fn fit_survival_location_scale_terms(
             .as_ref()
             .is_some_and(|derivs| survival_psi_derivatives_support_exact_joint_hessian(derivs));
 
-    let wiggle_rho0 = spec
-        .linkwiggle_block
-        .as_ref()
-        .and_then(|w| w.initial_log_lambdas.clone())
-        .unwrap_or_else(|| Array1::zeros(0));
+    // The wiggle seed is sized by its penalties, the rule every other block's
+    // seed follows (`initial_log_lambdas`); a selected wiggle basis carries no
+    // caller seed, and a zero-length seed would give the outer layout no wiggle
+    // ρ beside a realized block that carries its penalties (#3006).
+    let wiggle_rho0 = match spec.linkwiggle_block.as_ref() {
+        Some(wiggle) => {
+            initial_log_lambdas(&wiggle.penalties, wiggle.initial_log_lambdas.clone())
+                .map_err(SurvivalLocationScaleError::from)?
+        }
+        None => Array1::zeros(0),
+    };
     // Outer time-warp ρ count. In the reduced constant-scale-AFT regime the
     // time block collapses to its unpenalized affine null space (see
     // `prepare_identified_time_block`), so it carries NO smoothing parameter and
