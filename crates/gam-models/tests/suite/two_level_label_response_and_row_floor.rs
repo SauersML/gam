@@ -155,15 +155,16 @@ fn a_single_row_reports_too_few_rows_before_the_family_is_inferred() {
     };
     assert_too_few_rows(&one_row, &location_scale, "location-scale");
 
-    // Zero-weight rows carry no information, so they do not count.
-    let zero_weights = encode(
+    // Zero-weight rows carry no information, so they do not count: four rows
+    // with one positive weight are a one-row fit.
+    let one_weighted_row = encode(
         &["x", "y", "w"],
         (0..4)
             .map(|i| {
                 vec![
                     (i as f64 / 3.0).to_string(),
                     (i % 2).to_string(),
-                    "0".to_string(),
+                    if i == 0 { "1" } else { "0" }.to_string(),
                 ]
             })
             .collect(),
@@ -172,5 +173,5 @@ fn a_single_row_reports_too_few_rows_before_the_family_is_inferred() {
         weight_column: Some("w".to_string()),
         ..FitConfig::default()
     };
-    assert_too_few_rows(&zero_weights, &weighted, "all-zero weights");
+    assert_too_few_rows(&one_weighted_row, &weighted, "one positive-weight row");
 }
