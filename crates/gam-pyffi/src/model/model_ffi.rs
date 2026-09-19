@@ -1401,7 +1401,15 @@ fn fit_table(
     // driver and persistence envelope; route it here on the same predicate the
     // CLI uses, so callers read the model kind off the returned bytes
     // (`saved_model_kind`) instead of re-deriving it from the family name.
-    let fit_config = parse_fit_config(config_json.as_deref()).map_err(py_value_error)?;
+    // A refused configuration is an `InvalidConfigurationError` here exactly as
+    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamError`.
+    let fit_config = parse_fit_config(config_json.as_deref())
+        .map_err(|reason| {
+            workflow_error_to_pyerr(
+                py,
+                gam::families::fit_orchestration::WorkflowError::InvalidConfig { reason },
+            )
+        })?;
     if fit_config
         .family
         .as_deref()
