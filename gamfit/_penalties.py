@@ -165,7 +165,8 @@ def _build_penalty_wrapper(name: str, rust_cls: type[Any]) -> type[Any]:
             return self._inner
 
         def to_rust_descriptor(self) -> dict[str, Any]:
-            return self._inner.to_rust_descriptor()
+            descriptor: dict[str, Any] = self._inner.to_rust_descriptor()
+            return descriptor
 
         def set_weight_schedule(self, schedule: Any) -> "_PenaltyWrapper":
             self._inner.set_weight_schedule(schedule)

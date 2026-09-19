@@ -1684,6 +1684,69 @@ impl RankStart {
     }
 }
 
+/// A converged fit a certification ladder may read as its first rung instead
+/// of solving the same objective again: the accepted candidate, which the rank
+/// path fitted at the incumbent's setting (#2627). It carries what defines the
+/// objective it solved, so the ladder admits it only where its own first rung
+/// defines that objective.
+pub(crate) struct Admitted {
+    /// The (Gauss-Hermite order, mesh refinement) it was solved at.
+    setting: (usize, usize),
+    /// The rate each atom is held at, or `None` for a fitted rate.
+    held_rates: Vec<Option<f64>>,
+    /// The fixed log precisions of the atoms' loading priors, in the fit's
+    /// own block order (the latent block's penalties are last).
+    fixed_log_lambdas: Vec<f64>,
+    /// The number of reference-grid nodes, `None` under the stationary prior.
+    reference_nodes: Option<usize>,
+    fit: UnifiedFitResult,
+}
+
+impl Admitted {
+    /// The accepted candidate with what defines its objective.
+    pub(crate) fn of(candidate: EventHistoryFit) -> Self {
+        let atoms = candidate.rank();
+        let n_lambda = candidate.fit.log_lambdas.len();
+        Self {
+            setting: (
+                candidate.quadrature.gauss_hermite_order,
+                candidate.quadrature.mesh_refinement,
+            ),
+            held_rates: candidate.family.held_rates.clone(),
+            fixed_log_lambdas: candidate
+                .fit
+                .log_lambdas
+                .iter()
+                .skip(n_lambda.saturating_sub(atoms))
+                .copied()
+                .collect(),
+            reference_nodes: candidate.family.reference.as_ref().map(|r| r.grid.len()),
+            fit: candidate.fit,
+        }
+    }
+
+    /// Whether `built`, a ladder's rung at `setting`, defines the objective
+    /// this fit solved: the same order and mesh, the same held rates, the same
+    /// fixed loading priors and the same reference grid; everything else (the
+    /// frozen bases, the penalties, the options) is the one specification both
+    /// were built from. A published fit lists its atoms in the canonical gauge,
+    /// so a certification ladder started from it may order them differently.
+    /// Where the held rates and priors still agree slot by slot, the reordered
+    /// atoms are interchangeable in the objective, so a converged fit of one is
+    /// a converged fit of the other.
+    fn defines(&self, built: &Built, setting: (usize, usize)) -> bool {
+        let marks = built.family.marks();
+        let fixed: Option<&Array1<f64>> = built
+            .specs
+            .get(marks)
+            .map(|latent| &latent.initial_log_lambdas);
+        self.setting == setting
+            && self.held_rates == built.family.held_rates
+            && fixed.is_some_and(|fixed| fixed.iter().eq(self.fixed_log_lambdas.iter()))
+            && self.reference_nodes == built.family.reference.as_ref().map(|r| r.grid.len())
+    }
+}
+
 /// One step of the rank path: what the covariance score proposed and what
 /// the evidence made of it.
 #[derive(Clone, Debug)]
@@ -1880,13 +1943,16 @@ fn positivity_raise(order: usize, max_subject_nodes: usize, tolerance: f64) -> O
 /// rank down, with the new atom's loadings at the covariance score's
 /// proposal. An unpinned ladder starts at mesh refinement `from_refinement`:
 /// a model whose rank was decided at a mesh is never refitted on a coarser
-/// one, where the integrals the decision needed resolved are not.
+/// one, where the integrals the decision needed resolved are not. Where the
+/// first rung defines the objective `admitted` solved ([`Admitted::defines`]),
+/// that rung reads it instead of solving the same objective again.
 pub(crate) fn fit_at_rank(
     cohort: &EventHistoryCohort,
     spec: &EventHistorySpec,
     atoms: usize,
     start: Option<&RankStart>,
     pinned: Option<(usize, usize)>,
+    admitted: Option<Admitted>,
     from_refinement: usize,
     reference_refinement: usize,
 ) -> Result<EventHistoryFit, EventHistoryError> {
@@ -2081,8 +2147,13 @@ pub(crate) fn fit_at_rank(
         None => (spec.gauss_hermite_order.max(3), from_refinement),
     };
     let mut built = build(order, refinement)?;
+    let mut admitted = admitted.filter(|admitted| admitted.defines(&built, (order, refinement)));
     loop {
-        let fit = match fit_custom_family(&built.family, &built.specs, &options) {
+        let solved = match admitted.take() {
+            Some(admitted) => Ok(admitted.fit),
+            None => fit_custom_family(&built.family, &built.specs, &options),
+        };
+        let fit = match solved {
             Ok(fit) => fit,
             Err(error) => {
                 // The engine carries the family's errors as text, so a
@@ -3067,7 +3138,7 @@ fn fit_event_history_on_grid(
     // remains, the path stops at the certified incumbent and records the
     // growth as unresolved (`RankStep::growth_unresolved`).
     let mut rank_spec = spec.clone();
-    let mut fit = certified_rank(cohort, &rank_spec, 0, None, 0, reference_refinement)?;
+    let mut fit = certified_rank(cohort, &rank_spec, 0, None, None, 0, reference_refinement)?;
     let mut rank_path: Vec<RankStep> = Vec::new();
     let mut atom_evidence: Vec<f64> = Vec::new();
     loop {
@@ -3174,6 +3245,7 @@ fn fit_event_history_on_grid(
             rank + 1,
             Some(&start),
             pin,
+            None,
             fit.quadrature.mesh_refinement,
             reference_refinement,
         );
@@ -3221,12 +3293,16 @@ fn fit_event_history_on_grid(
                     candidate.rate_held.clone(),
                 );
                 // The accepted model is certified from the mesh its rank was
-                // decided at, never below it.
+                // decided at, never below it. The candidate is a converged fit
+                // of the model the ladder certifies, at the setting it starts
+                // from, so the ladder admits it as its first rung instead of
+                // solving the same objective again.
                 fit = certified_rank(
                     cohort,
                     &rank_spec,
                     rank + 1,
                     Some(&start),
+                    Some(Admitted::of(candidate)),
                     fit.quadrature.mesh_refinement,
                     reference_refinement,
                 )?;
@@ -3288,17 +3364,19 @@ fn typed_failure(family: &EventHistoryFamily, reason: String) -> EventHistoryErr
 
 /// The model at `atoms` from `start`, certified by [`fit_at_rank`]'s refinement
 /// ladder from mesh refinement `from_refinement` up, with the certified setting
-/// and the ladder's wall time logged.
+/// and the ladder's wall time logged. `admitted` is as [`fit_at_rank`] reads
+/// it.
 fn certified_rank(
     cohort: &EventHistoryCohort,
     spec: &EventHistorySpec,
     atoms: usize,
     start: Option<&RankStart>,
+    admitted: Option<Admitted>,
     from_refinement: usize,
     reference_refinement: usize,
 ) -> Result<EventHistoryFit, EventHistoryError> {
     let started = std::time::Instant::now();
-    let fit = fit_at_rank(cohort, spec, atoms, start, None, from_refinement, reference_refinement)?;
+    let fit = fit_at_rank(cohort, spec, atoms, start, None, admitted, from_refinement, reference_refinement)?;
     log::info!(
         "[event-history] rank {atoms}: certified at Gauss-Hermite order {}, mesh refinement {} ({:.2} s)",
         fit.quadrature.gauss_hermite_order,
@@ -3379,7 +3457,7 @@ fn raise_incumbent(
         fit.atom_log_lambdas.clone(),
         fit.rate_held.clone(),
     );
-    certified_rank(cohort, rank_spec, rank, Some(&start), from_refinement, reference_refinement).map(Some)
+    certified_rank(cohort, rank_spec, rank, Some(&start), None, from_refinement, reference_refinement).map(Some)
 }
 
 /// Fit and select structure under one reference-normalised objective, then
