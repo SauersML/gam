@@ -3571,7 +3571,8 @@ fn log_concave_link_posterior_variance(sigma: f64, mu: f64, log_gap: impl Fn(f64
     let (log_r2, log_l2) = (lobe(1.0, 2.0), lobe(-1.0, 2.0));
     let first = log_r1.exp() - log_l1.exp();
     let second = log_r2.exp() + log_l2.exp();
-    (second - first * first).max(0.0)
+    // `first² ≤ second/2`, so the difference is at least half of `second`.
+    second - first * first
 }
 
 /// `ln|σ(x) − σ(mu)|` for the logistic `σ`, from

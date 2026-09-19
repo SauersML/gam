@@ -174,7 +174,7 @@ impl StandardPredictor {
             .map(|(&e, &se)| {
                 strategy
                     .posterior_meanvariance(&quadctx, e, se)
-                    .map(|(_, var)| var.max(0.0).sqrt())
+                    .map(|(_, var)| var.sqrt())
             })
             .collect::<Result<Array1<f64>, _>>()?;
         Ok(LinearState {
@@ -287,7 +287,7 @@ impl PredictionTransform for StandardPredictor {
             .map(|(&e, &se)| {
                 strategy
                     .posterior_meanvariance(&quadctx, e, se)
-                    .map(|(_, var)| var.max(0.0).sqrt())
+                    .map(|(_, var)| var.sqrt())
             })
             .collect::<Result<Array1<f64>, _>>()
             .map(Some)
