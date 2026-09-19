@@ -1,4 +1,4 @@
-"""Parametric-term p-values in `summary()` are valid, and one value per surface.
+"""Parametric-term p-values in `summary()` are calibrated, and one value per surface.
 
 A linear term carries its own REML ridge. Its Wald statistic is scaled by the
 estimate's covariance with that ridge's own prior removed, which makes the
@@ -8,9 +8,14 @@ charges the ridge prior's variance to the estimate: at a true null the p-values
 piled up near 1 (size ~0.012 at 0.05, KS p ~1e-250 over 500 Gaussian reps).
 
 The seeded Monte Carlo checks here are a small version of
-`bench/pvalue_calibration/pv-parametric/calibrate.py`: the rejection rate at a
-true null lies within two Monte Carlo standard errors of the level, and the
-null p-values do not reject U(0, 1) under a Kolmogorov-Smirnov test.
+`bench/pvalue_calibration/pv-parametric/calibrate.py`. At a true null the
+rejection rate at 0.10, 0.05 and 0.01 lies within two Monte Carlo standard
+errors of the level on BOTH sides: a conservative test fails exactly as an
+anti-conservative one does. The null p-values also must not reject U(0, 1)
+under a two-sided Kolmogorov-Smirnov test.
+
+`REPS` is the smallest count at which the band at 0.01 excludes a zero rate,
+`2 sqrt(0.01 * 0.99 / REPS) < 0.01`, so every level is tested from below.
 """
 
 import json
@@ -29,7 +34,7 @@ _REPO_BIN = Path(__file__).resolve().parent.parent / "target" / "release" / "gam
 GAM = str(_REPO_BIN) if _REPO_BIN.exists() else shutil.which("gam")
 
 LEVELS = ("a", "b", "c", "d")
-REPS = 200
+REPS = 400
 
 
 def _null_frame(family: str, n: int, rep: int) -> pd.DataFrame:
@@ -60,7 +65,7 @@ def _null_pvalues(family: str, n: int):
 
 def _assert_calibrated(p: np.ndarray, label: str) -> None:
     assert len(p) == REPS and np.all(np.isfinite(p)), label
-    for alpha in (0.10, 0.05):
+    for alpha in (0.10, 0.05, 0.01):
         rate = float(np.mean(p <= alpha))
         mcse = math.sqrt(alpha * (1.0 - alpha) / len(p))
         assert abs(rate - alpha) <= 2.0 * mcse, (label, alpha, rate, mcse)

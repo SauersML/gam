@@ -10,11 +10,16 @@ Reported per cell and test: rejection rate at 0.10 / 0.05 / 0.01 with its Monte
 Carlo standard error, the Kolmogorov-Smirnov distance of the null p-values from
 U(0, 1) with its asymptotic p-value, and power at 0.05.
 
-For the Gaussian cells each dataset is also tested by the exact oracle: the
-least-squares t / F test of the same hypothesis with the true smooth shape
-`sin(2 pi x2)` as a known covariate. Its p-values are exactly U(0, 1) under the
-null, so its rejection rate on the same datasets is the Monte Carlo baseline the
-engine's rate is compared with, pair by pair.
+Each dataset is also tested by an oracle that knows the true smooth shape
+`sin(2 pi x2)` and fits it as a covariate, unpenalized:
+
+- Gaussian: the least-squares t / F test. Its p-values are exactly U(0, 1) under
+  the null, so its rejection rate on the same datasets is the Monte Carlo
+  baseline the engine's rate is compared with, pair by pair.
+- Binomial and Poisson: the maximum-likelihood Wald z / chi-square test and the
+  likelihood-ratio test. Neither is exact; both are the standard large-sample
+  tests, and their rates on the same datasets separate what the seed set does
+  from what the engine does.
 
     python bench/pvalue_calibration/pv-parametric/calibrate.py --reps 1000 \
         --out bench/pvalue_calibration/pv-parametric/results.json
@@ -88,6 +93,66 @@ def oracle_pvalues(frame: pd.DataFrame) -> dict:
     }
 
 
+def _design(frame: pd.DataFrame, x1: bool, g: bool) -> np.ndarray:
+    codes = frame["g"].cat.codes.to_numpy()
+    columns = [np.ones(len(frame)), np.sin(2.0 * np.pi * frame["x2"].to_numpy())]
+    if x1:
+        columns.append(frame["x1"].to_numpy())
+    if g:
+        columns.extend(np.eye(len(LEVELS))[codes][:, 1:].T)
+    return np.column_stack(columns)
+
+
+def _glm_mle(x: np.ndarray, y: np.ndarray, family: str):
+    """Unpenalized canonical-link MLE by Newton's method (Fisher scoring).
+
+    Returns the estimate, its inverse Fisher information and the log-likelihood.
+    Iterates until the Newton decrement is at rounding level.
+    """
+    beta = np.zeros(x.shape[1])
+    if family == "binomial":
+        beta[0] = math.log((y.mean()) / (1.0 - y.mean()))
+    else:
+        beta[0] = math.log(y.mean())
+    while True:
+        eta = x @ beta
+        if family == "binomial":
+            mu = 1.0 / (1.0 + np.exp(-eta))
+            w = mu * (1.0 - mu)
+        else:
+            mu = np.exp(eta)
+            w = mu
+        info = x.T @ (w[:, None] * x)
+        step = np.linalg.solve(info, x.T @ (y - mu))
+        beta = beta + step
+        if step @ info @ step <= np.finfo(float).eps * max(1.0, abs(float(y @ eta))):
+            break
+    eta = x @ beta
+    if family == "binomial":
+        loglik = float(y @ eta - np.logaddexp(0.0, eta).sum())
+    else:
+        loglik = float(y @ eta - np.exp(eta).sum())
+    return beta, np.linalg.inv(info), loglik
+
+
+def glm_oracle_pvalues(frame: pd.DataFrame, family: str) -> dict:
+    """Wald and likelihood-ratio p-values of the unpenalized MLE, true smooth shape known."""
+    y = frame["y"].to_numpy()
+    beta, covariance, full = _glm_mle(_design(frame, True, True), y, family)
+    wald_z = beta[2] / math.sqrt(covariance[2, 2])
+    block = slice(3, 3 + len(LEVELS) - 1)
+    wald_g = beta[block] @ np.linalg.solve(covariance[block, block], beta[block])
+    without_x1 = _glm_mle(_design(frame, False, True), y, family)[2]
+    without_g = _glm_mle(_design(frame, True, False), y, family)[2]
+    q = len(LEVELS) - 1
+    return {
+        "x1": float(2.0 * stats.norm.sf(abs(wald_z))),
+        "g": float(stats.chi2.sf(wald_g, q)),
+        "lr_x1": float(stats.chi2.sf(max(2.0 * (full - without_x1), 0.0), 1)),
+        "lr_g": float(stats.chi2.sf(max(2.0 * (full - without_g), 0.0), q)),
+    }
+
+
 def quiet_worker() -> None:
     """The engine's diagnostic stream (fd 2) is not part of the measurement."""
     os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
@@ -100,7 +165,7 @@ def one_rep(args):
     warnings.simplefilter("ignore")
     family = CELLS[cell][0]
     frame = simulate(cell, rep, alternative)
-    oracle = oracle_pvalues(frame) if family == "gaussian" else {}
+    oracle = oracle_pvalues(frame) if family == "gaussian" else glm_oracle_pvalues(frame, family)
     try:
         summary = gamfit.fit(frame, FORMULA, family=family).summary()
     except Exception as error:  # a failed fit is counted, never dropped silently
@@ -113,6 +178,8 @@ def one_rep(args):
         "g_unavailable": tests.get("g", {}).get("p_value_unavailable"),
         "oracle_x1": oracle.get("x1"),
         "oracle_g": oracle.get("g"),
+        "oracle_lr_x1": oracle.get("lr_x1"),
+        "oracle_lr_g": oracle.get("lr_g"),
     }
 
 
@@ -146,6 +213,7 @@ def report(null: list[float | None], alternative: list[float | None]) -> dict:
     out["ks_distance"] = d
     out["ks_p"] = kolmogorov_p(d, len(p)) if len(p) else float("nan")
     out["power@0.05"] = float(np.mean(q <= 0.05)) if len(q) else float("nan")
+    out["null_p"] = p.tolist()
     return out
 
 
@@ -172,13 +240,17 @@ def main() -> int:
                 "x1": report([r.get("x1") for r in null], [r.get("x1") for r in alt]),
                 "g": report([r.get("g") for r in null], [r.get("g") for r in alt]),
             }
-            if CELLS[cell][0] == "gaussian":
-                for term in ("x1", "g"):
-                    key = f"oracle_{term}"
-                    results[cell][key] = report(
-                        [r.get(key) for r in null], [r.get(key) for r in alt]
-                    )
-            print(cell, json.dumps(results[cell], indent=1), flush=True)
+            oracles = ("x1", "g") if CELLS[cell][0] == "gaussian" else ("x1", "g", "lr_x1", "lr_g")
+            for term in oracles:
+                key = f"oracle_{term}"
+                results[cell][key] = report(
+                    [r.get(key) for r in null], [r.get(key) for r in alt]
+                )
+            brief = {
+                name: ({k: v for k, v in value.items() if k != "null_p"} if isinstance(value, dict) else value)
+                for name, value in results[cell].items()
+            }
+            print(cell, json.dumps(brief, indent=1), flush=True)
     if args.out:
         with open(args.out, "w") as handle:
             json.dump(results, handle, indent=1, sort_keys=True)
