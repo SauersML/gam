@@ -131,7 +131,6 @@ fn fit_negbin_theta_and_se(x: &[f64], y: &[f64]) -> (f64, f64) {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )
