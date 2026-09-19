@@ -2606,6 +2606,11 @@ pub struct FitArtifacts {
     /// records none and on a model saved before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_warm_start: Option<OuterWarmStartRecord>,
+    /// Which rule selected the coefficient mode this fit reports (#2366,
+    /// #2661). A payload written before the record existed carries
+    /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
+    #[serde(default)]
+    pub coefficient_mode_selection: CoefficientModeSelection,
 }
 
 /// A certified outer point: `rho` in the outer optimizer's coordinates and
@@ -2615,6 +2620,97 @@ pub struct FitArtifacts {
 pub struct OuterWarmStartRecord {
     pub rho: Vec<f64>,
     pub beta: Vec<f64>,
+}
+
+/// Which rule selected a fit's coefficient mode (#2366, #2661).
+///
+/// A custom family whose inner coefficient objective is nonconvex can hold
+/// several modes at one ρ, and the profiled criterion `V(ρ)` is a function of
+/// ρ only once a rule names which mode the fit reports. The #2661 anchored
+/// continuation from maximal smoothing is that rule, and a family-owned
+/// objective homotopy is the stronger one where a family declares it. When
+/// the continuation declines, the fit proceeds from the caller's seed and its
+/// mode is a functional of that seed. This records which of these happened, so
+/// a consumer reads it from the fit and can refuse a seed-selected mode
+/// ([`Self::require_rule_selected`]) instead of finding it in a log.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "kebab-case")]
+pub enum CoefficientModeSelection {
+    /// No rule was recorded: a payload written before this record existed, or
+    /// a route that selects its mode elsewhere and records nothing here.
+    #[default]
+    NotRecorded,
+    /// The inner objective has one mode: the family's Hessian does not depend
+    /// on β, or the family certifies global convexity.
+    UniqueMode,
+    /// The endpoint of the family's certified coefficient-objective homotopy.
+    ObjectiveHomotopy { steps: usize },
+    /// The endpoint of the #2661 anchored continuation, certified.
+    AnchoredContinuation {
+        steps: usize,
+        endpoint_discrepancy: f64,
+    },
+    /// No rule selected the mode, so it is the one the caller's seed reached.
+    /// `reason` says why no rule applied: the continuation's refusal, or the
+    /// route having no smoothing parameter to anchor a continuation at.
+    SeedSelected { reason: String },
+}
+
+impl CoefficientModeSelection {
+    /// Refuse a mode no rule selected: a seed-selected mode, naming the
+    /// continuation's refusal, and an unrecorded one.
+    pub fn require_rule_selected(&self, context: &str) -> Result<(), String> {
+        match self {
+            Self::UniqueMode
+            | Self::ObjectiveHomotopy { .. }
+            | Self::AnchoredContinuation { .. } => Ok(()),
+            Self::SeedSelected { reason } => Err(format!(
+                "{context}: the coefficient mode is the one the caller's seed reached, because the \
+                 selection rule did not apply: {reason}"
+            )),
+            Self::NotRecorded => Err(format!(
+                "{context}: no rule selecting the coefficient mode was recorded"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod coefficient_mode_selection_wire_2661_tests {
+    use super::{CoefficientModeSelection, FitArtifacts};
+
+    /// Every variant survives the payload wire, and an artifacts record saved
+    /// before the field existed reads as `NotRecorded`, which claims nothing.
+    #[test]
+    fn the_mode_selection_record_round_trips_and_defaults_to_not_recorded() {
+        for selection in [
+            CoefficientModeSelection::NotRecorded,
+            CoefficientModeSelection::UniqueMode,
+            CoefficientModeSelection::ObjectiveHomotopy { steps: 3 },
+            CoefficientModeSelection::AnchoredContinuation {
+                steps: 4,
+                endpoint_discrepancy: 2.5e-7,
+            },
+            CoefficientModeSelection::SeedSelected {
+                reason: "the continuation declined".to_string(),
+            },
+        ] {
+            let wire = serde_json::to_string(&selection).expect("serialize");
+            let read: CoefficientModeSelection = serde_json::from_str(&wire).expect("deserialize");
+            assert_eq!(read, selection, "{wire}");
+        }
+        let mut saved = serde_json::to_value(FitArtifacts::default()).expect("serialize artifacts");
+        saved
+            .as_object_mut()
+            .expect("artifacts serialize as an object")
+            .remove("coefficient_mode_selection")
+            .expect("the record is on the wire");
+        let read: FitArtifacts = serde_json::from_value(saved).expect("an older record reads");
+        assert_eq!(
+            read.coefficient_mode_selection,
+            CoefficientModeSelection::NotRecorded
+        );
+    }
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -2646,6 +2742,10 @@ impl std::fmt::Debug for FitArtifacts {
                 &self.joint_log_lambdas.as_ref().map(|v| v.len()),
             )
             .field("covariance_declined", &self.covariance_declined)
+            .field(
+                "coefficient_mode_selection",
+                &self.coefficient_mode_selection,
+            )
             .field("jeffreys_arming_evidence", &self.jeffreys_arming_evidence)
             .field(
                 "outer_warm_start",
