@@ -22,6 +22,7 @@ use super::{
     InputSource, SaeRowJetContractedTile, SaeSoftmaxRowJetInput, checked_product, finite_or_err,
     validate_tile,
 };
+use crate::row_jet_program::execute_softmax_row_program;
 use gam_runtime::resource::{Governed, MemoryGovernor};
 
 /// Every row's `G` then `C`, row-major, charged to the memory governor.
@@ -78,9 +79,7 @@ pub(crate) fn prepare_bilinear_contractions(
     let mut values = vec![0.0_f64; checked_product(&[n, per_row])?];
     for (row, input) in rows.iter().enumerate() {
         let source = InputSource::new(input);
-        let scheduled = input
-            .gate_program
-            .execute(&source, inv_tau, input.sqrt_row_weight);
+        let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);
         source.finish()?;
         let probe_row = &probe[row * p..(row + 1) * p];
         let (second, mixed) = values[row * per_row..(row + 1) * per_row].split_at_mut(q * q);
@@ -163,8 +162,8 @@ impl SaeRowJetBilinearContractions {
 mod tests {
     use super::prepare_bilinear_contractions;
     use crate::gpu_kernels::sae_rowjet::{
-        SaeRowGateProgram, SaeRowJetContraction, SaeRowJetPath, SaeRowJetPrimary,
-        SaeSoftmaxRowJetInput, execute_softmax_row_jet_tile_contracted,
+        SaeRowJetContraction, SaeRowJetPath, SaeRowJetPrimary, SaeSoftmaxRowJetInput,
+        execute_softmax_row_jet_tile_contracted,
     };
 
     /// Softmax rows over three atoms with two logits and four coordinate primaries, every
@@ -221,7 +220,6 @@ mod tests {
                 beta_basis_first[4 * n_beta + 1] = 0.7;
                 beta_basis_first[5 * n_beta + 2] = -0.1;
                 SaeSoftmaxRowJetInput {
-                    gate_program: SaeRowGateProgram::Softmax,
                     n_atoms: k,
                     out_dim: p,
                     coordinate_slots: SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries),

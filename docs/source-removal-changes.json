@@ -1203,5 +1203,30 @@
     ],
     "reason": "#2946: CLOSED_FORM_OPERATIONS = 64 was a hand bound on the floating-point operations of one closed form of gam_math::gaussian_activation, used to band closed-form pairs as γ_64(|K| + |m m|). fr-kernel's pair_kernel publishes a derived per-evaluation bound, PairKernel::value_rounding (f37d909841), so closed-form pairs now take that plus γ_2 for the mean-product difference, and the rounding has one owner. banded_root and Columns were the tiles test's own column producer. The pins now read their columns from the owner, HermiteColumns::for_block, so both are deleted with it.",
     "evidence": "git grep -n -w CLOSED_FORM_OPERATIONS at a99ab01898 finds its declaration and its one production use in crates/gam-sae/src/response/tiles.rs, plus its import and two uses in tiles_tests.rs, all removed here. Gate job 1271973 at a99ab01898 named exactly these three items (CLOSED_FORM_OPERATIONS production_occurrences 5; banded_root and Columns test_scoped) before this entry existed. It also ran the workspace --all-targets check RC 0, gam-pyffi RC 0, public_api_census RC 0 and assertionless RC 0."
+  },
+  {
+    "base": "97ecb63d7c8ef5d6162770a0a4f2aa8de825cc02",
+    "items": [
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:enum:SaeRowGateProgram",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:contracted_trace_reduces_independent_logistic_rows_without_softmax_substitution_2333",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:execute",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:for_trace_shape",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:plan_softmax_row_jets_trace",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:project_output_bases",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:projected_output_bases_commute_with_softmax_row_program_2333",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:refuse_device_for_independent_program",
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs:fn:trace_weights",
+      "crates/gam-sae/src/manifold/construction.rs:struct:SelectedInverseRowSolve",
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs:fn:logdet_theta_adjoint",
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs:fn:selected_inverse_beta_block",
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs:fn:selected_inverse_row_blocks_or_solve",
+      "crates/gam-sae/src/manifold/construction_row_jet_logdet_channels.rs:fn:contracted_trace_adjoint",
+      "crates/gam-sae/src/manifold/tests_clamp_basin_deflation_2333.rs:fn:adjoint_gap",
+      "crates/gam-sae/src/manifold/tests_clamp_basin_deflation_2333.rs:fn:independent_gate_trace_theta_adjoint_whitens_like_from_probes_2333",
+      "crates/gam-sae/src/manifold/tests_clamp_basin_deflation_2333.rs:fn:threshold_gate_trace_theta_adjoint_matches_from_probes_on_clamp_basin_rows_2333",
+      "crates/gam-sae/src/manifold/tests_sparse_curvature_operator_2500.rs:fn:dense_theta_adjoint_matches_the_trace_majorizer_adjoint_for_a_threshold_gate_2933"
+    ],
+    "reason": "#2333/#2933 F03: fe688c66a made analytic_outer_rho_gradient_components_with_bundle refuse every (evidence, system) pairing except (none, none) and (ExactObservedInformation bundle, system), with exact_a_logdet_route = logdet_derivative_bundle.is_none(). Under !exact_a_logdet_route a bundle is therefore present, so the bundle-free arm that called logdet_theta_adjoint could not run. That arm was the last non-test caller of the Trace-seam majorizer theta-adjoint. The adjoint (logdet_theta_adjoint, contracted_trace_adjoint), the selected-inverse helpers only it used (selected_inverse_beta_block, selected_inverse_row_blocks_or_solve, SelectedInverseRowSolve), the SaeRowJetContraction::Trace variant with its ledger and planner (for_trace_shape, plan_softmax_row_jets_trace), the output-base projection only it used (project_output_bases), and SaeRowGateProgram, whose IndependentLogistic variant only that consumer constructed (with its execute dispatch and the device refusal for independent programs), are deleted with the tests that measured only them.",
+    "evidence": "Gate job 1197886 (gx8, 5023324b3c + patch d72e32519a06a71d81fb8c0a79207eec) ran source_removal_guard.py, which reported the fifteen identities other than the three selected-inverse helpers as removed without an acknowledgement; the same job's cargo check reported selected_inverse_beta_block, selected_inverse_row_blocks_or_solve and SelectedInverseRowSolve as never used, and this change deletes them. At the base, git grep finds logdet_theta_adjoint called only at the bundle-free arm of analytic_outer_rho_gradient_components_with_bundle and in tests_clamp_basin_deflation_2333.rs and tests_sparse_curvature_operator_2500.rs; contracted_trace_adjoint called only by logdet_theta_adjoint; the three selected-inverse helpers, plan_softmax_row_jets_trace, project_output_bases and SaeRowGateProgram::IndependentLogistic only inside contracted_trace_adjoint and sae_rowjet.rs tests; SaeRowGateProgram::Softmax only in three from_source calls in construction_row_jet_logdet_channels.rs, the sae_rowjet test fixture and tests/sae/sae/sae_rowjet_gpu_kscale_parity.rs, each updated here. deflation_folded_trace_weight survives through evidence_metric_raw_weight."
   }
 ]

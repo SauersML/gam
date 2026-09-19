@@ -5680,18 +5680,3 @@ mod construction_tests {
 
     include!("construction_tests.rs");
 }
-
-/// Solve-invariant operands of `selected_inverse_row_blocks_or_solve` (#932
-/// FRONT C): everything fixed across the per-row sweep of one
-/// trace/adjoint pass — the deflated solver, the factor cache, the dense
-/// `(H⁻¹)_ββ`, the Takahashi-vs-solve route flag, the shared zero β-RHS, and
-/// the error-context prefix — bundled so each per-row call carries only the
-/// row coordinates and the reusable scratch buffer.
-pub(crate) struct SelectedInverseRowSolve<'a> {
-    pub(crate) solver: &'a DeflatedArrowSolver<'a>,
-    pub(crate) cache: &'a ArrowFactorCache,
-    pub(crate) beta_inv: &'a Array2<f64>,
-    pub(crate) fast_selected: bool,
-    pub(crate) rhs_beta_zero: ArrayView1<'a, f64>,
-    pub(crate) context: &'a str,
-}

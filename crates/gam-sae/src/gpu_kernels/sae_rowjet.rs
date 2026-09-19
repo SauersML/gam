@@ -26,8 +26,7 @@
 //! they are never hidden by retrying the tile on the CPU.
 
 use crate::row_jet_program::{
-    SaeOrder2RowProgramSource, SaeRowPrimary, SaeScheduledRowJets,
-    execute_independent_logistic_row_program, execute_softmax_row_program,
+    SaeOrder2RowProgramSource, SaeRowPrimary, SaeScheduledRowJets, execute_softmax_row_program,
 };
 
 /// One primary in a complete SAE reconstruction row.
@@ -58,50 +57,17 @@ fn scheduled_primary(value: SaeRowJetPrimary) -> SaeRowPrimary {
     }
 }
 
-/// The structure-compiled gate program a row's channels are derived from.
-///
-/// Both programs consume the identical semantic row input and differ only in
-/// how gate masses move with their logits. The CUDA kernels lower the softmax
-/// program alone, so an independent-logistic tile always reduces on the host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SaeRowGateProgram {
-    /// `z = softmax(inv_tau · logits)`: gate masses normalize to one and every
-    /// logit moves every gate (`execute_softmax_row_program`).
-    Softmax,
-    /// `z_k = σ(inv_tau · (logit_k − shift_k))`: one logit per gate and no
-    /// normalization. Threshold gates, ordered Beta–Bernoulli gates, and the
-    /// logit-free top-k support gate (`execute_independent_logistic_row_program`).
-    IndependentLogistic,
-}
-
-impl SaeRowGateProgram {
-    fn execute<S: SaeOrder2RowProgramSource>(
-        self,
-        source: &S,
-        inv_tau: f64,
-        sqrt_row_w: f64,
-    ) -> SaeScheduledRowJets {
-        match self {
-            Self::Softmax => execute_softmax_row_program(source, inv_tau, sqrt_row_w),
-            Self::IndependentLogistic => {
-                execute_independent_logistic_row_program(source, inv_tau, sqrt_row_w)
-            }
-        }
-    }
-}
-
 /// Complete semantic inputs for one reconstruction row.
 ///
-/// `gate_program` names the row program the channels are derived from, and
-/// with it the normalization law `validate` applies to `gate_values`.
-/// `decoded_first` is indexed by the live primary slot (`q * p`); logit slots
+/// The channels are derived from the softmax row program
+/// (`execute_softmax_row_program`), so `validate` requires `gate_values` to
+/// sum to one. `decoded_first` is indexed by the live primary slot (`q * p`); logit slots
 /// are exact zero. `decoded_second` is `q * q * p`; only same-atom coordinate
 /// pairs can be nonzero. These are contractions of the term's live basis
 /// Jacobian/Hessian with its decoder, not derivatives reconstructed from stale
 /// coordinates or a second basis implementation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaeSoftmaxRowJetInput {
-    pub gate_program: SaeRowGateProgram,
     pub n_atoms: usize,
     pub out_dim: usize,
     pub primaries: Vec<SaeRowJetPrimary>,
@@ -150,7 +116,6 @@ impl SaeSoftmaxRowJetInput {
     /// derivatives come from the exact live source used by the CPU schedule.
     pub(crate) fn from_source<S: SaeOrder2RowProgramSource>(
         source: &S,
-        gate_program: SaeRowGateProgram,
         sqrt_row_weight: f64,
         shared_beta_layout: Option<(std::sync::Arc<[usize]>, std::sync::Arc<[f64]>)>,
     ) -> Result<Self, String> {
@@ -261,7 +226,6 @@ impl SaeSoftmaxRowJetInput {
         };
 
         let input = Self {
-            gate_program,
             n_atoms,
             out_dim,
             coordinate_slots: Self::coordinate_slots_for(&primaries),
@@ -281,54 +245,6 @@ impl SaeSoftmaxRowJetInput {
         };
         input.validate()?;
         Ok(input)
-    }
-
-    /// Apply one row-local linear output projection to every semantic base from
-    /// which the row program constructs its jets.
-    ///
-    /// The Trace contraction dots jets against jets and therefore cannot fold a
-    /// likelihood metric into a probe as the Linear/Bilinear contractions do.
-    /// Projecting these four bases first is exact because every scheduled jet is
-    /// a scalar linear combination of them. In particular, this is the single
-    /// typed seam for `Uᵀ decoded`, `Uᵀ decoded_first`,
-    /// `Uᵀ decoded_second`, and `Uᵀ beta_output` in the log-det consumer.
-    /// `beta_outputs` deliberately becomes row-local: row metrics differ by row,
-    /// so retaining the former cross-row `Arc` sharing would apply row zero's
-    /// metric to the whole tile.
-    pub(crate) fn project_output_bases(
-        &mut self,
-        projected_dim: usize,
-        project: impl Fn(&[f64], &mut [f64]),
-    ) -> Result<(), String> {
-        if projected_dim == 0 {
-            return Err("SAE row-jet output projection requires nonzero dimension".to_string());
-        }
-        self.validate()?;
-        let old_dim = self.out_dim;
-        let map_blocks = |values: &[f64], blocks: usize| -> Result<Vec<f64>, String> {
-            let projected_len = checked_product(&[blocks, projected_dim])?;
-            let mut projected = vec![0.0_f64; projected_len];
-            for block in 0..blocks {
-                project(
-                    &values[block * old_dim..(block + 1) * old_dim],
-                    &mut projected[block * projected_dim..(block + 1) * projected_dim],
-                );
-            }
-            Ok(projected)
-        };
-        let q = self.n_primaries();
-        let n_beta = self.n_beta_borders();
-        let q_squared = checked_product(&[q, q])?;
-        let decoded = map_blocks(&self.decoded, self.n_atoms)?;
-        let decoded_first = map_blocks(&self.decoded_first, q)?;
-        let decoded_second = map_blocks(&self.decoded_second, q_squared)?;
-        let beta_outputs = map_blocks(self.beta_outputs.as_ref(), n_beta)?;
-        self.decoded = decoded;
-        self.decoded_first = decoded_first;
-        self.decoded_second = decoded_second;
-        self.beta_outputs = beta_outputs.into();
-        self.out_dim = projected_dim;
-        self.validate()
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -391,24 +307,19 @@ impl SaeSoftmaxRowJetInput {
                 "SAE row-jet gate_values[{atom}] must be a probability; got {value}"
             ));
         }
-        // Only the softmax program normalizes its gates; an independent gate is
-        // any probability on its own.
-        if self.gate_program == SaeRowGateProgram::Softmax {
-            let gate_sum: f64 = self.gate_values.iter().sum();
-            let rounding_mass = (k as f64) * f64::EPSILON;
-            if rounding_mass >= 1.0 {
-                return Err(format!(
-                    "SAE row-jet K={k} is too large to certify a normalized f64 softmax"
-                ));
-            }
-            let summation_bound = rounding_mass / (1.0 - rounding_mass);
-            let normalization_bound =
-                f64::EPSILON + summation_bound + f64::EPSILON * summation_bound;
-            if (gate_sum - 1.0).abs() > normalization_bound * gate_sum.abs().max(1.0) {
-                return Err(format!(
-                    "SAE row-jet gate values must sum to one within the f64 normalization bound {normalization_bound:e}; got {gate_sum:e}"
-                ));
-            }
+        let gate_sum: f64 = self.gate_values.iter().sum();
+        let rounding_mass = (k as f64) * f64::EPSILON;
+        if rounding_mass >= 1.0 {
+            return Err(format!(
+                "SAE row-jet K={k} is too large to certify a normalized f64 softmax"
+            ));
+        }
+        let summation_bound = rounding_mass / (1.0 - rounding_mass);
+        let normalization_bound = f64::EPSILON + summation_bound + f64::EPSILON * summation_bound;
+        if (gate_sum - 1.0).abs() > normalization_bound * gate_sum.abs().max(1.0) {
+            return Err(format!(
+                "SAE row-jet gate values must sum to one within the f64 normalization bound {normalization_bound:e}; got {gate_sum:e}"
+            ));
         }
         for (slot, primary) in self.primaries.iter().copied().enumerate() {
             let atom = match primary {
@@ -589,37 +500,6 @@ pub(crate) enum SaeRowJetContraction<'a> {
         /// Row-major `n_rows × n_beta`.
         v_beta: &'a [f64],
     },
-    /// The `Γ = tr(H⁻¹ ∂H/∂θ)` log-det θ-adjoint shape (#2304).
-    ///
-    /// For every t-direction `w` and every β-direction `w_β` the consumer
-    /// (`SaeManifoldTerm::contracted_trace_adjoint`) reduces the derivative
-    /// matrix of the tower against the per-row selected inverse. With
-    /// `dh_w[a][b] = ⟨second(a,w),first(b)⟩ + ⟨first(a),second(b,w)⟩` the outputs are
-    ///
-    /// `t[r][w]    = Σ_{a,b} E_tt[r][a][b] dh_w[a][b]
-    ///             + Σ_a Σ_c 2·inv_vβ[r][a][c] (⟨second(a,w),β(c)⟩ + ⟨first(a),βderiv(w,c)⟩)
-    ///             + Σ_{i,j} βinv[i][j] (⟨βderiv(w,i),β(j)⟩ + ⟨β(i),βderiv(w,j)⟩)`,
-    /// `β[r][c_w] = Σ_{a,b} E_tt[r][a][b] (⟨βderiv(a,c_w),first(b)⟩ + ⟨first(a),βderiv(b,c_w)⟩)
-    ///             + Σ_a Σ_c 2·inv_vβ[r][a][c] ⟨βderiv(a,c_w),β(c)⟩`.
-    ///
-    /// `E_tt` is the row-local t–t weight with the Daleckii–Krein deflation
-    /// correction already folded in (`E = U(W⊙F)Uᵀ`, `W = Uᵀ inv_vv U`); it
-    /// equals `inv_vv` when the row carries no deflation. The t–β and β–β
-    /// blocks are never deflated, so they contract the raw `inv_vβ` / `βinv`.
-    /// The scalar diagonal channels (assignment prior, ARD) are NOT part of this
-    /// tower reduction; the caller adds them as an `E_tt`-weighted host
-    /// post-fold, which is exact because `tr(E·(dh+dh_scalar))` is linear. The
-    /// Trace contraction reduces on the host; it has no device kernel.
-    Trace {
-        /// Row-major `n_rows × q × q` deflation-folded t–t weight `E_tt`.
-        e_tt: &'a [f64],
-        /// Row-major `n_rows × q × n_beta` t–β selected inverse, restricted to
-        /// this tile's border channels.
-        inv_vbeta: &'a [f64],
-        /// Row-major `n_beta × n_beta` β–β selected inverse, shared across the
-        /// same-shape tile (the border layout is identical for every row).
-        beta_inv: &'a [f64],
-    },
 }
 
 /// Reduced outputs of one contracted tile: per-row t and β coefficients only.
@@ -656,26 +536,6 @@ impl<'a> SaeRowJetContraction<'a> {
                 finite_or_err("probe", probe)?;
                 finite_or_err("v_t", v_t)?;
                 finite_or_err("v_beta", v_beta)
-            }
-            SaeRowJetContraction::Trace {
-                e_tt,
-                inv_vbeta,
-                beta_inv,
-            } => {
-                expect("e_tt", e_tt.len(), checked_product(&[n, q, q])?)?;
-                expect(
-                    "inv_vbeta",
-                    inv_vbeta.len(),
-                    checked_product(&[n, q, n_beta])?,
-                )?;
-                expect(
-                    "beta_inv",
-                    beta_inv.len(),
-                    checked_product(&[n_beta, n_beta])?,
-                )?;
-                finite_or_err("e_tt", e_tt)?;
-                finite_or_err("inv_vbeta", inv_vbeta)?;
-                finite_or_err("beta_inv", beta_inv)
             }
         }
     }
@@ -721,13 +581,6 @@ pub(crate) fn execute_softmax_row_jet_tile_contracted(
             beta: Vec::new(),
         });
     }
-    refuse_device_for_independent_program(rows, path)?;
-    if path == SaeRowJetPath::Device && matches!(contraction, SaeRowJetContraction::Trace { .. }) {
-        return Err(
-            "SAE row-jet Trace contraction reduces on the host; it has no device kernel"
-                .to_string(),
-        );
-    }
     match path {
         SaeRowJetPath::Cpu => cpu_contracted_tile(rows, inv_tau, q, p, n_beta, contraction),
         SaeRowJetPath::Device => {
@@ -762,9 +615,7 @@ fn cpu_contracted_tile(
     let mut beta = vec![0.0_f64; checked_product(&[n, n_beta])?];
     for (row, input) in rows.iter().enumerate() {
         let source = InputSource::new(input);
-        let scheduled = input
-            .gate_program
-            .execute(&source, inv_tau, input.sqrt_row_weight);
+        let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);
         source.finish()?;
         match contraction {
             SaeRowJetContraction::Linear { probe } => {
@@ -796,54 +647,6 @@ fn cpu_contracted_tile(
                         acc += dot(probe_row, scheduled.beta_deriv(a, border)) * v_t_row[a];
                     }
                     beta[row * n_beta + border] = acc;
-                }
-            }
-            SaeRowJetContraction::Trace {
-                e_tt,
-                inv_vbeta,
-                beta_inv,
-            } => {
-                let e_row = &e_tt[row * q * q..(row + 1) * q * q];
-                let vbeta_row = &inv_vbeta[row * q * n_beta..(row + 1) * q * n_beta];
-                // One t-adjoint direction `w` (a live logit or coordinate slot).
-                for w in 0..q {
-                    let mut gamma = 0.0_f64;
-                    for a in 0..q {
-                        for b in 0..q {
-                            let dh = dot(scheduled.second(a, w), scheduled.first(b))
-                                + dot(scheduled.first(a), scheduled.second(b, w));
-                            gamma += e_row[a * q + b] * dh;
-                        }
-                        for border in 0..n_beta {
-                            let dh = dot(scheduled.second(a, w), scheduled.beta(border))
-                                + dot(scheduled.first(a), scheduled.beta_deriv(w, border));
-                            gamma += 2.0 * vbeta_row[a * n_beta + border] * dh;
-                        }
-                    }
-                    for i in 0..n_beta {
-                        for j in 0..n_beta {
-                            let dh = dot(scheduled.beta_deriv(w, i), scheduled.beta(j))
-                                + dot(scheduled.beta(i), scheduled.beta_deriv(w, j));
-                            gamma += beta_inv[i * n_beta + j] * dh;
-                        }
-                    }
-                    t[row * q + w] = gamma;
-                }
-                // One β-adjoint direction `w_beta`.
-                for w_beta in 0..n_beta {
-                    let mut gamma = 0.0_f64;
-                    for a in 0..q {
-                        for b in 0..q {
-                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.first(b))
-                                + dot(scheduled.first(a), scheduled.beta_l_deriv(b, w_beta));
-                            gamma += e_row[a * q + b] * dh;
-                        }
-                        for border in 0..n_beta {
-                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.beta(border));
-                            gamma += 2.0 * vbeta_row[a * n_beta + border] * dh;
-                        }
-                    }
-                    beta[row * n_beta + w_beta] = gamma;
                 }
             }
         }
@@ -1155,60 +958,6 @@ impl SaeRowJetMemoryLedger {
         })
     }
 
-    /// Memory ledger for the host Trace contraction: the complete-tower ledger
-    /// plus the selected-inverse operands and reduced outputs.
-    fn for_trace_shape(k: usize, q: usize, p: usize, n_beta: usize) -> Result<Self, String> {
-        let mut ledger = Self::for_shape(k, q, p, n_beta)?;
-        let f64_bytes = std::mem::size_of::<f64>();
-        let bytes = |count: usize| -> Result<usize, String> {
-            count
-                .checked_mul(f64_bytes)
-                .ok_or_else(|| "SAE row-jet Trace byte count overflow".to_string())
-        };
-        let beta_inv_count = n_beta
-            .checked_mul(n_beta)
-            .ok_or_else(|| "SAE row-jet Trace beta-inverse shape overflow".to_string())?;
-        let beta_inv = bytes(beta_inv_count)?;
-        // cudarc requires non-empty handles for zero-sized operands/outputs.
-        // These are distinct allocations from the complete tower's own dummies.
-        let trace_device_dummies = usize::from(beta_inv_count == 0)
-            + usize::from(q == 0) // e_tt
-            + usize::from(q == 0 || n_beta == 0) // inv_vbeta
-            + usize::from(q == 0) // reduced t
-            + usize::from(n_beta == 0); // reduced beta
-        let trace_fixed_device = beta_inv
-            .checked_add(bytes(trace_device_dummies)?)
-            .ok_or_else(|| "SAE row-jet Trace dummy bytes overflow".to_string())?;
-        let per_row_count = q
-            .checked_mul(q)
-            .and_then(|count| count.checked_add(q.checked_mul(n_beta)?))
-            .and_then(|count| count.checked_add(q))
-            .and_then(|count| count.checked_add(n_beta))
-            .ok_or_else(|| "SAE row-jet Trace row shape overflow".to_string())?;
-        let per_row = bytes(per_row_count)?;
-        ledger.fixed_device_bytes = ledger
-            .fixed_device_bytes
-            .checked_add(trace_fixed_device)
-            .ok_or_else(|| "SAE row-jet Trace fixed device bytes overflow".to_string())?;
-        ledger.device_bytes_per_row = ledger
-            .device_bytes_per_row
-            .checked_add(per_row)
-            .ok_or_else(|| "SAE row-jet Trace device row bytes overflow".to_string())?;
-        ledger.fixed_host_bytes = ledger
-            .fixed_host_bytes
-            .checked_add(beta_inv)
-            .ok_or_else(|| "SAE row-jet Trace fixed host bytes overflow".to_string())?;
-        ledger.cpu_host_bytes_per_row = ledger
-            .cpu_host_bytes_per_row
-            .checked_add(per_row)
-            .ok_or_else(|| "SAE row-jet Trace CPU host row bytes overflow".to_string())?;
-        ledger.host_bytes_per_row = ledger
-            .host_bytes_per_row
-            .checked_add(per_row)
-            .ok_or_else(|| "SAE row-jet Trace host row bytes overflow".to_string())?;
-        Ok(ledger)
-    }
-
     /// The only production caller is the CUDA tile planner, which compiles
     /// under `cfg(target_os = "linux")`; off-Linux the lib target therefore has
     /// no caller and `-D dead-code` rejects the method (this class of break has
@@ -1282,35 +1031,6 @@ pub(crate) fn plan_softmax_row_jets_contracted(
     }
     let ledger = SaeRowJetMemoryLedger::for_contracted_shape(k, q, p, n_beta)?;
     plan_dispatch(total_rows, k, q, p, n_beta, mode, ledger, host_budget)
-}
-
-/// Decide the bounded Trace tile width with its tower and selected-inverse
-/// operands charged explicitly (#2333). The Trace contraction has no device
-/// kernel, so the plan is always a host tile.
-pub(crate) fn plan_softmax_row_jets_trace(
-    total_rows: usize,
-    k: usize,
-    q: usize,
-    p: usize,
-    n_beta: usize,
-    host_budget: usize,
-) -> Result<SaeRowJetExecutionPlan, String> {
-    if k == 0 || p == 0 {
-        return Err(format!(
-            "Trace SAE row-jet plan requires nonzero K and p; got K={k}, p={p}"
-        ));
-    }
-    let ledger = SaeRowJetMemoryLedger::for_trace_shape(k, q, p, n_beta)?;
-    plan_dispatch(
-        total_rows,
-        k,
-        q,
-        p,
-        n_beta,
-        gam_gpu::GpuPolicy::Off,
-        ledger,
-        host_budget,
-    )
 }
 
 /// Shared backend/tile-width dispatch for an already-computed shape ledger.
@@ -1457,32 +1177,8 @@ fn validate_tile(rows: &[SaeSoftmaxRowJetInput]) -> Result<(usize, usize, usize,
                 "SAE row-jet tile row {row} has a different decoder-border atom layout"
             ));
         }
-        if input.gate_program != first.gate_program {
-            return Err(format!(
-                "SAE row-jet tile row {row} gate program {:?} != first-row program {:?}",
-                input.gate_program, first.gate_program
-            ));
-        }
     }
     Ok(shape)
-}
-
-/// The CUDA kernels lower only the softmax program, so a device tile of an
-/// independent-logistic program is refused before staging rather than
-/// evaluated under the softmax gate law.
-fn refuse_device_for_independent_program(
-    rows: &[SaeSoftmaxRowJetInput],
-    path: SaeRowJetPath,
-) -> Result<(), String> {
-    let program = rows
-        .first()
-        .map_or(SaeRowGateProgram::Softmax, |input| input.gate_program);
-    if path == SaeRowJetPath::Device && program != SaeRowGateProgram::Softmax {
-        return Err(format!(
-            "SAE row-jet device kernels lower only the softmax program; got {program:?}"
-        ));
-    }
-    Ok(())
 }
 
 /// Evaluate one already-planned bounded tile. Device failures propagate.
@@ -1500,7 +1196,6 @@ pub fn execute_softmax_row_jet_tile(
     if rows.is_empty() {
         return SaeRowJetChannels::zeros(0, 0, 0, 0, 0);
     }
-    refuse_device_for_independent_program(rows, path)?;
     match path {
         SaeRowJetPath::Cpu => cpu_tile(rows, inv_tau, k, q, p, n_beta),
         SaeRowJetPath::Device => {
@@ -1635,9 +1330,7 @@ fn cpu_tile(
     let mut out = SaeRowJetChannels::zeros(rows.len(), k, q, p, n_beta)?;
     for (row, input) in rows.iter().enumerate() {
         let source = InputSource::new(input);
-        let scheduled = input
-            .gate_program
-            .execute(&source, inv_tau, input.sqrt_row_weight);
+        let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);
         source.finish()?;
         for slot in 0..q {
             let target = row * q * p + slot * p;
@@ -2401,8 +2094,6 @@ mod device {
         let stream = b.stream.clone();
         let staged = stage_inputs(&stream, rows, k, q, p, n_beta)?;
 
-        // The Trace contraction has no device form (it reduces on the host), so
-        // only the two probe shapes reach the dot-table path below.
         enum DeviceContraction<'a> {
             Linear,
             Bilinear { v_t: &'a [f64], v_beta: &'a [f64] },
@@ -2411,11 +2102,6 @@ mod device {
             SaeRowJetContraction::Linear { probe } => (probe, DeviceContraction::Linear),
             SaeRowJetContraction::Bilinear { probe, v_t, v_beta } => {
                 (probe, DeviceContraction::Bilinear { v_t, v_beta })
-            }
-            SaeRowJetContraction::Trace { .. } => {
-                return Err(gam_gpu::gpu_err!(
-                    "SAE row-jet Trace contraction has no device kernel; it reduces on the host"
-                ));
             }
         };
         let probe_dev = stream
@@ -2754,7 +2440,6 @@ mod tests {
                 beta_basis_first[4 * n_beta + 1] = 0.7;
                 beta_basis_first[5 * n_beta + 2] = -0.1;
                 SaeSoftmaxRowJetInput {
-                    gate_program: SaeRowGateProgram::Softmax,
                     n_atoms: k,
                     out_dim: p,
                     coordinate_slots: SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries),
@@ -3068,246 +2753,6 @@ mod tests {
         .expect("CPU bilinear contraction");
         assert!(bilinear.t.iter().any(|&value| value != 0.0));
         assert!(bilinear.beta.iter().any(|&value| value != 0.0));
-    }
-
-    /// Representative per-row selected-inverse weights for the Trace shape: a
-    /// symmetric `E_tt` and `beta_inv` (as the true deflation-folded selected
-    /// inverse is) and an arbitrary `inv_vbeta`.
-    fn trace_weights(n: usize, q: usize, n_beta: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-        let mut e_tt = vec![0.0_f64; n * q * q];
-        for row in 0..n {
-            for a in 0..q {
-                for b in a..q {
-                    let value = ((row * 13 + a * 7 + b * 3 + 1) as f64 * 0.02).cos();
-                    e_tt[row * q * q + a * q + b] = value;
-                    e_tt[row * q * q + b * q + a] = value;
-                }
-            }
-        }
-        let inv_vbeta: Vec<f64> = (0..n * q * n_beta)
-            .map(|index| ((index * 17 + 3) as f64 * 0.01).sin())
-            .collect();
-        let mut beta_inv = vec![0.0_f64; n_beta * n_beta];
-        for i in 0..n_beta {
-            for j in i..n_beta {
-                let value = ((i * 5 + j * 3 + 2) as f64 * 0.03).cos();
-                beta_inv[i * n_beta + j] = value;
-                beta_inv[j * n_beta + i] = value;
-            }
-        }
-        (e_tt, inv_vbeta, beta_inv)
-    }
-
-    /// The log-det metric must be folded into the semantic BASES before the
-    /// Trace tower is built. This pins the algebraic invariant behind that
-    /// routing: applying a row-local linear map to all four bases commutes with
-    /// the complete softmax row program, including the decoder-border channels.
-    /// Distinct maps on the two rows also prove the tile no longer aliases row
-    /// zero's formerly shared `beta_outputs` frame.
-    #[test]
-    fn projected_output_bases_commute_with_softmax_row_program_2333() {
-        let rows = complete_fixture(2);
-        let original = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu)
-            .expect("unprojected CPU row jets")
-            .into_scheduled_rows();
-        let mut projected_rows = rows.clone();
-        let rank = 2usize;
-        let matrices = [
-            [[0.7_f64, -0.2, 0.4], [0.1, 0.8, -0.3]],
-            [[-0.5_f64, 0.6, 0.2], [0.9, -0.1, 0.3]],
-        ];
-        for (row, input) in projected_rows.iter_mut().enumerate() {
-            input
-                .project_output_bases(rank, |source, output| {
-                    for r in 0..rank {
-                        output[r] = matrices[row][r]
-                            .iter()
-                            .zip(source)
-                            .map(|(&left, &right)| left * right)
-                            .sum();
-                    }
-                })
-                .expect("row-local output-base projection");
-        }
-        assert_ne!(
-            projected_rows[0].beta_outputs,
-            projected_rows[1].beta_outputs,
-            "fixture must exercise row-local decoder-border frames"
-        );
-        let projected = execute_softmax_row_jet_tile(&projected_rows, 1.0, SaeRowJetPath::Cpu)
-            .expect("projected CPU row jets")
-            .into_scheduled_rows();
-        let assert_projected = |row: usize, source: &[f64], actual: &[f64], label: &str| {
-            for r in 0..rank {
-                let expected: f64 = matrices[row][r]
-                    .iter()
-                    .zip(source)
-                    .map(|(&left, &right)| left * right)
-                    .sum();
-                assert!(
-                    (actual[r] - expected).abs() <= 1.0e-12 * (1.0 + expected.abs()),
-                    "{label} row={row} rank={r}: actual={} expected={expected}",
-                    actual[r]
-                );
-            }
-        };
-        for row in 0..rows.len() {
-            let q = original[row].q();
-            let n_beta = original[row].n_beta();
-            for a in 0..q {
-                assert_projected(row, original[row].first(a), projected[row].first(a), "first");
-                for b in 0..q {
-                    assert_projected(
-                        row,
-                        original[row].second(a, b),
-                        projected[row].second(a, b),
-                        "second",
-                    );
-                }
-                for border in 0..n_beta {
-                    assert_projected(
-                        row,
-                        original[row].beta_deriv(a, border),
-                        projected[row].beta_deriv(a, border),
-                        "beta_deriv",
-                    );
-                    assert_projected(
-                        row,
-                        original[row].beta_l_deriv(a, border),
-                        projected[row].beta_l_deriv(a, border),
-                        "beta_l_deriv",
-                    );
-                }
-            }
-            for border in 0..n_beta {
-                assert_projected(
-                    row,
-                    original[row].beta(border),
-                    projected[row].beta(border),
-                    "beta",
-                );
-            }
-        }
-    }
-
-    /// #2333 — the Trace seam serves every gate family, not only softmax.
-    ///
-    /// An independent-logistic row (threshold gate, ordered Beta–Bernoulli,
-    /// top-k) moves one gate per logit, so a logit direction reaches a
-    /// coordinate pair only through its own atom's second jets and the softmax
-    /// data-weight-product substitution must not fire. The CPU seam must equal
-    /// the plain reduction of the independent program's materialized channels,
-    /// the normalization law must bind only the softmax program, and the device
-    /// path must refuse the Trace tile.
-    #[test]
-    fn contracted_trace_reduces_independent_logistic_rows_without_softmax_substitution_2333() {
-        let rows: Vec<SaeSoftmaxRowJetInput> = complete_fixture(4)
-            .into_iter()
-            .enumerate()
-            .map(|(row, mut input)| {
-                input.gate_program = SaeRowGateProgram::IndependentLogistic;
-                input.gate_values = vec![0.30 + 0.05 * row as f64, 0.80 - 0.04 * row as f64, 0.55];
-                input
-            })
-            .collect();
-        let mut as_softmax = rows[0].clone();
-        as_softmax.gate_program = SaeRowGateProgram::Softmax;
-        assert!(
-            as_softmax.validate().is_err(),
-            "unnormalized independent gates must fail the softmax normalization law"
-        );
-        for input in &rows {
-            input
-                .validate()
-                .expect("independent gates carry no normalization law");
-        }
-        let inv_tau = 1.3;
-        let channels = execute_softmax_row_jet_tile(&rows, inv_tau, SaeRowJetPath::Cpu)
-            .expect("CPU independent-logistic row jet");
-        let (n, q, n_beta) = (channels.n_rows, channels.q, channels.n_beta);
-        let scheduled = channels.into_scheduled_rows();
-        let dot =
-            |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum() };
-        let (e_tt, inv_vbeta, beta_inv) = trace_weights(n, q, n_beta);
-        let contraction = SaeRowJetContraction::Trace {
-            e_tt: &e_tt,
-            inv_vbeta: &inv_vbeta,
-            beta_inv: &beta_inv,
-        };
-        let trace =
-            execute_softmax_row_jet_tile_contracted(&rows, inv_tau, SaeRowJetPath::Cpu, contraction)
-                .expect("CPU independent-logistic trace contraction");
-        assert_eq!((trace.n_rows, trace.q, trace.n_beta), (n, q, n_beta));
-        let mut any_logit = false;
-        for (row, jets) in scheduled.iter().enumerate() {
-            let e_row = &e_tt[row * q * q..(row + 1) * q * q];
-            let vbeta_row = &inv_vbeta[row * q * n_beta..(row + 1) * q * n_beta];
-            for w in 0..q {
-                let mut expected = 0.0_f64;
-                for a in 0..q {
-                    for b in 0..q {
-                        let dh = dot(jets.second(a, w), jets.first(b))
-                            + dot(jets.first(a), jets.second(b, w));
-                        expected += e_row[a * q + b] * dh;
-                    }
-                    for border in 0..n_beta {
-                        let dh = dot(jets.second(a, w), jets.beta(border))
-                            + dot(jets.first(a), jets.beta_deriv(w, border));
-                        expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
-                    }
-                }
-                for i in 0..n_beta {
-                    for j in 0..n_beta {
-                        let dh = dot(jets.beta_deriv(w, i), jets.beta(j))
-                            + dot(jets.beta(i), jets.beta_deriv(w, j));
-                        expected += beta_inv[i * n_beta + j] * dh;
-                    }
-                }
-                assert_eq!(
-                    trace.t[row * q + w],
-                    expected,
-                    "independent-logistic trace t mismatch row={row}, w={w}"
-                );
-                if expected != 0.0
-                    && matches!(rows[row].primaries[w], SaeRowJetPrimary::Logit { .. })
-                {
-                    any_logit = true;
-                }
-            }
-            for w_beta in 0..n_beta {
-                let mut expected = 0.0_f64;
-                for a in 0..q {
-                    for b in 0..q {
-                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.first(b))
-                            + dot(jets.first(a), jets.beta_l_deriv(b, w_beta));
-                        expected += e_row[a * q + b] * dh;
-                    }
-                    for border in 0..n_beta {
-                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.beta(border));
-                        expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
-                    }
-                }
-                assert_eq!(
-                    trace.beta[row * n_beta + w_beta],
-                    expected,
-                    "independent-logistic trace beta mismatch row={row}, w_beta={w_beta}"
-                );
-            }
-        }
-        assert!(
-            any_logit,
-            "logit-direction independent-logistic trace must engage"
-        );
-        assert!(
-            execute_softmax_row_jet_tile_contracted(
-                &rows,
-                inv_tau,
-                SaeRowJetPath::Device,
-                contraction
-            )
-            .is_err(),
-            "the Trace contraction has no device kernel and must refuse this tile"
-        );
     }
 
     /// The contracted ledger must charge the reduced download + probe upload

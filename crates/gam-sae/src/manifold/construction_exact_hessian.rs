@@ -4531,37 +4531,35 @@ impl SaeManifoldTerm {
         explicit += &rank_charge.direct_rho;
 
         // #2080: the envelope Γ off the SAME shared low-rank logdet derivative
-        // representation (the all-or-nothing cluster's third channel) when
-        // present; the dense selected inverse otherwise. #2712: the border-only
-        // bundle reconstructs the row block on the DEFLATED chart too — `A_i` is
-        // the conditioned row Cholesky, so `A_i⁻¹ + G_i S⁻¹ G_iᵀ` is the deflated
-        // `(H⁻¹)_tt` — and `logdet_theta_adjoint_from_probes` subtracts the same
-        // Daleckii–Krein correction the dense route subtracts instead of routing
+        // representation (the all-or-nothing cluster's third channel). #2712: the
+        // border-only bundle reconstructs the row block on the DEFLATED chart too —
+        // `A_i` is the conditioned row Cholesky, so `A_i⁻¹ + G_i S⁻¹ G_iᵀ` is the
+        // deflated `(H⁻¹)_tt` — and `logdet_theta_adjoint_from_probes` subtracts the
+        // same Daleckii–Krein correction the dense route subtracts instead of routing
         // the fit away. Ordered Beta--Bernoulli uses its row-local PSD majorizer
         // and shared-mass derivative directly.
         // This completes the matrix-free selected-inverse cluster (smoothness EDF + ARD
         // Hessian trace + θ-adjoint); assignment log-strength traces remain
         // solver-bound
         // — the last gaps before the routing flip (see the docstring).
-        let majorizer_gamma = if exact_a_logdet_route {
-            None
-        } else {
-            let gamma = match logdet_derivative_bundle {
-                Some((probes, sinv)) => self
-                    .logdet_theta_adjoint_from_probes(
-                        rho,
-                        evidence_cache,
-                        probes,
-                        sinv,
-                        evidence_operator,
-                        Some(target),
-                    )
-                    .map_err(OuterGradientError::internal)?,
-                None => self
-                    .logdet_theta_adjoint(rho, cache, solver)
-                    .map_err(OuterGradientError::internal)?,
-            };
-            Some(gamma)
+        //
+        // #2333 — a bundle is the only producer here. The pairing refusal above
+        // admits no bundle-free route other than the dense exact-A one, whose Γ
+        // `dense_exact_a_logdet_channels` builds below, so the Trace-seam majorizer
+        // adjoint that used to be the bundle-free arm had no route left to serve.
+        let majorizer_gamma = match logdet_derivative_bundle {
+            None => None,
+            Some((probes, sinv)) => Some(
+                self.logdet_theta_adjoint_from_probes(
+                    rho,
+                    evidence_cache,
+                    probes,
+                    sinv,
+                    evidence_operator,
+                    Some(target),
+                )
+                .map_err(OuterGradientError::internal)?,
+            ),
         };
         // `½ Γ_joint·theta_hat + ∇R·theta_hat` is represented by one effective
         // logdet adjoint `Γ_eff = Γ_joint + 2∇R`, preserving the existing
@@ -4624,9 +4622,7 @@ impl SaeManifoldTerm {
         // `BundleEvidenceGeometry` that names the operator and carries `A`'s own
         // factor cache. `exact_a_logdet_route` still selects which ASSEMBLY runs —
         // the dense priced pseudo-inverse below, or the from-probes channels above
-        // — but no longer which operator is priced. #2333 (routing this θ-adjoint
-        // through the Trace row-jet seam on `A`'s selected inverse) is a
-        // representation change downstream of that, not a missing operator.
+        // — but no longer which operator is priced.
         //
         // Exactly one arm produces Γ, so the two assemblies cannot both be paid
         // for on one gradient.

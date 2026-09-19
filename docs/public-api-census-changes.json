@@ -4410,5 +4410,16 @@
     },
     "reason": "gam#2926: the marginal-slope latent-law gate returns a typed LatentMeasureDecision that carries which law the fit consumed, and the Bernoulli empirical intercept is solved in root slots on the fit's anchor law. build_latent_measure_with_geometry (the tuple-returning gate) and LatentMeasureKind::is_empirical are replaced by build_latent_measure_decision and exhaustive matches on the kind; new_intercept_warm_start_cache and hash_intercept_warm_start_key_rigid (the per-row rigid intercept key cache) are replaced by new_intercept_warm_start_cache_on_law, whose root slots are keyed on the law itself.",
     "evidence": "scripts/public_api_census.py --base bf8bcd492c --head the landing commit on MSI acl42 measured exactly these four removals. Every caller at the base (bms/block_specs.rs build_latent_measure_with_geometry, is_empirical and new_intercept_warm_start_cache; bms/cell_moment_assembly.rs hash_intercept_warm_start_key_rigid; survival/marginal_slope/fit_entry.rs is_empirical and new_intercept_warm_start_cache) moved to the successors. Successor tests: bms::anchor_law_2926_tests::rigid_intercept_slots_answer_repeats_and_seed_moved_iterates_2926 and rigid_intercept_slots_refuse_a_grid_that_is_not_the_law_2926 (root slots), bms::tests::a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declaration (the gate), bms::moving_law_rule::tests (the moving-law certificate), and the root bms_estimated_latent_law_2926 and bms_moving_law_certificate_2926 regressions."
+  },
+  {
+    "base": "97ecb63d7c8ef5d6162770a0a4f2aa8de825cc02",
+    "removed": {
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs::plan_softmax_row_jets_trace": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs::project_output_bases": 1,
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs::logdet_theta_adjoint": 1,
+      "crates/gam-sae/src/manifold/construction_row_jet_logdet_channels.rs::contracted_trace_adjoint": 1
+    },
+    "reason": "#2333/#2933 F03: the outer-gradient assembler's pairing refusal left no route to the bundle-free arm that called logdet_theta_adjoint, the last non-test caller of the Trace-seam majorizer theta-adjoint. The adjoint, its consumer contracted_trace_adjoint, the Trace planner plan_softmax_row_jets_trace and the output-base projection project_output_bases that only the consumer used are deleted.",
+    "evidence": "Gate job 1197886 (gx8, 5023324b3c + patch d72e32519a06a71d81fb8c0a79207eec): public_api_census.py reported exactly these four identities as removed without an acknowledgement (12200 public function declarations before, 12196 after). The three selected-inverse helpers this change also deletes are private or struct items that the census does not count."
   }
 ]
