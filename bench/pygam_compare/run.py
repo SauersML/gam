@@ -290,7 +290,13 @@ def run_plan(
                     elif cell.concurrency == 1:
                         batch = [
                             run_rep(
-                                lib, cell, rep, plan.timeout_s, memcap_mb, cwd, plan.postfit
+                                lib,
+                                cell,
+                                rep,
+                                plan.timeout_s,
+                                memcap_mb,
+                                cwd,
+                                plan.postfit,
                             )
                         ]
                     else:
