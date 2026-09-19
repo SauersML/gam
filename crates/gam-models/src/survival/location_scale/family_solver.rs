@@ -3,6 +3,100 @@ use gam_problem::ConstraintSet;
 use opt::{BacktrackConfig, backtracking_line_search, constants};
 use std::convert::Infallible;
 
+/// Absolute-value Newton direction of the direct parametric-AFT MLE, with the
+/// spectral facts the stopping rule and the saddle escape need.
+pub(crate) struct AftNewtonDirection {
+    /// `δ = Q|Λ|⁻¹Qᵀg` over the eigenvalues resolved from zero.
+    pub(crate) delta: Array1<f64>,
+    /// The decrement `λ² = gᵀδ = Σ cᵢ²/|λᵢ|` over the same eigenvalues.
+    pub(crate) decrement: f64,
+    /// Eigenvalues of `H = −∇²ℓ` resolved below zero.
+    pub(crate) negative_curvature: usize,
+    /// The spectrum's rounding band (see [`aft_absolute_newton_direction`]).
+    pub(crate) spectrum_band: f64,
+    pub(crate) min_eigenvalue: f64,
+    /// Unit eigenvector of `min_eigenvalue`.
+    pub(crate) min_eigenvector: Array1<f64>,
+}
+
+/// Ascent direction for `ℓ` given `H = −∇²ℓ` and `g = ∇ℓ`, where `H` was
+/// accumulated from `accumulated_rows` per-row terms (zero for an exact matrix).
+///
+/// With `H = Q Λ Qᵀ` and `cᵢ = qᵢᵀg`, the direction is `δ = Σ (cᵢ/|λᵢ|) qᵢ` over
+/// the eigenvalues outside the spectrum's rounding band
+/// `b_H = γ_{rows+3p+1}·‖H‖₂` (the row accumulation followed by a
+/// `p`-dimensional backward-stable eigensolve). It equals the Newton step
+/// `H⁻¹g` when `H` is positive definite and is an ascent direction for any
+/// symmetric `H`, since `g·δ = Σ cᵢ²/|λᵢ| > 0` (Dauphin et al., "Identifying
+/// and attacking the saddle point problem", NeurIPS 2014). It replaces a
+/// Levenberg ladder `H + τI` whose starting `τ`, growth factor and cap were
+/// tuned constants (#3090).
+///
+/// An eigenvalue inside the band carries no curvature, so the quadratic model
+/// has no maximizer along its eigenvector unless the gradient is flat there.
+/// A gradient component beyond that inner product's own rounding band along
+/// such a direction is reported as a structured failure: no Newton step
+/// exists, and inventing curvature for it would be a ridge.
+pub(crate) fn aft_absolute_newton_direction(
+    h: &Array2<f64>,
+    g: &Array1<f64>,
+    accumulated_rows: usize,
+) -> Result<AftNewtonDirection, SurvivalLocationScaleError> {
+    use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+    use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
+
+    let p = g.len();
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(h, faer::Side::Lower).map_err(
+        |error| SurvivalLocationScaleError::NumericalFailure {
+            reason: format!(
+                "direct parametric-AFT MLE: joint Hessian eigendecomposition failed: {error}"
+            ),
+        },
+    )?;
+    let h_norm = eigenvalues.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let spectrum_band = accumulation_growth(accumulated_rows + 3 * p + 1) * h_norm;
+    let mut delta = Array1::<f64>::zeros(p);
+    let mut decrement = 0.0_f64;
+    let mut negative_curvature = 0_usize;
+    let mut min_index = 0_usize;
+    for (k, &lambda) in eigenvalues.iter().enumerate() {
+        if lambda < eigenvalues[min_index] {
+            min_index = k;
+        }
+        let q = eigenvectors.column(k);
+        let c = q.dot(g);
+        if lambda.abs() <= spectrum_band {
+            let absolute_sum: f64 = q.iter().zip(g.iter()).map(|(a, b)| (a * b).abs()).sum();
+            let component_band = accumulation_band(accumulated_rows + p, absolute_sum);
+            if c.abs() > component_band {
+                return Err(SurvivalLocationScaleError::NumericalFailure {
+                    reason: format!(
+                        "direct parametric-AFT MLE: log-likelihood gradient {c:.6e} along a \
+                         direction with no resolved curvature (eigenvalue {lambda:.3e} within \
+                         the rounding band {spectrum_band:.3e}); the quadratic model has no \
+                         maximizer"
+                    ),
+                });
+            }
+            continue;
+        }
+        if lambda < 0.0 {
+            negative_curvature += 1;
+        }
+        let weight = c / lambda.abs();
+        delta.scaled_add(weight, &q);
+        decrement += c * weight;
+    }
+    Ok(AftNewtonDirection {
+        delta,
+        decrement,
+        negative_curvature,
+        spectrum_band,
+        min_eigenvalue: eigenvalues[min_index],
+        min_eigenvector: eigenvectors.column(min_index).to_owned(),
+    })
+}
+
 impl SurvivalLocationScaleFamily {
     /// Recompute every block's linear predictor `η_b = D_b · β_b + o_b` from
     /// the joint coefficient vector `theta` (block-concatenated) and the block
@@ -137,7 +231,6 @@ impl SurvivalLocationScaleFamily {
         &self,
         specs: &[ParameterBlockSpec],
     ) -> Result<(Vec<ParameterBlockState>, f64, Array2<f64>), SurvivalLocationScaleError> {
-        use gam_linalg::faer_ndarray::strict_symmetric_eigh;
         use gam_linalg::roundoff::accumulation_growth;
 
         self.validate_joint_specs(
@@ -241,33 +334,18 @@ impl SurvivalLocationScaleFamily {
                     reason: "direct parametric-AFT MLE: joint Hessian assembly failed".to_string(),
                 }
             })?;
-            let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&h, faer::Side::Lower)
-                .map_err(|error| SurvivalLocationScaleError::NumericalFailure {
-                    reason: format!(
-                        "direct parametric-AFT MLE: joint Hessian eigendecomposition failed: {error}"
-                    ),
-                })?;
-            let h_norm = eigenvalues.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-            let spectral_band = accumulation_growth(n_rows + 3 * p_total + 1) * h_norm;
             let gain_band = accumulation_growth(n_rows + p_total * p_total) * ll.abs();
 
             // Modified-Newton ascent direction in the |H| metric on the
             // numerically nonzero spectrum; its decrement λ² = gᵀδ.
-            let coordinates = eigenvectors.t().dot(&g);
-            let mut delta = Array1::<f64>::zeros(p_total);
-            let mut decrement = 0.0_f64;
-            for i in 0..p_total {
-                let magnitude = eigenvalues[i].abs();
-                if magnitude > spectral_band {
-                    let weight = coordinates[i] / magnitude;
-                    delta.scaled_add(weight, &eigenvectors.column(i));
-                    decrement += coordinates[i] * weight;
-                }
-            }
-            let (min_index, lambda_min) = eigenvalues.iter().copied().enumerate().fold(
-                (0_usize, f64::INFINITY),
-                |acc, (i, v)| if v < acc.1 { (i, v) } else { acc },
-            );
+            let AftNewtonDirection {
+                mut delta,
+                decrement,
+                negative_curvature,
+                spectrum_band: spectral_band,
+                min_eigenvalue: lambda_min,
+                min_eigenvector,
+            } = aft_absolute_newton_direction(&h, &g, n_rows)?;
 
             if 0.5 * decrement <= gain_band {
                 if lambda_min > spectral_band {
@@ -287,9 +365,8 @@ impl SurvivalLocationScaleFamily {
                 }
                 // A saddle: continue along the most negative curvature direction,
                 // signed uphill in ℓ, at unit |H|-length.
-                let direction = eigenvectors.column(min_index);
-                let sign = if g.dot(&direction) >= 0.0 { 1.0 } else { -1.0 };
-                delta = direction.mapv(|v| sign * v / lambda_min.abs().sqrt());
+                let sign = if g.dot(&min_eigenvector) >= 0.0 { 1.0 } else { -1.0 };
+                delta = min_eigenvector.mapv(|v| sign * v / lambda_min.abs().sqrt());
             }
 
             // Second-order model gain of ℓ along δ: m(α) = α·gᵀδ + ½α²·κ with
@@ -360,7 +437,8 @@ impl SurvivalLocationScaleFamily {
                         reason: format!(
                             "direct parametric-AFT MLE: no sufficient-increase step is resolvable \
                              above the objective band {gain_band:.6e} (½·decrement {half:.6e}, \
-                             smallest observed-information eigenvalue {lambda_min:.6e}); the \
+                             smallest observed-information eigenvalue {lambda_min:.6e}, \
+                             {negative_curvature} of {p_total} resolved below zero); the \
                              curvature model disagrees with the likelihood",
                             half = 0.5 * decrement
                         ),

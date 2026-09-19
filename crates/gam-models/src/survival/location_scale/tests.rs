@@ -2019,27 +2019,6 @@ fn survival_non_probit_test_links() -> Vec<(&'static str, InverseLink)> {
     ]
 }
 
-fn spec_from_dense_for_test(
-    name: &str,
-    design: DesignMatrix,
-    gauge_priority: u8,
-) -> ParameterBlockSpec {
-    let n = design.nrows();
-    ParameterBlockSpec {
-        name: name.to_string(),
-        design,
-        offset: Array1::zeros(n),
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::zeros(0),
-        initial_beta: None,
-        gauge_priority,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    }
-}
-
 #[test]
 fn survival_log_likelihood_only_matches_sum_of_exact_row_kernels() {
     let family = survival_exact_newton_test_family();
@@ -7402,3 +7381,6 @@ fn the_explicit_psi_terms_are_the_psi_derivatives_of_the_nll_2695() {
 
 /// gam#2695 degree ladder (child module so this file stays under the line gate).
 mod knot_ladder_2695;
+
+/// #3090: the direct parametric-AFT step on an indefinite Hessian.
+mod absolute_newton_3090;

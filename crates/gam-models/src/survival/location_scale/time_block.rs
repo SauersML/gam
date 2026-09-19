@@ -1160,7 +1160,8 @@ pub(crate) fn reduced_warp_logt_baseline_usable(
     design_exit: &Array2<f64>,
     log_time_exit: ndarray::ArrayView1<f64>,
 ) -> bool {
-    use gam_linalg::faer_ndarray::FaerCholesky;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    use gam_linalg::roundoff::{accumulation_band, symmetric_spectrum_rounding_band};
     let n = design_exit.nrows();
     let r = z.ncols();
     if n == 0 || r == 0 || log_time_exit.len() != n {
@@ -1169,22 +1170,27 @@ pub(crate) fn reduced_warp_logt_baseline_usable(
     let g = design_exit.dot(z); // (n, r) warp images of the null directions
     let gtg = g.t().dot(&g); // (r, r)
     let gtl = g.t().dot(&log_time_exit); // (r,)
-    // Tiny Levenberg ridge so a rank-deficient G (some null directions producing
-    // a (near-)zero warp image) still yields a well-posed projection rather than
-    // a Cholesky failure that would spuriously reject the collapse.
-    let scale = gtg
-        .diag()
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-        .max(1.0);
-    let mut ridged = gtg;
-    for i in 0..r {
-        ridged[[i, i]] += 1e-10 * scale;
-    }
-    let Ok(chol) = ridged.cholesky(faer::Side::Lower) else {
+    // Minimum-norm least-squares coefficients `c = G⁺ log t`, read off the
+    // spectrum of GᵀG. A null direction whose warp image is not resolved from
+    // zero — its eigenvalue inside the eigensolver's band plus the band the
+    // length-`n` inner products left in each Gram entry, `γ_n·√(dᵢdⱼ)` — carries
+    // no information and drops out. That is the τ→0 limit a ridge `τ·I` only
+    // approximates, with no τ to choose (#3090).
+    let Ok((eigenvalues, eigenvectors)) = gtg.eigh(faer::Side::Lower) else {
         return false;
     };
-    let c = chol.solvevec(&gtl);
+    let spectrum: Vec<f64> = eigenvalues.iter().copied().collect();
+    let root_diagonal_sum: f64 = gtg.diag().iter().map(|d| d.abs().sqrt()).sum();
+    let band = symmetric_spectrum_rounding_band(&spectrum)
+        + accumulation_band(n, root_diagonal_sum * root_diagonal_sum);
+    let mut c = Array1::<f64>::zeros(r);
+    for (k, &lambda) in spectrum.iter().enumerate() {
+        if lambda <= band {
+            continue;
+        }
+        let q = eigenvectors.column(k);
+        c.scaled_add(q.dot(&gtl) / lambda, &q);
+    }
     if c.iter().any(|v| !v.is_finite()) {
         return false;
     }

@@ -2762,7 +2762,7 @@ fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
         cost_stall: None,
         cost_stall_bounds: None,
         consecutive_probe_refusals: 0,
-        accepted_steps: None,
+        accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: None,
         stratum_rank: None,
@@ -3705,7 +3705,7 @@ fn bfgs_bridge_value_probe_carries_the_refusal_reason_where_plus_inf_names_nothi
             cost_stall: None,
             cost_stall_bounds: None,
             consecutive_probe_refusals: 0,
-            accepted_steps: None,
+            accepted_steps: Arc::default(),
             pending_first_order: Vec::new(),
             incumbent: None,
             stratum_rank: None,
@@ -3859,7 +3859,7 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo, hi)),
         consecutive_probe_refusals: 0,
-        accepted_steps: None,
+        accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: None,
         stratum_rank: None,
@@ -6623,3 +6623,8 @@ mod typed_objective_failure_propagation_1561_tests;
 // evaluated trials (#3017).
 #[path = "arc_rejected_trials_3017_tests.rs"]
 mod arc_rejected_trials_3017_tests;
+
+// The cost-stall guard judges a decrease against the objective bands of the
+// two evaluations it compares, not a relative floor (#3018).
+#[path = "cost_stall_objective_band_3018_tests.rs"]
+mod cost_stall_objective_band_3018_tests;
