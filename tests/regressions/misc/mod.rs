@@ -67,6 +67,7 @@ mod owed_1392;
 mod owed_1395;
 mod owed_1399;
 mod owed_1410;
+mod regression_1082_block_correction_decided_at_optimum;
 mod regression_2644_outer_criterion_conditioning;
 mod regression_2726_joint_psi_seed_shares_theta0;
 mod regression_2748_block_correction_continuity;

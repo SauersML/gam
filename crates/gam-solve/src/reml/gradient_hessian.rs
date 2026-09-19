@@ -3911,6 +3911,9 @@ impl<'a> RemlState<'a> {
             prev_warm_start_beta: RwLock::new(None),
             prev_warm_start_rho: RwLock::new(None),
             block_correction_admission: AtomicUsize::new(0),
+            block_correction_decision: std::sync::Mutex::new(
+                BlockCorrectionDecision::AtFirstEngagedEvaluation,
+            ),
             block_correction_axis_orders: std::sync::Mutex::new(None),
             ift_quality_runtime: std::sync::Mutex::new(Default::default()),
             ift_mode_response_slot: std::sync::Mutex::new(None),

@@ -1221,6 +1221,11 @@ where
         fit_linear_constraints.clone(),
     )?;
     reml_state.set_rho_prior(opts.rho_prior.clone());
+    // #1082: this search decides the #784 block-local correction's admission
+    // once, at its certified Laplace optimum, so no evaluation before that (the
+    // canonical-key and nuisance anchors at ρ = 0, the prepass, every seed) can
+    // latch it.
+    reml_state.defer_block_correction_admission();
     let resolved_likelihood_scale = cfg
         .likelihood
         .resolved_scale()
@@ -1323,6 +1328,10 @@ where
     let mut pirls_res;
     let mut negbin_alternation_round: usize = 0;
     let mut negbin_rho_seed: Option<Array1<f64>> = None;
+    // Set once the #784 correction is admitted at the Laplace optimum: every
+    // later run of the standard arm is the corrected search continued from that
+    // optimum, alone (#1082).
+    let mut corrected_continuation = false;
     let mut negbin_best_checkpoint: Option<NegbinJointCheckpoint> = None;
     // The box every outer arm searches the ρ block in, and so the box its
     // certificate judges rails against: the #2812 resolvability domain (#2902
@@ -1374,7 +1383,18 @@ where
                     ),
                 )
                 .with_tolerance(reml_tol)
-                .with_seed_config(reml_seed_config)
+                // The corrected continuation starts from the certified Laplace
+                // optimum alone: a seed plan would price the correction at every
+                // start for a criterion whose admission that optimum decided.
+                .with_seed_config(if corrected_continuation {
+                    SeedConfig {
+                        max_seeds: 1,
+                        seed_budget: 1,
+                        ..reml_seed_config
+                    }
+                } else {
+                    reml_seed_config
+                })
                 .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
                 // n-scaled absolute gradient floor for EVERY family (#1082).
@@ -1477,7 +1497,12 @@ where
             // matches the textbook profiled-REML and the curvature SIGN is
             // identifiable. Same machinery as the gam#1266 double-penalty rescue.
             let caller_seeded_rho = rho_warm_start.is_some_and(|h| h.len() == k);
-            let prepass_candidates: Vec<Array1<f64>> = {
+            let prepass_candidates: Vec<Array1<f64>> = 'prepass: {
+                // The corrected continuation has one start, the optimum that
+                // admitted the correction (#1082).
+                if corrected_continuation {
+                    break 'prepass Vec::new();
+                }
                 // The prepass scores its analytic candidates against the TRUE
                 // REML/LAML cost and adopts one only on strict improvement, so its
                 // window is the domain the outer optimizer itself searches: the
@@ -2283,6 +2308,17 @@ where
                     theta_residual,
                     theta_bound,
                 );
+                // #1082: the certified joint Laplace optimum decides the #784
+                // correction's admission, as for the rho-only search below.
+                if mixture_dim == 0
+                    && sas_dim == 0
+                    && reml_state.block_correction_admission_deferred()
+                    && reml_state.decide_block_correction_admission(&final_rho)?
+                {
+                    negbin_rho_seed = Some(final_rho.clone());
+                    corrected_continuation = true;
+                    continue;
+                }
                 break;
             }
 
@@ -2324,6 +2360,25 @@ where
             negbin_rho_seed = Some(final_rho.clone());
             reml_state.reset_outer_seed_state();
             negbin_alternation_round += 1;
+            continue;
+        }
+
+        // #1082: the certified Laplace optimum decides the #784 correction's
+        // admission. An admitted correction changes the criterion, so the search
+        // continues from this optimum under it. A search that did not certify
+        // never decides, and the certificate gate after the loop refuses it typed.
+        if mixture_dim == 0
+            && sas_dim == 0
+            && outer_result.converged()
+            && outer_result
+                .criterion_certificate
+                .as_ref()
+                .is_some_and(|certificate| certificate.certifies())
+            && reml_state.block_correction_admission_deferred()
+            && reml_state.decide_block_correction_admission(&final_rho)?
+        {
+            negbin_rho_seed = Some(final_rho.clone());
+            corrected_continuation = true;
             continue;
         }
 

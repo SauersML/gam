@@ -5505,6 +5505,36 @@ impl RemlArena {
     }
 }
 
+/// The ρ at which a fit decides the #784 block-local correction's admission,
+/// which [`RemlState::block_correction_admission`] then freezes for the fit
+/// (#2748, #1082).
+///
+/// A fixed-ρ evaluation publishes the ρ it is handed, so it decides there, at
+/// its first evaluation whose skewness verdict engages. A search publishes its
+/// certified optimum, and deciding at whichever ρ it evaluates first made the
+/// fitted criterion a function of the start. On
+/// `gam_tensor_te_2d_poisson_matches_mgcv` the verdict engaged at the first
+/// evaluation (`max|γ| = 0.238` against `τ = 0.126`) and not at the Laplace
+/// optimum (`0.066`), so that latch integrated an `m = 8` block at every one of
+/// 132 later inner solutions for a correction the published ρ declines (job
+/// 1246493). A search therefore prices the Laplace criterion, decides once at
+/// its certified optimum, and either declines there or latches and continues
+/// the corrected search from that optimum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockCorrectionDecision {
+    /// Decided at the first evaluation whose verdict engages (a fixed-ρ caller).
+    AtFirstEngagedEvaluation,
+    /// A search is running on the Laplace criterion: the correction is zero and
+    /// nothing latches.
+    DeferredToOptimum,
+    /// The next evaluation, at the search's certified optimum, decides.
+    DecidingAtOptimum,
+    /// The verdict declined at the certified optimum: zero for the fit.
+    DeclinedAtOptimum,
+    /// Admitted at the certified optimum and latched.
+    AdmittedAtOptimum,
+}
+
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5570,7 +5600,13 @@ pub(crate) struct RemlState<'a> {
     /// whose correction never engages is bit-identical to the pre-#2748 fit and
     /// a fit that engaged consistently keeps the same block it always had; only
     /// the fits that were toggling change.
+    ///
+    /// WHERE that admission is decided is [`Self::block_correction_decision`]
+    /// (#1082).
     pub(crate) block_correction_admission: AtomicUsize,
+    /// The ρ at which [`Self::block_correction_admission`] is decided (#1082); see
+    /// [`BlockCorrectionDecision`].
+    pub(crate) block_correction_decision: std::sync::Mutex<BlockCorrectionDecision>,
     /// The per-axis Gauss–Hermite orders latched beside
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve

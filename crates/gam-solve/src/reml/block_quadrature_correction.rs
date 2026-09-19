@@ -85,6 +85,12 @@ impl<'a> RemlState<'a> {
     /// admission would contribute a term they do not carry — the same
     /// objective↔gradient desync this site already declines the splice over for
     /// ψ coordinates and for the Beta family.
+    ///
+    /// Where the admission is decided is [`RemlState::block_correction_decision`]
+    /// (#1082). A search decides it once, at its certified Laplace optimum,
+    /// because a latch on the first engaged evaluation made the fitted criterion
+    /// a function of where the search started.
+    ///
     /// Per-bundle-cached wrapper around [`Self::block_local_quadrature_correction_compute`].
     ///
     /// The block-local correction is a deterministic function of this bundle's
@@ -103,6 +109,11 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         n_ext: usize,
     ) -> Result<TkCorrectionTerms, EstimationError> {
+        // A deferred search prices the Laplace criterion, which is not this
+        // bundle's correction once the admission is decided, so it is not cached.
+        if self.block_correction_admission_deferred() {
+            return self.block_local_quadrature_correction_compute(rho, bundle, n_ext);
+        }
         if let Some((cached_ext, terms, audit)) = bundle.block_local_correction.get()
             && *cached_ext == n_ext
         {
@@ -130,6 +141,53 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    fn block_correction_decision_guard(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BlockCorrectionDecision> {
+        self.block_correction_decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Price the Laplace criterion until the search certifies its optimum, and
+    /// decide the correction's admission there (#1082,
+    /// [`BlockCorrectionDecision::DeferredToOptimum`]).
+    pub(crate) fn defer_block_correction_admission(&self) {
+        *self.block_correction_decision_guard() = BlockCorrectionDecision::DeferredToOptimum;
+    }
+
+    pub(crate) fn block_correction_admission_deferred(&self) -> bool {
+        *self.block_correction_decision_guard() == BlockCorrectionDecision::DeferredToOptimum
+    }
+
+    /// Decide the deferred admission once, at the search's certified Laplace
+    /// optimum `rho` (#1082). One criterion evaluation there runs the skewness
+    /// verdict and, when it engages, the order search that latches the block,
+    /// exactly as a first admission does (#2748).
+    ///
+    /// Returns whether the correction was admitted. If it was, `rho` was
+    /// certified under a criterion that is no longer the model's, and the caller
+    /// continues the corrected search from it. A correction refused at `rho` is
+    /// the fit's error: the verdict requires the correction at the point the fit
+    /// would publish, and it cannot be evaluated there.
+    pub(crate) fn decide_block_correction_admission(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<bool, EstimationError> {
+        *self.block_correction_decision_guard() = BlockCorrectionDecision::DecidingAtOptimum;
+        // Every cached evaluation priced the Laplace criterion, and the decision
+        // is taken at the terminal inner mode, not a capped screening one.
+        self.reset_outer_seed_state();
+        self.compute_cost(rho)?;
+        let mut decision = self.block_correction_decision_guard();
+        // An unconditional decline (the family or the hyper-layout) returns
+        // before the verdict, so the decision is still open here.
+        if *decision == BlockCorrectionDecision::DecidingAtOptimum {
+            *decision = BlockCorrectionDecision::DeclinedAtOptimum;
+        }
+        Ok(*decision == BlockCorrectionDecision::AdmittedAtOptimum)
+    }
+
     fn block_local_quadrature_correction_compute(
         &self,
         rho: &Array1<f64>,
@@ -150,6 +208,15 @@ impl<'a> RemlState<'a> {
             gradient: Some(Array1::zeros(n_rho + n_ext)),
             hessian: None,
         };
+
+        // A search deciding at its optimum prices the Laplace criterion until
+        // then, and a correction declined there stays declined for the fit.
+        if matches!(
+            *self.block_correction_decision_guard(),
+            BlockCorrectionDecision::DeferredToOptimum | BlockCorrectionDecision::DeclinedAtOptimum
+        ) {
+            return Ok(zero());
+        }
 
         // Laplace is exact for the Gaussian-identity model: nothing to correct.
         if reml_is_gaussian_identity(&self.config.likelihood) {
@@ -266,6 +333,15 @@ impl<'a> RemlState<'a> {
             .load(std::sync::atomic::Ordering::Relaxed)
             .checked_sub(1);
         if latched_block_dim.is_none() && !verdict.fallback_required() {
+            if *self.block_correction_decision_guard() == BlockCorrectionDecision::DecidingAtOptimum
+            {
+                log::info!(
+                    "[#784] block-local correction DECLINED for this fit at its certified Laplace \
+                     optimum: max|γ|={:.4e} against τ={:.4e} (#1082)",
+                    verdict.max_abs_skewness,
+                    verdict.threshold,
+                );
+            }
             return Ok(zero());
         }
 
@@ -520,6 +596,11 @@ impl<'a> RemlState<'a> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(quadrature.axis_orders.clone());
+            let mut decision = self.block_correction_decision_guard();
+            if *decision == BlockCorrectionDecision::DecidingAtOptimum {
+                *decision = BlockCorrectionDecision::AdmittedAtOptimum;
+            }
+            drop(decision);
             log::info!(
                 "[#784] block-local correction ADMITTED for this fit: block dimension m={m} and \
                  axis orders {:?} are now the model's, and the tau={:.3} activation no longer \
