@@ -496,7 +496,6 @@ mod random_effect_signed_zero_tests {
             feature_col: 0,
             frozen_levels: None,
             lenient_unseen: true,
-            carries_level: false,
         }
     }
 
@@ -1285,7 +1284,6 @@ mod frozen_factor_level_collection_tests {
                 feature_col: 1,
                 frozen_levels: Some(vec![2.0_f64.to_bits(), 1.0_f64.to_bits()]),
                 lenient_unseen: false,
-                carries_level: false,
             }],
             smooth_terms: vec![smooth(
                 "s(x)",
@@ -1364,7 +1362,6 @@ mod frozen_factor_level_collection_tests {
                 feature_col: 1,
                 frozen_levels: Some(vec![2.0_f64.to_bits(), 1.0_f64.to_bits()]),
                 lenient_unseen: false,
-                carries_level: false,
             }],
             smooth_terms: vec![
                 smooth("nested", nested),

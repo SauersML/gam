@@ -42,13 +42,13 @@ mod adaptive_bounded_duchon_tests {
     fn spatial_penalty_ranges_follow_realized_global_layout_2287() {
         let data = array![
             [1.0, -0.8, 0.0, 0.0, 0.00, 0.57],
-            [2.0, -0.4, 1.0, 0.0, 0.14, 0.00],
-            [3.0, -0.1, 0.0, 0.0, 0.29, 0.86],
-            [4.0, 0.2, 1.0, 0.0, 0.43, 0.29],
+            [2.0, -0.4, 1.0, 1.0, 0.14, 0.00],
+            [3.0, -0.1, 0.0, 2.0, 0.29, 0.86],
+            [4.0, 0.2, 1.0, 3.0, 0.43, 0.29],
             [5.0, 0.5, 0.0, 0.0, 0.57, 1.00],
-            [6.0, 0.7, 1.0, 0.0, 0.71, 0.43],
-            [7.0, 0.9, 0.0, 0.0, 0.86, 0.14],
-            [8.0, 1.1, 1.0, 0.0, 1.00, 0.71],
+            [6.0, 0.7, 1.0, 1.0, 0.71, 0.43],
+            [7.0, 0.9, 0.0, 2.0, 0.86, 0.14],
+            [8.0, 1.1, 1.0, 3.0, 1.00, 0.71],
         ];
         let smooth = |name: &str, feature_col: usize| SmoothTermSpec {
             frozen_parametric_residualization: None,
@@ -98,25 +98,14 @@ mod adaptive_bounded_duchon_tests {
                     frozen_function_mass: None,
                 },
             ],
-            // Likewise, both random effects own non-empty coefficient ranges
-            // but only the first emits a ridge: the second is a one-level
-            // carrier of the model's level, which is the constant alone.
-            random_effect_terms: vec![
-                RandomEffectTermSpec {
-                    name: "penalized_group".to_string(),
-                    feature_col: 2,
-                    frozen_levels: Some(vec![0, 1]),
-                    lenient_unseen: true,
-                    carries_level: false,
-                },
-                RandomEffectTermSpec {
-                    name: "level_carrier".to_string(),
-                    feature_col: 3,
-                    frozen_levels: Some(vec![0.0_f64.to_bits()]),
-                    lenient_unseen: false,
-                    carries_level: true,
-                },
-            ],
+            // The random effect owns exactly one ridge between the linear
+            // ridges and the smooths. Column 3 is unused.
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "penalized_group".to_string(),
+                feature_col: 2,
+                frozen_levels: Some(vec![0, 1]),
+                lenient_unseen: true,
+            }],
             // Distinct feature ownership is essential here. Two copies of the
             // same smooth are deliberately collapsed by global hierarchical
             // identifiability, in which case the second term correctly owns no
@@ -335,7 +324,6 @@ mod adaptive_bounded_duchon_tests {
                 feature_col: 1,
                 frozen_levels: None,
                 lenient_unseen: true,
-                carries_level: false,
             }],
             smooth_terms: vec![SmoothTermSpec {
             frozen_parametric_residualization: None,

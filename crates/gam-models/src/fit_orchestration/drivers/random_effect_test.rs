@@ -18,7 +18,6 @@
 /// each random-effect row.
 pub fn random_effect_test_records(
     design: &gam_terms::smooth::TermCollectionDesign,
-    spec: &gam_terms::smooth::TermCollectionSpec,
     fit: &UnifiedFitResult,
 ) -> Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord> {
     use gam_terms::inference::random_effect_test::{
@@ -85,13 +84,8 @@ pub fn random_effect_test_records(
     };
     let requests: Vec<RandomEffectTermRequest> = ranges
         .iter()
-        .map(|(name, range)| RandomEffectTermRequest {
+        .map(|(_, range)| RandomEffectTermRequest {
             range: range.clone(),
-            carries_level: spec
-                .random_effect_terms
-                .iter()
-                .find(|term| term.name == *name)
-                .is_some_and(|term| term.carries_level),
         })
         .collect();
     records(

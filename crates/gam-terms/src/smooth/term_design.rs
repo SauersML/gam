@@ -184,7 +184,6 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         data,
         &spec.linear_terms,
         &spec.smooth_terms,
-        level_carrier_smooth(spec),
     )?;
 
     let p_rand: usize = random_blocks.iter().map(|b| b.num_groups).sum();
@@ -323,40 +322,17 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     }
 
     for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
-        let term = &spec.random_effect_terms[re_idx];
-        if !term.owns_penalty_block(range.len()) {
-            continue;
-        }
         let block_size = range.len();
-        // The level carrier's constant direction is the model's level, the one
-        // direction an intercept leaves unpenalized; its contrasts keep the
-        // penalty every other categorical block has.
-        let carries_level = term.carries_level;
         let global_index = penalties.len();
-        let (penalty, source, nullspace_dim) = if carries_level {
-            let centring = Array2::<f64>::eye(block_size)
-                - Array2::<f64>::from_elem((block_size, block_size), 1.0 / block_size as f64);
-            (
-                BlockwisePenalty::new(range.clone(), centring),
-                format!("RandomEffectContrastRidge({name})"),
-                1,
-            )
-        } else {
-            (
-                BlockwisePenalty::ridge(range.clone(), 1.0),
-                format!("RandomEffectRidge({name})"),
-                0,
-            )
-        };
-        penalties.push(penalty);
-        nullspace_dims.push(nullspace_dim);
+        penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));
+        nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: Some(name.clone()),
             penalty: ActivePenaltyInfo {
-                source: PenaltySource::Other(source),
+                source: PenaltySource::Other(format!("RandomEffectRidge({name})")),
                 original_index: re_idx,
-                effective_rank: block_size - nullspace_dim,
+                effective_rank: block_size,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,
@@ -483,15 +459,6 @@ fn build_term_collection_design_inner_with_policy_and_plan(
 /// formula kept its intercept and no anchored B-spline pins the level.
 pub fn term_collection_has_global_intercept(spec: &TermCollectionSpec) -> bool {
     matches!(spec.level, ModelLevel::Intercept) && !term_collection_has_anchored_bspline(spec)
-}
-
-/// The smooth that carries the constant level of a no-intercept model, if one
-/// was chosen (see [`ModelLevel`]).
-fn level_carrier_smooth(spec: &TermCollectionSpec) -> Option<usize> {
-    match spec.level {
-        ModelLevel::NoIntercept { level_smooth } => level_smooth,
-        ModelLevel::Intercept => None,
-    }
 }
 
 /// Whether any smooth term carries an anchored B-spline endpoint (one *or* two
@@ -1578,7 +1545,6 @@ fn apply_global_smooth_identifiability(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
-    level_smooth: Option<usize>,
 ) -> Result<(SmoothDesign, Array1<f64>), BasisError> {
     // Global smooth identifiability policy:
     //
@@ -1738,9 +1704,6 @@ fn apply_global_smooth_identifiability(
                         || factor_by_level_gate(termspec).is_some())
             }
         };
-        // The level-carrying smooth of a no-intercept model keeps its
-        // constant, so the constant column stays out of its block; a block
-        // left with no column is no block at all.
         let parametric_block = if !needs_parametric_block {
             None
         } else {
@@ -1748,9 +1711,7 @@ fn apply_global_smooth_identifiability(
                 data,
                 linear_terms,
                 termspec,
-                level_smooth != Some(idx),
             )?)
-            .filter(|block| block.ncols() > 0)
         };
         // The replay's own owner blocks, named by the chart rather than
         // re-derived: which owners bound is decided by a cross-residual on the
@@ -2183,7 +2144,6 @@ fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     termspec: &SmoothTermSpec,
-    include_constant: bool,
 ) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
@@ -2235,13 +2195,10 @@ fn build_parametric_constraint_block_for_term(
         }
     }
 
-    let lead = usize::from(include_constant);
-    let mut c = Array2::<f64>::zeros((n, lead + parametric_cols.len()));
-    if include_constant {
-        c.column_mut(0).fill(1.0);
-    }
+    let mut c = Array2::<f64>::zeros((n, 1 + parametric_cols.len()));
+    c.column_mut(0).fill(1.0);
     for (j, &feature_col) in parametric_cols.iter().enumerate() {
-        c.column_mut(j + lead).assign(&data.column(feature_col));
+        c.column_mut(j + 1).assign(&data.column(feature_col));
     }
     Ok(c)
 }

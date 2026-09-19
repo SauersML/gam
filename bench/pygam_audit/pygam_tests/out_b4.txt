@@ -1,0 +1,20 @@
+[2m 05s] [INDEF-HESS] rho=[11.460324183299358, 23.760455425728786, -6.079144882377884, 25.738749110263594, -2.0497280141744487]
+[2m 05s] [INDEF-HESS] eigenvalues=[5.095730698966836e-9, 2.7531975654870415e-7, 1.6951652548177315e-5, 0.4011844511256195, 0.4925701991073902]
+[2m 05s] [INDEF-HESS] active_rank=4/5 structural_zero=0 unresolvable_curvature=0 below_gradient_floor=1 curvature_resolution=3.497e-14
+[2m 05s] [INDEF-HESS] classifications=["G", "A", "A", "A", "A"] (A=active; Z=certified null of the penalty map, excused by STRUCTURE; R=under the measured curvature resolution ||dH||_2, excused by RESOLUTION; G=under the outer loop's own gradient floor, i.e. a saturation null, excused by the CHAIN RULE)
+[2m 05s] [INDEF-HESS] min_eigenvalue=5.0957e-9 min_eigenvector=[-8.751409124413796e-7, 1.0691795432809884e-7, 4.571872237262149e-9, 0.9999999999996115, 1.300973586059466e-8]
+[2m 05s] [INDEF-HESS] outer_gradient=[-1.682712154477064e-5, 1.2269577193709067e-7, 7.601615472660033e-7, 1.3224993704576044e-7, -1.64276032286227e-5]
+[2m 05s] [INDEF-HESS] reparam_split sigma=[5.095730698966836e-9, 2.7531975654870415e-7, 1.6951652548177315e-5, 0.4011844511256195, 0.4925701991073902] reparam=sum_k g_k v_k^2=[1.3224993703276892e-7, 1.22695771937006e-7, -1.68271215440616e-5, -1.6351457775639647e-5, 6.840160935869908e-7] intrinsic=sigma-reparam=[-1.2715420633380209e-7, 1.5262398461169816e-7, 3.377877409223892e-5, 0.40120080258339513, 0.4925695150912966] gradient_floor=sum_k |g_k| v_k^2=[1.322499370585493e-7, 1.2269577193717472e-7, 1.6827121544062765e-5, 1.63581931303095e-5, 8.295716462741997e-7] (a certified-null direction has intrinsic == 0 EXACTLY, so |sigma| == floor and the gate's boundary runs through it; see #2676)
+[2m 05s] [INDEF-HESS] penalty_count=5 ranges=[(0, 25), (0, 25), (0, 25), (0, 25), (0, 25)] ranks=[2, 10, 1, 10, 1]
+[2m 05s] [INDEF-HESS] pair=(0,1) relative_defect=7.071068e-1 best_scale=0.000000e0 tr_ii=2.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-6.9442e-7
+[2m 05s] [INDEF-HESS] pair=(0,2) relative_defect=7.071068e-1 best_scale=0.000000e0 tr_ii=2.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-6.2205e-7
+[2m 05s] [INDEF-HESS] pair=(0,3) relative_defect=7.071068e-1 best_scale=0.000000e0 tr_ii=2.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0711e-1
+[2m 05s] [INDEF-HESS] pair=(0,4) relative_defect=7.071068e-1 best_scale=0.000000e0 tr_ii=2.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-6.2802e-7
+[2m 05s] [INDEF-HESS] pair=(1,2) relative_defect=1.000000e0 best_scale=1.281643e-30 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=7.2370e-8
+[2m 05s] [INDEF-HESS] pair=(1,3) relative_defect=1.000000e0 best_scale=0.000000e0 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0711e-1
+[2m 05s] [INDEF-HESS] pair=(1,4) relative_defect=1.000000e0 best_scale=0.000000e0 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=6.6403e-8
+[2m 05s] [INDEF-HESS] pair=(2,3) relative_defect=1.000000e0 best_scale=0.000000e0 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0711e-1
+[2m 05s] [INDEF-HESS] pair=(2,4) relative_defect=1.000000e0 best_scale=0.000000e0 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-5.9665e-9
+[2m 05s] [INDEF-HESS] pair=(3,4) relative_defect=1.000000e0 best_scale=1.390237e-29 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=7.0711e-1
+[2m 10s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+2000 y ~ factor(student) + s(balance) + s(income) wall 132.7s cpu 29.0s certified True edf 2.8910338702776954

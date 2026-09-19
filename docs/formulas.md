@@ -153,36 +153,39 @@ mutually exclusive.
 y ~ 0 + x                 # regression through the origin (penalized slope)
 y ~ x - 1                 # the same model
 y ~ 0 + linear(x, double_penalty=false)   # unpenalized: OLS through the origin
-y ~ 0 + g                 # one coefficient per level; their mean is unpenalized, their contrasts penalized
-y ~ 0 + s(x) + s(z)       # s(x) carries the level; s(z) stays centred
+y ~ 0 + g                 # g spans the constant: the same model as y ~ g
+y ~ 0 + s(x) + s(z)       # s(x) spans the constant: the same model as y ~ s(x) + s(z)
 ```
 
 `0 + …`, `… + 0` and `… - 1` remove the global intercept; `1 + …` (or
-`+ 1`) keeps it, which is the default. The constant level of the model is
-always carried at most once, and always in an unpenalized direction, so
-shifting the response shifts the fit and nothing else. With the intercept
-it is the all-ones column and every other term is centred against it.
-Without it the level moves to one term, chosen by this rule:
+`+ 1`) keeps it, which is the default. The constant is never penalized: a
+shift of the response shifts the fit and nothing else. Every other
+direction keeps its penalty, so a term with no support in the data can
+still be shrunk to zero.
 
-1. **The first factor** — `+ g`, `factor(g)`, or the main
-   effect of a factor `by=` smooth. It is dummy-coded with every level kept
-   (no reference level), and its ridge becomes the centring projector
-   `I − 11ᵀ/L` on its `L` levels: the common level of all its coefficients is
-   the one unpenalized direction, and the contrasts between levels keep the
-   REML-estimated penalty they have with an intercept. A second factor keeps
-   its usual ridge.
-2. **Else the first pure-indicator interaction** (`g:h`), which keeps every
-   cell, its reference cell included.
-3. **Else the first B-spline or tensor smooth** (`s(x)`, `te(x, z)`, …). A
-   smooth with an explicit `identifiability=none` is preferred; otherwise
-   the first default-centred one has its sum-to-zero centring released.
-   Either way its null-space ridge is dropped so the constant it now spans
-   is unpenalized — unless `double_penalty=true` was written, in which case
-   the whole null space, the level included, stays shrunk as asked. Every
-   other smooth stays centred.
+Removing the intercept therefore removes the constant only when no term
+could represent it. A term that spans the constant keeps the intercept, and
+the model is exactly the one written with it:
 
-A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never carries the
-level: its levels are mean-zero deviations. When no term can carry it, the
+- **A fixed factor** — `+ g`, `factor(g)`, or the main effect of a
+  factor `by=` smooth. `0 + g` is `g`: every level keeps its column and its
+  REML-estimated ridge. Beside the free intercept that ridge shrinks only the
+  contrasts between levels, so the overall level is free and the level
+  differences shrink toward zero when the data do not support them.
+- **A pure-indicator interaction over every level** (`g:h` with no `g` or
+  `h` main effect). `0 + g:h` is `g:h`: one reference cell is absorbed by the
+  intercept and every other cell keeps its ridge.
+- **A B-spline or tensor smooth** (`s(x)`, `te(x, z)`, …) with the default
+  centring or `identifiability=none`. `0 + s(x)` is `s(x)`: the smooth stays
+  centred and keeps its null-space ridge, so its linear part is shrunk like
+  any other and only the constant is free.
+
+The column space is the one the formula wrote; the coefficients are
+parametrized as the intercept plus centred effects, and the fit reports an
+inference note naming the term that kept the intercept.
+
+A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never spans the
+constant: its levels are mean-zero deviations. When no term spans it, the
 model has no constant at all and every effect passes through the origin,
 exactly as a parametric no-intercept fit does. `y ~ 0 + linear(x,
 double_penalty=false)` is ordinary least squares through the origin, to
@@ -219,10 +222,8 @@ the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing
 parameter and give the same predictions for every level seen in training.
-No spelling fits an unpenalized level effect. Without an intercept the
-first factor also carries the model's level, and only that constant
-direction is unpenalized (see
-[Removing the intercept](#removing-the-intercept)).
+No spelling fits an unpenalized fixed effect, with or without an intercept
+in the formula (see [Removing the intercept](#removing-the-intercept)).
 
 They differ in two ways only:
 

@@ -2321,7 +2321,6 @@ fn attach_basis_adequacy(
     standard.fit.artifacts.random_effect_tests =
         crate::fit_orchestration::drivers::random_effect_test_records(
             &standard.design,
-            &standard.resolvedspec,
             &standard.fit,
         );
     if let Some(data) = covariate_frame {

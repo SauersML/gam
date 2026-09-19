@@ -68,11 +68,11 @@ fn unordered_by_factor_expands_to_level_smooths_and_random_main_effect() {
     assert!(
         spec.random_effect_terms
             .iter()
-            .any(|term| term.name == "group" && !term.carries_level),
+            .any(|term| term.name == "group"),
         "`s(x, by=group)` must add `group` as a penalized full-level random block; got {:?}",
         spec.random_effect_terms
             .iter()
-            .map(|term| (&term.name, term.carries_level))
+            .map(|term| &term.name)
             .collect::<Vec<_>>()
     );
     assert!(spec.smooth_terms.iter().all(|term| matches!(
