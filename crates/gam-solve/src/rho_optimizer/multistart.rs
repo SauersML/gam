@@ -148,6 +148,11 @@ impl OuterProblem {
     /// memory-dependent choices read the lane: that availability and its own pins. So every
     /// search takes the path it takes running alone, and the winner does not
     /// depend on how many ran at once.
+    ///
+    /// A warm start ([`OuterProblem::with_warm_start`]) on the parent's own inputs
+    /// is one run first, which accepts the parent's point where it stands or
+    /// declines; the outcome is then that one run. On other inputs the point is
+    /// one more seed.
     pub fn run_certified_multistart<R, Run>(
         &self,
         context: &str,
@@ -191,7 +196,106 @@ impl OuterProblem {
             ) -> (Result<CertifiedOuterResult, EstimationError>, R)
             + Sync,
     {
-        let seeds = self.outer_seeds(context)?;
+        // A warm start (gam#3002), if its point has this search's dimension.
+        let warm_start = self.warm_start_for_this_search().cloned();
+        // On the parent's own inputs the point is offered as a prior certificate
+        // first, as one run of its own: that run accepts the point where it stands
+        // or declines without searching (`resume_only`), and a decline leaves the
+        // multistart to run exactly as it runs cold.
+        if let Some(warm_start) = warm_start
+            .as_ref()
+            .filter(|warm_start| warm_start.same_inputs)
+        {
+            let mut resume = self.clone().with_sole_seed(warm_start.theta.clone());
+            resume.cache_session = None;
+            resume.cache_mirror_sessions.clear();
+            resume.resume_only = true;
+            let attempt = Self::run_seed_problems(
+                governor,
+                context,
+                serial_available_bytes,
+                working_set_bytes,
+                vec![warm_start.theta.clone()],
+                vec![resume],
+                &run_seed,
+            )?;
+            if attempt.winner.is_some() {
+                return Ok(attempt);
+            }
+            warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
+                super::RESUME_DECLINED,
+            ));
+        }
+        // On other inputs the point joins this argmin as one more seed, so the
+        // winner is taken over a superset of the cold seeds and its V is at most
+        // the cold winner's, within the tie envelope. It enters as a caller
+        // candidate, so it is projected into this fit's search box and
+        // deduplicated like every other seed.
+        let cold = self.without_warm_start();
+        let joined = warm_start
+            .as_ref()
+            .filter(|warm_start| !warm_start.same_inputs);
+        let seeds = match joined {
+            Some(warm_start) => {
+                let mut with_warm = cold.clone();
+                with_warm
+                    .initial_rho_candidates
+                    .insert(0, warm_start.theta.clone());
+                warm_start.record(gam_model_api::WarmStartOutcome::JoinedMultistart);
+                with_warm.outer_seeds(context)?
+            }
+            None => cold.outer_seeds(context)?,
+        };
+        // One sole-seed problem per seed, without the cache session, which belongs
+        // to one search. The joined point's inner mode seeds only its own run.
+        let problems = seeds
+            .iter()
+            .map(|seed| {
+                let mut problem = cold.clone().with_sole_seed(seed.clone());
+                problem.cache_session = None;
+                problem.cache_mirror_sessions.clear();
+                problem.warm_start =
+                    joined
+                        .filter(|warm_start| &warm_start.theta == seed)
+                        .map(|warm_start| super::BoundInnerSeed {
+                            theta: warm_start.theta.clone(),
+                            beta: warm_start.beta.clone(),
+                        });
+                problem
+            })
+            .collect();
+        Self::run_seed_problems(
+            governor,
+            context,
+            serial_available_bytes,
+            working_set_bytes,
+            seeds,
+            problems,
+            &run_seed,
+        )
+    }
+
+    /// Run `problems[i]`, the search from `seeds[i]`, by `run_seed` on lanes the
+    /// memory governor admits, and pick the keep-best winner among the certified
+    /// runs.
+    fn run_seed_problems<R, Run>(
+        governor: &gam_runtime::resource::MemoryGovernor,
+        context: &str,
+        serial_available_bytes: u64,
+        working_set_bytes: usize,
+        seeds: Vec<Array1<f64>>,
+        problems: Vec<OuterProblem>,
+        run_seed: &Run,
+    ) -> Result<MultistartOutcome<R>, EstimationError>
+    where
+        R: Send,
+        Run: Fn(
+                usize,
+                OuterProblem,
+                std::sync::Arc<gam_runtime::resource::SearchLaneBudget>,
+            ) -> (Result<CertifiedOuterResult, EstimationError>, R)
+            + Sync,
+    {
         // No more lanes than the pool that would run a single search has workers,
         // so the multistart never runs more threads than the caller gave it.
         let concurrency = seeds.len().min(rayon::current_num_threads().max(1));
@@ -212,16 +316,9 @@ impl OuterProblem {
             admission.serial_available_bytes,
         );
         let started = std::time::Instant::now();
-        // One sole-seed problem per seed, without the cache session, which belongs
-        // to one search.
-        let problems: Vec<std::sync::Mutex<Option<OuterProblem>>> = seeds
-            .iter()
-            .map(|seed| {
-                let mut problem = self.clone().with_sole_seed(seed.clone());
-                problem.cache_session = None;
-                problem.cache_mirror_sessions.clear();
-                std::sync::Mutex::new(Some(problem))
-            })
+        let problems: Vec<std::sync::Mutex<Option<OuterProblem>>> = problems
+            .into_iter()
+            .map(|problem| std::sync::Mutex::new(Some(problem)))
             .collect();
         let slots: Vec<std::sync::Mutex<Option<std::thread::Result<_>>>> =
             seeds.iter().map(|_| std::sync::Mutex::new(None)).collect();

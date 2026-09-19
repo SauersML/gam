@@ -14,12 +14,12 @@ pub(crate) fn materialize_standard<'a>(
                 .into(),
         );
     }
-    // The standard REML search has no cache seam for a saved model's point.
-    if config.outer_warm_start.is_some() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "warm_start_from resumes custom-family fits (marginal-slope, survival, \
-                     transformation-normal, location-scale); a standard GAM does not read it"
-                .to_string(),
+    // The standard REML search does not take a warm start (gam#3002).
+    if config.warm_start.is_some() {
+        return Err(WorkflowError::WarmStartRefused {
+            refusal: WarmStartRefusal::NoSearchTakesIt {
+                route: "a standard GAM fit",
+            },
         });
     }
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;

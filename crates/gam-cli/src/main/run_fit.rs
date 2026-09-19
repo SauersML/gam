@@ -276,11 +276,6 @@ fn run_canonical_standard_fit(
                 .likelihood_family
                 .clone()
                 .unwrap_or_else(LikelihoodSpec::gaussian_identity);
-            let model_label = if fit_config.family.as_deref() == Some("expectile") {
-                "expectile"
-            } else {
-                "standard"
-            };
             print_spatial_aniso_scales(&result.resolvedspec);
             let status = result.fit.convergence_evidence().inner_status().label();
             let iterations = result.fit.outer_iterations;
@@ -300,6 +295,18 @@ fn run_canonical_standard_fit(
                 fit_config,
                 result,
             })?;
+            // The persisted estimator tag, not the requested family string,
+            // names an expectile fit: the same `Expectile(tau=...)` the saved
+            // summary and Python `family_name` report.
+            let (model_label, family_name) = match payload.estimator {
+                gam::inference::model::FittedEstimator::Expectile { tau } => (
+                    "expectile",
+                    gam::inference::model::expectile_display_name(tau),
+                ),
+                gam::inference::model::FittedEstimator::Likelihood => {
+                    ("standard", family.name().to_string())
+                }
+            };
             let fit = payload
                 .fit_result
                 .as_ref()
@@ -307,7 +314,7 @@ fn run_canonical_standard_fit(
             cli_out!(
                 "{} fit | family={} | status={} | iterations={} | terms={} | edf={:.3} | loglik={:.6e} | reml_score={} | raw_reml_score={}",
                 model_label,
-                family.name(),
+                family_name,
                 status,
                 iterations,
                 term_count,

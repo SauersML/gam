@@ -862,6 +862,8 @@ pub(crate) struct EvidenceRootCounters {
     negative_curvature_no_steps: std::sync::atomic::AtomicUsize,
     unfactorable_no_steps: std::sync::atomic::AtomicUsize,
     uncertified_refinements: std::sync::atomic::AtomicUsize,
+    rounding_floor_stops: std::sync::atomic::AtomicUsize,
+    band_refused_commits: std::sync::atomic::AtomicUsize,
 }
 
 /// A snapshot of [`EvidenceRootTelemetry`].
@@ -881,6 +883,11 @@ pub(crate) struct EvidenceRootCounts {
     /// A refinement moved the state and recurred, but the refined root did not certify, so
     /// the accepted state was priced.
     pub(crate) uncertified_refinements: usize,
+    /// #2822 — the gate sat inside its formation band, so no root step was solved for.
+    pub(crate) rounding_floor_stops: usize,
+    /// #2822 — a trial the strict contraction would have committed, refused because the two
+    /// gates' formation bands overlap.
+    pub(crate) band_refused_commits: usize,
 }
 
 impl EvidenceRootTelemetry {
@@ -896,6 +903,8 @@ impl EvidenceRootTelemetry {
                 .load(Ordering::Relaxed),
             unfactorable_no_steps: self.0.unfactorable_no_steps.load(Ordering::Relaxed),
             uncertified_refinements: self.0.uncertified_refinements.load(Ordering::Relaxed),
+            rounding_floor_stops: self.0.rounding_floor_stops.load(Ordering::Relaxed),
+            band_refused_commits: self.0.band_refused_commits.load(Ordering::Relaxed),
         }
     }
 }

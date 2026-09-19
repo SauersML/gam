@@ -196,7 +196,7 @@ pub(crate) fn pullback_labeled_outer_eval(
 /// problem. Per-block penalties already travel through `physical_rho`; joint
 /// penalties need this full-width bundle so coefficient correction and endpoint
 /// criterion assembly see exactly the same objective.
-fn labeled_options_for_rho<'a>(
+pub(crate) fn labeled_options_for_rho<'a>(
     options: &'a BlockwiseFitOptions,
     specs: &[ParameterBlockSpec],
     layout: &PenaltyLabelLayout,

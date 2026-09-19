@@ -600,6 +600,73 @@ fn sigma_step_to_rho_domain(
     }
 }
 
+/// The ρ-directions the sigma-point cubature integrates, each with the
+/// first-order ρ-variance it carries: `(axis, variance)`, `axis` a unit
+/// ρ-vector.
+///
+/// A coordinate in `railed` sits on its box face. At that face the smoothing
+/// parameter has saturated (`∂β̂/∂ρ_k → 0`: a `λ` factor at `λ → 0`, `H⁻¹ ~ 1/λ`
+/// at `λ → ∞`), so the integrand is flat in it and its ρ-marginal is a point
+/// mass at the face contributing its limit. The cubature is therefore taken
+/// over the FREE coordinates only, under their marginal covariance: the free
+/// block `V_FF` of the certified `V_ρ = Σ_active u_j u_jᵀ/σ_j`. Its eigenvectors
+/// carry no railed component, so no node ever steps off a face, and every axis
+/// has a strictly positive chord inside the box. Integrating the certified
+/// eigen-axes instead mixed railed coordinates: at a corner an axis whose
+/// railed components have opposite signs leaves the box both ways at once, and
+/// the proposal had no width at all.
+///
+/// With nothing railed this is exactly the certified active spectrum, taken
+/// as is rather than re-decomposed. A free-block eigenvalue that is not
+/// strictly positive is a direction `V_ρ` gives no variance, so it is not a
+/// candidate — the same rule the active classification applies to `σ_j`.
+fn sigma_cubature_axes(
+    spectrum: &crate::estimate::smoothing_correction::RhoSensitivitySpectrum,
+    railed: &[bool],
+) -> Result<Vec<(Array1<f64>, f64)>, EstimationError> {
+    let active = spectrum.active_directions();
+    if !railed.iter().any(|&on_face| on_face) {
+        return Ok(active
+            .into_iter()
+            .map(|index| {
+                (spectrum.eigenvectors.column(index).to_owned(), spectrum.eigenvalues[index].recip())
+            })
+            .collect());
+    }
+    let free: Vec<usize> = (0..railed.len()).filter(|&k| !railed[k]).collect();
+    if free.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut free_covariance = Array2::<f64>::zeros((free.len(), free.len()));
+    for &index in &active {
+        let direction = spectrum.eigenvectors.column(index);
+        let inverse_curvature = spectrum.eigenvalues[index].recip();
+        for (row, &a) in free.iter().enumerate() {
+            for (col, &b) in free.iter().enumerate() {
+                free_covariance[[row, col]] += direction[a] * direction[b] * inverse_curvature;
+            }
+        }
+    }
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let (variances, vectors) = free_covariance.eigh(faer::Side::Lower).map_err(|error| {
+        EstimationError::TrialPointRefused {
+            reason: format!("free-coordinate rho covariance eigendecomposition failed: {error}"),
+        }
+    })?;
+    Ok(variances
+        .iter()
+        .enumerate()
+        .filter(|(_, variance)| variance.is_finite() && **variance > 0.0)
+        .map(|(column, &variance)| {
+            let mut axis = Array1::<f64>::zeros(railed.len());
+            for (row, &k) in free.iter().enumerate() {
+                axis[k] = vectors[[row, column]];
+            }
+            (axis, variance)
+        })
+        .collect())
+}
+
 impl<'a> RemlState<'a> {
     /// Integrate the sampler's declared density, including the distribution
     /// prior and precision-to-log-precision Jacobian, rather than treating
@@ -1107,6 +1174,10 @@ impl<'a> RemlState<'a> {
         outer_gradient: &Array1<f64>,
         outer_hessian: Option<&Array2<f64>>,
         caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
+        // The ρ coordinates the outer certificate judged railed on a face of
+        // `rho_domain`. The cubature conditions on them (see
+        // [`sigma_cubature_axes`]).
+        railed_coordinates: &[usize],
     ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
 
@@ -1273,8 +1344,37 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        // Rank the active directions by the variance each one contributes to
-        // the correction, `‖Qs·J·u_j‖²/σ_j`, and upgrade the largest.
+        // Railed coordinates are conditioned at their face and the cubature
+        // integrates the free ones (`sigma_cubature_axes`). A coordinate lying
+        // exactly on a face is railed whatever the caller reports: it has no
+        // chord on the outward side, so it cannot be integrated across.
+        let railed: Vec<bool> = (0..n_rho)
+            .map(|k| {
+                railed_coordinates.contains(&k)
+                    || final_rho[k] == rho_domain.0[k]
+                    || final_rho[k] == rho_domain.1[k]
+            })
+            .collect();
+        let axes = sigma_cubature_axes(spectrum, &railed)?;
+        if axes.is_empty() {
+            return self.finalize_smoothing_outcome(first_order_routine(
+                first_order_correction,
+                "every rho coordinate carrying variance is railed: conditioned on its face the \
+                 cubature integrand is a point mass, whose limit is the first-order correction"
+                    .into(),
+            ));
+        }
+        if railed.iter().any(|&on_face| on_face) {
+            log::debug!(
+                "[sigma-cubature] conditioning on {} railed rho coordinate(s); integrating {} \
+                 free-coordinate axis/axes",
+                railed.iter().filter(|&&on_face| on_face).count(),
+                axes.len(),
+            );
+        }
+
+        // Rank the axes by the variance each one contributes to the
+        // correction, `‖Qs·J·a‖²·v`, and upgrade the largest.
         //
         // The previous rule ranked by `1/σ_j` — the spread of ρ — and kept
         // whichever direction the outer surface was flattest along. That is
@@ -1283,9 +1383,14 @@ impl<'a> RemlState<'a> {
         // rank budget on the one direction that contributes nothing and
         // dropped every direction that does (#2728: rank=1 retained
         // `λ = 7.2e-9` and discarded the other six).
-        let mut ranked: Vec<(usize, f64)> = active_directions
+        let axis_contribution = |axis: &Array1<f64>, variance: f64| {
+            let column = spectrum.sensitivity_orig.dot(axis);
+            column.dot(&column) * variance
+        };
+        let mut ranked: Vec<(usize, f64)> = axes
             .iter()
-            .map(|&index| (index, spectrum.first_order_variance(index)))
+            .enumerate()
+            .map(|(index, (axis, variance))| (index, axis_contribution(axis, *variance)))
             .filter(|(_, variance)| variance.is_finite() && *variance > 0.0)
             .collect();
         if ranked.is_empty() {
@@ -1339,8 +1444,9 @@ impl<'a> RemlState<'a> {
         let mut proposal_center = final_rho.clone();
         let mut proposal_axes = Vec::with_capacity(rank);
         for &index in &upgraded {
-            let axis = spectrum.eigenvectors.column(index).to_owned();
-            let wald_step = spectrum.eigenvalues[index].sqrt().recip();
+            let (axis, variance) = &axes[index];
+            let axis = axis.clone();
+            let wald_step = variance.sqrt();
             let plus = self.calibrate_sigma_node(final_rho, centre_cost, &axis, wald_step, rho_domain)?;
             let minus = self.calibrate_sigma_node(final_rho, centre_cost, &(-&axis), wald_step, rho_domain)?;
             let width = 0.5 * (plus.step + minus.step);
@@ -1499,19 +1605,18 @@ impl<'a> RemlState<'a> {
                 );
             }
         }
-        // Every ACTIVE direction that was not upgraded keeps the first-order
-        // column `Qs·J·u_k/√σ_k` it would have contributed to `J·V_ρ·Jᵀ`, so
-        // the cubature covers the same subspace the first-order correction
-        // does. Without this the truncation would silently SHRINK the
-        // correction relative to the term it is supposed to upgrade.
+        // Every axis that was not upgraded keeps the first-order column
+        // `Qs·J·a·√v` it would have contributed to `J·V_ρ·Jᵀ` (`Qs·J·u_k/√σ_k`
+        // on an active direction when nothing is railed), so the cubature
+        // covers the same subspace the first-order correction does. Without
+        // this the truncation would silently SHRINK the correction relative
+        // to the term it is supposed to upgrade.
         let residual_columns: Vec<Array1<f64>> = ranked[rank..]
             .iter()
             .map(|&(index, _)| {
-                let scale = spectrum.eigenvalues[index].sqrt().recip();
-                spectrum
-                    .sensitivity_orig
-                    .dot(&spectrum.eigenvectors.column(index))
-                    .mapv(|value| value * scale)
+                let (axis, variance) = &axes[index];
+                let scale = variance.sqrt();
+                spectrum.sensitivity_orig.dot(axis).mapv(|value| value * scale)
             })
             .collect();
         let mut total_cov = accumulate_sigma_cubature_total_covariance(
@@ -1765,6 +1870,129 @@ mod sigma_cubature_accumulation_tests {
         ];
         assert!(accumulate_sigma_cubature_total_covariance(&points, &[2.0, -1.0], &[], 1).is_err());
         assert!(accumulate_sigma_cubature_total_covariance(&points, &[0.0, 0.0], &[], 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sigma_cubature_axes_tests {
+    use super::{sigma_cubature_axes, sigma_step_to_rho_domain};
+    use crate::estimate::smoothing_correction::{EigenClassification, RhoSensitivitySpectrum};
+    use ndarray::{Array1, Array2, array};
+
+    /// An orthonormal ρ-spectrum whose first direction mixes coordinates 0 and
+    /// 1 with the SAME sign and whose other two mix them with OPPOSITE signs:
+    /// every certified axis moves both of them.
+    fn corner_mixing_spectrum(classifications: Vec<EigenClassification>) -> RhoSensitivitySpectrum {
+        let (a, b, c) = (2.0_f64.sqrt(), 3.0_f64.sqrt(), 6.0_f64.sqrt());
+        RhoSensitivitySpectrum {
+            sensitivity_orig: Array2::zeros((2, 3)),
+            eigenvalues: array![2.0, 4.0, 8.0],
+            eigenvectors: array![
+                [1.0 / a, 1.0 / b, 1.0 / c],
+                [1.0 / a, -1.0 / b, -1.0 / c],
+                [0.0, 1.0 / b, -2.0 / c]
+            ],
+            classifications,
+        }
+    }
+
+    fn certified_covariance(spectrum: &RhoSensitivitySpectrum) -> Array2<f64> {
+        let mut covariance = Array2::<f64>::zeros((3, 3));
+        for index in spectrum.active_directions() {
+            let u = spectrum.eigenvectors.column(index);
+            for row in 0..3 {
+                for col in 0..3 {
+                    covariance[[row, col]] += u[row] * u[col] / spectrum.eigenvalues[index];
+                }
+            }
+        }
+        covariance
+    }
+
+    fn reassembled(axes: &[(Array1<f64>, f64)]) -> Array2<f64> {
+        let mut covariance = Array2::<f64>::zeros((3, 3));
+        for (axis, variance) in axes {
+            for row in 0..3 {
+                for col in 0..3 {
+                    covariance[[row, col]] += axis[row] * axis[col] * variance;
+                }
+            }
+        }
+        covariance
+    }
+
+    fn max_abs(matrix: &Array2<f64>) -> f64 {
+        matrix.iter().fold(0.0_f64, |m, x| m.max(x.abs()))
+    }
+
+    #[test]
+    fn nothing_railed_integrates_exactly_the_certified_active_spectrum() {
+        let spectrum = corner_mixing_spectrum(vec![
+            EigenClassification::Active,
+            EigenClassification::StructuralZero,
+            EigenClassification::Active,
+        ]);
+        let axes = sigma_cubature_axes(&spectrum, &[false, false, false]).unwrap();
+        assert_eq!(axes.len(), 2);
+        for ((axis, variance), index) in axes.iter().zip([0usize, 2]) {
+            assert_eq!(axis, &spectrum.eigenvectors.column(index).to_owned());
+            assert_eq!(*variance, spectrum.eigenvalues[index].recip());
+        }
+    }
+
+    #[test]
+    fn railed_corner_axes_stay_on_the_face_and_have_positive_width_both_ways() {
+        let spectrum = corner_mixing_spectrum(vec![EigenClassification::Active; 3]);
+        // ρ̂ at the (lower, upper) corner of coordinates 0 and 1, interior in 2.
+        let bounds = (Array1::from_elem(3, -10.0), Array1::from_elem(3, 10.0));
+        let rho_hat = array![-10.0, 10.0, 1.5];
+
+        // The defect: every certified axis moves a railed coordinate, so at
+        // least one sign steps off a face at once; axis 0 moves 0 and 1 the
+        // same way, so `+` leaves the upper face of 1 and `−` the lower face of
+        // 0, and its chord is empty both ways — no positive-width proposal.
+        for index in 0..3 {
+            let axis = spectrum.eigenvectors.column(index).to_owned();
+            let plus = sigma_step_to_rho_domain(&rho_hat, &axis, &bounds);
+            let minus = sigma_step_to_rho_domain(&rho_hat, &axis.mapv(|v| -v), &bounds);
+            assert_eq!(plus.min(minus), 0.0, "certified axis {index} should be pinned by the corner");
+            if index == 0 {
+                assert_eq!(plus.max(minus), 0.0, "axis 0 should have no width at all");
+            }
+        }
+
+        let axes = sigma_cubature_axes(&spectrum, &[true, true, false]).unwrap();
+        assert_eq!(axes.len(), 1, "one free coordinate carries one axis");
+        let (axis, variance) = &axes[0];
+        assert_eq!((axis[0], axis[1]), (0.0, 0.0), "no component on a railed coordinate");
+        assert!((axis[2].abs() - 1.0).abs() < 1e-14);
+        // The free marginal variance is the certified V_ρ[2,2], not 1/σ of any axis.
+        let certified = certified_covariance(&spectrum);
+        assert!((variance - certified[[2, 2]]).abs() < 1e-14 * certified[[2, 2]]);
+        let plus = sigma_step_to_rho_domain(&rho_hat, axis, &bounds);
+        let minus = sigma_step_to_rho_domain(&rho_hat, &axis.mapv(|v| -v), &bounds);
+        assert!(plus > 0.0 && minus > 0.0, "free axis chord ({minus}, {plus}) must be open");
+    }
+
+    #[test]
+    fn railed_axes_reassemble_the_free_block_of_the_certified_covariance() {
+        let spectrum = corner_mixing_spectrum(vec![EigenClassification::Active; 3]);
+        let railed = [true, false, false];
+        let axes = sigma_cubature_axes(&spectrum, &railed).unwrap();
+        assert_eq!(axes.len(), 2);
+        let mut expected = certified_covariance(&spectrum);
+        for k in 0..3 {
+            expected[[0, k]] = 0.0;
+            expected[[k, 0]] = 0.0;
+        }
+        let error = max_abs(&(reassembled(&axes) - &expected));
+        assert!(error < 1e-14, "free block mismatch {error}");
+    }
+
+    #[test]
+    fn every_coordinate_railed_leaves_nothing_to_integrate() {
+        let spectrum = corner_mixing_spectrum(vec![EigenClassification::Active; 3]);
+        assert!(sigma_cubature_axes(&spectrum, &[true, true, true]).unwrap().is_empty());
     }
 }
 
@@ -2185,6 +2413,8 @@ mod smoothing_correction_outcome_tests {
                     // second assembly of the rho-Hessian to compare against: an
                     // absent measurement, not a zero (#2748).
                     None,
+                    &[],
+                    // The bisected ρ̂ is interior: no coordinate is railed.
                     &[],
                 )
                 .expect("smoothing correction evaluation");

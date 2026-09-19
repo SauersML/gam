@@ -4,6 +4,8 @@
 // (`refined_root_verdict`), and the removal of the evidence factor's unit-stiffened row directions
 // from that step. Included from `construction_quasi_laplace.rs`.
 
+use super::construction_arrow_schur_assembly::SaeGradientAccumulation;
+
 impl SaeManifoldTerm {
     /// #2228 — carry a state the KKT band admitted to the numerical root of its own
     /// stationarity residual before the criterion prices it.
@@ -22,11 +24,21 @@ impl SaeManifoldTerm {
     /// the route the polish takes (the dense geometry's pseudoinverse, on the
     /// operator and null band the value prices, for ordered Beta–Bernoulli, and none
     /// where that pencil resolves a negative curvature; the arrow exact-A system factored
-    /// once at ridge 0, without the Newton–Schur clamp, otherwise). A step
-    /// commits only if it strictly contracts the gate norm and does not raise the
-    /// penalized objective past its round-off cushion. On a nonsingular `A` the
-    /// contraction is quadratic and the phase ends at the first step round-off cannot
-    /// contract, so no step count is chosen. Returns whether the state moved.
+    /// once at ridge 0, without the Newton–Schur clamp, otherwise). A step commits only
+    /// if it contracts the gate norm by more than the two gates' rounding. On a
+    /// nonsingular `A` the contraction is quadratic and the phase ends at the first step
+    /// round-off cannot resolve, so no step count is chosen.
+    ///
+    /// No objective test guards a commit, for the reason the first paragraph gives: both
+    /// routes step only on curvature they have shown positive definite (the pencil route
+    /// takes no step along a resolved negative direction, and the ridge-0 factorization
+    /// refuses a non-positive pivot), so a step moves the penalized objective by
+    /// `−½gᵀA⁻¹g` up to third order, under its round-off at every state this phase starts
+    /// from. The test it replaced could fire only on rounding, and did: Slurm 1288395
+    /// (`c28ea34406`) refused a trial whose gate contracted from `3.57e-11` to `2.35e-14`,
+    /// past both bands, on an objective rise of `7.5e-13` on `58.488`. What catches a wrong
+    /// step is the certificate the refined root must still pass on the exact information
+    /// ([`Self::refined_root_verdict`]).
     ///
     /// #2822 — the residual the step solves, the step, and the gate that judges it all
     /// live on the complement of the directions the evidence factor unit-stiffened
@@ -41,6 +53,19 @@ impl SaeManifoldTerm {
     /// `‖g + AΔ‖ ≈ 1e-20` while the trial left `‖r‖ = 4.057776e-9` from `4.057830e-9`
     /// (`‖JΔ‖/‖AΔ‖ ≈ 1.46e-5`), so every step contracted strictly and the phase committed
     /// thousands of them.
+    ///
+    /// #2822 — "strictly contracts" is read against the gate's rounding
+    /// ([`Self::root_gate`]): a commit's gate and its trial's gate are each known only to
+    /// within their formation bands, so a contraction counts only when the two intervals
+    /// are disjoint, and a gate inside its own band ends the phase with no step
+    /// ([`Self::evidence_root_step`]). Strict `<` alone committed rounding jitter: Slurm
+    /// 1255806 at `aaa0ddcfac` (the `sae_ev_vs_k_frontier` K = 1 fits, n = 1800) read 59
+    /// commits, 31 of them leaving the penalized objective bit-identical, e.g. gate
+    /// 1.368e-13 → 8.03e-14 → 7.32e-14 → 7.24e-14 → 6.86e-14 at objective
+    /// 2.0876354128857729e3, each one a 13.5 s dense pencil eigendecomposition. The bands
+    /// are read off the absolute summands the assembly carries out of its own folds
+    /// ([`SaeGradientAccumulation`]), so every assembly route has them. Returns the number
+    /// of commits.
     fn refine_evidence_root(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -48,36 +73,32 @@ impl SaeManifoldTerm {
         registry: Option<&AnalyticPenaltyRegistry>,
         lambda_smooth: &[f64],
         options: &ArrowSolveOptions,
-    ) -> Result<bool, String> {
-        let mut moved = false;
+    ) -> Result<usize, String> {
+        let mut commits = 0usize;
         loop {
-            let Some(EvidenceRootStep { gate, step, cache }) =
-                self.evidence_root_step(target, rho_fixed, registry, lambda_smooth, options)?
+            let Some(EvidenceRootStep {
+                gate,
+                gate_band,
+                step,
+                cache,
+            }) = self.evidence_root_step(target, rho_fixed, registry, lambda_smooth, options)?
             else {
-                return Ok(moved);
+                return Ok(commits);
             };
-            let pre_objective = self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
             let snapshot = self.snapshot_mutable_state();
             let trial = match self.apply_newton_step(step.t.view(), step.beta.view(), 1.0) {
-                Ok(()) => match self.assemble_arrow_schur(target, rho_fixed, registry) {
+                Ok(()) => match self
+                    .assemble_arrow_schur_with_gradient_accumulation(target, rho_fixed, registry)
+                {
                     // The trial residual is judged on the same complement as the step: the
                     // directions this state's factor stiffened, not the trial state's.
-                    Ok(mut trial_sys) => match Self::remove_unit_stiffened_directions_from_rows(
+                    Ok((mut trial_sys, trial_accumulation)) => match self.root_gate(
                         &mut trial_sys,
+                        &trial_accumulation,
                         &cache.deflated_row_directions,
+                        lambda_smooth,
                     ) {
-                        Ok(()) => {
-                            let trial_sq = Self::system_grad_norm_sq(&trial_sys);
-                            let trial_gate = self.quotient_gradient_norm_from_system(
-                                &trial_sys,
-                                trial_sq,
-                                lambda_smooth,
-                            );
-                            let trial_objective = self
-                                .penalized_objective_total(target, rho_fixed, registry, 1.0)
-                                .unwrap_or(f64::INFINITY);
-                            Some((trial_gate, trial_objective))
-                        }
+                        Ok(gated) => Some(gated),
                         Err(err) => {
                             log::trace!("[SAE-ROOT] root step trial residual: {err}");
                             None
@@ -94,28 +115,94 @@ impl SaeManifoldTerm {
                 }
             };
             match trial {
-                Some((trial_gate, trial_objective))
-                    if trial_gate < gate
-                        && trial_objective.is_finite()
-                        && trial_objective
-                            <= pre_objective + opt::armijo_roundoff_cushion(pre_objective) =>
+                Some((trial_gate, trial_band))
+                    if Self::root_gate_contracts(gate, gate_band, trial_gate, trial_band) =>
                 {
                     log::debug!(
-                        "[SAE-ROOT] committed: gate ‖g‖ {gate:.6e} → {trial_gate:.6e}, penalized \
-                         objective {pre_objective:.16e} → {trial_objective:.16e}"
+                        "[SAE-ROOT] committed: gate ‖g‖ {gate:.6e} → {trial_gate:.6e} (bands \
+                         {gate_band:.6e} → {trial_band:.6e})"
                     );
-                    moved = true;
+                    commits += 1;
                 }
                 other => {
                     self.restore_mutable_state(&snapshot)?;
+                    // A trial the strict contraction would have committed is a band refusal,
+                    // counted apart from the floor stops so a regression shows as one or the
+                    // other.
+                    if let Some((trial_gate, _)) = other
+                        && trial_gate < gate
+                    {
+                        self.evidence_root_telemetry
+                            .0
+                            .band_refused_commits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     log::debug!(
-                        "[SAE-ROOT] root at gate ‖g‖ {gate:.6e}: the exact Newton trial left \
-                         (gate, objective) = {other:?} against objective {pre_objective:.16e}"
+                        "[SAE-ROOT] root at gate ‖g‖ {gate:.6e} (band {gate_band:.6e}): the exact \
+                         Newton trial left (gate, band) = {other:?}"
                     );
-                    return Ok(moved);
+                    return Ok(commits);
                 }
             }
         }
+    }
+
+    /// #2822 — whether a trial gate is resolved below the gate it replaces: the two gates'
+    /// band intervals are disjoint, `trial + band_trial < gate − band_gate`.
+    fn root_gate_contracts(gate: f64, gate_band: f64, trial_gate: f64, trial_band: f64) -> bool {
+        trial_gate + trial_band < gate - gate_band
+    }
+
+    /// #2822 — the root phase's gate at an assembled system, and the band it is known to.
+    ///
+    /// Removes the unit-stiffened directions from the rows and reads the quotient gradient
+    /// norm, as the phase always has. The band bounds `|gate − ‖P g‖|`, where `g` is the
+    /// exact gradient of the same computed summands at the installed state and `P` the same
+    /// two projections in exact arithmetic:
+    /// * `‖ĝ − g‖₂` is bounded by the absolute summands the assembly carried out of its folds
+    ///   and projections ([`SaeGradientAccumulation::band_norm`]). Both projections here are
+    ///   orthogonal, so they cannot enlarge it.
+    /// * Each row's removal is one Gram–Schmidt pass against its directions, and the quotient
+    ///   is one pass against its basis over the whole residual. Each errs by
+    ///   `gram_schmidt_residual_band` of the vector it acts on.
+    /// * The norm sums `D` squares and takes a root, a relative `γ_{D+1}`.
+    fn root_gate(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        accumulation: &SaeGradientAccumulation,
+        directions: &[Vec<Array1<f64>>],
+        lambda_smooth: &[f64],
+    ) -> Result<(f64, f64), String> {
+        let row_norms: Vec<f64> = sys.rows.iter().map(|row| row.gt.dot(&row.gt).sqrt()).collect();
+        let rows_norm = row_norms.iter().map(|norm| norm * norm).sum::<f64>().sqrt();
+        let border_norm = sys.gb.dot(&sys.gb).sqrt();
+        let formation = accumulation.band_norm(rows_norm, border_norm);
+        Self::remove_unit_stiffened_directions_from_rows(sys, directions)?;
+        let grad_norm_sq = Self::system_grad_norm_sq(sys);
+        let gate = self.quotient_gradient_norm_from_system(sys, grad_norm_sq, lambda_smooth);
+        let removal_sq = directions
+            .iter()
+            .zip(sys.rows.iter().zip(row_norms.iter()))
+            .map(|(row_directions, (row, &norm))| {
+                let band = gam_math::roundoff::gram_schmidt_residual_band(
+                    1,
+                    row_directions.len(),
+                    row.gt.len(),
+                    norm,
+                );
+                band * band
+            })
+            .sum::<f64>();
+        let dim = sys.rows.iter().map(|row| row.gt.len()).sum::<usize>() + sys.gb.len();
+        let quotient_directions = self.posterior_null_quotient_basis(lambda_smooth)?.len();
+        let quotient = gam_math::roundoff::gram_schmidt_residual_band(
+            1,
+            quotient_directions,
+            dim,
+            grad_norm_sq.sqrt(),
+        );
+        let norm = gam_linalg::roundoff::accumulation_growth(dim + 1) * gate;
+        Ok((gate, formation + removal_sq.sqrt() + quotient + norm))
     }
 
     /// #2228/#2822 — one exact root step from the installed state, for
@@ -123,7 +210,8 @@ impl SaeManifoldTerm {
     /// directions it unit-stiffened from the residual, read the gate, solve on the route the
     /// polish takes, and remove the same directions from the step. `None` is where the phase
     /// ends without a step: a factor or route that yields no Newton step, a gate that is not a
-    /// finite positive number, or a non-finite step. The state is not moved.
+    /// finite positive number, a gate inside its own formation band (#2822: no step from it
+    /// can be resolved, so none is solved for), or a non-finite step. The state is not moved.
     fn evidence_root_step(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -132,8 +220,8 @@ impl SaeManifoldTerm {
         lambda_smooth: &[f64],
         options: &ArrowSolveOptions,
     ) -> Result<Option<EvidenceRootStep>, String> {
-        let mut sys = self
-            .assemble_arrow_schur(target, rho_fixed, registry)
+        let (mut sys, accumulation) = self
+            .assemble_arrow_schur_with_gradient_accumulation(target, rho_fixed, registry)
             .map_err(|err| format!("SaeManifoldTerm::refine_evidence_root: {err}"))?;
         let factor =
             match self.factor_deflated_evidence_with_grad_norms(&mut sys, lambda_smooth, options) {
@@ -144,10 +232,24 @@ impl SaeManifoldTerm {
                 }
             };
         let cache = factor.cache;
-        Self::remove_unit_stiffened_directions_from_rows(&mut sys, &cache.deflated_row_directions)?;
-        let grad_norm_sq = Self::system_grad_norm_sq(&sys);
-        let gate = self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, lambda_smooth);
+        let (gate, gate_band) = self.root_gate(
+            &mut sys,
+            &accumulation,
+            &cache.deflated_row_directions,
+            lambda_smooth,
+        )?;
         if !(gate.is_finite() && gate > 0.0) {
+            return Ok(None);
+        }
+        if gate <= gate_band {
+            self.evidence_root_telemetry
+                .0
+                .rounding_floor_stops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::debug!(
+                "[SAE-ROOT] root at its rounding floor: gate ‖g‖ {gate:.6e} is inside its \
+                 formation band {gate_band:.6e}, so no step from it can be resolved"
+            );
             return Ok(None);
         }
         let exact_dim = sae_exact_stationarity_dim(cache.delta_t_len(), cache.k);
@@ -211,7 +313,12 @@ impl SaeManifoldTerm {
             &cache.row_offsets,
             &cache.deflated_row_directions,
         )?;
-        Ok(Some(EvidenceRootStep { gate, step, cache }))
+        Ok(Some(EvidenceRootStep {
+            gate,
+            gate_band,
+            step,
+            cache,
+        }))
     }
 
     /// #2228 — the arrow route's root step: the exact Newton step `Δ = −A⁻¹g` of the exact-A
@@ -377,7 +484,7 @@ impl SaeManifoldTerm {
     ) -> Result<Option<DeflatedEvidenceFactor>, String> {
         let accepted_state = self.snapshot_mutable_state();
         let accepted_loss = *loss;
-        if !self.refine_evidence_root(target, rho_fixed, registry, lambda_smooth, options)? {
+        if self.refine_evidence_root(target, rho_fixed, registry, lambda_smooth, options)? == 0 {
             return Ok(None);
         }
         let refine_iter = inner_max_iter.max(1);
@@ -686,10 +793,12 @@ impl std::fmt::Display for RefinedRootVerdict {
 }
 
 /// #2228/#2822 — one exact root step ([`SaeManifoldTerm::refine_evidence_root`]): the gate the
-/// installed state reads, the step, and the deflated evidence factor whose unit-stiffened
-/// directions both were removed from.
+/// installed state reads, the band it is known to (#2822, [`SaeManifoldTerm::root_gate`]), the
+/// step, and the deflated evidence factor whose unit-stiffened directions both were removed
+/// from.
 struct EvidenceRootStep {
     gate: f64,
+    gate_band: f64,
     step: SaeArrowVector,
     cache: ArrowFactorCache,
 }
@@ -1073,5 +1182,301 @@ mod evidence_root_gauge_projection_2822_tests {
                 other.tag()
             ),
         }
+    }
+
+    /// #2822 — the root phase ends at its gradient's rounding floor, and a contraction inside
+    /// that floor is not a commit.
+    ///
+    /// Positive control: the pinned circle starts above its gate's formation band, so the
+    /// refinement has resolved steps to commit, and it ends at a root whose gate sits inside
+    /// the band, where [`SaeManifoldTerm::evidence_root_step`] takes no step. The band is
+    /// therefore not too tight to fire at a converged root.
+    ///
+    /// Negative control, the defect the band removes: from that root, the exact dense Newton
+    /// step the phase would otherwise take leaves a gate that the strict `trial < gate`
+    /// predicate calls a contraction, while the two gates' bands overlap. That is the commit
+    /// Slurm 1255806 measured 31 times in 59 on the `sae_ev_vs_k_frontier` K = 1 fits, with a
+    /// bit-identical objective, one dense pencil eigendecomposition each.
+    #[test]
+    fn root_phase_stops_at_its_gradient_rounding_floor_2822() {
+        let (mut term, z, rho) = pinned_circle_state();
+        let options = term.evidence_factor_options();
+        let lambda_smooth = rho
+            .lambda_smooth_vec()
+            .expect("the pinned rho carries its smoothing coordinates");
+        let gated = |term: &mut SaeManifoldTerm| {
+            let (mut sys, accumulation) = term
+                .assemble_arrow_schur_with_gradient_accumulation(z.view(), &rho, None)
+                .expect("the state assembles");
+            let cache = term
+                .factor_deflated_evidence_with_grad_norms(&mut sys, &lambda_smooth, &options)
+                .expect("the deflated evidence factor exists")
+                .cache;
+            let (gate, band) = term
+                .root_gate(&mut sys, &accumulation, &cache.deflated_row_directions, &lambda_smooth)
+                .expect("the gate evaluates");
+            (sys, cache, gate, band)
+        };
+
+        // Every measurement first, so the diagnostics print whatever the assertions decide.
+        let start = gated(&mut term);
+        let (start_gate, start_band) = (start.2, start.3);
+        let commits = term
+            .refine_evidence_root(z.view(), &rho, None, &lambda_smooth, &options)
+            .expect("the root refinement runs at the pinned state");
+        let refined = term.evidence_root_telemetry.counts();
+        let (sys, cache, root_gate, root_band) = gated(&mut term);
+        // The exact dense Newton step the phase would take from the refined root, on a copy.
+        let mut trial_term = term.clone();
+        let total_t = cache.delta_t_len();
+        let mut residual_t = Array1::<f64>::zeros(total_t);
+        let mut offset = 0usize;
+        for row in &sys.rows {
+            for (axis, &g) in row.gt.iter().enumerate() {
+                residual_t[offset + axis] = g;
+            }
+            offset += row.gt.len();
+        }
+        let residual = SaeArrowVector {
+            t: residual_t,
+            beta: sys.gb.clone(),
+        };
+        let solve = trial_term
+            .materialize_exact_stationarity_geometry(&rho, z.view(), &cache)
+            .and_then(|geometry| geometry.solve_stationarity(&residual));
+        let mut step = trial_term
+            .evidence_root_step_from_pencil(solve)
+            .expect("premise: the refined root has an exact dense Newton step");
+        SaeManifoldTerm::remove_unit_stiffened_directions_from_flat(
+            &mut step.t,
+            &cache.row_offsets,
+            &cache.deflated_row_directions,
+        )
+        .expect("the step's unit-stiffened directions are removed");
+        trial_term
+            .apply_newton_step(step.t.view(), step.beta.view(), 1.0)
+            .expect("the root's Newton step applies");
+        let (mut trial_sys, trial_accumulation) = trial_term
+            .assemble_arrow_schur_with_gradient_accumulation(z.view(), &rho, None)
+            .expect("the trial assembles");
+        let (trial_gate, trial_band) = trial_term
+            .root_gate(
+                &mut trial_sys,
+                &trial_accumulation,
+                &cache.deflated_row_directions,
+                &lambda_smooth,
+            )
+            .expect("the trial gate evaluates");
+        eprintln!(
+            "[#2822 floor pin] start gate {start_gate:.6e} band {start_band:.6e}; {commits} \
+             commit(s), {} floor stop(s), {} band refusal(s); root gate {root_gate:.6e} band \
+             {root_band:.6e}; root→trial gate {trial_gate:.6e} band {trial_band:.6e}",
+            refined.rounding_floor_stops, refined.band_refused_commits
+        );
+
+        assert!(
+            start_gate > start_band,
+            "premise: the pinned state's gate {start_gate:.6e} must sit above its band \
+             {start_band:.6e}, so the refinement has resolved steps to take"
+        );
+        assert!(commits >= 1, "the refinement must commit its resolved steps from the pinned state");
+        assert!(
+            root_gate <= root_band,
+            "positive control: the refined root's gate {root_gate:.6e} must sit inside its \
+             formation band {root_band:.6e}"
+        );
+        assert!(refined.rounding_floor_stops >= 1, "the refinement must have ended at its rounding floor");
+        assert!(
+            term.evidence_root_step(z.view(), &rho, None, &lambda_smooth, &options)
+                .expect("the root step evaluates at the refined root")
+                .is_none(),
+            "at its rounding floor the phase takes no step"
+        );
+        assert_eq!(
+            term.evidence_root_telemetry.counts().rounding_floor_stops,
+            refined.rounding_floor_stops + 1,
+            "a floor stop is counted"
+        );
+        assert!(
+            trial_gate < root_gate,
+            "premise: the strict predicate must commit this step: gate {root_gate:.6e} → \
+             {trial_gate:.6e}"
+        );
+        assert!(
+            !SaeManifoldTerm::root_gate_contracts(root_gate, root_band, trial_gate, trial_band),
+            "a contraction inside the two gates' bands must not commit"
+        );
+    }
+
+    /// #2822 — every assembly route carries its gradient's band, so the root phase ends at its
+    /// rounding floor there too. The two-atom softmax state takes the routes the phase once had
+    /// no band on: a softmax assignment's logit Jacobian, and the pairwise decoder repulsion and
+    /// separation barrier of `K = 2`. On those routes the old rule was the strict contraction,
+    /// which never stops at a floor, so a floor stop here is the route's own band firing, and a
+    /// finite positive band at a finite gate is the band existing. The state is the #2336
+    /// `ard_saddle_state` (the tiny two-atom fixture with an amplitude-0.6 harmonic added to
+    /// its target), whose exact `A` is positive definite (probe 1336871), so the arrow route
+    /// has an exact Newton step to take.
+    #[test]
+    fn a_softmax_two_atom_root_ends_at_its_rounding_floor_2822() {
+        let (mut term, mut target, mut rho) =
+            crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture();
+        let (n, p) = (target.nrows(), target.ncols());
+        for row in 0..n {
+            for col in 0..p {
+                let phase = (row as f64 + 0.35) / n as f64;
+                let theta = std::f64::consts::TAU * phase;
+                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+            }
+        }
+        rho.log_lambda_sparse = -0.5;
+        for value in rho.log_lambda_smooth.iter_mut() {
+            *value = -1.0;
+        }
+        for axis in rho.log_ard.iter_mut() {
+            for value in axis.iter_mut() {
+                *value = -0.5;
+            }
+        }
+        term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            40,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect("the two-atom softmax fixture prices");
+        assert!(
+            matches!(term.assignment.mode, AssignmentMode::Softmax { .. }) && term.k_atoms() == 2,
+            "premise: the fixture is a two-atom softmax term"
+        );
+        let options = term.evidence_factor_options();
+        let lambda_smooth = rho
+            .lambda_smooth_vec()
+            .expect("the fixture's rho carries its smoothing coordinates");
+        let before = term.evidence_root_telemetry.counts();
+        let commits = term
+            .refine_evidence_root(target.view(), &rho, None, &lambda_smooth, &options)
+            .expect("the root refinement runs on the two-atom softmax fixture");
+        let after = term.evidence_root_telemetry.counts();
+        let (mut sys, accumulation) = term
+            .assemble_arrow_schur_with_gradient_accumulation(target.view(), &rho, None)
+            .expect("the refined state assembles");
+        let cache = term
+            .factor_deflated_evidence_with_grad_norms(&mut sys, &lambda_smooth, &options)
+            .expect("the deflated evidence factor exists")
+            .cache;
+        let (gate, band) = term
+            .root_gate(&mut sys, &accumulation, &cache.deflated_row_directions, &lambda_smooth)
+            .expect("the gate evaluates");
+        eprintln!(
+            "[#2822 softmax K=2 pin] {commits} commit(s), floor stops {} → {}, unfactorable {} \
+             → {}; gate {gate:.6e} band {band:.6e}",
+            before.rounding_floor_stops,
+            after.rounding_floor_stops,
+            before.unfactorable_no_steps,
+            after.unfactorable_no_steps,
+        );
+        assert!(
+            gate.is_finite() && band.is_finite() && band > 0.0,
+            "the softmax K = 2 route must carry a finite positive band: gate {gate:.6e} band \
+             {band:.6e}"
+        );
+        assert_eq!(
+            after.rounding_floor_stops,
+            before.rounding_floor_stops + 1,
+            "the softmax K = 2 root phase must end at its rounding floor"
+        );
+        assert!(
+            gate <= band,
+            "the refined root's gate {gate:.6e} must sit inside its band {band:.6e}"
+        );
+    }
+
+    /// #2822 — the band does not block a resolved step. The refined pinned root is displaced
+    /// along its stiffest pencil direction, as in
+    /// `a_refined_root_certifies_and_a_displaced_state_does_not_2228`, by `δ` with
+    /// `½λ² = 10⁴` times the stall tolerance on the objective scale. From there the first root
+    /// step contracts the gate by more than the two gates' formation bands together, so it
+    /// commits, and the refinement neither stops at the floor nor refuses it.
+    #[test]
+    fn a_displaced_root_still_commits_past_both_bands_2822() {
+        let (mut term, z, rho) = pinned_circle_state();
+        let options = term.evidence_factor_options();
+        let lambda_smooth = rho
+            .lambda_smooth_vec()
+            .expect("the pinned rho carries its smoothing coordinates");
+        term.refine_evidence_root(z.view(), &rho, None, &lambda_smooth, &options)
+            .expect("the root refinement runs at the pinned state");
+        let mut sys = term
+            .assemble_arrow_schur(z.view(), &rho, None)
+            .expect("the refined root assembles");
+        let cache = term
+            .factor_deflated_evidence_with_grad_norms(&mut sys, &lambda_smooth, &options)
+            .expect("the deflated evidence factor exists")
+            .cache;
+        let geometry = term
+            .materialize_exact_stationarity_geometry(&rho, z.view(), &cache)
+            .expect("the pinned state lies within the dense admission");
+        let stiffest = (0..geometry.eigenvalues.len())
+            .max_by(|&left, &right| geometry.eigenvalues[left].total_cmp(&geometry.eigenvalues[right]))
+            .expect("the pencil has directions");
+        let mu = geometry.eigenvalues[stiffest];
+        let scale = term
+            .penalized_objective_total(z.view(), &rho, None, 1.0)
+            .expect("the objective evaluates")
+            .abs()
+            + 1.0;
+        let delta = (2.0 * 1.0e4 * SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * scale / mu).sqrt();
+        let direction = geometry.eigenvectors.column(stiffest);
+        let total_t = cache.delta_t_len();
+        let step_t = Array1::from_iter(direction.iter().take(total_t).map(|value| delta * value));
+        let step_beta = Array1::from_iter(direction.iter().skip(total_t).map(|value| delta * value));
+        term.apply_newton_step(step_t.view(), step_beta.view(), 1.0)
+            .expect("the displacement applies");
+
+        let before = term.evidence_root_telemetry.counts();
+        let root = term
+            .evidence_root_step(z.view(), &rho, None, &lambda_smooth, &options)
+            .expect("the root step evaluates at the displaced state")
+            .expect("a displaced state has a root step");
+        let gate_band = root.gate_band;
+        term.apply_newton_step(root.step.t.view(), root.step.beta.view(), 1.0)
+            .expect("the root step applies");
+        let (mut trial_sys, trial_accumulation) = term
+            .assemble_arrow_schur_with_gradient_accumulation(z.view(), &rho, None)
+            .expect("the trial assembles");
+        let (trial_gate, trial_band) = term
+            .root_gate(
+                &mut trial_sys,
+                &trial_accumulation,
+                &root.cache.deflated_row_directions,
+                &lambda_smooth,
+            )
+            .expect("the trial gate evaluates");
+        eprintln!(
+            "[#2822 displaced pin] gate {:.6e} (band {gate_band:.6e}) → {trial_gate:.6e} (band \
+             {trial_band:.6e})",
+            root.gate
+        );
+        assert!(
+            root.gate > gate_band,
+            "premise: the displaced gate {:.6e} must sit above its band {gate_band:.6e}",
+            root.gate
+        );
+        assert!(
+            SaeManifoldTerm::root_gate_contracts(root.gate, gate_band, trial_gate, trial_band),
+            "a resolved root step must commit: gate {:.6e} → {trial_gate:.6e} against bands \
+             {gate_band:.6e} + {trial_band:.6e}",
+            root.gate
+        );
+        let after = term.evidence_root_telemetry.counts();
+        assert_eq!(
+            (after.rounding_floor_stops, after.band_refused_commits),
+            (before.rounding_floor_stops, before.band_refused_commits),
+            "a resolved step is neither a floor stop nor a band refusal"
+        );
     }
 }

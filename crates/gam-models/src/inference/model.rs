@@ -120,7 +120,16 @@ use std::path::Path;
 // family objective homotopy, a unique mode, or the caller's seed when no rule applied. The field
 // carries a serde default, so an older payload loads as `NotRecorded`, which claims nothing; a
 // v26 binary refuses a v27 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 27;
+// v28 records, beside a certified outer point, the criterion value certified there and the
+// fingerprint of the fit's inputs (`OuterWarmStartRecord::{value, input_fingerprint}`, gam#3002),
+// and names its coordinates `theta` (the `rho` of a v25 to v27 record reads as its alias). Both
+// fields carry serde defaults, so an older point loads without them and can only join a search,
+// never resume one; a v27 binary refuses a v28 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 28;
+
+/// The schema before the certified point's value and input fingerprint (gam#3002), whose only
+/// difference is those fields' absence.
+const WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION: u32 = 27;
 
 /// The schema before the coefficient-mode record (gam#2661), whose only difference is that
 /// field's absence.
@@ -136,7 +145,7 @@ const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
 
 /// The schema before the certified outer point (`warm_start_from`), whose only difference
 /// from [`LOCATION_ONLY_SCALE_PAYLOAD_VERSION`] is that record's absence.
-const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
+pub(crate) const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
 
 /// The schema before the residual repair block's covariance declination (gam#2985),
 /// whose only difference is that variant's absence.
@@ -168,8 +177,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 10] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 11] = [
     MODEL_PAYLOAD_VERSION,
+    WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
     MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
     LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
     OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
@@ -1287,6 +1297,12 @@ pub enum ModelKind {
 pub enum FittedEstimator {
     Likelihood,
     Expectile { tau: f64 },
+}
+
+/// The family name every surface (summary, CLI fit line, Python
+/// `family_name`) reports for an expectile fit.
+pub fn expectile_display_name(tau: f64) -> String {
+    format!("Expectile(tau={tau})")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3658,6 +3674,11 @@ impl FittedModel {
     /// than to a blank family.
     pub fn display_family_name(&self) -> String {
         let payload = self.payload();
+        // An expectile fit's persisted likelihood is its Gaussian-identity
+        // working model; the estimator tag names what was actually fitted.
+        if let FittedEstimator::Expectile { tau } = payload.estimator {
+            return expectile_display_name(tau);
+        }
         match &payload.family_state {
             FittedFamily::LocationScale { .. } if !payload.family.is_empty() => {
                 payload.family.clone()
@@ -7495,6 +7516,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
@@ -7511,8 +7533,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
         assert_eq!(
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             MODEL_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
@@ -7538,6 +7564,29 @@ mod tests {
         assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);
         assert_eq!(COVARIANCE_COPIES_PAYLOAD_VERSION, EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION - 1);
+    }
+
+    /// gam#3002: a certified point saved before v28 reads with its `rho` as `theta` and with
+    /// no value or fingerprint, so a warm start from it can only join a search; a v28 point
+    /// round-trips whole.
+    #[test]
+    fn a_certified_point_before_v28_loads_without_its_value_or_fingerprint_3002() {
+        use gam_solve::model_types::OuterWarmStartRecord;
+        let record: OuterWarmStartRecord =
+            serde_json::from_str(r#"{"rho":[1.5,-2.0],"beta":[0.25]}"#).expect("a v27 point reads");
+        assert_eq!(record.theta, vec![1.5, -2.0]);
+        assert_eq!(
+            (record.value, record.input_fingerprint.as_deref()),
+            (None, None)
+        );
+        let current = OuterWarmStartRecord {
+            value: Some(3.0),
+            input_fingerprint: Some("00ff".to_string()),
+            ..record
+        };
+        let text = serde_json::to_string(&current).expect("a v28 point writes");
+        let read: OuterWarmStartRecord = serde_json::from_str(&text).expect("a v28 point reads");
+        assert_eq!(read, current);
     }
 
     /// #2954: a payload written before the certificate recorded its Newton polish and each

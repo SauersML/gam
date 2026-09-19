@@ -505,7 +505,8 @@ class BlockSparseDictionaryFit:
     @property
     def n_blocks(self) -> int:
         """Number of blocks ``G = K / b``."""
-        return self.decoder.shape[0] // self.block_size
+        n_atoms: int = self.decoder.shape[0]
+        return n_atoms // self.block_size
 
     @property
     def n_atoms(self) -> int:
@@ -663,7 +664,7 @@ class BlockSparseDictionaryFit:
         n_basis_chart: int = 4,
         residual_target: bool = True,
         name_prefix: str = "block",
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Per-block seed records for ranking which blocks deserve a curved Tier-2
         chart, each carrying MDL-scorer featurizer rows (block rung + circle-chart
         rung) matching the mdl_ladder JSON interface.
@@ -697,7 +698,7 @@ class BlockSparseDictionaryFit:
         include_bases: bool = True,
         name_prefix: str = "block",
         block_tile: int = 1024,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """A JSON-serialisable Tier-1 -> Tier-2 hand-off manifest: per-block basis,
         coordinate statistics, firing counts, and MDL featurizer rows, plus a flat
         ``mdl_featurizers`` list ready to pass straight to ``mdl.score_json``.
@@ -929,7 +930,8 @@ class BlockSparseStreamArtifact:
     @property
     def n_blocks(self) -> int:
         """Number of blocks ``G = K / b``."""
-        return self.decoder.shape[0] // self.block_size
+        n_atoms: int = self.decoder.shape[0]
+        return n_atoms // self.block_size
 
     def transform(
         self, X: Any, block_topk: int | None = None
