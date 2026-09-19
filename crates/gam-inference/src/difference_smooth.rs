@@ -44,6 +44,10 @@ pub struct DifferenceSmoothRow {
     pub level: f64,
     pub simultaneous: bool,
     pub critical: f64,
+    /// Whole-curve p-value of "no difference between `level_1` and `level_2`
+    /// anywhere on the grid", from the simultaneous band's own `max|Z|` law;
+    /// shared by every row of the pair. `None` for pointwise bands.
+    pub p_value: Option<f64>,
     pub covariance_kind: String,
     pub covariance_corrected: bool,
 }
@@ -221,6 +225,7 @@ pub fn difference_smooth_report(
                 level,
                 simultaneous: request.simultaneous,
                 critical: report.critical,
+                p_value: report.zero_curve_p_value,
                 covariance_kind: covariance_kind.clone(),
                 covariance_corrected,
             });
@@ -419,5 +424,78 @@ mod tests {
         .expect("difference report");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| (row.diff - 1.5).abs() < 1.0e-12));
+        assert!(rows.iter().all(|row| row.p_value.is_none()));
+    }
+
+    #[test]
+    fn simultaneous_rows_share_one_no_difference_p_value_per_pair() {
+        let schema = DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: Vec::new(),
+                },
+                SchemaColumn {
+                    name: "g".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["A".to_string(), "B".to_string()],
+                },
+            ],
+        };
+        let termspec = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            smooth_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+        };
+        let covariance = array![[0.1, 0.0], [0.0, 0.1]];
+        let simulations = 999;
+        let report = |group_effect: f64| {
+            let beta = Array1::from_vec(vec![0.0, group_effect]);
+            difference_smooth_report(
+                DifferenceSmoothInputs {
+                    schema: &schema,
+                    training_feature_ranges: &[(0.0, 1.0), (0.0, 1.0)],
+                    termspec: &termspec,
+                    beta: beta.view(),
+                    covariance: covariance.view(),
+                    covariance_source: CovarianceSource::Conditional,
+                },
+                DifferenceSmoothRequest {
+                    view: "x".to_string(),
+                    group: Some("g".to_string()),
+                    pairs: Some(vec![("B".to_string(), "A".to_string())]),
+                    n: 5,
+                    level: Some(0.95),
+                    simultaneous: true,
+                    n_sim: Some(simulations),
+                    seed: None,
+                    marginalise_random: false,
+                    group_means: true,
+                    template: None,
+                },
+                |_, rows| {
+                    Ok(Array2::from_shape_fn((rows.len(), 2), |(row, column)| {
+                        if column == 0 || rows[row][1] == "B" {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }))
+                },
+            )
+            .expect("difference report")
+        };
+        // diff / se = 1.5 / sqrt(0.1) ≈ 4.7: no draw of the one-dimensional
+        // supremum law reaches it, so p is the Monte Carlo floor 1 / (S + 1).
+        let distinct = report(1.5);
+        assert!(
+            distinct
+                .iter()
+                .all(|row| row.p_value == Some(1.0 / (simulations + 1) as f64))
+        );
+        // Identical groups: the estimated difference is exactly zero.
+        let shared = report(0.0);
+        assert!(shared.iter().all(|row| row.p_value == Some(1.0)));
     }
 }

@@ -710,11 +710,11 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
             .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
     let model = load_model_impl(model_bytes)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let selected_covariance = gam::inference::effects::select_covariance(
-        &fit,
-        gam::inference::effects::CovarianceSource::SmoothingCorrected,
-    )
-    .map_err(|error| error.to_string())?;
+    // The band prices its SEs off the covariance the fit publishes, as
+    // `summary()` and `partial_dependence` do (#2779); a fit whose correction
+    // is typed unavailable reports the conditional band under that label.
+    let selected_covariance = gam::inference::effects::select_published_covariance(&fit)
+        .map_err(|error| error.to_string())?;
     let payload = model.payload();
     let schema = payload
         .data_schema

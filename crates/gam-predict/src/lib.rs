@@ -1475,14 +1475,6 @@ pub struct PredictUncertaintyOptions {
     /// `predictor_x_for_corrections` and `training_support`. Factor is
     /// `1 + γ · Σ_k (excess_k / range_k)²`, with γ = `ood_gamma`.
     pub ood_inflation: bool,
-    /// Joint coverage adjustment over a query batch. When ON (default
-    /// OFF) the per-row z multiplier is increased so the family-wise
-    /// coverage of the returned intervals matches `confidence_level`.
-    /// Uses Bonferroni: `z_joint = standard_normal_quantile(
-    /// 0.5 + 0.5·(1 − (1 − level) / m))` where m is the joint query count
-    /// (defaults to the prediction batch size when `joint_query_count` is
-    /// None).
-    pub multi_point_joint: bool,
     /// Predictor rows aligned with the prediction batch, used by boundary
     /// and OOD corrections. Number of columns must match
     /// `training_support.axis_min.len()`. When None, both corrections
@@ -1505,9 +1497,6 @@ pub struct PredictUncertaintyOptions {
     /// None, Edgeworth correction reduces to the standard symmetric
     /// quantile (no-op).
     pub eta_skewness_for_corrections: Option<Array1<f64>>,
-    /// Joint query count m for the multi-point adjustment. When None the
-    /// prediction batch size is used.
-    pub joint_query_count: Option<usize>,
     /// Boundary correction strength α (multiplier on the squared shortfall).
     /// Default 0.25. Larger ⇒ more inflation near the edge.
     pub boundary_alpha: f64,
@@ -1554,12 +1543,10 @@ impl Default for PredictUncertaintyOptions {
             edgeworth_one_sided: true,
             boundary_correction: true,
             ood_inflation: false,
-            multi_point_joint: false,
             predictor_x_for_corrections: None,
             training_support: None,
             extrapolation_variance: None,
             eta_skewness_for_corrections: None,
-            joint_query_count: None,
             boundary_alpha: 0.25,
             boundary_band_fraction: 0.05,
             ood_gamma: 1.0,
@@ -1678,22 +1665,6 @@ pub(crate) fn ood_variance_inflation_factor(
         sq_excess += frac * frac;
     }
     (1.0 + gamma * sq_excess).max(1.0)
-}
-
-/// Bonferroni-adjusted z multiplier for joint coverage of `m` query
-/// rows at central level `level`. The per-row tail probability is
-/// `(1 − level) / m` (split equally across both tails), giving a
-/// per-row central level of `1 − (1 − level) / m`. Returns the
-/// corresponding standard-normal quantile, or the un-adjusted z if
-/// m ≤ 1 or inputs are degenerate.
-pub(crate) fn multi_point_joint_z(level: f64, m: usize) -> Result<f64, String> {
-    if m <= 1 || !(level.is_finite() && level > 0.0 && level < 1.0) {
-        return standard_normal_quantile(0.5 + 0.5 * level);
-    }
-    let alpha = 1.0 - level;
-    let per_row_alpha = alpha / (m as f64);
-    let per_row_level = 1.0 - per_row_alpha;
-    standard_normal_quantile(0.5 + 0.5 * per_row_level)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2829,15 +2800,10 @@ where
     }
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
-    // Per-row z multipliers. Joint adjustment widens the central level
-    // first; Edgeworth then optionally splits the lower/upper tails.
+    // Per-row z multipliers; Edgeworth optionally splits the lower/upper tails.
     let level = options.confidence_level;
-    let z_central = if options.multi_point_joint {
-        let m = options.joint_query_count.unwrap_or(n_rows).max(1);
-        multi_point_joint_z(level, m).map_err(EstimationError::InvalidInput)?
-    } else {
-        standard_normal_quantile(0.5 + 0.5 * level).map_err(EstimationError::InvalidInput)?
-    };
+    let z_central =
+        standard_normal_quantile(0.5 + 0.5 * level).map_err(EstimationError::InvalidInput)?;
     let mut z_lower_per_row = Array1::<f64>::from_elem(n_rows, z_central);
     let mut z_upper_per_row = Array1::<f64>::from_elem(n_rows, z_central);
     if options.edgeworth_one_sided
@@ -2851,13 +2817,7 @@ where
         }
     }
     let (eta_lower, eta_upper) = if let Some(fit) = constrained_fit {
-        let interval_level = if options.multi_point_joint {
-            let count = options.joint_query_count.unwrap_or(n_rows).max(1) as f64;
-            1.0 - (1.0 - level) / count
-        } else {
-            level
-        };
-        constrained_linear_predictor_intervals(fit, &x, offset, interval_level, requested_mode)?
+        constrained_linear_predictor_intervals(fit, &x, offset, level, requested_mode)?
     } else {
         (
             Array1::from_iter(
@@ -3295,7 +3255,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
 
@@ -3522,7 +3481,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let result = predict_gamwith_uncertainty(
@@ -3560,7 +3518,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let result = predict_gamwith_uncertainty(
@@ -3890,7 +3847,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
 
@@ -3935,7 +3891,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let options_fused = PredictUncertaintyOptions {
@@ -4084,7 +4039,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let corrected_fit = gaussian_location_scale_fit_with_covariance_and_corrected(
@@ -4366,7 +4320,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         }
     }
@@ -4549,47 +4502,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_point_joint_widens_interval_relative_to_per_row() {
-        let beta = array![1.0_f64];
-        let cov = array![[0.25_f64]];
-        let fit = posterior_band_fixture(beta.clone(), cov);
-        // Five identical query rows; joint over m=5 must widen each
-        // interval relative to the per-row baseline, by the Bonferroni z.
-        let x = Array2::<f64>::from_elem((5, 1), 1.0_f64);
-        let offset = Array1::zeros(5);
-        let mut opts = corrections_baseline_options();
-        opts.multi_point_joint = true;
-        // Don't set joint_query_count so the helper uses batch size = 5.
-
-        let pred = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            &fit,
-            &opts,
-        )
-        .expect("joint-adjusted prediction");
-
-        let z_per_row = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
-        let z_joint = standard_normal_quantile(0.5 + 0.5 * (1.0 - 0.05_f64 / 5.0)).unwrap();
-        assert!(
-            z_joint > z_per_row + 1e-6,
-            "Bonferroni z must exceed per-row z: joint={z_joint}, per-row={z_per_row}"
-        );
-        let baseline_se = (0.25_f64).sqrt();
-        // Width per row should be 2·z_joint·se.
-        for i in 0..5 {
-            let width = pred.eta_upper[i] - pred.eta_lower[i];
-            let expected = 2.0 * z_joint * baseline_se;
-            assert!(
-                (width - expected).abs() <= 1e-12,
-                "joint row {i} width mismatch: got {width}, expected {expected}"
-            );
-        }
-    }
-
-    #[test]
     fn edgeworth_helper_zero_skew_returns_central_z() {
         let z = 1.96_f64;
         let adj = edgeworth_one_sided_quantile(z, 0.0);
@@ -4618,13 +4530,6 @@ mod tests {
             1.0,
         );
         assert!((f - 1.0).abs() <= 1e-12);
-    }
-
-    #[test]
-    fn multi_point_joint_z_passthrough_at_m_one() {
-        let z1 = multi_point_joint_z(0.95, 1).unwrap();
-        let z_baseline = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
-        assert!((z1 - z_baseline).abs() <= 1e-12);
     }
 
     #[test]
