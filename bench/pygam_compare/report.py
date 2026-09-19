@@ -18,6 +18,10 @@ Verdict rules (all "lower is better"; every LOSS is printed, none is hidden):
   (gamfit - comparator) is a **LOSS** when d > 2 SE, a WIN when d < -2 SE,
   otherwise "worse n.s." / "better n.s." / TIE. With a single paired seed
   there is no SE, so the sign alone decides and the verdict says "(1 seed)".
+* Thread scaling (only for runs whose cells set ``threads`` / ``concurrency``):
+  median fit wall per thread setting with its speedup over one thread, and for
+  a process fan-out the batch wall and fits per second next to the same shape
+  run alone. These are gamfit against itself, so they carry no verdict.
 * Status: a cell where gamfit has fewer ok reps than the comparator is a
   **LOSS(status)** regardless of the numbers (listed once per cell in the loss
   list; metric tables show it wherever gamfit has no ok rep to measure); a
@@ -37,13 +41,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .plans import threads_label, variant_suffix
+
 GAMFIT = "gamfit"
 COMPARATORS: tuple[str, ...] = ("pygam", "pygam_gs")
 COVERAGE_TARGET = 0.95
 SE_MULTIPLIER = 2.0
 
 Record = dict[str, Any]
-CellKey = tuple[str, int, str]
+# (family, n, design, threads, concurrency); records written before the
+# thread fields existed are single-thread, single-process cells.
+CellKey = tuple[str, int, str, int | None, int]
 
 
 @dataclass(frozen=True)
@@ -58,24 +66,32 @@ class Verdict:
         return "(status)" in self.text
 
 
+def _cell_key(r: Record) -> CellKey:
+    return (
+        str(r["family"]),
+        int(r["n"]),
+        str(r["design"]),
+        r.get("threads", 1),
+        int(r.get("concurrency", 1)),
+    )
+
+
 def _cells(records: Iterable[Record]) -> list[CellKey]:
     seen: dict[CellKey, None] = {}
     for r in records:
-        seen.setdefault((str(r["family"]), int(r["n"]), str(r["design"])), None)
+        seen.setdefault(_cell_key(r), None)
     return list(seen)
 
 
 def _cell_name(cell: CellKey) -> str:
-    family, n, design = cell
-    return f"{family} n={n:g} {design}"
+    family, n, design, threads, concurrency = cell
+    return f"{family} n={n:g} {design}{variant_suffix(threads, concurrency)}"
 
 
 def _group(records: Iterable[Record]) -> dict[tuple[CellKey, str], list[Record]]:
     out: dict[tuple[CellKey, str], list[Record]] = defaultdict(list)
     for r in records:
-        out[((str(r["family"]), int(r["n"]), str(r["design"])), str(r["lib"]))].append(
-            r
-        )
+        out[(_cell_key(r), str(r["lib"]))].append(r)
     return out
 
 
@@ -195,6 +211,89 @@ ACCURACY_METRICS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _thread_order(threads: int | None) -> tuple[bool, int]:
+    return (threads is None, threads or 0)
+
+
+def scaling_lines(records: list[Record]) -> list[str]:
+    """Thread-scaling and process-fan-out tables for the cells that vary the
+    thread setting; empty when every cell is the single-core default."""
+    groups = _group(r for r in records if r.get("lib") == GAMFIT)
+    cells = [c for c, _ in groups]
+    if all(c[3] == 1 and c[4] == 1 for c in cells):
+        return []
+    lines: list[str] = []
+    shapes = list(dict.fromkeys(c[:3] for c in cells))
+
+    def alone(shape: tuple[str, int, str], threads: int | None) -> float | None:
+        return _median(groups.get(((*shape, threads, 1), GAMFIT), []), "fit_s")
+
+    settings = sorted({c[3] for c in cells if c[4] == 1}, key=_thread_order)
+    if len(settings) > 1:
+        lines += [
+            "## Thread scaling: gamfit fit wall (median), speedup over threads=1",
+            "",
+        ]
+        rows = []
+        for shape in shapes:
+            base = alone(shape, 1)
+            row = [_cell_name((*shape, 1, 1))]
+            for t in settings:
+                v = alone(shape, t)
+                speedup = f" ({base / v:.2f}x)" if base and v else ""
+                row.append(_fmt(v, " s") + speedup)
+            rows.append(row)
+        lines += _table(
+            ["cell", *(f"threads={threads_label(t)}" for t in settings)], rows
+        ) + [""]
+
+    fanouts = sorted(
+        {c for c in cells if c[4] > 1}, key=lambda c: (c[:3], _thread_order(c[3]))
+    )
+    if fanouts:
+        lines += [
+            "## Process fan-out: K simultaneous gamfit processes vs one alone",
+            "",
+            "Process wall covers import, fit and predict. The throughput ratio is"
+            " the batch's processes per second over one process alone at the same"
+            " thread setting: K is perfect use of K workers, below 1 means the"
+            " fan-out is slower than running the processes one after another.",
+            "",
+        ]
+        rows = []
+        for cell in fanouts:
+            recs = groups[(cell, GAMFIT)]
+            k = cell[4]
+            solo = groups.get(((*cell[:3], cell[3], 1), GAMFIT), [])
+            solo_wall = _median(solo, "proc_wall_s")
+            batch = _median(recs, "batch_wall_s")
+            ratio = k * solo_wall / batch if batch and solo_wall else None
+            rows.append(
+                [
+                    _cell_name(cell),
+                    _status_summary(recs),
+                    _fmt(_median(solo, "fit_s"), " s"),
+                    _fmt(_median(recs, "fit_s"), " s"),
+                    _fmt(solo_wall, " s"),
+                    _fmt(batch, " s"),
+                    _fmt(ratio, "x"),
+                ]
+            )
+        lines += _table(
+            [
+                "cell",
+                "status",
+                "fit wall alone",
+                "fit wall in batch",
+                "process wall alone",
+                "batch wall",
+                "throughput ratio",
+            ],
+            rows,
+        ) + [""]
+    return lines
+
+
 def _table(header: list[str], rows: list[list[str]]) -> list[str]:
     out = [
         "| " + " | ".join(header) + " |",
@@ -238,6 +337,15 @@ def render(records: list[Record], metas: list[dict[str, Any]] | None = None) -> 
             f" nproc {meta.get('nproc')}, RAM {meta.get('total_ram_mb', 0) / 1024:.1f} GiB",
             f"- versions: {', '.join(meta.get('lib_versions', []))}",
             f"- thread env: {', '.join(f'{k}={v}' for k, v in meta.get('thread_env', {}).items())}",
+            *(
+                [
+                    "- per-cell thread settings (every pool variable set to the value,"
+                    " or all unset for auto): "
+                    + ", ".join(meta["cell_thread_settings"])
+                ]
+                if meta.get("cell_thread_settings", ["1"]) != ["1"]
+                else []
+            ),
             f"- safety net (not a solver budget): timeout {plan.get('timeout_s')} s/rep,"
             f" memcap {meta.get('memcap_mb', 0):.0f} MiB/rep",
             "",
@@ -251,6 +359,7 @@ def render(records: list[Record], metas: list[dict[str, Any]] | None = None) -> 
             "",
         ]
 
+    lines += scaling_lines(records)
     lines += ["## Status", ""]
     rows = []
     for cell in cells:

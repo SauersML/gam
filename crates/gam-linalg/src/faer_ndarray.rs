@@ -1089,12 +1089,15 @@ const fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
         && m.saturating_mul(n).saturating_mul(k) >= MIN_FLOP_SCALE
 }
 
+/// Multiply-adds below which a product runs sequentially: the parallel split
+/// costs more than it saves.
+const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
+
 #[inline]
 pub fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     // Prefer a work-based policy over per-dimension thresholds.
     // Tall/skinny products (e.g. N x p with large N, modest p) should still
     // parallelize when total work is high.
-    const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
     const PAR_MIN_LONG_DIM: usize = 256;
     let flop_scale = m.saturating_mul(n).saturating_mul(k);
     let long_dim = m.max(n).max(k);
@@ -1105,6 +1108,115 @@ pub fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
         pool_parallelism()
     } else {
         Par::Seq
+    }
+}
+
+/// Rows per block when the `m×n` product of a `k`-row contraction runs as a
+/// row-block reduction ([`row_block_contraction`]), or `None` when it runs as one
+/// faer GEMM at [`matmul_parallelism`].
+///
+/// faer parallelizes a GEMM over output tiles, and every `k`-block of the
+/// contraction ends in a gang barrier across the whole pool. A reduction-shaped
+/// product — a Gram or cross-product of a tall design, `p×q` output from `n`
+/// rows — has one or two output tiles, so the other workers spin at a barrier
+/// several hundred times per product, and under oversubscription (joblib
+/// `n_jobs=-1`, `cross_val_score(n_jobs=-1)`) the gang waits on descheduled
+/// members: four concurrent `n = 1e5` fits took 3× the wall of one-thread fits.
+/// These products split the rows instead ([`crate::parallel::row_contraction_block_rows`]).
+#[inline]
+fn row_contraction_rows(m: usize, n: usize, k: usize) -> Option<usize> {
+    if m.saturating_mul(n).saturating_mul(k) < PAR_MIN_FLOP_SCALE {
+        return None;
+    }
+    crate::parallel::row_contraction_block_rows(m.saturating_mul(n))
+}
+
+/// `out (+)= lhsᵀ·diag(w)·rhs` (`diag(w)` omitted when `weights` is `None`) as a
+/// row-block reduction: rows `[b·block_rows, (b+1)·block_rows)` form block `b`,
+/// each block is one sequential GEMM into a private partial, and the partials
+/// are combined over [`crate::pairwise_reduce::par_deterministic_block_fold_by_work`].
+///
+/// **Determinism.** The blocks come from the shape alone and the combine tree
+/// from the block count alone, so the product is bit-identical at every pool
+/// width and whichever worker runs which block; faer's sequential GEMM is
+/// deterministic within a block. The rows are summed in a different order than
+/// one faer GEMM over all `k` rows, so the words differ from that path once,
+/// by summation order only, and are invariant across thread counts after.
+///
+/// **Scheduling.** The fold is `rayon::join` work stealing, never a barrier: a
+/// worker that is descheduled delays only the block it holds, and a call from
+/// inside a saturated pool runs its blocks inline. The same holds when the
+/// caller asked for [`Par::Seq`] from an outer parallel region, so no degree is
+/// taken from the caller: the split, and so the bits, never depend on it.
+///
+/// With [`BlockStructure::TriangularLower`] only the lower triangle of each
+/// partial is formed; the caller mirrors.
+fn row_block_contraction(
+    out: &mut Array2<f64>,
+    accum: faer::Accum,
+    lhs: MatRef<'_, f64>,
+    rhs: MatRef<'_, f64>,
+    weights: Option<&[f64]>,
+    structure: faer::linalg::matmul::triangular::BlockStructure,
+    block_rows: usize,
+) {
+    use faer::Accum;
+    use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
+
+    let k = lhs.nrows();
+    let (m, n) = (lhs.ncols(), rhs.ncols());
+    assert_eq!(rhs.nrows(), k, "row-block contraction operands must share rows");
+    assert_eq!(out.dim(), (m, n), "row-block contraction output shape");
+    if let Some(w) = weights {
+        assert_eq!(w.len(), k, "row-block contraction weights must match rows");
+    }
+    let n_blocks = k.div_ceil(block_rows.max(1));
+    let block_product = |part: &mut Array2<f64>, block: usize| {
+        let start = block * block_rows;
+        let rows = block_rows.min(k - start);
+        let lhs_block = lhs.subrows(start, rows).transpose();
+        let rhs_block = rhs.subrows(start, rows);
+        let scaled;
+        let rhs_block = match weights {
+            None => rhs_block,
+            Some(w) => {
+                let w = &w[start..start + rows];
+                scaled = Mat::<f64>::from_fn(rows, n, |i, j| w[i] * rhs_block[(i, j)]);
+                scaled.as_ref()
+            }
+        };
+        tri_matmul(
+            array2_to_matmut(part),
+            structure,
+            Accum::Add,
+            lhs_block,
+            BlockStructure::Rectangular,
+            rhs_block,
+            BlockStructure::Rectangular,
+            1.0,
+            Par::Seq,
+        );
+    };
+    let total = crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        n_blocks,
+        block_rows,
+        |blocks: core::ops::Range<usize>| {
+            let mut part = Array2::<f64>::zeros((m, n));
+            for block in blocks {
+                block_product(&mut part, block);
+            }
+            part
+        },
+        |mut left: Array2<f64>, right: Array2<f64>| {
+            left += &right;
+            left
+        },
+    );
+    match (total, accum) {
+        (Some(total), Accum::Replace) => out.assign(&total),
+        (Some(total), Accum::Add) => *out += &total,
+        (None, Accum::Replace) => out.fill(0.0),
+        (None, Accum::Add) => {}
     }
 }
 
@@ -1182,10 +1294,23 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
         return;
     }
 
-    let mut outview = array2_to_matmut(out);
-
     let aview = FaerArrayView::new(a);
     let a_ref = aview.as_ref();
+    if let Some(block_rows) = row_contraction_rows(p, p, n) {
+        row_block_contraction(
+            out,
+            Accum::Replace,
+            a_ref,
+            a_ref,
+            None,
+            BlockStructure::TriangularLower,
+            block_rows,
+        );
+        mirror_lower_to_upper(out);
+        return;
+    }
+
+    let mut outview = array2_to_matmut(out);
     let a_t = a_ref.transpose();
     let par = matmul_parallelism(p, p, n);
     tri_matmul(
@@ -1199,7 +1324,13 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
         1.0,
         par,
     );
-    // Mirror lower triangle to upper to populate the full symmetric output.
+    mirror_lower_to_upper(out);
+}
+
+/// Copy the lower triangle of a square matrix onto its upper triangle.
+#[inline]
+fn mirror_lower_to_upper(out: &mut Array2<f64>) {
+    let p = out.nrows();
     for i in 0..p {
         for j in (i + 1)..p {
             out[[i, j]] = out[[j, i]];
@@ -1245,12 +1376,28 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return a.t().dot(b);
     }
 
-    let mut result = Mat::<f64>::zeros(p, q);
-
     let aview = FaerArrayView::new(a);
     let bview = FaerArrayView::new(b);
     let a_ref = aview.as_ref();
     let b_ref = bview.as_ref();
+
+    // A reduction-shaped product splits its rows whatever `par` says; see
+    // `row_block_contraction` for why the caller's degree cannot enter.
+    if let Some(block_rows) = row_contraction_rows(p, q, n_a) {
+        let mut out = Array2::<f64>::zeros((p, q));
+        row_block_contraction(
+            &mut out,
+            Accum::Replace,
+            a_ref,
+            b_ref,
+            None,
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            block_rows,
+        );
+        return out;
+    }
+
+    let mut result = Mat::<f64>::zeros(p, q);
 
     // dst = A^T * B
     matmul(
@@ -2231,6 +2378,42 @@ pub fn stream_weighted_crossprod_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>
         return;
     }
 
+    if let Some(block_rows) = row_contraction_rows(p, p, n) {
+        // Row-block reduction: each block row-scales at most `block_rows × p`
+        // cells, the same bound on the working set as the streamed chunk below.
+        let x_view = FaerArrayView::new(x);
+        let x_ref = x_view.as_ref();
+        let w_owned;
+        let w_slice = match w.as_slice() {
+            Some(slice) => slice,
+            None => {
+                w_owned = w.to_vec();
+                w_owned.as_slice()
+            }
+        };
+        let accum = match accum {
+            CrossprodAccum::Replace => Accum::Replace,
+            CrossprodAccum::Add => Accum::Add,
+        };
+        let block_structure = match structure {
+            CrossprodStructure::SymmetricLower => BlockStructure::TriangularLower,
+            CrossprodStructure::Full => BlockStructure::Rectangular,
+        };
+        row_block_contraction(
+            out,
+            accum,
+            x_ref,
+            x_ref,
+            Some(w_slice),
+            block_structure,
+            block_rows,
+        );
+        if structure == CrossprodStructure::SymmetricLower {
+            mirror_lower_to_upper(out);
+        }
+        return;
+    }
+
     // Streaming chunked: peak allocation is chunk_rows × p instead of n × p.
     let chunk_rows = streaming_chunk_rows(p, n);
 
@@ -2373,6 +2556,30 @@ fn fast_xt_diag_y_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem
     if !should_use_faer_matmul(px, q, n) {
         let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
         return x.t().dot(&w_y);
+    }
+
+    if let Some(block_rows) = row_contraction_rows(px, q, n) {
+        let x_view = FaerArrayView::new(x);
+        let y_view = FaerArrayView::new(y);
+        let w_owned;
+        let w_slice = match w.as_slice() {
+            Some(slice) => slice,
+            None => {
+                w_owned = w.to_vec();
+                w_owned.as_slice()
+            }
+        };
+        let mut out = Array2::<f64>::zeros((px, q));
+        row_block_contraction(
+            &mut out,
+            Accum::Replace,
+            x_view.as_ref(),
+            y_view.as_ref(),
+            Some(w_slice),
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            block_rows,
+        );
+        return out;
     }
 
     // Streaming: only allocate chunk_rows × q for the weighted Y slice.
@@ -5863,5 +6070,160 @@ mod lblt_inertia_2901_tests {
         let inertia = FaerLblt::new(mixed.as_ref(), Side::Lower).inertia();
         assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 1, 1), "{inertia:?}");
         assert_eq!(inertia.smallest_pivot, -2.0, "{inertia:?}");
+    }
+}
+
+#[cfg(test)]
+mod pool_width_invariance_tests {
+    use super::*;
+
+    /// A deterministic `n × p` design whose entries span several binades, so a
+    /// change of summation order moves low-order bits.
+    fn design(n: usize, p: usize, seed: u64) -> Array2<f64> {
+        let mut state = seed;
+        Array2::from_shape_fn((n, p), |_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = (state >> 11) as f64 / (1_u64 << 53) as f64;
+            (unit - 0.5) * (1.0 + 7.0 * unit)
+        })
+    }
+
+    fn signed_weights(n: usize) -> Array1<f64> {
+        Array1::from_shape_fn(n, |i| (0.37 * i as f64).sin() + 0.25)
+    }
+
+    fn words(a: &Array2<f64>) -> Vec<u64> {
+        a.iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn assert_same_words_at_every_pool_width(
+        label: &str,
+        product: impl Fn() -> Array2<f64> + Sync,
+    ) {
+        let at_width = |width: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
+            pool.install(|| words(&product()))
+        };
+        let single = at_width(1);
+        for width in [2, 3, 8] {
+            assert!(
+                single == at_width(width),
+                "{label}: pool width {width} changed the words"
+            );
+        }
+    }
+
+    fn naive_xt_diag_y(x: &Array2<f64>, w: Option<&Array1<f64>>, y: &Array2<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+        for i in 0..x.nrows() {
+            let wi = w.map_or(1.0, |w| w[i]);
+            for a in 0..x.ncols() {
+                for b in 0..y.ncols() {
+                    out[[a, b]] += x[[i, a]] * wi * y[[i, b]];
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_close(label: &str, got: &Array2<f64>, want: &Array2<f64>) {
+        let scale = want.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+        let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            err <= 1e-11 * scale,
+            "{label}: max error {err:e} against scale {scale:e}"
+        );
+    }
+
+    /// Every reduction-shaped product — Gram, cross-product and their weighted
+    /// forms of a tall design — carries the same words on pools of width 1, 2, 3
+    /// and 8, on both sides of the row-split output bound: `p·q ≤ 31 250` runs
+    /// as shape-sized row blocks, `200 × 200` as faer's output-tiled GEMM.
+    #[test]
+    fn reduction_products_carry_the_same_words_at_every_pool_width() {
+        for &(n, p, q) in &[
+            (50_000usize, 10usize, 7usize),
+            (50_000, 50, 50),
+            (12_000, 200, 200),
+        ] {
+            let x = design(n, p, 0x5EED ^ p as u64);
+            let y = design(n, q, 0xBEEF ^ q as u64);
+            let w = signed_weights(n);
+            let shape = format!("n={n} p={p} q={q}");
+
+            assert_same_words_at_every_pool_width(&format!("fast_ata {shape}"), || fast_ata(&x));
+            assert_same_words_at_every_pool_width(&format!("fast_atb {shape}"), || {
+                fast_atb(&x, &y)
+            });
+            assert_same_words_at_every_pool_width(&format!("fast_xt_diag_x {shape}"), || {
+                fast_xt_diag_x(&x, &w)
+            });
+            assert_same_words_at_every_pool_width(&format!("fast_xt_diag_y {shape}"), || {
+                fast_xt_diag_y(&x, &w, &y)
+            });
+            assert_same_words_at_every_pool_width(&format!("stream Full/Add {shape}"), || {
+                let mut out = Array2::<f64>::from_elem((p, p), 0.5);
+                stream_weighted_crossprod_into(
+                    &x,
+                    &w,
+                    &mut out,
+                    CrossprodStructure::Full,
+                    CrossprodAccum::Add,
+                    matmul_parallelism(p, p, n),
+                );
+                out
+            });
+
+            assert_close(
+                &format!("fast_ata {shape}"),
+                &fast_ata(&x),
+                &naive_xt_diag_y(&x, None, &x),
+            );
+            assert_close(
+                &format!("fast_atb {shape}"),
+                &fast_atb(&x, &y),
+                &naive_xt_diag_y(&x, None, &y),
+            );
+            assert_close(
+                &format!("fast_xt_diag_y {shape}"),
+                &fast_xt_diag_y(&x, &w, &y),
+                &naive_xt_diag_y(&x, Some(&w), &y),
+            );
+            let gram = fast_xt_diag_x(&x, &w);
+            assert_close(
+                &format!("fast_xt_diag_x {shape}"),
+                &gram,
+                &naive_xt_diag_y(&x, Some(&w), &x),
+            );
+            assert!(
+                gram == gram.t(),
+                "fast_xt_diag_x {shape} must be exactly symmetric"
+            );
+        }
+    }
+
+    /// A caller inside an outer parallel region asks for `Par::Seq`; the row
+    /// split is taken from the shape, not from that degree, so the nested call
+    /// and the top-level call agree word for word.
+    #[test]
+    fn a_sequential_caller_gets_the_same_words_as_the_pool() {
+        let (n, p, q) = (50_000usize, 12usize, 9usize);
+        let x = design(n, p, 11);
+        let y = design(n, q, 13);
+        let w = signed_weights(n);
+        assert!(
+            words(&fast_atb_with_parallelism(&x, &y, Par::Seq)) == words(&fast_atb(&x, &y)),
+            "fast_atb must not depend on the caller's degree"
+        );
+        assert!(
+            words(&fast_xt_diag_x_with_parallelism(&x, &w, Par::Seq))
+                == words(&fast_xt_diag_x(&x, &w)),
+            "fast_xt_diag_x must not depend on the caller's degree"
+        );
     }
 }

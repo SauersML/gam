@@ -40,12 +40,8 @@ pub(crate) struct FirthSecondDirEyeCache {
 }
 
 impl<'a> RemlState<'a> {
-    pub(crate) fn xt_diag_x_dense_into(
-        x: &Array2<f64>,
-        diag: &Array1<f64>,
-        weighted: &mut Array2<f64>,
-    ) -> Array2<f64> {
-        super::assembly::xt_diag_x_dense_into(x, diag, weighted)
+    pub(crate) fn xt_diag_x_dense(x: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
+        super::assembly::xt_diag_x_dense(x, diag)
     }
 
     #[inline]

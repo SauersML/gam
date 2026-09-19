@@ -1980,9 +1980,7 @@ impl<'a> RemlState<'a> {
                 if !is_gaussian_identity {
                     // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
                     let c_x_tau_beta = directional_curvature_weights(c_array, &x_tau_beta_j);
-                    let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-                    b_j +=
-                        &Self::xt_diag_x_dense_into(x_dense, &c_x_tau_beta, &mut weighted_scratch);
+                    b_j += &Self::xt_diag_x_dense(x_dense, &c_x_tau_beta);
                 }
 
                 // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
@@ -3181,7 +3179,6 @@ impl<'a> RemlState<'a> {
 
         // Build HyperCoord for each link parameter.
         let mut coords = Vec::with_capacity(aux_dim);
-        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
         for j in 0..aux_dim {
             // a_j = dF/dθ_j|_{β fixed} = -dℓ/dθ_j|_{η fixed}.
             let a_j = -direct_ll[j];
@@ -3195,8 +3192,7 @@ impl<'a> RemlState<'a> {
             // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
             // Uses observed-information weight derivatives (not Fisher) for exact
             // REML/LAML with non-canonical links (SAS, beta-logistic).
-            let b_j =
-                Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+            let b_j = Self::xt_diag_x_dense(x_dense, &dw_explicit_by_j[j]);
 
             coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
@@ -3363,7 +3359,6 @@ impl<'a> RemlState<'a> {
         }
 
         let mut coords = Vec::with_capacity(aux_dim);
-        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
         for j in 0..aux_dim {
             let a_j = -direct_ll[j];
             let g_j = {
@@ -3373,8 +3368,7 @@ impl<'a> RemlState<'a> {
             // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
             // Uses observed-information weight derivatives (not Fisher) for exact
             // REML/LAML with non-canonical links (mixture/blended).
-            let b_j =
-                Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+            let b_j = Self::xt_diag_x_dense(x_dense, &dw_explicit_by_j[j]);
 
             coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
@@ -3518,7 +3512,6 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
         let mut g_pairs: Vec<Array1<f64>> = Vec::with_capacity(aux_dim * aux_dim);
         let mut b_pairs: Vec<Array2<f64>> = Vec::with_capacity(aux_dim * aux_dim);
         for idx in 0..aux_dim * aux_dim {
@@ -3528,11 +3521,7 @@ impl<'a> RemlState<'a> {
                 continue;
             }
             g_pairs.push(-x_eff.t().dot(&d2u[idx]));
-            b_pairs.push(super::assembly::xt_diag_x_dense_into(
-                &x_eff,
-                &d2w[idx],
-                &mut weighted_scratch,
-            ));
+            b_pairs.push(super::assembly::xt_diag_x_dense(&x_eff, &d2w[idx]));
         }
 
         let a_pairs = std::sync::Arc::new(a_pairs);
@@ -3587,9 +3576,8 @@ impl<'a> RemlState<'a> {
                 }
                 let eta_dir = drift_x.dot(delta);
                 let diag = mixed * &eta_dir;
-                let mut scratch = Array2::<f64>::zeros((0, 0));
                 Ok(Some(super::reml_outer_engine::DriftDerivResult::Dense(
-                    super::assembly::xt_diag_x_dense_into(&drift_x, &diag, &mut scratch),
+                    super::assembly::xt_diag_x_dense(&drift_x, &diag),
                 )))
             },
         );

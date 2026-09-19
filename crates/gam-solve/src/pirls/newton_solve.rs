@@ -42,13 +42,8 @@ pub(crate) enum XtWxBackend {
 /// column are stored in ascending order. Lower-triangle entries are left at
 /// zero — they are written through the scatter to `xtwxvalues` but never read,
 /// because `assemble_upper` filters to row ≤ col.
-///
-/// `thread_buffers` is bounded at exactly `rayon::current_num_threads()` and
-/// reused across PIRLS iterations, so allocation cost is amortized across the
-/// entire fit rather than paid per call.
 pub(crate) struct DenseOuterState {
     pub(crate) xtwx_dense: Array2<f64>,
-    pub(crate) thread_buffers: Vec<Array2<f64>>,
 }
 
 /// State for the sparse-SpGEMM backend (faer numeric matmul scratch and the
@@ -95,7 +90,6 @@ impl SparseXtWxCache {
         let backend = if x.ncols() <= DENSE_OUTER_MAX_P {
             XtWxBackend::Dense(DenseOuterState {
                 xtwx_dense: Array2::<f64>::zeros((x.ncols(), x.ncols())),
-                thread_buffers: Vec::new(),
             })
         } else {
             // The SpGEMM scratch is sized by the handle's degree, so the handle
@@ -196,11 +190,9 @@ impl DenseOuterState {
     /// `self.xtwx_dense`.
     ///
     /// Decides serial vs parallel from a cost model on total estimated FLOPs
-    /// and the number of available rayon workers. In parallel mode each
-    /// worker accumulates into a thread-local p×p buffer (allocated once and
-    /// reused across calls); the workers are summed into `xtwx_dense` in
-    /// place, preserving its allocation rather than replacing it with a
-    /// freshly-allocated reduction result.
+    /// alone. In parallel mode each row chunk accumulates into its own p×p
+    /// partial; the partials are combined over a fixed pairwise tree and the
+    /// sum is written into `xtwx_dense` in place, preserving its allocation.
     pub(crate) fn compute(
         &mut self,
         x_t: SparseColMatRef<'_, usize, f64>,
@@ -225,10 +217,19 @@ impl DenseOuterState {
             .saturating_mul(nnz_total)
             .checked_div(n as u64)
             .unwrap_or(u64::MAX);
-        let n_threads = rayon::current_num_threads();
-        let parallelize = n_threads > 1 && work >= DENSE_OUTER_PARALLEL_FLOP_THRESHOLD;
-
-        if !parallelize {
+        // The chunking is a function of the shape alone and the per-chunk
+        // partials combine over a fixed pairwise tree, so the Gram's bits are
+        // the same at every pool width. (A split into one chunk per pool
+        // worker made them follow `RAYON_NUM_THREADS`, and a one-worker pool
+        // took a different, unchunked summation order from every wider one.)
+        let min_parallel_work = DENSE_OUTER_PARALLEL_FLOP_THRESHOLD.min(usize::MAX as u64) as usize;
+        let row_work = work.checked_div(n as u64).unwrap_or(0).max(1);
+        let Some(chunk_rows) = gam_linalg::parallel::row_reduction_chunk_rows(
+            n,
+            row_work.min(usize::MAX as u64) as usize,
+            p.saturating_mul(p),
+            min_parallel_work,
+        ) else {
             accumulate_outer_upper(&mut self.xtwx_dense, x_t, weights, 0..n);
             log::info!(
                 "[STAGE] PIRLS dense XᵀWX assembly (serial) n={} p={} flops~{} elapsed={:.3}s",
@@ -238,35 +239,32 @@ impl DenseOuterState {
                 xtwx_start.elapsed().as_secs_f64(),
             );
             return;
-        }
-
-        // Bounded thread allocation: exactly `n_threads` p×p buffers, one
-        // per worker, reused across calls.
-        if self.thread_buffers.len() != n_threads {
-            self.thread_buffers
-                .resize_with(n_threads, || Array2::<f64>::zeros((p, p)));
-        }
-        let chunk = n.div_ceil(n_threads);
-        self.thread_buffers
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(t, buf)| {
-                buf.fill(0.0);
-                let start = t * chunk;
-                let end = (start + chunk).min(n);
-                if start < end {
-                    accumulate_outer_upper(buf, x_t, weights, start..end);
-                }
-            });
-
-        // Reduce per-thread buffers into the cached output. The += preserves
-        // `xtwx_dense`'s storage; we never reallocate it.
-        for buf in &self.thread_buffers {
-            self.xtwx_dense += buf;
+        };
+        let n_chunks = gam_linalg::parallel::row_reduction_chunk_count(n, chunk_rows);
+        if let Some(sum) = gam_linalg::pairwise_reduce::par_deterministic_block_fold_by_work(
+            n_chunks,
+            chunk_rows,
+            |chunks| {
+                let mut partial = Array2::<f64>::zeros((p, p));
+                accumulate_outer_upper(
+                    &mut partial,
+                    x_t,
+                    weights,
+                    chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
+                );
+                partial
+            },
+            |mut acc, partial| {
+                acc += &partial;
+                acc
+            },
+        ) {
+            // The assign preserves `xtwx_dense`'s storage; it is never reallocated.
+            self.xtwx_dense.assign(&sum);
         }
         log::info!(
-            "[STAGE] PIRLS dense XᵀWX assembly (parallel, threads={}) n={} p={} flops~{} elapsed={:.3}s",
-            rayon::current_num_threads(),
+            "[STAGE] PIRLS dense XᵀWX assembly (parallel, chunks={}) n={} p={} flops~{} elapsed={:.3}s",
+            n_chunks,
             n,
             p,
             (n as u64).saturating_mul((p as u64).saturating_mul(p as u64)),

@@ -834,7 +834,6 @@ impl<'a> GamWorkingModel<'a> {
                     // weights.  Use Xᵀ(WX) exactly; never sqrt/clip.
                     PirlsWorkspace::add_dense_xtwx_signed(
                         weights,
-                        &mut workspace.weighted_x_chunk,
                         x_dense.as_ref(),
                         &mut workspace.hessian_buf,
                     );
@@ -843,7 +842,6 @@ impl<'a> GamWorkingModel<'a> {
                     // computes Xᵀ·diag(w)·X directly without sqrt/clip.
                     PirlsWorkspace::add_dense_xtwx_signed(
                         weights,
-                        &mut workspace.weighted_x_chunk,
                         x_dense.as_ref(),
                         &mut workspace.hessian_buf,
                     );
