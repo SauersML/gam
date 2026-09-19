@@ -123,6 +123,7 @@ def test_posterior_payloads_require_exact_fitted_link_identity(
         "ess": 2.0,
         "converged": True,
         "method": "laplace",
+        "acceptance_rate": None,
         "exact": False,
         "covariance_source": "conditional",
         "model_class": "standard",
