@@ -7,7 +7,7 @@ use super::cohort::{
     design_rows, expand_nodes,
 };
 use super::covariance::{
-    DirectionEvidence, DirectionProfile, empirical_bayes_ridge, quartic_moments,
+    DirectionEvidence, DirectionProfile, empirical_bayes_ridge, quartic_moments, ridge_profile,
 };
 use super::family::{
     DecisionIntegral, Directional, EventHistoryFamily, EventHistoryFit, EventHistorySpec,
@@ -3935,8 +3935,10 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         eigenvalue,
         information,
     };
-    let below = empirical_bayes_ridge(&[quartic(0.9 * threshold * information.sqrt())]);
-    let above = empirical_bayes_ridge(&[quartic(1.1 * threshold * information.sqrt())]);
+    let below = empirical_bayes_ridge(&[quartic(0.9 * threshold * information.sqrt())])
+        .expect("certified empirical-Bayes prior");
+    let above = empirical_bayes_ridge(&[quartic(1.1 * threshold * information.sqrt())])
+        .expect("certified empirical-Bayes prior");
     emit(&format!("[ridge] below {below:?} above {above:?}"));
     assert!(
         !below.accepted,
@@ -3949,7 +3951,7 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
     assert!(above.log_lambda.exp() < 1.1 * threshold * information.sqrt());
     assert!(above.gain > 0.0 && above.mode_scale > 0.0);
     // A strong direction lands near the Laplace-scale prior `λ = J / μ`.
-    let strong = empirical_bayes_ridge(&[quartic(400.0)]);
+    let strong = empirical_bayes_ridge(&[quartic(400.0)]).expect("certified empirical-Bayes prior");
     assert!(strong.accepted);
     assert!(
         (strong.log_lambda - (information / 400.0).ln()).abs() < 0.2,
@@ -3961,7 +3963,8 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         strong.gain
     );
     // No positive direction: no finite prior raises the evidence.
-    let none = empirical_bayes_ridge(&[quartic(-5.0), quartic(-40.0)]);
+    let none = empirical_bayes_ridge(&[quartic(-5.0), quartic(-40.0)])
+        .expect("certified empirical-Bayes prior");
     assert!(!none.accepted && none.log_lambda.is_infinite() && none.gain == 0.0);
     // Other directions charge their Occam factor: the same strong direction
     // beside three strongly negative ones is still accepted, and a marginal
@@ -3971,13 +3974,15 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         quartic(-300.0),
         quartic(-300.0),
         quartic(-300.0),
-    ]);
+    ])
+    .expect("certified empirical-Bayes prior");
     assert!(beside.accepted);
     let marginal = empirical_bayes_ridge(&[
         quartic(1.1 * threshold * information.sqrt()),
         quartic(-300.0),
         quartic(-300.0),
-    ]);
+    ])
+    .expect("certified empirical-Bayes prior");
     emit(&format!("[ridge] marginal beside negatives {marginal:?}"));
     assert!(!marginal.accepted);
 
@@ -4004,7 +4009,7 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         values,
         slopes,
     });
-    let from_profile = empirical_bayes_ridge(&[exact]);
+    let from_profile = empirical_bayes_ridge(&[exact]).expect("certified empirical-Bayes prior");
     emit(&format!(
         "[ridge] quartic {strong:?} profile {from_profile:?}"
     ));
@@ -4015,6 +4020,208 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
     );
     assert!((from_profile.gain - strong.gain).abs() < 1e-2 * strong.gain);
     assert!((from_profile.mode_scale - strong.mode_scale).abs() < 1e-3);
+}
+
+/// Every empirical-Bayes prior is either a stationary point `opt` certifies
+/// on the exact profile, with a positive gain, or the refusal `λ = ∞` with
+/// no gain. A positive first direction beside negative ones whose Occam
+/// factors outweigh it has its infimum at `λ → ∞`: the hand-rolled secant
+/// this replaced stopped at a finite `ρ` there once the slope fell under a
+/// seed-relative tolerance and reported that finite prior with a negative
+/// gain. A profile whose value carries more rounding than that tolerance
+/// (a small minimum among large channel magnitudes) must still certify.
+#[test]
+fn the_empirical_bayes_prior_is_a_certified_minimum_or_a_refusal() {
+    let quartic = |eigenvalue: f64, information: f64| DirectionEvidence::Quartic {
+        eigenvalue,
+        information,
+    };
+    let assert_certified_or_refused = |directions: &[DirectionEvidence]| {
+        let ridge = empirical_bayes_ridge(directions).unwrap_or_else(|error| {
+            panic!("{directions:?} has no certified empirical-Bayes prior: {error}")
+        });
+        if ridge.log_lambda.is_infinite() {
+            assert!(
+                ridge.log_lambda > 0.0 && ridge.gain == 0.0 && !ridge.accepted,
+                "{directions:?}: a refusal is λ = ∞ with no gain, got {ridge:?}"
+            );
+            return ridge;
+        }
+        let (sample, _) = ridge_profile(directions, ridge.log_lambda);
+        let verdict = opt::newton_decrement_verdict(
+            sample
+                .hessian
+                .as_ref()
+                .expect("the profile has an exact curvature"),
+            &sample.gradient,
+            None,
+            sample
+                .decrement_bands
+                .as_ref()
+                .expect("the profile carries its rounding bands"),
+        );
+        assert!(
+            verdict.is_certified(),
+            "{directions:?}: the prior {ridge:?} is not certified stationary: {verdict:?}"
+        );
+        assert!(
+            ridge.gain > 0.0 && ridge.gain == -sample.value,
+            "{directions:?}: a finite prior buys evidence, got {ridge:?}"
+        );
+        ridge
+    };
+
+    let outweighed = assert_certified_or_refused(&[
+        quartic(0.087_776_022_525_470_23, 0.071_663_948_857_696_47),
+        quartic(-42.451_280_621_543_155, 24.034_589_866_078_31),
+        quartic(-27.985_945_809_076_46, 0.280_927_402_614_955),
+        quartic(-309.233_908_949_846_35, 1_158.957_268_798_450_5),
+    ]);
+    assert!(outweighed.log_lambda.is_infinite(), "{outweighed:?}");
+
+    // The minimum `c ≈ −0.904` sits among channels of magnitude about 7.5,
+    // so the value's rounding exceeds `√ε` of the seed's slope scale.
+    let resolved = assert_certified_or_refused(&[
+        quartic(43.258, 73.916),
+        quartic(-404.07, 8.53),
+        quartic(-37.0, 1.56),
+        quartic(-0.1265, 1.18e-4),
+        quartic(-2.64, 0.163),
+    ]);
+    assert!(
+        resolved.accepted && resolved.log_lambda.is_finite(),
+        "{resolved:?}"
+    );
+
+    // A deterministic sweep over strengths, informations and ranks.
+    let mut state: u64 = 7;
+    let mut uniform = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let (mut certified, mut refused) = (0usize, 0usize);
+    for _ in 0..3000 {
+        let rank = 1 + (uniform() * 5.0) as usize;
+        let directions: Vec<DirectionEvidence> = (0..rank)
+            .map(|i| {
+                let information = 10f64.powf(uniform() * 8.0 - 4.0);
+                let strength = if i == 0 {
+                    uniform() * 6.0
+                } else {
+                    uniform() * 12.0 - 10.0
+                };
+                quartic(
+                    strength * information.sqrt() * 10f64.powf(uniform() * 2.0),
+                    information,
+                )
+            })
+            .collect();
+        if assert_certified_or_refused(&directions)
+            .log_lambda
+            .is_infinite()
+        {
+            refused += 1;
+        } else {
+            certified += 1;
+        }
+    }
+    emit(&format!(
+        "[ridge] sweep certified {certified} refused {refused}"
+    ));
+    assert!(certified > 0 && refused > 0);
+}
+
+/// A sampled profile's evidence tends to the current rank's `c = 0` as the
+/// prior pins the loading to zero, however coarse its sampling. Its
+/// likelihood integral is a trapezoidal rule of fixed spacing `h`; once the
+/// prior's width `λ^{−1/2}` falls below `h` that rule collapses onto the
+/// node at zero, and the prior's normaliser must be formed by the same rule
+/// or the ratio reads `c ≈ −½ ln(λh²/2π)`, falling without bound: the
+/// search then ran to `ρ → ∞` and ended at the trust region's floor, so a
+/// fit with such a proposal failed instead of refusing the atom. The
+/// derivatives are the exact ones of that value, tail included.
+#[test]
+fn a_sampled_profile_normalises_its_prior_by_its_own_rule() {
+    let profile = |mu: f64, j: f64, per_mode: f64, reach: f64| {
+        let mode = (mu / j).sqrt();
+        let step = mode / per_mode;
+        let (mut points, mut values, mut slopes) = (vec![0.0], vec![0.0], vec![0.0]);
+        let mut t = 0.0;
+        while t < reach * mode {
+            t += step;
+            points.push(t);
+            values.push(0.5 * mu * t * t - 0.25 * j * t * t * t * t);
+            slopes.push(mu * t - j * t * t * t);
+        }
+        DirectionEvidence::Sampled(DirectionProfile {
+            points,
+            values,
+            slopes,
+        })
+    };
+    let information: f64 = 100.0;
+    let gamma_quarter = 3.625_609_908_221_908_3_f64;
+    let gamma_three_quarters = 1.225_416_702_465_177_6_f64;
+    let threshold = gamma_quarter / (2.0 * gamma_three_quarters) * information.sqrt();
+    for (mu, per_mode, reach) in [
+        (400.0, 1.0, 2.0),
+        (400.0, 0.25, 2.0),
+        (1.1 * threshold, 1.0, 3.0),
+        (0.9 * threshold, 0.5, 3.0),
+        (2.0, 1.0, 6.0),
+    ] {
+        let directions = [
+            profile(mu, information, per_mode, reach),
+            DirectionEvidence::Quartic {
+                eigenvalue: -30.0,
+                information: 5.0,
+            },
+        ];
+        // The limit: at a prior far narrower than the spacing the value is
+        // within its own rounding of zero, not tens of nats below it.
+        let (pinned, _) = ridge_profile(&directions[..1], 80.0);
+        let band = pinned.decrement_bands.as_ref().expect("bands").objective;
+        assert!(
+            pinned.value.abs() <= band,
+            "mu {mu}: c(ρ = 80) = {} outside its band {band}",
+            pinned.value
+        );
+        // The slope and curvature are the value's.
+        for rho in [-4.0, 0.0, 3.0, 8.0, 14.0] {
+            let at = |r: f64| ridge_profile(&directions, r).0;
+            let step = 1e-5;
+            let (lo, mid, hi) = (at(rho - step), at(rho), at(rho + step));
+            let slope = (hi.value - lo.value) / (2.0 * step);
+            let curvature = (hi.gradient[0] - lo.gradient[0]) / (2.0 * step);
+            let scale = 1.0 + mid.gradient[0].abs();
+            assert!(
+                (slope - mid.gradient[0]).abs() < 1e-5 * scale,
+                "mu {mu} ρ {rho}: slope {} vs difference {slope}",
+                mid.gradient[0]
+            );
+            let hessian = mid.hessian.as_ref().expect("curvature")[[0, 0]];
+            assert!(
+                (curvature - hessian).abs() < 1e-5 * (1.0 + hessian.abs()),
+                "mu {mu} ρ {rho}: curvature {hessian} vs difference {curvature}"
+            );
+        }
+        // And the search ends at a certified prior or refuses the atom.
+        for directions in [&directions[..1], &directions[..]] {
+            let ridge = empirical_bayes_ridge(directions).unwrap_or_else(|error| {
+                panic!("mu {mu} per_mode {per_mode}: no certified prior: {error}")
+            });
+            emit(&format!(
+                "[ridge] sampled mu {mu} per_mode {per_mode} ranks {} {ridge:?}",
+                directions.len()
+            ));
+            assert!(
+                ridge.log_lambda.is_infinite() == (ridge.gain == 0.0),
+                "{ridge:?}"
+            );
+        }
+    }
 }
 
 #[test]

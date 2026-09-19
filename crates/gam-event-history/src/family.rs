@@ -3018,7 +3018,7 @@ fn propose_atom(
                 Err(error) => return Err(error),
             }
         }
-        let refined = empirical_bayes_ridge(&directions);
+        let refined = empirical_bayes_ridge(&directions)?;
         let lambda = refined.log_lambda.exp();
         let unresolved: Vec<usize> = directions
             .iter()

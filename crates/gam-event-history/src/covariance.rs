@@ -25,7 +25,13 @@
 use super::cohort::EventHistoryError;
 use faer::Side;
 use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+use gam_math::probability::erfcx_nonnegative;
+use gam_solve::exact_jet_objective::certified_newton_minimum;
 use ndarray::{Array1, Array2};
+use opt::{
+    Bfgs, Bounds, DecrementBands, FirstOrderSample, FusedObjective, GradientTolerance,
+    ObjectiveEvalError, SecondOrderSample, accumulation_growth,
+};
 
 /// `C(Δ) = Σ_k C_k e^{−r_k |Δ|}` for one covariance share `C_k = E[a_k a_kᵀ]`
 /// per atom and rates in the data's time unit.
@@ -97,8 +103,16 @@ pub(crate) struct SubjectResiduals {
 /// forward–backward recursion of the exponential kernel.
 fn kernel_sums(times: &[f64], x: &[f64], width: usize, rate: f64) -> [Vec<f64>; 3] {
     let n = times.len();
-    let mut forward = [vec![0.0; n * width], vec![0.0; n * width], vec![0.0; n * width]];
-    let mut backward = [vec![0.0; n * width], vec![0.0; n * width], vec![0.0; n * width]];
+    let mut forward = [
+        vec![0.0; n * width],
+        vec![0.0; n * width],
+        vec![0.0; n * width],
+    ];
+    let mut backward = [
+        vec![0.0; n * width],
+        vec![0.0; n * width],
+        vec![0.0; n * width],
+    ];
     for i in 0..n {
         let (decay, delta) = if i == 0 {
             (0.0, 0.0)
@@ -222,7 +236,11 @@ fn direction_information(
     for subject in subjects {
         let n = subject.times.len();
         let kappa: Vec<f64> = (0..n)
-            .map(|node| (0..marks).map(|d| v[d] * v[d] * subject.curvatures[node * marks + d]).sum())
+            .map(|node| {
+                (0..marks)
+                    .map(|d| v[d] * v[d] * subject.curvatures[node * marks + d])
+                    .sum()
+            })
             .collect();
         let sums = kernel_sums(&subject.times, &kappa, 1, 2.0 * rate);
         for node in 0..n {
@@ -258,6 +276,96 @@ fn direction_information(
     (information, information_slope)
 }
 
+/// [`quartic_direction_moments`] as `(ln ∫, E[t²], E[t⁴])`.
+#[cfg(test)]
+pub(crate) fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f64, f64) {
+    let moments = quartic_direction_moments(mu, information, lambda);
+    (moments.log_integral, moments.second, moments.fourth)
+}
+
+/// The moments of one direction's penalised integrand and the channels
+/// their rounding is charged on.
+///
+/// Each channel is a dimensionless multiple of the unit accumulation growth
+/// `γ_m` the caller fixes once it knows the longest accumulation `m`: a
+/// sampled exponent `h_i` carries an absolute rounding of `γ_m · C_i`, with
+/// `C_i` the sum of the magnitudes of the terms it is formed from, so its
+/// weight `exp(h_i − shift)` carries a relative rounding of
+/// `γ_m · (C_i + |shift| + 1)`, and a ratio of weighted sums carries the
+/// weighted means of those relative roundings of its numerator and
+/// denominator plus the sums' own growth.
+struct DirectionMoments {
+    log_integral: f64,
+    second: f64,
+    fourth: f64,
+    /// The maximiser of the penalised integrand on `t ≥ 0`.
+    mode: f64,
+    /// Terms in the quadrature sums.
+    terms: usize,
+    /// Absolute rounding of `log_integral`, in units of `γ_m`.
+    log_integral_channel: f64,
+    /// Relative rounding of `E[t²]`, in units of `γ_m`.
+    second_channel: f64,
+    /// Relative rounding of `E[t⁴]`, in units of `γ_m`.
+    fourth_channel: f64,
+}
+
+/// The part of an integral beyond a rule's last sample, formed in closed
+/// form: `∫ exp(h(t) − shift) tⁿ dt` for `n = 0, 2, 4` in units of the rule's
+/// spacing, and the relative rounding they carry in units of `γ_m`.
+#[derive(Clone, Copy, Default)]
+struct AnalyticTail {
+    mass: f64,
+    second: f64,
+    fourth: f64,
+    channel: f64,
+}
+
+/// Trapezoidal sums over `(t, h(t), C(t), weight)` samples of a penalised
+/// log integrand with maximum `shift` and spacing `spacing`, where `C(t)` is
+/// the magnitude channel of `h(t)` and `weight` the rule's multiplicity,
+/// plus the closed-form `tail` beyond the last sample.
+fn trapezoidal_moments(
+    samples: impl Iterator<Item = (f64, f64, f64, f64)>,
+    shift: f64,
+    spacing: f64,
+    mode: f64,
+    tail: AnalyticTail,
+) -> DirectionMoments {
+    let mut terms = 1usize;
+    let mut mass = tail.mass;
+    let mut second = tail.second;
+    let mut fourth = tail.fourth;
+    let mut mass_channel = tail.mass * tail.channel;
+    let mut second_channel = tail.second * tail.channel;
+    let mut fourth_channel = tail.fourth * tail.channel;
+    for (t, value, magnitude, multiplicity) in samples {
+        let weight = (value - shift).exp() * multiplicity;
+        let channel = magnitude + shift.abs() + 1.0;
+        let (t2, t4) = (t * t, t * t * t * t);
+        terms += 1;
+        mass += weight;
+        second += weight * t2;
+        fourth += weight * t4;
+        mass_channel += weight * channel;
+        second_channel += weight * t2 * channel;
+        fourth_channel += weight * t4 * channel;
+    }
+    let mass_relative = mass_channel / mass;
+    let ratio = |sum: f64, channel: f64| if sum > 0.0 { channel / sum } else { 0.0 };
+    let log_integral = shift + (mass * spacing).ln();
+    DirectionMoments {
+        log_integral,
+        second: second / mass,
+        fourth: fourth / mass,
+        mode,
+        terms,
+        log_integral_channel: shift.abs() + log_integral.abs() + 2.0 + mass_relative,
+        second_channel: 2.0 + mass_relative + ratio(second, second_channel),
+        fourth_channel: 2.0 + mass_relative + ratio(fourth, fourth_channel),
+    }
+}
+
 /// The exact one-dimensional marginal of the quartic evidence model along
 /// one direction: `ln ∫ exp(½ a t² − ¼ J t⁴) dt` with `a = μ − λ`, and the
 /// moments `E[t²]`, `E[t⁴]` of `t` under that density.
@@ -269,10 +377,13 @@ fn direction_information(
 /// far below roundoff, and it extends to where the integrand has fallen
 /// sixty nats below its peak, which is `e⁻⁶⁰` of it. The sums are formed in
 /// log space.
-pub(crate) fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f64, f64) {
+fn quartic_direction_moments(mu: f64, information: f64, lambda: f64) -> DirectionMoments {
     let a = mu - lambda;
     let j = information;
     let g = |t: f64| 0.5 * a * t * t - 0.25 * j * t * t * t * t;
+    // `a = μ − λ` is rounded on `|μ| + λ`.
+    let g_magnitude =
+        |t: f64| 0.5 * (mu.abs() + lambda.abs()) * t * t + 0.25 * j.abs() * t * t * t * t;
     let (peak, g_peak) = if a > 0.0 {
         ((a / j).sqrt(), a * a / (4.0 * j))
     } else {
@@ -293,17 +404,34 @@ pub(crate) fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f
         shift = shift.max(value);
         values.push((t, value));
     }
-    let mut mass = 0.0;
-    let mut second = 0.0;
-    let mut fourth = 0.0;
-    for &(t, value) in &values {
-        let weight = (value - shift).exp();
-        mass += weight;
-        second += weight * t * t;
-        fourth += weight * t * t * t * t;
+    let mode = if a > 0.0 { peak } else { 0.0 };
+    trapezoidal_moments(
+        values
+            .into_iter()
+            .map(|(t, value)| (t, value, g_magnitude(t), 1.0)),
+        shift,
+        spacing,
+        mode,
+        AnalyticTail::default(),
+    )
+}
+
+/// The Gaussian prior's normaliser `ln ∫ exp(−½λt²) dt` over the whole line
+/// and its moments `E[t²] = 1/λ`, `E[t⁴] = 3/λ²`, in closed form: the
+/// quartic rule resolves the prior's own width, so it integrates the prior
+/// exactly to roundoff and the closed form is what that rule reads.
+fn gaussian_prior_moments(lambda: f64) -> DirectionMoments {
+    let log_integral = 0.5 * (2.0 * std::f64::consts::PI / lambda).ln();
+    DirectionMoments {
+        log_integral,
+        second: 1.0 / lambda,
+        fourth: 3.0 / (lambda * lambda),
+        mode: 0.0,
+        terms: 1,
+        log_integral_channel: log_integral.abs() + 1.0,
+        second_channel: 1.0,
+        fourth_channel: 2.0,
     }
-    let log_integral = shift + (mass * spacing).ln();
-    (log_integral, second / mass, fourth / mass)
 }
 
 /// A sampled profile of the marginal log-likelihood along one direction of
@@ -326,8 +454,9 @@ pub(crate) struct DirectionProfile {
 const PROFILE_SUBPOINTS: usize = 64;
 
 impl DirectionProfile {
-    /// Hermite cubic within the sampled interval.
-    fn evaluate(&self, t: f64) -> f64 {
+    /// Hermite cubic within the sampled interval, with the sum of its terms'
+    /// magnitudes, the channel its rounding is charged on.
+    fn evaluate(&self, t: f64) -> (f64, f64) {
         let n = self.points.len();
         assert!(n >= 2 && t >= 0.0 && t <= self.points[n - 1]);
         let i = match self.points.iter().position(|&p| t < p) {
@@ -345,35 +474,40 @@ impl DirectionProfile {
             -2.0 * s3 + 3.0 * s2,
             s3 - s2,
         );
-        h00 * self.values[i]
-            + h10 * h * self.slopes[i]
-            + h01 * self.values[i + 1]
-            + h11 * h * self.slopes[i + 1]
+        let terms = [
+            h00 * self.values[i],
+            h10 * h * self.slopes[i],
+            h01 * self.values[i + 1],
+            h11 * h * self.slopes[i + 1],
+        ];
+        (
+            terms.iter().sum(),
+            terms.iter().map(|term| term.abs()).sum(),
+        )
     }
 
     /// The penalised log integrand `g(t) − ½λt²` sampled on the interpolant's
-    /// subpoints, with its maximum, its maximiser and the sample spacing.
-    fn penalised_samples(&self, lambda: f64) -> (Vec<(f64, f64)>, f64, f64, f64) {
+    /// subpoints as `(t, value, magnitude)`, with its maximum, its maximiser
+    /// and the sample spacing.
+    fn penalised_samples(&self, lambda: f64) -> (Vec<(f64, f64, f64)>, f64, f64, f64) {
         let last = self.points[self.points.len() - 1];
         let steps = (self.points.len() - 1) * PROFILE_SUBPOINTS;
         let spacing = last / steps as f64;
         let mut shift = f64::NEG_INFINITY;
         let mut mode = 0.0;
-        let mut samples: Vec<(f64, f64)> = Vec::with_capacity(steps + 1);
+        let mut samples: Vec<(f64, f64, f64)> = Vec::with_capacity(steps + 1);
         for k in 0..=steps {
             // `steps · (last / steps)` can round one ulp above `last`, outside
             // the sampled interval; the upper endpoint is the last sample itself.
-            let t = if k == steps {
-                last
-            } else {
-                k as f64 * spacing
-            };
-            let value = self.evaluate(t) - 0.5 * lambda * t * t;
+            let t = if k == steps { last } else { k as f64 * spacing };
+            let (interpolant, magnitude) = self.evaluate(t);
+            let penalty = 0.5 * lambda * t * t;
+            let value = interpolant - penalty;
             if value > shift {
                 shift = value;
                 mode = t;
             }
-            samples.push((t, value));
+            samples.push((t, value, magnitude + penalty.abs()));
         }
         (samples, shift, mode, spacing)
     }
@@ -388,7 +522,7 @@ impl DirectionProfile {
         let steps = samples.len() - 1;
         let mut mass = 0.0;
         let mut spread = 0.0;
-        for (k, &(t, value)) in samples.iter().enumerate() {
+        for (k, &(t, value, _)) in samples.iter().enumerate() {
             let weight = (value - shift).exp() * if k == 0 || k == steps { 1.0 } else { 2.0 };
             mass += weight;
             spread += weight * (t - mode) * (t - mode);
@@ -399,21 +533,78 @@ impl DirectionProfile {
     /// `ln ∫ exp(g(t) − ½λt²) dt` over the whole line and the moments
     /// `E[t²]`, `E[t⁴]` of `t` under that density, by the trapezoidal rule on
     /// the interpolant, plus the maximiser of `g(t) − ½λt²`.
-    fn moments(&self, lambda: f64) -> (f64, f64, f64, f64) {
+    fn moments(&self, lambda: f64) -> DirectionMoments {
         let (samples, shift, mode, spacing) = self.penalised_samples(lambda);
         let steps = samples.len() - 1;
-        let mut mass = 0.0;
-        let mut second = 0.0;
-        let mut fourth = 0.0;
-        for (k, &(t, value)) in samples.iter().enumerate() {
-            // Reflect the trapezoidal rule: both endpoints have half
-            // weight before reflection, including the finite upper endpoint.
-            let weight = (value - shift).exp() * if k == 0 || k == steps { 1.0 } else { 2.0 };
-            mass += weight;
-            second += weight * t * t;
-            fourth += weight * t * t * t * t;
-        }
-        (shift + (mass * spacing).ln(), second / mass, fourth / mass, mode)
+        // Reflect the trapezoidal rule: both endpoints have half weight
+        // before reflection, including the finite upper endpoint.
+        trapezoidal_moments(
+            samples
+                .into_iter()
+                .enumerate()
+                .map(|(k, (t, value, magnitude))| {
+                    let multiplicity = if k == 0 || k == steps { 1.0 } else { 2.0 };
+                    (t, value, magnitude, multiplicity)
+                }),
+            shift,
+            spacing,
+            mode,
+            AnalyticTail::default(),
+        )
+    }
+
+    /// The Gaussian prior's normaliser `ln ∫ exp(−½λt²) dt` over the whole
+    /// line and its moments `E[t²]`, `E[t⁴]`, by the same reflected
+    /// trapezoidal rule [`Self::moments`] integrates the likelihood with on
+    /// `[0, T]`, `T` the last sample, and in closed form beyond it.
+    ///
+    /// The prior must be normalised by the rule that integrates the
+    /// likelihood under it. Once the prior's width `λ^{−1/2}` falls below the
+    /// rule's spacing both integrals collapse onto the node at zero, where
+    /// `g(0) = 0`, so their ratio — the marginal likelihood — tends to one,
+    /// the current rank, as it must. Against the closed-form normaliser
+    /// `√(2π/λ)` the collapsed rule instead reads a marginal likelihood
+    /// growing like `√λ` without bound, and the evidence runs off to `λ → ∞`.
+    /// As the spacing goes to zero the two normalisers agree.
+    ///
+    /// Beyond `T` the tail `Iₙ = ∫_T^∞ tⁿ e^{−½λt²} dt` is
+    /// `I₀ = √(π/(2λ)) erfcx(T√(λ/2)) e^{−½λT²}` and
+    /// `Iₙ = T^{n−1} e^{−½λT²}/λ + (n−1)/λ · Iₙ₋₂`, a recurrence of positive
+    /// terms.
+    fn prior_moments(&self, lambda: f64) -> DirectionMoments {
+        let last = self.points[self.points.len() - 1];
+        let steps = (self.points.len() - 1) * PROFILE_SUBPOINTS;
+        let spacing = last / steps as f64;
+        let edge_penalty = 0.5 * lambda * last * last;
+        let edge = (-edge_penalty).exp();
+        let i0 = (0.5 * std::f64::consts::PI / lambda).sqrt()
+            * erfcx_nonnegative((0.5 * lambda).sqrt() * last)
+            * edge;
+        let i2 = last * edge / lambda + i0 / lambda;
+        let i4 = last * last * last * edge / lambda + 3.0 * i2 / lambda;
+        // Both reflected tails, in units of the spacing. `e^{−½λT²}` is
+        // rounded on its exponent, as a sample's weight is; the closed form
+        // adds the rounding of its seven operations, `erfcx`'s own three
+        // units (`< 5e-16`), and four per step of the recurrence.
+        let reflected = 2.0 / spacing;
+        let tail = AnalyticTail {
+            mass: reflected * i0,
+            second: reflected * i2,
+            fourth: reflected * i4,
+            channel: edge_penalty + 1.0 + 7.0 + 3.0 + 2.0 * 4.0,
+        };
+        trapezoidal_moments(
+            (0..=steps).map(|k| {
+                let t = if k == steps { last } else { k as f64 * spacing };
+                let penalty = 0.5 * lambda * t * t;
+                let multiplicity = if k == 0 || k == steps { 1.0 } else { 2.0 };
+                (t, -penalty, penalty, multiplicity)
+            }),
+            0.0,
+            spacing,
+            0.0,
+            tail,
+        )
     }
 }
 
@@ -430,22 +621,22 @@ pub(crate) enum DirectionEvidence {
 impl DirectionEvidence {
     /// `ln ∫ exp(g(t) − ½λt²) dt`, `E[t²]`, `E[t⁴]`, and the mode of
     /// `g(t) − ½λt²` on `t ≥ 0`.
-    fn moments(&self, lambda: f64) -> (f64, f64, f64, f64) {
+    fn moments(&self, lambda: f64) -> DirectionMoments {
         match self {
             Self::Quartic {
                 eigenvalue,
                 information,
-            } => {
-                let (log_integral, second, fourth) =
-                    quartic_moments(*eigenvalue, *information, lambda);
-                let mode = if *eigenvalue > lambda {
-                    ((eigenvalue - lambda) / information).sqrt()
-                } else {
-                    0.0
-                };
-                (log_integral, second, fourth, mode)
-            }
+            } => quartic_direction_moments(*eigenvalue, *information, lambda),
             Self::Sampled(profile) => profile.moments(lambda),
+        }
+    }
+
+    /// The prior's normaliser `ln ∫ exp(−½λt²) dt` and its moments, by the
+    /// rule [`Self::moments`] integrates the likelihood with.
+    fn prior_moments(&self, lambda: f64) -> DirectionMoments {
+        match self {
+            Self::Quartic { .. } => gaussian_prior_moments(lambda),
+            Self::Sampled(profile) => profile.prior_moments(lambda),
         }
     }
 
@@ -458,7 +649,7 @@ impl DirectionEvidence {
                 information,
             } => (*eigenvalue > 0.0 && *information > 0.0).then(|| information / eigenvalue),
             Self::Sampled(profile) => {
-                let (_, _, _, mode) = profile.moments(0.0);
+                let mode = profile.moments(0.0).mode;
                 (mode > 0.0).then(|| 1.0 / (mode * mode))
             }
         }
@@ -484,20 +675,94 @@ pub(crate) struct RidgeProfile {
     pub accepted: bool,
 }
 
+/// The ridge objective `c(ρ) = −Σ_i ln Z_i(e^ρ)` at `ρ` with its exact
+/// derivatives in `ρ` and their rounding bands, and the posterior mode of
+/// the first direction.
+///
+/// With `Z_i` the likelihood's integral against `exp(−½λt²)` and `P_i` the
+/// prior's normaliser by the same rule, each direction contributes
+/// `ln P_i − ln Z_i` to the value, `½λ(E_Z[t²] − E_P[t²])` to the slope and
+/// that slope plus `¼λ² (Var_P(t²) − Var_Z(t²))` to the curvature in `ρ`.
+/// Every channel is charged `γ_m` of its magnitude, with `m` the longest
+/// accumulation: a direction's quadrature sums followed by the sum over
+/// directions.
+pub(crate) fn ridge_profile(
+    directions: &[DirectionEvidence],
+    rho: f64,
+) -> (SecondOrderSample, f64) {
+    let lambda = rho.exp();
+    let mut value = 0.0;
+    let mut d_rho = 0.0;
+    let mut d2_rho = 0.0;
+    let mut top_mode = 0.0;
+    let mut terms = 0usize;
+    let mut value_channel = 0.0;
+    let mut slope_channel = 0.0;
+    let mut curvature_channel = 0.0;
+    for (i, direction) in directions.iter().enumerate() {
+        let likelihood = direction.moments(lambda);
+        let prior = direction.prior_moments(lambda);
+        if i == 0 {
+            top_mode = likelihood.mode;
+        }
+        let spread =
+            |moments: &DirectionMoments| moments.fourth - moments.second * moments.second;
+        let slope = 0.5 * lambda * (likelihood.second - prior.second);
+        value += prior.log_integral - likelihood.log_integral;
+        d_rho += slope;
+        d2_rho += slope + 0.25 * lambda * lambda * (spread(&prior) - spread(&likelihood));
+        terms = terms.max(likelihood.terms).max(prior.terms);
+        value_channel += likelihood.log_integral_channel + prior.log_integral_channel + 1.0;
+        let slope_magnitude = |moments: &DirectionMoments| {
+            0.5 * lambda * moments.second * (moments.second_channel + 2.0)
+        };
+        let spread_magnitude = |moments: &DirectionMoments| {
+            0.25 * lambda
+                * lambda
+                * (moments.fourth * (moments.fourth_channel + 2.0)
+                    + moments.second * moments.second * (2.0 * moments.second_channel + 2.0))
+        };
+        let slope_channel_i = slope_magnitude(&likelihood) + slope_magnitude(&prior);
+        slope_channel += slope_channel_i;
+        curvature_channel +=
+            slope_channel_i + spread_magnitude(&likelihood) + spread_magnitude(&prior);
+    }
+    let growth = accumulation_growth(terms + directions.len());
+    let sample = SecondOrderSample {
+        value,
+        gradient: Array1::from_elem(1, d_rho),
+        hessian: Some(Array2::from_elem((1, 1), d2_rho)),
+        decrement_bands: Some(DecrementBands {
+            objective: growth * value_channel,
+            gradient: Array1::from_elem(1, growth * slope_channel),
+            hessian: growth * curvature_channel,
+        }),
+    };
+    (sample, top_mode)
+}
+
 /// The empirical-Bayes prior for a loading vector from the evidence along
 /// the eigen-directions of the covariance score: the first direction's
 /// integrand is the quartic or sampled profile carried by
 /// [`DirectionEvidence`]. This factorisation is a proposal approximation.
 ///
 /// The negative log marginal likelihood
-/// `c(λ) = −Σ_i ln Z_i(λ)` is `+∞` at `λ → 0` (a prior too loose to
-/// normalise) and tends to zero as `λ → ∞` (the atom pinned to zero, the
-/// current rank). It is minimised over `ρ = ln λ` by a safeguarded Newton
-/// on its exact derivatives, `dc/dλ = Σ_i [½ E_i[t²] − 1/(2λ)]` and
-/// `d²c/dλ² = Σ_i [1/(2λ²) − ¼ Var_i(t²)]`, from the Laplace-scale start of
-/// the first direction. A profile whose first direction has its maximiser
-/// at zero has no finite minimiser and is refused without a search.
-pub(crate) fn empirical_bayes_ridge(directions: &[DirectionEvidence]) -> RidgeProfile {
+/// `c(λ) = Σ_i [ln P_i(λ) − ln Z_i(λ)]`, with `P_i` the prior's normaliser
+/// by the rule that forms `Z_i` (see [`DirectionProfile::prior_moments`]), is
+/// `+∞` at `λ → 0` (a prior too loose to normalise) and tends to zero as
+/// `λ → ∞` (the atom pinned to zero, the current rank). It is minimised over
+/// `ρ = ln λ` by `opt`'s Newton trust region on its exact derivatives,
+/// `dc/dλ = Σ_i ½ (E_Z[t²] − E_P[t²])` and
+/// `d²c/dλ² = Σ_i ¼ (Var_P(t²) − Var_Z(t²))`, from the Laplace-scale start of
+/// the first direction, and only a certified stationary point is read: the
+/// Newton decrement there lies inside the rounding band of the value itself,
+/// charged on the magnitudes the quadrature sums accumulate. A profile whose
+/// first direction has its maximiser at zero has no finite minimiser and is
+/// refused without a search, and so is one whose minimum does not lie below
+/// the current rank's `c = 0`: no finite prior raises the evidence.
+pub(crate) fn empirical_bayes_ridge(
+    directions: &[DirectionEvidence],
+) -> Result<RidgeProfile, EventHistoryError> {
     let refused = RidgeProfile {
         log_lambda: f64::INFINITY,
         gain: 0.0,
@@ -505,66 +770,30 @@ pub(crate) fn empirical_bayes_ridge(directions: &[DirectionEvidence]) -> RidgePr
         accepted: false,
     };
     let Some(start) = directions.first().and_then(DirectionEvidence::scale_start) else {
-        return refused;
+        return Ok(refused);
     };
-    let profile = |rho: f64| -> (f64, f64, f64, f64) {
-        let lambda = rho.exp();
-        let mut value = 0.0;
-        let mut d_lambda = 0.0;
-        let mut d2_lambda = 0.0;
-        let mut top_mode = 0.0;
-        for (i, direction) in directions.iter().enumerate() {
-            let (log_integral, second, fourth, mode) = direction.moments(lambda);
-            if i == 0 {
-                top_mode = mode;
-            }
-            value += -0.5 * (lambda / (2.0 * std::f64::consts::PI)).ln() - log_integral;
-            d_lambda += 0.5 * second - 0.5 / lambda;
-            d2_lambda += 0.5 / (lambda * lambda) - 0.25 * (fourth - second * second);
-        }
-        let d_rho = lambda * d_lambda;
-        let d2_rho = lambda * d_lambda + lambda * lambda * d2_lambda;
-        (value, d_rho, d2_rho, top_mode)
-    };
-    let mut rho = start.ln();
-    let (mut value, mut slope, mut curvature, mut mode_scale) = profile(rho);
-    for _ in 0..200 {
-        let tolerance = f64::EPSILON.sqrt() * (1.0 + value.abs());
-        if !(slope.abs() > tolerance) {
-            break;
-        }
-        let direction = if curvature > 0.0 {
-            (-slope / curvature).clamp(-2.0, 2.0)
-        } else {
-            -slope.signum()
-        };
-        let mut t = 1.0;
-        let mut moved = false;
-        for _ in 0..60 {
-            let trial = rho + t * direction;
-            let (trial_value, trial_slope, trial_curvature, trial_mode) = profile(trial);
-            if trial_value < value {
-                rho = trial;
-                value = trial_value;
-                slope = trial_slope;
-                curvature = trial_curvature;
-                mode_scale = trial_mode;
-                moved = true;
-                break;
-            }
-            t *= 0.5;
-        }
-        if !moved {
-            break;
-        }
+    let solution = certified_newton_minimum(
+        Array1::from_elem(1, start.ln()),
+        None,
+        None,
+        |point: &Array1<f64>| Ok(ridge_profile(directions, point[0]).0),
+    )
+    .map_err(|error| EventHistoryError::NumericalFailure {
+        reason: format!("the empirical-Bayes loading prior has no certified optimum: {error}"),
+    })?;
+    let rho = solution.final_point[0];
+    let (sample, mode_scale) = ridge_profile(directions, rho);
+    let value = sample.value;
+    if !(value < 0.0) {
+        return Ok(refused);
     }
-    let accepted = value < 0.0 && mode_scale > 0.0;
-    RidgeProfile {
+    let accepted = mode_scale > 0.0;
+    Ok(RidgeProfile {
         log_lambda: rho,
         gain: -value,
         mode_scale: if accepted { mode_scale } else { 0.0 },
         accepted,
-    }
+    })
 }
 
 /// The atom the covariance score proposes and the evidence's verdict on it.
@@ -605,7 +834,6 @@ impl NewAtom {
         self.at_lower_limit || self.at_upper_limit
     }
 }
-
 
 /// The band `(ν_min, ν_max)` of dimensionless rates `ν = rate · T̄` a set of
 /// breakpoints resolves — the fit passes the cohort's own level-0 cell
@@ -665,7 +893,7 @@ struct GainPoint {
 /// Propose the next atom: at every log-rate the top eigenpair `(μ, v)` of
 /// `M(ρ)` is the direction with the largest second-order evidence slope in
 /// its variance, and the standardised gain `μ² / (4 J)` is maximised over
-/// `ρ` by a secant Newton on its exact derivative (Hellmann–Feynman for
+/// `ρ` by `opt`'s bounded quasi-Newton on its exact derivative (Hellmann–Feynman for
 /// `μ`, first-order eigenvector perturbation for `v`, the kernel recursion
 /// for `J`). At the rate found, the empirical-Bayes prior of the loadings is
 /// computed from the score's whole spectrum and decides the atom. `None`
@@ -711,7 +939,8 @@ pub(crate) fn best_new_atom(
         // Signed gain μ|μ| / (4J): odd in μ, so the ascent also moves a
         // negative top eigenvalue toward where it turns positive.
         let gain = top * top.abs() / (4.0 * information);
-        let slope = (2.0 * top.abs() * top_slope * information - top * top.abs() * information_slope)
+        let slope = (2.0 * top.abs() * top_slope * information
+            - top * top.abs() * information_slope)
             / (4.0 * information * information);
         Ok(GainPoint {
             rho,
@@ -727,40 +956,46 @@ pub(crate) fn best_new_atom(
     if !(lower.is_finite() && upper.is_finite() && upper > lower) {
         return Ok(None);
     }
-    // Start at the cohort's own time scale (rate = 1 / T̄).
-    let mut point = evaluate(0.0_f64.clamp(lower, upper))?;
-    let mut curvature: Option<f64> = None;
-    for _ in 0..100 {
-        let tolerance = f64::EPSILON.sqrt() * (1.0 + point.gain.abs());
-        if !(point.slope.abs() > tolerance) {
-            break;
-        }
-        // Secant Newton on the exact slope; a unit step in log-rate when no
-        // negative curvature is known yet, never more than two per step.
-        let direction = match curvature {
-            Some(h) if h < 0.0 => (-point.slope / h).clamp(-2.0, 2.0),
-            _ => point.slope.signum(),
-        };
-        let mut t = 1.0;
-        let mut moved = false;
-        for _ in 0..60 {
-            let target = (point.rho + t * direction).clamp(lower, upper);
-            if target == point.rho {
-                break;
-            }
-            let trial = evaluate(target)?;
-            if trial.gain > point.gain {
-                curvature = Some((trial.slope - point.slope) / (trial.rho - point.rho));
-                point = trial;
-                moved = true;
-                break;
-            }
-            t *= 0.5;
-        }
-        if !moved {
-            break;
-        }
+    // Maximise the gain on the resolvable band from the cohort's own time
+    // scale (rate = 1 / T̄), with `opt`'s bounded quasi-Newton on the exact
+    // slope. Only a certified projected-stationary rate is read: the slope
+    // under `√ε` relative to the seed's gain, the resolution the plateau
+    // tests below compare against.
+    let seed = 0.0_f64.clamp(lower, upper);
+    let resolution = f64::EPSILON.sqrt();
+    let bounds = Bounds::new(
+        Array1::from_elem(1, lower),
+        Array1::from_elem(1, upper),
+        resolution,
+    )
+    .map_err(|error| EventHistoryError::NumericalFailure {
+        reason: format!("the resolvable rate band is not a box: {error}"),
+    })?;
+    let objective = FusedObjective::new(|point: &Array1<f64>| {
+        evaluate(point[0])
+            .map(|trial| FirstOrderSample {
+                value: -trial.gain,
+                gradient: Array1::from_elem(1, -trial.slope),
+            })
+            .map_err(|error| ObjectiveEvalError::fatal(error.to_string()))
+    });
+    let solution = Bfgs::new(Array1::from_elem(1, seed), objective)
+        .with_bounds(bounds)
+        .with_gradient_tolerance(GradientTolerance::relative_to_cost(resolution))
+        .run()
+        .map_err(|error| EventHistoryError::NumericalFailure {
+            reason: format!("the covariance-score rate search did not converge: {error}"),
+        })?;
+    if !solution.status().is_success() {
+        return Err(EventHistoryError::NumericalFailure {
+            reason: format!(
+                "the covariance-score rate search stopped uncertified ({}) at log-rate {}",
+                solution.termination.label(),
+                solution.final_point[0],
+            ),
+        });
     }
+    let point = evaluate(solution.final_point[0])?;
     let rate = point.rho.exp() / time_scale;
     // The information along every eigen-direction of the score at the rate
     // found: the quartic model of the evidence is read on the whole spectrum,
@@ -773,20 +1008,19 @@ pub(crate) fn best_new_atom(
             (point.values[i], information)
         })
         .collect();
-    let directions: Vec<DirectionEvidence> = std::iter::once(DirectionEvidence::Quartic {
-        eigenvalue: point.top,
-        information: point.information,
-    })
-    .chain(
-        other_directions
-            .iter()
-            .map(|&(eigenvalue, information)| DirectionEvidence::Quartic {
+    let directions: Vec<DirectionEvidence> =
+        std::iter::once(DirectionEvidence::Quartic {
+            eigenvalue: point.top,
+            information: point.information,
+        })
+        .chain(other_directions.iter().map(|&(eigenvalue, information)| {
+            DirectionEvidence::Quartic {
                 eigenvalue,
                 information,
-            }),
-    )
-    .collect();
-    let ridge = empirical_bayes_ridge(&directions);
+            }
+        }))
+        .collect();
+    let ridge = empirical_bayes_ridge(&directions)?;
     let standardised_gain = if point.information > 0.0 {
         point.top * point.top.abs() / (4.0 * point.information)
     } else {
@@ -817,7 +1051,11 @@ pub(crate) fn best_new_atom(
     let at_lower_limit = point.rho <= lower + margin(lower) || flat_slower;
     let at_upper_limit = point.rho >= upper - margin(upper) || (flat_faster && !flat_slower);
     Ok(Some(NewAtom {
-        log_rate: if at_lower_limit { f64::NEG_INFINITY } else { point.rho },
+        log_rate: if at_lower_limit {
+            f64::NEG_INFINITY
+        } else {
+            point.rho
+        },
         direction,
         loading,
         eigenvalue: point.top,
