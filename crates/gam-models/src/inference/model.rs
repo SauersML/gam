@@ -1279,6 +1279,12 @@ pub enum FittedEstimator {
     Expectile { tau: f64 },
 }
 
+/// The family name every surface (summary, CLI fit line, Python
+/// `family_name`) reports for an expectile fit.
+pub fn expectile_display_name(tau: f64) -> String {
+    format!("Expectile(tau={tau})")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "family_kind", rename_all = "kebab-case")]
 pub enum FittedFamily {
@@ -3648,6 +3654,11 @@ impl FittedModel {
     /// than to a blank family.
     pub fn display_family_name(&self) -> String {
         let payload = self.payload();
+        // An expectile fit's persisted likelihood is its Gaussian-identity
+        // working model; the estimator tag names what was actually fitted.
+        if let FittedEstimator::Expectile { tau } = payload.estimator {
+            return expectile_display_name(tau);
+        }
         match &payload.family_state {
             FittedFamily::LocationScale { .. } if !payload.family.is_empty() => {
                 payload.family.clone()
