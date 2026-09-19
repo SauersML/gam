@@ -29,7 +29,9 @@ import gamfit
 
 
 def _eta(model: Any, data: dict[str, np.ndarray]) -> np.ndarray:
-    return np.asarray(model.predict(data, interval=0.95)["linear_predictor_plugin"], float)
+    return np.asarray(
+        model.predict(data, interval=0.95)["linear_predictor_plugin"], float
+    )
 
 
 def _intercept(model: Any, data: dict[str, np.ndarray]) -> float:
@@ -106,7 +108,9 @@ def test_univariate_pdep_plus_intercept_equals_linear_predictor(
     np.testing.assert_allclose(total, eta, rtol=0.0, atol=_scale_tol(eta))
 
 
-def test_multi_smooth_poisson_additive_identity(counts_like: dict[str, np.ndarray]) -> None:
+def test_multi_smooth_poisson_additive_identity(
+    counts_like: dict[str, np.ndarray],
+) -> None:
     d = counts_like
     m = gamfit.fit(d, "y ~ s(time) + s(tmpd)", family="poisson")
     eta = _eta(m, d)

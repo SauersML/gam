@@ -53,7 +53,13 @@ def test_non_finite_prediction_input_is_rejected(
 # test_utils::test_check_y_* : responses outside the family's support.
 @pytest.mark.parametrize(
     ("family", "bad_value"),
-    [("binomial", 2.0), ("binomial", -1.0), ("poisson", -1.0), ("gamma", 0.0), ("gamma", -2.0)],
+    [
+        ("binomial", 2.0),
+        ("binomial", -1.0),
+        ("poisson", -1.0),
+        ("gamma", 0.0),
+        ("gamma", -2.0),
+    ],
 )
 def test_out_of_domain_response_is_rejected(family: str, bad_value: float) -> None:
     rng = np.random.default_rng(61)
@@ -107,8 +113,13 @@ def test_extrapolation_is_finite_and_linear(
 ) -> None:
     d, m = fitted
     lo, hi = float(d["x"].min()), float(d["x"].max())
-    for grid in (np.linspace(hi + 0.1, hi + 2.0, 12), np.linspace(lo - 2.0, lo - 0.1, 12)):
-        curve = np.asarray(m.predict({"x": grid}, return_type="dict")["mean_plugin"], float)
+    for grid in (
+        np.linspace(hi + 0.1, hi + 2.0, 12),
+        np.linspace(lo - 2.0, lo - 0.1, 12),
+    ):
+        curve = np.asarray(
+            m.predict({"x": grid}, return_type="dict")["mean_plugin"], float
+        )
         assert np.all(np.isfinite(curve))
         second = np.diff(curve, n=2)
         assert np.max(np.abs(second)) <= 1e-8 * max(1.0, float(np.max(np.abs(curve))))

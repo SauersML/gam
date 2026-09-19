@@ -27,7 +27,9 @@ def test_integer_poisson_weights_equal_row_duplication() -> None:
     x = rng.uniform(0.0, 1.0, n)
     y = rng.poisson(np.exp(1.0 + np.sin(6.0 * x))).astype(float)
     w = rng.integers(1, 4, n).astype(float)
-    weighted = gamfit.fit({"x": x, "y": y, "w": w}, "y ~ s(x)", family="poisson", weights="w")
+    weighted = gamfit.fit(
+        {"x": x, "y": y, "w": w}, "y ~ s(x)", family="poisson", weights="w"
+    )
     reps = w.astype(int)
     expanded = gamfit.fit(
         {"x": np.repeat(x, reps), "y": np.repeat(y, reps)}, "y ~ s(x)", family="poisson"
@@ -56,7 +58,9 @@ def test_gaussian_weight_rescaling_is_absorbed_by_the_dispersion(factor: float) 
     p1 = base.predict(grid, interval=0.9)
     p2 = scaled.predict(grid, interval=0.9)
     np.testing.assert_allclose(
-        np.asarray(p2["posterior_mean"], float), np.asarray(p1["posterior_mean"], float), rtol=1e-6
+        np.asarray(p2["posterior_mean"], float),
+        np.asarray(p1["posterior_mean"], float),
+        rtol=1e-6,
     )
     np.testing.assert_allclose(
         np.asarray(p2["posterior_mean_standard_error"], float),
@@ -86,13 +90,16 @@ def test_log_exposure_offset_is_additive_on_the_predictor() -> None:
     r0 = m.predict(at_zero, interval=0.9)
     r2 = m.predict(doubled, interval=0.9)
     np.testing.assert_allclose(
-        np.asarray(r2["linear_predictor_plugin"], float) - np.asarray(r0["linear_predictor_plugin"], float),
+        np.asarray(r2["linear_predictor_plugin"], float)
+        - np.asarray(r0["linear_predictor_plugin"], float),
         np.log(2.0),
         rtol=0.0,
         atol=1e-12,
     )
     np.testing.assert_allclose(
-        np.asarray(r2["mean_plugin"], float), 2.0 * np.asarray(r0["mean_plugin"], float), rtol=1e-12
+        np.asarray(r2["mean_plugin"], float),
+        2.0 * np.asarray(r0["mean_plugin"], float),
+        rtol=1e-12,
     )
 
 
@@ -102,6 +109,8 @@ def test_offset_is_not_absorbed_into_the_smooth() -> None:
     d = _exposure_data()
     m = gamfit.fit(d, "y ~ s(x)", family="poisson", offset="log_exposure")
     grid = np.linspace(0.05, 0.95, 30)
-    rate = np.asarray(m.predict({"x": grid, "log_exposure": np.zeros_like(grid)}), float)
+    rate = np.asarray(
+        m.predict({"x": grid, "log_exposure": np.zeros_like(grid)}), float
+    )
     truth = np.exp(0.5 + np.sin(6.0 * grid))
     assert float(np.max(np.abs(np.log(rate) - np.log(truth)))) < 0.25

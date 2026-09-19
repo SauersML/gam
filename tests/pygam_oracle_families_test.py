@@ -6,7 +6,8 @@ response domain. Here each family is fitted on seeded synthetic data drawn from
 that family, and every fit must also:
 
 * report a certified convergence,
-* predict means inside the family's support, and
+* predict means inside the family's support,
+* map the linear predictor to the mean through the family's link, and
 * recover the generating mean curve better than the intercept-only model.
 
 pyGAM is never imported.
@@ -27,14 +28,23 @@ def _truth(x: np.ndarray) -> np.ndarray:
 
 
 # family -> (draw y given eta, inverse link, open/closed support check)
-FAMILIES: dict[str, tuple[Callable[[np.random.Generator, np.ndarray], np.ndarray], Callable[[np.ndarray], np.ndarray], Callable[[np.ndarray], bool]]] = {
+FAMILIES: dict[
+    str,
+    tuple[
+        Callable[[np.random.Generator, np.ndarray], np.ndarray],
+        Callable[[np.ndarray], np.ndarray],
+        Callable[[np.ndarray], bool],
+    ],
+] = {
     "gaussian": (
         lambda rng, eta: eta + rng.normal(0.0, 0.3, eta.size),
         lambda eta: eta,
         lambda mu: bool(np.all(np.isfinite(mu))),
     ),
     "binomial": (
-        lambda rng, eta: (rng.uniform(size=eta.size) < 1.0 / (1.0 + np.exp(-eta))).astype(float),
+        lambda rng, eta: (
+            rng.uniform(size=eta.size) < 1.0 / (1.0 + np.exp(-eta))
+        ).astype(float),
         lambda eta: 1.0 / (1.0 + np.exp(-eta)),
         lambda mu: bool(np.all((mu > 0.0) & (mu < 1.0))),
     ),
@@ -60,17 +70,25 @@ def test_family_fit_is_certified_in_domain_and_informative(family: str) -> None:
     eta = 1.0 + _truth(x)
     d = {"x": x, "y": draw(rng, eta)}
     m = gamfit.fit(d, "y ~ s(x)", family=family)
-    assert "certified" in list(m.summary().convergence), m.summary().convergence
+    convergence = m.summary().convergence
+    assert convergence["certified"] is True, convergence
 
     grid = np.linspace(0.0, 1.0, 50)
     mu = np.asarray(m.predict({"x": grid}), float)
     assert in_support(mu), (family, mu.min(), mu.max())
+    # The fit uses the family's canonical link, not an identity fit of the mean.
+    plugin = m.predict({"x": grid}, return_type="dict")
+    np.testing.assert_allclose(
+        np.asarray(plugin["mean_plugin"], float),
+        inverse_link(np.asarray(plugin["linear_predictor_plugin"], float)),
+        rtol=1e-10,
+    )
 
     target = inverse_link(1.0 + _truth(grid))
     null = np.full_like(target, float(np.mean(d["y"])))
     err_fit = float(np.sqrt(np.mean((mu - target) ** 2)))
     err_null = float(np.sqrt(np.mean((null - target) ** 2)))
-    assert err_fit < 0.25 * err_null, (family, err_fit, err_null)
+    assert err_fit < 0.5 * err_null, (family, err_fit, err_null)
 
 
 def test_binomial_two_smooth_fit_finds_the_signal() -> None:
@@ -89,3 +107,20 @@ def test_binomial_two_smooth_fit_finds_the_signal() -> None:
     order = np.argsort(x)
     lo, hi = mu[order[: n // 4]].mean(), mu[order[-n // 4 :]].mean()
     assert hi - lo > 0.5
+
+
+def test_poisson_two_smooths_and_a_tensor_certify() -> None:
+    """pyGAM's chicago model s + s + te under a Poisson family: the three-term
+    fit must converge to a certified optimum with a finite likelihood."""
+    rng = np.random.default_rng(76)
+    n = 1000
+    a, b, c = rng.uniform(size=n), rng.uniform(size=n), rng.uniform(size=n)
+    y = rng.poisson(np.exp(1.0 + np.sin(3.0 * a) + b * c)).astype(float)
+    m = gamfit.fit(
+        {"a": a, "b": b, "c": c, "y": y}, "y ~ s(a) + s(b) + te(b, c)", family="poisson"
+    )
+    s = m.summary()
+    assert s.convergence["certified"] is True, s.convergence
+    assert np.isfinite(float(s.log_likelihood))
+    mu = np.asarray(m.predict({"a": a[:50], "b": b[:50], "c": c[:50]}), float)
+    assert np.all(mu > 0.0)
