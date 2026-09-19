@@ -2325,6 +2325,9 @@ pub(crate) enum SmoothPenaltyDemand {
 pub struct TermCollectionPredictionDesign {
     pub design: DesignMatrix,
     pub affine_offset: Array1<f64>,
+    /// Each smooth term's name and coefficient range, relative to the smooth
+    /// block, in spec order.
+    pub smooth_coefficient_ranges: Vec<(String, Range<usize>)>,
 }
 
 impl TermCollectionPredictionDesign {
@@ -5709,10 +5712,16 @@ fn tensor_null_function_block_ridges(
         .collect()
 }
 
+/// Build a tensor B-spline term, assembling its penalties only when
+/// `realize_penalties` is set. The design and metadata never read them, and
+/// the tensor penalties (Kronecker sums, their chart restriction and
+/// renormalization, the null-function ridges, candidate filtering) are the
+/// dominant cost of evaluating a frozen tensor on new rows.
 pub(crate) fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
     spec: &TensorBSplineSpec,
+    realize_penalties: bool,
 ) -> Result<BasisBuildResult, BasisError> {
     if feature_cols.is_empty() {
         crate::bail_invalid_basis!("TensorBSpline requires at least one feature column");
@@ -5995,109 +6004,115 @@ pub(crate) fn build_tensor_bspline_basis(
         );
     }
 
-    match spec.penalty_decomposition {
-        TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => {
-            // Margin `dim`'s roughness is integrated over the other margins'
-            // functions. For `f = Σ β (B_0 ⊗ … ⊗ B_{d-1})`,
-            // `∫ (∂ᵐ_dim f)² = βᵀ (G_0 ⊗ … ⊗ S_dim ⊗ … ⊗ G_{d-1}) β`, where `G_j`
-            // is margin `j`'s function Gram. `S_dim ⊗ I` would measure the other
-            // margins by their coefficients, and agrees with the integral only
-            // where those bases are Gram-orthonormal (#1561, SPEC rule 5). Every
-            // `G_j` is positive definite, so the joint null space of the sum is
-            // still the tensor of the marginal polynomial null spaces: the one
-            // the tensor double penalty (built after the identifiability chart)
-            // shrinks, never the already-penalized interaction range.
-            //
-            // Each other margin's Gram is divided by its own domain measure
-            // `1ᵀ G_j 1 = ∫ (Σ_i b_i)²`, the margin's length for a partition-of-unity
-            // basis, so the other margins enter as an average over their domains.
-            // A raw Gram would carry margin `j`'s length unit into margin `dim`'s λ
-            // (#2315 scale law), and a Frobenius normalizer would carry its basis
-            // size instead. The physical integral's scale moves into
-            // `normalization_scale`.
-            let mut gram_measures = Vec::<f64>::with_capacity(marginal_function_grams.len());
-            for (j, gram) in marginal_function_grams.iter().enumerate() {
-                let measure = gram.sum();
-                if !(measure.is_finite() && measure > 0.0) {
-                    crate::bail_invalid_basis!(
-                        "internal TensorBSpline error at dim {j}: function Gram measure {measure} is not positive and finite"
-                    );
-                }
-                gram_measures.push(measure);
-            }
-            for dim in 0..normalized_marginal_penalties.len() {
-                let mut s_dim = Array2::<f64>::eye(1);
-                let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
-                let mut other_measures = 1.0_f64;
+    // A design-only build reads no penalty; the chart below is placed from
+    // the marginal designs alone.
+    if realize_penalties {
+        match spec.penalty_decomposition {
+            TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => {
+                // Margin `dim`'s roughness is integrated over the other margins'
+                // functions. For `f = Σ β (B_0 ⊗ … ⊗ B_{d-1})`,
+                // `∫ (∂ᵐ_dim f)² = βᵀ (G_0 ⊗ … ⊗ S_dim ⊗ … ⊗ G_{d-1}) β`, where `G_j`
+                // is margin `j`'s function Gram. `S_dim ⊗ I` would measure the other
+                // margins by their coefficients, and agrees with the integral only
+                // where those bases are Gram-orthonormal (#1561, SPEC rule 5). Every
+                // `G_j` is positive definite, so the joint null space of the sum is
+                // still the tensor of the marginal polynomial null spaces: the one
+                // the tensor double penalty (built after the identifiability chart)
+                // shrinks, never the already-penalized interaction range.
+                //
+                // Each other margin's Gram is divided by its own domain measure
+                // `1ᵀ G_j 1 = ∫ (Σ_i b_i)²`, the margin's length for a partition-of-unity
+                // basis, so the other margins enter as an average over their domains.
+                // A raw Gram would carry margin `j`'s length unit into margin `dim`'s λ
+                // (#2315 scale law), and a Frobenius normalizer would carry its basis
+                // size instead. The physical integral's scale moves into
+                // `normalization_scale`.
+                let mut gram_measures = Vec::<f64>::with_capacity(marginal_function_grams.len());
                 for (j, gram) in marginal_function_grams.iter().enumerate() {
-                    let factor = if j == dim {
-                        normalized_marginal_penalties[j].0.clone()
-                    } else {
-                        other_measures *= gram_measures[j];
-                        gram.mapv(|value| value / gram_measures[j])
-                    };
-                    factors.push(factor.clone());
-                    s_dim = kronecker_product(&s_dim, &factor);
+                    let measure = gram.sum();
+                    if !(measure.is_finite() && measure > 0.0) {
+                        crate::bail_invalid_basis!(
+                            "internal TensorBSpline error at dim {j}: function Gram measure {measure} is not positive and finite"
+                        );
+                    }
+                    gram_measures.push(measure);
                 }
-                candidates.push(PenaltyCandidate {
-                    matrix: ConstructiveQuadratic::try_from_dense_psd(
-                        s_dim,
-                        "tensor marginal penalty",
-                    )?,
-                    source: PenaltySource::TensorMarginal { dim },
-                    normalization_scale: normalized_marginal_penalties[dim].1 * other_measures,
-                    kronecker_factors: Some(factors),
-                    op: None,
-                });
+                for dim in 0..normalized_marginal_penalties.len() {
+                    let mut s_dim = Array2::<f64>::eye(1);
+                    let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
+                    let mut other_measures = 1.0_f64;
+                    for (j, gram) in marginal_function_grams.iter().enumerate() {
+                        let factor = if j == dim {
+                            normalized_marginal_penalties[j].0.clone()
+                        } else {
+                            other_measures *= gram_measures[j];
+                            gram.mapv(|value| value / gram_measures[j])
+                        };
+                        factors.push(factor.clone());
+                        s_dim = kronecker_product(&s_dim, &factor);
+                    }
+                    candidates.push(PenaltyCandidate {
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            s_dim,
+                            "tensor marginal penalty",
+                        )?,
+                        source: PenaltySource::TensorMarginal { dim },
+                        normalization_scale: normalized_marginal_penalties[dim].1 * other_measures,
+                        kronecker_factors: Some(factors),
+                        op: None,
+                    });
+                }
             }
-        }
-        TensorBSplinePenaltyDecomposition::Separable => {
-            // t2: one penalty per functional-ANOVA block. Each margin enters a block
-            // through its roughness `S̃_j` (the block penalizes that margin's
-            // wiggliness) or through the mass of its null-space component (the block
-            // holds that margin to its unpenalized functions). Both are functionals
-            // of the margin's functions, so every block penalizes the function, never
-            // the coefficients (#2901, SPEC rule 5). The block is the Kronecker
-            // product of its factors as they stand, so those factors describe it
-            // exactly, and the physical scale moves into `normalization_scale` as in
-            // the te decomposition above.
-            let margins =
-                tensor_margin_separable_factors(&normalized_marginal_penalties, &marginal_function_grams)?;
-            let n_masks = 1usize.checked_shl(margins.len() as u32).ok_or_else(|| {
-                BasisError::InvalidInput(format!(
-                    "t2 separable tensor penalty supports at most {} margins, got {}",
-                    usize::BITS - 1,
-                    margins.len()
-                ))
-            })?;
-            for mask in 1..n_masks {
-                let mut matrix = Array2::<f64>::eye(1);
-                let mut factors = Vec::<Array2<f64>>::with_capacity(margins.len());
-                let mut penalized_margins = Vec::<usize>::new();
-                let mut normalization_scale = 1.0_f64;
-                for (dim, margin) in margins.iter().enumerate() {
-                    let use_range = ((mask >> dim) & 1) == 1;
-                    let factor = if use_range {
-                        penalized_margins.push(dim);
-                        normalization_scale *= margin.range_scale;
-                        margin.range.clone()
-                    } else {
-                        normalization_scale *= margin.null_scale;
-                        margin.null.clone()
-                    };
-                    matrix = kronecker_product(&matrix, &factor);
-                    factors.push(factor);
+            TensorBSplinePenaltyDecomposition::Separable => {
+                // t2: one penalty per functional-ANOVA block. Each margin enters a block
+                // through its roughness `S̃_j` (the block penalizes that margin's
+                // wiggliness) or through the mass of its null-space component (the block
+                // holds that margin to its unpenalized functions). Both are functionals
+                // of the margin's functions, so every block penalizes the function, never
+                // the coefficients (#2901, SPEC rule 5). The block is the Kronecker
+                // product of its factors as they stand, so those factors describe it
+                // exactly, and the physical scale moves into `normalization_scale` as in
+                // the te decomposition above.
+                let margins = tensor_margin_separable_factors(
+                    &normalized_marginal_penalties,
+                    &marginal_function_grams,
+                )?;
+                let n_masks = 1usize.checked_shl(margins.len() as u32).ok_or_else(|| {
+                    BasisError::InvalidInput(format!(
+                        "t2 separable tensor penalty supports at most {} margins, got {}",
+                        usize::BITS - 1,
+                        margins.len()
+                    ))
+                })?;
+                for mask in 1..n_masks {
+                    let mut matrix = Array2::<f64>::eye(1);
+                    let mut factors = Vec::<Array2<f64>>::with_capacity(margins.len());
+                    let mut penalized_margins = Vec::<usize>::new();
+                    let mut normalization_scale = 1.0_f64;
+                    for (dim, margin) in margins.iter().enumerate() {
+                        let use_range = ((mask >> dim) & 1) == 1;
+                        let factor = if use_range {
+                            penalized_margins.push(dim);
+                            normalization_scale *= margin.range_scale;
+                            margin.range.clone()
+                        } else {
+                            normalization_scale *= margin.null_scale;
+                            margin.null.clone()
+                        };
+                        matrix = kronecker_product(&matrix, &factor);
+                        factors.push(factor);
+                    }
+                    candidates.push(PenaltyCandidate {
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            matrix,
+                            "tensor separable penalty",
+                        )?,
+                        source: PenaltySource::TensorSeparable { penalized_margins },
+                        normalization_scale,
+                        kronecker_factors: Some(factors),
+                        op: None,
+                    });
                 }
-                candidates.push(PenaltyCandidate {
-                    matrix: ConstructiveQuadratic::try_from_dense_psd(
-                        matrix,
-                        "tensor separable penalty",
-                    )?,
-                    source: PenaltySource::TensorSeparable { penalized_margins },
-                    normalization_scale,
-                    kronecker_factors: Some(factors),
-                    op: None,
-                });
             }
         }
     }
@@ -6205,7 +6220,7 @@ pub(crate) fn build_tensor_bspline_basis(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
-    if spec.double_penalty {
+    if realize_penalties && spec.double_penalty {
         // The null-function ridges are built in the coefficient chart the fit
         // uses, after identifiability, because the chart decides which null
         // blocks remain free (see `tensor_null_function_block_ridges`).
@@ -8083,6 +8098,11 @@ pub(crate) fn build_single_local_smooth_term_for(
         return build_by_smooth_local(data, term, smooth, by_kind, workspace);
     }
 
+    // A frozen chart needs no penalty to place its design: the joint-null
+    // rotation is the only penalty-derived design input, and a frozen spec
+    // persists it or has none.
+    let realize_penalties = demand == SmoothPenaltyDemand::Realize
+        || (term.joint_null_rotation.is_none() && !smooth_has_frozen_identifiability(term));
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::FactorSumToZero {
             inner,
@@ -8685,7 +8705,7 @@ pub(crate) fn build_single_local_smooth_term_for(
             )?
         }
         SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-            build_tensor_bspline_basis(data, feature_cols, spec)?
+            build_tensor_bspline_basis(data, feature_cols, spec, realize_penalties)?
         }
         SmoothBasisSpec::ByVariable { .. } => {
             crate::bail_invalid_basis!(
@@ -8724,12 +8744,8 @@ pub(crate) fn build_single_local_smooth_term_for(
     // penalty, and the κ-optimizer re-key / ψ-derivative paths route through the
     // same triplet builder so the block count stays ψ-stable (#1270).
     //
-    // A frozen chart needs no penalty to place its design (the joint-null
-    // rotation below is the only penalty-derived design input, and a frozen
-    // spec persists it or has none), so a design-only caller skips the
-    // override and the renormalization below.
-    let realize_penalties = demand == SmoothPenaltyDemand::Realize
-        || (term.joint_null_rotation.is_none() && !smooth_has_frozen_identifiability(term));
+    // A design-only build of a frozen chart skips the override and the
+    // renormalization below.
     if !realize_penalties {
         built.active_penalties.clear();
         built.dropped_penalties.clear();

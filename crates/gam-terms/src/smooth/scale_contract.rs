@@ -1227,7 +1227,7 @@ mod tests {
                 identifiability: TensorBSplineIdentifiability::None,
                 penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
             };
-            build_tensor_bspline_basis(scaled.view(), &[0, 1], &spec)
+            build_tensor_bspline_basis(scaled.view(), &[0, 1], &spec, true)
                 .expect("rescaled tensor basis")
         };
         let reference = build_tensor(1.0, 1.0);

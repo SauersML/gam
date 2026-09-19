@@ -352,17 +352,12 @@ struct CoefficientStatePayload {
     group_metadata: Option<GroupMetadata>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 struct TermBlock {
     name: String,
     kind: String,
     start: usize,
     end: usize,
-}
-
-#[derive(Deserialize)]
-struct TermBlocksPayload {
-    term_blocks: Vec<TermBlock>,
 }
 
 #[derive(Serialize)]
@@ -451,14 +446,15 @@ fn smooth_term_column_ranges(
         data[[0, col]] = lo;
         data[[1, col]] = hi;
     }
-    let design = build_term_collection_design(data.view(), spec).ok()?;
-    let mut out = Vec::with_capacity(design.smooth.terms.len());
-    for term in &design.smooth.terms {
-        let r = term.coeff_range.clone();
-        let global = (smooth_start + r.start)..(smooth_start + r.end);
-        out.push((term.name.clone(), global));
-    }
-    Some(out)
+    let design =
+        gam::terms::smooth::build_term_collection_prediction_design(data.view(), spec).ok()?;
+    Some(
+        design
+            .smooth_coefficient_ranges
+            .into_iter()
+            .map(|(name, r)| (name, (smooth_start + r.start)..(smooth_start + r.end)))
+            .collect(),
+    )
 }
 
 fn coefficient_provenance_for_state(
@@ -637,10 +633,7 @@ fn term_blocks_for_model_impl(
 ) -> Result<Vec<(String, String, usize, usize)>, String> {
     // A scan-routed model has a single smooth term occupying the smoother's
     // entire coefficient space (its per-knot function values). Report that one
-    // contiguous block directly — without round-tripping through
-    // `coefficient_state_json_impl`, which a scan model cannot satisfy (it keeps
-    // no dense coefficient covariance) and which would be O(n²) even if it
-    // could (#1046).
+    // contiguous block directly: it keeps no dense coefficient state (#1046).
     {
         if let Some(scan) = scan_introspection(&model)? {
             return Ok(vec![(
@@ -651,11 +644,12 @@ fn term_blocks_for_model_impl(
             )]);
         }
     }
-    let state_json = coefficient_state_json_impl(model)?;
-    let payload: TermBlocksPayload = serde_json::from_str(&state_json)
-        .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
-    let mut blocks = Vec::with_capacity(payload.term_blocks.len());
-    for (idx, block) in payload.term_blocks.into_iter().enumerate() {
+    let beta_len = gam::families::survival::predict::saved_fit_result(model)?
+        .beta
+        .len();
+    let (_, term_blocks) = coefficient_provenance_for_state(model.payload(), beta_len);
+    let mut blocks = Vec::with_capacity(term_blocks.len());
+    for (idx, block) in term_blocks.into_iter().enumerate() {
         if block.end < block.start {
             return Err(format!(
                 "term block {idx} has invalid range [{}, {})",

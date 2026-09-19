@@ -5219,6 +5219,16 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
             prediction.affine_offset, full.affine_offset,
             "`{formula}`: the prediction offset must equal the full rebuild's"
         );
+        let full_ranges: Vec<_> = full
+            .smooth
+            .terms
+            .iter()
+            .map(|term| (term.name.clone(), term.coeff_range.clone()))
+            .collect();
+        assert_eq!(
+            prediction.smooth_coefficient_ranges, full_ranges,
+            "`{formula}`: the prediction smooth coefficient ranges must equal the full rebuild's"
+        );
         assert!(
             !full.smooth.penalties.is_empty(),
             "`{formula}`: the full rebuild realizes the smooth penalties"
@@ -5248,5 +5258,60 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
                 term.name
             );
         }
+    }
+}
+
+#[test]
+fn frozen_tensor_design_is_built_without_its_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((29, 4), |(i, j)| match j {
+        1 | 2 => ((i * (j + 5)) % 29) as f64 / 28.0,
+        _ => 0.0,
+    });
+    for formula in [
+        "y ~ te(x, z)",
+        "y ~ ti(x, z)",
+        "y ~ t2(x, z)",
+        "y ~ te(x, z, double_penalty=true)",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let (feature_cols, tensor) = frozen
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+                    Some((feature_cols, spec))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{formula}` has no tensor term"));
+        let build = |realize_penalties: bool| {
+            crate::smooth::build_tensor_bspline_basis(
+                new_rows.view(),
+                feature_cols,
+                tensor,
+                realize_penalties,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` tensor build: {err}"))
+        };
+        let full = build(true);
+        let design_only = build(false);
+        assert!(
+            !full.active_penalties.is_empty(),
+            "`{formula}`: the full build realizes penalties"
+        );
+        assert!(
+            design_only.active_penalties.is_empty() && design_only.dropped_penalties.is_empty(),
+            "`{formula}`: a design-only tensor build must not assemble penalties"
+        );
+        assert_eq!(
+            design_only.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the tensor design must not depend on its penalties"
+        );
     }
 }

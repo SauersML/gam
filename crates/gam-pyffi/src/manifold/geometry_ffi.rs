@@ -8029,7 +8029,7 @@ fn model_partial_dependence_impl(
         grid,
     )?;
     let x = standard_mean_design_dense(&model, table.table.clone())?;
-    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let beta = &fit.beta;
     // The partial-effect band prices its SEs off the covariance the fit
     // publishes — the same choice `summary()` makes — and names it in the
@@ -8079,7 +8079,7 @@ fn model_variance_share_encoded_impl(
 ) -> Result<Vec<(String, f64)>, String> {
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let x = standard_mean_design_dense(&model, dataset)?;
-    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model)?
         .into_iter()
         .filter(|(name, kind, _, _)| {
@@ -8193,8 +8193,9 @@ fn standard_mean_design_dense(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
-        .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    let design =
+        gam::terms::smooth::build_term_collection_prediction_design(dataset.values.view(), &spec)
+            .map_err(|err| format!("failed to build design matrix: {err}"))?;
     if design.affine_offset.iter().any(|value| *value != 0.0) {
         return Err(
             "design_matrix cannot represent a model with non-zero smooth anchors as a single \

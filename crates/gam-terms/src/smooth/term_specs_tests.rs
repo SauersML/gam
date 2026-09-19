@@ -331,7 +331,7 @@ mod tensor_function_space_runtime_tests {
             identifiability: TensorBSplineIdentifiability::None,
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
         };
-        let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("double-penalty tensor basis");
         assert!(
             built
@@ -341,7 +341,7 @@ mod tensor_function_space_runtime_tests {
         );
 
         spec.double_penalty = false;
-        let singly_penalized = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let singly_penalized = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("single-penalty tensor basis");
         // Each margin block is `S_dim ⊗ G_other / 1ᵀ G_other 1` (#1561, SPEC rule 5).
         let mut margin_blocks = 0usize;
@@ -431,7 +431,7 @@ mod tensor_function_space_runtime_tests {
                 identifiability,
                 penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
             };
-            let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+            let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
                 .expect("double-penalty tensor basis");
             let ridges = physical_null_ridges(&built);
             assert_eq!(
@@ -476,7 +476,7 @@ mod tensor_function_space_runtime_tests {
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
         };
 
-        let error = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let error = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect_err("a tensor margin cannot silently discard an inhomogeneous lift");
         let message = error.to_string();
         assert!(message.contains("TensorBSpline margin 0"));

@@ -614,6 +614,7 @@ pub fn build_term_collection_prediction_design(
     let TermCollectionDesign {
         design,
         affine_offset,
+        smooth,
         ..
     } = build_term_collection_design_inner_with_policy_and_plan(
         data,
@@ -625,6 +626,11 @@ pub fn build_term_collection_prediction_design(
     Ok(TermCollectionPredictionDesign {
         design,
         affine_offset,
+        smooth_coefficient_ranges: smooth
+            .terms
+            .into_iter()
+            .map(|term| (term.name, term.coeff_range))
+            .collect(),
     })
 }
 
@@ -3190,7 +3196,7 @@ mod sparse_transform_tests {
             identifiability: crate::smooth::TensorBSplineIdentifiability::None,
             penalty_decomposition: Default::default(),
         };
-        let built = crate::smooth::build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let built = crate::smooth::build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("te(x, h) basis");
         let DesignMatrix::Sparse(sparse) = &built.design else {
             panic!("te(x, h) with no identifiability chart must build the sparse Khatri-Rao design; got {:?}", built.design);

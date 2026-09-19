@@ -5533,9 +5533,14 @@ fn remap_term_collectionspec_columns(
 pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, String> {
+    saved_fit_result(model).cloned()
+}
+
+/// Borrow the saved canonical fit result, for readers that need no owned copy.
+pub fn saved_fit_result(model: &SavedModel) -> Result<&UnifiedFitResult, String> {
     model
         .fit_result
-        .clone()
+        .as_ref()
         .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())
 }
 
