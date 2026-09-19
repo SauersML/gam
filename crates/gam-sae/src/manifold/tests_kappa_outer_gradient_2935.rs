@@ -625,3 +625,72 @@ fn snapshot_restore_carries_the_curvature_derivative_2935() {
         "the restored κ energy channel {after:?} is not the snapshot state's {before:?}"
     );
 }
+
+/// A dictionary that carries both crosscoder block weights and a curvature
+/// coordinate lays the block tail out BEFORE the curvature tail. At `λ_block = 1`
+/// the block pricing leaves the target and the fitted state as they are, so the
+/// κ entry of the dense gradient must be the one the plain dictionary reports.
+/// Locating the block tail as an offset from the end of ρ handed the κ slot the
+/// block's implicit right-hand side and the block slot the κ one.
+#[test]
+fn crosscoder_block_weights_leave_the_curvature_gradient_entry_in_place_2935() {
+    let (term, target, rho) = curvature_fixture();
+    let (state, anchor, _) = converged_anchor(term, &target, rho);
+    let dense_gradient = |blocks: bool| -> (SaeManifoldRho, Array1<f64>) {
+        let mut at = anchor.clone();
+        if blocks {
+            at.log_lambda_block = vec![0.0];
+        }
+        let objective =
+            SaeManifoldOuterObjective::new(state.clone(), target.clone(), None, at, 0, 0.4, 1.0e-6, 1.0e-6);
+        let mut objective = if blocks {
+            objective
+                .with_crosscoder_blocks(1, vec![2])
+                .expect("one anchor column and one two-column output block")
+        } else {
+            objective
+        };
+        let at = objective.baseline_rho.clone();
+        let evaluation = objective
+            .evaluate_outer_criterion_route(&at, true, false)
+            .expect("the dense route prices the state");
+        let gradient = objective
+            .analytic_gradient_for_outer_evaluation(&at, &evaluation)
+            .expect("the dense route differentiates the state");
+        (at, gradient)
+    };
+    let (plain_rho, plain) = dense_gradient(false);
+    let (block_rho, priced) = dense_gradient(true);
+    let plain_flat = plain_rho.kappa_flat_index(0).expect("curvature coordinate");
+    let block_flat = block_rho.kappa_flat_index(0).expect("curvature coordinate");
+    let block_range = block_rho.block_flat_range();
+    println!(
+        "[#2935 block tail] plain κ entry {:.12e}; priced κ entry {:.12e}; block range \
+         {block_range:?}, κ at {block_flat}; priced gradient {priced:?}",
+        plain[plain_flat], priced[block_flat]
+    );
+    assert_eq!(block_range, plain_flat..plain_flat + 1, "the block tail precedes κ");
+    assert_eq!(block_flat, plain_flat + 1, "κ is the last coordinate");
+    assert_eq!(priced.len(), plain.len() + 1);
+    assert!(
+        plain[plain_flat].abs() > 1.0e-3,
+        "the κ entry must be material for the comparison to mean anything ({})",
+        plain[plain_flat]
+    );
+    let tolerance = 1.0e-8 * plain[plain_flat].abs().max(1.0);
+    assert!(
+        (priced[block_flat] - plain[plain_flat]).abs() <= tolerance,
+        "installing block pricing moved the κ entry from {} to {}",
+        plain[plain_flat],
+        priced[block_flat]
+    );
+    for coord in 0..plain_flat {
+        assert!(
+            (priced[coord] - plain[coord]).abs() <= 1.0e-8 * plain[coord].abs().max(1.0),
+            "installing block pricing moved entry {coord} from {} to {}",
+            plain[coord],
+            priced[coord]
+        );
+    }
+    assert!(priced[block_range.start].is_finite(), "the block entry is finite");
+}

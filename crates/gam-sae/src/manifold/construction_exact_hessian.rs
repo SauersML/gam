@@ -4763,9 +4763,11 @@ impl SaeManifoldTerm {
                 },
             )
         })?;
-        let block_tail_start = n_params - rho.log_lambda_block.len();
+        // The block weights sit before the curvature tail, so their range is
+        // derived forwards from the flat layout, not as an offset from the end.
+        let block_range = rho.block_flat_range();
         for coord in 0..n_params {
-            let rhs = if coord >= block_tail_start && !rho.log_lambda_block.is_empty() {
+            let rhs = if block_range.contains(&coord) {
                 let &(p_x, ref block_dims) =
                     self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
                         OuterGradientError::internal(
@@ -4774,7 +4776,7 @@ impl SaeManifoldTerm {
                                 .to_string(),
                         )
                     })?;
-                let block = coord - block_tail_start;
+                let block = coord - block_range.start;
                 let start = p_x + block_dims[..block].iter().sum::<usize>();
                 self.crosscoder_block_ift_rhs(cache, target, start..start + block_dims[block])
                     .map_err(OuterGradientError::internal)?
