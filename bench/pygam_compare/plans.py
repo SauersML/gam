@@ -18,11 +18,21 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from .worker import COUNT_FAMILIES, FAMILIES, LIBS
+from .worker import (
+    BINOMIAL_FAMILIES,
+    COUNT_FAMILIES,
+    EXTRA_DESIGNS,
+    FAMILIES,
+    LIBS,
+    POSITIVE_FAMILIES,
+)
 from .worker import DESIGNS as ALL_DESIGNS
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
 SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
+# The Gaussian identity sweep (audit lane sweep-gaussian): every core design
+# plus a tensor-with-additive-smooth and a factor-by smooth.
+GAUSSIAN_SWEEP_DESIGNS: tuple[str, ...] = ALL_DESIGNS + EXTRA_DESIGNS
 
 
 @dataclass(frozen=True)
@@ -61,6 +71,11 @@ class Plan:
     reps: int
     timeout_s: float
     libs: tuple[str, ...] = field(default=LIBS)
+
+
+# The binomial sweep (audit lane sweep-binomial): prevalence 0.5 / 0.1 / 0.01
+# and a grouped binomial with 1..20 trials per row.
+BINOMIAL_SWEEP: tuple[str, ...] = ("binomial", *BINOMIAL_FAMILIES)
 
 
 def _grid(
@@ -162,10 +177,95 @@ PLANS: dict[str, Plan] = {
             timeout_s=3_600.0,
         ),
         Plan(
+            name="gaussian_small",
+            description=(
+                "Gaussian identity, n in {1e2, 1e3, 1e4} x {p1, p5, p20, te, te+s, by},"
+                " 3 reps (the nightly Gaussian regression cells)"
+            ),
+            cells=_grid((100, 1_000, 10_000), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
+            timeout_s=1_200.0,
+        ),
+        Plan(
+            name="gaussian_1e5",
+            description="Gaussian identity, n=1e5 x {p1, p5, p20, te, te+s, by}, 3 reps",
+            cells=_grid((100_000,), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="gaussian_1e6",
+            description=(
+                "Gaussian identity, n=1e6 x {p1, p5, p20, te, te+s, by}, 3 reps:"
+                " wall, CPU and peak RSS at the largest scale"
+            ),
+            cells=_grid((1_000_000,), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
+            timeout_s=3_600.0,
+        ),
+        Plan(
             name="full",
             description="n in {1e3, 1e4, 1e5}, every family x every design, 3 reps",
             cells=_grid((1_000, 10_000, 100_000), ALL_DESIGNS),
             reps=3,
+            timeout_s=3_600.0,
+        ),
+        # The positive-continuous speed/convergence sweep (audit lane
+        # sweep-positive): Gamma on the log and inverse links, Gamma with heavy
+        # right skew and near-zero responses, the inverse Gaussian, a
+        # log-normal response fitted as Gaussian on the log scale and as
+        # Gamma(log) on the raw scale, and the scaled Student-t. pyGAM runs the
+        # Gamma cells only; the others report gamfit's absolute times and
+        # certification.
+        Plan(
+            name="positive_small",
+            description="n in {1e2, 1e3}, every positive family x every design, 3 reps",
+            cells=_grid((100, 1_000), ALL_DESIGNS, POSITIVE_FAMILIES),
+            reps=3,
+            timeout_s=600.0,
+        ),
+        Plan(
+            name="positive_1e4",
+            description="n=1e4, every positive family x every design, 2 reps",
+            cells=_grid((10_000,), ALL_DESIGNS, POSITIVE_FAMILIES),
+            reps=2,
+            timeout_s=1_800.0,
+        ),
+        Plan(
+            name="positive_1e5",
+            description="n=1e5, every positive family x {p1, p5, te}, 1 rep",
+            cells=_grid((100_000,), CORE_DESIGNS, POSITIVE_FAMILIES),
+            reps=1,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="binomial_small",
+            description=(
+                "n in {1e2, 1e3}, binomial at prevalence 0.5 / 0.1 / 0.01 and"
+                " with trials x every design, 3 reps"
+            ),
+            cells=_grid((100, 1_000), ALL_DESIGNS, BINOMIAL_SWEEP),
+            reps=3,
+            timeout_s=600.0,
+        ),
+        Plan(
+            name="binomial_1e4",
+            description=(
+                "n=1e4, binomial at prevalence 0.5 / 0.1 / 0.01 and with trials"
+                " x every design, 2 reps"
+            ),
+            cells=_grid((10_000,), ALL_DESIGNS, BINOMIAL_SWEEP),
+            reps=2,
+            timeout_s=1_800.0,
+        ),
+        Plan(
+            name="binomial_1e5",
+            description=(
+                "n=1e5, binomial at prevalence 0.5 / 0.1 / 0.01 and with trials"
+                " x every design, 1 rep"
+            ),
+            cells=_grid((100_000,), ALL_DESIGNS, BINOMIAL_SWEEP),
+            reps=1,
             timeout_s=3_600.0,
         ),
         # The count-family speed/convergence sweep (audit lane sweep-count):

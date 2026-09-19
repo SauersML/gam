@@ -42,7 +42,12 @@ pub(super) fn sanitized_eval_state_key(
 ///
 /// The outer cap is only a budget on how far the inner solve descends toward
 /// the stationary mode at rho; a mode certified with no cap at the same rho is
-/// that destination, so it answers the capped request exactly.  The converse
+/// that destination, certified at the uncapped (tighter) tolerance, and it is
+/// the mode the criterion's value at rho was scored on.  It is not bitwise what
+/// a capped solve would return (that one stops at the looser tolerance, from
+/// its own warm start, or on its budget), but it is the quantity the capped
+/// solve approximates, so answering from it is at least as accurate and keeps
+/// value and gradient on one beta.  The converse
 /// never holds (#2309): a capped entry is a partial solve and must not stand in
 /// for the uncapped mode.  Screening keys have no stand-in, since a screening
 /// solve carries its own cache and KKT semantics.

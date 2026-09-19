@@ -138,7 +138,8 @@ def test_count_plans_run_pygam_only_where_it_has_the_family() -> None:
 
 
 def test_exposure_draw_carries_its_offset() -> None:
-    X, y, mu, offset = make_data(500, "p1", "poisson_exposure", 0)
+    X, y, mu, weights, offset = make_data(500, "p1", "poisson_exposure", 0)
+    assert weights is None
     assert offset is not None and offset.shape == y.shape
     rate = mu / np.exp(offset)
     # The rate is the level times the smooth; the exposure is all in the offset.
@@ -146,7 +147,7 @@ def test_exposure_draw_carries_its_offset() -> None:
         rate, EXPOSURE_RATE * np.exp(COUNT_SLOPE * np.sin(2 * np.pi * X[:, 0]))
     )
     for family in ("poisson_lo", "negbin", "tweedie"):
-        assert make_data(50, "p1", family, 0)[3] is None
+        assert make_data(50, "p1", family, 0)[3:] == (None, None)
 
 
 def test_timeout_is_a_listed_loss_not_a_skip() -> None:

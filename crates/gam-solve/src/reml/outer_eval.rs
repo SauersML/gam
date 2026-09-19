@@ -33,9 +33,7 @@ pub(crate) use gam_problem::{
 };
 pub(crate) use gam_problem::{HessianValue, OuterEval};
 pub(crate) use gam_runtime::warm_start::Fingerprinter;
-pub(crate) use gam_terms::construction::{
-    create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
-};
+pub(crate) use gam_terms::construction::precompute_reparam_invariant_from_canonical;
 // #1521 trait-inversion: the `BlockExcessTarget` evaluator trait (implemented by
 // `Gam784BlockTarget`, consumed by the up-tier #784 sampler) lives in the neutral
 // `gam_problem` contract so gam-solve has no back-edge into the gam-inference SCC.

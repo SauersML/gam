@@ -1,0 +1,11 @@
+import numpy as np, pandas as pd, gamfit
+rng=np.random.default_rng(0)
+n=300; x=rng.uniform(0,1,n); y=np.sin(8*x)+rng.normal(0,.3,n)
+df=dict(x=x,y=y)
+m=gamfit.fit(df,"y ~ s(x)")
+p=m.predict(dict(x=x[:5]))
+print(type(p)); print(p)
+print(m.summary())
+yb=(rng.uniform(size=n)<1/(1+np.exp(-3*np.sin(6*x)))).astype(int)
+m2=gamfit.fit(dict(x=x,y=yb),"y ~ s(x)")
+print(m2.family_name, m2.predict(dict(x=x[:3])))

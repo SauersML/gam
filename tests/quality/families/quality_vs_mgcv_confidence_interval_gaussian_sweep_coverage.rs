@@ -190,7 +190,6 @@ fn gam_confidence_interval_domain_averaged_coverage_hits_nominal() {
                     edgeworth_one_sided: false,
                     boundary_correction: false,
                     ood_inflation: false,
-                    multi_point_joint: false,
                     ..PredictUncertaintyOptions::default()
                 },
             )

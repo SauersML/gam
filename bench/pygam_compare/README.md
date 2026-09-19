@@ -52,11 +52,24 @@ These are the plans (see `plans.py`):
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
+| `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
+| `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
+| `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
 | `count_small` | n ∈ {1e2, 1e3}, count families × all designs | 3 |
 | `count_1e4` | n=1e4, count families × all designs | 2 |
 | `count_1e5` | n=1e5, count families × {`p1`, `p5`, `te`} | 1 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
 | `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
+
+The positive-response families are Gamma on the log link (`gamma_log`, shape 3),
+heavy right skew with responses near zero (`gamma_skew`, shape 0.5), Gamma on the
+inverse link (`gamma_inverse`), the inverse Gaussian (`inverse_gaussian`),
+log-normal data fitted as a Gaussian on log y (`lognormal_gaussian`) and as a
+Gamma on y (`lognormal_gamma`), and scaled-t noise with 3 degrees of freedom
+(`student_t`). pyGAM is the comparator for the Gamma and log-normal families.
+It has no scaled-t family, and its inverse Gaussian stores sqrt(phi) as its
+scale, so `inverse_gaussian` and `student_t` run gamfit alone and report
+absolute numbers.
 
 The count plans are the count-family sweep. They use their own families:
 `poisson_lo`, `poisson_mid` and `poisson_hi` (Poisson with mean level 0.3, 5
