@@ -2,12 +2,13 @@
   "workflow": "Benchmark Suite",
   "publish_job_status": "success",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "run_id": "35326882983",
-  "run_number": "2488",
+  "publish_job_failed_steps": "",
+  "run_id": "35406072191",
+  "run_number": "2489",
   "run_attempt": "1",
-  "event": "schedule",
+  "event": "workflow_dispatch",
   "ref": "refs/heads/main",
-  "sha": "19143a151111c307d64fc49a3f99347306c416c3",
-  "completed_utc": "2026-09-18T16:59:18Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/35326882983"
+  "sha": "29221e56b14b051044d09335fd292929fdc5a714",
+  "completed_utc": "2026-09-19T00:06:24Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/35406072191"
 }
