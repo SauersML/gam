@@ -380,7 +380,7 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
 #[test]
 fn an_absent_warm_start_attaches_no_cache_session() {
     let absent = blockwise_fit_options(&FitConfig::default());
-    assert!(absent.cache_session.is_none() && absent.required_warm_start.is_none());
+    assert!(absent.cache_session.is_none() && absent.warm_start.is_none());
 }
 
 /// The carrier is survival-only: a standard fit has no survival time basis to
@@ -2160,6 +2160,7 @@ fn bernoulli_marginal_slope_prune_drops_penalized_redundant_scalar_term() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
     let mut notes = Vec::new();
     let removed = prune_unidentified_linear_terms_for_marginal_slope(
@@ -3949,8 +3950,10 @@ fn gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differ
 fn marginal_slope_base_link_accepts_only_probit() {
     let parsed = gam_terms::inference::formula_dsl::parse_formula("y ~ x + link(type=probit)")
         .expect("main formula");
-    let resolved = super::marginal_slope::resolve_marginal_slope_base_link(
+    let (resolved, _) = super::marginal_slope::resolve_marginal_slope_link(
         parsed.linkspec.as_ref(),
+        None,
+        false,
         "bernoulli marginal-slope",
     )
     .expect("explicit probit base link");
@@ -3961,11 +3964,15 @@ fn marginal_slope_base_link_accepts_only_probit() {
         "y ~ x + link(type=sas, sas_init=\"0.1,-0.2\")",
         "y ~ x + link(type=beta-logistic, beta_logistic_init=\"0.3,0.7\")",
         "y ~ x + link(type=blended(logit,probit,cloglog), rho=\"0.4,-0.1\")",
+        "y ~ x + link(type=flexible(logit))",
+        "y ~ x + link(type=log)",
     ] {
         let parsed =
             gam_terms::inference::formula_dsl::parse_formula(formula).expect("main formula");
-        let err = super::marginal_slope::resolve_marginal_slope_base_link(
+        let err = super::marginal_slope::resolve_marginal_slope_link(
             parsed.linkspec.as_ref(),
+            None,
+            false,
             "bernoulli marginal-slope",
         )
         .expect_err("non-probit marginal-slope link should be rejected");
@@ -3982,43 +3989,194 @@ fn marginal_slope_base_link_accepts_only_probit() {
     }
 }
 
+/// gam#2999: the request's `link` and `flexible_link` arguments (gamfit's `link=` and
+/// `flexible_link=`) are read, never dropped. A non-probit link named there is refused
+/// by the argument's name, and a flexible probit link, in either place, comes back as
+/// a flexible choice for the default link deviation.
 #[test]
-fn marginal_slope_base_link_rejects_flexible_and_unbounded_links() {
-    let parsed =
-        gam_terms::inference::formula_dsl::parse_formula("y ~ x + link(type=flexible(logit))")
-            .expect("main formula");
-    let err = super::marginal_slope::resolve_marginal_slope_base_link(
-        parsed.linkspec.as_ref(),
-        "bernoulli marginal-slope",
-    )
-    .expect_err("flexible link should be rejected");
-    assert!(
-        matches!(
-            err,
-            WorkflowError::MarginalSlopeLink {
-                context: "bernoulli marginal-slope",
-                refusal: MarginalSlopeLinkRefusal::Flexible,
-            }
-        ),
-        "a flexible link must be the typed flexible refusal, got {err:?}"
-    );
+fn marginal_slope_link_arguments_are_honoured_or_refused_by_name_2999() {
+    use gam_terms::inference::formula_dsl::LinkMode;
+    let resolve = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let parsed =
+            gam_terms::inference::formula_dsl::parse_formula(formula).expect("main formula");
+        super::marginal_slope::resolve_marginal_slope_link(
+            parsed.linkspec.as_ref(),
+            link,
+            flexible_link,
+            "bernoulli marginal-slope",
+        )
+    };
+    let mode = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let (base, choice) = resolve(formula, link, flexible_link)
+            .unwrap_or_else(|err| panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}"));
+        assert_eq!(base, InverseLink::Standard(StandardLink::Probit));
+        choice.map(|choice| {
+            assert_eq!(choice.link, LinkFunction::Probit);
+            matches!(choice.mode, LinkMode::Flexible)
+        })
+    };
+    assert_eq!(mode("y ~ x", None, false), None);
+    assert_eq!(mode("y ~ x", Some("probit"), false), Some(false));
+    assert_eq!(mode("y ~ x + link(type=probit)", Some("probit"), false), Some(false));
+    for (formula, link, flexible_link) in [
+        ("y ~ x", None, true),
+        ("y ~ x", Some("probit"), true),
+        ("y ~ x", Some("flexible(probit)"), false),
+        ("y ~ x + link(type=flexible(probit))", None, false),
+        ("y ~ x + link(type=probit)", None, true),
+        ("y ~ x + link(type=probit)", Some("flexible(probit)"), false),
+    ] {
+        assert_eq!(
+            mode(formula, link, flexible_link),
+            Some(true),
+            "{formula} link={link:?} flexible_link={flexible_link} must ask for the link deviation"
+        );
+    }
+    for (formula, link, flexible_link) in [
+        ("y ~ x", "logit", false),
+        ("y ~ x", "cloglog", false),
+        ("y ~ x", "sas", false),
+        ("y ~ x", "cauchit", false),
+        ("y ~ x", "flexible(logit)", false),
+        ("y ~ x", "logit", true),
+        ("y ~ x + link(type=probit)", "logit", false),
+    ] {
+        let err = resolve(formula, Some(link), flexible_link)
+            .expect_err("a non-probit link argument must be refused");
+        assert!(
+            matches!(
+                &err,
+                WorkflowError::MarginalSlopeLink {
+                    context: "bernoulli marginal-slope",
+                    refusal: MarginalSlopeLinkRefusal::NonProbitArgument { link: named },
+                } if named == link
+            ),
+            "{formula} link={link}: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&format!("the link argument names '{link}'")),
+            "the refusal must name the argument and its value: {err}"
+        );
+    }
+}
 
-    let parsed = gam_terms::inference::formula_dsl::parse_formula("y ~ x + link(type=log)")
-        .expect("main formula");
-    let err = super::marginal_slope::resolve_marginal_slope_base_link(
-        parsed.linkspec.as_ref(),
-        "bernoulli marginal-slope",
-    )
-    .expect_err("log link should be rejected");
+/// gam#2999: through materialization, `flexible_link=True` and `link="flexible(probit)"`
+/// give the Bernoulli marginal-slope fit the link deviation the formula's `linkwiggle()`
+/// gives, an explicit `linkwiggle(...)` still wins, and `link="logit"` is refused.
+#[test]
+fn bernoulli_marginal_slope_reads_the_link_arguments_2999() {
+    let data = workflow_test_dataset();
+    let link_dev = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let config = FitConfig {
+            slope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            link: link.map(str::to_string),
+            flexible_link,
+            ..FitConfig::default()
+        };
+        let materialized = materialize(formula, &data, &config).unwrap_or_else(|err| {
+            panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}")
+        });
+        let FitRequest::BernoulliMarginalSlope(request) = materialized.request else {
+            panic!("expected a Bernoulli marginal-slope request");
+        };
+        request.spec.link_dev.map(|config| format!("{config:?}"))
+    };
+    let formula_default = link_dev("event ~ bmi + linkwiggle()", None, false)
+        .expect("linkwiggle() builds the link deviation");
+    assert_eq!(link_dev("event ~ bmi", None, false), None);
+    assert_eq!(link_dev("event ~ bmi", Some("probit"), false), None);
+    for (link, flexible_link) in [(None, true), (Some("flexible(probit)"), false)] {
+        assert_eq!(
+            link_dev("event ~ bmi", link, flexible_link).as_deref(),
+            Some(formula_default.as_str()),
+            "link={link:?} flexible_link={flexible_link} must build linkwiggle()'s block"
+        );
+    }
+    let explicit = "event ~ bmi + linkwiggle(degree=3, internal_knots=9, penalty_order=\"1\")";
+    assert_eq!(
+        link_dev(explicit, None, true),
+        link_dev(explicit, None, false),
+        "an explicit linkwiggle(...) wins over flexible_link"
+    );
+    let config = FitConfig {
+        slope_formula: Some("1".to_string()),
+        z_column: Some("z".to_string()),
+        link: Some("logit".to_string()),
+        ..FitConfig::default()
+    };
+    let err = match materialize("event ~ bmi", &data, &config) {
+        Ok(_) => panic!("link=\"logit\" must be refused"),
+        Err(err) => err,
+    };
     assert!(
         matches!(
-            err,
+            &err,
             WorkflowError::MarginalSlopeLink {
                 context: "bernoulli marginal-slope",
-                refusal: MarginalSlopeLinkRefusal::NonProbit,
-            }
+                refusal: MarginalSlopeLinkRefusal::NonProbitArgument { link },
+            } if link == "logit"
         ),
-        "a log link must be the typed probit-only refusal, got {err:?}"
+        "link=\"logit\" must be the named link-argument refusal, got {err:?}"
+    );
+}
+
+/// gam#2999: survival marginal-slope reads the link arguments too. Its main-formula
+/// `linkwiggle()` is its link deviation, so a flexible link builds that block, and
+/// `link="logit"` is refused by the argument's name.
+#[test]
+fn survival_marginal_slope_reads_the_link_arguments_2999() {
+    let data = workflow_test_dataset();
+    let link_dev = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let config = FitConfig {
+            survival_likelihood: Some("marginal-slope".to_string()),
+            slope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            link: link.map(str::to_string),
+            flexible_link,
+            ..FitConfig::default()
+        };
+        let materialized = materialize(formula, &data, &config).unwrap_or_else(|err| {
+            panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}")
+        });
+        let FitRequest::SurvivalMarginalSlope(request) = materialized.request else {
+            panic!("expected a survival marginal-slope request");
+        };
+        request.spec.link_dev.map(|config| format!("{config:?}"))
+    };
+    let formula = "Surv(age_entry, age_exit, event) ~ bmi";
+    let formula_default = link_dev(&format!("{formula} + linkwiggle()"), None, false)
+        .expect("linkwiggle() builds the link deviation");
+    assert_eq!(link_dev(formula, None, false), None);
+    assert_eq!(link_dev(formula, Some("probit"), false), None);
+    for (link, flexible_link) in [(None, true), (Some("flexible(probit)"), false)] {
+        assert_eq!(
+            link_dev(formula, link, flexible_link).as_deref(),
+            Some(formula_default.as_str()),
+            "link={link:?} flexible_link={flexible_link} must build linkwiggle()'s block"
+        );
+    }
+
+    let config = FitConfig {
+        survival_likelihood: Some("marginal-slope".to_string()),
+        slope_formula: Some("1".to_string()),
+        z_column: Some("z".to_string()),
+        link: Some("logit".to_string()),
+        ..FitConfig::default()
+    };
+    let err = match materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config) {
+        Ok(_) => panic!("link=\"logit\" must be refused on survival marginal-slope"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(
+            &err,
+            WorkflowError::MarginalSlopeLink {
+                context: "survival marginal-slope",
+                refusal: MarginalSlopeLinkRefusal::NonProbitArgument { link },
+            } if link == "logit"
+        ),
+        "link=\"logit\" must be the named link-argument refusal, got {err:?}"
     );
 }
 
@@ -4216,5 +4374,28 @@ fn survival_marginal_slope_and_latent_refusals_raise_their_category_2937() {
             "{mode}: {err}"
         );
         assert_eq!(err.variant_name(), "FitFailure::Input", "{mode}: {err}");
+    }
+}
+
+/// PKG-10: one predicate names the multinomial-logit family for the CLI, the
+/// Python `fit_table` entry and the latent fitters, and the scalar resolver
+/// refuses exactly those names.
+#[test]
+fn multinomial_family_names_are_one_predicate() {
+    for name in [
+        "multinomial",
+        "Multinomial_Logit",
+        "categorical",
+        "categorical-logit",
+        "SOFTMAX",
+    ] {
+        assert!(is_multinomial_family_name(name), "{name}");
+        assert!(
+            scalar_family_from_name(name, FamilyNuisanceOverrides::default()).is_err(),
+            "{name}"
+        );
+    }
+    for name in ["binomial", "gaussian", "poisson", "ordinal", "auto"] {
+        assert!(!is_multinomial_family_name(name), "{name}");
     }
 }

@@ -97,6 +97,7 @@ fn thin_plate_term(d: usize, num_centers: usize) -> TermCollectionSpec {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

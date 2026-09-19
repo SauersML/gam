@@ -8,6 +8,7 @@ model.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any, Mapping, Sequence
 
 from ._binding import rust_module
@@ -22,13 +23,13 @@ def _ffi(name: str, *args: Any) -> Any:
         raise map_exception(exc) from exc
 
 
-def _np():
+def _np() -> ModuleType:
     import numpy as np
 
     return np
 
 
-def _composition_rows(np: Any, values: Any) -> tuple[Any, bool]:
+def _composition_rows(np: ModuleType, values: Any) -> tuple[Any, bool]:
     """Marshal a composition argument to the ``(rows, parts)`` 2-D layout the
     Rust FFI requires, recording whether the caller passed a single composition.
 
@@ -495,7 +496,6 @@ def fit_response_geometry(
     coordinates: str | None = None,
     reference: int = -1,
     weights: str | None = None,
-    persistent_warm_start_root: Any | None = None,
     fisher_rao_w: Any | None = None,
     scale_dimensions: bool | None = None,
     firth: bool | None = None,
@@ -563,7 +563,6 @@ def fit_response_geometry(
         "family": "gaussian",
         "link": "identity",
         "weights": weights,
-        "persistent_warm_start_root": persistent_warm_start_root,
         "scale_dimensions": scale_dimensions,
         "firth": firth,
         "precision_hyperpriors": precision_hyperpriors,

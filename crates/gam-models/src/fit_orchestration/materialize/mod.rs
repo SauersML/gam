@@ -14,11 +14,13 @@ mod transformation;
 mod validation;
 
 pub use columns::{
-    fit_required_columns, formula_columns, resolve_offset_column, resolve_weight_column,
+    expand_automatic_fit_formula, fit_required_columns, formula_columns, resolve_offset_column,
+    resolve_weight_column,
 };
 pub(crate) use columns::resolve_continuous_column;
 pub use family::{
-    FamilyNuisanceOverrides, resolve_family, response_column_kind, scalar_family_from_name,
+    FamilyNuisanceOverrides, is_multinomial_family_name, resolve_family, response_column_kind,
+    scalar_family_from_name,
 };
 pub use survival_time::{PreparedSurvivalTimeStack, prepare_survival_time_stack};
 pub use validation::is_binary_response;
@@ -67,14 +69,14 @@ fn blockwise_fit_options(config: &FitConfig) -> BlockwiseFitOptions {
     )
 }
 
-/// A `warm_start_from` point on a custom-family request, as the request's
-/// required cache session. Every custom-family request built from a `FitConfig`
-/// passes through here, so the point reaches the solver on every such route.
-fn with_caller_warm_start(mut options: BlockwiseFitOptions, config: &FitConfig) -> BlockwiseFitOptions {
-    if let Some(warm_start) = config.outer_warm_start.as_ref() {
-        options.cache_session = Some(std::sync::Arc::clone(warm_start.session()));
-        options.required_warm_start = Some(warm_start.required().clone());
-    }
+/// A `warm_start_from` point on a custom-family request (gam#3002). Every
+/// custom-family request built from a `FitConfig` passes through here, so the
+/// point reaches the outer driver on every such route.
+fn with_caller_warm_start(
+    mut options: BlockwiseFitOptions,
+    config: &FitConfig,
+) -> BlockwiseFitOptions {
+    options.warm_start = config.warm_start.clone();
     options
 }
 

@@ -11,6 +11,8 @@ and host/device marshalling.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 
 from . import kernels as _kernels
@@ -23,21 +25,47 @@ except ImportError as exc:  # pragma: no cover
         "gamfit.kernels_jax requires JAX. Install with 'pip install jax'."
     ) from exc
 
+if TYPE_CHECKING:
+    from jax.typing import ArrayLike
 
-def _forward_host(atoms_np, weights_np, cost_np, eps, n_iter):
+# Host-side residuals carried from the forward to the backward pass:
+# ``(atoms, weights, cost, eps, n_iter)``.
+_Residuals = tuple[np.ndarray, np.ndarray, np.ndarray, float, int]
+
+
+def _forward_host(
+    atoms_np: np.ndarray,
+    weights_np: np.ndarray,
+    cost_np: np.ndarray,
+    eps: float,
+    n_iter: int,
+) -> np.ndarray:
     return _kernels.sinkhorn_barycenter(
         atoms_np, weights_np, cost_np, eps=eps, n_iter=n_iter
     )
 
 
-def _vjp_host(atoms_np, weights_np, cost_np, eps, n_iter, cot_np):
+def _vjp_host(
+    atoms_np: np.ndarray,
+    weights_np: np.ndarray,
+    cost_np: np.ndarray,
+    eps: float,
+    n_iter: int,
+    cot_np: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     return _kernels.sinkhorn_barycenter_vjp(
         atoms_np, weights_np, cost_np, eps, n_iter, cot_np
     )
 
 
 @jax.custom_vjp
-def sinkhorn_barycenter(atoms, weights, cost, eps=0.01, n_iter=20):
+def sinkhorn_barycenter(
+    atoms: ArrayLike,
+    weights: ArrayLike,
+    cost: ArrayLike,
+    eps: float = 0.01,
+    n_iter: int = 20,
+) -> jax.Array:
     """Differentiable Sinkhorn Wasserstein barycenter (JAX).
 
     Backward via Rust finite-iteration VJP at the same ``n_iter``.
@@ -49,7 +77,13 @@ def sinkhorn_barycenter(atoms, weights, cost, eps=0.01, n_iter=20):
     return jnp.asarray(bary_np)
 
 
-def _fwd(atoms, weights, cost, eps, n_iter):
+def _fwd(
+    atoms: ArrayLike,
+    weights: ArrayLike,
+    cost: ArrayLike,
+    eps: float,
+    n_iter: int,
+) -> tuple[jax.Array, _Residuals]:
     atoms_np = np.asarray(atoms, dtype=np.float64)
     weights_np = np.asarray(weights, dtype=np.float64)
     cost_np = np.asarray(cost, dtype=np.float64)
@@ -57,7 +91,9 @@ def _fwd(atoms, weights, cost, eps, n_iter):
     return jnp.asarray(bary_np), (atoms_np, weights_np, cost_np, float(eps), int(n_iter))
 
 
-def _bwd(res, cotangent):
+def _bwd(
+    res: _Residuals, cotangent: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     atoms_np, weights_np, cost_np, eps, n_iter = res
     cot_np = np.asarray(cotangent, dtype=np.float64)
     d_atoms_np, d_weights_np = _vjp_host(

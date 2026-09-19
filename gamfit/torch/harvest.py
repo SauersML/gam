@@ -105,7 +105,9 @@ def _jvp_with_attention_diagnostic(
     this JVP boundary receives the actionable eager-attention diagnosis.
     """
     try:
-        return torch.func.jvp(function, (primal,), (tangent,))
+        # ``torch.func.jvp`` annotates its result as a union over ``has_aux``;
+        # with ``has_aux`` left ``False`` it is always ``(output, jvp_out)``.
+        result = torch.func.jvp(function, (primal,), (tangent,))
     except (RuntimeError, NotImplementedError) as error:
         message = str(error).lower()
         if any(marker in message for marker in _ATTENTION_FORWARD_AD_MARKERS):
@@ -120,6 +122,25 @@ def _jvp_with_attention_diagnostic(
                 f"estimator. Original torch error: {error}"
             ) from error
         raise
+    output: torch.Tensor = result[0]
+    jvp_out: torch.Tensor = result[1]
+    return output, jvp_out
+
+
+def _vjp(
+    function: Callable[[torch.Tensor], torch.Tensor],
+    primal: torch.Tensor,
+) -> tuple[torch.Tensor, Callable[[torch.Tensor], tuple[torch.Tensor]]]:
+    """``torch.func.vjp`` of a one-tensor function, typed without aux outputs.
+
+    torch annotates the result as a union over ``has_aux``; with ``has_aux``
+    left ``False`` it is always ``(output, vjp_fn)``, and ``vjp_fn`` returns one
+    cotangent per primal (here exactly one).
+    """
+    result = torch.func.vjp(function, primal)
+    output: torch.Tensor = result[0]
+    vjp_fn: Callable[[torch.Tensor], tuple[torch.Tensor]] = result[1]
+    return output, vjp_fn
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +302,7 @@ def _pullback_matvec(
 
 def _orthonormalize(M: torch.Tensor) -> torch.Tensor:
     """Thin QR returning an orthonormal ``(p, m)`` basis for ``range(M)``."""
+    q: torch.Tensor
     q, _ = torch.linalg.qr(M, mode="reduced")
     return q
 
@@ -394,22 +416,20 @@ def _capture_activations(
 
     # Flatten leading axes to a token list: act (..., p) -> (n, p).
     act_flat = act.reshape(-1, act.shape[-1]).detach()
-    feature_shape = act.shape
 
     def logits_from_act(single_row: torch.Tensor, row_index: int) -> torch.Tensor:
         """Logits as a function of one spliced-in activation row ``ℝ^p → ℝ^C``."""
-        replacement = {"value": None, "index": row_index, "shape": feature_shape}
 
         def _splice(_mod: torch.nn.Module, _inp: Any, out: torch.Tensor) -> torch.Tensor:
             flat = out.reshape(-1, out.shape[-1])
             rows = [flat[i] for i in range(flat.shape[0])]
-            rows[replacement["index"]] = single_row
+            rows[row_index] = single_row
             new_flat = torch.stack(rows, dim=0)
             return new_flat.reshape(out.shape)
 
         h = hook_module.register_forward_hook(_splice)
         try:
-            out_logits = model(inputs)
+            out_logits: torch.Tensor = model(inputs)
         finally:
             h.remove()
         return out_logits.reshape(-1, out_logits.shape[-1])[row_index]
@@ -448,11 +468,9 @@ def _capture_activations_downstream(
         handle.remove()
 
     act_flat = act.reshape(-1, act.shape[-1]).detach()
-    feature_shape = act.shape
 
     def logits_all_from_act(single_row: torch.Tensor, row_index: int) -> torch.Tensor:
         """Full ``(n_pos, C)`` logit block as a function of one spliced row."""
-        replacement = {"index": row_index, "shape": feature_shape}
 
         def _splice(_mod: torch.nn.Module, _inp: Any, out: torch.Tensor) -> torch.Tensor:
             flat = out.reshape(-1, out.shape[-1])
@@ -461,13 +479,13 @@ def _capture_activations_downstream(
             # model may run bf16, and torch.stack rejects mixed dtypes. Autograd
             # differentiates through the cast, so the VJP still lands in the
             # probe's working dtype.
-            rows[replacement["index"]] = single_row.to(dtype=flat.dtype)
+            rows[row_index] = single_row.to(dtype=flat.dtype)
             new_flat = torch.stack(rows, dim=0)
             return new_flat.reshape(out.shape)
 
         h = hook_module.register_forward_hook(_splice)
         try:
-            out_logits = model(inputs)
+            out_logits: torch.Tensor = model(inputs)
         finally:
             h.remove()
         return out_logits.reshape(-1, out_logits.shape[-1])
@@ -557,7 +575,11 @@ def harvest_output_fisher_factors(
         # never formed. Columns are looped explicitly (m is small: r+oversample
         # or a handful of trace probes) — robust through the model's forward
         # hooks, which vmap would have to trace through.
-        def jvp_fn(V: torch.Tensor, _f=f_row, _x=x_row) -> torch.Tensor:
+        def jvp_fn(
+            V: torch.Tensor,
+            _f: Callable[[torch.Tensor], torch.Tensor] = f_row,
+            _x: torch.Tensor = x_row,
+        ) -> torch.Tensor:
             cols = []
             for j in range(V.shape[1]):
                 _out, jv = _jvp_with_attention_diagnostic(
@@ -570,16 +592,24 @@ def harvest_output_fisher_factors(
             return torch.stack(cols, dim=1)  # (C, m)
 
         # VJP: W (C, m) -> J_nᵀ W (p, m). Build the pullback closure once per row.
-        _out0, vjp_raw = torch.func.vjp(f_row, x_row)
+        _out0, vjp_raw = _vjp(f_row, x_row)
 
-        def vjp_fn(W: torch.Tensor, _vjp=vjp_raw) -> torch.Tensor:
+        def vjp_fn(
+            W: torch.Tensor,
+            _vjp: Callable[[torch.Tensor], tuple[torch.Tensor]] = vjp_raw,
+        ) -> torch.Tensor:
             cols = []
             for j in range(W.shape[1]):
                 (gx,) = _vjp(W[:, j].contiguous())  # (p,)
                 cols.append(gx)
             return torch.stack(cols, dim=1)  # (p, m)
 
-        def matvec(V: torch.Tensor, _j=jvp_fn, _vj=vjp_fn, _p=probs) -> torch.Tensor:
+        def matvec(
+            V: torch.Tensor,
+            _j: Callable[[torch.Tensor], torch.Tensor] = jvp_fn,
+            _vj: Callable[[torch.Tensor], torch.Tensor] = vjp_fn,
+            _p: torch.Tensor = probs,
+        ) -> torch.Tensor:
             return _pullback_matvec(_j, _vj, _p, V)
 
         gen = torch.Generator(device="cpu")
@@ -690,7 +720,7 @@ def harvest_behavioral_fisher_probes(
 
         # One forward builds the VJP closure; its primal output IS the logits,
         # so the softmax probs come for free (no extra forward pass).
-        logits_row, vjp_raw = torch.func.vjp(f_row, x_row)
+        logits_row, vjp_raw = _vjp(f_row, x_row)
         with torch.no_grad():
             probs_row = torch.softmax(logits_row, dim=-1)  # (C,)
 
@@ -815,7 +845,11 @@ def harvest_downstream_output_fisher_factors(
         with torch.no_grad():
             probs_future = torch.softmax(f_future(x_row), dim=-1)  # (T, C)
 
-        def jvp_fn(V: torch.Tensor, _f=f_future, _x=x_row) -> torch.Tensor:
+        def jvp_fn(
+            V: torch.Tensor,
+            _f: Callable[[torch.Tensor], torch.Tensor] = f_future,
+            _x: torch.Tensor = x_row,
+        ) -> torch.Tensor:
             cols = []
             for j in range(V.shape[1]):
                 _out, jv = _jvp_with_attention_diagnostic(
@@ -827,16 +861,24 @@ def harvest_downstream_output_fisher_factors(
                 cols.append(jv)  # (T, C)
             return torch.stack(cols, dim=2)  # (T, C, m)
 
-        _out0, vjp_raw = torch.func.vjp(f_future, x_row)
+        _out0, vjp_raw = _vjp(f_future, x_row)
 
-        def vjp_fn(W: torch.Tensor, _vjp=vjp_raw) -> torch.Tensor:
+        def vjp_fn(
+            W: torch.Tensor,
+            _vjp: Callable[[torch.Tensor], tuple[torch.Tensor]] = vjp_raw,
+        ) -> torch.Tensor:
             cols = []
             for j in range(W.shape[2]):
                 (gx,) = _vjp(W[:, :, j].contiguous())  # (p,)
                 cols.append(gx)
             return torch.stack(cols, dim=1)  # (p, m)
 
-        def matvec(V: torch.Tensor, _j=jvp_fn, _vj=vjp_fn, _pf=probs_future) -> torch.Tensor:
+        def matvec(
+            V: torch.Tensor,
+            _j: Callable[[torch.Tensor], torch.Tensor] = jvp_fn,
+            _vj: Callable[[torch.Tensor], torch.Tensor] = vjp_fn,
+            _pf: torch.Tensor = probs_future,
+        ) -> torch.Tensor:
             return _downstream_pullback_matvec(_j, _vj, _pf, V)
 
         gen = torch.Generator(device="cpu")

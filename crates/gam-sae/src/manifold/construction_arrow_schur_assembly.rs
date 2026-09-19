@@ -9,6 +9,118 @@
 //! `build_factored_beta_penalty_curvature`, `add_factored_repulsion_curvature`)
 //! fold the analytic decoder penalties into that same arrow structure.
 use super::*;
+use gam_linalg::roundoff::GradientAccumulation;
+
+/// #2822 — the absolute summands behind one assembled gradient, carried out of the assembly
+/// that forms it ([`SaeManifoldTerm::assemble_arrow_schur_with_gradient_accumulation`]), so a
+/// consumer bands the gradient it was handed and not a second derivation of it.
+///
+/// Each part is a [`GradientAccumulation`]: `absolute_sums` holds, per coordinate, every
+/// summand the assembly adds into that coordinate, in absolute value, and
+/// `accumulation_depth` is the deepest rounded path of any of them, its formation plus the
+/// additions after it. So `γ_depth·absolute_sums[j]` bounds the coordinate's rounding
+/// (Higham, *Accuracy and Stability of Numerical Algorithms*, Lemma 3.1 and §3.1). The
+/// summands enter as the assembly formed them: the residual, the Jacobian, the gates, the
+/// prior gradients and each penalty helper's contribution are charged at their computed
+/// magnitudes, so a helper's own internal cancellation is not charged.
+pub(crate) struct SaeGradientAccumulation {
+    /// Every row's `gt`, concatenated in row order (the flat `t` layout of the residual),
+    /// before the chart's tangent projection.
+    pub(crate) rows: GradientAccumulation,
+    /// `gb` in the full-`B` layout, before the frame projection.
+    pub(crate) border: GradientAccumulation,
+    /// The depth of the tangent projection applied to the rows after their folds: zero on a
+    /// flat chart, whose projection is the identity.
+    pub(crate) row_projection_depth: usize,
+    /// The depth of the frame projection `g_C = Φᵀg_B` applied to the border: zero when no
+    /// frame is engaged.
+    pub(crate) border_projection_depth: usize,
+}
+
+impl SaeGradientAccumulation {
+    /// A bound on `‖ĝ − g‖₂`, the computed gradient's distance from the exact gradient of the
+    /// same computed summands, given the norms of the projected rows and border it bands:
+    /// the per-coordinate bands `γ_depth·Σ|terms|` of both parts in the 2-norm, plus each
+    /// projection's own rounding, `γ_depth` of the norm it produced. Both projections are
+    /// orthogonal (the chart's tangent projection and the orthonormal frames), so they do not
+    /// enlarge the folds' band.
+    pub(crate) fn band_norm(&self, rows_norm: f64, border_norm: f64) -> f64 {
+        use gam_linalg::roundoff::accumulation_growth;
+        let squared = |part: &GradientAccumulation| {
+            let growth = accumulation_growth(part.accumulation_depth);
+            part.absolute_sums
+                .iter()
+                .map(|&sum| (growth * sum) * (growth * sum))
+                .sum::<f64>()
+        };
+        (squared(&self.rows) + squared(&self.border)).sqrt()
+            + accumulation_growth(self.row_projection_depth) * rows_norm
+            + accumulation_growth(self.border_projection_depth) * border_norm
+    }
+}
+
+/// #2822 — the running per-coordinate absolute sums and addition counts behind
+/// [`SaeGradientAccumulation`] while the assembly folds.
+struct GradientTally {
+    absolute_sums: Vec<f64>,
+    additions: Vec<usize>,
+    formation_depth: usize,
+}
+
+impl GradientTally {
+    fn new(len: usize) -> Self {
+        Self {
+            absolute_sums: vec![0.0; len],
+            additions: vec![0; len],
+            formation_depth: 0,
+        }
+    }
+
+    /// One summand of `formation` rounded operations added into coordinate `index`.
+    fn add(&mut self, index: usize, summand: f64, formation: usize) {
+        self.absolute_sums[index] += summand.abs();
+        self.additions[index] += 1;
+        self.formation_depth = self.formation_depth.max(formation);
+    }
+
+    /// The contribution a helper added into `after` over `before`, one pre-formed summand
+    /// per coordinate it moved.
+    fn add_delta(&mut self, before: &[f64], after: &[f64]) {
+        for (index, (&old, &new)) in before.iter().zip(after.iter()).enumerate() {
+            if new != old {
+                self.add(index, new - old, 1);
+            }
+        }
+    }
+
+    fn finish(self) -> GradientAccumulation {
+        let additions = self.additions.iter().copied().max().unwrap_or(0);
+        GradientAccumulation {
+            accumulation_depth: self.formation_depth + additions,
+            absolute_sums: Array1::from_vec(self.absolute_sums),
+        }
+    }
+}
+
+/// The assembly's carried accumulation, when both tallies ran.
+fn carried_accumulation(
+    rows: Option<GradientTally>,
+    border: Option<GradientTally>,
+    row_projection_depth: usize,
+    border_projection_depth: usize,
+) -> Option<SaeGradientAccumulation> {
+    Some(SaeGradientAccumulation {
+        rows: rows?.finish(),
+        border: border?.finish(),
+        row_projection_depth,
+        border_projection_depth,
+    })
+}
+
+/// Every row's `gt`, concatenated in row order.
+fn flat_row_gradients(sys: &ArrowSchurSystem) -> Vec<f64> {
+    sys.rows.iter().flat_map(|row| row.gt.iter().copied()).collect()
+}
 
 /// #2144 — PSD Loewner majorizer of the raw ordered Beta--Bernoulli assignment-prior diagonal
 /// curvature `raw = w·(s'·J² + s·c)` at one logit slot, for the low-rank-metric
@@ -181,6 +293,53 @@ impl SaeManifoldTerm {
         dense_beta_penalty_probe_max_dim: usize,
         forced_layout: ForcedRowLayout,
     ) -> Result<ArrowSchurSystem, String> {
+        self.assemble_arrow_schur_core(
+            target,
+            rho,
+            analytic_penalties,
+            penalty_scale,
+            dense_beta_penalty_probe_max_dim,
+            forced_layout,
+            false,
+        )
+        .map(|(sys, _)| sys)
+    }
+
+    /// #2822 — the full-batch assembly of [`Self::assemble_arrow_schur`], with the absolute
+    /// summands behind its gradient carried out of the same folds
+    /// ([`SaeGradientAccumulation`]).
+    pub(crate) fn assemble_arrow_schur_with_gradient_accumulation(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+    ) -> Result<(ArrowSchurSystem, SaeGradientAccumulation), String> {
+        let (sys, accumulation) = self.assemble_arrow_schur_core(
+            target,
+            rho,
+            analytic_penalties,
+            1.0,
+            SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM,
+            None,
+            true,
+        )?;
+        let accumulation = accumulation
+            .ok_or("the assembly asked to carry its gradient accumulation returned none")?;
+        Ok((sys, accumulation))
+    }
+
+    /// The assembly behind every entry point. With `accumulate`, every gradient summand is
+    /// also tallied in absolute value as it is folded ([`SaeGradientAccumulation`]).
+    fn assemble_arrow_schur_core(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        penalty_scale: f64,
+        dense_beta_penalty_probe_max_dim: usize,
+        forced_layout: ForcedRowLayout,
+        accumulate: bool,
+    ) -> Result<(ArrowSchurSystem, Option<SaeGradientAccumulation>), String> {
         self.assignment.validate_rho_domain(rho)?;
         let ard_precisions = self.validated_ard_precisions(rho)?;
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
@@ -326,6 +485,8 @@ impl SaeManifoldTerm {
         // path, so this is a zero-cost capture there.
         let mut smooth_scaled_s: Vec<Array2<f64>> = Vec::with_capacity(self.atoms.len());
         let mut smooth_grad_gb = vec![0.0_f64; beta_dim];
+        // #2822 — the gradient's absolute summands, tallied only when the caller carries them.
+        let mut border_tally = accumulate.then(|| GradientTally::new(beta_dim));
         // #1117 — rank deficiency is handled at the basis layer: any
         // rank-deficient atom was reparametrized onto its data-supported subspace
         // at fit entry (`reduce_atoms_to_data_supported_rank`), so the β-tier here
@@ -368,6 +529,25 @@ impl SaeManifoldTerm {
                 for i in 0..m {
                     let beta_i = off + i * p + out_col;
                     smooth_grad_gb[beta_i] += sb[[i, out_col]];
+                }
+            }
+            if let Some(tally) = border_tally.as_mut() {
+                // Each entry of `λ·(½(S + Sᵀ)B)` sums `m` products of a symmetrized
+                // coefficient (an addition and a halving) and a decoder entry, then scales by
+                // `λ`: `m + 3` rounded operations, charged at `|λ|·Σⱼ|½(S + Sᵀ)ᵢⱼ|·|Bⱼₒ|`.
+                let decoder = atom.decoder_coefficients();
+                let penalty = atom.smooth_penalty();
+                let scale = lambda_smooth[atom_idx].abs();
+                for out_col in 0..p {
+                    for i in 0..m {
+                        let magnitude = (0..m)
+                            .map(|j| {
+                                (0.5 * (penalty[[i, j]] + penalty[[j, i]])).abs()
+                                    * decoder[[j, out_col]].abs()
+                            })
+                            .sum::<f64>();
+                        tally.add(off + i * p + out_col, scale * magnitude, m + 3);
+                    }
                 }
             }
             // IdentityRightKroneckerPenaltyOp: factor_a = λ·S_k (m×m), factor_b = I_p.
@@ -632,6 +812,9 @@ impl SaeManifoldTerm {
             /// factored β-Hessian operator. `Some` only on the frames+whitening
             /// path; `None` (and never allocated) otherwise.
             pub(crate) frame_support: Option<Vec<(usize, usize, f64)>>,
+            /// #2822 — `Σ|summands|` of each of this row's `gt` entries, when the caller
+            /// carries the gradient's accumulation.
+            pub(crate) gt_abs: Option<Vec<f64>>,
         }
 
         // Per-row scratch reused across all rows a rayon worker processes
@@ -720,6 +903,15 @@ impl SaeManifoldTerm {
             } else {
                 Vec::new()
             };
+        // #2822 — every row's `gt` summands in row order, and each summand's rounded path: the
+        // data inner product over the whitened width (and the whitening's own `p`-term products),
+        // then at most three additions into a coordinate (the data term, the assignment prior
+        // with its gate Jacobian, the ARD prior). A border summand from a row is `a·φ·√w` times a
+        // residual entry, three products, after the `p`-term metric application when whitening.
+        let mut rows_abs: Vec<f64> = Vec::new();
+        let whitening_depth = if whitens_likelihood { p } else { 0 };
+        let row_gt_formation = (w_dim + whitening_depth).max(2);
+        let row_border_formation = 3 + whitening_depth;
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let chunk_end = (chunk_start + assembly_chunk_rows).min(n);
@@ -967,6 +1159,7 @@ impl SaeManifoldTerm {
 
                         // Fill the zeroed row buffer admitted by the system
                         // constructor; each worker owns a disjoint row.
+                        let mut gt_abs = accumulate.then(|| vec![0.0_f64; q_row]);
                         for a in 0..q_row {
                             let jac_a = &jac_white[a * w_dim..(a + 1) * w_dim];
                             let g = jac_a
@@ -975,6 +1168,13 @@ impl SaeManifoldTerm {
                                 .map(|(&j, &e)| j * e)
                                 .sum::<f64>();
                             block.gt[a] += g;
+                            if let Some(abs) = gt_abs.as_mut() {
+                                abs[a] += jac_a
+                                    .iter()
+                                    .zip(error_white.iter())
+                                    .map(|(&j, &e)| (j * e).abs())
+                                    .sum::<f64>();
+                            }
                             for b in 0..q_row {
                                 let jac_b = &jac_white[b * w_dim..(b + 1) * w_dim];
                                 let h = jac_a
@@ -1011,6 +1211,11 @@ impl SaeManifoldTerm {
                             for free_idx in 0..assignment_dim {
                                 block.gt[free_idx] += assignment_grad[assignment_base + free_idx]
                                     + gate_jacobian_grad[assignment_base + free_idx];
+                                if let Some(abs) = gt_abs.as_mut() {
+                                    abs[free_idx] += assignment_grad[assignment_base + free_idx]
+                                        .abs()
+                                        + gate_jacobian_grad[assignment_base + free_idx].abs();
+                                }
                             }
                             if let Some((penalty, scale)) = softmax_dense.as_ref() {
                                 // #1419: write the genuine Gershgorin Loewner majorizer
@@ -1142,6 +1347,9 @@ impl SaeManifoldTerm {
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                                     block.gt[starts[j] + axis] += w_row * prior.grad;
+                                    if let Some(abs) = gt_abs.as_mut() {
+                                        abs[starts[j] + axis] += (w_row * prior.grad).abs();
+                                    }
                                     block.htt[[starts[j] + axis, starts[j] + axis]] +=
                                         w_row * prior.psd_majorizer_hess();
                                 }
@@ -1172,6 +1380,9 @@ impl SaeManifoldTerm {
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                                     block.gt[off + axis] += w_row * prior.grad;
+                                    if let Some(abs) = gt_abs.as_mut() {
+                                        abs[off + axis] += (w_row * prior.grad).abs();
+                                    }
                                     block.htt[[off + axis, off + axis]] +=
                                         w_row * prior.psd_majorizer_hess();
                                 }
@@ -1395,6 +1606,7 @@ impl SaeManifoldTerm {
                             kron_a_phi,
                             kron_jac,
                             frame_support,
+                            gt_abs,
                         })
                         }) // #1557 with_nested_parallel
                     },
@@ -1418,6 +1630,12 @@ impl SaeManifoldTerm {
                 fold_offset_in_chunk += 1;
                 for (idx, value) in row_result.gb_delta {
                     sys.gb[idx] += value;
+                    if let Some(tally) = border_tally.as_mut() {
+                        tally.add(idx, value, row_border_formation);
+                    }
+                }
+                if let Some(abs) = row_result.gt_abs {
+                    rows_abs.extend(abs);
                 }
                 for ((atom_i, atom_j), data) in row_result.g_blocks {
                     let m_i = data.nrows();
@@ -1453,6 +1671,26 @@ impl SaeManifoldTerm {
             }
             chunk_start = chunk_end;
         }
+        let mut rows_tally = if accumulate {
+            let mut tally = GradientTally::new(rows_abs.len());
+            tally.absolute_sums = rows_abs;
+            tally.additions.fill(3);
+            tally.formation_depth = row_gt_formation;
+            Some(tally)
+        } else {
+            None
+        };
+        // The chart's tangent projection of every row's `gt`: the identity on a flat chart,
+        // else `g − (tᵀg)t`-type projections, a `q`-term product and two operations.
+        let row_projection_depth = if !accumulate
+            || self
+                .ext_coord_manifold()
+                .preserves_isometry_cross_block_coherence()
+        {
+            0
+        } else {
+            q + 2
+        };
         // #1407: fixed-decoder early return. The per-row htt/gt are now fully
         // assembled (data GN + assignment/ARD prior). Apply only the htt/gt
         // Riemannian projection (the decoder/β tier is intentionally absent), then
@@ -1525,7 +1763,10 @@ impl SaeManifoldTerm {
             // Publish this assembly's row identity — see the note at the other
             // return of this function.
             sys.refresh_row_hessian_fingerprint();
-            return Ok(sys);
+            return Ok((
+                sys,
+                carried_accumulation(rows_tally, border_tally, row_projection_depth, 0),
+            ));
         }
         // Apply Riemannian geometry to the per-row row blocks (htt, gt) and
         // also to the per-row Kronecker local Jacobians stored in kron_jac.
@@ -1888,6 +2129,7 @@ impl SaeManifoldTerm {
             // "unsupported penalty" fallthrough, no K-gating.
             self.validate_analytic_penalty_registry(registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
+            let before = accumulate.then(|| (flat_row_gradients(&sys), sys.gb.to_vec()));
             beta_penalty_assembly = self
                 .add_sae_analytic_penalty_contributions(
                     &mut sys,
@@ -1898,13 +2140,25 @@ impl SaeManifoldTerm {
                     factored_row_projection,
                 )
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
+            if let Some((rows_before, border_before)) = before {
+                if let Some(tally) = rows_tally.as_mut() {
+                    tally.add_delta(&rows_before, &flat_row_gradients(&sys));
+                }
+                if let Some(tally) = border_tally.as_mut() {
+                    tally.add_delta(&border_before, sys.gb.as_slice().expect("gb is contiguous"));
+                }
+            }
         }
         // #1026 — decoder repulsion (collinearity-gated, registry-independent):
         // accumulate into the full-`B` β-tier here, BEFORE the frame transform,
         // so a framed system carries it identically to the analytic β penalties.
         // No-op unless two atoms are near-collinear (the frozen gate is `None`).
+        let border_before = accumulate.then(|| sys.gb.to_vec());
         if self.add_sae_decoder_repulsion(&mut sys, penalty_scale, dense_beta_curvature) {
             beta_penalty_assembly.record_curvature(dense_beta_curvature);
+        }
+        if let (Some(before), Some(tally)) = (border_before, border_tally.as_mut()) {
+            tally.add_delta(&before, sys.gb.as_slice().expect("gb is contiguous"));
         }
         // #1026/#1522/#2343 — interior-point collapse-prevention barriers. The
         // AMPLITUDE barrier (`add_sae_amplitude_barrier`, #2343) supplies the
@@ -1936,11 +2190,16 @@ impl SaeManifoldTerm {
         // Keep it in the structured smooth blocks even when other penalties
         // use dense storage. Marking this ridge as dense disables framed device
         // data although the device operator represents it exactly (#2627).
+        let border_before = accumulate.then(|| sys.gb.to_vec());
         self.add_sae_amplitude_barrier(
             &mut sys,
             penalty_scale,
             &mut sep_atom_curv,
         );
+        if let (Some(before), Some(tally)) = (border_before, border_tally.as_mut()) {
+            tally.add_delta(&before, sys.gb.as_slice().expect("gb is contiguous"));
+        }
+        let border_before = accumulate.then(|| sys.gb.to_vec());
         let separation_wrote = self.add_sae_separation_barrier(
             &mut sys,
             penalty_scale,
@@ -1948,6 +2207,9 @@ impl SaeManifoldTerm {
             &mut sep_atom_curv,
             &mut sep_curvature,
         );
+        if let (Some(before), Some(tally)) = (border_before, border_tally.as_mut()) {
+            tally.add_delta(&before, sys.gb.as_slice().expect("gb is contiguous"));
+        }
         if separation_wrote && dense_beta_curvature {
             beta_penalty_assembly.record_curvature(true);
         }
@@ -2382,7 +2644,17 @@ impl SaeManifoldTerm {
         // unconditional: two genuinely different operators still carry different
         // fingerprints and are still refused.
         sys.refresh_row_hessian_fingerprint();
-        Ok(sys)
+        // The frame projection `g_C = Φᵀg_B` sums `p` products per factored coordinate.
+        let border_projection_depth = if frames_engaged { p } else { 0 };
+        Ok((
+            sys,
+            carried_accumulation(
+                rows_tally,
+                border_tally,
+                row_projection_depth,
+                border_projection_depth,
+            ),
+        ))
     }
 
     /// Project a dense full-`B` Beta-tier penalty Hessian `hbb` (`beta_dim ×

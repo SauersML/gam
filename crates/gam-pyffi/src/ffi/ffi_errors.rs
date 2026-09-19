@@ -767,6 +767,13 @@ pub(crate) fn py_value_error(message: String) -> PyErr {
     GamError::new_err(message)
 }
 
+/// A table gam-data refuses to encode (an unsupported value, a blank label,
+/// a malformed layout) is a data error on every ingestion path, whichever
+/// transport the table crossed the boundary in.
+pub(crate) fn data_error_to_pyerr(error: gam::data::DataError) -> PyErr {
+    DataError::new_err(error.to_string())
+}
+
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
     py_value_error(format!(
         "{context} panicked inside Rust boundary: {}",
@@ -1015,8 +1022,12 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
             )
         }
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
+        WorkflowError::TermBuilder { .. } => TermBuilderError::new_err(err.to_string()),
         WorkflowError::MarginalSlopeLink { .. } => InvalidConfigurationError::new_err(err.to_string()),
         WorkflowError::TransformationNormalConflict { .. } => {
+            InvalidConfigurationError::new_err(err.to_string())
+        }
+        WorkflowError::WarmStartRefused { .. } => {
             InvalidConfigurationError::new_err(err.to_string())
         }
     }
