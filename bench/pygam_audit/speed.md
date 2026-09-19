@@ -71,9 +71,10 @@ Suggested CI gate:
 ## 3. Results
 
 The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
-- **Complete:** the n=1e3 Gaussian block, n=1e4 Gaussian, and n=1e5 Gaussian p1 and p5.
-- **Still in progress when this was written:** the GLM blocks at n=1e4/1e5, and the n=1e6 runs.
-  They are 3 fits/config × minutes each at 0.2 core.
+- **Complete:** n=1e3 (all families), n=1e4 core (all families), n=1e5 Gaussian p1 and p5, and
+  the n=1e6 subset (Gaussian p1 and p5, Poisson p1; 1 rep each).
+- **Still in progress when this was written:** the rest of n=1e5, meaning Gaussian p20 rep 3,
+  pyGAM p20, and the GLM/te blocks. At 0.2 core each config takes 3 fits × tens of minutes.
 - **Spot checks instead:** where the matrix had not reached a config, I ran 1-rep spot checks
   (marked †) with the same worker.
 
@@ -91,6 +92,8 @@ The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
 | gaussian | 1e5 | p1 | 1.40 [1.39-1.67] | 2.16 | 0.52 | 5.03 | 2.7x | 0.28x |
 | gaussian | 1e5 | p5 | 15.9 [14.3-19.8] | - | 4.78 [4.58-5.36] | 50.0 [48.1-51.9] (2 reps) | 3.3x | 0.32x |
 | gaussian | 1e6 | p1 | 31.8 (1 rep) | - | 12.1 (1 rep) | - | 2.6x | - |
+| gaussian | 1e5 | **p20** | 249 [165-333] (2 reps; 818-1400 s wall) | - | pending | - | - | - |
+| gaussian | 1e6 | **p5** | **memcap 6 GB, no fit (F11)** | - | memcap 6 GB | - | both fail | - |
 | binomial | 1e3 | p1 | 0.53 [0.51-0.58] | 0.75 | 0.0127 | 0.098 | 41x | 5.4x |
 | binomial | 1e3 | p5 | 3.66 [3.66-4.40] | 12.2 [9.6-13.0] | 0.053 | 0.38 | 69x | 9.8x |
 | binomial | 1e3 | **p20** | **timeout 400 s wall** | **timeout** | 0.48 | 4.44 | ∞ | ∞ |
@@ -104,7 +107,8 @@ The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
 | poisson | 1e3 | **p20** | **timeout 400 s wall** | **timeout** | 0.76 | 4.27 | ∞ | ∞ |
 | poisson | 1e4 | p1 | 3.53 [3.51-3.74] | - | 0.10 | 0.49 | 35x | 7.2x |
 | poisson | 1e4 | p5 | 29.1 [28.0-29.1] | - | 0.73 | 4.65 | 40x | 6.3x |
-| poisson | 1e4 | te | 12.8 [12.7-12.9] (2 ok; **seed 2 timed out at 900 s wall**, 663 MB) | - | 0.83 | 4.75 | 15x | 2.7x |
+| poisson | **1e6** | p1 | **492** (1 rep; 1704 s wall; 219 s sys CPU) | - | 28.2 (1 rep; 15 s sys) | - | **17.4x** | - |
+| poisson | 1e4 | te | 12.8 [12.7-12.9] (2 ok; **seed 2: 364 s CPU / 1032 s wall, F10**) | - | 0.83 | 4.75 | 15x | 2.7x |
 
 Wall time at the observed load is about 4-6x the CPU time. For example, binomial 1e4 p5 took
 **177 s wall** for gamfit against 4.6 s CPU / about 20 s wall for gridsearch.
@@ -118,14 +122,17 @@ Wall time at the observed load is about 4-6x the CPU time. For example, binomial
 | gaussian | 1e4 | p1 / p5 / te | 156 / 280 / 260 | 126 / 181 / 179 | 129 / 191 / 189 | 1.2-1.55x |
 | gaussian | 1e5 | p1 | 465 | 275 | 278 | 1.69x |
 | gaussian | 1e5 | p5 | **1398** | 800 | 821 | **1.75x** |
+| gaussian | 1e5 | p20 | **4802 [4781-4823]** (2 reps, converged) | pending | - | 27x the dense n×p design (177 MB) |
 | gaussian | 1e6 | p1 | **2708** (ru_maxrss 2688; 15.9 s of sys CPU) | 1587 | - | **1.71x** |
+| gaussian | 1e6 | p5 | **memcap 6 GB after 1478 s wall, no fit** (F11) | memcap 6 GB after 388 s | - | both fail |
+| poisson | 1e6 | p1 | 1412 (492 s CPU, **219 s of it sys**) | 1643 | - | **0.86x (gamfit wins)** |
 | binomial | 1e3 | p5 | 176 (k20: 264) | 122 | 125 | 1.44x |
 | binomial | 1e4 | p1 / p5 | 171 / 247 | 126 / 188 | 130 / 199 | 1.3-1.36x |
 | binomial | 1e4 | te | **645** | 186 | 196 | **3.46x** |
 | poisson | 1e4 | p1 / p5 / te | 166 / 246 / 242 | 126 / 188 / 184 | 129 / 199 / 194 | 1.31-1.32x |
 
 The import baseline is about 107 MB for gamfit and about 112 MB for pyGAM. **gamfit uses more
-memory than pyGAM in every measured config.**
+memory than pyGAM in every measured config except Poisson 1e6 p1 (0.86x).**
 
 ### 3.3 Predict CPU (n fresh rows)
 
@@ -185,10 +192,19 @@ That is **linear at about 48 µs/row**, against about 3 µs/row for Gaussian and
   - Cost per outer iteration: about 0.25 s CPU. That breaks down as a 1-iteration Gaussian PIRLS
     solve of 0.4-0.6 s wall plus an operator outer Hessian of 0.6-0.8 s wall.
 - RSS reaches about 1.39 GB within 2 minutes and holds there, against pyGAM's 160 MB. That is
-  about 6x the dense 221×221 working set. The 128 MiB PIRLS LRU (`pirls/mod.rs:124`) and the
-  256-entry probe cache (`rho_optimizer/bridges.rs:152`) are count-bounded, not byte-bounded, and
-  together with per-evaluation derivative stores they plausibly account for it. I did not pin the
-  exact owner, because the `.so` is stripped.
+  about 6x the dense 221×221 working set.
+  - Correction, re-checked at HEAD 56a37c6: the PIRLS LRU **is** byte-bounded
+    (`pirls/mod.rs:124` `PIRLS_CACHE_BYTE_BUDGET` = 128 MiB, enforced in
+    `reml/mod.rs:5125-5156`). Only the value-probe cache is count-bounded
+    (`rho_optimizer/bridges.rs:152,1461`, 256 entries), and each entry holds only ρ plus an
+    outcome, so it is small.
+  - The owner of the extra ~1.2 GB is therefore **unattributed**. The `.so` is stripped, so I
+    could not pin it. Per-evaluation derivative and operator-Hessian stores are the remaining
+    suspects.
+- **n dependence (new data, `n1e5.jsonl`).** Gaussian p20 at **n=1e5 does converge**, in 2 of 2
+  finished reps: 165-333 s CPU, 818-1400 s wall, edf 180. So the crawl is a small-n problem
+  (n/p ≈ 4.5 at n=1e3), where the REML surface is flat in many directions.
+  Memory at 1e5 is covered by F11.
 - The developers already know about the budget exhaustion: `rho_optimizer/run_plan.rs:1560-1625`
   (#2817) says "All six runs ... burned their 200-iteration budget, 1200 outer evaluations". The
   crawl/thrash census is in `bridges.rs:3300-3350`.
@@ -273,7 +289,7 @@ same tolerance.
     ρ̂+L⁻¹z and runs a **full `criterion(&rho_m)` PIRLS solve per draw**.
   - The trace shows many draws failing with `Hessian not positive definite (min eig -1.6e144)` and
     gradients around 4e23 at extreme draws.
-  - `optimizer.rs:3713-3737` calls it on every fit and says it is "CHEAP (a handful of
+  - `optimizer.rs:3778-3789` (re-verified at HEAD 56a37c6) calls it on every fit and says it is "CHEAP (a handful of
     outer-criterion evaluations) so it is emitted regardless of `skip_rho_posterior_inference`".
     It is not cheap.
   - `reml/eval.rs:970` recomputes `compute_lamlhessian_consistent` again.
@@ -288,7 +304,7 @@ same tolerance.
 - Cache the outer Hessian per ρ̂.
 - Derive M from the PSIS k̂ / ESS target instead of the constant 64.
 
-**Files:** `crates/gam-inference/src/rho_posterior.rs:119,550-600`, `crates/gam-solve/src/estimate/optimizer.rs:3713-3737`,
+**Files:** `crates/gam-inference/src/rho_posterior.rs:119,550-600`, `crates/gam-solve/src/estimate/optimizer.rs:3778-3789`,
 `crates/gam-solve/src/reml/eval.rs:970`. **Size: M.**
 
 ### F5 — Gaussian derivative evaluations re-run full n-row passes instead of sufficient statistics. HIGH, gap
@@ -302,6 +318,11 @@ same tolerance.
 - At 1e6 p1 the fit takes 31.8 s CPU, including **15.9 s system CPU** (page-fault/allocation
   churn), and 2.7 GB RSS. Those numbers only make sense if n-sized buffers are reallocated for
   each evaluation.
+- The same churn shows up for GLMs. Poisson 1e6 p1 takes **492 s CPU, of which 219 s (44%) is
+  system CPU**. pyGAM takes 28.2 s total with 15 s sys, so gamfit is 17.4x slower (`n1e6.jsonl`).
+  - The sufficient-statistics shortcut does not apply to non-Gaussian families.
+  - Buffer reuse across PIRLS and outer evaluations still does. At 1e6 the sys time alone is 7.8x
+    pyGAM's entire fit.
 
 **Fix.**
 - For Gaussian identity with no offsets varying in ρ, form the p×p sufficient statistics once and
@@ -345,11 +366,11 @@ This is exact, not an approximation.
   My guess is that te predictions carry a larger posterior σ, which pushes rows
   onto the 160-term erfcx series plus the adaptive cross-check.
   Poisson and Gaussian cost about 3 µs/row.
-- `crates/gam-solve/src/quadrature.rs:1127-1150`: `logit_posterior_meanwith_deriv_controlled`
-  computes the erfcx series candidate (up to `LOGIT_MAX_TERMS=160`, line 454), then **always**
-  runs `logit_posterior_meanwith_deriv_quadrature`. That is two `integrate_normal_adaptive` calls,
+- `crates/gam-solve/src/quadrature.rs:989-1024` (re-verified at HEAD 56a37c6): `logit_posterior_meanwith_deriv_controlled`
+  computes the erfcx series candidate (up to `LOGIT_MAX_TERMS=160`, line 442), then **always**
+  runs `logit_posterior_meanwith_deriv_quadrature` (line 977, called at 1014 as a "Defense-in-depth drift-check"). That is two `integrate_normal_adaptive` calls,
   for the mean and its derivative, run on every row as a drift cross-check.
-- For σ<`LOGIT_ERFCX_SIGMA_MIN=0.25` (line 299), which is the usual case for predictions, the code
+- For σ<`LOGIT_ERFCX_SIGMA_MIN=0.25` (line 293), which is the usual case for predictions, the code
   goes straight to adaptive quadrature.
 - The derivative is computed at predict time even though predict never uses it.
 - In addition, predictions return to Python as JSON text: `model_ffi.rs:1692` (`predict_table -> PyResult<String>`)
@@ -363,7 +384,7 @@ This is exact, not an approximation.
 3. Skip the derivative on predict-only calls.
 4. Return a numpy buffer, not JSON.
 
-**Files:** `crates/gam-solve/src/quadrature.rs:299,454,1127-1150`, `crates/gam-pyffi/src/model/model_ffi.rs:1692`,
+**Files:** `crates/gam-solve/src/quadrature.rs:293,442,977,989-1024`, `crates/gam-pyffi/src/model/model_ffi.rs:1692`,
 `crates/gam-pyffi/src/manifold/geometry_ffi.rs:7189-7206`. **Size: S/M.**
 
 ### F8 — Small-n fixed overhead: 19-25x pyGAM default and about 2-2.5x gridsearch at n=1e3 (Gaussian). MED, gap
@@ -395,6 +416,88 @@ This is exact, not an approximation.
 
 **Size: S.**
 
+### F10 — The #784 block-local Gauss-Hermite correction makes one Poisson te fit 28x slower (364 s CPU, 1032 s wall), and every evaluation was declined. HIGH in the wheel; mostly fixed at repo HEAD (9918fc7), with a residual MED, bug
+
+**Evidence.**
+- `trace_worker_seed.py poisson 10000 te 2`, which reproduces the n=1e4 seed-2 timeout from the
+  matrix: the fit takes **364 s CPU and 1032 s wall**. The other two seeds of the same config take
+  12.8 s CPU. Log: `trace_poisson_te_1e4_s2.log`.
+- BFGS itself converges in 19 iterations. The problem is only k=3, p=49.
+- About 47% of wall time is the gap before each `[#784] block-local correction` record at
+  `nodes=3125`. That is a 5^5 tensor-product Gauss-Hermite rule, 22 times, about 481 s wall.
+- **All 22 of those were `declined`**: "paired Gauss-Hermite error ... does not resolve
+  min(|Δ_b|, 1/n_eff)". The work was bought and thrown away.
+- Overall: 174 correction attempts, 40 engaged, all of them at 25 nodes.
+- The 625-, 125-, 5-node and cap-declined records add about 40 s.
+- Post-search (6m31s → 17m11s) is 62% of wall time. Most of it is spent re-running this
+  correction at the certification, mint and Hessian points, while the dense outer Hessian itself
+  takes 0.07 s.
+- RSS swings 250 ↔ 660 MB per evaluation. The correction takes a dense design copy
+  (`block_quadrature_correction.rs:242-250`).
+
+**Repo status.**
+- HEAD contains `9918fc7` (#1082): `optimizer.rs:1224-1228` calls `defer_block_correction_admission()`,
+  and `block_quadrature_correction.rs:212-219` returns zero while the decision is `DeferredToOptimum`.
+- So in the repo the correction is no longer priced on every search evaluation. It is decided once
+  at the certified optimum (`decide_block_correction_admission`, lines 173-189).
+- The wheel (0.1.267) predates that commit, so this measurement overstates the repo's search-phase cost.
+
+**Residual at HEAD (not measured; would need a rebuild).**
+- The one decision evaluation still runs the full order search. This trace shows it reaching
+  m=5 / 3125 nodes, which at n=1e4 is about 20 s wall at 0.2 core, only to decline.
+- If the correction is admitted, the corrected search continues at that node count.
+
+**Fix.**
+- Bound the order search a priori. The paired-rule error estimate at order m, and the target
+  min(|Δ_b|, 1/n_eff), are available before the 5^m product is built. Stop escalating as soon as
+  the error-per-node trend shows the target cannot be met: the error barely moved from m=3
+  (1.5e-4) to m=5 (2.7e-4 to 3.2e-4).
+- Replace the tensor product with a sparse (Smolyak) or rank-adapted rule over the
+  curvature-heavy directions.
+- Reuse the one dense design copy across evaluations.
+
+These change the quadrature's cost, not its acceptance criterion.
+
+**Files:** `crates/gam-solve/src/reml/block_quadrature_correction.rs:191-620`, `crates/gam-math/src/quadrature.rs`. **Size: M.**
+
+### F11 — Memory grows to 14-30x the dense design; Gaussian 1e6 p5 hits a 6 GB cap mid-optimization. HIGH (SPEC "never OOM"), bug
+
+**Evidence** (`n1e5.jsonl`, `n1e6.jsonl`, single-threaded env).
+
+| config | dense X (n×p×8 B) | gamfit peak RSS | ratio |
+|---|---|---|---|
+| Gaussian 1e6 p1 (p=11) | 88 MB | 2708 MB | about 30x |
+| Gaussian 1e5 p20 (p=221) | 177 MB | 4802 MB | about 27x |
+| Gaussian 1e6 p5 (p=51) | 408 MB | **more than 6002 MB, killed by memcap after 1478 s wall** | more than 14x |
+
+- For the 1e6 p5 run, the last stderr lines before the kill are `[22m 33s] [INDEF-HESS]` pair
+  diagnostics over all 10 smoothing parameters, with `relative_defect=1.0`.
+- So the process had been in the outer loop for 22 minutes and was still growing. This is not an
+  up-front allocation.
+- pyGAM also hits the cap on this config (after 388 s), so this is **not a loss relative to
+  pyGAM**. It is a violation of SPEC's "must never run out of memory", and gamfit only reaches it
+  after doing most of the work.
+- Known byte bounds do not explain the growth:
+  - the PIRLS LRU is capped at 128 MiB (`pirls/mod.rs:124`, `reml/mod.rs:5125-5156`);
+  - the probe cache stores only ρ (`bridges.rs:152,1461`).
+- The unbounded consumer is not attributed (the `.so` is stripped). Suspects:
+  - n-sized per-evaluation working buffers (F5; 44% sys CPU in Poisson 1e6);
+  - the n-sized conformal substrate (F6);
+  - per-evaluation derivative and operator stores.
+
+**Fix.**
+- Give every n-scaled store, including the PIRLS cache, derivative stores and payload substrate,
+  a byte budget. Derive the budget once per fit from the design's resident bytes and the host's
+  available memory. That makes it a derived quantity, not a user knob.
+- Account for the budget in one allocator-level ledger, and evict or recompute rather than grow.
+- Stream XᵀWX in row chunks when the dense design would not fit the ledger.
+- Add a regression test that asserts peak RSS stays within a constant times the dense-design size
+  for an n=1e6 p5 Gaussian fit.
+
+**Files:** `crates/gam-solve/src/reml/mod.rs:5097-5156` (the one cache that is already
+byte-bounded, to use as the pattern), `pirls/loop_driver.rs:747-795`, `pirls/newton_solve.rs:1705-1740`,
+`model_payload_builders.rs:285-338`. **Size: L.**
+
 ### Already better (keep)
 
 - **A1: import.** 0.3-0.5 s against pyGAM's 1.2-1.8 s.
@@ -402,6 +505,7 @@ This is exact, not an approximation.
   or better rmse_mu, while doing REML with certified convergence.
 - **A3: Gaussian p5 predict at 1e5.** 0.41 s against 0.58 s.
 - **A4: accuracy.** rmse_mu is never worse than pyGAM default, and is at parity with gridsearch.
+- **A6: Poisson 1e6 p1 peak RSS.** 1412 MB against pyGAM's 1643 MB (0.86x), with better rmse_mu. This is the only measured config where gamfit uses less memory.
 - **A5 (partial): no BLAS thread explosion.** With the env pinned to 1, pyGAM ran 1 thread and gamfit 6 (polled max). gamfit keeps a few helper threads even with `RAYON_NUM_THREADS=1`, but it does not spawn nproc BLAS threads per process.
 
 ### pyGAM slop to avoid (do not copy to "win" benchmarks)
@@ -417,10 +521,13 @@ This is exact, not an approximation.
 
 ## 5. Open measurement gaps
 
-- n=1e4 core is complete (3 reps). Poisson te seed 2 timed out at 900 s wall, so one ordinary 2-D smooth fit at n=1e4 also failed to finish; its log was not captured.
+- n=1e4 core is complete (3 reps). Poisson te seed 2 timed out at 900 s wall. Re-run with logging, it finishes in 1032 s wall and 364 s CPU, and the cost is the #784 correction (F10).
 - n=1e3 is complete: 144 configs × 3 reps. p20 timed out for all three families, with both gamfit variants.
-- n=1e5 and 1e6 GLM, and n=1e5 te, were still running.
 - At 0.2 core per process, a single gamfit binomial fit at 1e5 p5 is expected to take more than
   25 min wall.
-- n=1e6 has Gaussian p1 only (1 rep each). gamfit takes 31.8 s CPU and 2.7 GB; pyGAM takes 12.1 s CPU and 1.59 GB, with gamfit's rmse_mu better (0.0018 against 0.0024). The Gaussian p5 and Poisson p1 runs at 1e6 were still going.
+- n=1e6 is complete for its subset (1 rep each).
+  - Gaussian p1: gamfit takes 31.8 s CPU and 2.7 GB; pyGAM takes 12.1 s CPU and 1.59 GB. gamfit's rmse_mu is better (0.0018 against 0.0024).
+  - Gaussian p5: both libraries hit the 6 GB memcap (F11).
+  - Poisson p1: gamfit takes 492 s CPU and 1.41 GB; pyGAM takes 28.2 s CPU and 1.64 GB, so gamfit is 17.4x slower. gamfit's rmse_mu is better (0.0055 against 0.0070).
+- n=1e5: Gaussian p1, p5 and p20 are done (p20 has 2 of 3 reps). pyGAM p20 and the GLM/te blocks were still running.
 - The record files are appendable, and `analyze.py` regenerates every table from them.
