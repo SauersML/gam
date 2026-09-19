@@ -695,6 +695,7 @@ fn fit_outer_stage_to_boundary(
         // here, before the objective exists, so no criterion this entry evaluates sees the
         // full-width border that the zero-iteration freeze assumes was already reduced.
         term.prepare_entry_stages().map_err(SaeFitError::Fit)?;
+        let p_beta = term.beta_dim();
         let mut objective = SaeManifoldOuterObjective::new(
             term,
             target.clone(),
@@ -714,7 +715,9 @@ fn fit_outer_stage_to_boundary(
         objective.set_cancel_flag(Arc::clone(cancel_flag));
 
         let boundary = if run_outer_rho_search {
-            let problem = OuterProblem::new(rho_flat.len()).with_initial_rho(rho_flat);
+            let problem = OuterProblem::new(rho_flat.len())
+                .with_problem_size(target.len(), p_beta)
+                .with_initial_rho(rho_flat);
             match problem.run(&mut objective, "SAE manifold") {
                 Ok(result) if result.converged() => {
                     return certify_outer_stage(objective, stage, Ok(result))

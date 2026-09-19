@@ -2216,7 +2216,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2296,7 +2296,7 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2387,7 +2387,7 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2465,7 +2465,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2842,7 +2842,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -2907,7 +2907,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -2981,7 +2981,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -3039,7 +3039,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -3072,12 +3072,11 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 /// negative curvature, and once a PSD improving iterate replaces the saddle as
 /// best, the next filled window certifies THAT point.
 /// A configuration whose certificate band is exactly `band` at every criterion
-/// value: the absolute tolerance with no point-anchored relative widening. The guard judges a stall's claim by the certificate's band
+/// value: the absolute tolerance. The guard judges a stall's claim by the certificate's band
 /// (#2817), so a guard fixture that means "stationary below `band`" builds this.
 fn claim_band_config(band: f64) -> OuterConfig {
     OuterConfig {
         tolerance: band,
-        rel_cost_tolerance: Some(0.0),
         ..OuterConfig::default()
     }
 }
@@ -3290,7 +3289,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3359,7 +3358,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3439,7 +3438,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3522,7 +3521,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3629,7 +3628,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
