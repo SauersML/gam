@@ -753,7 +753,9 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         } else {
             self.rho_domain
         };
+        // The augmented criterion carries the test point as one more row.
         let problem = OuterProblem::new(1)
+            .with_problem_size(self.n + usize::from(z.is_some()), self.p)
             .with_gradient(Derivative::Analytic)
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_elem(1, lower), Array1::from_elem(1, upper));

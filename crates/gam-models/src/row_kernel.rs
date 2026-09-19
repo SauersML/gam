@@ -677,28 +677,6 @@ pub(crate) fn row_kernel_design_jf_column_dot(
     out
 }
 
-/// Validate that shared row-kernel caches have one entry per observation.
-pub(crate) fn validate_row_kernel_cache_lengths(
-    context: &str,
-    expected_len: usize,
-    caches: &[(&str, usize)],
-) -> Result<(), String> {
-    let mismatches = caches
-        .iter()
-        .filter_map(|(name, actual)| {
-            (*actual != expected_len).then_some(format!("{name}={actual}"))
-        })
-        .collect::<Vec<_>>();
-    if mismatches.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{context} row-kernel cache length mismatch: {} expected={expected_len}",
-            mismatches.join(" ")
-        ))
-    }
-}
-
 // ── Cache ────────────────────────────────────────────────────────────
 
 /// Cached row-level kernel outputs (NLL + gradient + Hessian in primary space).
@@ -2603,20 +2581,6 @@ mod gram_inner_contraction_tests {
                 vec![1.0, 2.0, 0.0, 0.0, 5.0, 6.0, 3.0, 4.0, 0.0, 0.0, 7.0, 8.0,],
             )
             .unwrap()
-        );
-    }
-
-    #[test]
-    fn validate_row_kernel_cache_lengths_reports_all_mismatches() {
-        validate_row_kernel_cache_lengths("ctx", 3, &[("third", 3), ("fourth", 3)])
-            .expect("matching lengths pass");
-
-        let err = validate_row_kernel_cache_lengths("ctx", 3, &[("third", 2), ("fourth", 4)])
-            .expect_err("mismatches fail");
-
-        assert_eq!(
-            err,
-            "ctx row-kernel cache length mismatch: third=2 fourth=4 expected=3"
         );
     }
 
