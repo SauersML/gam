@@ -4760,11 +4760,14 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         .expect("FLEX baseline first callback")
         .expect("FLEX baseline first terms are present");
     assert_eq!(first.score_psi.len(), dimension);
-    let first_hessian = first
-        .hessian_psi_operator
-        .as_ref()
-        .expect("FLEX baseline first Hessian operator")
-        .to_dense();
+    // gam#3061: the ζ composition serves this frame's chart terms with a dense θ Hessian.
+    assert!(family.timewiggle_zeta_available());
+    assert!(
+        first.hessian_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline θ Hessian"
+    );
+    let first_hessian = first.hessian_psi.clone();
+    assert!(first_hessian.iter().any(|value| *value != 0.0));
     assert_eq!(first_hessian.dim(), (dimension, dimension));
     assert!(first.score_psi.iter().all(|value| value.is_finite()));
     assert!(first_hessian.iter().all(|value| value.is_finite()));
