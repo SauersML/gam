@@ -11,8 +11,19 @@ LAML optimum" with one fold at edf 2, and proposes as an optional improvement
 
 The brief says that if this integral gives no measurable improvement anywhere,
 the evidence should be reported instead of shipping the complexity. **It gives
-no measurable improvement.** The shipped estimand is unchanged, and
-`tests/rho_marginal_predictive_mean_acc6_test.py` pins it.
+no consistent improvement.** On independent replicates the first-order
+ρ-marginal mean is:
+
+- measurably better on one generator: binom_sin2_n500, −0.24% truth-MSE
+  (t = −3.71);
+- measurably worse on another of the same family: binom_add4_n300, +0.33%
+  (t = +2.31);
+- indistinguishable from the shipped mean on the other five, with the
+  coal-shaped generator leaning worse (+1.27%, t = +1.74).
+
+The full integral, with the mean shift, is worse wherever its effect is
+measurable, including on binom_sin2_n500. The shipped estimand is unchanged,
+and `tests/rho_marginal_predictive_mean_acc6_test.py` pins it.
 
 ## What `predict` returns today
 
@@ -117,7 +128,9 @@ not move cannot move the prediction. The folds where V_p does move it (+32% to
 +49% median variance) go both ways: fold 4 improves and fold 3 gets worse.
 The coal gap to pyGAM is not smoothing-parameter uncertainty.
 
-On independent datasets drawn from a coal-shaped rate (`coal_like_n150`, in the replicate table below), the paired test is valid, unlike on CV folds.
+On independent datasets drawn from a coal-shaped rate (`coal_like_n150`),
+where the paired test is valid, gamfit's ρ-marginal mean is 1.27% *worse* in
+truth-MSE than the shipped mean (t = +1.74; gamfit replicate table below).
 
 ### Whole `bench_accuracy.py` battery (first-order ρ-marginal vs shipped)
 
@@ -153,6 +166,24 @@ non-Gaussian cases:
 - The few with a large fold t go both ways: binom_sin2_n500 −0.44%,
   binom_add4_n1000 +0.47%, prostate_pc +0.02%.
 
+### gamfit on independent replicates (`rho_marginal_replicates.py`, R = 40)
+
+The fold t above is not a valid test. This one is: each replicate is a fresh
+dataset from the same non-Gaussian generator (same truth, same n), gamfit is
+fitted once, and truth-MSE is scored on 2000 fresh covariate draws. `*` marks
+|t| above the two-sided 5% Student-t quantile. Replicates without an exported
+`V_p` are left out of the pairing (none of the fits failed).
+
+| generator | replicates with V_p | plug-in | conditional (shipped) | ρ-marginal (V_p) | marginal vs shipped | t | shipped vs plug-in | t |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| binom_add4_n1000 | 39/40 | 0.0028489 | 0.002838 | 0.0028389 | +0.049% | +0.92 | +0.061% | +0.14 |
+| binom_add4_n300 | 34/40 | 0.0082228 | 0.0081989 | 0.0082195 | +0.329% | +2.31 * | -0.562% | -0.65 |
+| binom_sin2_n500 | 40/40 | 0.0030989 | 0.0030626 | 0.0030551 | -0.238% | -3.71 * | -0.983% | -1.43 |
+| coal_like_n150 | 39/40 | 0.039221 | 0.039842 | 0.040129 | +1.270% | +1.74 | +2.836% | +1.30 |
+| gamma_add2_n300 | 37/40 | 0.17755 | 0.17531 | 0.17548 | -0.017% | -0.05 | -1.250% | -0.97 |
+| pois_add2_n300 | 40/40 | 0.30507 | 0.30767 | 0.30791 | +0.060% | +1.00 | +0.707% | +1.25 |
+| pois_lowcount_n500 | 40/40 | 0.0066966 | 0.0067338 | 0.0067364 | +0.020% | +0.13 | +1.187% | +0.75 |
+
 ### Full Laplace on the CV folds (1-D cases, independent fit)
 
 | case | family | full Laplace vs plug-in | paired fold t |
@@ -172,6 +203,7 @@ here, unlike on overlapping folds.
 
 | generator | first-order vs plug-in | t | full Laplace vs plug-in | t |
 |---|---:|---:|---:|---:|
+| binom_sin2_n500 | -0.171% | -4.38 | +2.234% | +2.69 |
 | hetero_n500 | +0.000% | 0 (identity link) | +0.253% | +0.64 |
 | outlier_n300 | +0.000% | 0 (identity link) | +7.767% | +1.25 |
 | pois_lowcount_n500 | +0.160% | +0.94 | +2.070% | +2.95 |
@@ -179,14 +211,27 @@ here, unlike on overlapping folds.
 
 ## Conclusion
 
-- The first-order ρ-marginal mean costs nothing to compute, yet it does not
-  improve held-out accuracy on any case in a way that survives the sign test
-  across the battery.
-- The full Laplace integral, which includes the mean shift, is neutral or
-  harmful. Where its effect is distinguishable from noise on independent
-  replicates, it makes truth-MSE worse: pois_lowcount_n500 +2.07% (t = +2.95), with sin1_n100 +1.73% (t = +2.19) borderline.
-- That is expected. REML's ρ̂ is a good point estimate for prediction, and
-  averaging over ρ adds variance-driven bias through the curvature of g⁻¹
+- **The first-order ρ-marginal mean.** It costs nothing to compute, but it has
+  no consistent effect.
+  - On gamfit's own independent replicates it is significantly better on one
+    of seven generators (binom_sin2_n500, −0.24%) and significantly worse on
+    another (binom_add4_n300, +0.33%).
+  - Both are binomial, so there is no family or regime where it reliably
+    wins.
+  - On the coal-shaped generator it leans worse (+1.27%, t = +1.74), and on
+    the rest it is within noise.
+  - Making it the default would trade sub-percent changes of either sign.
+- **The full Laplace integral, which includes the mean shift, is harmful
+  wherever its effect is measurable.** On independent replicates:
+  - pois_lowcount_n500: +2.07% (t = +2.95);
+  - binom_sin2_n500: +2.23% (t = +2.69);
+  - sin1_n100: +1.73% (t = +2.19).
+
+  So the small first-order gain on binom_sin2_n500 is not the leading term of
+  a larger gain from doing the integral properly. Doing the integral
+  properly reverses it.
+- **That is expected.** REML's ρ̂ is a good point estimate for prediction.
+  Averaging over ρ adds variance-driven bias through the curvature of g⁻¹
   without reducing error.
 
 Nothing is shipped:
@@ -220,7 +265,15 @@ Nothing is shipped:
   optimum that an evaluated state beats".
 - **No `V_p` exported.** `covariance_smoothing_corrected` is `None` on some
   folds: haberman 0, heart_failure 0 and 4, nearsep_n200 3, null3_n2000 1 and
-  wage 1.
+  wage 1. The same happens on 11 of the 280 gamfit replicate fits, all of
+  which converged: binom_add4_n300 seeds 1000, 1001, 1005, 1024, 1029 and
+  1038; gamma_add2_n300 seeds 1011, 1017 and 1037; binom_add4_n1000 seed
+  1035; coal_like_n150 seed 1035. These replicates cannot be scored for the
+  ρ-marginal mean, so they drop out of its pairing.
+- **`toy_classification` (binomial, n = 5000, six terms).** Its 5 folds did
+  not finish inside a 25-minute bench timeout on a 4-CPU box running about
+  8 jobs, so it has no row in the battery table. The timeout belongs to this
+  bench, not the library. The case is not measured here.
 - **`V_p − V_β` can be indefinite.** This is not a bug. Under the cubature
   correction, E_ρ[H(ρ)⁻¹] can be smaller than H(ρ̂)⁻¹.
 
@@ -232,6 +285,7 @@ into `bench/pygam_audit/accuracy/` first. Then run:
 
     python rho_marginal_bench.py [--only REGEX] [--no-big]   # -> results/<case>.json
     python rho_marginal_report.py                             # battery table
+    python rho_marginal_replicates.py GENERATOR 40 1000       # -> results/gamfit_replicates_<GENERATOR>.json
     python full_laplace_folds.py 'REGEX'                      # -> results/full_laplace_folds.json
     python full_laplace_replicates.py GENERATOR 40 1000       # -> results/full_laplace_replicates_<GENERATOR>.json
 

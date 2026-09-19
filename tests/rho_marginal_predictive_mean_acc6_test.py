@@ -3,10 +3,12 @@ alternative the audit proposed.
 
 The audit asked whether ``predict`` should integrate over the smoothing
 parameters, ``E[mu(x) | y] = ∫ E[mu(x) | rho, y] p(rho | y) d rho``, when the
-LAML surface over ``rho`` is flat (coal-mining disasters, Poisson). Measured
-over the whole ``bench_accuracy.py`` battery, that integral does not improve
-held-out accuracy anywhere (``bench/pygam_audit/accuracy/acc6/README.md``), so
-the shipped estimand stays the conditional posterior mean at ``rho_hat``:
+LAML surface over ``rho`` is flat (coal-mining disasters, Poisson). It was
+measured over the whole ``bench_accuracy.py`` battery and on independent
+replicates (``bench/pygam_audit/accuracy/acc6/README.md``). The first-order
+integral changes accuracy by sub-percent amounts of either sign, and the full
+integral is worse wherever its effect is measurable. So the shipped estimand
+stays the conditional posterior mean at ``rho_hat``:
 
     posterior_mean = E[g^{-1}(eta)],  eta ~ N(x' beta_hat, x' V_beta x)
 
