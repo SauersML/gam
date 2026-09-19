@@ -3,7 +3,7 @@
 
 Each class holds only a JSON descriptor (kind + parameters); the
 ``exp / log / metric / dimension / ambient_dim`` primitives delegate to
-``gam_pyffi._rust.manifold_{exp_map, log_map, metric_tensor, dimension,
+``gamfit._rust.manifold_{exp_map, log_map, metric_tensor, dimension,
 ambient_dimension}`` (see :mod:`crates/gam-pyffi/src/lib.rs`), each of
 which in turn calls the canonical Rust implementations under
 :mod:`src/geometry/`. No Riemannian math is reimplemented in Python.
@@ -11,7 +11,7 @@ which in turn calls the canonical Rust implementations under
 Torch interop: when the input is a ``torch.Tensor`` we wrap the Rust call
 in a :class:`torch.autograd.Function` so callers get a tensor back.
 Backward routes through the canonical Rust analytic vector–Jacobian product
-``gam_pyffi._rust.manifold_exp_map_vjp`` (dispatching
+``gamfit._rust.manifold_exp_map_vjp`` (dispatching
 ``RiemannianManifold::exp_map_vjp``): exact for flat manifolds (Euclidean /
 Circle / Torus / products thereof, where the VJP collapses to the identity)
 *and* for curved ones (Sphere / Grassmann / Stiefel / SPD and products thereof).

@@ -5256,3 +5256,49 @@ fn domain_is_validated_against_the_data_and_its_own_shape() {
         assert!(err.contains(needle), "`{term}`: expected {needle:?} in {err}");
     }
 }
+
+/// pyGAM audit F2: a categorical column in a term that reads its inputs as
+/// numeric axes must be a typed error pointing at `factor()`/`group()`,
+/// instead of fitting the level codes as positions on a line.
+#[test]
+fn categorical_column_in_a_numeric_axis_term_is_rejected() {
+    let ds = factor_dataset_l3();
+    let col_map = ds.column_map();
+    for formula in [
+        "y ~ s(g)",
+        "y ~ linear(g)",
+        "y ~ te(x, g)",
+        "y ~ s(g, bs=\"cc\")",
+        "y ~ thinplate(x, g)",
+        "y ~ matern(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse numeric-axis formula");
+        let mut notes = Vec::new();
+        let err = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .expect_err(&format!("`{formula}` must reject the categorical column"));
+        assert!(
+            matches!(err, TermBuilderError::IncompatibleConfig { .. }),
+            "`{formula}` must raise a typed IncompatibleConfig, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'g' is categorical") && msg.contains("factor(g)") && msg.contains("group(g)"),
+            "`{formula}` must name the column and point at factor()/group(): {msg}"
+        );
+    }
+    // The factor-smooth family consumes the categorical as its grouping
+    // factor, and the categorical wrappers are its level effects, so none of
+    // these is a numeric axis.
+    for formula in [
+        "y ~ s(x, g, bs=\"fs\", k=5)",
+        "y ~ s(x, by=g, k=5)",
+        "y ~ x + g",
+        "y ~ x + factor(g)",
+        "y ~ x + group(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse categorical formula");
+        let mut notes = Vec::new();
+        build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .unwrap_or_else(|err| panic!("`{formula}` must still build, got: {err:?}"));
+    }
+}

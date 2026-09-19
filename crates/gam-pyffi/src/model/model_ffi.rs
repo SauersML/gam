@@ -592,7 +592,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// Python objects and then reparsing their string representations. This class
 /// owns the canonical `EncodedDataset`. Its sequence protocol renders only a
 /// requested row for the few metadata helpers that still consume text.
-#[pyclass(name = "_EncodedTable", frozen, skip_from_py_object)]
+#[pyclass(module = "gamfit._rust", name = "_EncodedTable", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyEncodedTable {
     dataset: EncodedDataset,
@@ -1512,7 +1512,15 @@ fn fit_table(
     // driver and persistence envelope; route it here on the same predicate the
     // CLI uses, so callers read the model kind off the returned bytes
     // (`saved_model_kind`) instead of re-deriving it from the family name.
-    let fit_config = parse_fit_config(config_json.as_deref()).map_err(py_value_error)?;
+    // A refused configuration is an `InvalidConfigurationError` here exactly as
+    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamError`.
+    let fit_config = parse_fit_config(config_json.as_deref())
+        .map_err(|reason| {
+            workflow_error_to_pyerr(
+                py,
+                gam::families::fit_orchestration::WorkflowError::InvalidConfig { reason },
+            )
+        })?;
     if fit_config
         .family
         .as_deref()
@@ -3952,7 +3960,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     enum ScoreKind {
         Reml,
         Laml,
-        Bic,
         Tk,
     }
     #[derive(Deserialize)]
@@ -3995,7 +4002,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
             name: String,
             raw_reml: LifecycleFloat,
             laml: Option<LifecycleFloat>,
-            deviance: Option<LifecycleFloat>,
             null_dim: Option<LifecycleFloat>,
             null_space_logdet: Option<LifecycleFloat>,
             effective_dim: LifecycleFloat,
@@ -4026,7 +4032,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     let score_kind = match request.score_kind {
         ScoreKind::Reml => gam::solver::TopologySelectionScoreKind::Reml,
         ScoreKind::Laml => gam::solver::TopologySelectionScoreKind::Laml,
-        ScoreKind::Bic => gam::solver::TopologySelectionScoreKind::Bic,
         ScoreKind::Tk => gam::solver::TopologySelectionScoreKind::Tk,
     };
     let score_scale = match request.score_scale {
@@ -4042,7 +4047,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                 name,
                 raw_reml,
                 laml,
-                deviance,
                 null_dim,
                 null_space_logdet,
                 effective_dim,
@@ -4053,7 +4057,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                     name,
                     raw_reml: raw_reml.decode()?,
                     laml: laml.map(LifecycleFloat::decode).transpose()?,
-                    deviance: deviance.map(LifecycleFloat::decode).transpose()?,
                     null_dim: null_dim.map(LifecycleFloat::decode).transpose()?,
                     null_space_logdet: null_space_logdet.map(LifecycleFloat::decode).transpose()?,
                     effective_dim: effective_dim.decode()?,
