@@ -95,15 +95,16 @@ The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
 | binomial | 1e3 | p5 | 3.66 [3.66-4.40] | 12.2 [9.6-13.0] | 0.053 | 0.38 | 69x | 9.8x |
 | binomial | 1e3 | **p20** | **timeout 400 s wall** | **timeout** | 0.48 | 4.44 | ∞ | ∞ |
 | binomial | 1e4 | p1 | 3.10 [3.01-3.49] | - | 0.065 | 0.43 | 48x | 7.2x |
-| binomial | 1e4 | p5 | 31.4 (1 rep; trace 29.9) | - | 0.86† | 4.59† | 37x | 6.8x |
-| binomial | 1e4 | te | 30.0 (trace, 1 rep) | - | 0.72† | 4.77† | 42x | 6.3x |
+| binomial | 1e4 | p5 | 31.4 [30.6-33.1] | - | 0.63 | 4.71 | 50x | 6.7x |
+| binomial | 1e4 | te | 39.4 [27.9-46.7] | - | 0.65 | 3.99 | 61x | 9.9x |
 | binomial | 1e3 | te | 1.59 [1.47-2.49] | 4.89 | 0.049 | 0.40 | 33x | 4.0x |
 | poisson | 1e3 | p1 | 0.51 [0.50-0.63] | 0.79 | 0.016 | 0.099 | 32x | 5.2x |
 | poisson | 1e3 | p5 | 3.64 [3.36-4.41] | 9.24 | 0.065 | 0.42 | 56x | 8.6x |
 | poisson | 1e3 | te | 2.66 [2.52-2.91] | 6.00 | 0.080 | 0.45 | 34x | 5.9x |
 | poisson | 1e3 | **p20** | **timeout 400 s wall** | **timeout** | 0.76 | 4.27 | ∞ | ∞ |
-| poisson | 1e4 | p1 | 4.11† | - | 0.106† | - | 39x | - |
-| poisson | 1e4 | p5 | 27.3 (trace, 1 rep) | - | 1.01† | 4.77† | 27x | 5.7x |
+| poisson | 1e4 | p1 | 3.53 [3.51-3.74] | - | 0.10 | 0.49 | 35x | 7.2x |
+| poisson | 1e4 | p5 | 29.1 [28.0-29.1] | - | 0.73 | 4.65 | 40x | 6.3x |
+| poisson | 1e4 | te | 12.8 [12.7-12.9] (2 ok; **seed 2 timed out at 900 s wall**, 663 MB) | - | 0.83 | 4.75 | 15x | 2.7x |
 
 Wall time at the observed load is about 4-6x the CPU time. For example, binomial 1e4 p5 took
 **177 s wall** for gamfit against 4.6 s CPU / about 20 s wall for gridsearch.
@@ -119,7 +120,9 @@ Wall time at the observed load is about 4-6x the CPU time. For example, binomial
 | gaussian | 1e5 | p5 | **1398** | 800 | 821 | **1.75x** |
 | gaussian | 1e6 | p1 | **2708** (ru_maxrss 2688; 15.9 s of sys CPU) | 1587 | - | **1.71x** |
 | binomial | 1e3 | p5 | 176 (k20: 264) | 122 | 125 | 1.44x |
-| binomial | 1e4 | p1 / p5 | 171 / 247 | 126 / 188† | 130 / 199† | 1.3-1.36x |
+| binomial | 1e4 | p1 / p5 | 171 / 247 | 126 / 188 | 130 / 199 | 1.3-1.36x |
+| binomial | 1e4 | te | **645** | 186 | 196 | **3.46x** |
+| poisson | 1e4 | p1 / p5 / te | 166 / 246 / 242 | 126 / 188 / 184 | 129 / 199 / 194 | 1.31-1.32x |
 
 The import baseline is about 107 MB for gamfit and about 112 MB for pyGAM. **gamfit uses more
 memory than pyGAM in every measured config.**
@@ -135,7 +138,8 @@ memory than pyGAM in every measured config.**
 | gaussian | 1e6 | p1 | 3.65 s | 4.43 s | **0.82x (gamfit wins)** |
 | binomial | 1e3 | p1 / p5 | 55 / 52 ms | 1.6 / 4.7 ms | **35x / 11x** |
 | binomial | 1e3 | **te** | **1.36 s [1.19-1.37]** | 2.5 ms | **544x** (about 1.3 ms/row) |
-| binomial | 1e4 | p1 | 470 ms | 11.5 ms | **41x** |
+| binomial | 1e4 | p1 / p5 / te | 470 / 590 / 470 ms | 11.5 / 40 / 22 ms | **41x / 15x / 22x** |
+| poisson | 1e4 | p1 / p5 / te | 33 / 46 / 50 ms | 13 / 47 / 21 ms | 2.5x / 0.99x / 2.4x |
 | poisson | 1e3 / 1e4 | p1 | 4.8 / 36 ms† | 1.4 / 15 ms† | 2.4-3.4x |
 
 Binomial predict against rows (`pred_overhead.py`, s(x), p=11):
@@ -337,7 +341,8 @@ This is exact, not an approximation.
 - Binomial predict costs about 48 µs/row; it is 35x slower than pyGAM at 1e3 rows and 41x at 1e4.
 - For `te(x0, x1)` binomial it is much worse: 1.36 s [1.19-1.37] for 1e3 rows, about 1.3 ms/row
   against pyGAM's 2.5 ms total, which is **544x** (3 reps). I did not trace why te costs 27x more
-  per row than s(x). My guess is that te predictions carry a larger posterior σ, which pushes rows
+  per row than s(x). It is not monotone in n: binomial te predict at n_train=1e4 is only 47 µs/row.
+  My guess is that te predictions carry a larger posterior σ, which pushes rows
   onto the 160-term erfcx series plus the adaptive cross-check.
   Poisson and Gaussian cost about 3 µs/row.
 - `crates/gam-solve/src/quadrature.rs:1127-1150`: `logit_posterior_meanwith_deriv_controlled`
@@ -412,6 +417,7 @@ This is exact, not an approximation.
 
 ## 5. Open measurement gaps
 
+- n=1e4 core is complete (3 reps). Poisson te seed 2 timed out at 900 s wall, so one ordinary 2-D smooth fit at n=1e4 also failed to finish; its log was not captured.
 - n=1e3 is complete: 144 configs × 3 reps. p20 timed out for all three families, with both gamfit variants.
 - n=1e5 and 1e6 GLM, and n=1e5 te, were still running.
 - At 0.2 core per process, a single gamfit binomial fit at 1e5 p5 is expected to take more than
