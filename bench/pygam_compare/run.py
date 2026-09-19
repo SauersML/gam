@@ -2,7 +2,8 @@
 
     python -m bench.pygam_compare.run PLAN --out DIR [--reps R] [--timeout S]
                                               [--memcap-mb M] [--only-libs a,b]
-                                              [--shard I/K] [--lib-path DIR]
+                                              [--designs d1,d2] [--shard I/K]
+                                              [--lib-path DIR]
 
 Writes ``DIR/records.jsonl`` (one JSON object per rep, including reps that
 timed out, blew the memory cap, errored or were not run), ``DIR/meta.json``
@@ -265,6 +266,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--only-libs", help="comma-separated subset of the plan's libs")
     ap.add_argument(
+        "--designs",
+        help="comma-separated subset of the plan's designs (every n and family "
+        "of each), e.g. to re-run the designs a generator change touched",
+    )
+    ap.add_argument(
         "--shard",
         help="I/K: run only the designs whose index in the plan is I mod K, so "
         "K drivers can split a plan across cores (merge with report.py)",
@@ -288,6 +294,14 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             ap.error(f"unknown libs {sorted(unknown)}")
         plan = dataclasses.replace(plan, libs=libs)
+    if args.designs:
+        wanted = set(args.designs.split(","))
+        unknown = wanted - {c.design for c in plan.cells}
+        if unknown:
+            ap.error(f"unknown designs {sorted(unknown)}")
+        plan = dataclasses.replace(
+            plan, cells=tuple(c for c in plan.cells if c.design in wanted)
+        )
     if args.shard:
         index, count = (int(v) for v in args.shard.split("/"))
         if not 0 <= index < count:
