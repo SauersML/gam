@@ -629,6 +629,10 @@ pub(crate) enum FamilyArg {
     GammaLog,
     Tweedie,
     Beta,
+    /// Robust scaled Student-t response on the identity link; its scale and
+    /// degrees of freedom are estimated jointly with the smoothing parameters.
+    #[value(alias = "student_t", alias = "t")]
+    StudentT,
     RoystonParmar,
     Expectile,
     /// Penalized multinomial-logit GAM: a categorical response with K classes

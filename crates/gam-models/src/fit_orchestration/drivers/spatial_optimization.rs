@@ -2769,7 +2769,7 @@ fn wrap_local_build_as_realization(
     termspec: &SmoothTermSpec,
 ) -> Result<SingleSmoothTermRealization, String> {
     let p_local = local.dim;
-    let lb_local = local.lower_bounds.take();
+    let lb_local = local.shape_lower_bounds.take();
 
     // Stage-2 joint-null absorption rotation, same logic as the main
     // aggregation loop in `build_smooth_design_withworkspace_unvalidated`:
@@ -4995,7 +4995,8 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         | ResponseFamily::Tweedie { .. }
         | ResponseFamily::NegativeBinomial { .. }
         | ResponseFamily::Beta { .. }
-        | ResponseFamily::Gamma => gam_problem::SeedRiskProfile::GeneralizedLinear,
+        | ResponseFamily::Gamma
+        | ResponseFamily::StudentT { .. } => gam_problem::SeedRiskProfile::GeneralizedLinear,
     }
 }
 

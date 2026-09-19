@@ -4810,6 +4810,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
     module.add_function(wrap_pyfunction!(inference_notes_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(
         required_saved_model_payload_string,
         module

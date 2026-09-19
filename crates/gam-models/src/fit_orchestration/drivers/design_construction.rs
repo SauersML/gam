@@ -1089,7 +1089,9 @@ fn validate_bounded_observation_inputs(
             }
             ResponseFamily::Tweedie { .. } => yi.is_finite() && yi >= 0.0,
             ResponseFamily::Gamma => yi.is_finite() && yi > 0.0,
-            ResponseFamily::Beta { .. } | ResponseFamily::RoystonParmar => false,
+            ResponseFamily::Beta { .. }
+            | ResponseFamily::StudentT { .. }
+            | ResponseFamily::RoystonParmar => false,
         };
         if !valid {
             return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "bounded-family response", eta[i], yi));
@@ -1396,6 +1398,9 @@ fn exact_standard_observation_row(
         }
         ResponseFamily::Beta { .. } => {
             crate::bail_invalid_estim!("bounded linear terms are not supported for BetaLogit fits");
+        }
+        ResponseFamily::StudentT { .. } => {
+            crate::bail_invalid_estim!("bounded linear terms are not supported for Student-t fits");
         }
         ResponseFamily::RoystonParmar => {
             crate::bail_invalid_estim!(
@@ -2127,7 +2132,9 @@ impl CustomFamily for BoundedLinearFamily {
     ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
         if matches!(
             self.likelihood.spec.response,
-            ResponseFamily::Beta { .. } | ResponseFamily::RoystonParmar
+            ResponseFamily::Beta { .. }
+                | ResponseFamily::StudentT { .. }
+                | ResponseFamily::RoystonParmar
         ) {
             None
         } else {
@@ -3640,6 +3647,7 @@ fn exact_joint_spatial_outer_hessian_available(
         | ResponseFamily::NegativeBinomial { .. }
         | ResponseFamily::Beta { .. }
         | ResponseFamily::Gamma
+        | ResponseFamily::StudentT { .. }
         | ResponseFamily::RoystonParmar => true,
     };
     // A design with zero columns has no joint outer-Hessian to compute;

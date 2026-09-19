@@ -124,22 +124,47 @@ class Smooth(_BasisDescriptor):
         or ``"concave"`` (f''(x) ≤ 0), or a list of those imposed jointly
         (``["monotone_increasing", "concave"]``). Contradictory pairs (both
         monotone directions, or convex with concave) are rejected because
-        they force a constant or an affine function. A tensor-product smooth
-        takes one entry per margin in margin order, each an atom, ``None`` or
-        a list: ``["monotone_increasing", None]`` makes the surface
-        non-decreasing along the first margin at every value of the second.
-        Every margin of a shaped tensor must be a B-spline (``ps``/``bs``):
-        with no ``bs=`` given all margins default to ``ps`` rather than
-        ``cr``, whose basis takes negative values. The constraint is the exact B-spline control-polygon cone
-        ``A·β ≥ 0``, so it certifies the shape on the whole domain, not on a
-        grid; when constraints are active at convergence the outer REML
-        score uses the tangent-projected LAML formulation. With a numeric
-        ``by`` the cone is imposed on ``f``, so the term ``z·f(x)`` has the
-        stated shape in ``x`` only where ``z ≥ 0`` (the mirrored shape where
-        ``z < 0``). This mirrors mgcv's ``scop=...`` argument and the
-        ``scam`` R library. Only open B-spline bases and tensor products of
-        them carry the exact cone; other bases reject non-``None`` shapes
-        with a clear error from the Rust core.
+        they force a constant or an affine function. The constraint is exact
+        and involves no evaluation grid: it is a cone on the raw B-spline
+        control points ``β``. The derivative of a degree-``d`` spline is a
+        degree-``d-1`` spline whose control points are ``d·(β[i+1] - β[i]) /
+        (t[i+d+1] - t[i+1])``, and B-splines are non-negative, so
+        non-negative consecutive control-point differences certify
+        ``f' ≥ 0`` on every knot span. Likewise, non-decreasing
+        control-polygon slopes (divided by the knot-dependent
+        Greville-abscissa gaps, so any knot placement is handled) certify
+        ``f'' ≥ 0``. For a single shape the engine reparameterizes
+        ``β = C·γ`` so the cone becomes the coordinate bounds ``γ_j ≥ 0`` on
+        the difference coordinates, and the penalized fit solves that
+        bound-constrained problem; a list of shapes enters the solver as the
+        merged, de-duplicated inequality rows ``A·β ≥ 0``. Either way the
+        term is centred like an unconstrained smooth (weighted sum-to-zero
+        over the training rows): ``C`` drops the constant level column,
+        which a clamped B-spline basis would duplicate with the intercept,
+        and the rows ``A`` are written in the centred chart, which leaves
+        every control-point difference unchanged. When constraints are
+        active at the optimum, the REML/LAML score is evaluated on the
+        subspace left free by the active face. The certificate is always
+        sufficient. It is also necessary when the constrained derivative is
+        piecewise linear (a monotone quadratic or a convex/concave cubic);
+        for higher degrees it is slightly conservative. A tensor-product
+        smooth takes one entry per margin in margin order, each an atom,
+        ``None`` or a list: ``["monotone_increasing", None]`` makes the
+        surface non-decreasing along the first margin at every value of the
+        second (the margin's cone Kroneckered with identities on the other
+        margins). Every margin of a shaped tensor must be an open B-spline
+        (``ps``/``bs``); with no ``bs=`` given all margins default to ``ps``
+        rather than ``cr``, whose coefficients are knot values, and ``ti()``
+        is rejected because its zero-average slices have no genuine shape.
+        With a factor ``by`` every level's curve carries the cone. With a
+        numeric ``by`` the cone is imposed on ``f``, so the term ``z·f(x)``
+        has the stated shape in ``x`` only where ``z ≥ 0`` (the mirrored
+        shape where ``z < 0``). Supported on open (``periodic=False``)
+        :class:`BSpline` smooths and :class:`TensorBSpline` products of
+        them, with or without ``by``. :class:`Duchon`, :class:`Matern`,
+        :class:`Sphere`, periodic B-splines and every other smooth kind
+        reject a non-``None`` shape constraint with an error from the Rust
+        core.
     """
 
     name: str | None = None

@@ -600,15 +600,6 @@ fn sigma_step_to_rho_domain(
     }
 }
 
-/// Whether every coordinate of `rho` lies in the ρ box, bounds included. A
-/// non-finite coordinate is outside it. An empty box (no ρ block was bounded)
-/// restricts nothing.
-fn rho_within_domain(rho: &Array1<f64>, bounds: &(Array1<f64>, Array1<f64>)) -> bool {
-    rho.iter()
-        .zip(bounds.0.iter().zip(bounds.1.iter()))
-        .all(|(value, (lo, hi))| *value >= *lo && *value <= *hi)
-}
-
 /// The ρ-directions the sigma-point cubature integrates, each with the
 /// first-order ρ-variance it carries: `(axis, variance)`, `axis` a unit
 /// ρ-vector.
@@ -1043,6 +1034,13 @@ impl<'a> RemlState<'a> {
     /// ever turning into a NUTS-over-ρ sampler benchmark.
     ///
     /// [`Escalate`]: gam_problem::rho_posterior::RhoProposalAdequacy::Escalate
+    ///
+    /// `rho_domain` is the box the outer arm searched and certified against
+    /// (the #2812 resolvability domain). It is the support of `π(ρ|y)`: a
+    /// proposal outside it is not a model, so it carries zero importance weight
+    /// and is never handed to the inner solve. A railed coordinate's Laplace
+    /// proposal is near-flat, so without this its draws land hundreds of
+    /// log-units past the face, where P-IRLS has no valid minimum to report.
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
@@ -1087,21 +1085,19 @@ impl<'a> RemlState<'a> {
                 );
             }
         };
+        let in_domain = |rho: &Array1<f64>| {
+            rho.iter().enumerate().all(|(k, &value)| {
+                rho_domain.0.get(k).is_none_or(|&lower| value >= lower)
+                    && rho_domain.1.get(k).is_none_or(|&upper| value <= upper)
+            })
+        };
         let outcome = match escalator.rho_posterior_adequacy(
             final_rho,
             &outer_hessian,
             &|rho| {
-                // The criterion's support is the box the outer arm searched ρ
-                // in (#2412, #2812): a draw outside it is not a model, so its
-                // importance weight is zero and there is nothing to evaluate. A
-                // railed coordinate has a near-flat outer curvature, so the
-                // Gaussian proposal puts draws hundreds of units past the rail,
-                // where λ ≈ e^±600 leaves a constrained inner solve with no
-                // valid minimum to report after a full failed search.
-                if !rho_within_domain(rho, rho_domain) {
-                    return None;
-                }
-                self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
+                in_domain(rho)
+                    .then(|| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()))
+                    .flatten()
             },
             n_samples,
         ) {
@@ -1154,6 +1150,9 @@ impl<'a> RemlState<'a> {
                     final_rho,
                     &outer_hessian,
                     &mut |rho| {
+                        if !in_domain(rho) {
+                            return None;
+                        }
                         self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
                             .and_then(|cost| {
                                 self.rho_prior_distribution_correction(rho)
@@ -1162,6 +1161,9 @@ impl<'a> RemlState<'a> {
                             })
                     },
                     &mut |rho| {
+                        if !in_domain(rho) {
+                            return None;
+                        }
                         self.without_persistent_warm_start_store(|| {
                             // NUTS leapfrog gradients need the criterion value and
                             // gradient at the same rho; compute them through one
@@ -1770,25 +1772,6 @@ impl<'a> RemlState<'a> {
             }
         }
         Ok(outcome)
-    }
-}
-
-#[cfg(test)]
-mod rho_domain_membership_tests {
-    use super::rho_within_domain;
-    use ndarray::array;
-
-    #[test]
-    fn a_draw_past_a_rail_or_non_finite_is_outside_the_rho_box() {
-        let bounds = (array![-16.0, -16.0], array![20.0, 20.0]);
-        assert!(rho_within_domain(&array![0.0, 3.0], &bounds));
-        // The rails themselves are in the box: a railed ρ̂ is a model.
-        assert!(rho_within_domain(&array![-16.0, 20.0], &bounds));
-        // The draws a near-flat railed coordinate produces.
-        assert!(!rho_within_domain(&array![-600.0, 3.0], &bounds));
-        assert!(!rho_within_domain(&array![0.0, 600.0], &bounds));
-        assert!(!rho_within_domain(&array![f64::NAN, 0.0], &bounds));
-        assert!(!rho_within_domain(&array![0.0, f64::INFINITY], &bounds));
     }
 }
 

@@ -134,7 +134,7 @@ fn duchon_spec(pc_dim: usize, k_centers: usize, eta: &[f64]) -> TermCollectionSp
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     }
