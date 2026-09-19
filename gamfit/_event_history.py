@@ -116,8 +116,9 @@ class EventHistoryModel:
 
     @property
     def reference_refinements(self) -> np.ndarray:
-        """Summed time and latent-order reference discrepancies in nats.
-        The final discrepancy must meet the reference tolerance."""
+        """For each reference grid the fit ran on, the move of any fitted
+        coefficient the next grid makes at the fitted coefficients, in
+        posterior standard deviations."""
         return np.asarray(self._native.reference_refinements())
 
     @property
@@ -128,8 +129,9 @@ class EventHistoryModel:
 
     @property
     def reference_certificate(self) -> float | None:
-        """Sum of time-refinement and latent-order discrepancies at fixed
-        coefficients, in nats. ``None`` when the
+        """The reference grid's certificate: the geometric-tail estimate of the
+        moves finer grids make the fitted coefficients take, in posterior
+        standard deviations, within the certificate's tolerance. ``None`` when the
         baselines are centred on the stationary prior."""
         return self._native.reference_certificate()
 
