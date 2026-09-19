@@ -1566,7 +1566,7 @@ fn equivariant_gauge_companion_loss<'py>(
     })
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SparsityPenalty")]
 struct SparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -1750,7 +1750,7 @@ fn py_repr(value: &Bound<'_, PyAny>) -> PyResult<String> {
     value.repr()?.extract()
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "ARDPenalty")]
+#[pyclass(module = "gamfit._rust", name = "ARDPenalty")]
 struct ARDPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -1813,7 +1813,7 @@ impl ARDPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "TopKActivationPenalty")]
+#[pyclass(module = "gamfit._rust", name = "TopKActivationPenalty")]
 struct PyTopKActivationPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -1892,7 +1892,7 @@ impl PyTopKActivationPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SmoothThresholdPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SmoothThresholdPenalty")]
 struct SmoothThresholdPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2093,7 +2093,7 @@ fn validate_aux_conditional_prior_lambda(
     Ok(())
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "BlockSparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "BlockSparsityPenalty")]
 struct BlockSparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2261,7 +2261,7 @@ fn block_sparsity_coerce_groups(groups: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u
     Ok(out)
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SoftmaxAssignmentSparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SoftmaxAssignmentSparsityPenalty")]
 struct SoftmaxAssignmentSparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2348,7 +2348,7 @@ impl SoftmaxAssignmentSparsityPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "IsometryPenalty")]
+#[pyclass(module = "gamfit._rust", name = "IsometryPenalty")]
 struct IsometryPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2413,7 +2413,7 @@ impl IsometryPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "OrderedBetaBernoulliPenalty")]
+#[pyclass(module = "gamfit._rust", name = "OrderedBetaBernoulliPenalty")]
 struct PyOrderedBetaBernoulliPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2563,7 +2563,7 @@ fn total_variation_coerce_edges(edges: &Bound<'_, PyAny>) -> PyResult<Vec<(i64, 
     Ok(out)
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "TotalVariationPenalty")]
+#[pyclass(module = "gamfit._rust", name = "TotalVariationPenalty")]
 struct TotalVariationPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2832,7 +2832,7 @@ fn validate_parametric_aux_conditional_prior(
 use gam::terms::sae::assignment::inverse_softplus as inverse_softplus_scalar;
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "ParametricAuxConditionalPriorPenalty"
 )]
 struct ParametricAuxConditionalPriorPenalty {
@@ -3057,7 +3057,7 @@ impl ParametricAuxConditionalPriorPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "OrthogonalityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "OrthogonalityPenalty")]
 struct OrthogonalityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3140,7 +3140,7 @@ impl OrthogonalityPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "ScadMcpPenalty")]
+#[pyclass(module = "gamfit._rust", name = "ScadMcpPenalty")]
 struct ScadMcpPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3285,7 +3285,7 @@ impl ScadMcpPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "IvaeRidgeMeanGauge")]
+#[pyclass(module = "gamfit._rust", name = "IvaeRidgeMeanGauge")]
 struct IvaeRidgeMeanGauge {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3488,7 +3488,7 @@ fn validate_ivae_ridge_mean_gauge_aux(
     Ok(())
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "MechanismSparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "MechanismSparsityPenalty")]
 struct MechanismSparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3746,7 +3746,7 @@ fn mechanism_weight_schedule_descriptor(py: Python<'_>, schedule: &PyObject) -> 
     ))
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "BlockOrthogonalityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "BlockOrthogonalityPenalty")]
 struct BlockOrthogonalityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3921,7 +3921,7 @@ impl BlockOrthogonalityPenalty {
 // SheafConsistencyPenalty — cellular-sheaf consistency loss.
 // ---------------------------------------------------------------------------
 
-#[pyclass(module = "gam_pyffi._rust", name = "SheafConsistencyPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SheafConsistencyPenalty")]
 struct SheafConsistencyPenalty {
     inner: CoreSheafConsistencyPenalty,
     #[pyo3(get)]
@@ -4188,7 +4188,7 @@ impl SheafConsistencyPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "AuxConditionalPriorPenalty")]
+#[pyclass(module = "gamfit._rust", name = "AuxConditionalPriorPenalty")]
 struct AuxConditionalPriorPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -4335,7 +4335,7 @@ impl AuxConditionalPriorPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "NuclearNormPenalty")]
+#[pyclass(module = "gamfit._rust", name = "NuclearNormPenalty")]
 struct NuclearNormPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -5104,7 +5104,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(auc_from_predictions, module)?)?;
-    module.add_function(wrap_pyfunction!(weighted_auc_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(brier_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
@@ -6470,7 +6469,7 @@ fn mdl_featurizer_to_py(py: Python<'_>, row: &MdlFeaturizerRow) -> PyResult<Py<P
 /// routes and accumulates one shard; `end_epoch()` refreshes the decoder and
 /// revives dead atoms; `finalize()` returns the decoder + metadata. The decoder
 /// and dead-atom revival state warm-start across every call.
-#[pyclass(module = "gam_pyffi._rust", name = "SparseDictStream")]
+#[pyclass(module = "gamfit._rust", name = "SparseDictStream")]
 struct SparseDictStream {
     inner: SparseDictStreamState,
 }
@@ -6599,7 +6598,7 @@ impl SparseDictStream {
 /// routes + accumulates one shard, `end_epoch()` refreshes γ + frames and revives
 /// dead blocks, `finalize()` returns the frames + γ + per-block report. The frames,
 /// γ, and revival state warm-start across every call.
-#[pyclass(module = "gam_pyffi._rust", name = "BlockSparseDictStream")]
+#[pyclass(module = "gamfit._rust", name = "BlockSparseDictStream")]
 struct BlockSparseDictStream {
     inner: BlockSparseStreamState,
 }

@@ -383,6 +383,19 @@ pub(crate) fn marginal_slope_z_alias_is_live(
 // ParsedTerm[] + Dataset → TermCollectionSpec
 // ---------------------------------------------------------------------------
 
+/// A categorical column cannot be the argument of a term that treats its
+/// input as a numeric axis: the category codes would be read as positions on
+/// a line, silently fitting an arbitrary order. Point the user at the
+/// categorical spellings instead.
+fn categorical_in_numeric_term_error(term: &str, column: &str) -> TermBuilderError {
+    TermBuilderError::incompatible_config(format!(
+        "{term} treats its arguments as numeric axes, but column '{column}' is \
+         categorical; use factor({column}) for a categorical level effect, \
+         group({column}) for a random effect, or s(x, {column}, bs=\"fs\") for a \
+         per-level smooth of a numeric x"
+    ))
+}
+
 pub fn build_termspec(
     terms: &[ParsedTerm],
     ds: &Dataset,
@@ -478,6 +491,9 @@ pub fn build_termspec(
                     .to_string()
                 })?;
                 if *explicit {
+                    if matches!(auto_kind, ColumnKindTag::Categorical) {
+                        return Err(categorical_in_numeric_term_error("linear()", name));
+                    }
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
                         feature_col: col,
@@ -2591,6 +2607,19 @@ pub(crate) fn build_smooth_basis(
 
     let smooth_double_penalty = option_bool(options, "double_penalty")?.unwrap_or(true);
     let type_opt = resolve_smooth_type_name(kind, cols.len(), options);
+
+    // Only the factor-smooth family (fs/sz/re) consumes a categorical column
+    // as a grouping factor. Every other smooth places its inputs on numeric
+    // axes, where category codes would silently fit an arbitrary level order.
+    if !matches!(type_opt.as_str(), "fs" | "sz" | "re")
+        && let Some((var, _)) = vars.iter().zip(cols.iter()).find(|(_, col)| {
+            matches!(ds.column_kinds.get(**col), Some(ColumnKindTag::Categorical))
+        })
+    {
+        return Err(
+            categorical_in_numeric_term_error(&format!("a '{type_opt}' smooth"), var).to_string(),
+        );
+    }
 
     if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
         if type_opt == "re" {
