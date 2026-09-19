@@ -58,12 +58,7 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_initial_rho(array![SEED_3017])
-        .with_bounds(array![-30.0], array![30.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_bounds(array![-30.0], array![30.0]);
     let mut obj = problem.build_objective(
         State::default(),
         |_: &mut State, theta: &Array1<f64>| Ok(value_3017(theta[0])),
