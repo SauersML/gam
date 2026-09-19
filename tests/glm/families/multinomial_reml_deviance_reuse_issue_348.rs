@@ -72,7 +72,7 @@ fn multinomial_formula_deviance_equals_independent_softmax_recompute() {
     init_parallelism();
     let (data, labels) = categorical_dataset();
 
-    // Same entry point + tuning the Python FFI uses (fit_multinomial_formula_pyfunc).
+    // Same entry point + tuning the Python FFI uses (`fit_table`, multinomial family).
     let config = FitConfig::default();
     let model =
         fit_penalized_multinomial_formula(&MultinomialFitRequest::new(&data, "y ~ x", &config))

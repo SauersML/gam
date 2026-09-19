@@ -306,6 +306,7 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
     mean_plugin: ArrayView1<'_, f64>,
     posterior_mean: Option<ArrayView1<'_, f64>>,
     noise_scale: Option<ArrayView1<'_, f64>>,
+    expectile_curves: &[(String, Array1<f64>)],
     linear_predictor_standard_error: Option<ArrayView1<'_, f64>>,
     posterior_mean_standard_error: Option<ArrayView1<'_, f64>>,
     posterior_mean_lower: Option<ArrayView1<'_, f64>>,
@@ -327,6 +328,13 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
     let noise_scale = noise_scale.map(|values| values.to_vec());
     if let Some(values) = noise_scale.as_ref() {
         columns.push((PREDICTION_NOISE_SCALE_COLUMN, values));
+    }
+    // A joint expectile fit's level curves, in increasing level order.
+    for (name, curve) in expectile_curves {
+        let values = curve.as_slice().ok_or_else(|| CliError::Internal {
+            reason: format!("expectile curve `{name}` is not contiguous"),
+        })?;
+        columns.push((name.as_str(), values));
     }
 
     let eta_standard_error = linear_predictor_standard_error.map(|values| values.to_vec());

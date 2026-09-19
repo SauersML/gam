@@ -1090,12 +1090,22 @@ pub(crate) fn run_predict_unified(
             // estimand a prediction surface reports, and the plug-in pair is
             // carried by name, not selected by a mode.
             let published_posterior_mean = posterior_mean.as_ref().map(|values| values.view());
+            // A joint expectile fit publishes its level curves `E[μ] + c_k·E[σ]`.
+            let expectile_curves = gam_predict::joint_expectile_curves(
+                model,
+                predictor,
+                pred_input,
+                specialised_point,
+            )
+            .map_err(|e| format!("expectile curve prediction failed: {e}"))?
+            .unwrap_or_default();
             write_estimand_explicit_prediction_csv(
                 &args.out,
                 linear_predictor_plugin.view(),
                 mean_plugin.view(),
                 published_posterior_mean,
                 noise_scale.as_ref().map(|values| values.view()),
+                &expectile_curves,
                 linear_predictor_standard_error.as_ref().map(|a| a.view()),
                 posterior_mean_standard_error.as_ref().map(|a| a.view()),
                 posterior_mean_lower.as_ref().map(|a| a.view()),
@@ -1273,6 +1283,7 @@ pub(crate) fn run_predict_spline_scan(
         mean.view(),
         Some(mean.view()),
         None,
+        &[],
         // Identity link: η and the response share one posterior SD.
         se_opt.as_ref().map(|a| a.view()),
         se_opt.as_ref().map(|a| a.view()),
@@ -1356,6 +1367,7 @@ pub(crate) fn run_predict_residual_cascade(
         mean.view(),
         Some(mean.view()),
         None,
+        &[],
         // Identity link: η and the response share one posterior SD.
         se_opt.as_ref().map(|a| a.view()),
         se_opt.as_ref().map(|a| a.view()),

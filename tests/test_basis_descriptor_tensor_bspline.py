@@ -1,5 +1,5 @@
-"""Callable-basis contract for :class:`gamfit.TensorBSpline` (also covers
-:func:`gamfit.Cylinder` / :func:`gamfit.Torus`, which are factory functions
+"""Callable-basis contract for :class:`gamfit.smooth.TensorBSpline` (also covers
+:func:`gamfit.topology.Cylinder` / :func:`gamfit.topology.Torus`, which are factory functions
 returning a :class:`TensorBSpline`).
 """
 
@@ -13,13 +13,13 @@ torch = pytest.importorskip("torch")
 import gamfit
 
 
-def _tensor_spec() -> "gamfit.TensorBSpline":
+def _tensor_spec() -> "gamfit.smooth.TensorBSpline":
     knots_a = np.linspace(0.0, 1.0, 7 + 2 * 3)
     knots_b = np.linspace(0.0, 1.0, 5 + 2 * 3)
-    return gamfit.TensorBSpline(
+    return gamfit.smooth.TensorBSpline(
         marginals=[
-            gamfit.BSpline(knots=knots_a, degree=3, periodic=False),
-            gamfit.BSpline(knots=knots_b, degree=3, periodic=False),
+            gamfit.smooth.BSpline(knots=knots_a, degree=3, periodic=False),
+            gamfit.smooth.BSpline(knots=knots_b, degree=3, periodic=False),
         ]
     )
 

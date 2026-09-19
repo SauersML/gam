@@ -330,6 +330,7 @@ fn build_sample_payload(
         // produced them (gam#2778); nothing here re-derives it from the
         // model class.
         method: nuts.sampler.label().to_string(),
+        acceptance_rate: nuts.sampler.acceptance_rate(),
         exact: nuts.sampler.targets_exact_posterior(),
         covariance_source: nuts.covariance.as_str().to_string(),
     })
@@ -966,6 +967,21 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     serde_json::to_string(&summary).map_err(|err| format!("failed to serialize summary: {err}"))
 }
 
+/// The summary payload with its rendered text under `"text"`: the one Rust
+/// renderer `gam summary` prints, so `str(model.summary())` is that same string.
+fn summary_value_with_text_impl(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let model = load_model_impl(model_bytes)?;
+    let summary = saved_model_summary(&model)?;
+    let text = render_summary_text(&summary);
+    let mut value = serde_json::to_value(&summary)
+        .map_err(|err| format!("failed to serialize summary: {err}"))?;
+    let serde_json::Value::Object(fields) = &mut value else {
+        return Err("model summary payload must be a JSON object".to_string());
+    };
+    fields.insert("text".to_string(), serde_json::Value::String(text));
+    Ok(value)
+}
+
 /// One `curv(...)` term's #944 report, JSON-serialized for the Python surface.
 #[derive(Serialize)]
 struct CurvatureInferenceRow {
@@ -1102,9 +1118,21 @@ struct SmoothTermLrRow {
     correction_provenance: &'static str,
 }
 
+/// A smooth term the per-term LR test does not report, with its typed reason.
+#[derive(Serialize)]
+struct SmoothTermLrUnavailableRow {
+    name: String,
+    term_idx: usize,
+    /// Machine-readable reason, e.g. `"shape_constrained"`.
+    p_value_unavailable: &'static str,
+    /// One-sentence explanation of why no p-value exists.
+    explanation: &'static str,
+}
+
 #[derive(Serialize)]
 struct SmoothTermLrPayload {
     smooth_terms: Vec<SmoothTermLrRow>,
+    unavailable: Vec<SmoothTermLrUnavailableRow>,
 }
 
 fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
@@ -1247,6 +1275,7 @@ fn smooth_term_lr_inference_dataset_json_impl(
     if spec.smooth_terms.is_empty() {
         let payload = SmoothTermLrPayload {
             smooth_terms: Vec::new(),
+            unavailable: Vec::new(),
         };
         return serde_json::to_string(&payload)
             .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"));
@@ -1316,7 +1345,21 @@ fn smooth_term_lr_inference_dataset_json_impl(
         })
         .collect::<Vec<_>>();
 
-    let payload = SmoothTermLrPayload { smooth_terms };
+    let unavailable =
+        gam::families::fit_orchestration::drivers::smooth_term_lr_unavailable_forspec(&spec)
+            .into_iter()
+            .map(|r| SmoothTermLrUnavailableRow {
+                name: r.name,
+                term_idx: r.term_idx,
+                p_value_unavailable: r.reason.label(),
+                explanation: r.reason.explanation(),
+            })
+            .collect::<Vec<_>>();
+
+    let payload = SmoothTermLrPayload {
+        smooth_terms,
+        unavailable,
+    };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"))
 }

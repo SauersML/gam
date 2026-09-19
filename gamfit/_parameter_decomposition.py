@@ -44,7 +44,7 @@ def run_parameter_decomposition(
     """Run one ``gam.mpd-request`` document against its named input arrays.
 
     Every validation and refusal happens in Rust; a refused request raises
-    :class:`gamfit.GamError`. JSON has no non-finite numbers, so a request
+    :class:`gamfit.errors.GamError`. JSON has no non-finite numbers, so a request
     holding one is rejected by :func:`json.dumps` before Rust is called.
     """
     report_json, arrays = rust_module().parameter_decomposition_run(

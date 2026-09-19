@@ -16,7 +16,7 @@ the marginal diverges, with a message that names the observed sd, the threshold,
 and concrete remedies (check units, centre/rescale, or drop the column).
 
 This test pins both directions: the near-constant reproducer raises a clean
-``gamfit.GamError`` (no panic, no inf-crash message), and a well-conditioned
+``gamfit.errors.GamError`` (no panic, no inf-crash message), and a well-conditioned
 response with the same shape fits successfully (no over-rejection).
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ def test_near_constant_gaussian_response_rejected_cleanly() -> None:
         "y": rng.normal(scale=1e-13, size=n),
     }
 
-    with pytest.raises(gamfit.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.GamError) as excinfo:
         gamfit.fit(data, "y ~ s(x)", family="gaussian")
 
     msg = str(excinfo.value)

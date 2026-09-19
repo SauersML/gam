@@ -491,7 +491,7 @@ def audit_sae(
     report = dict(payload)
     report["checkpoint"] = checkpoint_meta
     report["route_source"] = route_meta
-    report["api"] = "gamfit.audit_sae"
+    report["api"] = "gamfit.sae.audit_sae"
     return report
 
 
@@ -814,7 +814,7 @@ def _contract_tuples(chain: list[tuple[str, float, float, float]]) -> list[tuple
     return [(str(n), float(dr), float(de), float(li)) for n, dr, de, li in chain]
 
 
-def _composed_contract(payload: dict) -> ComposedContract:
+def _composed_contract(payload: dict[str, Any]) -> ComposedContract:
     return ComposedContract(
         total_defect=float(payload["total_defect"]),
         per_stage_contribution=[float(v) for v in payload["per_stage_contribution"]],

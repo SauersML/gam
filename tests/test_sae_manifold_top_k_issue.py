@@ -17,7 +17,7 @@ def test_smooth_assignments_reject_top_k(assignment: str) -> None:
     with pytest.raises(
         ValueError, match=r"valid only with assignment_kind 'topk'"
     ):
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=_random_inputs(),
             K=3,
             atom_basis="periodic",
@@ -30,7 +30,7 @@ def test_smooth_assignments_reject_top_k(assignment: str) -> None:
 
 @pytest.mark.parametrize("support", [1, 2])
 def test_topk_fit_uses_exact_fixed_support(support: int) -> None:
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=_random_inputs(),
         K=4,
         atom_basis="periodic",
@@ -46,7 +46,7 @@ def test_topk_fit_uses_exact_fixed_support(support: int) -> None:
 
 
 def test_topk_payload_is_one_unprojected_model() -> None:
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=_random_inputs(),
         K=3,
         atom_basis="periodic",
@@ -72,7 +72,7 @@ def test_overcomplete_topk_defaults_reach_the_support_lane_2627() -> None:
     descriptor that the lane then refused ("does not accept dense-coordinate or coefficient
     penalties"). With the default resolved to what the lane accepts, the default call fits.
     """
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=_random_inputs(),
         K=6,
         d_atom=1,
@@ -89,7 +89,7 @@ def test_overcomplete_topk_defaults_reach_the_support_lane_2627() -> None:
 
 def test_overcomplete_topk_refuses_an_explicit_sparsity_weight_2627() -> None:
     with pytest.raises(ValueError, match=r"sparsity_weight=0.5 has no coordinate to scale"):
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=_random_inputs(),
             K=6,
             d_atom=1,
