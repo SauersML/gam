@@ -354,15 +354,6 @@ impl OrthantLogMass {
         (sigma, mu)
     }
 
-    /// Site `j`'s cavity read from a freshly formed posterior: the re-inverted reference the
-    /// fixed-point tests sweep with.
-    #[cfg(test)]
-    fn cavity(&self, j: usize) -> (f64, f64) {
-        let (sigma, mu) = self.posterior();
-        let s_jj = sigma[[j, j]];
-        (1.0 / s_jj - self.tau[j], mu[j] / s_jj - self.nu[j])
-    }
-
     /// `ln Z_EP` and the summed magnitude of its terms,
     ///
     /// `Σ_j [ln Φ(z_j) + ½ln(1 + τ̃_j v_j) + ½(τ̃_j m_j − ν̃_j)²/(τ̃_j(1 + τ̃_j v_j))]
@@ -775,6 +766,14 @@ mod tests {
     use gam_math::probability::normal_logcdf;
     use ndarray::array;
 
+    /// Site `j`'s cavity read from a freshly formed posterior: the re-inverted reference the
+    /// fixed-point tests sweep with.
+    fn cavity(mass: &OrthantLogMass, j: usize) -> (f64, f64) {
+        let (sigma, mu) = mass.posterior();
+        let s_jj = sigma[[j, j]];
+        (1.0 / s_jj - mass.tau[j], mu[j] / s_jj - mass.nu[j])
+    }
+
     /// A rounding band for a quantity assembled from terms of total magnitude `magnitude` in
     /// `operations` rounded steps.
     fn band(operations: usize, magnitude: f64) -> f64 {
@@ -852,7 +851,7 @@ mod tests {
         let mut checked = mass.clone();
         let q = m0.len();
         for j in 0..q {
-            let (tau_c, nu_c) = checked.cavity(j);
+            let (tau_c, nu_c) = cavity(&checked, j);
             let update = site_update(tau_c, nu_c);
             checked.tau[j] = update.tau;
             checked.nu[j] = update.nu;
@@ -970,7 +969,7 @@ mod tests {
             .unwrap_or_else(|refusal| panic!("EP settles on the correlated orthant: {refusal}"));
         let mut checked = mass.clone();
         for j in 0..q {
-            let (tau_c, nu_c) = checked.cavity(j);
+            let (tau_c, nu_c) = cavity(&checked, j);
             let update = site_update(tau_c, nu_c);
             checked.tau[j] = update.tau;
             checked.nu[j] = update.nu;
