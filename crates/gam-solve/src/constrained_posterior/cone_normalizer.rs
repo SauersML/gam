@@ -36,13 +36,20 @@
 //! added to. A row with no posterior spread along its normal (its normal in the kernel of the
 //! pseudo-inverse the criterion prices) removes no mass and is skipped, as [`super`] skips it.
 //! No dependence filter is needed: nothing below forms `W⁻¹`, so rows whose normals are linearly
-//! dependent are admissible.
+//! dependent are admissible. A row repeated exactly is the same half-space, and the intersection
+//! holds it once, so it enters once. EP would give each copy its own site and count its
+//! truncation once per copy. A family whose cone is declared over its data rows repeats a row
+//! for every tied data row: the transformation-normal cone `ψ_iᵀA_k ≥ 0` repeats each response
+//! row once per data row of an intercept-only fit.
 //!
 //! # `ln P` by expectation propagation
 //!
 //! `P(u ≥ 0)` has no closed form beyond two rows. It is estimated by EP on the orthant's
 //! half-line indicators (Cunningham, Hennig and Lacoste-Julien, 2011): deterministic, smooth in
-//! `(m₀, W)`, and exact for one row and for rows whose normals are `M⁻¹`-orthogonal. A sweep
+//! `(m₀, W)`, and exact for one row and for rows whose normals are `M⁻¹`-orthogonal. Each sweep
+//! visits the sites in order, carrying the posterior from one site to the next by the rank-one
+//! update the site's move makes to its precision, `O(q²)` a site, and forms the posterior
+//! exactly again at the sweep's end. A sweep
 //! that moves `ln Z_EP` by no more than its own rounding band ends the iteration. The change need
 //! not fall monotonically on the way: on strongly correlated rows it can grow for one sweep and
 //! then contract geometrically. A sweep that fails to contract halves the step every later site
@@ -246,6 +253,19 @@ pub struct OrthantLogMass {
     /// The share of its full update each site took on the last sweep: 1 unless a sweep failed to
     /// contract.
     fraction: f64,
+    /// The linearized fixed point at these sites, formed on the first derivative that reads it.
+    site_motion_system: std::sync::OnceLock<Result<SiteMotionSystem, ConeNormalizerRefusal>>,
+}
+
+/// What the sites' motion reads at a fixed point that does not depend on the direction of the
+/// motion: the posterior `(Σ, μ)`, each site's update partials in its cavity, and the inverse of
+/// `I − ∂F/∂s`. Every direction of every coordinate pair solves with the same inverse.
+#[derive(Clone, Debug)]
+struct SiteMotionSystem {
+    sigma: Array2<f64>,
+    mu: Array1<f64>,
+    jacobians: Vec<[f64; 4]>,
+    inverse: Array2<f64>,
 }
 
 impl OrthantLogMass {
@@ -264,6 +284,7 @@ impl OrthantLogMass {
             log_mass: 0.0,
             sweeps: 0,
             fraction: 1.0,
+            site_motion_system: std::sync::OnceLock::new(),
         };
         if q == 0 {
             return Ok(state);
@@ -274,8 +295,18 @@ impl OrthantLogMass {
         loop {
             state.sweeps += 1;
             let (mut at_fixed_point, mut moved) = (true, false);
+            // The sweep starts from the posterior of its sites, formed exactly, and carries it
+            // from site to site by the rank-one update a site's move makes to the precision
+            // `W⁻¹ + T`: with `c = Δτ̃/(1 + Δτ̃ Σ_jj)`, `Σ ← Σ − c Σ_{:j}Σ_{j:}` and
+            // `μ ← μ + Σ_{:j}(Δν̃ − Δτ̃ μ_j)/(1 + Δτ̃ Σ_jj)`. Site `j` reads the same cavity it
+            // would from `(E W, E(m₀ + W ν̃))` at the sites before it, in `O(q²)` instead of the
+            // `O(q³)` of forming and inverting `I + WT` again. `1 + Δτ̃ Σ_jj = Σ_jj (τ_c + τ̃_j)` is
+            // positive for an admissible cavity, since the new `τ̃_j` is not negative.
+            let (mut sigma, mut mu) = state.posterior();
             for j in 0..q {
-                let (tau_c, nu_c) = state.cavity(j);
+                let s_jj = sigma[[j, j]];
+                let tau_c = 1.0 / s_jj - state.tau[j];
+                let nu_c = mu[j] / s_jj - state.nu[j];
                 if !(tau_c > 0.0 && tau_c.is_finite()) {
                     return Err(ConeNormalizerRefusal::CavityPrecision {
                         row: j,
@@ -288,10 +319,22 @@ impl OrthantLogMass {
                 let tau = (1.0 - fraction) * state.tau[j] + fraction * update.tau;
                 let nu = (1.0 - fraction) * state.nu[j] + fraction * update.nu;
                 moved |= tau != state.tau[j] || nu != state.nu[j];
+                let (d_tau, d_nu) = (tau - state.tau[j], nu - state.nu[j]);
                 state.tau[j] = tau;
                 state.nu[j] = nu;
-                state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
+                let denominator = 1.0 + d_tau * s_jj;
+                let column = sigma.column(j).to_owned();
+                let mean_step = (d_nu - d_tau * mu[j]) / denominator;
+                mu.scaled_add(mean_step, &column);
+                let shrink = d_tau / denominator;
+                for a in 0..q {
+                    let scaled = shrink * column[a];
+                    for b in 0..q {
+                        sigma[[a, b]] -= scaled * column[b];
+                    }
+                }
             }
+            state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
             let (log_mass, magnitude) = state.evaluate_log_mass()?;
             let change = (log_mass - previous).abs();
             // Every term of ln Z_EP is formed in O(q²) rounded operations. A damped sweep moves
@@ -324,12 +367,6 @@ impl OrthantLogMass {
         let sigma = self.e.dot(&self.w);
         let mu = self.e.dot(&(&self.m0 + &self.w.dot(&self.nu)));
         (sigma, mu)
-    }
-
-    fn cavity(&self, j: usize) -> (f64, f64) {
-        let (sigma, mu) = self.posterior();
-        let s_jj = sigma[[j, j]];
-        (1.0 / s_jj - self.tau[j], mu[j] / s_jj - self.nu[j])
     }
 
     /// `ln Z_EP` and the summed magnitude of its terms,
@@ -457,45 +494,69 @@ impl OrthantLogMass {
     /// Per unit site change the posterior moves by `dΣ/dτ̃_k = −Σ_{:k}Σ_{k:}`,
     /// `dμ/dτ̃_k = −Σ_{:k} μ_k`, `dμ/dν̃_k = Σ_{:k}`; along `(dm₀, dW)` by `dΣ = E dW Eᵀ` and
     /// `dμ = E dm₀ + E dW (ν̃ − Tμ)`. Site `j` reads the cavity
-    /// `(1/Σ_jj − τ̃_j, μ_j/Σ_jj − ν̃_j)`.
+    /// `(1/Σ_jj − τ̃_j, μ_j/Σ_jj − ν̃_j)`. Only the right-hand side depends on the direction; the
+    /// system is the fixed point's own ([`Self::linearized_fixed_point`]).
     fn site_motion(
         &self,
         dm0: &Array1<f64>,
         dw: &Array2<f64>,
     ) -> Result<(Array1<f64>, Array1<f64>), ConeNormalizerRefusal> {
         let q = self.m0.len();
-        let (sigma, mu) = self.posterior();
+        let system = self.linearized_fixed_point()?;
+        let (sigma, mu) = (&system.sigma, &system.mu);
         let d_sigma = self.e.dot(dw).dot(&self.e.t());
-        let shift = &self.nu - &(&self.tau * &mu);
+        let shift = &self.nu - &(&self.tau * mu);
         let d_mu = self.e.dot(dm0) + self.e.dot(&dw.dot(&shift));
-        let mut system = Array2::<f64>::eye(2 * q);
         let mut rhs = Array1::<f64>::zeros(2 * q);
         for j in 0..q {
             let s_jj = sigma[[j, j]];
-            let tau_c = 1.0 / s_jj - self.tau[j];
-            let nu_c = mu[j] / s_jj - self.nu[j];
-            let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = site_update(tau_c, nu_c).jacobian;
+            let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = system.jacobians[j];
             let s2 = s_jj * s_jj;
-            let cavity_rate = |d_sjj: f64, d_muj: f64| -> (f64, f64) {
-                (-d_sjj / s2, d_muj / s_jj - mu[j] * d_sjj / s2)
-            };
-            for k in 0..q {
-                let (dtc, dnc) =
-                    cavity_rate(-sigma[[j, k]] * sigma[[j, k]], -sigma[[j, k]] * mu[k]);
-                let dtc = if k == j { dtc - 1.0 } else { dtc };
-                system[[j, k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                system[[q + j, k]] -= dn_dtc * dtc + dn_dnc * dnc;
-                let (dtc, dnc) = cavity_rate(0.0, sigma[[j, k]]);
-                let dnc = if k == j { dnc - 1.0 } else { dnc };
-                system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
-            }
-            let (dtc, dnc) = cavity_rate(d_sigma[[j, j]], d_mu[j]);
+            let (dtc, dnc) = (-d_sigma[[j, j]] / s2, d_mu[j] / s_jj - mu[j] * d_sigma[[j, j]] / s2);
             rhs[j] = dt_dtc * dtc + dt_dnc * dnc;
             rhs[q + j] = dn_dtc * dtc + dn_dnc * dnc;
         }
-        let ds = invert(system, "the linearized EP fixed point")?.dot(&rhs);
+        let ds = system.inverse.dot(&rhs);
         Ok((ds.slice(s![0..q]).to_owned(), ds.slice(s![q..2 * q]).to_owned()))
+    }
+
+    /// The posterior, the site partials and the inverse of the linearized fixed point's
+    /// `2q × 2q` system `I − ∂F/∂s`, formed once for these sites.
+    fn linearized_fixed_point(&self) -> Result<&SiteMotionSystem, ConeNormalizerRefusal> {
+        self.site_motion_system
+            .get_or_init(|| {
+                let q = self.m0.len();
+                let (sigma, mu) = self.posterior();
+                let mut system = Array2::<f64>::eye(2 * q);
+                let mut jacobians = Vec::with_capacity(q);
+                for j in 0..q {
+                    let s_jj = sigma[[j, j]];
+                    let tau_c = 1.0 / s_jj - self.tau[j];
+                    let nu_c = mu[j] / s_jj - self.nu[j];
+                    let jacobian = site_update(tau_c, nu_c).jacobian;
+                    let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobian;
+                    jacobians.push(jacobian);
+                    let s2 = s_jj * s_jj;
+                    let cavity_rate = |d_sjj: f64, d_muj: f64| -> (f64, f64) {
+                        (-d_sjj / s2, d_muj / s_jj - mu[j] * d_sjj / s2)
+                    };
+                    for k in 0..q {
+                        let (dtc, dnc) =
+                            cavity_rate(-sigma[[j, k]] * sigma[[j, k]], -sigma[[j, k]] * mu[k]);
+                        let dtc = if k == j { dtc - 1.0 } else { dtc };
+                        system[[j, k]] -= dt_dtc * dtc + dt_dnc * dnc;
+                        system[[q + j, k]] -= dn_dtc * dtc + dn_dnc * dnc;
+                        let (dtc, dnc) = cavity_rate(0.0, sigma[[j, k]]);
+                        let dnc = if k == j { dnc - 1.0 } else { dnc };
+                        system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
+                        system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
+                    }
+                }
+                let inverse = invert(system, "the linearized EP fixed point")?;
+                Ok(SiteMotionSystem { sigma, mu, jacobians, inverse })
+            })
+            .as_ref()
+            .map_err(|refusal| refusal.clone())
     }
 }
 
@@ -577,12 +638,22 @@ impl ConeNormalizer {
         let center = beta - &y;
         let p = beta.len();
         let mut kept: Vec<(Array1<f64>, Array1<f64>, f64)> = Vec::new();
+        let mut half_spaces = std::collections::HashSet::<Vec<u64>>::new();
         for row in 0..rows.nrows() {
             let norm = rows.row(row).dot(&rows.row(row)).sqrt();
             if !(norm > 0.0) {
                 continue;
             }
             let unit = rows.row(row).mapv(|value| value / norm);
+            let bound = bounds[row] / norm;
+            // A row repeated exactly bounds the same half-space, and an intersection holds it
+            // once: `P(u ≥ 0)` is the same with the repeat as without it. EP is not, since it
+            // gives each copy its own site, so a repeat enters once.
+            let half_space: Vec<u64> =
+                unit.iter().chain(std::iter::once(&bound)).map(|value| (value + 0.0).to_bits()).collect();
+            if !half_spaces.insert(half_space) {
+                continue;
+            }
             let solved = solve(&unit);
             let variance = unit.dot(&solved);
             if !variance.is_finite() {
@@ -591,7 +662,7 @@ impl ConeNormalizer {
             if !(variance > 0.0) {
                 continue;
             }
-            let mean = unit.dot(&center) - bounds[row] / norm;
+            let mean = unit.dot(&center) - bound;
             if mean / variance.sqrt() < horizon {
                 kept.push((unit, solved, mean));
             }
@@ -767,6 +838,20 @@ mod tests {
         move |rhs: &Array1<f64>| inverse.dot(rhs)
     }
 
+    /// One undamped EP sweep read straight off the definitions: each site's cavity from
+    /// `Σ = EW` and `μ = E(m₀ + Wν̃)` re-formed from `E = (I + WT)⁻¹` after every site.
+    fn sequential_site_sweep(state: &mut OrthantLogMass) {
+        for j in 0..state.m0.len() {
+            let (sigma, mu) = state.posterior();
+            let s_jj = sigma[[j, j]];
+            let update = site_update(1.0 / s_jj - state.tau[j], mu[j] / s_jj - state.nu[j]);
+            state.tau[j] = update.tau;
+            state.nu[j] = update.nu;
+            state.e = inverse_i_plus_wt(&state.w, &state.tau).expect("admissible sites");
+        }
+        state.site_motion_system = std::sync::OnceLock::new();
+    }
+
     /// The change of `ln Z_EP` need not fall monotonically. This orthant is where EP was refused on
     /// the #2765 named gate for one growing sweep (seven rows correlated up to 0.98; job 1264873,
     /// change 1.047e-5 after 1.546e-7 at sweep 5). Continued undamped from there, the same
@@ -799,13 +884,7 @@ mod tests {
             .unwrap_or_else(|refusal| panic!("EP settles on the recorded orthant: {refusal}"));
         let mut checked = mass.clone();
         let q = m0.len();
-        for j in 0..q {
-            let (tau_c, nu_c) = checked.cavity(j);
-            let update = site_update(tau_c, nu_c);
-            checked.tau[j] = update.tau;
-            checked.nu[j] = update.nu;
-            checked.e = inverse_i_plus_wt(&checked.w, &checked.tau).expect("admissible sites");
-        }
+        sequential_site_sweep(&mut checked);
         let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
         let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
         eprintln!(
@@ -1078,6 +1157,111 @@ mod tests {
         assert!(
             (second - fd2).abs() <= bar2,
             "d²C {second} against central difference of dC {fd2} (bar {bar2})"
+        );
+    }
+
+    /// gam#3135 (the property gam-2959 proposed for #2959 M7): the rank-one sweep stops at a fixed
+    /// point of the definition's sweep. On a correlated three-row orthant, a twelve-row banded one
+    /// and a twelve-row one near rank one, a further sweep that re-forms the posterior after every
+    /// site moves `ln P` by no more than the rounding band EP stops at.
+    #[test]
+    fn the_rank_one_sweep_stops_at_a_fixed_point_of_the_sequential_site_sweep_3135() {
+        let correlated = (
+            array![-1.5, 0.2, 1.0],
+            array![[1.0, 0.5, -0.3], [0.5, 2.0, 0.4], [-0.3, 0.4, 0.8]],
+        );
+        let rows = 12usize;
+        let banded = (
+            Array1::from_shape_fn(rows, |i| 1.5 * (1.3 * i as f64).sin()),
+            Array2::from_shape_fn((rows, rows), |(i, j)| {
+                let scale = (0.5 + 0.1 * i as f64) * (0.5 + 0.1 * j as f64);
+                scale * 0.6_f64.powi((i as i32 - j as i32).abs())
+            }),
+        );
+        let near_rank_one = (
+            Array1::from_shape_fn(rows, |i| 0.3 * (0.7 * i as f64).cos() - 0.2),
+            Array2::from_shape_fn((rows, rows), |(i, j)| {
+                let (a, b) = (1.0 + 0.05 * i as f64, 1.0 + 0.05 * j as f64);
+                0.97 * a * b + if i == j { 0.03 * a * a } else { 0.0 }
+            }),
+        );
+        for (m0, w) in [correlated, banded, near_rank_one] {
+            let q = m0.len();
+            let mass = OrthantLogMass::converge(&m0, &w).expect("the orthant converges");
+            let (_, magnitude) = mass.evaluate_log_mass().expect("a finite EP log mass");
+            let mut checked = mass.clone();
+            sequential_site_sweep(&mut checked);
+            let (after, _) = checked.evaluate_log_mass().expect("a finite EP log mass");
+            let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
+            eprintln!(
+                "[3135-EP] q = {q}: ln P {:.15e} after {} sweeps; a sequential sweep moves it {:e} (band {band:e})",
+                mass.log_mass(),
+                mass.sweeps(),
+                (after - mass.log_mass()).abs()
+            );
+            assert!(
+                (after - mass.log_mass()).abs() <= band,
+                "q = {q}: a sequential sweep from the rank-one stop moves ln P {:.15e} by {:e}, \
+                 above the band {band:e}",
+                mass.log_mass(),
+                (after - mass.log_mass()).abs()
+            );
+        }
+    }
+
+
+    /// An exactly repeated row is one half-space: `C` is the value of the rows without the repeat,
+    /// bit for bit. Positive control: EP handed the copies counts each one's truncation.
+    #[test]
+    fn a_repeated_row_enters_the_normalizer_once_1082() {
+        let h = array![[2.0, 0.8, 0.3], [0.8, 1.5, -0.4], [0.3, -0.4, 1.2]];
+        let solve = dense_solve(&h);
+        let beta = array![0.0, 0.2, 0.5];
+        let gradient = array![0.3, 0.0, 0.0];
+        let distinct = array![[1.0, 0.0, 0.0], [0.0, 0.6, 0.8]];
+        let distinct_bounds = array![0.0, 0.1];
+        let copies = 38;
+        let repeated = Array2::from_shape_fn((2 * copies, 3), |(i, j)| distinct[[i % 2, j]]);
+        let repeated_bounds = Array1::from_shape_fn(2 * copies, |i| distinct_bounds[i % 2]);
+        let once = ConeNormalizer::evaluate(&distinct, &distinct_bounds, &beta, &gradient, &solve)
+            .expect("normalizer on the distinct rows");
+        let with_copies = ConeNormalizer::evaluate(&repeated, &repeated_bounds, &beta, &gradient, &solve)
+            .expect("normalizer on the repeated rows");
+        assert_eq!(with_copies.retained_rows(), once.retained_rows(), "each half-space enters once");
+        assert_eq!(
+            with_copies.value().to_bits(),
+            once.value().to_bits(),
+            "C with {copies} copies of each row {} against C without them {}",
+            with_copies.value(),
+            once.value()
+        );
+        // The active row alone: one half-space, where EP is exact, against 38 sites on it.
+        let v = solve(&array![1.0, 0.0, 0.0])[0];
+        let m = -0.3 * v;
+        let exact = normal_logcdf(m / v.sqrt());
+        let single = OrthantLogMass::converge(&array![m], &array![[v]]).expect("one site");
+        let copied = OrthantLogMass::converge(
+            &Array1::from_elem(copies, m),
+            &Array2::from_elem((copies, copies), v),
+        )
+        .expect("the copied sites converge");
+        eprintln!(
+            "[1082-EP] one row at z = {:.6}: ln Φ {exact:.15e}; EP on one site {:.15e}; EP on {copies} copies \
+             {:.15e} in {} sweeps",
+            m / v.sqrt(),
+            single.log_mass(),
+            copied.log_mass(),
+            copied.sweeps()
+        );
+        assert!(
+            (single.log_mass() - exact).abs() <= band(64, exact.abs().max(1.0)),
+            "one site is exact: {} against ln Φ {exact}",
+            single.log_mass()
+        );
+        assert!(
+            (copied.log_mass() - exact).abs() > 1.0e3 * band(64, exact.abs().max(1.0)),
+            "positive control: EP on {copies} copies of one row gives {} against ln Φ {exact}",
+            copied.log_mass()
         );
     }
 }

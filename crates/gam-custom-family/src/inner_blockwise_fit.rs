@@ -3980,7 +3980,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 None
             };
             let mut cached_mode_acceptable = true;
-            let mut certified_workspace = cached.joint_workspace.clone();
+            let mut certified_workspace = None;
             if has_joint_exacthessian {
                 match exact_joint_mode_curvature_certificate(
                     family,

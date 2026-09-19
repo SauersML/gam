@@ -488,7 +488,6 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
         converged: inner.converged,
         block_logdet_h: Some(inner.block_logdet_h),
         block_logdet_s: Some(inner.block_logdet_s),
-        joint_workspace: None,
         // Persistent warm-start records don't carry the KKT-residual or
         // active-constraint diagnostics (they're not serialized on disk;
         // they're rebuilt from the inner solve on next visit), so a

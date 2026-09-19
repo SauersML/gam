@@ -6846,7 +6846,7 @@ fn rigid_survival_dense_overrides_match_generic_on_every_row_set_3035() {
             family,
             block_states,
         );
-        crate::row_kernel::row_set_override_tests::assert_dense_overrides_match_generic(
+        crate::test_support::row_set_overrides::assert_dense_overrides_match_generic(
             &format!("rigid survival marginal-slope frailty={frailty:?}"),
             &kernel,
             &[0.4, -0.6, 0.3, 0.8, -0.2],

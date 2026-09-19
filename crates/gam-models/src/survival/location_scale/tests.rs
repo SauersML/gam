@@ -1276,7 +1276,7 @@ fn survival_ls_dense_overrides_match_generic_on_every_row_set_3035() {
                     deriv_log_scale: 0.0,
                     offsets: family.joint_block_offsets(),
                 };
-                crate::row_kernel::row_set_override_tests::assert_dense_overrides_match_generic(
+                crate::test_support::row_set_overrides::assert_dense_overrides_match_generic(
                     &format!("survival location-scale {distribution:?}"),
                     &kernel,
                     &[0.7, -0.5, 0.9],
