@@ -51,10 +51,12 @@
 //!     `FitResult::GaussianLocationScale`; the mean/log-sigma coefficient blocks
 //!     carry `BlockRole::Location` / `BlockRole::Scale`, and the resolved designs
 //!     live in `fit.meanspec_resolved` / `fit.noisespec_resolved`.
-//!   * The noise link is `sigma = LOGB_SIGMA_FLOOR + exp(eta_scale)` with
-//!     `LOGB_SIGMA_FLOOR = 0.01` (mirrors `families::sigma_link`, mgcv `gaulss(b=0.01)`).
-//!   * The in-Rust path does NOT rescale `y`, so reconstructed mu/sigma are in raw
-//!     response units — directly comparable to the y we generated.
+//!   * The noise link is `sigma = response_scale*sigma_floor + exp(eta_scale)`,
+//!     where `sigma_floor` is the fit's recording-grid bound δ/√12 of the
+//!     standardized response (`families::sigma_link`).
+//!   * The returned coefficients are mapped back to raw response units, so
+//!     reconstructed mu/sigma are in raw response units — directly comparable to
+//!     the y we generated.
 
 use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
@@ -74,10 +76,6 @@ use std::path::Path;
 /// "Modern Applied Statistics with S" (the MASS R package). Mirrored at
 /// `bench/datasets/gagurine.csv` (columns: rownames, Age, GAG).
 const GAGURINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
-
-/// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
-/// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR` (and mgcv `gaulss(b=0.01)`).
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 /// Closed-form CRPS of a Gaussian predictive `N(mu, sigma)` at observation `y`,
 /// computed from gam's OWN standard-normal CDF/PDF primitives. Used here only to
@@ -178,10 +176,16 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ s(x, k=8)", &ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        sigma_floor,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
+    let raw_sigma_floor = response_scale * sigma_floor;
 
     let beta_location = fit
         .fit
@@ -198,7 +202,8 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
 
     // ---- predict (mu, sigma) on the held-out TEST points -------------------
     // Rebuild the frozen mean / log-sigma designs at the test x and apply each
-    // block's coefficients. mu = X_mean*beta; sigma = floor + exp(X_scale*beta).
+    // block's coefficients. mu = X_mean*beta; sigma = floor + exp(X_scale*beta),
+    // with the fit's floor in raw units (response_scale*sigma_floor).
     let mut grid = Array2::<f64>::zeros((n_test, ncols));
     for (i, &t) in x_test.iter().enumerate() {
         grid[[i, x_idx]] = t;
@@ -212,7 +217,7 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
     let eta_sigma_test: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
     let sigma_test: Vec<f64> = eta_sigma_test
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| raw_sigma_floor + e.exp())
         .collect();
 
     assert_eq!(mu_test.len(), n_test);
@@ -227,11 +232,13 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
     // ---- ORACLE predictive: the true data-generating distribution ----------
     // N(mu_true(x_test), sigma_true(x_test)). Its expected CRPS is the irreducible
     // floor; no estimator can beat it in expectation. This is the optimality
-    // yardstick for gam's distributional fit.
+    // yardstick for gam's distributional fit. sigma_true dips below zero where
+    // sin(2*pi*x) < -1/2, so the oracle scale is clamped at the same floor gam's
+    // own noise link imposes (the fit's raw-unit floor).
     let mu_oracle: Vec<f64> = x_test.iter().map(|&t| mu_true(t)).collect();
     let sigma_oracle: Vec<f64> = x_test
         .iter()
-        .map(|&t| sigma_true(t).max(LOGB_SIGMA_FLOOR))
+        .map(|&t| sigma_true(t).max(raw_sigma_floor))
         .collect();
 
     // ---- HOMOSCEDASTIC baseline: right mean, scale channel switched off -----
@@ -405,10 +412,16 @@ fn gam_gaussian_location_scale_crps_matches_properscoring_on_real_data() {
     };
     let result =
         fit_from_formula("GAG ~ s(Age, k=10)", &train_ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        sigma_floor,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
+    let raw_sigma_floor = response_scale * sigma_floor;
 
     let beta_location = fit
         .fit
@@ -437,7 +450,7 @@ fn gam_gaussian_location_scale_crps_matches_properscoring_on_real_data() {
     let eta_sigma_test: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
     let sigma_test: Vec<f64> = eta_sigma_test
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| raw_sigma_floor + e.exp())
         .collect();
 
     assert_eq!(mu_test.len(), n_test);

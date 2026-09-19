@@ -58,12 +58,13 @@ pub fn canonical_standard_fit_options(
         // works for every family (the `COV_MAX_P` diagonal fallback caps cost).
         compute_inference: true,
         // Formula/CLI fits are the interactive/default path: keep coefficient
-        // covariance and the smoothing correction, and request no rho-posterior
-        // inference. The Tier-0 adequacy diagnostic and the escalation tiers it
-        // selects (Tier-1 quadrature / Tier-2 NUTS over rho) have no reader on
-        // this path, so the fit publishes `NotComputed(InferenceNotRequested)`
-        // and spends no criterion evaluation on them (#3010). Callers that read
-        // them opt in (`skip_rho_posterior_inference: false`).
+        // covariance and the analytic first-order smoothing correction, which
+        // the returned fit needs. The rho-posterior adequacy diagnostic (Tier-0
+        // PSIS over dozens of refits, and its Tier-1/Tier-2 escalations) has no
+        // reader on this path, so the fit publishes
+        // `NotComputed(InferenceNotRequested)` and spends no criterion
+        // evaluation on it (#3010); lower-level callers that read it request it
+        // (`skip_rho_posterior_inference: false`).
         skip_rho_posterior_inference: true,
         // The count for the loops that still take one: the negative-binomial
         // alternation, the expectile LAWS iterations, the bounded-effect
@@ -2641,8 +2642,7 @@ fn joint_expectile_standardized_expectiles(
         .design
         .quadratic_form_diag(&scale_block)
         .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?;
-    let sigma_floor =
-        location_scale.response_scale * gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+    let sigma_floor = location_scale.response_scale * location_scale.sigma_floor;
     let standardized: Vec<f64> = (0..n)
         .map(|i| {
             let sigma = gam_model_kernels::sigma_link::logb_sigma_posterior_mean_with_floor_scalar(
