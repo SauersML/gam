@@ -2,8 +2,10 @@
 
 Surface 2, ``basis_check``: the penalized score lack-of-fit p-value that
 ``Summary.basis_checks`` / ``Model.basis_check`` report per smooth. Under an
-adequate basis (a smooth truth, default ``s(x)``) it must satisfy
-``P(p <= a) <= a``; on a ``k=4`` fit of a ``sin(6x)`` truth it should reject.
+adequate basis (a smooth truth, default ``s(x)``) it must be U(0, 1): a
+two-sided KS test and ``P(p <= a) = a`` within Monte Carlo error at every
+level, so a conservative p-value fails exactly as an anti-conservative one
+does. On a ``k=4`` fit of a ``sin(6x)`` truth it should reject.
 
 Surface 1, ``compare_models``: it returns no nested-model p-value, only an
 information-criterion ranking and its gaps. The null-nested cells record how
