@@ -254,9 +254,10 @@ pub(super) fn default_beta_guess_external(
                     // Outer arm guard already filtered out Log/Identity; fall
                     // back to the canonical logit transform for defensive safety
                     // if these are ever reached unexpectedly.
-                    LinkFunction::Log | LinkFunction::Identity => {
-                        (prevalence / (1.0 - prevalence)).ln()
-                    }
+                    LinkFunction::Log
+                    | LinkFunction::Identity
+                    | LinkFunction::Inverse
+                    | LinkFunction::InverseSquared => (prevalence / (1.0 - prevalence)).ln(),
                 };
                 if mixture_link_state.is_some() {
                     beta[intercept_col] = solve_intercept_for_prevalence(
@@ -296,6 +297,29 @@ pub(super) fn default_beta_guess_external(
                 // of an invented floor (#2469).
                 if mean_y > 0.0 {
                     beta[intercept_col] = mean_y.ln();
+                }
+            }
+        }
+        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+            // The intercept-only root of every power-variance score under
+            // `μ = η^(−a)` is `μ = ȳ` (weighted), i.e. `η = ȳ^(−1/a)`: `1/ȳ` for
+            // the inverse link and `1/ȳ²` for the inverse-squared link. That
+            // seed lies inside the link's domain `η > 0` on every row. A
+            // non-positive mean has no such root; the intercept keeps its zero
+            // seed and the solve reports the domain violation itself.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                let mean_y = weighted_sum / totalweight;
+                if mean_y > 0.0 {
+                    beta[intercept_col] = match link_function {
+                        LinkFunction::Inverse => mean_y.recip(),
+                        _ => (mean_y * mean_y).recip(),
+                    };
                 }
             }
         }

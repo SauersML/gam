@@ -4116,6 +4116,7 @@ where
         | LikelihoodScaleMetadata::EstimatedGammaShape { .. }
         | LikelihoodScaleMetadata::FixedBetaPhi { .. }
         | LikelihoodScaleMetadata::EstimatedTweediePhi { .. }
+        | LikelihoodScaleMetadata::EstimatedDispersion { .. }
         | LikelihoodScaleMetadata::FixedNegBinTheta { .. }
         | LikelihoodScaleMetadata::Unspecified => {}
     }

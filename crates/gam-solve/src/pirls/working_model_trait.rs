@@ -413,6 +413,40 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
+            (ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian, link, _)
+                if reciprocal_power_link(link).is_some() =>
+            {
+                let (standard, exponent) =
+                    reciprocal_power_link(link).expect("guarded by reciprocal_power_link");
+                let family = match self.spec.response {
+                    ResponseFamily::Gaussian => PowerVarianceEdm::Gaussian,
+                    ResponseFamily::Gamma => PowerVarianceEdm::Gamma,
+                    _ => PowerVarianceEdm::InverseGaussian,
+                };
+                write_reciprocal_link_working_state(
+                    family,
+                    standard,
+                    exponent,
+                    fixed_glm_dispersion(self)?,
+                    y,
+                    eta,
+                    priorweights,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )
+            }
+            (ResponseFamily::InverseGaussian, _, _) => write_inverse_gaussian_log_working_state(
+                y,
+                eta,
+                priorweights,
+                fixed_glm_dispersion(self)?,
+                mu,
+                weights,
+                z,
+                derivatives,
+            ),
             (ResponseFamily::Gaussian, _, _) => {
                 let resolved_scale = self
                     .resolved_scale()

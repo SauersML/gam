@@ -1054,6 +1054,7 @@ pub(crate) fn reml_fixed_glm_dispersion(
         // Hessian. Treating Beta precision as EDM dispersion double-scales EFS.
         Scale::Unit | Scale::NegativeBinomial { .. } | Scale::BetaPrecision { .. } => 1.0,
         Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } => phi.value(),
+        Scale::Dispersion { phi, .. } => phi.value(),
         Scale::Gamma { .. } => resolved
             .gamma_phi()
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,

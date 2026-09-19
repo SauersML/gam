@@ -70,6 +70,18 @@ impl VarianceJet {
         }
     }
 
+    /// Inverse-Gaussian variance V(μ) = μ³.
+    #[inline]
+    pub fn inverse_gaussian(mu: f64) -> Self {
+        Self {
+            v: mu * mu * mu,
+            v1: 3.0 * mu * mu,
+            v2: 6.0 * mu,
+            v3: 6.0,
+            v4: 0.0,
+        }
+    }
+
     /// Tweedie variance V(μ) = μ^p.
     #[inline]
     pub fn tweedie(mu: f64, p: f64) -> Self {
@@ -191,7 +203,9 @@ pub(crate) fn fixed_glm_dispersion(
     match scale {
         // The profiled Gaussian working geometry is intentionally scale-free.
         Scale::ProfiledGaussian | Scale::Unit | Scale::NegativeBinomial { .. } => Ok(1.0),
-        Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } => Ok(phi.value()),
+        Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } | Scale::Dispersion { phi, .. } => {
+            Ok(phi.value())
+        }
         Scale::Gamma { .. } => scale
             .gamma_phi()
             .map_err(|error| EstimationError::InvalidInput(error.to_string())),
@@ -227,6 +241,8 @@ pub(crate) fn fixed_glm_dispersion(
 ///  * Tweedie: weight `prior·μ^{2−p}/φ` ⇒ `k = 1/φ` (the μ-power is already in
 ///    the deviance's η-derivative, so only the constant `1/φ` is missing from D).
 ///  * Gaussian with an explicitly fixed `φ ≠ 1`: weight `prior/φ` ⇒ `k = 1/φ`.
+///  * Inverse Gaussian, and Gaussian under a non-identity link (both carry a
+///    generic EDM dispersion): weight `prior·h'²/(φV)` ⇒ `k = 1/φ`.
 ///  * Every other family (Poisson, Binomial, negative-binomial, Beta, profiled
 ///    Gaussian): the working weight carries no constant dispersion factor absent
 ///    from D, so `k = 1` and the objective is already self-consistent.
@@ -249,13 +265,20 @@ pub(crate) fn penalized_objective_deviance_scale(
         }
         ResponseFamily::Gaussian => match resolved {
             gam_problem::ResolvedLikelihoodScale::ProfiledGaussian => 1.0,
-            gam_problem::ResolvedLikelihoodScale::FixedGaussian { phi } => 1.0 / phi.value(),
+            gam_problem::ResolvedLikelihoodScale::FixedGaussian { phi }
+            | gam_problem::ResolvedLikelihoodScale::Dispersion { phi, .. } => 1.0 / phi.value(),
             _ => {
                 return Err(EstimationError::InvalidInput(
                     "resolved Gaussian scale has the wrong family variant".to_string(),
                 ));
             }
         },
+        ResponseFamily::InverseGaussian => {
+            let phi = resolved
+                .dispersion_phi()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            1.0 / phi
+        }
         _ => 1.0,
     };
     if k.is_finite() && k > 0.0 {
@@ -289,6 +312,7 @@ pub(crate) fn weight_family_for_glm_likelihood(
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
         }),
         ResponseFamily::Gamma => Ok(WeightFamily::Gamma),
+        ResponseFamily::InverseGaussian => Ok(WeightFamily::InverseGaussian),
         ResponseFamily::Binomial => Ok(WeightFamily::Binomial),
         ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "Royston-Parmar is not a GLM weight family".to_string(),
@@ -301,6 +325,8 @@ pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> Weight
     match inverse_link {
         InverseLink::Standard(StandardLink::Log) => WeightLink::Log,
         InverseLink::Standard(StandardLink::Identity)
+        | InverseLink::Standard(StandardLink::Inverse)
+        | InverseLink::Standard(StandardLink::InverseSquared)
         | InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
@@ -322,7 +348,20 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
         return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
-    if matches!(spec.response, ResponseFamily::Gamma) {
+    // Every link of these continuous families has an analytic 5-jet, and the
+    // generic `observed_weight_noncanonical` tower evaluates their observed
+    // information exactly (it reduces to Fisher on the canonical cells).
+    if matches!(
+        spec.response,
+        ResponseFamily::Gamma | ResponseFamily::InverseGaussian
+    ) {
+        return true;
+    }
+    // A non-identity Gaussian link is non-canonical: the residual-dependent
+    // correction `(y-μ)·B` is nonzero and the Laplace approximation needs it.
+    if matches!(spec.response, ResponseFamily::Gaussian)
+        && !matches!(inverse_link, InverseLink::Standard(StandardLink::Identity))
+    {
         return true;
     }
     if !matches!(spec.response, ResponseFamily::Binomial) {
@@ -761,6 +800,7 @@ pub(crate) enum WeightFamily {
     NegativeBinomial { theta: f64 },
     Beta { phi: f64 },
     Gamma,
+    InverseGaussian,
 }
 
 /// Link tag for the observed-information weight dispatch.
@@ -793,6 +833,7 @@ pub(crate) fn variance_jet_for_weight_family(
         WeightFamily::NegativeBinomial { theta } => VarianceJet::negative_binomial(mu, theta),
         WeightFamily::Beta { phi } => VarianceJet::beta(mu, one_minus_mu, phi),
         WeightFamily::Gamma => VarianceJet::gamma(mu),
+        WeightFamily::InverseGaussian => VarianceJet::inverse_gaussian(mu),
     }
 }
 
