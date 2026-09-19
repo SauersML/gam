@@ -14,7 +14,7 @@ def main() -> None:
             [-0.1, 0.0, 0.99498743710662],
         ]
     )
-    mean = gamfit.sphere_frechet_mean(points)
+    mean = gamfit.response_geometry.sphere_frechet_mean(points)
     print("sphere mean", np.round(mean, 6))
 
 

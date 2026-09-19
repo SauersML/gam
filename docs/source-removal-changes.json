@@ -1545,5 +1545,30 @@
     ],
     "reason": "pyGAM audit G8: create_difference_penalty_matrix built the knot-scaled coefficient-difference Gram DᵀD, a penalty on the coefficient sequence. SPEC puts penalties on the function: every production B-spline penalty is the exact function-space Gram bspline_derivative_penalty_matrix (∫B^(m)B^(m)ᵀ), and the one production caller, compute_geometric_constraint_transform, formed this penalty only for bspline_build.rs to discard it (`let (z, _)`). The function now returns just the transform Z and the difference penalty is deleted. The removed tests exercised only that deleted function (its null space, span rejection and scale invariance) or the discarded penalty output of owed_bughunt_splines_tests.rs; clamped_cubic_knots and penalty_for_width were that file's private helpers. Tests that used the Gram only as a generic PSD fixture now call the test-only gam_linalg_test_support::coefficient_difference_penalty.",
     "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call (duchon_thinplate.rs compute_geometric_constraint_transform) whose penalty result both bspline_build.rs callers bind to `_`; every other occurrence is a test or a comment. In the landing tree the name has 0 occurrences outside this ledger. cargo check --workspace --all-targets RC 0; gam-terms basis::tests::test_geometric_constraint_transform_{orthogonality,dimensions} and knot_scale_invariance_tests pass; gam-linalg-test-support 13/13 including coefficient_difference_penalty_matches_closed_form_second_difference_gram."
+  },
+  {
+    "base": "e110c67a94b801ddc9cc3756a3d0c61dada87550",
+    "items": [
+      "crates/gam-math/src/probability.rs:const:GAUSS_LEGENDRE_16",
+      "crates/gam-math/src/probability.rs:const:IMHOF_MAX_PANELS",
+      "crates/gam-math/src/probability.rs:fn:imhof_amplitude_bound",
+      "crates/gam-math/src/probability.rs:fn:imhof_amplitude_panel",
+      "crates/gam-math/src/probability.rs:fn:imhof_integrand",
+      "crates/gam-math/src/probability.rs:fn:imhof_log_rho",
+      "crates/gam-math/src/probability.rs:fn:imhof_phase_slack",
+      "crates/gam-math/src/probability.rs:fn:imhof_survival",
+      "crates/gam-math/src/probability.rs:fn:regularized_beta_lower_from_log_x",
+      "crates/gam-math/src/probability.rs:fn:signed_weighted_chi_square_sf_to_tolerance",
+      "crates/gam-math/src/probability.rs:fn:term",
+      "crates/gam-math/src/probability.rs:fn:the_amplitude_bound_certifies_the_zero_statistic_answer",
+      "crates/gam-math/src/probability.rs:fn:the_f_tail_is_the_two_term_signed_combination_at_zero",
+      "crates/gam-math/src/probability.rs:fn:the_quadrature_resolves_the_amplitude_not_only_the_phase",
+      "crates/gam-math/src/probability.rs:struct:WeightedChiSquareTerm",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_TAIL_COARSEST",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_TAIL_ROUNDOFF_FLOOR",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:fn:selection_standard_error"
+    ],
+    "reason": "pyGAM audit pv-tails-numerics (inference L4). The Imhof evaluator in probability.rs computed P(Q > q) = 1/2 + I/pi. That form cancels once the tail falls below about 1e-16, which is the floor under small smooth-term LR p-values. The evaluator is deleted along with its Gauss-Legendre panel rule, its integrand, log-rho, phase-slack and amplitude-bound helpers, its panel cap and its caller-tolerance entry point. Its in-file tests pinned that method's panel and amplitude behaviour and are deleted too. It is replaced by crates/gam-math/src/probability/weighted_chi_square.rs, which inverts the moment generating function along a saddle-point contour and returns a TailProbability with a derived relative bound. WeightedChiSquareTerm moves there unchanged and is re-exported from gam_math::probability. The two-term F test and its term() helper move there as well. regularized_beta_lower_from_log_x becomes regularized_beta_lower_from_logs, which also takes ln(1 - x), so F and t tails whose x rounds to one are no longer returned as 1. In smooth_term_lr.rs, the tolerance floor (SMOOTH_LR_TAIL_ROUNDOFF_FLOOR), the ceiling (SMOOTH_LR_TAIL_COARSEST) and selection_standard_error existed only to budget the Imhof tolerance, and the replacement takes no tolerance.",
+    "evidence": "git grep -w finds none of imhof_integrand, imhof_log_rho, imhof_phase_slack, imhof_amplitude_panel, imhof_amplitude_bound, imhof_survival, IMHOF_MAX_PANELS, GAUSS_LEGENDRE_16, signed_weighted_chi_square_sf_to_tolerance, regularized_beta_lower_from_log_x, SMOOTH_LR_TAIL_ROUNDOFF_FLOOR, SMOOTH_LR_TAIL_COARSEST or selection_standard_error under crates, src or tests at the landing tree. WeightedChiSquareTerm, term and the_f_tail_is_the_two_term_signed_combination_at_zero are declared in crates/gam-math/src/probability/weighted_chi_square.rs. crates/gam-math/tests/tail_references.rs passes all five tests against stored 25-digit mpmath references: worst relative error 5.0e-12 (chi-square), 7.9e-12 (F), 1.85e-11 (t) and 1.1e-13 (weighted, within its returned bound, which is at most 1e-10), plus the monotonicity property. The gam-math lib tests pass, 364 of 364. Without this entry, source_removal_guard.py at base e110c67a94 refused exactly these items."
   }
 ]

@@ -172,7 +172,7 @@ class SheafConsistencyPenalty:
     --------
     >>> import numpy as np
     >>> import gamfit
-    >>> sheaf = gamfit.SheafConsistencyPenalty(
+    >>> sheaf = gamfit.penalties.SheafConsistencyPenalty(
     ...     edges=[(0, 1), (1, 2)],
     ...     restriction_ops=[np.eye(3), np.eye(3)],
     ...     weight=0.1,

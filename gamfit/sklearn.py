@@ -466,7 +466,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
             probabilities = np.asarray(self.model_.predict(table), dtype=float)
             ordered: np.ndarray = probabilities[:, self._multinomial_columns_]
             return ordered
-        positive = np.clip(self._posterior_mean(X), 0.0, 1.0)
+        positive = self._posterior_mean(X)
         return np.column_stack([1.0 - positive, positive])
 
     def predict(self, X: Any) -> np.ndarray:
@@ -528,13 +528,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
             )
         observed = self._encode_labels(y)
         positive = self.predict_proba(X)[:, 1].astype(float)
-        train_prev = float(np.mean(observed)) if observed.size else 0.0
         return dict(
-            rust_module().classification_metrics(
-                observed.tolist(),
-                positive.tolist(),
-                train_prev,
-            )
+            rust_module().classification_metrics(observed.tolist(), positive.tolist())
         )
 
     def _encode_labels(self, y: Any) -> np.ndarray:

@@ -1,6 +1,6 @@
 """Regression test for issue #395.
 
-``gamfit.select_topology`` raised ``ValueError: select_topology could not
+``gamfit.topology.select_topology`` raised ``ValueError: select_topology could not
 determine fitted basis size`` on every clean dataset because its summary
 reader gated on ``isinstance(payload, collections.abc.Mapping)``. The object
 returned by ``Model.summary()`` is a ``gamfit._summary.Summary`` frozen

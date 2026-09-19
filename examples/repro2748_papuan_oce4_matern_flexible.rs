@@ -150,6 +150,7 @@ fn main() {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![smooth_term(x.ncols(), centers)],
+        level: Default::default(),
     };
 
     let t0 = Instant::now();

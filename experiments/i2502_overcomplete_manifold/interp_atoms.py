@@ -37,7 +37,7 @@ def main():
 
     import gamfit
     with open(os.path.join(args.fits, f"manifold_k{args.k}.pkl"), "rb") as f:
-        model = gamfit.model_from_dict(pickle.load(f))  # K > P carries the support tag (#2567)
+        model = gamfit.sae.model_from_dict(pickle.load(f))  # K > P carries the support tag (#2567)
     X = np.load(f"{args.prep}/train.npy")[: args.rows_cap]
     rows = np.load(f"{args.prep}/rows_train.npy")[: args.rows_cap]
     tok_ids = np.load(f"{args.harvest}/token_ids.npy")
