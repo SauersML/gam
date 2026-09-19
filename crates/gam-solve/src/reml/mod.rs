@@ -5028,9 +5028,14 @@ impl EvalShared {
         }
     }
 
+    ///
+    /// `spectra` must be the state's [`RemlState::penalty_unit_spectra`]; it
+    /// serves the factorization whenever the applied penalties are the
+    /// canonical list itself, which is the ordinary path.
     pub(crate) fn penalty_pseudologdet_original(
         &self,
         canonical_penalties: &Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
+        spectra: &penalty_logdet::PenaltyUnitSpectra,
         lambdas: &[f64],
         p: usize,
     ) -> Result<Arc<penalty_logdet::PenaltyPseudologdet>, EstimationError> {
@@ -5047,10 +5052,12 @@ impl EvalShared {
         // `log|S|₊` is one half of the LAML ratio `½(log|H| − log|S|₊)`; the
         // other half carries the split-projected penalty, so this one must too.
         let applied = self.applied_canonical_penalties(canonical_penalties)?;
-        let pld = Arc::new(
+        let pld = if spectra.serves(&applied) {
+            penalty_logdet::PenaltyPseudologdet::from_penalty_spectra(spectra, lambdas, p)
+        } else {
             penalty_logdet::PenaltyPseudologdet::from_penalties(&applied, lambdas, p)
-                .map_err(EstimationError::InvalidInput)?,
-        );
+        };
+        let pld = Arc::new(pld.map_err(EstimationError::InvalidInput)?);
         match self.penalty_pseudologdet.set(Arc::clone(&pld)) {
             Ok(()) => Ok(pld),
             // A concurrent caller initialized the cell first; both objects
@@ -6036,4 +6043,8 @@ pub(crate) struct RemlState<'a> {
     /// operator, kept for the weights it was formed at. Keyed to `x`, so
     /// `reset_surface` clears it.
     pub(crate) data_root_cache: laml_logdet::DataRootCache,
+    /// The λ-free half of every evaluation's `log|Sλ|₊` factorization — each
+    /// penalty's unit root and each block's structural rank — for the penalty
+    /// list in `canonical_penalties`. See [`Self::penalty_unit_spectra`].
+    pub(crate) penalty_unit_spectra: RwLock<Option<Arc<penalty_logdet::PenaltyUnitSpectra>>>,
 }

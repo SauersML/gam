@@ -16,6 +16,7 @@ fn face_law_falsification_declines_at_a_refused_pulled_back_point_2735() {
         released_penalties: vec![Array2::from_diag(&array![2.0, 3.0])],
         released_score: array![1.0, 2.0],
         form_conditioning: 1.0,
+        form_error_bound: 0.0,
         limit_beta: Array1::zeros(0),
         limit_dispersion: 1.0,
         released_curvature_drift: None,

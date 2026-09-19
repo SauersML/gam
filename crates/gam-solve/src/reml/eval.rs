@@ -949,6 +949,7 @@ impl<'a> RemlState<'a> {
         // exactly once for value, ρ-derivatives, and τ components alike.
         let pld = bundle.penalty_pseudologdet_original(
             &self.canonical_penalties,
+            &self.penalty_unit_spectra(),
             lambdas_slice,
             self.p,
         )?;
