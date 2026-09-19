@@ -261,9 +261,7 @@ class GamfitAdapter(Adapter):
             self.formula = "y ~ " + " + ".join(f"s({nm})" for nm in self.names)
         self.model: Any = None
 
-    def _table(
-        self, X: FloatArray, offset: FloatArray | None
-    ) -> dict[str, FloatArray]:
+    def _table(self, X: FloatArray, offset: FloatArray | None) -> dict[str, FloatArray]:
         table = {nm: X[:, j] for j, nm in enumerate(self.names)}
         if offset is not None:
             table[OFFSET_COLUMN] = offset

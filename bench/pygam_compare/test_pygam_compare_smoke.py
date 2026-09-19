@@ -142,7 +142,9 @@ def test_exposure_draw_carries_its_offset() -> None:
     assert offset is not None and offset.shape == y.shape
     rate = mu / np.exp(offset)
     # The rate is the level times the smooth; the exposure is all in the offset.
-    assert np.allclose(rate, EXPOSURE_RATE * np.exp(COUNT_SLOPE * np.sin(2 * np.pi * X[:, 0])))
+    assert np.allclose(
+        rate, EXPOSURE_RATE * np.exp(COUNT_SLOPE * np.sin(2 * np.pi * X[:, 0]))
+    )
     for family in ("poisson_lo", "negbin", "tweedie"):
         assert make_data(50, "p1", family, 0)[3] is None
 
