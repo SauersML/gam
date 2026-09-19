@@ -3929,6 +3929,7 @@ impl<'a> RemlState<'a> {
             frozen_tweedie_phi: Arc::new(AtomicU64::new(0)),
             frozen_gamma_shape: Arc::new(AtomicU64::new(0)),
             frozen_beta_phi: Arc::new(AtomicU64::new(0)),
+            frozen_dispersion_phi: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
@@ -6823,6 +6824,21 @@ impl<'a> RemlState<'a> {
                 "frozen Beta precision",
                 |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
             )?;
+            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+            // same λ-search freeze as the Tweedie φ.
+            apply_frozen_search_scale(
+                &mut pirls_config.likelihood,
+                matches!(
+                    resolved_likelihood_scale,
+                    gam_problem::ResolvedLikelihoodScale::Dispersion {
+                        estimated: true,
+                        ..
+                    }
+                ),
+                self.frozen_dispersion_phi.load(Ordering::Relaxed),
+                "frozen dispersion",
+                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
+            )?;
             // Levenberg-Marquardt damping warm-start: the λ the previous
             // successful PIRLS solve at this surface ended on (0 = no hint).
             // It encodes the curvature regime that solve settled into; PIRLS
@@ -7276,6 +7292,38 @@ impl<'a> RemlState<'a> {
                  measured at the converged η); outer REML criterion now stationary in ρ"
             );
         }
+        // Capture the Gaussian (non-identity link) / inverse Gaussian dispersion
+        // MLE at the first converged non-screening solve's η and hold it for the
+        // rest of the search, exactly as the Tweedie φ above.
+        if !in_screening
+            && matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            )
+            && self.frozen_dispersion_phi.load(Ordering::Relaxed) == 0
+            && matches!(
+                pirls_result.status,
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
+            )
+        {
+            let spec = reml_spec(&self.config.likelihood);
+            let phi = pirls::estimate_dispersion_phi_from_eta(
+                &spec.response,
+                &spec.link,
+                self.y,
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?;
+            self.frozen_dispersion_phi
+                .store(phi.to_bits(), Ordering::Relaxed);
+            log::info!(
+                "[OUTER] dispersion λ-search φ frozen at {phi:.6e} (measured at the \
+                 converged η); outer REML criterion now stationary in ρ"
+            );
+        }
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
@@ -7672,6 +7720,21 @@ impl<'a> RemlState<'a> {
             self.frozen_beta_phi.load(Ordering::Relaxed),
             "frozen Beta precision",
             |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
+        )?;
+        // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+        // same λ-search freeze as the Tweedie φ.
+        apply_frozen_search_scale(
+            &mut pirls_config.likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_dispersion_phi.load(Ordering::Relaxed),
+            "frozen dispersion",
+            |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
         )?;
 
         // Gaussian + Identity outer REML reuses a precomputed XᵀWX and

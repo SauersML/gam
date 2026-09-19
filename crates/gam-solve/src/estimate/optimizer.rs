@@ -990,6 +990,9 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         gam_problem::ResolvedLikelihoodScale::BetaPrecision {
             estimated: true, ..
         } => (&reml_state.frozen_beta_phi, "beta precision"),
+        gam_problem::ResolvedLikelihoodScale::Dispersion {
+            estimated: true, ..
+        } => (&reml_state.frozen_dispersion_phi, "dispersion"),
         _ => return Ok(()),
     };
     if k == 0 || frozen.load(Ordering::Relaxed) != 0 {

@@ -302,6 +302,110 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
     }
 }
 
+/// Exact dispersion MLE `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` for the families whose
+/// log-likelihood is `−dᵢ/(2φ/wᵢ) − ½ log(φ/wᵢ) + c(yᵢ)`: the Gaussian
+/// (`d = (y−μ)²`) and the inverse Gaussian (`d = (y−μ)²/(y μ²)`).
+///
+/// `μ` is read from the same inverse-link surface as the working state
+/// (reciprocal power `μ = η^{−a}` or the log link), so an `η` outside the link
+/// domain fails exactly as the PIRLS row does.
+pub(crate) fn estimate_dispersion_phi_from_eta(
+    response: &ResponseFamily,
+    inverse_link: &InverseLink,
+    y: ArrayView1<'_, f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+) -> Result<f64, EstimationError> {
+    let inverse_gaussian = match response {
+        ResponseFamily::Gaussian => false,
+        ResponseFamily::InverseGaussian => true,
+        other => crate::bail_invalid_estim!(
+            "dispersion φ̂ is defined for the Gaussian and inverse Gaussian families, not {other:?}"
+        ),
+    };
+    let reciprocal = reciprocal_power_link(inverse_link);
+    let mean = |i: usize| -> Result<f64, EstimationError> {
+        match (reciprocal, inverse_link) {
+            (Some((link, exponent)), _) => {
+                require_reciprocal_link_domain(link, eta[i])?;
+                Ok((-exponent * eta[i].ln()).exp())
+            }
+            (None, InverseLink::Standard(StandardLink::Log)) => {
+                crate::mixture_link::log_link_solver_exp(eta[i])
+            }
+            (None, InverseLink::Standard(StandardLink::Identity)) if !inverse_gaussian => {
+                Ok(eta[i])
+            }
+            (None, other) => crate::bail_invalid_estim!(
+                "dispersion φ̂ has no inverse link surface for {other:?}"
+            ),
+        }
+    };
+    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+            if wi == 0.0 {
+                return Ok((0.0, 0.0));
+            }
+            let mu = mean(i)?;
+            if !mu.is_finite() {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "mean", eta[i], mu));
+            }
+            let statistic = if inverse_gaussian {
+                if !(y[i].is_finite() && y[i] > 0.0) {
+                    return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                        i,
+                        "inverse Gaussian response",
+                        eta[i],
+                        y[i],
+                    ));
+                }
+                let resid = y[i] - mu;
+                // w (y−μ)²/(y μ²) = w · y · (1/μ − 1/y)²; assembled in logs so
+                // neither the squared residual nor μ² has to be representable.
+                if resid == 0.0 {
+                    0.0
+                } else {
+                    (wi.ln() + 2.0 * resid.abs().ln() - y[i].ln() - 2.0 * mu.ln()).exp()
+                }
+            } else {
+                if !y[i].is_finite() {
+                    return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                        i,
+                        "Gaussian response",
+                        eta[i],
+                        y[i],
+                    ));
+                }
+                let resid = y[i] - mu;
+                wi * resid * resid
+            };
+            if !(statistic.is_finite() && statistic >= 0.0) {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                    i,
+                    "dispersion statistic",
+                    eta[i],
+                    statistic,
+                ));
+            }
+            Ok((statistic, wi))
+        })
+        .collect();
+    let (weighted_deviance, total_weight) = certified_pairs_sum(rows)?;
+    if !(total_weight > 0.0 && weighted_deviance > 0.0) {
+        crate::bail_invalid_estim!(
+            "dispersion MLE is not finite and positive (deviance={weighted_deviance:?}, weight={total_weight:?})"
+        );
+    }
+    let phi = weighted_deviance / total_weight;
+    if phi.is_finite() && phi > 0.0 {
+        Ok(phi)
+    } else {
+        crate::bail_invalid_estim!("dispersion estimate is invalid: {phi:?}")
+    }
+}
+
 #[cfg(test)]
 mod gamma_tweedie_profile_math_tests {
     use super::*;
