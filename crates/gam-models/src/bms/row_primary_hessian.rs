@@ -1261,11 +1261,11 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// BMS-FLEX GPU milestone 1: pack the row-primary Hessian inputs for the
-    /// Stage-2 device kernel in `crate::bms::gpu::row`. Returns `None`
-    /// when any precondition fails (latent is not StandardNormal, the
-    /// row-cell-moments bundle was not materialised, or score-warp /
-    /// link-deviation runtimes are missing). A caller that selected GPU
-    /// execution treats `None` as an unsupported-input error.
+    /// Stage-2 device kernel in `crate::bms::gpu::row`. Total over the models
+    /// the kernel declares (`BMS_FLEX_ROW_KERNEL_CAPABILITY`), which are the
+    /// only models selection hands it: any other model, or a primary layout
+    /// that disagrees with the family's blocks, is an engine defect and an
+    /// `Err` (gam#3000).
     ///
     /// The packed bundle mirrors `lower_bms_flex_row_order2_from_parts`
     /// (`StandardNormal` branch at lines 9047–9314) field-for-field. The
@@ -1276,37 +1276,35 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
-    ) -> Result<Option<crate::bms::gpu::row::BmsFlexRowKernelInputsOwned>, String> {
+    ) -> Result<crate::bms::gpu::row::BmsFlexRowKernelInputsOwned, String> {
         use super::exact_kernel as exact;
         use crate::marginal_slope_shared::SparsePrimaryCoeffJetView;
 
-        // ── Preconditions: the Stage-2 kernel only handles the StandardNormal
-        //    cell-loop branch with a pre-built row-cell-moments bundle. The
-        //    empirical-grid branch and the per-row degree-9 path both
-        //    require additional packing the kernel does not consume yet.
-        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
-            return Ok(None);
+        if let Some(missing) = crate::bms::gpu::flex::BMS_FLEX_ROW_KERNEL_CAPABILITY
+            .missing_for(&self.flex_row_model())
+        {
+            return Err(format!(
+                "bms_flex_row pack: the row kernel was handed a model it does not compute \
+                 (it lacks {missing}); selection reads the same declaration, so this is an \
+                 engine defect"
+            ));
         }
-        let Some(bundle) = cache.row_cell_moments.as_ref() else {
-            return Ok(None);
-        };
         let primary = &cache.primary;
         let r = primary.total;
-        if r < 2 {
-            return Ok(None);
-        }
         let h_range = primary.h.clone();
         let w_range = primary.w.clone();
         let p_h = h_range.as_ref().map(|range| range.len()).unwrap_or(0);
         let p_w = w_range.as_ref().map(|range| range.len()).unwrap_or(0);
-        if r != 2 + p_h + p_w {
-            return Ok(None);
-        }
-        if p_h > 0 && self.score_warp.is_none() {
-            return Ok(None);
-        }
-        if p_w > 0 && self.link_dev.is_none() {
-            return Ok(None);
+        if r != 2 + p_h + p_w
+            || (p_h > 0 && self.score_warp.is_none())
+            || (p_w > 0 && self.link_dev.is_none())
+        {
+            return Err(format!(
+                "bms_flex_row pack: primary layout r={r} p_h={p_h} p_w={p_w} disagrees with the \
+                 family's blocks (score-warp={}, link-deviation={})",
+                self.score_warp.is_some(),
+                self.link_dev.is_some()
+            ));
         }
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
@@ -1330,17 +1328,40 @@ impl BernoulliMarginalSlopeFamily {
         #[cfg(not(target_os = "linux"))]
         let build_device_moments = false;
 
+        // ── Each row's denested partition. The row-cell-moments bundle
+        //    memoizes `denested_partition_cells` at the row's `(a, b)` with its
+        //    degree-9 moments. A row the bundle does not hold (the bundle was
+        //    refused on its byte budget, or built for an outer-score
+        //    subsample) is partitioned here by that same function, as the CPU
+        //    row lowering does for it, so the packing never depends on what the
+        //    memo happens to cover.
+        let moment_degree = crate::bms::gpu::row::MOMENT_STRIDE - 1;
+        let memo_row = |row: usize| {
+            cache
+                .row_cell_moments
+                .as_ref()
+                .and_then(|bundle| bundle.row(row, moment_degree))
+        };
+        let partitions: Vec<Vec<exact::DenestedPartitionCell>> = (0..n)
+            .into_par_iter()
+            .map(|row| match memo_row(row) {
+                Some(entries) => Ok(entries.iter().map(|entry| entry.partition_cell).collect()),
+                None => self.denested_partition_cells(
+                    Self::row_ctx(cache, row).intercept,
+                    block_states[1].eta[row],
+                    beta_h,
+                    beta_w,
+                ),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
         // ── First pass: row offsets + total cell count. The Stage-2 kernel
         //    consumes a CSR `cell_offsets[n+1]` with `total_cells =
-        //    cell_offsets[n]`; reject up front any row whose cells were
-        //    not materialised at degree ≥ 9 (the kernel needs `m_0..m_9`).
+        //    cell_offsets[n]`.
         let mut cell_offsets: Vec<u32> = Vec::with_capacity(n + 1);
         cell_offsets.push(0);
         let mut total_cells: u32 = 0;
-        for row in 0..n {
-            let Some(row_cells) = bundle.row(row, 9) else {
-                return Ok(None);
-            };
+        for (row, row_cells) in partitions.iter().enumerate() {
             let len_u32 = u32::try_from(row_cells.len()).map_err(|_| {
                 format!("bms_flex_row pack: row {row} cell count exceeds u32 range")
             })?;
@@ -1426,12 +1447,11 @@ impl BernoulliMarginalSlopeFamily {
             row_w.push(self.weights[row]);
 
             let start = cell_offsets[row] as usize;
-            let row_cells = bundle
-                .row(row, 9)
-                .expect("row cell moments presence verified above");
-            for (local_idx, entry) in row_cells.iter().enumerate() {
+            let row_cells = &partitions[row];
+            let row_memo = memo_row(row);
+            for (local_idx, partition_cell) in row_cells.iter().enumerate() {
                 let cell_idx = start + local_idx;
-                let cell = entry.partition_cell.cell;
+                let cell = partition_cell.cell;
                 let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
                 let u_mid = a + b * z_mid;
 
@@ -1442,16 +1462,16 @@ impl BernoulliMarginalSlopeFamily {
 
                 // dc_da, dc_db (scaled)
                 let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
-                    entry.partition_cell.score_span,
-                    entry.partition_cell.link_span,
+                    partition_cell.score_span,
+                    partition_cell.link_span,
                     a,
                     b,
                 );
                 let dc_da = scale_coeff4(dc_da_raw, scale);
                 let dc_db = scale_coeff4(dc_db_raw, scale);
                 let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
-                    entry.partition_cell.score_span,
-                    entry.partition_cell.link_span,
+                    partition_cell.score_span,
+                    partition_cell.link_span,
                     a,
                     b,
                 );
@@ -1574,10 +1594,17 @@ impl BernoulliMarginalSlopeFamily {
                 // when host moments are selected. When the device-moment
                 // build is selected, this storage is
                 // skipped entirely and the substrate produces moments
-                // directly on the GPU below.
+                // directly on the GPU below. A row outside the memo takes the
+                // bundle's own evaluator at the bundle's degree.
                 if !build_device_moments {
+                    let state = match row_memo {
+                        Some(entries) => std::borrow::Cow::Borrowed(&entries[local_idx].state),
+                        None => std::borrow::Cow::Owned(
+                            exact::evaluate_cell_derivative_moments_uncached(cell, moment_degree)?,
+                        ),
+                    };
                     let mom_base = cell_idx * moment_stride;
-                    let src_moments: &[f64] = &entry.state.moments;
+                    let src_moments: &[f64] = &state.moments;
                     let copy_len = src_moments.len().min(moment_stride);
                     for k in 0..copy_len {
                         cell_moments[mom_base + k] = src_moments[k];
@@ -1587,11 +1614,9 @@ impl BernoulliMarginalSlopeFamily {
 
             // Moving-boundary terms of the link-knot crossings (#2901), the same
             // closed form `lower_bms_flex_row_order2_from_parts` adds.
-            let partition: Vec<exact::DenestedPartitionCell> =
-                row_cells.iter().map(|entry| entry.partition_cell).collect();
             let crossing =
                 super::standard_normal_flex_fifth::standard_normal_flex_crossing_second_partials(
-                    &partition, a, b, scale,
+                    row_cells, a, b, scale,
                 );
             row_crossing[row * 3..row * 3 + 3].copy_from_slice(&crossing);
 
@@ -1760,7 +1785,7 @@ impl BernoulliMarginalSlopeFamily {
         // Free the now-unneeded scratch.
         drop(gpu_cells);
 
-        Ok(Some(crate::bms::gpu::row::BmsFlexRowKernelInputsOwned {
+        Ok(crate::bms::gpu::row::BmsFlexRowKernelInputsOwned {
             n_rows: n,
             r,
             p_h,
@@ -1795,7 +1820,28 @@ impl BernoulliMarginalSlopeFamily {
             rho_u: row_rho,
             tau_u: row_tau,
             r_uv: row_ruv,
-        }))
+        })
+    }
+
+    /// The model this family asks a FLEX row kernel to evaluate. The law and the
+    /// blocks are fixed when the family is made, so every call answers the same.
+    pub(super) fn flex_row_model(&self) -> crate::bms::gpu::flex::BmsFlexRowModel {
+        crate::bms::gpu::flex::BmsFlexRowModel {
+            latent_integral: self.latent_measure.integral(),
+            score_warp: self.score_warp.is_some(),
+            link_deviation: self.link_dev.is_some(),
+            residual_repair: self.residual.is_some(),
+        }
+    }
+
+    /// Which kernel builds this family's row-primary Hessian: the one decision,
+    /// read at fit entry (where `gpu=required` for a model the device kernel
+    /// does not compute is refused before any seed) and by every cache build.
+    pub(super) fn flex_row_kernel_decision(&self) -> Result<gam_gpu::GpuDecision, String> {
+        crate::bms::gpu::flex::require_row_primary_hessian_supported(
+            &self.flex_row_model(),
+            self.y.len(),
+        )
     }
 
     pub(super) fn build_row_primary_hessian_cache(
@@ -1824,7 +1870,7 @@ impl BernoulliMarginalSlopeFamily {
             runtime_available,
             workspace_pinned,
         );
-        let gpu_decision = crate::bms::gpu::flex::require_row_primary_hessian_supported(n, r)?;
+        let gpu_decision = self.flex_row_kernel_decision()?;
         // When policy selects GPU, backend readiness is part of the execution
         // contract. A failed probe is surfaced immediately; silently changing
         // algorithms after selection would make both performance and failure
@@ -1952,16 +1998,13 @@ impl BernoulliMarginalSlopeFamily {
                 gpu_decision.reason,
             );
         }
-        // GPU selection is fail-closed: unsupported packed inputs and every
-        // backend error are returned to the caller. CPU execution remains a
-        // separate policy decision, never an implicit retry of a selected GPU
-        // algorithm.
+        // GPU selection is fail-closed: every backend error is returned to the
+        // caller. The device kernel is selected only for a model it declares,
+        // and the packer is total over those models, so no input it is handed
+        // can send the build back to the CPU. CPU execution remains a separate
+        // policy decision, never an implicit retry of a selected GPU algorithm.
         if gpu_decision.use_gpu {
-            let owned = self
-                .pack_bms_flex_row_kernel_inputs(block_states, cache)?
-                .ok_or_else(|| {
-                    "BMS FLEX GPU selected for inputs unsupported by the row kernel".to_string()
-                })?;
+            let owned = self.pack_bms_flex_row_kernel_inputs(block_states, cache)?;
             // When both marginal/slope designs expose a contiguous dense
             // view, keep the n×r² row Hessian + designs resident for all
             // subsequent HVP / diagonal launches.

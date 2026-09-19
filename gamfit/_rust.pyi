@@ -437,6 +437,7 @@ __all__ = [
     "stack_topologies_gaussian",
     "stacked_predictive_mean",
     "stacking_weights_from_log_density",
+    "student_t_parameters_from_model",
     "summary_criterion_row",
     "summary_html",
     "summary_json",
@@ -2281,6 +2282,8 @@ def stack_topologies_gaussian(names: Sequence[str], y: Sequence[float], means: S
 def stacked_predictive_mean(weights: Sequence[float], means: Sequence[Sequence[float]]) -> list[float]: ...
 
 def stacking_weights_from_log_density(names: Sequence[str], log_density_rows: Sequence[Sequence[float]]) -> str: ...
+
+def student_t_parameters_from_model(model_bytes: Sequence[int]) -> tuple[float, float] | None: ...
 
 def summary_criterion_row(payload: dict[Any, Any]) -> str: ...
 

@@ -3444,17 +3444,15 @@ pub(crate) fn compute_greville_abscissae(
 /// # Arguments
 /// * `knot_vector` - Full knot vector
 /// * `degree` - B-spline degree
-/// * `penalty_order` - Order of difference penalty (typically 2)
 ///
 /// # Returns
-/// Tuple of (transform Z, projected_penalty Z'SZ) where:
-/// - Z: k × (k-2) matrix mapping raw coefficients to constrained space
-/// - S_constrained: (k-2) × (k-2) projected second-difference penalty
+/// The k × (k-2) transform Z mapping constrained coefficients to raw ones.
+/// No penalty is formed here: callers restrict the basis's own function-space
+/// roughness candidates through Z (`restrict_penalty_candidates`).
 pub(crate) fn compute_geometric_constraint_transform(
     knot_vector: &Array1<f64>,
     degree: usize,
-    penalty_order: usize,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+) -> Result<Array2<f64>, BasisError> {
     // 1. Compute Greville abscissae
     let g = compute_greville_abscissae(knot_vector, degree)?;
     let k = g.len();
@@ -3507,14 +3505,7 @@ pub(crate) fn compute_geometric_constraint_transform(
         });
     }
 
-    // 5. Build raw penalty and project: S_c = Z' S Z
-    let s_raw = create_difference_penalty_matrix(k, penalty_order, Some(g.view()))?;
-    let s_constrained = {
-        let zt_s = fast_atb(&z, &s_raw);
-        fast_ab(&zt_s, &z)
-    };
-
-    Ok((z, s_constrained))
+    Ok(z)
 }
 
 /// Result of auto-deriving a clamped B-spline knot vector from 1-D data.
@@ -4465,5 +4456,3 @@ mod range_floor_psi_jet_tests {
 #[cfg(test)]
 mod sum_to_zero_sparse_projector_idempotence_tests;
 
-#[cfg(test)]
-mod owed_bughunt_splines_tests;

@@ -3017,7 +3017,8 @@ impl<'a> RemlState<'a> {
         } else if let Some(mix_state) = &self.runtime_mixture_link_state {
             self.build_mixture_link_ext_coords(bundle, mix_state)
         } else {
-            Ok(Vec::new())
+            // Student-t (ln σ, ln ν); empty for every other family.
+            self.build_student_t_ext_coords(bundle)
         }
     }
 

@@ -760,8 +760,8 @@ pub(crate) fn validate_linear_constraints(
 }
 
 /// Orthonormal basis `z` (raw `p` × reduced `r`) of the penalty null space —
-/// the affine `{1, log t}` AFT baseline an I-spline 2nd-order difference penalty
-/// leaves unpenalized. The penalized (curvature) directions are exactly the
+/// the affine `{1, log t}` AFT baseline a rank-2-null-space I-spline time
+/// penalty leaves unpenalized. The penalized (curvature) directions are exactly the
 /// non-affine deviation the constant-scale data cannot identify, so the
 /// null-space columns are precisely the identifiable parametric subspace.
 ///
@@ -1030,8 +1030,8 @@ pub(crate) fn unit_log_time_slope(
 
 /// Does the rank-1 reduced parametric-AFT regime apply (issue #892)?
 ///
-/// The real survival time penalty is a 1st-difference penalty, so its null space
-/// is DIMENSION 1: a single monotone log-t trend column `z` (p×1). When it does,
+/// The real survival time penalty (the I-spline value-space curvature Gram) has
+/// a null space of DIMENSION 1: a single monotone log-t trend column `z` (p×1). When it does,
 /// the time warp is REMOVED entirely (`h ≡ 0`) and the `log t` baseline is
 /// carried as a per-row σ-scaled LOCATION offset instead — `u = inv_sigma·(log t
 /// − η_t) = (log t − μ)/σ` — so the event Jacobian gains the `−log σ` term that
@@ -1283,8 +1283,8 @@ pub(crate) fn prepare_identified_time_block(
         // and miscalibrates the absolute survival curve.
         //
         // RANK-1 case (the one that actually fires for real fits): the survival
-        // time penalty is a 1st-difference penalty, so its null space is
-        // DIMENSION 1 — a single monotone log-t trend column. Pin the warp SHAPE
+        // time penalty (the I-spline value-space curvature Gram) has a null space
+        // of DIMENSION 1 — a single monotone log-t trend column. Pin the warp SHAPE
         // to exactly `log t` (built straight from the event times, NOT the
         // I-spline's curved image of it) but keep its SCALE `θ` a single FREE
         // coefficient: `h(t) = θ · log t`. The standardized residual is
@@ -1320,7 +1320,7 @@ pub(crate) fn prepare_identified_time_block(
                 p,
             ));
         }
-        // RANK-2 case (2nd-difference penalty `{1, log t}`): kept for correctness
+        // RANK-2 case (a time penalty with null space `{1, log t}`): kept for correctness
         // where it occurs (golden unit test), though real fits use rank-1 above.
         if r == 2
             && z.nrows() == p

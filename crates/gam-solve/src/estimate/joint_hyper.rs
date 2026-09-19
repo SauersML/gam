@@ -432,7 +432,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let k = self.reml_state.canonical_penalties.len();
         let seed_config = super::optimizer::external_reml_seed_config(
             k,
-            self.reml_state.config.link_function(),
+            self.reml_state.config.likelihood.spec.is_gaussian_identity(),
         );
 
         self.reml_state.without_persistent_warm_start_store(|| {

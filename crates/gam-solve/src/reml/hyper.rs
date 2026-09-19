@@ -1347,7 +1347,7 @@ impl<'a> RemlState<'a> {
                 self.build_tau_hyper_coords_sparse_exact(rho, bundle, hyper_dirs, true)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_sparse_exact(rho, bundle, hyper_dirs)?;
-            let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
+            let fixed_drift_deriv = if self.config.likelihood.spec.is_gaussian_identity()
             {
                 None
             } else {
@@ -1366,7 +1366,7 @@ impl<'a> RemlState<'a> {
                 self.build_tau_hyper_coords_original_basis(rho, bundle, hyper_dirs, true)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks_original_basis(rho, bundle, hyper_dirs)?;
-            let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
+            let fixed_drift_deriv = if self.config.likelihood.spec.is_gaussian_identity()
             {
                 None
             } else {
@@ -1378,7 +1378,7 @@ impl<'a> RemlState<'a> {
             let ext_coords = self.build_tau_hyper_coords(rho, bundle, hyper_dirs, true)?;
             let (ext_pair_fn, rho_ext_pair_fn) =
                 self.build_tau_pair_callbacks(rho, bundle, hyper_dirs)?;
-            let fixed_drift_deriv = if matches!(self.config.link_function(), LinkFunction::Identity)
+            let fixed_drift_deriv = if self.config.likelihood.spec.is_gaussian_identity()
             {
                 None
             } else {
@@ -1462,7 +1462,7 @@ impl<'a> RemlState<'a> {
         let c_array = &pirls_result.solve_c_array.to_owned();
 
         // Whether third-derivative corrections are needed (non-Gaussian).
-        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
+        let is_gaussian_identity = self.config.likelihood.spec.is_gaussian_identity();
         let b_depends_on_beta = !is_gaussian_identity;
 
         // Firth operator (Firth-logit only).
@@ -2282,7 +2282,7 @@ impl<'a> RemlState<'a> {
             gam_linalg::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.to_owned());
         let x_design = self.x().clone();
 
-        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
+        let is_gaussian_identity = self.config.likelihood.spec.is_gaussian_identity();
         let firth_jeffreys_link = super::outer_eval::reml_robust_jeffreys_link(&self.config);
         let firth_op_original = if let Some(jeffreys_link) = firth_jeffreys_link {
             if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
@@ -2630,7 +2630,7 @@ impl<'a> RemlState<'a> {
         let w_diag = pirls_result.finalweights.to_owned();
         let c_array = pirls_result.solve_c_array.to_owned();
         let d_array = pirls_result.solve_d_array.to_owned();
-        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
+        let is_gaussian_identity = self.config.likelihood.spec.is_gaussian_identity();
 
         let s_tau_tau = std::sync::Arc::new(s_tau_tau);
         // `ld_s` contracts `S_k` against `pld`, so it must be the SAME penalty
@@ -2907,7 +2907,7 @@ impl<'a> RemlState<'a> {
         let w_diag = pirls_result.finalweights.to_owned();
         let c_array = pirls_result.solve_c_array.to_owned();
         let d_array = pirls_result.solve_d_array.to_owned();
-        let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
+        let is_gaussian_identity = self.config.likelihood.spec.is_gaussian_identity();
 
         // Capture into Arc for shared ownership in closures.
         let s_tau_tau = Arc::new(s_tau_tau);
@@ -3392,6 +3392,90 @@ impl<'a> RemlState<'a> {
         Ok(coords)
     }
 
+    /// Prior-weighted fixed-β θ-jets of the Student-t likelihood at the
+    /// converged `η̂`, `θ = (ln σ, ln ν)`, or `None` for any other family.
+    fn student_t_theta_jets(
+        &self,
+        bundle: &EvalShared,
+    ) -> Result<Option<Vec<crate::pirls::StudentTThetaJet>>, EstimationError> {
+        let Some(parameters) = self.config.likelihood.student_t_parameters() else {
+            return Ok(None);
+        };
+        let (sigma, nu) = parameters.map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+        let scale = crate::pirls::StudentTScale::new(sigma, nu)?;
+        let eta = &bundle.pirls_result.final_eta;
+        let mut jets = Vec::with_capacity(eta.len());
+        for i in 0..eta.len() {
+            let w = self.weights[i];
+            let mut jet = scale.theta_jet(i, self.y[i], eta[i])?;
+            jet.scale_by(w);
+            jets.push(jet);
+        }
+        Ok(Some(jets))
+    }
+
+    /// Build [`HyperCoord`] objects for the Student-t scale and degrees of
+    /// freedom, `θ = (ln σ, ln ν)`.
+    ///
+    /// Same fixed-β objects as [`Self::build_sas_link_ext_coords`], from the
+    /// closed-form jets of [`crate::pirls::StudentTScale::theta_jet`]:
+    /// `a = −Σ w ∂ℓ/∂θ`, `g = −Xᵀ(w ∂u/∂θ)`, `B = Xᵀ diag(w ∂W_obs/∂θ) X`.
+    /// `W_obs` is the observed information, the curvature the Laplace
+    /// approximation carries for this family. Built in the transformed
+    /// basis; the caller rotates them with the other link-ext coords.
+    pub(crate) fn build_student_t_ext_coords(
+        &self,
+        bundle: &EvalShared,
+    ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
+        let Some(jets) = self.student_t_theta_jets(bundle)? else {
+            return Ok(Vec::new());
+        };
+        let pirls_result = bundle.pirls_result.as_ref();
+        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let x_dense_arc = pirls_result
+            .x_transformed
+            .try_to_dense_arc("build_student_t_ext_coords requires dense transformed design")
+            .map_err(EstimationError::InvalidInput)?;
+        let x_dense_owned = free_basis_opt.as_ref().map(|z| {
+            DenseRightProductView::new(x_dense_arc.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
+        let x_dense = x_dense_owned
+            .as_ref()
+            .unwrap_or_else(|| x_dense_arc.as_ref());
+        let aux_dim = 2usize;
+        if x_dense.ncols() == 0 {
+            return Ok(empty_hyper_coords(
+                EmptyHyperCoords::AuxiliaryAxes(aux_dim),
+                true,
+            ));
+        }
+        let mut coords = Vec::with_capacity(aux_dim);
+        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+        for j in 0..aux_dim {
+            let a_j = -jets.iter().map(|jet| jet.log_likelihood[j]).sum::<f64>();
+            let du = Array1::from_iter(jets.iter().map(|jet| jet.score[j]));
+            let dw = Array1::from_iter(jets.iter().map(|jet| jet.weight[j]));
+            coords.push(super::reml_outer_engine::HyperCoord {
+                a: a_j,
+                g: -x_dense.t().dot(&du),
+                drift: super::reml_outer_engine::HyperCoordDrift::from_dense(
+                    Self::xt_diag_x_dense_into(x_dense, &dw, &mut weighted_scratch),
+                ),
+                // The penalties do not depend on (σ, ν).
+                ld_s: 0.0,
+                // W_obs depends on β through the residual y − Xβ.
+                b_depends_on_beta: true,
+                is_penalty_like: false,
+                firth_g: None,
+                tk_eta_fixed: None,
+                tk_x_fixed: None,
+            });
+        }
+        Ok(coords)
+    }
+
     /// The dense design in the SAME coefficient basis the link-ext
     /// `HyperCoord`s occupy once `rotate_link_ext_coords_to_original` has run.
     ///
@@ -3474,12 +3558,14 @@ impl<'a> RemlState<'a> {
         &self,
         bundle: &EvalShared,
     ) -> Result<Option<LinkExtPairObjects>, EstimationError> {
+        if let Some(t_jets) = self.student_t_theta_jets(bundle)? {
+            return self.student_t_pair_objects(bundle, &t_jets).map(Some);
+        }
         let Some(jets) = self.build_link_param_jets2(bundle)? else {
             return Ok(None);
         };
         let aux_dim = jets.aux_dim;
         let x_eff = std::sync::Arc::new(self.link_ext_effective_design(bundle)?);
-        let p_dim = x_eff.ncols();
         let nobs = jets.rows.len();
 
         let mut a_pairs = Array2::<f64>::zeros((aux_dim, aux_dim));
@@ -3518,88 +3604,132 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-        let mut g_pairs: Vec<Array1<f64>> = Vec::with_capacity(aux_dim * aux_dim);
-        let mut b_pairs: Vec<Array2<f64>> = Vec::with_capacity(aux_dim * aux_dim);
-        for idx in 0..aux_dim * aux_dim {
-            if p_dim == 0 {
-                g_pairs.push(Array1::<f64>::zeros(0));
-                b_pairs.push(Array2::<f64>::zeros((0, 0)));
-                continue;
-            }
-            g_pairs.push(-x_eff.t().dot(&d2u[idx]));
-            b_pairs.push(super::assembly::xt_diag_x_dense_into(
-                &x_eff,
-                &d2w[idx],
-                &mut weighted_scratch,
-            ));
-        }
-
-        let a_pairs = std::sync::Arc::new(a_pairs);
-        let g_pairs = std::sync::Arc::new(g_pairs);
-        let b_pairs = std::sync::Arc::new(b_pairs);
-        let pair_fn: Box<
-            dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
-        > = Box::new(
-            move |i: usize, j: usize| -> super::reml_outer_engine::HyperCoordPairResult {
-                if i >= aux_dim || j >= aux_dim {
-                    return Err(format!(
-                        "link-ext pair index ({i},{j}) out of range for {aux_dim} link parameters"
-                    ));
-                }
-                let idx = i * aux_dim + j;
-                Ok(super::reml_outer_engine::HyperCoordPair {
-                    a: a_pairs[[i, j]],
-                    g: g_pairs[idx].clone(),
-                    b_mat: b_pairs[idx].clone(),
-                    b_operator: None,
-                    // The penalty matrices do not depend on the link-shape
-                    // parameters, so the penalty pseudo-logdet has no second
-                    // partial in them. This is the ONLY structurally-zero
-                    // ingredient of the link-link block.
-                    ld_s: 0.0,
-                })
-            },
-        );
-
-        let drift_x = std::sync::Arc::clone(&x_eff);
-        let dw_deta = std::sync::Arc::new(dw_deta);
-        let drift_fn: super::reml_outer_engine::FixedDriftDerivFn = Box::new(
-            move |i: usize,
-                  delta: &Array1<f64>|
-                  -> Result<Option<super::reml_outer_engine::DriftDerivResult>, String> {
-                let Some(mixed) = dw_deta.get(i) else {
-                    return Err(format!(
-                        "link-ext drift-derivative index {i} out of range for {} link parameters",
-                        dw_deta.len()
-                    ));
-                };
-                if drift_x.ncols() == 0 || drift_x.nrows() == 0 {
-                    return Ok(None);
-                }
-                if delta.len() != drift_x.ncols() {
-                    return Err(format!(
-                        "link-ext drift-derivative direction has length {} but the design has \
-                         {} columns",
-                        delta.len(),
-                        drift_x.ncols()
-                    ));
-                }
-                let eta_dir = drift_x.dot(delta);
-                let diag = mixed * &eta_dir;
-                let mut scratch = Array2::<f64>::zeros((0, 0));
-                Ok(Some(super::reml_outer_engine::DriftDerivResult::Dense(
-                    super::assembly::xt_diag_x_dense_into(&drift_x, &diag, &mut scratch),
-                )))
-            },
-        );
-
-        Ok(Some(LinkExtPairObjects {
-            pair_fn,
-            drift_fn,
-        }))
+        Ok(Some(link_ext_pair_objects_from_rows(
+            aux_dim, x_eff, a_pairs, d2u, d2w, dw_deta,
+        )))
     }
 
+    /// Student-t `(ln σ, ln ν)` pair objects: the second θ-partials of the
+    /// prior-weighted jets and `∂²W_obs/∂θ∂η` for the drift derivative.
+    fn student_t_pair_objects(
+        &self,
+        bundle: &EvalShared,
+        jets: &[crate::pirls::StudentTThetaJet],
+    ) -> Result<LinkExtPairObjects, EstimationError> {
+        let aux_dim = 2usize;
+        let x_eff = std::sync::Arc::new(self.link_ext_effective_design(bundle)?);
+        let mut a_pairs = Array2::<f64>::zeros((aux_dim, aux_dim));
+        let mut d2u = Vec::with_capacity(aux_dim * aux_dim);
+        let mut d2w = Vec::with_capacity(aux_dim * aux_dim);
+        for i in 0..aux_dim {
+            for j in 0..aux_dim {
+                a_pairs[[i, j]] = -jets.iter().map(|jet| jet.log_likelihood2[i][j]).sum::<f64>();
+                d2u.push(Array1::from_iter(jets.iter().map(|jet| jet.score2[i][j])));
+                d2w.push(Array1::from_iter(jets.iter().map(|jet| jet.weight2[i][j])));
+            }
+        }
+        let dw_deta = (0..aux_dim)
+            .map(|i| Array1::from_iter(jets.iter().map(|jet| jet.weight_eta[i])))
+            .collect();
+        Ok(link_ext_pair_objects_from_rows(
+            aux_dim, x_eff, a_pairs, d2u, d2w, dw_deta,
+        ))
+    }
+}
+
+/// Assemble the ext-ext pair callback and drift derivative from per-row
+/// second-order partials: `a_pairs[i,j] = ∂²F/∂θ_i∂θ_j`, and per pair index
+/// `i·aux_dim + j` the row vectors `∂²u/∂θ_i∂θ_j` and `∂²W_obs/∂θ_i∂θ_j`, plus
+/// `∂²W_obs/∂θ_i∂η` per parameter.
+fn link_ext_pair_objects_from_rows(
+    aux_dim: usize,
+    x_eff: std::sync::Arc<Array2<f64>>,
+    a_pairs: Array2<f64>,
+    d2u: Vec<Array1<f64>>,
+    d2w: Vec<Array1<f64>>,
+    dw_deta: Vec<Array1<f64>>,
+) -> LinkExtPairObjects {
+    let p_dim = x_eff.ncols();
+    let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
+    let mut g_pairs: Vec<Array1<f64>> = Vec::with_capacity(aux_dim * aux_dim);
+    let mut b_pairs: Vec<Array2<f64>> = Vec::with_capacity(aux_dim * aux_dim);
+    for idx in 0..aux_dim * aux_dim {
+        if p_dim == 0 {
+            g_pairs.push(Array1::<f64>::zeros(0));
+            b_pairs.push(Array2::<f64>::zeros((0, 0)));
+            continue;
+        }
+        g_pairs.push(-x_eff.t().dot(&d2u[idx]));
+        b_pairs.push(super::assembly::xt_diag_x_dense_into(
+            &x_eff,
+            &d2w[idx],
+            &mut weighted_scratch,
+        ));
+    }
+
+    let a_pairs = std::sync::Arc::new(a_pairs);
+    let g_pairs = std::sync::Arc::new(g_pairs);
+    let b_pairs = std::sync::Arc::new(b_pairs);
+    let pair_fn: Box<
+        dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult + Send + Sync,
+    > = Box::new(
+        move |i: usize, j: usize| -> super::reml_outer_engine::HyperCoordPairResult {
+            if i >= aux_dim || j >= aux_dim {
+                return Err(format!(
+                    "link-ext pair index ({i},{j}) out of range for {aux_dim} link parameters"
+                ));
+            }
+            let idx = i * aux_dim + j;
+            Ok(super::reml_outer_engine::HyperCoordPair {
+                a: a_pairs[[i, j]],
+                g: g_pairs[idx].clone(),
+                b_mat: b_pairs[idx].clone(),
+                b_operator: None,
+                // The penalty matrices do not depend on the link-shape
+                // parameters, so the penalty pseudo-logdet has no second
+                // partial in them. This is the ONLY structurally-zero
+                // ingredient of the link-link block.
+                ld_s: 0.0,
+            })
+        },
+    );
+
+    let drift_x = std::sync::Arc::clone(&x_eff);
+    let dw_deta = std::sync::Arc::new(dw_deta);
+    let drift_fn: super::reml_outer_engine::FixedDriftDerivFn = Box::new(
+        move |i: usize,
+              delta: &Array1<f64>|
+              -> Result<Option<super::reml_outer_engine::DriftDerivResult>, String> {
+            let Some(mixed) = dw_deta.get(i) else {
+                return Err(format!(
+                    "link-ext drift-derivative index {i} out of range for {} link parameters",
+                    dw_deta.len()
+                ));
+            };
+            if drift_x.ncols() == 0 || drift_x.nrows() == 0 {
+                return Ok(None);
+            }
+            if delta.len() != drift_x.ncols() {
+                return Err(format!(
+                    "link-ext drift-derivative direction has length {} but the design has \
+                     {} columns",
+                    delta.len(),
+                    drift_x.ncols()
+                ));
+            }
+            let eta_dir = drift_x.dot(delta);
+            let diag = mixed * &eta_dir;
+            let mut scratch = Array2::<f64>::zeros((0, 0));
+            Ok(Some(super::reml_outer_engine::DriftDerivResult::Dense(
+                super::assembly::xt_diag_x_dense_into(&drift_x, &diag, &mut scratch),
+            )))
+        },
+    );
+
+    LinkExtPairObjects { pair_fn, drift_fn }
+}
+
+impl<'a> RemlState<'a> {
     /// Per-observation link jets carried to second parameter order, for
     /// whichever flexible-link family is active.
     fn build_link_param_jets2(

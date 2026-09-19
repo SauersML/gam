@@ -1529,5 +1529,21 @@
     ],
     "reason": "#2951 S2a: the registry-export reader moves out of mpd_induction_registry.rs into the shared crates/gam-sae/examples/support/induction_export.rs, which the registry example now #[path]-includes, so the S2a and S2b examples read an export through the same loader. The moved items are the five functions float64_array, payload, read_array, stored_tensor and use_map, and the five records Export, Config, Tensor, Use and ExportFile. In the shared module the records and float64_array are pub, load_export (new) returns the export with its TensorRegistry and a weight reader, and the other four functions are its private helpers.",
     "evidence": "Direct gate dx2 run mpd-lead-ind-g4 (direct-dx2-mpd-lead-ind-g4.log) at 6340572d96, with this unit in the carried induction stack (tree 3f22c187): RC_CHECK 0 (workspace, all targets, so the registry example and its includes compile under deny(warnings)), RC_PYFFI 0, 379/379 parameter_decomposition:: tests, DONE_SENTINEL_0. Each moved item is declared in crates/gam-sae/examples/support/induction_export.rs, added by the same landing."
+  },
+  {
+    "base": "a5a71e516b0a0f1afd3b29b7e1e080926e4bb206",
+    "items": [
+      "crates/gam-terms/src/basis/bspline_eval.rs:fn:create_difference_penalty_matrix",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:clamped_cubic_knots",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:difference_penalty_annihilates_constant_and_greville_linear",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:difference_penalty_rejects_collapsed_span",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:difference_penalty_value_is_scale_invariant_across_decades",
+      "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:penalty_for_width",
+      "crates/gam-terms/src/basis/internal.rs:fn:divided_difference_penalty_is_invariant_on_tiny_coordinate_domains",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:test_penalty_matrix_creation",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:test_penalty_matrix_rejects_singular_greville_span"
+    ],
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix built the knot-scaled coefficient-difference Gram DᵀD, a penalty on the coefficient sequence. SPEC puts penalties on the function: every production B-spline penalty is the exact function-space Gram bspline_derivative_penalty_matrix (∫B^(m)B^(m)ᵀ), and the one production caller, compute_geometric_constraint_transform, formed this penalty only for bspline_build.rs to discard it (`let (z, _)`). The function now returns just the transform Z and the difference penalty is deleted. The removed tests exercised only that deleted function (its null space, span rejection and scale invariance) or the discarded penalty output of owed_bughunt_splines_tests.rs; clamped_cubic_knots and penalty_for_width were that file's private helpers. Tests that used the Gram only as a generic PSD fixture now call the test-only gam_linalg_test_support::coefficient_difference_penalty.",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call (duchon_thinplate.rs compute_geometric_constraint_transform) whose penalty result both bspline_build.rs callers bind to `_`; every other occurrence is a test or a comment. In the landing tree the name has 0 occurrences outside this ledger. cargo check --workspace --all-targets RC 0; gam-terms basis::tests::test_geometric_constraint_transform_{orthogonality,dimensions} and knot_scale_invariance_tests pass; gam-linalg-test-support 13/13 including coefficient_difference_penalty_matches_closed_form_second_difference_gram."
   }
 ]

@@ -22,16 +22,81 @@ pub(super) fn shape_order_and_sign(shape: ShapeConstraint) -> Option<(usize, f64
     }
 }
 
-pub fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Array1<f64>> {
+/// Coordinate lower bounds of the shape chart built by
+/// [`bspline_shape_cone_chart`]. The chart's leading coordinates are the free
+/// affine ones — level then (for curvature) slope — and every later coordinate
+/// is a cone coordinate `δ_j ≥ 0`. A centred chart has no level coordinate, so
+/// one fewer leading coordinate is free.
+pub fn shape_lower_bounds_local(
+    shape: ShapeConstraint,
+    dim: usize,
+    level_in_chart: bool,
+) -> Option<Array1<f64>> {
     let (order, _) = shape_order_and_sign(shape)?;
-    if dim <= order {
+    let free = if level_in_chart { order } else { order - 1 };
+    if dim <= free {
         return None;
     }
     let mut lb = Array1::<f64>::from_elem(dim, f64::NEG_INFINITY);
-    for j in order..dim {
+    for j in free..dim {
         lb[j] = 0.0;
     }
     Some(lb)
+}
+
+/// Whether a realized raw→shape chart kept the level coordinate. The centred
+/// chart drops exactly that one column; every other chart is square.
+pub fn shape_chart_keeps_level(chart: &Array2<f64>) -> bool {
+    chart.ncols() == chart.nrows()
+}
+
+/// Raw-coefficient chart `β = C δ` realizing the exact shape cone of an open
+/// B-spline as coordinate bounds on `δ` (see [`shape_lower_bounds_local`]).
+///
+/// The square box transform `T` (cumulative sums for monotone, knot-scaled
+/// derivative controls for convex/concave) has the constant `T[:, 0] = ±1` as
+/// its first column. A clamped B-spline basis is a partition of unity, so that
+/// column reproduces the model intercept exactly. When the smooth is centred
+/// (`raw_column_means = Some(B̄)`, the weighted column means of the raw basis
+/// on the fitting rows) the level column is dropped and every remaining column
+/// is centred, `C = T₁ − 1 (T₁ᵀ B̄)ᵀ`, so `Σ_i w_i f(x_i) = 0` for every `δ`.
+/// Subtracting a constant from every control point leaves all control-point
+/// differences unchanged, so the cone `δ ≥ 0` still certifies the shape
+/// exactly; centring is a linear chart, not a penalty or an affine offset.
+/// `raw_column_means = None` keeps the level column (square `C = T`).
+pub(super) fn bspline_shape_cone_chart(
+    shape: ShapeConstraint,
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    raw_column_means: Option<ArrayView1<'_, f64>>,
+) -> Result<Array2<f64>, BasisError> {
+    let Some((order, sign)) = shape_order_and_sign(shape) else {
+        return Err(BasisError::InvalidInput(
+            "shape cone chart requires a non-None shape constraint".to_string(),
+        ));
+    };
+    let spans = bspline_first_derivative_control_spans(knots, degree)?;
+    let p = spans.len() + 1;
+    let t = if order == 2 {
+        super::coefficient_transforms::convex_derivative_control_transform_matrix(&spans, sign)?
+    } else {
+        super::coefficient_transforms::cumulative_sum_transform_matrix(p, order, sign)
+    };
+    let Some(means) = raw_column_means else {
+        return Ok(t);
+    };
+    if means.len() != p {
+        return Err(BasisError::DimensionMismatch(format!(
+            "shape cone chart received {} raw column means for a {p}-column basis",
+            means.len()
+        )));
+    }
+    let mut chart = t.slice(s![.., 1..]).to_owned();
+    let centre = chart.t().dot(&means);
+    for mut row in chart.rows_mut() {
+        row -= &centre;
+    }
+    Ok(chart)
 }
 
 pub(super) fn shape_supports_basis(term: &SmoothTermSpec) -> bool {
@@ -52,10 +117,6 @@ pub(super) fn shape_supports_basis(term: &SmoothTermSpec) -> bool {
         BSplineKnotSpec::PeriodicUniform { .. } | BSplineKnotSpec::NaturalCubicRegression { .. }
     ) && matches!(&spec.boundary, OneDimensionalBoundary::Open)
         && spec.boundary_conditions.is_free()
-}
-
-pub(super) fn shape_uses_box_reparameterization(basis: &SmoothBasisSpec) -> bool {
-    matches!(basis, SmoothBasisSpec::BSpline1D { .. })
 }
 
 /// First-derivative control denominators for an open B-spline basis.
@@ -310,6 +371,58 @@ mod exact_bspline_shape_tests {
     }
 
     #[test]
+    fn centred_cone_chart_drops_level_keeps_cone_and_sums_to_zero() {
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.08, 0.37, 0.62, 1.0, 1.0, 1.0, 1.0];
+        let p = knots.len() - 4;
+        // Positive, non-uniform column means that sum to one, like the weighted
+        // means of a partition-of-unity basis.
+        let raw_means = Array1::from_iter((0..p).map(|j| 1.0 + j as f64 * 0.3));
+        let raw_means = &raw_means / raw_means.sum();
+        for shape in [
+            ShapeConstraint::MonotoneIncreasing,
+            ShapeConstraint::MonotoneDecreasing,
+            ShapeConstraint::Convex,
+            ShapeConstraint::Concave,
+        ] {
+            let (order, _) = shape_order_and_sign(shape).unwrap();
+            let square = bspline_shape_cone_chart(shape, knots.view(), 3, None).unwrap();
+            let centred =
+                bspline_shape_cone_chart(shape, knots.view(), 3, Some(raw_means.view())).unwrap();
+            assert_eq!(square.dim(), (p, p));
+            assert_eq!(centred.dim(), (p, p - 1));
+            assert!(shape_chart_keeps_level(&square));
+            assert!(!shape_chart_keeps_level(&centred));
+            // The square chart's level column is the constant the intercept carries.
+            let level = square.column(0);
+            assert!(level.iter().all(|v| (v.abs() - 1.0).abs() == 0.0));
+            // Every centred column integrates to zero against the column means.
+            let centre = centred.t().dot(&raw_means);
+            assert!(centre.iter().all(|v| v.abs() <= 64.0 * f64::EPSILON));
+            // Centring shifts every control point equally, so the exact cone
+            // rows see the centred chart exactly as the square chart without
+            // its level column: `δ ≥ 0` still certifies the shape.
+            let cone = bspline_shape_linear_constraints(knots.view(), 3, shape)
+                .unwrap()
+                .unwrap();
+            let on_centred = cone.a.dot(&centred);
+            let on_square = cone.a.dot(&square.slice(s![.., 1..]));
+            for (a, b) in on_centred.iter().zip(on_square.iter()) {
+                assert!((a - b).abs() <= 64.0 * f64::EPSILON);
+            }
+            // The free coordinates lose the level; the rest stay in the cone.
+            let lb = shape_lower_bounds_local(shape, p - 1, false).unwrap();
+            let free = lb.iter().take_while(|v| v.is_infinite()).count();
+            assert_eq!(free, order - 1);
+            assert!(lb.iter().skip(free).all(|&v| v == 0.0));
+            let lb_square = shape_lower_bounds_local(shape, p, true).unwrap();
+            assert_eq!(
+                lb_square.iter().take_while(|v| v.is_infinite()).count(),
+                order
+            );
+        }
+    }
+
+    #[test]
     fn affine_linear_spline_has_vacuous_curvature_cone() {
         let knots = array![0.0, 0.0, 1.0, 1.0];
         for shape in [ShapeConstraint::Convex, ShapeConstraint::Concave] {
@@ -318,7 +431,7 @@ mod exact_bspline_shape_tests {
                 .unwrap();
             assert_eq!(constraints.a.dim(), (0, 2));
             assert!(constraints.b.is_empty());
-            assert!(shape_lower_bounds_local(shape, 2).is_none());
+            assert!(shape_lower_bounds_local(shape, 2, true).is_none());
         }
     }
 

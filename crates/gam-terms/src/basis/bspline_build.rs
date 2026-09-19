@@ -1268,8 +1268,7 @@ fn compute_geometric_constraint_transform_in_chart(
         }
         Ok(z)
     } else {
-        let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
-        Ok(z)
+        compute_geometric_constraint_transform(knots, degree)
     }
 }
 
@@ -1433,7 +1432,7 @@ pub(crate) fn build_streaming_bspline_design_and_candidates(
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::RemoveLinearTrend => {
-            let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
+            let z = compute_geometric_constraint_transform(knots, degree)?;
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
