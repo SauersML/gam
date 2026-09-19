@@ -1605,7 +1605,6 @@ pub(crate) fn compute_smoothing_correction(
                 correction: None,
                 rho_covariance: None,
                 active_rank: None,
-                spectrum: None,
                 status: SmoothingCorrectionStatus::Unavailable(
                     SmoothingCorrectionUnavailable::PenaltyStructure {
                         error: error.to_string(),
@@ -1619,7 +1618,6 @@ pub(crate) fn compute_smoothing_correction(
             correction: None,
             rho_covariance: None,
             active_rank: None,
-            spectrum: None,
             status: SmoothingCorrectionStatus::Unavailable(
                 SmoothingCorrectionUnavailable::PenaltyDimension {
                     rho: n_rho,
