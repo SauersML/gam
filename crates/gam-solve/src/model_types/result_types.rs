@@ -3106,11 +3106,18 @@ pub struct FitInference {
     #[serde(default)]
     pub coefficient_influence: Option<Array2<f64>>,
     /// Weighted Gram `X'WX = H − S(λ)` in the original coefficient basis —
-    /// symmetric PSD by construction. Stored directly (issue #1027) so the
+    /// symmetric PSD by construction on the GLM lanes. Stored directly (issue #1027) so the
     /// Wood–Pya–Säfken corrected-EDF correction `tr(X'WX·Σ_ρ)` pairs the true
     /// PSD Gram with `Σ_ρ`, rather than reconstructing it as `H·F` from a
     /// Hessian surface that need not satisfy `H·F = X'WX` (which made the
     /// correction indefinite and the corrected EDF drop below the conditional).
+    ///
+    /// A blockwise custom-family fit publishes its likelihood curvature
+    /// `H − S(λ)` here, the observed information of an arbitrary likelihood,
+    /// which is PSD only at a likelihood maximum. Such a fit has no scalar
+    /// covariance scale, so the corrected-EDF correction never reads it; the
+    /// smooth score test refuses a term whose score covariance it leaves
+    /// indefinite.
     #[serde(default)]
     pub weighted_gram: Option<Array2<f64>>,
     /// The penalized Hessian's identified coefficient subspace at the fitted

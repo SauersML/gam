@@ -270,7 +270,9 @@ class Summary:
         null does not remove), ``"fit_curvature_unavailable"`` (the model kept no
         exact penalized Hessian and weighted Gram), ``"dispersion_unavailable"``
         (the coefficient covariance scale cannot be resolved),
-        ``"not_identified"``, or ``"residual_df_unavailable"``.
+        ``"not_identified"``, ``"indefinite_curvature"`` (a custom family's
+        observed information leaves the term's score no covariance), or
+        ``"residual_df_unavailable"``.
         Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None

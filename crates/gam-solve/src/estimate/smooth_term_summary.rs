@@ -324,6 +324,9 @@ impl<'a> ScoreTestFit<'a> {
                 SmoothPValueUnavailable::UnpenalizedDirection
             }
             SmoothScoreTestRefusal::NotIdentified => SmoothPValueUnavailable::NotIdentified,
+            SmoothScoreTestRefusal::IndefiniteCurvature => {
+                SmoothPValueUnavailable::IndefiniteCurvature
+            }
             SmoothScoreTestRefusal::ResidualDfUnavailable => {
                 SmoothPValueUnavailable::ResidualDfUnavailable
             }

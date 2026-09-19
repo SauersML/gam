@@ -77,6 +77,12 @@ pub enum SmoothPValueUnavailable {
     /// coefficients' penalized Hessian is not positive definite, or the term's
     /// score has no variance left once they are fitted.
     NotIdentified,
+    /// The fit's likelihood curvature `H − S(λ)` is indefinite on the term's
+    /// score once the other coefficients are fitted. A custom family's
+    /// penalized Hessian is its observed information, which need not be
+    /// positive semidefinite at a penalized mode; the score then has no
+    /// covariance to refer it to.
+    IndefiniteCurvature,
     /// The scale is estimated, but the fit has no positive residual degrees of
     /// freedom for the denominator of the reference law.
     ResidualDfUnavailable,
@@ -98,6 +104,7 @@ impl SmoothPValueUnavailable {
             Self::FitCurvatureUnavailable => "fit_curvature_unavailable",
             Self::DispersionUnavailable => "dispersion_unavailable",
             Self::NotIdentified => "not_identified",
+            Self::IndefiniteCurvature => "indefinite_curvature",
             Self::ResidualDfUnavailable => "residual_df_unavailable",
             Self::RandomEffect(reason) => reason.label(),
             Self::RandomEffectTestNotRecorded => "random_effect_test_not_recorded",
@@ -128,6 +135,10 @@ impl SmoothPValueUnavailable {
             Self::NotIdentified => {
                 "not identified: the term's score has no variance once the other terms are \
                  fitted; no p-value is reported"
+            }
+            Self::IndefiniteCurvature => {
+                "indefinite curvature: the fit's likelihood curvature leaves the term's score an \
+                 indefinite covariance, so the score has no variance law; no p-value is reported"
             }
             Self::ResidualDfUnavailable => {
                 "residual df unavailable: the scale is estimated but the fit has no positive \

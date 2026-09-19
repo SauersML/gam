@@ -125,6 +125,9 @@ pub enum SmoothScoreTestRefusal {
     /// the term's score has no variance left once they are fitted: the term is
     /// not identified apart from the rest of the model.
     NotIdentified,
+    /// The likelihood curvature `G` leaves the term's score an indefinite
+    /// covariance, so the score has no variance law to refer it to.
+    IndefiniteCurvature,
     /// The scale is estimated but the fit has no residual degrees of freedom.
     ResidualDfUnavailable,
 }
@@ -184,6 +187,17 @@ pub fn smooth_score_test(
         let cov = &g_jj - &cross - &cross.t() + &a.t().dot(&g_oo.dot(&a));
         (score, symmetrized(&cov))
     };
+    // `C = MᵀGM` is a covariance whenever `G` is; a likelihood curvature that is
+    // not (an observed information away from a likelihood maximum) gives the
+    // score no variance law, and testing on the positive part of `C` would
+    // test a different statistic.
+    let (score_cov_evals, _) = score_cov
+        .eigh(faer::Side::Lower)
+        .map_err(|_| SmoothScoreTestRefusal::InconsistentFit)?;
+    let score_cov_tolerance = crate::basis::spectral_noise_tolerance(&score_cov_evals);
+    if score_cov_evals.iter().any(|&e| e < -score_cov_tolerance) {
+        return Err(SmoothScoreTestRefusal::IndefiniteCurvature);
+    }
 
     // K = Σ_l K_l / tr(K_l C) over the components the other terms leave
     // identified; the ranges of all S_l must cover the block.
@@ -752,6 +766,30 @@ mod tests {
         assert_eq!(refused.unwrap_err(), SmoothScoreTestRefusal::UnpenalizedDirection);
         let refused = test_with(&design, &fitted, SmoothTestScale::Estimated, &[]);
         assert_eq!(refused.unwrap_err(), SmoothScoreTestRefusal::UnpenalizedDirection);
+    }
+
+    /// An observed-information curvature need not be positive semi-definite —
+    /// a location-scale fit's joint `H − S(λ)` is indefinite away from a
+    /// log-concave likelihood. Where it leaves the term's score covariance
+    /// with a negative eigenvalue the score has no variance law, and the test
+    /// is refused rather than computed on the positive part of the spectrum.
+    #[test]
+    fn an_indefinite_score_covariance_is_refused() {
+        let design = design(60);
+        let mut rng = StdRng::seed_from_u64(13);
+        let mut fitted = fit(&design, &null_response(&design, &mut rng));
+        let term = design.term.clone();
+        let shift = 100.0 * fitted.gram.diag().sum();
+        for k in term {
+            fitted.gram[[k, k]] -= shift;
+        }
+        let refused = test_with(
+            &design,
+            &fitted,
+            SmoothTestScale::Estimated,
+            &[design.wiggle.clone(), design.null_space.clone()],
+        );
+        assert_eq!(refused.unwrap_err(), SmoothScoreTestRefusal::IndefiniteCurvature);
     }
 
     /// The estimated-scale reference needs its denominator degrees of freedom.
