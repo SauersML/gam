@@ -27,7 +27,7 @@ def test_standalone_ctn_schema_uses_fit_request(tmp_path):
         geometry["correction"] = None
         fit["covariance_conditional"] = None
         fit["covariance_corrected"] = None
-    with pytest.raises(gamfit.errors.GamError, match="posterior-mean"):
+    with pytest.raises(gamfit.errors.GamfitError, match="posterior-mean"):
         gamfit.loads(json.dumps(declined).encode()).transformation_score(data)
 
 

@@ -22,6 +22,8 @@ pub struct GaussianLocationScaleAloRowInput<'a> {
     pub eta_log_sigma: f64,
     pub prior_weight: f64,
     pub response_scale: f64,
+    /// Standardized-response σ floor saved with the model.
+    pub sigma_floor: f64,
     pub wiggle_basis: &'a [f64],
     pub wiggle_basis_d1: &'a [f64],
     pub wiggle_basis_d2: &'a [f64],
@@ -100,6 +102,7 @@ pub fn gaussian_location_scale_alo_row_geometry(
         eta_log_sigma,
         prior_weight,
         response_scale,
+        sigma_floor,
         wiggle_basis,
         wiggle_basis_d1,
         wiggle_basis_d2,
@@ -128,6 +131,7 @@ pub fn gaussian_location_scale_alo_row_geometry(
         warped_mean / response_scale,
         eta_log_sigma - response_scale.ln(),
         prior_weight,
+        sigma_floor,
         (2.0 * std::f64::consts::PI).ln(),
     )?;
     // The row derivatives in the standardized fit frame are the order-2 surface
@@ -302,6 +306,7 @@ mod tests {
         let eta_sigma = 0.3;
         let weight = 1.4;
         let response_scale = 5.0;
+        let sigma_floor = 0.03;
         let geometry = gaussian_location_scale_alo_row_geometry(GaussianLocationScaleAloRowInput {
             row: 0,
             y,
@@ -309,6 +314,7 @@ mod tests {
             eta_log_sigma: eta_sigma,
             prior_weight: weight,
             response_scale,
+            sigma_floor,
             wiggle_basis: &[],
             wiggle_basis_d1: &[],
             wiggle_basis_d2: &[],
@@ -316,8 +322,7 @@ mod tests {
         })
         .expect("Gaussian saved row must replay");
 
-        let sigma =
-            response_scale * gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR + eta_sigma.exp();
+        let sigma = response_scale * sigma_floor + eta_sigma.exp();
         let kappa = eta_sigma.exp() / sigma;
         let residual = y - mean;
         let residual_sq = residual * residual / (sigma * sigma);

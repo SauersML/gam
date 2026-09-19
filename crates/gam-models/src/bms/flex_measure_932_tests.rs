@@ -200,6 +200,7 @@ fn mfixture(is_score_warp: bool) -> MFixture {
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
+        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -543,6 +544,7 @@ pub(super) fn build_fixture_with_runtime(is_score_warp: bool, runtime: Deviation
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
+        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -704,6 +706,7 @@ fn measure_third_fourth_branch<const K: usize>(
         &pairs,
         &fx.primary,
         1,
+        &fx.family.jet_scratch.batch,
     )
     .expect("dynamic fourth contraction of canonical plan");
     for a in 0..r {
@@ -778,6 +781,7 @@ fn measure_third_fourth_branch<const K: usize>(
                 &pairs,
                 &fx.primary,
                 1,
+                &fx.family.jet_scratch.batch,
             )
             .expect("dynamic fourth contraction")[0]
                 .iter()
@@ -816,4 +820,119 @@ fn release_measure_bms_empirical_third_fourth_fixed_vs_dynamic_932() {
     if let Some(gate) = gate {
         gate.finish();
     }
+}
+
+/// gam#2989: the empirical FLEX jet scratch belongs to the fit. A runtime-width
+/// contraction leaves one idle workspace in the family's pool, charged to the
+/// governor, and dropping the family frees it. A per-worker thread-local kept
+/// the largest arena on every pool worker for the life of the process instead.
+#[test]
+fn flex_jet_scratch_is_charged_and_ends_with_the_family_2989() {
+    let fx = mfixture(true);
+    assert_empirical_branch(&fx);
+    let pt = mpoint(&fx);
+    let r = fx.primary.total;
+    let (intercept, m_a, _) = fx
+        .family
+        .solve_row_intercept_base(0, pt.q, pt.b, Some(&pt.beta), None, None)
+        .expect("intercept solve");
+    let grid = fx
+        .family
+        .latent_measure
+        .empirical_grid_for_training_row(0)
+        .expect("latent measure query")
+        .expect("forced empirical grid");
+    let plan = fx
+        .family
+        .compile_empirical_bms_row_program(
+            0,
+            &fx.primary,
+            pt.q,
+            pt.b,
+            Some(&pt.beta),
+            None,
+            intercept,
+            &grid,
+        )
+        .expect("canonical empirical-flex row plan");
+    let point =
+        BernoulliMarginalSlopeFamily::intercept_primary_point(pt.q, pt.b, Some(&pt.beta), None);
+    let dir_u = Array1::from_shape_fn(r, |i| 0.5 + 0.1 * i as f64);
+    let dir_v = Array1::from_shape_fn(r, |i| -0.3 + 0.05 * i as f64);
+    let pairs: [(&Array1<f64>, &Array1<f64>); 1] = [(&dir_u, &dir_v)];
+
+    let scratch = Arc::clone(&fx.family.jet_scratch);
+    let pool = &scratch.batch;
+    assert_eq!(pool.idle_len(), 0, "a fresh family holds no jet scratch");
+    let first = BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
+        &plan,
+        &point,
+        &pairs,
+        &fx.primary,
+        1,
+        &pool,
+    )
+    .expect("dynamic fourth contraction");
+    assert_eq!(pool.idle_len(), 1, "the workspace returns to the pool");
+    assert!(
+        pool.retained_bytes() > 0,
+        "the idle workspace is charged to the governor"
+    );
+
+    // The first warm reset folds the cold arena's chunks into one chunk of the
+    // high-water size, and the pool re-charges it; from then on a warm
+    // contraction reuses the workspace without growing it.
+    let contract = || {
+        BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
+            &plan,
+            &point,
+            &pairs,
+            &fx.primary,
+            1,
+            &pool,
+        )
+        .expect("warm dynamic fourth contraction")
+    };
+    let second = contract();
+    let retained = pool.retained_bytes();
+    let third = contract();
+    assert_eq!(first, second, "a reused workspace gives the same contraction");
+    assert_eq!(second, third);
+    assert_eq!(pool.idle_len(), 1);
+    assert_eq!(pool.retained_bytes(), retained);
+
+    // The third-trace gradient draws its trace-jet workspace from the same
+    // fit-owned scratch, and returns it charged.
+    let row_ctx = BernoulliMarginalSlopeRowExactContext {
+        intercept,
+        m_a,
+        intercept_fast_path: false,
+    };
+    let gram: Vec<f64> = (0..r * r)
+        .map(|index| (1.0 + 0.7 * (index / r) as f64 + 1.3 * (index % r) as f64).sin())
+        .collect();
+    assert_eq!(scratch.trace.idle_len(), 0);
+    fx.family
+        .empirical_flex_row_third_trace_gradient(
+            0,
+            &fx.primary,
+            pt.q,
+            pt.b,
+            Some(&pt.beta),
+            None,
+            &row_ctx,
+            &gram,
+            &grid,
+        )
+        .expect("third trace gradient");
+    assert_eq!(scratch.trace.idle_len(), 1, "the trace workspace returns to the pool");
+    assert!(scratch.trace.retained_bytes() > 0);
+
+    let scratch_alive = Arc::downgrade(&scratch);
+    drop(scratch);
+    drop(fx);
+    assert!(
+        scratch_alive.upgrade().is_none(),
+        "dropping the family frees its jet scratch"
+    );
 }

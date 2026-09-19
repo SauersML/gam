@@ -44,6 +44,28 @@ impl FailureCategory {
             Self::Unclassified => "unclassified",
         }
     }
+
+    /// The user-facing category a fit failure of this kind reports.
+    ///
+    /// Every numerical way a fit can stop short of a usable estimate is a
+    /// convergence failure. `Unclassified` is one too: it names a fit that
+    /// stopped without producing an estimate, whose producing helper's text
+    /// spans kinds, so the only thing known of it is that the fit did not
+    /// finish. A refused input is a property of the data the fit was handed;
+    /// a violated invariant is an engine defect.
+    #[must_use]
+    pub const fn error_category(self) -> gam_spec::ErrorCategory {
+        use gam_spec::ErrorCategory;
+        match self {
+            Self::Convergence
+            | Self::StartupSeeds
+            | Self::Numerical
+            | Self::Integration
+            | Self::Unclassified => ErrorCategory::Convergence,
+            Self::Input => ErrorCategory::Data,
+            Self::Invariant => ErrorCategory::Internal,
+        }
+    }
 }
 
 impl std::fmt::Display for FailureCategory {

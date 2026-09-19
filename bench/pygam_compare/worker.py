@@ -8,7 +8,12 @@ Usage: worker.py LIB FAMILY N DESIGN SEED
           positive-continuous family of the ``positive_*`` plans (see
           ``POSITIVE_FAMILIES``)
   DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
-          | by (see ``make_data``) | ff-<regime>
+          | by (see ``make_data``) | fz<case> | ff-<regime>
+
+A ``fz<case>`` design is a convergence-fuzz case (``fuzz_terms.py``): a seeded
+term structure — tensor, ``ti``, ``by=``, factor, random-effect, cyclic, 2-D
+isotropic, shape-constrained and concurvity terms — fitted with gamfit only
+on the gaussian, binomial and poisson families; see :func:`run_fuzz`.
 
 An ``ff-<regime>`` design is a family-convergence-fuzz cell
 (``fuzz_families.py``): FAMILY is then a fuzz family label (every family and
@@ -54,9 +59,10 @@ from numpy.typing import NDArray
 from scipy import special, stats
 
 if __package__:
-    from . import fuzz_families
+    from . import fuzz_families, fuzz_terms
 else:  # run as a script by run.py: this directory is sys.path[0]
     import fuzz_families  # type: ignore[no-redef]
+    import fuzz_terms  # type: ignore[no-redef]
 
 LIBS = ("gamfit", "pygam", "pygam_gs")
 FAMILIES = ("gaussian", "binomial", "poisson")
@@ -137,6 +143,9 @@ EXTRA_DESIGNS = ("te+s", "by")
 BY_LEVELS = ("a", "b", "c")
 INTERVAL_LEVEL = 0.95
 TEST_SEED_OFFSET = 1000
+# The fuzz interval phase checks that intervals are finite on this many
+# held-out rows; interval speed is measured by the core plans, not here.
+FUZZ_INTERVAL_ROWS = 200
 
 FloatArray = NDArray[np.float64]
 
@@ -485,9 +494,87 @@ class PygamAdapter(Adapter):
         }
 
 
+def run_fuzz(family: str, n: int, design: str, seed: int) -> dict[str, Any]:
+    """One convergence-fuzz rep (design ``fz<case>``, gamfit only).
+
+    Same phases as :func:`run`, plus what the fuzz triage needs: the formula,
+    the certificate verdict, whether every prediction and interval came back
+    finite, and the exception type of a phase that raised, so a typed
+    build-time refusal can be told apart from a solver failure.
+    """
+    data = fuzz_terms.draw(int(design[2:]), n, family, seed)
+    out: dict[str, Any] = {"base_rss_mb": rss_peak_mb(), "formula": data.formula}
+    errors: dict[str, str] = {}
+    error_types: dict[str, str] = {}
+
+    def phase(name: str, fn: Callable[[], Any]) -> Any:
+        t = Timer()
+        try:
+            value = fn()
+        except Exception as exc:
+            errors[name] = traceback.format_exc(limit=4)[-2000:]
+            error_types[name] = type(exc).__name__
+            return None
+        out[f"{name}_s"], out[f"{name}_cpu_s"] = t.stop()
+        return value
+
+    gamfit: Any = phase("import", lambda: importlib.import_module("gamfit"))
+    model: Any = None
+    if gamfit is not None:
+        out["lib_version"] = str(gamfit.__version__)
+        out["lib_file"] = str(gamfit.__file__)
+        train = fuzz_terms.as_frame(data.train, data.categorical)
+        model = phase("fit", lambda: gamfit.fit(train, data.formula, family=family))
+    if model is not None:
+        out["rss_after_fit_mb"] = rss_peak_mb()
+        test = fuzz_terms.as_frame(data.test, data.categorical)
+        head = fuzz_terms.as_frame(
+            {k: v[:FUZZ_INTERVAL_ROWS] for k, v in data.test.items()},
+            data.categorical,
+        )
+        pred = phase(
+            "pred", lambda: np.asarray(model.predict(test), dtype=float).reshape(-1)
+        )
+        iv = phase(
+            "interval",
+            lambda: model.predict(head, interval=INTERVAL_LEVEL, return_type="dict"),
+        )
+        summ = phase("info", model.summary)
+        if summ is not None:
+            conv = getattr(summ, "convergence", None)
+            out["convergence"] = json.loads(json.dumps(conv, default=str))
+            out["certified"] = None if conv is None else bool(conv.get("certified"))
+            out["edf"] = None if summ.edf_total is None else float(summ.edf_total)
+        if pred is not None:
+            out["pred_finite"] = bool(np.all(np.isfinite(pred)))
+            if out["pred_finite"]:
+                out["rmse_mu"] = float(np.sqrt(np.mean((pred - data.mu_test) ** 2)))
+        if iv is not None:
+            lo = np.asarray(iv["posterior_mean_lower"], dtype=float)
+            hi = np.asarray(iv["posterior_mean_upper"], dtype=float)
+            finite = np.isfinite(lo) & np.isfinite(hi)
+            out["interval_finite"] = bool(np.all(finite))
+            if out["interval_finite"]:
+                mu = data.mu_test[: lo.shape[0]]
+                out["coverage"] = float(np.mean((mu >= lo) & (mu <= hi)))
+    out["peak_rss_mb"] = rss_peak_mb()
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    out["cpu_user_s"] = usage.ru_utime
+    out["cpu_sys_s"] = usage.ru_stime
+    out["status"] = "error" if errors else "ok"
+    if errors:
+        out["errors"] = errors
+        out["error_types"] = error_types
+    return out
+
+
 def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]:
     if lib not in LIBS:
         raise ValueError(f"unknown lib {lib!r}; expected one of {LIBS}")
+    if fuzz_terms.is_fuzz_design(design):
+        if lib != "gamfit":
+            raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")
+        return run_fuzz(family, n, design, seed)
     if fuzz_families.is_fuzz_design(design):
         if lib != "gamfit":
             raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")

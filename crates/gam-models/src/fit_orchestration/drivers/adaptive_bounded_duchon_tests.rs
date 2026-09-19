@@ -1006,6 +1006,7 @@ mod adaptive_bounded_duchon_tests {
                 min: 0.0,
                 max: 1.0,
                 prior: BoundedCoefficientPriorSpec::Uniform,
+                latent_center: 0.0,
             }],
         };
         let state = vec![ParameterBlockState {
@@ -1101,6 +1102,7 @@ mod adaptive_bounded_duchon_tests {
                     min: -1.0,
                     max: 2.0,
                     prior,
+                    latent_center: 0.0,
                 }],
             };
             let at = |beta: Array1<f64>| {
@@ -1171,6 +1173,7 @@ mod adaptive_bounded_duchon_tests {
                         min: -1.0,
                         max: 2.0,
                         prior,
+                        latent_center: 0.0,
                     }],
                 }
             };

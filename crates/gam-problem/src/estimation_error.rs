@@ -1462,6 +1462,22 @@ impl EstimationError {
         }
     }
 
+    /// The user-facing category of this failure: [`Self::failure_category`]
+    /// read at the coarser grain every front end classifies by, except that
+    /// a model specification the engine refuses before any data is looked at
+    /// is a defect of the request rather than of the data.
+    #[must_use]
+    pub fn error_category(&self) -> crate::ErrorCategory {
+        let decisive = self.innermost_estimation_error();
+        match decisive {
+            Self::InvalidSpecification(_) | Self::InvalidStabilization(_) | Self::BasisError(_) => {
+                crate::ErrorCategory::Formula
+            }
+            Self::CustomFamily(err) => err.error_category(),
+            _ => decisive.failure_category().error_category(),
+        }
+    }
+
     /// The `Enum::Variant` name of this error, the one a front end prints
     /// beside the message (#2937). Wrappers are named by what they wrap; see
     /// [`Self::innermost_estimation_error`].

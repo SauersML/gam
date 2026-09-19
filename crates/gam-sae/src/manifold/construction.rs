@@ -5140,6 +5140,79 @@ impl SaeManifoldTerm {
         })
     }
 
+    /// #2231 — the derivative of [`Self::loss_scaled`]'s data fit along a target
+    /// direction `D` at this fixed state: `Σ_i w_i·⟨U_iᵀ(t_i − f_i), U_iᵀ d_i⟩`, the
+    /// reconstruction `f_i` read on the same active support and with the same row
+    /// weights and whitening that price the value. A crosscoder block weight
+    /// `log λ_ℓ` moves the scaled target along `D = ½·Z̃_ℓ` on the block's columns.
+    pub(crate) fn data_fit_target_derivative(
+        &self,
+        target: ArrayView2<'_, f64>,
+        direction: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let (n, p, k_atoms) = (self.n_obs(), self.output_dim(), self.k_atoms());
+        if target.dim() != (n, p) || direction.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::data_fit_target_derivative: target {:?} and direction {:?} \
+                 must both be ({n}, {p})",
+                target.dim(),
+                direction.dim()
+            ));
+        }
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let row_loss_w = self.row_loss_weights.as_deref();
+        let recon_layout = self
+            .last_row_layout
+            .as_ref()
+            .filter(|l| l.active_atoms.len() == n);
+        let mut g_buf = vec![0.0_f64; p];
+        let mut residual = Array1::<f64>::zeros(p);
+        let mut assign_buf = vec![0.0_f64; k_atoms];
+        let mut vals = Vec::with_capacity(n);
+        for row in 0..n {
+            self.assignment
+                .try_assignments_row_into(row, &mut assign_buf)?;
+            residual.fill(0.0);
+            let mut add_atom = |atom_idx: usize, residual: &mut Array1<f64>| {
+                self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                let a_k = assign_buf[atom_idx];
+                for out_col in 0..p {
+                    residual[out_col] += a_k * g_buf[out_col];
+                }
+            };
+            match recon_layout {
+                Some(layout) => {
+                    for &atom_idx in &layout.active_atoms[row] {
+                        add_atom(atom_idx, &mut residual);
+                    }
+                }
+                None => {
+                    for atom_idx in 0..k_atoms {
+                        add_atom(atom_idx, &mut residual);
+                    }
+                }
+            }
+            for out_col in 0..p {
+                residual[out_col] = target[[row, out_col]] - residual[out_col];
+            }
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+            let contraction = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric
+                    .whiten_residual_row(row, residual.view())
+                    .iter()
+                    .zip(metric.whiten_residual_row(row, direction.row(row)).iter())
+                    .map(|(r, d)| r * d)
+                    .sum::<f64>(),
+                _ => residual.dot(&direction.row(row)),
+            };
+            vals.push(w_row * contraction);
+        }
+        Ok(gam_linalg::pairwise_reduce::pairwise_sum(&vals))
+    }
+
     pub fn analytic_penalty_value_total(
         &self,
         registry: &AnalyticPenaltyRegistry,

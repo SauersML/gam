@@ -2754,8 +2754,10 @@ pub(crate) fn build_latent_measure_decision(
                 .to_string()
             })?;
             // The law moves, so it is chosen among nested arms by the moving-law
-            // certificate at the converged fit. The fit starts on the simplest arm
-            // that follows a moving mean and variance.
+            // certificate at the converged fit. The fit starts on the simplest
+            // admissible arm that follows a moving mean and variance: the
+            // location-scale Gaussian law only if its residual passes the adequacy
+            // screen.
             let a_block = conditioning.ok_or_else(|| {
                 format!(
                     "{context}: the conditional-law evidence moved without a marginal-index span \
@@ -2768,6 +2770,7 @@ pub(crate) fn build_latent_measure_decision(
                 a_block,
                 local,
                 grid_size,
+                policy,
                 evidence.clone(),
                 context,
             )
@@ -3330,7 +3333,6 @@ pub(crate) fn weighted_tail_mass(
 // Cross-module constants — declared here so all submodules can reach them
 // via `use super::*` without promoting implementation details to pub(crate).
 // ---------------------------------------------------------------------------
-pub(super) const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 /// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
 /// row-accumulation phases.
 ///
@@ -3693,8 +3695,7 @@ pub(crate) use family::{
 pub(crate) use gradient_paths::MarginalSlopeCovarianceRef;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{
-    empirical_intercept_from_marginal, empirical_intercept_from_marginal_within,
-    empirical_intercept_tail_tolerance, signed_probit_neglog_derivatives_up_to_fourth,
+    empirical_intercept, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };

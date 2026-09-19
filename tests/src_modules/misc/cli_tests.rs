@@ -2600,7 +2600,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         scale_dimensions: false,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("main formula should reject z-column reuse");
+    .expect_err("main formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("main formula"), "{err}");
@@ -2644,7 +2645,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         scale_dimensions: false,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("slope formula should reject z-column reuse");
+    .expect_err("slope formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("slope_formula"), "{err}");
@@ -3509,6 +3511,11 @@ fn test_payload(
     payload
 }
 
+/// Standardized-units σ floor saved with the intercept-only Gaussian
+/// location-scale fixture (a fitted model derives it from the response's
+/// recording grid; the fixture has no training response, so it pins one).
+const INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR: f64 = 0.01;
+
 fn intercept_only_gaussian_location_scale_model(
     beta_mu: f64,
     beta_log_sigma: f64,
@@ -3552,6 +3559,7 @@ fn intercept_only_gaussian_location_scale_model(
     payload.formula_noise = Some("1".to_string());
     payload.beta_noise = Some(vec![beta_log_sigma]);
     payload.gaussian_response_scale = Some(response_scale);
+    payload.gaussian_sigma_floor = Some(INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR);
     payload.set_training_feature_metadata(vec![], vec![]);
     payload.resolved_termspec = Some(empty_termspec());
     payload.resolved_termspec_noise = Some(empty_termspec());
@@ -3947,7 +3955,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
 }
 
 #[test]
-fn parse_bounded_linear_term_defaults_to_no_prior() {
+fn parse_bounded_linear_term_defaults_to_shrinkage_prior() {
     let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1) + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
@@ -3962,7 +3970,7 @@ fn parse_bounded_linear_term_defaults_to_no_prior() {
             assert_eq!(name, "mu_hat");
             assert_eq!((*min, *max), (0.0, 1.0));
             match prior {
-                BoundedCoefficientPriorSpec::None => {}
+                BoundedCoefficientPriorSpec::Shrinkage => {}
                 other => panic!("unexpected prior: {other:?}"),
             }
             assert!(!*double_penalty);
@@ -5700,6 +5708,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5741,6 +5750,7 @@ fn location_scale_map_prediction_omits_the_posterior_estimand() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5772,6 +5782,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
     let eta = array![1.0];
     let mean = array![1.0];
     let sigma = array![0.4];
+    let eta_std_error = array![0.25];
     let std_error = array![0.3];
     let mean_lower = array![0.2];
     let mean_upper = array![1.8];
@@ -5782,6 +5793,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
         Some(mean.view()),
         Some(sigma.view()),
         &[],
+        Some(eta_std_error.view()),
         Some(std_error.view()),
         Some(mean_lower.view()),
         Some(mean_upper.view()),
@@ -5799,14 +5811,14 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
     assert_eq!(
         lines.next(),
         Some(
-            "linear_predictor_plugin,mean_plugin,posterior_mean,noise_scale,posterior_mean_standard_error,posterior_mean_lower,posterior_mean_upper"
+            "linear_predictor_plugin,mean_plugin,posterior_mean,noise_scale,linear_predictor_standard_error,posterior_mean_standard_error,posterior_mean_lower,posterior_mean_upper"
         ),
         "location-scale uncertainty output must name the posterior estimand"
     );
     assert_eq!(
         lines.next(),
         Some(
-            "1.000000000000,1.000000000000,1.000000000000,0.400000000000,0.300000000000,0.200000000000,1.800000000000"
+            "1.000000000000,1.000000000000,1.000000000000,0.400000000000,0.250000000000,0.300000000000,0.200000000000,1.800000000000"
         )
     );
 
@@ -5822,8 +5834,8 @@ fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
     // that shift, so it is the only piece still standardized and the only piece
     // multiplied here:
     //
-    //   σ_raw = response_scale·LOGB_SIGMA_FLOOR + exp(η_ls)
-    //         = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal))
+    //   σ_raw = response_scale·sigma_floor + exp(η_ls)
+    //         = response_scale·(sigma_floor + exp(η_internal))
     //
     // Scaling the whole `(floor + exp(η_ls))` instead would apply
     // `response_scale` twice on the exp term and break σ's response-scale
@@ -5831,7 +5843,7 @@ fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
     // fixture used to assert. See `GaussianLocationScalePredictor::compute_sigma`.
     //
     // Pick the input so σ exits at 2.0 exactly under the real convention:
-    // exp(η_ls) = 2.0 − 8·0.01 = 1.92.
+    // exp(η_ls) = 2.0 − 8·INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR = 1.92.
     let model = intercept_only_gaussian_location_scale_model(-3.0, (1.92f64).ln(), 8.0);
     let data = ndarray::Array2::<f64>::zeros((2, 0));
     let headers = vec![];
@@ -7594,7 +7606,7 @@ fn run_fit_request_document(data: PathBuf, out: PathBuf, document: &str) -> Resu
     args.formula_positional = None;
     args.predict_noise = None;
     args.survival_likelihood = None;
-    run_fit(args)
+    run_fit(args).map_err(|error| error.to_string())
 }
 
 /// Integration test: a small survival dataset (6 rows, intercept-only
