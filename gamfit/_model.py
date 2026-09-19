@@ -569,7 +569,24 @@ class Model:
         :math:`\\alpha = 0.05` and up to 1.6x anti-conservative at
         :math:`10^{-4}`), or ``"unit_weight_fallback"``.
 
-        For each penalized (shape-unconstrained) smooth term it returns
+        It returns one row per smooth term, always with the same keys. The
+        published p-value is exactly one of:
+
+        * ``p_value`` — the tail of the Bartlett-corrected statistic, resolved
+          to within ``p_value_bound``;
+        * ``p_value_upper_bound`` — the tail is smaller than the accuracy the
+          reference law can be evaluated to, so it is reported as ``p <
+          p_value_upper_bound`` (a Chernoff bound on the conditional law plus
+          the selection replay's shift and noise) rather than as a rounding
+          residue such as ``0.0`` or ``1e-15``;
+        * ``unavailable_reason`` — a stable label (``"shape_constrained"``,
+          ``"empty_coefficient_block"``, ``"degenerate_reference"``,
+          ``"full_refit_failed"``, ``"null_refit_failed"``,
+          ``"null_log_likelihood_not_finite"``, ``"tail_not_computable"``)
+          with ``unavailable_message`` saying what happened; every inference
+          field of such a row is ``None``.
+
+        For a term with an inference row it also carries
         ``statistic_lr`` (the raw :math:`W`), ``ref_df`` (the null mean
         :math:`d = \\sum_j w_j`, which is what the Bartlett factor is
         denominated in — *not* a chi-square degrees of freedom),
@@ -579,13 +596,14 @@ class Model:
         estimated-scale channel above, ``None`` off the profiled Gaussian),
         ``bartlett_factor``
         :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
-        ``p_value_corrected`` (the magic-by-default value), ``material`` (the
+        ``p_value_corrected`` (the raw evaluated tail behind ``p_value`` /
+        ``p_value_upper_bound``), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and
         ``correction_provenance`` — ``"lawley_lr"`` when the family carries
         closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
-        null refit converged, else ``"none"`` (the uncorrected reference stands,
-        never weakened).
+        factor is computable at this ``n``, else
+        ``"none"`` (the uncorrected reference stands, never weakened).
 
         Needs the training ``data`` for the per-term null refits, exactly as
         :meth:`curvature` does. Returns an empty list when the model has no

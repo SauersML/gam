@@ -2464,17 +2464,134 @@ impl SmoothLrReferenceDf {
             .collect()
     }
 
-    fn conditional_tail_with_bound(&self, statistic: f64) -> (f64, f64) {
+    /// The fixed-`λ` event `W > statistic` as a tail of a linear combination of
+    /// chi-squares: `P(Σ_j λ_j χ²_{h_j} > x)` for the returned `(terms, x)`, or
+    /// the probability itself where the event is decided without one.
+    ///
+    /// One construction serves both the quadrature and the tail ceiling
+    /// ([`Self::conditional_tail_upper_bound`]), so the two cannot describe
+    /// different events.
+    fn conditional_law(&self, statistic: f64) -> SmoothLrConditionalLaw {
         if !statistic.is_finite() {
-            return (f64::NAN, f64::NAN);
+            return SmoothLrConditionalLaw::Undefined;
         }
-        let summary =
-            |w: f64| gam_math::probability::chi_square_sf(w / self.scale, self.chi_square_df);
         if self.weights.is_empty() && self.profiled_scale.is_none() {
             // The summary IS the reference on the two degraded lanes, and it is
             // a closed form: no truncation, so no bound to report.
-            return (summary(statistic), 0.0);
+            return SmoothLrConditionalLaw::Closed(gam_math::probability::chi_square_sf(
+                statistic / self.scale,
+                self.chi_square_df,
+            ));
         }
+        let mut terms = self.null_law_terms();
+        let Some(scale) = self.profiled_scale.as_ref() else {
+            return SmoothLrConditionalLaw::Combination(terms, statistic);
+        };
+        // `W > w  ⟺  Q/V > expm1((w − B)/n)`, so the tail is the SIGNED
+        // combination `Q − c·V` at zero. See [`SmoothLrProfiledScale`].
+        let ratio = ((statistic - scale.deterministic_offset) / scale.observations).exp_m1();
+        if !ratio.is_finite() {
+            return SmoothLrConditionalLaw::Undefined;
+        }
+        if ratio <= 0.0 {
+            // `W` is at or under the value the two fits' degrees of freedom
+            // alone produce. `Q ≥ 0` and `V > 0`, so `Q − cV ≥ 0` with
+            // certainty and the statistic is not evidence of anything.
+            return SmoothLrConditionalLaw::Closed(1.0);
+        }
+        terms.extend(scale.residual_weights.iter().map(|&weight| {
+            gam_math::probability::WeightedChiSquareTerm {
+                weight: -ratio * weight,
+                degrees_of_freedom: 1.0,
+            }
+        }));
+        if scale.residual_unit_dimension > 0.0 {
+            terms.push(gam_math::probability::WeightedChiSquareTerm {
+                weight: -ratio,
+                degrees_of_freedom: scale.residual_unit_dimension,
+            });
+        }
+        SmoothLrConditionalLaw::Combination(terms, 0.0)
+    }
+
+    /// A certified CEILING on the conditional tail at `statistic`: the
+    /// optimized Chernoff bound
+    /// [`gam_math::probability::signed_weighted_chi_square_log_sf_chernoff_bound`]
+    /// on the same event [`Self::conditional_tail_with_bound`] integrates.
+    ///
+    /// This is what a very strong effect is reported against. The quadrature's
+    /// accuracy is ABSOLUTE — Imhof's `½ + (1/π)∫…` cannot resolve a tail far
+    /// below its own truncation bound, whatever that bound is — so past it the
+    /// point value is noise around zero and the true statement is `p ≤ ceiling`.
+    /// The generating function supplies that ceiling at any depth, with no
+    /// tolerance of its own. On the closed-form lanes the value is exact and is
+    /// returned as its own ceiling.
+    fn conditional_tail_upper_bound(&self, statistic: f64) -> f64 {
+        match self.conditional_law(statistic) {
+            SmoothLrConditionalLaw::Undefined => f64::NAN,
+            SmoothLrConditionalLaw::Closed(value) => value,
+            SmoothLrConditionalLaw::Combination(terms, x) => {
+                gam_math::probability::signed_weighted_chi_square_log_sf_chernoff_bound(&terms, x)
+                    .exp()
+            }
+        }
+    }
+
+    /// The typed p-value for `statistic`: a point value when the published
+    /// accuracy resolves it away from zero, and an explicit ceiling when it does
+    /// not.
+    ///
+    /// `(value, accuracy)` is what [`Self::tail_probability_with_bound`] returned
+    /// at this statistic. When `value ≤ accuracy` the interval the reference
+    /// certifies, `[value − accuracy, value + accuracy]`, contains zero: the
+    /// digits of `value` are the quadrature's roundoff rather than the tail, and
+    /// publishing them as a probability would be publishing noise. What IS
+    /// known there is a ceiling, and two independent ones are available — the
+    /// certified interval's own top, and the conditional tail's Chernoff bound
+    /// carried through the selection replay exactly as the point value is
+    /// (`+ shift`, with the replay's `2·se` as its accuracy) — so the smaller of
+    /// the two is reported.
+    ///
+    /// `None` when the value or its accuracy is not a number, which the driver
+    /// reports as [`SmoothLrUnavailable::TailNotComputable`].
+    pub fn typed_p_value(&self, statistic: f64, value: f64, accuracy: f64) -> Option<SmoothLrPValue> {
+        if !(value.is_finite() && accuracy.is_finite()) {
+            return None;
+        }
+        if value > accuracy {
+            return Some(SmoothLrPValue::Resolved(value));
+        }
+        let interval_top = value + accuracy;
+        let conditional_ceiling = self.conditional_tail_upper_bound(statistic);
+        let chernoff = match self.selection.replay() {
+            Some(replay) => {
+                let (shift, standard_error) =
+                    replay.tail_shift(self.selection_threshold(statistic));
+                conditional_ceiling + shift.max(0.0) + 2.0 * standard_error
+            }
+            None => conditional_ceiling,
+        };
+        let ceiling = if chernoff.is_finite() {
+            interval_top.min(chernoff)
+        } else {
+            interval_top
+        };
+        // A tail past `exp(−745)` underflows to zero, and "p ≤ 0" is false for
+        // every continuous law; the ceiling is lifted to the smallest positive
+        // double, which is the least representable true statement.
+        Some(SmoothLrPValue::UpperBound(
+            ceiling.clamp(f64::from_bits(1), 1.0),
+        ))
+    }
+
+    fn conditional_tail_with_bound(&self, statistic: f64) -> (f64, f64) {
+        let (terms, x) = match self.conditional_law(statistic) {
+            SmoothLrConditionalLaw::Undefined => return (f64::NAN, f64::NAN),
+            SmoothLrConditionalLaw::Closed(value) => return (value, 0.0),
+            SmoothLrConditionalLaw::Combination(terms, x) => (terms, x),
+        };
+        let summary =
+            |w: f64| gam_math::probability::chi_square_sf(w / self.scale, self.chi_square_df);
         let derived = if self.statistic_resolution.is_finite() && self.statistic_resolution > 0.0 {
             let delta = self.statistic_resolution * (statistic.abs() + self.mean.abs());
             (summary(statistic) - summary(statistic + delta)).abs()
@@ -2505,37 +2622,134 @@ impl SmoothLrReferenceDf {
         let tolerance = derived
             .max(self.selection_standard_error(statistic))
             .clamp(SMOOTH_LR_TAIL_ROUNDOFF_FLOOR, SMOOTH_LR_TAIL_COARSEST);
-        let mut terms = self.null_law_terms();
-        let Some(scale) = self.profiled_scale.as_ref() else {
-            return gam_math::probability::signed_weighted_chi_square_sf_to_tolerance(
-                &terms, statistic, tolerance,
-            );
-        };
-        // `W > w  ⟺  Q/V > expm1((w − B)/n)`, so the tail is the SIGNED
-        // combination `Q − c·V` at zero. See [`SmoothLrProfiledScale`].
-        let ratio = ((statistic - scale.deterministic_offset) / scale.observations).exp_m1();
-        if !ratio.is_finite() {
-            return (f64::NAN, f64::NAN);
+        gam_math::probability::signed_weighted_chi_square_sf_to_tolerance(&terms, x, tolerance)
+    }
+}
+
+/// See [`SmoothLrReferenceDf::conditional_law`].
+enum SmoothLrConditionalLaw {
+    /// The statistic is not a number, so there is no event to score.
+    Undefined,
+    /// The tail in closed form (a degraded lane's summary, or an event the
+    /// support decides).
+    Closed(f64),
+    /// `P(Σ_j λ_j χ²_{h_j} > x)`.
+    Combination(Vec<gam_math::probability::WeightedChiSquareTerm>, f64),
+}
+
+/// A smooth term's LR p-value as the reference can actually certify it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SmoothLrPValue {
+    /// A point value, resolved away from zero by the published accuracy
+    /// [`SmoothTermLrInference::p_value_bound`].
+    Resolved(f64),
+    /// `p ≤` this ceiling. The effect is strong enough that the tail sits below
+    /// what the quadrature resolves, so a point value would be roundoff; see
+    /// [`SmoothLrReferenceDf::typed_p_value`].
+    UpperBound(f64),
+}
+
+/// Why a smooth term carries no LR p-value. Every smooth term in the model gets
+/// a row: a p-value ([`SmoothLrPValue`]) or one of these, never a silent gap and
+/// never an error for the whole call because one term's test could not run.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SmoothLrUnavailable {
+    /// A shape-constrained smooth. Its LR is a cone-projected boundary test
+    /// whose null law is a chi-bar-square mixture, not the central law this
+    /// reference is; the summary table declines it for the same reason.
+    ShapeConstrained,
+    /// The term spans no coefficient columns in the fitted design, so there is
+    /// nothing to drop and no hypothesis to test.
+    EmptyCoefficientBlock,
+    /// The term's null law has no positive mean or no positive two-moment
+    /// shape/scale — the tested block carries no degree of freedom the data can
+    /// move, so no tail can be read from it.
+    DegenerateReference,
+    /// The full model could not be refitted from the supplied data, so no term
+    /// has an `ℓ_full` to be compared against.
+    FullRefitFailed(String),
+    /// The reduced model (this term dropped) did not reach a converged
+    /// optimum. A fit object is only ever the product of a converged
+    /// optimization, so there is no `ℓ_null` and no statistic.
+    NullRefitFailed(String),
+    /// The reduced model converged but its log-likelihood is not finite.
+    NullLogLikelihoodNotFinite,
+    /// The statistic was formed but the reference returned no finite tail or
+    /// accuracy for it.
+    TailNotComputable,
+}
+
+impl SmoothLrUnavailable {
+    /// Stable machine-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ShapeConstrained => "shape_constrained",
+            Self::EmptyCoefficientBlock => "empty_coefficient_block",
+            Self::DegenerateReference => "degenerate_reference",
+            Self::FullRefitFailed(_) => "full_refit_failed",
+            Self::NullRefitFailed(_) => "null_refit_failed",
+            Self::NullLogLikelihoodNotFinite => "null_log_likelihood_not_finite",
+            Self::TailNotComputable => "tail_not_computable",
         }
-        if ratio <= 0.0 {
-            // `W` is at or under the value the two fits' degrees of freedom
-            // alone produce. `Q ≥ 0` and `V > 0`, so `Q − cV ≥ 0` with
-            // certainty and the statistic is not evidence of anything.
-            return (1.0, 0.0);
-        }
-        terms.extend(scale.residual_weights.iter().map(|&weight| {
-            gam_math::probability::WeightedChiSquareTerm {
-                weight: -ratio * weight,
-                degrees_of_freedom: 1.0,
+    }
+}
+
+impl std::fmt::Display for SmoothLrUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShapeConstrained => f.write_str(
+                "shape-constrained smooth: its LR is a boundary test with no central reference",
+            ),
+            Self::EmptyCoefficientBlock => f.write_str("the term spans no coefficient columns"),
+            Self::DegenerateReference => {
+                f.write_str("the term's null law has no positive mean, shape or scale")
             }
-        }));
-        if scale.residual_unit_dimension > 0.0 {
-            terms.push(gam_math::probability::WeightedChiSquareTerm {
-                weight: -ratio,
-                degrees_of_freedom: scale.residual_unit_dimension,
-            });
+            Self::FullRefitFailed(message) => write!(f, "full-model refit failed: {message}"),
+            Self::NullRefitFailed(message) => {
+                write!(f, "reduced-model refit (term dropped) failed: {message}")
+            }
+            Self::NullLogLikelihoodNotFinite => {
+                f.write_str("the reduced model's log-likelihood is not finite")
+            }
+            Self::TailNotComputable => {
+                f.write_str("the reference produced no finite tail at this statistic")
+            }
         }
-        gam_math::probability::signed_weighted_chi_square_sf_to_tolerance(&terms, 0.0, tolerance)
+    }
+}
+
+/// One smooth term's LR significance outcome: the report, or why there is none.
+#[derive(Clone, Debug)]
+pub struct SmoothTermLrReport {
+    /// Smooth-term name (matches the summary row).
+    pub name: String,
+    /// Smooth-term index within `resolvedspec.smooth_terms`.
+    pub term_idx: usize,
+    pub outcome: Result<SmoothTermLrInference, SmoothLrUnavailable>,
+}
+
+impl SmoothTermLrReport {
+    /// The report, when the test ran.
+    pub fn inference(&self) -> Option<&SmoothTermLrInference> {
+        self.outcome.as_ref().ok()
+    }
+}
+
+impl SmoothLrPValue {
+    /// The point value, when there is one.
+    pub fn value(self) -> Option<f64> {
+        match self {
+            Self::Resolved(value) => Some(value),
+            Self::UpperBound(_) => None,
+        }
+    }
+
+    /// The ceiling, when the tail was reported as one.
+    pub fn upper_bound(self) -> Option<f64> {
+        match self {
+            Self::UpperBound(bound) => Some(bound),
+            Self::Resolved(_) => None,
+        }
     }
 }
 
@@ -2617,6 +2831,11 @@ pub struct SmoothTermLrInference {
     /// hit its panel backstop, which is a statement about the spectrum's spread
     /// and not a defect in the p-value's derivation.
     pub p_value_bound: f64,
+    /// [`Self::p_value_corrected`] as the reference can certify it: the point
+    /// value when [`Self::p_value_bound`] resolves it away from zero, else an
+    /// explicit ceiling `p ≤ bound` — a strong effect's tail sits below the
+    /// quadrature's absolute accuracy, and its digits there are roundoff.
+    pub p_value: SmoothLrPValue,
 }
 
 /// The materiality threshold for [`SmoothTermLrInference::material`] (#939
@@ -2703,11 +2922,19 @@ fn fitted_rho_penalty_components(
 ///    `W` with [`gam_terms::inference::lawley::lawley_lr_bartlett_factor`]. The
 ///    null annihilates the tested block's penalty (`S_λ β₀ = 0` on that block),
 ///    so the penalized Lawley expansion applies verbatim.
-/// 5. Otherwise (no closed-form jets, or a null refit that did not converge) the
-///    uncorrected `χ²_d` stands with provenance `none` — never weakened.
+/// 5. Otherwise (no closed-form jets) the uncorrected `χ²_d` stands with
+///    provenance `none` — never weakened.
 ///
-/// Random-effect smooths and shape-constrained smooths are skipped (their tests
-/// are not a central-χ² LR), matching the summary table's policy.
+/// # Output
+///
+/// Exactly one [`SmoothTermLrReport`] per smooth term, in term order. Its
+/// outcome is either the inference — whose [`SmoothTermLrInference::p_value`]
+/// is a resolved value or an explicit ceiling — or the typed
+/// [`SmoothLrUnavailable`] reason the term has none: shape-constrained (its test
+/// is not a central-χ² LR, matching the summary table's policy), a reduced model
+/// whose fit did not converge, a degenerate reference, and so on. A failure of
+/// one term's refit is that term's reason and never the call's error; `Err` is
+/// reserved for inputs that break the driver's own invariants.
 pub fn smooth_term_lr_inference_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -2716,7 +2943,7 @@ pub fn smooth_term_lr_inference_forspec(
     resolvedspec: &TermCollectionSpec,
     family: LikelihoodSpec,
     options: &FitOptions,
-) -> Result<Vec<SmoothTermLrInference>, EstimationError> {
+) -> Result<Vec<SmoothTermLrReport>, EstimationError> {
     use gam_terms::inference::lawley::{
         LAWLEY_PAIR_MATRIX_MAX_ROWS, known_scale_expected_jets_with_dispersion,
         lawley_lr_bartlett_factor, lawley_lr_mean_shift_with_rho_variation,
@@ -2725,7 +2952,10 @@ pub fn smooth_term_lr_inference_forspec(
     let n = data.nrows();
     // Full fit: ℓ_full, the per-term coefficient ranges/EDF/influence, and the
     // full design whose column layout fixes each tested block for Lawley.
-    let full = fit_term_collection_forspec(
+    //
+    // A failure here is every term's reason, reported per term like any other:
+    // the call's contract is one row per smooth, each a p-value or a reason.
+    let full = match fit_term_collection_forspec(
         data,
         y,
         weights,
@@ -2733,7 +2963,42 @@ pub fn smooth_term_lr_inference_forspec(
         resolvedspec,
         family.clone(),
         options,
-    )?;
+    ) {
+        Ok(full) => full,
+        Err(error) => {
+            let message = error.to_string();
+            return Ok(resolvedspec
+                .smooth_terms
+                .iter()
+                .enumerate()
+                .map(|(term_idx, term)| SmoothTermLrReport {
+                    name: term.name.clone(),
+                    term_idx,
+                    outcome: Err(SmoothLrUnavailable::FullRefitFailed(message.clone())),
+                })
+                .collect());
+        }
+    };
+    // The reduced models are fitted for ONE number, `ℓ_null`, plus `β_null`
+    // for the Lawley jets. Neither depends on whether inference is requested —
+    // the optimizer's own contract is that standard errors cannot move `β̂`
+    // or `ρ̂` — but the inference block is where the smoothing-parameter
+    // cubature, the covariance inverse and the influence matrix are built, and
+    // a reduced model has no use for any of them. Running it there turns
+    // every failure of that machinery on a model nobody reports into a
+    // missing p-value for the model that IS reported.
+    //
+    // The one published quantity that differs is `σ̂` on the profiled
+    // Gaussian: it divides by `n` rather than `n − edf` with inference off.
+    // That moves `ℓ_null` and therefore `W`, and it is exactly what the
+    // estimated-scale reference's `B = n·ln(ν_f/ν_0) + (ν_0 − ν_f)` absorbs:
+    // `ν_0` is read back from the null fit's own `D/σ̂²`
+    // ([`profiled_residual_degrees_of_freedom`]) rather than assumed, so
+    // `W − B = n·ln(D_0/D_f)` is identical under either convention.
+    let null_options = FitOptions {
+        compute_inference: false,
+        ..options.clone()
+    };
     let ll_full = full.fit.log_likelihood;
     let p_total = full.design.design.ncols();
     let lambdas = full.fit.lambdas.as_slice().ok_or_else(|| {
@@ -2829,8 +3094,13 @@ pub fn smooth_term_lr_inference_forspec(
         },
     );
 
-    let mut out = Vec::<SmoothTermLrInference>::new();
+    let mut out = Vec::<SmoothTermLrReport>::new();
     for (term_idx, design_term) in full.design.smooth.terms.iter().enumerate() {
+        let report = |outcome| SmoothTermLrReport {
+            name: design_term.name.clone(),
+            term_idx,
+            outcome,
+        };
         let penalty_range = full
             .design
             .smooth_term_penalty_range(term_idx)
@@ -2841,12 +3111,14 @@ pub fn smooth_term_lr_inference_forspec(
         // Shape-constrained smooths get no central-χ² LR (cone-projected
         // boundary test); the summary table skips them too.
         if design_term.shape != ShapeConstraint::None {
+            out.push(report(Err(SmoothLrUnavailable::ShapeConstrained)));
             continue;
         }
         // Shifted into the GLOBAL coefficient layout — see `smooth_start` above.
         let coeff_range = (smooth_start + design_term.coeff_range.start)
             ..(smooth_start + design_term.coeff_range.end);
         if coeff_range.start >= coeff_range.end || coeff_range.end > p_total {
+            out.push(report(Err(SmoothLrUnavailable::EmptyCoefficientBlock)));
             continue;
         }
         // Per-term EDF for the χ² reference df FALLBACK (used only when the
@@ -2975,49 +3247,61 @@ pub fn smooth_term_lr_inference_forspec(
             && reference.scale.is_finite()
             && reference.scale > 0.0)
         {
+            out.push(report(Err(SmoothLrUnavailable::DegenerateReference)));
             continue;
         }
 
         // Null model: drop this smooth term from the spec and refit. The term's
-        // name pins which spec entry to remove (design and spec share names).
+        // name pins which spec entry to remove (design and spec share names;
+        // the design was BUILT from this spec, so a design term with no spec
+        // entry is a broken invariant rather than a property of the data).
         let mut null_spec = resolvedspec.clone();
-        let Some(spec_pos) = null_spec
+        let spec_pos = null_spec
             .smooth_terms
             .iter()
             .position(|t| t.name == design_term.name)
-        else {
-            continue;
-        };
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "smooth_term_lr_inference: design term '{}' has no entry in the \
+                     resolved spec it was built from",
+                    design_term.name
+                ))
+            })?;
         null_spec.smooth_terms.remove(spec_pos);
-        let null_fit = fit_term_collection_forspec(
+        let null = match fit_term_collection_forspec(
             data,
             y,
             weights,
             offset,
             &null_spec,
             family.clone(),
-            options,
-        );
-        let (statistic_lr, eta_null, null_residual_df) = match null_fit {
-            Ok(null) if null.fit.log_likelihood.is_finite() => {
-                let w = (2.0 * (ll_full - null.fit.log_likelihood)).max(0.0);
-                // η at the null fit: X_null β_null + affine_offset + offset
-                // (per-row linear predictor; design-layout independent — Lawley
-                // reads it on the full design rows). `compose_offset` folds the
-                // design's fixed affine channel (non-zero endpoint anchor,
-                // #2297) into the user offset.
-                let null_offset = null
-                    .design
-                    .compose_offset(offset, "smooth likelihood-ratio null model")
-                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                let mut eta = null.design.design.dot(&null.fit.beta);
-                eta += &null_offset;
-                let residual_df =
-                    profiled_residual_degrees_of_freedom(&null.fit, profiled_observations);
-                (w, Some(eta), residual_df)
+            &null_options,
+        ) {
+            Ok(null) => null,
+            Err(error) => {
+                out.push(report(Err(SmoothLrUnavailable::NullRefitFailed(
+                    error.to_string(),
+                ))));
+                continue;
             }
-            _ => (f64::NAN, None, None),
         };
+        if !null.fit.log_likelihood.is_finite() {
+            out.push(report(Err(SmoothLrUnavailable::NullLogLikelihoodNotFinite)));
+            continue;
+        }
+        let statistic_lr = (2.0 * (ll_full - null.fit.log_likelihood)).max(0.0);
+        // η at the null fit: X_null β_null + affine_offset + offset (per-row
+        // linear predictor; design-layout independent — Lawley reads it on the
+        // full design rows). `compose_offset` folds the design's fixed affine
+        // channel (non-zero endpoint anchor, #2297) into the user offset.
+        let null_offset = null
+            .design
+            .compose_offset(offset, "smooth likelihood-ratio null model")
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+        let mut eta = null.design.design.dot(&null.fit.beta);
+        eta += &null_offset;
+        let eta_null = Some(eta);
+        let null_residual_df = profiled_residual_degrees_of_freedom(&null.fit, profiled_observations);
 
         // The estimated-scale channel needs BOTH fits' residual degrees of
         // freedom, so it is completed here rather than where the rest of the
@@ -3143,7 +3427,12 @@ pub fn smooth_term_lr_inference_forspec(
             SmoothLrCorrection::None => false,
         };
 
-        out.push(SmoothTermLrInference {
+        let Some(p_value) = reference.typed_p_value(statistic_corrected, p_corrected, p_bound) else {
+            out.push(report(Err(SmoothLrUnavailable::TailNotComputable)));
+            continue;
+        };
+
+        out.push(report(Ok(SmoothTermLrInference {
             name: design_term.name.clone(),
             term_idx,
             statistic_lr,
@@ -3159,7 +3448,8 @@ pub fn smooth_term_lr_inference_forspec(
             correction,
             p_value_conditional: p_conditional,
             p_value_bound: p_bound,
-        });
+            p_value,
+        })));
     }
     Ok(out)
 }
@@ -3885,6 +4175,72 @@ mod profiled_scale_reference_tests {
         assert!(just_above < 1.0 && just_above > 0.999, "{just_above}");
     }
 
+    /// A huge effect is reported as a finite p-value or an explicit ceiling,
+    /// and the ceiling is a true statement about the tail.
+    ///
+    /// On the profiled reference the tail is `P(F_{q,ν} > c·ν/(g·q))` in closed
+    /// form (see the flat-spectrum test above), which `fisher_snedecor_sf`
+    /// evaluates in log space far below anything Imhof's absolute accuracy can
+    /// resolve. There the point value is roundoff, so the typed result has to be
+    /// `UpperBound`, the bound has to sit above the exact tail, and it has to be
+    /// sharper than the quadrature's own resolution — otherwise the ceiling says
+    /// nothing the accuracy did not.
+    #[test]
+    fn a_huge_effect_is_a_ceiling_above_the_exact_tail() {
+        use super::SmoothLrPValue;
+        let (q, scale, nu) = (4usize, 0.37_f64, 26.0_f64);
+        let observations = nu + q as f64;
+        let subject = reference(
+            vec![scale; q],
+            Some(SmoothLrProfiledScale {
+                observations,
+                deterministic_offset: 0.0,
+                residual_weights: Vec::new(),
+                residual_unit_dimension: nu,
+            }),
+        );
+        for &statistic in &[60.0_f64, 150.0, 400.0, 2000.0] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            let ratio = (statistic / observations).exp_m1();
+            let exact =
+                gam_math::probability::fisher_snedecor_sf(ratio * nu / (scale * q as f64), q as f64, nu);
+            let typed = subject
+                .typed_p_value(statistic, value, accuracy)
+                .expect("a finite statistic has a typed p-value");
+            let SmoothLrPValue::UpperBound(ceiling) = typed else {
+                panic!("W={statistic}: exact tail {exact:.3e} resolved as {typed:?} at accuracy {accuracy:.3e}");
+            };
+            assert!(ceiling >= exact, "W={statistic}: ceiling {ceiling:.3e} below the exact tail {exact:.3e}");
+            assert!(
+                ceiling < accuracy,
+                "W={statistic}: ceiling {ceiling:.3e} no sharper than the accuracy {accuracy:.3e}"
+            );
+        }
+        // A moderate statistic is resolved, and the typed value is the point
+        // value itself.
+        let (value, accuracy) = subject.tail_probability_with_bound(3.0);
+        assert_eq!(subject.typed_p_value(3.0, value, accuracy), Some(SmoothLrPValue::Resolved(value)));
+        assert_eq!(subject.typed_p_value(f64::NAN, f64::NAN, f64::NAN), None);
+    }
+
+    /// On a flat known-scale spectrum the tail is a closed-form chi-square with
+    /// no truncation, so even a tail of `10⁻⁴⁰` is a resolved finite value —
+    /// no floor at `10⁻¹⁶`, no `1 − cdf` cancellation.
+    #[test]
+    fn a_closed_form_tail_resolves_arbitrarily_deep() {
+        use super::SmoothLrPValue;
+        let subject = reference(vec![1.0; 3], None);
+        for &statistic in &[80.0_f64, 200.0, 600.0] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            let exact = gam_math::probability::chi_square_sf(statistic, 3.0);
+            assert!(exact > 0.0 && exact < 1e-16, "W={statistic}: {exact:.3e}");
+            assert_eq!(accuracy, 0.0);
+            assert_eq!(
+                subject.typed_p_value(statistic, value, accuracy),
+                Some(SmoothLrPValue::Resolved(exact))
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -597,6 +597,150 @@ pub fn signed_weighted_chi_square_sf_to_tolerance(
     imhof_survival(&active, statistic, tolerance)
 }
 
+/// A rigorous UPPER BOUND on `ln P(Σ_j λ_j χ²_{h_j} > statistic)`, for weights
+/// of either sign: the Chernoff bound, optimized.
+///
+/// # Why a bound, and why this one
+///
+/// [`signed_weighted_chi_square_sf_to_tolerance`] returns Imhof's
+/// `1/2 + (1/π)∫…`, so a tail of `10⁻³⁰` is the difference of two numbers of
+/// order one: its absolute accuracy is floored by the roundoff of the integral,
+/// and every tail below that floor comes back as noise around zero. That is not
+/// a defect in the quadrature — it is what an absolute-accuracy method CAN say
+/// — but it means a very strong effect has no representable point value there.
+/// What it does have is a certified ceiling, and Markov's inequality on
+/// `e^{tQ}` supplies one directly from the cumulant generating function:
+///
+/// ```text
+/// P(Q > x) ≤ exp(−t·x + K(t)),   K(t) = −½ Σ_j h_j ln(1 − 2tλ_j),
+/// ```
+///
+/// for EVERY `t ∈ [0, t⁺)`, `t⁺ = 1/(2·max_j λ_j⁺)`. A negative weight only
+/// makes its `ln(1 − 2tλ_j)` term positive and never limits `t`, so the signed
+/// ratio references are covered by the same line.
+///
+/// # No tolerance anywhere
+///
+/// Because the inequality holds at every admissible `t`, the minimizer does
+/// not have to be found accurately for the result to be a bound — only for it
+/// to be TIGHT. The exponent is convex with derivative
+/// `g'(t) = −x + Σ_j h_j λ_j/(1 − 2tλ_j)`, which starts at `E[Q] − x` and
+/// diverges to `+∞` at `t⁺`. So:
+///
+/// * `x ≤ E[Q]` — the minimum is at `t = 0` and the bound is the trivial `0`
+///   (i.e. `P ≤ 1`); nothing sharper follows from the generating function;
+/// * otherwise the root of `g'` is bracketed in `(0, t⁺)` and bisected until
+///   the bracket stops shrinking in floating point. The bisection runs on
+///   `ln(1 − 2tλ_max)`, the coordinate in which the root moves as `x` grows
+///   (the root approaches `t⁺` like `1/x`), so an arbitrarily large statistic
+///   costs a fixed number of halvings rather than an unbounded number.
+///
+/// Returns `0.0` when the bound is trivial, `−∞` when the event is impossible
+/// (every weight non-positive and `statistic ≥ 0`), and `NaN` on a non-finite
+/// weight, an invalid degrees of freedom, or a `NaN` statistic.
+pub fn signed_weighted_chi_square_log_sf_chernoff_bound(
+    terms: &[WeightedChiSquareTerm],
+    statistic: f64,
+) -> f64 {
+    if statistic.is_nan() {
+        return f64::NAN;
+    }
+    for term in terms {
+        if !term.weight.is_finite()
+            || !(term.degrees_of_freedom.is_finite() && term.degrees_of_freedom > 0.0)
+        {
+            return f64::NAN;
+        }
+    }
+    let max_positive = terms
+        .iter()
+        .map(|term| term.weight)
+        .fold(0.0_f64, f64::max);
+    if max_positive <= 0.0 {
+        // `Q ≤ 0` almost surely: `P(Q > x)` is zero for `x ≥ 0`, and for a
+        // negative `x` the generating function has no finite ceiling on `t`, so
+        // the trivial bound is what stands.
+        return if statistic >= 0.0 { f64::NEG_INFINITY } else { 0.0 };
+    }
+    let mean: f64 = terms
+        .iter()
+        .map(|term| term.degrees_of_freedom * term.weight)
+        .sum();
+    if statistic <= mean {
+        return 0.0;
+    }
+    // `s = 1 − 2tλ_max ∈ (0, 1]`, so `2t = (1 − s)/λ_max` and each term's
+    // `ln(1 − 2tλ_j) = ln1p(−(1 − s)·λ_j/λ_max)`, exact at `s → 0` for the
+    // dominant term instead of `ln` of a cancelled difference.
+    let log_one_minus = |s: f64, weight: f64| -> f64 {
+        if weight == max_positive {
+            s.ln()
+        } else {
+            (-(1.0 - s) * (weight / max_positive)).ln_1p()
+        }
+    };
+    let exponent = |s: f64| -> f64 {
+        let two_t = (1.0 - s) / max_positive;
+        let cumulant: f64 = terms
+            .iter()
+            .map(|term| -0.5 * term.degrees_of_freedom * log_one_minus(s, term.weight))
+            .sum();
+        -0.5 * two_t * statistic + cumulant
+    };
+    let slope = |s: f64| -> f64 {
+        // `g'(t) = −x + Σ h_j λ_j / (1 − 2tλ_j)`.
+        let two_t = (1.0 - s) / max_positive;
+        let sum: f64 = terms
+            .iter()
+            .map(|term| {
+                let denominator = if term.weight == max_positive {
+                    s
+                } else {
+                    1.0 - two_t * term.weight
+                };
+                term.degrees_of_freedom * term.weight / denominator
+            })
+            .sum();
+        sum - statistic
+    };
+    // Bracket in `ln s`: `s = 1` (t = 0) has slope `E[Q] − x < 0`; walk the
+    // lower end down by doubling `|ln s|` until the slope turns positive. The
+    // dominant term alone contributes `h_max·λ_max/s`, so the walk ends by the
+    // time `s ≲ h_max·λ_max/x`, which is a handful of doublings for any
+    // representable `x`.
+    let mut log_high = 0.0_f64;
+    let mut log_low = -1.0_f64;
+    while slope(log_low.exp()) <= 0.0 {
+        log_high = log_low;
+        log_low *= 2.0;
+        if log_low.exp() == 0.0 {
+            break;
+        }
+    }
+    loop {
+        let log_mid = 0.5 * (log_low + log_high);
+        if log_mid <= log_low || log_mid >= log_high {
+            break;
+        }
+        if slope(log_mid.exp()) > 0.0 {
+            log_low = log_mid;
+        } else {
+            log_high = log_mid;
+        }
+    }
+    // Either end of the final bracket is admissible; the one with the smaller
+    // exponent is the tighter bound. `log_low` can only be the underflowed
+    // walk's end when the slope never turned, where `s = 0` is inadmissible.
+    let candidates = [log_high, log_low];
+    candidates
+        .iter()
+        .map(|&log_s| log_s.exp())
+        .filter(|&s| s > 0.0)
+        .map(exponent)
+        .filter(|value| !value.is_nan())
+        .fold(0.0_f64, f64::min)
+}
+
 /// Gauss-Legendre nodes and weights on `[-1, 1]`, 16 points. A 16-node rule is
 /// exact through degree 31, which is far beyond the smooth amplitude
 /// `1/(u ρ(u))` over one phase period; the panel width, not the node count, is
@@ -3748,5 +3892,92 @@ mod signed_weighted_chi_square_tests {
             }
         }
         println!("worst discretization error against the fine-panel reference: {worst:.3e}");
+    }
+
+    /// One scaled chi-square has the Chernoff optimum in closed form: at
+    /// `1 − 2tλ = hλ/x` the exponent is `−(x/λ − h)/2 + (h/2)·ln(x/(hλ))`. The
+    /// bisection has to land on it, including at a statistic so large that the
+    /// optimum sits within `10⁻³⁰⁰` of the pole — the regime a very strong
+    /// effect lives in, and the reason the search runs in `ln s`.
+    #[test]
+    fn chernoff_bound_matches_the_single_term_closed_form() {
+        for &(weight, df) in &[(1.0_f64, 1.0_f64), (1.0, 3.0), (2.5, 7.5), (0.03, 1.0)] {
+            for &ratio in &[1.5_f64, 10.0, 1e3, 1e8, 1e300] {
+                let statistic = ratio * weight * df;
+                let scaled = statistic / weight;
+                let expected = -0.5 * (scaled - df) + 0.5 * df * (scaled / df).ln();
+                let got = signed_weighted_chi_square_log_sf_chernoff_bound(
+                    &[term(weight, df)],
+                    statistic,
+                );
+                assert!(
+                    (got - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+                    "λ={weight} h={df} x={statistic}: {got} vs closed form {expected}"
+                );
+            }
+        }
+    }
+
+    /// The bound is a bound: never below the exact tail, for positive
+    /// combinations against Imhof and for the signed ratio form against the
+    /// F tail's closed form, which stays accurate far below where Imhof's
+    /// absolute accuracy stops resolving anything. The deep F cases are the
+    /// point — there the bound is the only certified statement available, and
+    /// it has to be informative (far below one) as well as valid.
+    #[test]
+    fn chernoff_bound_dominates_the_exact_tail() {
+        let positive: [&[WeightedChiSquareTerm]; 3] = [
+            &[term(1.0, 1.0), term(0.4, 2.0)],
+            &[term(0.9, 1.0), term(0.5, 1.0), term(0.1, 3.0)],
+            &[term(1.0, 2.0), term(1.0, 1.0), term(0.25, 4.0)],
+        ];
+        for terms in positive {
+            let mean: f64 = terms.iter().map(|t| t.weight * t.degrees_of_freedom).sum();
+            for &multiple in &[1.2_f64, 2.0, 4.0, 8.0] {
+                let statistic = multiple * mean;
+                let (exact, accuracy) =
+                    signed_weighted_chi_square_sf_to_tolerance(terms, statistic, 1e-13);
+                let bound = signed_weighted_chi_square_log_sf_chernoff_bound(terms, statistic);
+                assert!(
+                    exact - accuracy <= bound.exp(),
+                    "{terms:?} at {statistic}: exact {exact} ± {accuracy} above bound {}",
+                    bound.exp()
+                );
+                assert!(bound < 0.0, "{terms:?} at {statistic}: trivial bound above the mean");
+            }
+        }
+        for &(a, b) in &[(1.0_f64, 5.0_f64), (3.0, 26.0), (0.7, 24.0), (6.0, 190.0)] {
+            for &f in &[3.0_f64, 30.0, 1e3, 1e6] {
+                let exact = fisher_snedecor_sf(f, a, b);
+                let terms = [term(1.0, a), term(-f * a / b, b)];
+                let bound = signed_weighted_chi_square_log_sf_chernoff_bound(&terms, 0.0);
+                assert!(
+                    exact.ln() <= bound,
+                    "F({a},{b}) > {f}: ln tail {} above bound {bound}",
+                    exact.ln()
+                );
+                assert!(bound < 0.0, "F({a},{b}) > {f}: trivial bound");
+            }
+        }
+    }
+
+    /// The trivial and impossible ends: no generating-function statement is
+    /// sharper than `P ≤ 1` at or below the mean, and a combination with no
+    /// positive weight never exceeds a non-negative threshold.
+    #[test]
+    fn chernoff_bound_trivial_and_impossible_ends() {
+        let terms = [term(1.0, 2.0), term(-0.5, 1.0)];
+        assert_eq!(signed_weighted_chi_square_log_sf_chernoff_bound(&terms, 1.5), 0.0);
+        assert_eq!(signed_weighted_chi_square_log_sf_chernoff_bound(&terms, -3.0), 0.0);
+        let negative = [term(-1.0, 2.0), term(-0.5, 1.0)];
+        assert_eq!(
+            signed_weighted_chi_square_log_sf_chernoff_bound(&negative, 0.0),
+            f64::NEG_INFINITY
+        );
+        assert!(signed_weighted_chi_square_log_sf_chernoff_bound(&terms, f64::NAN).is_nan());
+        assert!(
+            signed_weighted_chi_square_log_sf_chernoff_bound(&[term(f64::INFINITY, 1.0)], 1.0)
+                .is_nan()
+        );
     }
 }
