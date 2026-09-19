@@ -1593,8 +1593,7 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn tk_xt_diag_x(x_dense: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
-        let mut weighted = Array2::<f64>::zeros(x_dense.raw_dim());
-        Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted)
+        Self::xt_diag_x_dense(x_dense, diag)
     }
 
     pub(crate) fn tk_hessian_rho_canonical_logit<S>(
@@ -6356,12 +6355,8 @@ impl<'a> RemlState<'a> {
             // the transformed design column space. The hphi block below is
             // therefore the curvature of that basis-invariant penalty,
             // represented in the current transformed basis.
-            let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
-            let diag_term = Self::xt_diag_x_dense_into(
-                &firth_op.x_dense,
-                &(&firth_op.w2 * &firth_op.h_diag),
-                &mut weighted_xtdx,
-            );
+            let diag_term =
+                Self::xt_diag_x_dense(&firth_op.x_dense, &(&firth_op.w2 * &firth_op.h_diag));
             let bpb = gam_linalg::faer_ndarray::fast_atb(&firth_op.b_base, &firth_op.p_b_base);
             let mut hphi = 0.5 * (diag_term - bpb);
             // Numerical symmetry guard.

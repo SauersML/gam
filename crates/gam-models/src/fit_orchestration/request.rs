@@ -280,8 +280,34 @@ pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool>
 
     spec.smooth_terms
         .iter()
-        .map(|term| auto_spatial(&term.basis))
+        .map(|term| auto_spatial(&term.basis) || adaptive_bspline_knots(&term.basis).is_some())
         .collect()
+}
+
+/// Internal-knot count of an ungated formula-default `s(x)` B-spline whose
+/// resolution the standard workflow owns
+/// ([`gam_terms::basis::BSplineKnotSpec::Automatic`]`{ adaptive: true, .. }`).
+/// A row-gated smooth (`by=`, factor sum-to-zero) is supported by only its
+/// gate's rows, so the covariate's distinct values do not bound its basis; it
+/// keeps its starting resolution.
+pub(crate) fn adaptive_bspline_knots(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
+    match basis {
+        gam_terms::smooth::SmoothBasisSpec::BSpline1D {
+            spec:
+                gam_terms::basis::BSplineBasisSpec {
+                    knotspec:
+                        gam_terms::basis::BSplineKnotSpec::Automatic {
+                            num_internal_knots: Some(num_internal_knots),
+                            adaptive: true,
+                            ..
+                        },
+                    boundary: gam_terms::basis::OneDimensionalBoundary::Open,
+                    ..
+                },
+            ..
+        } => Some(*num_internal_knots),
+        _ => None,
+    }
 }
 
 pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<Option<usize>> {
@@ -315,7 +341,7 @@ pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<O
 
     spec.smooth_terms
         .iter()
-        .map(|term| center_count(&term.basis))
+        .map(|term| center_count(&term.basis).or_else(|| adaptive_bspline_knots(&term.basis)))
         .collect()
 }
 
@@ -612,7 +638,8 @@ pub struct FitConfig {
     /// cross anywhere (see `fit_expectile_location_scale`). `None` defaults to
     /// the single median level `[0.5]`. The levels may also be written inline
     /// as `family = "expectile(0.9)"` or `family = "expectile(0.1, 0.9)"`;
-    /// both spellings together must agree.
+    /// both spellings together must agree. Setting it with any other family is
+    /// rejected by [`FitConfig::resolve`].
     pub expectile_tau: Option<Vec<f64>>,
     /// Cross-fitted predictive CTN, saved with an ordinary marginal-slope outcome.
     pub ctn_stage1: Option<CtnStage1Recipe>,
