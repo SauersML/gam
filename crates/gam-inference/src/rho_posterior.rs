@@ -89,20 +89,21 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        rho_domain: &(Array1<f64>, Array1<f64>),
+        support: &(Array1<f64>, Array1<f64>),
         held: &[usize],
-        criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        criterion: &dyn Fn(&Array1<f64>) -> Result<f64, String>,
         n_samples: Option<usize>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal> {
-        rho_posterior_adequacy(rho_hat, outer_hessian, rho_domain, held, criterion, n_samples)
+        rho_posterior_adequacy(rho_hat, outer_hessian, support, held, criterion, n_samples)
     }
 
     fn escalate_rho_posterior(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        criterion: &mut dyn FnMut(&Array1<f64>) -> Option<f64>,
-        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send),
+        criterion: &mut dyn FnMut(&Array1<f64>) -> Result<f64, String>,
+        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String>
+                  + Send),
     ) -> RhoPosteriorEscalation {
         escalate_rho_posterior(rho_hat, outer_hessian, criterion, criterion_and_grad)
     }
@@ -214,7 +215,7 @@ pub(crate) fn enumerate_gh_product(
 }
 
 /// One normalized node from the quadrature core: `(ρ, cost, normalized weight,
-/// normalized log-weight)`. Infeasible nodes carry `cost = +∞` and zero weight.
+/// normalized log-weight)`.
 struct NormalizedQuadratureNode {
     rho: Array1<f64>,
     cost: f64,
@@ -225,7 +226,9 @@ struct NormalizedQuadratureNode {
 /// Tier-1 quadrature core (#938): whiten by the exact outer Hessian, enumerate
 /// the Gauss-Hermite product grid, reweight each node by the exact profiled
 /// criterion `exp(−V(ρ_m) + V(ρ̂) + ½‖z_m‖²) × GH-weight`, and normalize.
-/// `rho_posterior_quadrature` is its criterion-closure adapter.
+/// `rho_posterior_quadrature` is its criterion-closure adapter. Every node
+/// carries rule mass, so a node the criterion cannot value, or values as
+/// non-finite, fails the rule rather than being dropped from it.
 fn quadrature_nodes_core<E>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
@@ -234,7 +237,7 @@ fn quadrature_nodes_core<E>(
     mut eval_node: E,
 ) -> Result<(Vec<NormalizedQuadratureNode>, f64), EstimationError>
 where
-    E: FnMut(&Array1<f64>) -> Result<Option<f64>, EstimationError>,
+    E: FnMut(&Array1<f64>) -> Result<f64, String>,
 {
     let k = rho_hat.len();
     if k == 0 || outer_hessian.nrows() != k || outer_hessian.ncols() != k {
@@ -283,32 +286,25 @@ where
             }
             rho[i] += acc;
         }
-        let (cost, log_weight) = match eval_node(&rho)? {
-            Some(cost) if cost.is_finite() => {
-                let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
-                (cost, log_base_weight - cost + cost_hat + half_norm_sq)
-            }
-            // Infeasible node: zero importance weight, never fatal.
-            _ => (f64::INFINITY, f64::NEG_INFINITY),
-        };
-        if log_weight.is_finite() {
-            max_log_weight = max_log_weight.max(log_weight);
+        let cost = eval_node(&rho).map_err(|detail| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "rho_posterior_quadrature: criterion unavailable at node {rho:?}: {detail}"
+            ))
+        })?;
+        if !cost.is_finite() {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "rho_posterior_quadrature: criterion at node {rho:?} is {cost}"
+            )));
         }
+        let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
+        let log_weight = log_base_weight - cost + cost_hat + half_norm_sq;
+        max_log_weight = max_log_weight.max(log_weight);
         raw_nodes.push((rho, cost, log_weight));
-    }
-    if !max_log_weight.is_finite() {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "rho_posterior_quadrature: all quadrature nodes were non-finite".to_string(),
-        ));
     }
     let mut total = 0.0;
     let mut scaled = Vec::with_capacity(raw_nodes.len());
     for (_, _, log_weight) in &raw_nodes {
-        let w = if log_weight.is_finite() {
-            (*log_weight - max_log_weight).exp()
-        } else {
-            0.0
-        };
+        let w = (*log_weight - max_log_weight).exp();
         total += w;
         scaled.push(w);
     }
@@ -363,8 +359,8 @@ fn mixture_moments(nodes: &[RhoMixtureNode], k: usize) -> (Array1<f64>, Array2<f
 /// then normalized. The result is `π(ρ|y)` as a discrete mixture of conditional
 /// Gaussians with its moment summary.
 ///
-/// * `criterion` — the `OuterObjective::eval_cost` contract (`None` for
-///   infeasible `ρ`, which gets zero weight). Each call is one warm inner
+/// * `criterion` — the `OuterObjective::eval_cost` contract, or the reason it
+///   cannot value a node, which fails the rule. Each call is one warm inner
 ///   profile solve.
 /// * `nodes_per_axis` — 3 or 5; pass `None` to auto-select (5 for `K ≤ 2`,
 ///   3 for `K ≤ 4` — at most 125 criterion evaluations either way).
@@ -375,19 +371,17 @@ pub(crate) fn rho_posterior_quadrature<F>(
     nodes_per_axis: Option<usize>,
 ) -> Result<RhoPosteriorMixture, EstimationError>
 where
-    F: FnMut(&Array1<f64>) -> Option<f64>,
+    F: FnMut(&Array1<f64>) -> Result<f64, String>,
 {
     let k = rho_hat.len();
     let nodes_per_axis = nodes_per_axis.unwrap_or(if k <= 2 { 5 } else { 3 });
-    let cost_hat = criterion(rho_hat).ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "rho_posterior_quadrature: criterion is infeasible at rho_hat itself".to_string(),
-        )
+    let cost_hat = criterion(rho_hat).map_err(|detail| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "rho_posterior_quadrature: criterion is unavailable at rho_hat itself: {detail}"
+        ))
     })?;
     let (core_nodes, effective_sample_size) =
-        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, |rho| {
-            Ok(criterion(rho))
-        })?;
+        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, criterion)?;
     let nodes: Vec<RhoMixtureNode> = core_nodes
         .into_iter()
         .map(|node| RhoMixtureNode {
@@ -411,8 +405,9 @@ where
 /// `ρ̂` (the `hmc` module's whitening design reused one level up).
 ///
 /// * `criterion_and_grad` — `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, both EXACT
-///   (the engine's LAML value and ρ-gradient); `None` for infeasible `ρ`. Each
-///   call is one warm inner profile solve + IFT gradient.
+///   (the engine's LAML value and ρ-gradient), or the reason it cannot value a
+///   position, which fails the run. Each call is one warm inner profile solve +
+///   IFT gradient.
 /// * `n_samples` — post-warmup draws per chain. Warmup ends when adaptation has
 ///   stabilized and the chains agree.
 /// * `seed` — deterministic seeding: the seed feeds the same splitmix64 chain /
@@ -426,7 +421,7 @@ pub(crate) fn rho_posterior_nuts<F>(
     seed: u64,
 ) -> Result<RhoPosteriorSamples, EstimationError>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     let k = rho_hat.len();
     let config = crate::hmc_io::NutsConfig {
@@ -487,8 +482,8 @@ pub fn escalate_rho_posterior<F, G>(
     criterion_and_grad: G,
 ) -> RhoPosteriorEscalation
 where
-    F: FnMut(&Array1<f64>) -> Option<f64>,
-    G: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<f64, String>,
+    G: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     let k = rho_hat.len();
     if k == 0 {
@@ -571,21 +566,23 @@ fn truncated_standard_normal(a: f64, b: f64, log_mass: f64, u: f64) -> f64 {
     x.clamp(a, b)
 }
 
-/// The Laplace proposal of `π(ρ|y)` restricted to `ρ`'s domain (#3010).
+/// The Laplace proposal of `π(ρ|y)` restricted to its support (#3010).
 ///
-/// The support of `π(ρ|y)` is the box the outer arm searched and certified. A
-/// coordinate held on a face (railed by the certificate, or with `ρ̂` at a face
-/// of the box) is a boundary of that support, not a direction to sample, so it
-/// stays at `ρ̂`. The free coordinates `f` are drawn from the Laplace
-/// approximation conditioned on the held ones at `ρ̂`, mean `ρ̂_f` and precision
-/// the free block `H_ff` of the outer Hessian, restricted to the box.
+/// The support is a box that is finite only at a literal face, past which `ρ`
+/// is not a model; past a saturated face the criterion continues, so that side
+/// is unbounded. A held coordinate (railed by the certificate or found on a
+/// face, and any with `ρ̂` on a finite face of the support) is the face-reduced
+/// model's, not a direction to sample, so it stays at `ρ̂`. The free coordinates
+/// `f` are drawn from the Laplace approximation conditioned on the held ones at
+/// `ρ̂`, mean `ρ̂_f` and precision the free block `H_ff` of the outer Hessian,
+/// restricted to the support.
 ///
 /// The restriction is drawn exactly, with no rejection: `ρ_f = ρ̂_f + U z` with
 /// `U = R⁻ᵀ` upper triangular, so coordinate `a` depends on `z_a, …, z_{k−1}`
-/// only. Sweeping `a` from the last coordinate to the first, the box confines
-/// `z_a` to an interval given the `z` already drawn, and `z_a` is drawn from
-/// the standard normal truncated to it (Geweke–Hajivassiliou–Keane). Every draw
-/// lies in the box, whatever share of the Gaussian the box holds. The draw's
+/// only. Sweeping `a` from the last coordinate to the first, the support
+/// confines `z_a` to an interval given the `z` already drawn, and `z_a` is drawn
+/// from the standard normal truncated to it (Geweke–Hajivassiliou–Keane). Every
+/// draw lies in the support, whatever share of the Gaussian it holds. The draw's
 /// density is `∏_a φ(z_a) / p_a` with `p_a` the mass of `z_a`'s interval, so
 /// its negative log-density is `½‖z‖² + Σ_a ln p_a` up to a constant that is
 /// the same for every draw and cancels from self-normalized importance weights
@@ -603,13 +600,13 @@ pub(crate) struct DomainLaplaceProposal {
 }
 
 impl DomainLaplaceProposal {
-    /// `rho_domain` bounds each coordinate it has an entry for; a coordinate
+    /// `support` bounds each coordinate it has an entry for; a coordinate
     /// past the end of either bound is unbounded on that side. `held` names the
     /// coordinates the certificate railed.
     pub(crate) fn new(
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        rho_domain: &(Array1<f64>, Array1<f64>),
+        support: &(Array1<f64>, Array1<f64>),
         held: &[usize],
     ) -> Result<Self, RhoPosteriorRefusal> {
         let k = rho_hat.len();
@@ -621,10 +618,10 @@ impl DomainLaplaceProposal {
             });
         }
         let lower = Array1::from_iter(
-            (0..k).map(|i| rho_domain.0.get(i).copied().unwrap_or(f64::NEG_INFINITY)),
+            (0..k).map(|i| support.0.get(i).copied().unwrap_or(f64::NEG_INFINITY)),
         );
         let upper =
-            Array1::from_iter((0..k).map(|i| rho_domain.1.get(i).copied().unwrap_or(f64::INFINITY)));
+            Array1::from_iter((0..k).map(|i| support.1.get(i).copied().unwrap_or(f64::INFINITY)));
         let free: Vec<usize> = (0..k)
             .filter(|&i| !held.contains(&i) && rho_hat[i] > lower[i] && rho_hat[i] < upper[i])
             .collect();
@@ -650,7 +647,7 @@ impl DomainLaplaceProposal {
         self.free.len()
     }
 
-    /// One draw `(ρ, ½‖z‖² + Σ_a ln p_a)`: the point in the box and its
+    /// One draw `(ρ, ½‖z‖² + Σ_a ln p_a)`: the point in the support and its
     /// negative log proposal density up to the shared constant.
     ///
     /// Refused as [`RhoPosteriorRefusal::DegenerateProposalInterval`] only when
@@ -681,7 +678,7 @@ impl DomainLaplaceProposal {
     }
 
     /// `m` draws of the proposal, each `(ρ, ½‖z‖² + Σ_a ln p_a)`. Every draw is
-    /// in the box, and the criterion is evaluated for none of them here.
+    /// in the support, and the criterion is evaluated for none of them here.
     pub(crate) fn sample(
         &self,
         m: usize,
@@ -697,39 +694,44 @@ impl DomainLaplaceProposal {
 /// * `outer_hessian` — the exact outer Hessian `H_ρ` of the criterion at `ρ̂`
 ///   (`K × K`). The proposal precision is its free block `H_ff`, which must be
 ///   positive definite.
-/// * `rho_domain` — the `(lower, upper)` box that is the support of `π(ρ|y)`.
-/// * `held` — the coordinates the outer certificate railed. They, and every
-///   coordinate with `ρ̂` on a face of the box, stay at `ρ̂`
+/// * `support` — the `(lower, upper)` box of `π(ρ|y)`: finite only at a
+///   literal face, infinite past a saturated one.
+/// * `held` — the coordinates the outer certificate railed or found on a face.
+///   They, and every coordinate with `ρ̂` on a finite face of `support`, stay
+///   at `ρ̂`
 ///   ([`DomainLaplaceProposal`]).
 /// * `criterion` — evaluates the outer criterion `−log π(ρ|y)` (the LAML/REML
-///   objective) at a trial `ρ`; returns `None` for infeasible `ρ`. This is the
+///   objective) at a trial `ρ`, or says why it cannot. This is the
 ///   `OuterObjective::eval_cost` contract, supplied by the caller that retains
-///   (or rebuilds) the objective. It is only ever called inside the box.
+///   (or rebuilds) the objective. It is only ever called inside `support`.
+///   Every draw carries proposal mass, so the diagnostic is refused at the
+///   first draw it cannot value, never formed from the rest.
 /// * `n_samples` — proposal draw count `M` (defaults to 64 when `None`).
 ///
 /// Returns `Ok(None)` when no coordinate is free: there is nothing to grade.
 /// Returns the typed [`RhoPosteriorRefusal`] naming the site when the diagnostic
 /// cannot be formed — an outer Hessian whose shape does not match `ρ̂` or whose
-/// free block is not positive definite, an infeasible or non-finite criterion at
-/// `ρ̂`, a proposal interval whose mass rounds to zero, no proposal draw with a
-/// finite criterion, too few finite weights for the Pareto tail fit, a non-finite
-/// tail shape, or smoothed weights that do not normalize.
+/// free block is not positive definite, an unavailable or non-finite criterion at
+/// `ρ̂` or at a draw, a proposal interval whose mass rounds to zero, a failed
+/// Pareto tail fit, a non-finite tail shape, or smoothed weights that do not
+/// normalize.
 pub fn rho_posterior_adequacy<F>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
-    rho_domain: &(Array1<f64>, Array1<f64>),
+    support: &(Array1<f64>, Array1<f64>),
     held: &[usize],
     criterion: F,
     n_samples: Option<usize>,
 ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>
 where
-    F: Fn(&Array1<f64>) -> Option<f64>,
+    F: Fn(&Array1<f64>) -> Result<f64, String>,
 {
-    let proposal = DomainLaplaceProposal::new(rho_hat, outer_hessian, rho_domain, held)?;
+    let proposal = DomainLaplaceProposal::new(rho_hat, outer_hessian, support, held)?;
     if proposal.free_dim() == 0 {
         return Ok(None);
     }
-    let cost_hat = criterion(rho_hat).ok_or(RhoPosteriorRefusal::CriterionInfeasibleAtRhoHat)?;
+    let cost_hat = criterion(rho_hat)
+        .map_err(|detail| RhoPosteriorRefusal::CriterionUnavailableAtRhoHat { detail })?;
     if !cost_hat.is_finite() {
         return Err(RhoPosteriorRefusal::CriterionNotFiniteAtRhoHat);
     }
@@ -738,39 +740,23 @@ where
         .max(2 * gam_solve::psis::MIN_TAIL_COUNT);
 
     let mut rng = DetNormal::new(ADEQUACY_SEED);
-    let raw_weights: Vec<f64> = proposal
-        .sample(m, &mut rng)?
-        .iter()
+    let mut raw_weights: Vec<f64> = Vec::with_capacity(m);
+    for (draw, (rho_m, neg_log_q)) in proposal.sample(m, &mut rng)?.iter().enumerate() {
         // log w_m = −criterion(ρ_m) + criterion(ρ̂) − ln q(ρ_m).
-        .map(|(rho_m, neg_log_q)| match criterion(rho_m) {
-            Some(c) if c.is_finite() => -c + cost_hat + neg_log_q,
-            // Infeasible / non-finite criterion ⇒ zero importance weight.
-            _ => f64::NEG_INFINITY,
-        })
-        .collect();
+        let cost = criterion(rho_m)
+            .map_err(|detail| RhoPosteriorRefusal::CriterionUnavailableAtDraw { draw, detail })?;
+        if !cost.is_finite() {
+            return Err(RhoPosteriorRefusal::CriterionNotFiniteAtDraw { draw });
+        }
+        raw_weights.push(-cost + cost_hat + neg_log_q);
+    }
 
     // Stabilize and exponentiate: subtract the max log-weight (cancels in the
     // self-normalized weights and the Pareto fit).
-    let max_lw = raw_weights
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .fold(f64::NEG_INFINITY, f64::max);
-    if !max_lw.is_finite() {
-        return Err(RhoPosteriorRefusal::NoFiniteProposal);
-    }
-    let weights: Vec<f64> = raw_weights
-        .iter()
-        .map(|&lw| {
-            if lw.is_finite() {
-                (lw - max_lw).exp()
-            } else {
-                0.0
-            }
-        })
-        .collect();
+    let max_lw = raw_weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = raw_weights.iter().map(|&lw| (lw - max_lw).exp()).collect();
 
-    let psis = pareto_smooth_weights(&weights).ok_or(RhoPosteriorRefusal::TooFewFiniteWeights)?;
+    let psis = pareto_smooth_weights(&weights).ok_or(RhoPosteriorRefusal::TailFitUnavailable)?;
     let k_hat = psis.k_hat;
     if !k_hat.is_finite() {
         return Err(RhoPosteriorRefusal::TailShapeNotFinite);
@@ -841,7 +827,7 @@ mod tests {
                     q += d[i] * h[[i, j]] * d[j];
                 }
             }
-            Some(0.5 * q)
+            Ok(0.5 * q)
         };
         let graded = rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], crit, Some(256))
             .expect("diagnostic formed")
@@ -873,7 +859,7 @@ mod tests {
         // logarithmically, so far in the tail π(ρ)/proposal(ρ) → ∞.
         let crit = |rho: &Array1<f64>| {
             let r = rho[0];
-            Some((1.0 + r * r).ln())
+            Ok((1.0 + r * r).ln())
         };
         let graded = rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], crit, Some(512))
             .expect("diagnostic formed")
@@ -919,7 +905,7 @@ mod tests {
         // the ESS are exercised away from `M`.
         let crit = |rho: &Array1<f64>| {
             let d = rho[0] - 1.0;
-            Some(0.5 * d * d + d.powi(4) / 24.0)
+            Ok(0.5 * d * d + d.powi(4) / 24.0)
         };
         let a = rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], crit, Some(64))
             .expect("a formed")
@@ -968,7 +954,7 @@ mod tests {
         let rho_hat: Array1<f64> = array![];
         let h = Array2::<f64>::zeros((0, 0));
         assert!(matches!(
-            rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], |_| Some(0.0), None),
+            rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], |_| Ok(0.0), None),
             Ok(None)
         ));
     }
@@ -981,15 +967,15 @@ mod tests {
         rho_hat: &'a Array1<f64>,
         h: &'a Array2<f64>,
         seen: &'a std::cell::RefCell<Vec<Array1<f64>>>,
-    ) -> impl Fn(&Array1<f64>) -> Option<f64> + 'a {
+    ) -> impl Fn(&Array1<f64>) -> Result<f64, String> + 'a {
         move |rho: &Array1<f64>| {
             seen.borrow_mut().push(rho.clone());
             let d = rho - rho_hat;
-            Some(0.5 * d.dot(&h.dot(&d)) + d.mapv(|v| v.powi(4)).sum() / 24.0)
+            Ok(0.5 * d.dot(&h.dot(&d)) + d.mapv(|v| v.powi(4)).sum() / 24.0)
         }
     }
 
-    /// #3010: every criterion evaluation lies in `ρ`'s domain, and a coordinate
+    /// #3010: every criterion evaluation lies in the support, and a coordinate
     /// held on a face (here `ρ̂_0` at its lower face, and `ρ_3`, which the
     /// certificate railed) stays at `ρ̂` bit for bit. The free block has
     /// proposal standard deviation 10 on `ρ_1` and `ρ_2` against boxes of
@@ -1031,7 +1017,7 @@ mod tests {
             for i in 0..4 {
                 assert!(
                     rho[i] >= lower[i] && rho[i] <= upper[i],
-                    "criterion evaluated outside the domain at {rho}"
+                    "criterion evaluated outside the support at {rho}"
                 );
             }
             assert_eq!(rho[0].to_bits(), rho_hat[0].to_bits(), "the face coordinate moved");
@@ -1197,7 +1183,7 @@ mod tests {
         let rho_hat = array![0.0, 0.0];
         let h = array![[1.0, 1.0], [1.0, 1.0]];
         assert!(whitening_factor_from_outer_hessian(&h).is_err());
-        let refusal = rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], |_| Some(0.0), Some(64))
+        let refusal = rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], |_| Ok(0.0), Some(64))
             .expect_err("a singular outer Hessian must be refused");
         assert!(
             matches!(refusal, RhoPosteriorRefusal::HessianNotPositiveDefinite { .. }),

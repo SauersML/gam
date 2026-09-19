@@ -485,11 +485,178 @@ pub(crate) fn resolvability_domain_from_design(
 /// ([`unpenalized_fit_is_identified`]). An edge that is the precision box a term without penalty
 /// geometry falls back to, or that the representable log-strength range cut, is
 /// a literal and is not.
+///
+/// `lower_is_saturated` marks a lower edge that is the term's own
+/// `ln(√ε γ_min)`, identified or not. Past it every direction with data
+/// curvature is unpenalized to the gradient's resolution, and a direction with
+/// none contributes a constant, so the criterion is affine in that coordinate
+/// there ([`CriterionContinuation`]). An upper edge is saturated exactly when it
+/// is a limit face, so `upper_is_limit` serves both.
 pub(crate) struct ResolvabilityDomain {
     pub(crate) lower: Array1<f64>,
     pub(crate) upper: Array1<f64>,
     pub(crate) lower_is_limit: Vec<bool>,
     pub(crate) upper_is_limit: Vec<bool>,
+    pub(crate) lower_is_saturated: Vec<bool>,
+}
+
+impl ResolvabilityDomain {
+    /// The criterion's continuation past this domain's faces.
+    pub(crate) fn continuation(&self) -> CriterionContinuation {
+        CriterionContinuation {
+            lower: self.lower.clone(),
+            upper: self.upper.clone(),
+            lower_saturated: self.lower_is_saturated.clone(),
+            upper_saturated: self.upper_is_limit.clone(),
+        }
+    }
+}
+
+/// The outer criterion on all of `ρ`-space, from its values inside the
+/// resolvability domain.
+///
+/// The domain is where the criterion's gradient resolves each term; it is not
+/// the support of `π(ρ|y)`, which is every `ρ`. Past a saturated face every
+/// direction of that coordinate's term is at its limit (effective degrees of
+/// freedom `γ/(γ+λ)` under resolution past the upper edge, at one past the lower
+/// edge), so each summand of `∂V/∂ρ_k = ½[λβ̂ᵀSβ̂ + tr(H⁻¹λS) − ∂log|S_λ|₊]`
+/// has stopped moving, and `V` is affine in `ρ_k` and decoupled from the other
+/// coordinates to the gradient's resolution. So at a `ρ` outside the domain
+/// `V(ρ) = V(ρ_c) + ∇V(ρ_c)·(ρ − ρ_c)` with `ρ_c` the clamp of `ρ` onto the
+/// domain, and `∇V(ρ) = ∇V(ρ_c)`: the continuation is the criterion there, and
+/// it is `C¹` across the face.
+///
+/// A literal face (the precision box of a term without penalty geometry, or the
+/// representable log-strength cut) carries no such statement, so a `ρ` past one
+/// is refused with the coordinate named, never assigned a value. A coordinate
+/// past the end of the domain's vectors is unbounded.
+#[derive(Debug, Clone)]
+pub(crate) struct CriterionContinuation {
+    lower: Array1<f64>,
+    upper: Array1<f64>,
+    lower_saturated: Vec<bool>,
+    upper_saturated: Vec<bool>,
+}
+
+impl CriterionContinuation {
+    /// The support of `π(ρ|y)` as a `(lower, upper)` box: the domain with each
+    /// saturated face opened to `∓∞`, since the criterion continues past it,
+    /// and each literal face kept, since past it `ρ` is not a model. A draw
+    /// confined to it is one [`Self::value`] can value (#3010).
+    pub(crate) fn posterior_support(&self) -> (Array1<f64>, Array1<f64>) {
+        let open = |faces: &Array1<f64>, saturated: &[bool], infinity: f64| {
+            Array1::from_iter(faces.iter().enumerate().map(|(k, &face)| {
+                if saturated.get(k).copied().unwrap_or(false) {
+                    infinity
+                } else {
+                    face
+                }
+            }))
+        };
+        (
+            open(&self.lower, &self.lower_saturated, f64::NEG_INFINITY),
+            open(&self.upper, &self.upper_saturated, f64::INFINITY),
+        )
+    }
+
+    /// The coordinates a proposal around `rho_hat` holds at `rho_hat`: the
+    /// `railed` ones, and every one with `rho_hat` on a face of the domain,
+    /// saturated or literal. Each is the face-reduced model's (#3010).
+    pub(crate) fn held_at(&self, rho_hat: &Array1<f64>, railed: &[usize]) -> Vec<usize> {
+        (0..rho_hat.len())
+            .filter(|&k| {
+                railed.contains(&k)
+                    || self.lower.get(k).is_some_and(|&face| rho_hat[k] <= face)
+                    || self.upper.get(k).is_some_and(|&face| rho_hat[k] >= face)
+            })
+            .collect()
+    }
+
+    /// `None` inside the domain; otherwise the clamp `ρ_c` of `ρ` onto it, or
+    /// the refusal naming the first coordinate past a literal face.
+    fn clamp_past_saturated_faces(&self, rho: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        let mut clamped: Option<Array1<f64>> = None;
+        for (k, &value) in rho.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!("rho[{k}] = {value} is not a point of rho-space"));
+            }
+            let (Some(&lower), Some(&upper)) = (self.lower.get(k), self.upper.get(k)) else {
+                continue;
+            };
+            let (face, saturated, side) = if value < lower {
+                (lower, self.lower_saturated.get(k).copied().unwrap_or(false), "lower")
+            } else if value > upper {
+                (upper, self.upper_saturated.get(k).copied().unwrap_or(false), "upper")
+            } else {
+                continue;
+            };
+            if !saturated {
+                return Err(format!(
+                    "rho[{k}] = {value} lies past its {side} face {face}, which is a literal \
+                     face, not the term's saturation edge, so the criterion has no continuation \
+                     there"
+                ));
+            }
+            clamped.get_or_insert_with(|| rho.clone())[k] = face;
+        }
+        Ok(clamped)
+    }
+
+    /// `V(ρ)`: `value` inside the domain, the affine continuation from
+    /// `value_and_gradient` at the clamp outside it.
+    pub(crate) fn value(
+        &self,
+        rho: &Array1<f64>,
+        value: impl FnOnce(&Array1<f64>) -> Result<f64, String>,
+        value_and_gradient: impl FnOnce(&Array1<f64>) -> Result<(f64, Array1<f64>), String>,
+    ) -> Result<f64, String> {
+        match self.clamp_past_saturated_faces(rho)? {
+            None => value(rho),
+            Some(clamped) => {
+                let (at_face, gradient) = value_and_gradient(&clamped)?;
+                affine_continuation(rho, &clamped, at_face, &gradient)
+            }
+        }
+    }
+
+    /// `(V(ρ), ∇V(ρ))`, continued past saturated faces as in [`Self::value`].
+    pub(crate) fn value_and_gradient(
+        &self,
+        rho: &Array1<f64>,
+        value_and_gradient: impl FnOnce(&Array1<f64>) -> Result<(f64, Array1<f64>), String>,
+    ) -> Result<(f64, Array1<f64>), String> {
+        match self.clamp_past_saturated_faces(rho)? {
+            None => value_and_gradient(rho),
+            Some(clamped) => {
+                let (at_face, gradient) = value_and_gradient(&clamped)?;
+                let continued = affine_continuation(rho, &clamped, at_face, &gradient)?;
+                Ok((continued, gradient))
+            }
+        }
+    }
+}
+
+/// `V_c + g_c·(ρ − ρ_c)`.
+fn affine_continuation(
+    rho: &Array1<f64>,
+    clamped: &Array1<f64>,
+    at_face: f64,
+    gradient: &Array1<f64>,
+) -> Result<f64, String> {
+    if gradient.len() != rho.len() {
+        return Err(format!(
+            "criterion gradient at the face has {} entries for {} coordinates",
+            gradient.len(),
+            rho.len()
+        ));
+    }
+    Ok(at_face
+        + rho
+            .iter()
+            .zip(clamped.iter())
+            .zip(gradient.iter())
+            .map(|((&value, &face), &slope)| slope * (value - face))
+            .sum::<f64>())
 }
 
 /// The weighted Gram `X_rᵀ W X_r` of each range's columns `r`. A sparse design
@@ -611,6 +778,7 @@ pub(crate) fn resolvability_domain_and_limit_faces_from_design(
     let mut upper = Array1::<f64>::from_elem(penalties.len(), box_hi);
     let mut lower_is_limit = vec![false; penalties.len()];
     let mut upper_is_limit = vec![false; penalties.len()];
+    let mut lower_is_saturated = vec![false; penalties.len()];
     for (k, penalty) in penalties.iter().enumerate() {
         let Some(index) = ranges.iter().position(|range| *range == penalty.col_range) else {
             continue;
@@ -637,7 +805,8 @@ pub(crate) fn resolvability_domain_and_limit_faces_from_design(
                 .own_gammas
                 .as_deref()
                 .is_some_and(|gammas| unpenalized_fit_is_identified(gammas, columns));
-            lower_is_limit[k] = lo == interval.0 && identified;
+            lower_is_saturated[k] = lo == interval.0;
+            lower_is_limit[k] = lower_is_saturated[k] && identified;
             upper_is_limit[k] = hi == interval.1;
         }
     }
@@ -646,6 +815,7 @@ pub(crate) fn resolvability_domain_and_limit_faces_from_design(
         upper,
         lower_is_limit,
         upper_is_limit,
+        lower_is_saturated,
     })
 }
 
@@ -817,5 +987,172 @@ mod tests {
             !unpenalized_fit_is_identified(&unidentified, 3),
             "rank deficient: {unidentified:?}"
         );
+    }
+
+    /// A decoupled criterion whose coordinate `k` is the quadratic
+    /// `½ c_k (ρ_k − a_k)²` on `[s_lo_k, s_hi_k]` and continues affinely with its
+    /// face slope beyond: the shape the criterion takes past a term's saturation
+    /// edges, `C¹` across them.
+    struct SaturatingCriterion {
+        centre: Array1<f64>,
+        curvature: Array1<f64>,
+        saturates_below: Array1<f64>,
+        saturates_above: Array1<f64>,
+    }
+
+    impl SaturatingCriterion {
+        fn value_and_gradient(&self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
+            let mut value = 0.0;
+            let mut gradient = Array1::zeros(rho.len());
+            for k in 0..rho.len() {
+                let face = rho[k].clamp(self.saturates_below[k], self.saturates_above[k]);
+                let slope = self.curvature[k] * (face - self.centre[k]);
+                value += 0.5 * self.curvature[k] * (face - self.centre[k]).powi(2)
+                    + slope * (rho[k] - face);
+                gradient[k] = slope;
+            }
+            (value, gradient)
+        }
+    }
+
+    fn saturated_box(lower: Array1<f64>, upper: Array1<f64>) -> CriterionContinuation {
+        let k = lower.len();
+        CriterionContinuation {
+            lower,
+            upper,
+            lower_saturated: vec![true; k],
+            upper_saturated: vec![true; k],
+        }
+    }
+
+    /// Moving a saturated box edge outward through the criterion's affine
+    /// region changes nothing the ρ-posterior reads: every draw keeps its
+    /// value and gradient, so the Tier-0 importance weights, their
+    /// self-normalized form and their sum (the integral's estimate) are the
+    /// same under both boxes, and no draw is dropped under either.
+    #[test]
+    fn importance_weights_and_integral_do_not_move_with_the_box_edge() {
+        let criterion = SaturatingCriterion {
+            centre: array![0.5, -1.0],
+            curvature: array![0.8, 2.5],
+            saturates_below: array![-2.0, -2.5],
+            saturates_above: array![2.0, 0.0],
+        };
+        let tight = saturated_box(
+            criterion.saturates_below.clone(),
+            criterion.saturates_above.clone(),
+        );
+        let wide = saturated_box(array![-4.0, -3.5], array![3.5, 1.5]);
+        let rho_hat = criterion.centre.clone();
+        // Proposal N(ρ̂, (∇²V)⁻¹) widened so draws land inside, between the two
+        // boxes' edges, and past both.
+        let spread = array![1.0 / 0.8_f64.sqrt(), 1.0 / 2.5_f64.sqrt()] * 3.0;
+        let (v_hat, _) = criterion.value_and_gradient(&rho_hat);
+        let log_weights = |domain: &CriterionContinuation| -> Vec<f64> {
+            let mut log_weights = Vec::new();
+            for i in -6..=6 {
+                for j in -6..=6 {
+                    let z = array![f64::from(i) / 3.0, f64::from(j) / 3.0];
+                    let rho = &rho_hat + &(&spread * &z);
+                    let v = domain
+                        .value(
+                            &rho,
+                            |r| Ok(criterion.value_and_gradient(r).0),
+                            |r| Ok(criterion.value_and_gradient(r)),
+                        )
+                        .expect("every draw past a saturated face has a value");
+                    let (v_joint, g_joint) = domain
+                        .value_and_gradient(&rho, |r| Ok(criterion.value_and_gradient(r)))
+                        .expect("every draw past a saturated face has a gradient");
+                    let (v_true, g_true) = criterion.value_and_gradient(&rho);
+                    assert!((v - v_true).abs() <= 1e-12 * v_true.abs().max(1.0), "{rho:?}");
+                    assert!((v_joint - v_true).abs() <= 1e-12 * v_true.abs().max(1.0));
+                    for (a, b) in g_joint.iter().zip(g_true.iter()) {
+                        assert!((a - b).abs() <= 1e-12 * b.abs().max(1.0), "{rho:?}");
+                    }
+                    log_weights.push(-v + v_hat + 0.5 * z.dot(&z));
+                }
+            }
+            log_weights
+        };
+        let past = |domain: &CriterionContinuation, rho: &Array1<f64>| {
+            rho.iter()
+                .enumerate()
+                .any(|(k, &r)| r < domain.lower[k] || r > domain.upper[k])
+        };
+        let draws: Vec<Array1<f64>> = (-6..=6)
+            .flat_map(|i| (-6..=6).map(move |j| (i, j)))
+            .map(|(i, j)| &rho_hat + &(&spread * &array![f64::from(i) / 3.0, f64::from(j) / 3.0]))
+            .collect();
+        assert!(draws.iter().any(|r| past(&wide, r)), "no draw exercises the wide box's faces");
+        assert!(
+            draws.iter().any(|r| past(&tight, r) && !past(&wide, r)),
+            "no draw lies between the two boxes' edges"
+        );
+
+        let tight_weights = log_weights(&tight);
+        let wide_weights = log_weights(&wide);
+        assert_eq!(tight_weights.len(), draws.len());
+        assert_eq!(wide_weights.len(), draws.len());
+        let normalize = |log_weights: &[f64]| -> (Vec<f64>, f64) {
+            let raw: Vec<f64> = log_weights.iter().map(|lw| lw.exp()).collect();
+            let total: f64 = raw.iter().sum();
+            (raw.iter().map(|w| w / total).collect(), total)
+        };
+        let (tight_normalized, tight_total) = normalize(&tight_weights);
+        let (wide_normalized, wide_total) = normalize(&wide_weights);
+        assert!(
+            (tight_total - wide_total).abs() <= 1e-12 * wide_total,
+            "integral moved with the box edge: {tight_total} vs {wide_total}"
+        );
+        for (a, b) in tight_normalized.iter().zip(wide_normalized.iter()) {
+            assert!((a - b).abs() <= 1e-12, "self-normalized weight moved: {a} vs {b}");
+        }
+    }
+
+    /// A literal face states nothing about the criterion beyond it, so a draw
+    /// past one is refused with its coordinate named rather than valued.
+    #[test]
+    fn a_draw_past_a_literal_face_is_refused_by_name() {
+        let domain = CriterionContinuation {
+            lower: array![-1.0, -1.0],
+            upper: array![1.0, 1.0],
+            lower_saturated: vec![true, true],
+            upper_saturated: vec![true, false],
+        };
+        let affine = |r: &Array1<f64>| Ok((r.sum(), Array1::ones(r.len())));
+        assert_eq!(
+            domain
+                .value(&array![3.0, 0.0], |r| Ok(r.sum()), affine)
+                .expect("past a saturated face"),
+            3.0
+        );
+        let refusal = domain
+            .value(&array![0.0, 1.5], |r| Ok(r.sum()), affine)
+            .expect_err("past a literal face");
+        assert!(refusal.contains("rho[1]") && refusal.contains("upper"), "{refusal}");
+        assert!(domain.value_and_gradient(&array![0.0, f64::NAN], affine).is_err());
+    }
+
+    /// #3010: the posterior's support opens every saturated face and keeps
+    /// every literal one, so every point of it is one the continuation values;
+    /// the held coordinates are the railed ones and those with `ρ̂` on a face.
+    #[test]
+    fn the_posterior_support_is_bounded_only_at_literal_faces_3010() {
+        let domain = CriterionContinuation {
+            lower: array![-1.0, -2.0, -3.0],
+            upper: array![1.0, 2.0, 3.0],
+            lower_saturated: vec![true, false, true],
+            upper_saturated: vec![false, true, true],
+        };
+        let (lower, upper) = domain.posterior_support();
+        assert_eq!(lower, array![f64::NEG_INFINITY, -2.0, f64::NEG_INFINITY]);
+        assert_eq!(upper, array![1.0, f64::INFINITY, f64::INFINITY]);
+        let affine = |r: &Array1<f64>| Ok((r.sum(), Array1::ones(r.len())));
+        for corner in [array![-40.0, -2.0, 40.0], array![1.0, 40.0, -40.0]] {
+            assert!(domain.value(&corner, |r| Ok(r.sum()), affine).is_ok(), "{corner}");
+        }
+        assert_eq!(domain.held_at(&array![0.0, 2.0, -3.0], &[0]), vec![0, 1, 2]);
+        assert_eq!(domain.held_at(&array![0.0, 1.0, 0.0], &[]), Vec::<usize>::new());
     }
 }

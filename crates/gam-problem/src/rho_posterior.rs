@@ -104,19 +104,23 @@ pub enum RhoPosteriorRefusal {
     /// The outer Hessian has no strict Cholesky factor, so there is no Gaussian
     /// proposal with covariance `H_ρ⁻¹`.
     HessianNotPositiveDefinite { detail: String },
-    /// The criterion is infeasible at `ρ̂`.
-    CriterionInfeasibleAtRhoHat,
+    /// The criterion could not be evaluated at `ρ̂`, and why.
+    CriterionUnavailableAtRhoHat { detail: String },
     /// The criterion at `ρ̂` is not finite.
     CriterionNotFiniteAtRhoHat,
-    /// A sequential interval of the Laplace proposal restricted to `ρ`'s domain
-    /// has a mass whose two log-probabilities round to the same value, so the
-    /// draw's density on free coordinate `coordinate` is not representable.
-    /// No criterion was evaluated off `ρ̂` (#3010).
+    /// A sequential interval of the Laplace proposal restricted to the support
+    /// of `π(ρ|y)` has a mass whose two log-probabilities round to the same
+    /// value, so the draw's density on free coordinate `coordinate` is not
+    /// representable. No criterion was evaluated off `ρ̂` (#3010).
     DegenerateProposalInterval { coordinate: usize },
-    /// No proposal draw has a finite criterion.
-    NoFiniteProposal,
-    /// Too few finite importance weights for the Pareto tail fit.
-    TooFewFiniteWeights,
+    /// The criterion could not be evaluated at proposal draw `draw`, and why.
+    /// Every draw carries mass, so one the criterion cannot value refuses the
+    /// diagnostic rather than being dropped from it.
+    CriterionUnavailableAtDraw { draw: usize, detail: String },
+    /// The criterion at proposal draw `draw` is not finite.
+    CriterionNotFiniteAtDraw { draw: usize },
+    /// The Pareto tail fit of the importance weights failed.
+    TailFitUnavailable,
     /// The Pareto tail fit returned a non-finite shape, which grades nothing.
     TailShapeNotFinite,
     /// The smoothed importance weights do not sum to a positive finite total.
@@ -132,16 +136,23 @@ impl fmt::Display for RhoPosteriorRefusal {
             Self::HessianNotPositiveDefinite { detail } => {
                 write!(f, "outer Hessian is not positive definite: {detail}")
             }
-            Self::CriterionInfeasibleAtRhoHat => f.write_str("criterion is infeasible at rho_hat"),
+            Self::CriterionUnavailableAtRhoHat { detail } => {
+                write!(f, "criterion is unavailable at rho_hat: {detail}")
+            }
             Self::CriterionNotFiniteAtRhoHat => f.write_str("criterion at rho_hat is not finite"),
             Self::DegenerateProposalInterval { coordinate } => write!(
                 f,
-                "the Laplace proposal restricted to the rho domain has an interval of \
-                 unrepresentable mass on rho coordinate {coordinate}"
+                "the Laplace proposal restricted to the support of pi(rho|y) has an interval \
+                 of unrepresentable mass on rho coordinate {coordinate}"
             ),
-            Self::NoFiniteProposal => f.write_str("no proposal draw has a finite criterion"),
-            Self::TooFewFiniteWeights => {
-                f.write_str("too few finite importance weights for the Pareto tail fit")
+            Self::CriterionUnavailableAtDraw { draw, detail } => {
+                write!(f, "criterion is unavailable at proposal draw {draw}: {detail}")
+            }
+            Self::CriterionNotFiniteAtDraw { draw } => {
+                write!(f, "criterion at proposal draw {draw} is not finite")
+            }
+            Self::TailFitUnavailable => {
+                f.write_str("the Pareto tail fit of the importance weights failed")
             }
             Self::TailShapeNotFinite => f.write_str("the Pareto tail shape is not finite"),
             Self::SmoothedWeightsNotNormalizable => {
@@ -226,8 +237,7 @@ pub struct RhoMixtureNode {
     pub weight: f64,
     /// Normalized log node probability.
     pub log_weight: f64,
-    /// Exact profiled criterion value at the node (`+∞` for infeasible nodes,
-    /// which carry zero weight).
+    /// Exact profiled criterion value at the node.
     pub cost: f64,
 }
 
@@ -304,33 +314,38 @@ pub enum RhoPosteriorEscalation {
 /// leaving the plug-in + first-order intervals.
 pub trait RhoPosteriorEscalator: Send + Sync {
     /// Tier-0 PSIS `ρ`-adequacy diagnostic. `criterion` evaluates the outer criterion
-    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). `rho_domain` is
-    /// the `(lower, upper)` box that is the support of `π(ρ|y)`, and `held`
-    /// names the coordinates the outer certificate railed: those, and any at a
-    /// face of the box, stay at `ρ̂`, and the criterion is only ever evaluated
-    /// inside the box (#3010). Returns `Ok(None)` when there is nothing to grade
-    /// (no free coordinate) and the typed [`RhoPosteriorRefusal`] when the
-    /// diagnostic cannot be formed.
+    /// `−log π(ρ|y)` at any `ρ`, or says why it cannot; a draw it cannot value
+    /// refuses the diagnostic, since dropping it would drop its mass. `support`
+    /// is the `(lower, upper)` box of `π(ρ|y)`: finite only at a literal face,
+    /// past which `ρ` is not a model, and infinite at a saturated face, past
+    /// which the criterion continues. `held` names the coordinates the outer
+    /// certificate railed or found on a face; they stay at `ρ̂`, and the rest
+    /// are drawn from the Laplace approximation conditioned on them and
+    /// truncated to `support` (#3010). Returns `Ok(None)` when there is nothing
+    /// to grade (no free coordinate) and the typed [`RhoPosteriorRefusal`] when
+    /// the diagnostic cannot be formed.
     fn rho_posterior_adequacy(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        rho_domain: &(Array1<f64>, Array1<f64>),
+        support: &(Array1<f64>, Array1<f64>),
         held: &[usize],
-        criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        criterion: &dyn Fn(&Array1<f64>) -> Result<f64, String>,
         n_samples: Option<usize>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 
     /// Auto-selected escalation (Tier-1 quadrature / Tier-2 NUTS / honest
     /// `Unavailable`). `criterion` returns the exact profiled criterion value,
-    /// `criterion_and_grad` the value plus the exact LAML `ρ`-gradient; both are
-    /// `None` for infeasible `ρ`.
+    /// `criterion_and_grad` the value plus the exact LAML `ρ`-gradient; either
+    /// failing at a node or a sampler position makes the tier `Unavailable`
+    /// with that reason.
     fn escalate_rho_posterior(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        criterion: &mut dyn FnMut(&Array1<f64>) -> Option<f64>,
-        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send),
+        criterion: &mut dyn FnMut(&Array1<f64>) -> Result<f64, String>,
+        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String>
+                  + Send),
     ) -> RhoPosteriorEscalation;
 }
 

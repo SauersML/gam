@@ -109,13 +109,7 @@ fn joint_rho_psi_optimum_certifies_when_only_the_psi_coordinate_rails_2425() {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_bounds(lower, upper)
-        .with_initial_rho(array![0.0, 0.0, PSI_RAIL_FACE])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0, PSI_RAIL_FACE]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), theta: &Array1<f64>| Ok(psi_rail_cost(theta)),
@@ -181,13 +175,7 @@ fn railed_psi_coordinate_is_in_the_certificates_evidence_not_only_on_its_face_26
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_bounds(lower, upper)
-        .with_initial_rho(array![0.0, 0.0, PSI_RAIL_FACE])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0, PSI_RAIL_FACE]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), theta: &Array1<f64>| Ok(psi_rail_cost(theta)),
