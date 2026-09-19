@@ -141,7 +141,7 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
         // center spacing for moderate n), kappa·r runs large at every center
         // pair, every kernel block underflows toward machine epsilon, and the
         // constrained radial Gram collapses to floating-point noise
-        // (`positive_spectral_whitener_from_gram` then rejects a rank-0 smooth —
+        // (`positive_spectral_frame_from_gram` then rejects a rank-0 smooth —
         // gam#1091). The natural operating scale of a radial kernel is the
         // typical center separation, where kappa·r ≈ O(1) keeps every block
         // O(1); promote at that scale rather than inheriting the (possibly

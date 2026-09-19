@@ -4404,7 +4404,8 @@ fn col_minmax_refuses_a_constant_column_and_keeps_a_tiny_real_range_2469() {
 /// they are already correct, and resolves the blocks a builder cutoff decides.
 /// - Unframed blocks across the basis families: `resolved_eigenvalue_count` equals
 ///   the builder's rank exactly, on a population whose gaps are clean.
-/// - Frame-declared blocks: the declared frame is the nullity, unchanged.
+/// - Frame-declared blocks: the measured null space lies inside the declared
+///   frame, and the owner resolves the builder's rank.
 /// - The Matérn operator mass penalty: at a short length scale the builder's
 ///   rank is full, and the collocation factor agrees. At a long one the factor
 ///   still resolves every mode, while the builder's dense Gram has lost some.
@@ -4450,11 +4451,49 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
         for term in &design.smooth.terms {
             for penalty in &term.active_penalties {
                 match penalty.info.structural_null_frame.as_ref() {
-                    Some(frame) => assert_eq!(
-                        frame.ncols(),
-                        penalty.nullity,
-                        "{formula}: the declared frame is the nullity"
-                    ),
+                    Some(frame) => {
+                        // The frame is the SEMINORM's null space; the shipped
+                        // matrix may carry a deliberate conditioning ridge on
+                        // part of it (Duchon's `√ε` affine ridge, gam#1816),
+                        // which sits within a decade of the rank cutoff, so
+                        // whether a rank test reads it as null is a property
+                        // of the chart. What holds in every chart: the
+                        // measured null space lies inside the declared frame,
+                        // and the owner resolves exactly the builder's rank.
+                        assert!(
+                            penalty.nullity <= frame.ncols(),
+                            "{formula}: measured nullity {} exceeds the declared frame {}",
+                            penalty.nullity,
+                            frame.ncols()
+                        );
+                        let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
+                            .expect("penalty spectrum");
+                        if let Some(null) = penalty.null_eigenvectors.as_ref() {
+                            // Davis–Kahan: a computed null eigenvector tilts by
+                            // at most `p·ε·λmax / gap`, and every range
+                            // eigenvalue clears the rank cutoff, so the gap
+                            // is at least `rank_tol`.
+                            let lambda_max = analysis
+                                .eigenvalues
+                                .iter()
+                                .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+                            let tilt_bound = (frame.nrows() as f64) * f64::EPSILON * lambda_max
+                                / analysis.rank_tol;
+                            let outside = null - &frame.dot(&frame.t().dot(null));
+                            let leak = outside.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+                            assert!(
+                                leak <= tilt_bound,
+                                "{formula}: a measured null direction leaves the declared frame \
+                                 by {leak:.3e} (bound {tilt_bound:.3e})"
+                            );
+                        }
+                        assert_eq!(
+                            resolved_eigenvalue_count(&analysis.eigenvalues.to_vec(), 0.0),
+                            penalty.info.effective_rank,
+                            "{formula} {:?}: the owner must reproduce the builder's rank",
+                            penalty.info.source
+                        );
+                    }
                     None => {
                         let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
                             .expect("penalty spectrum");

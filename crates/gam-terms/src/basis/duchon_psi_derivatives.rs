@@ -1691,7 +1691,7 @@ pub fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
 /// **Why**: in high d with a small length scale the spectral normalization
 /// `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` of the Matérn block is `~1e-14`,
 /// driving every `K(r) = c · r^ν · K_ν(κr)` to `~1e-16`. Downstream
-/// `B^T B` is then at `~1e-32` — below `eps²` — and the spectral whitener
+/// `B^T B` is then at `~1e-32` — below `eps²` — and the spectral frame
 /// truncates everything as noise, even though the basis is mathematically
 /// well-defined.
 ///
