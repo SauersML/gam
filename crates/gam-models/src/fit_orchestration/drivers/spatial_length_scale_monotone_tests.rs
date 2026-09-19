@@ -140,6 +140,7 @@ mod spatial_length_scale_monotone_tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -261,6 +262,7 @@ mod spatial_length_scale_monotone_tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let fit_opts = FitOptions {
             max_iter: 40,
@@ -316,6 +318,7 @@ mod spatial_length_scale_monotone_tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let fit_opts = FitOptions {
             max_iter: 40,

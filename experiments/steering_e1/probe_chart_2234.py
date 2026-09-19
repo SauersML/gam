@@ -15,7 +15,7 @@ evidence rather than guessed at 10 minutes per guess:
   `harvest`  one GPU pass; dumps the ambient activation cloud + labels + template
              indices to an `.npz` (no fit).
   `sweep`    CPU only; for each (per-template-centering, PCA dim) cell, fits
-             `gamfit.sae_manifold_fit` exactly as the E1 harness does and reports
+             `gamfit.sae.sae_manifold_fit` exactly as the E1 harness does and reports
              the fit EV together with how much of the *known* structure the
              fitted coordinate recovers (circular R² against the day-of-week
              phase for the cyclic ladder, linear R² against rank for the ordinal
@@ -264,7 +264,7 @@ def planted(args) -> int:
             free = structure_recovery(
                 Xr[:, 0] - Xr[:, 0].mean(), label_idx, False, n_labels)
         try:
-            fit = gamfit.sae_manifold_fit(
+            fit = gamfit.sae.sae_manifold_fit(
                 np.ascontiguousarray(Xr), K=1, d_atom=1, atom_topology=structure.topology,
                 assignment="softmax", n_iter=args.n_iter, random_state=args.seed)
             ev = float(1.0 - np.sum((Xr - np.asarray(fit.fitted)) ** 2)
@@ -342,7 +342,7 @@ def sweep(args) -> int:
             evr = float((svals[:r] ** 2).sum() / max((svals**2).sum(), 1e-30))
             for K in k_atoms:
                 try:
-                    fit = gamfit.sae_manifold_fit(
+                    fit = gamfit.sae.sae_manifold_fit(
                         Xr, K=K, d_atom=1, atom_topology=topology, assignment="softmax",
                         n_iter=args.n_iter, random_state=args.seed)
                     fit_ev = float(

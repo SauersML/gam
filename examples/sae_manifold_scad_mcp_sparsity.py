@@ -38,7 +38,7 @@ def main() -> None:
     x += 0.03 * rng.standard_normal(x.shape)
 
     fits = {
-        "scad": gamfit.sae_manifold_fit(
+        "scad": gamfit.sae.sae_manifold_fit(
             x,
             K=5,
             d_atom=1,
@@ -50,7 +50,7 @@ def main() -> None:
             n_iter=20,
             random_state=240,
         ),
-        "mcp": gamfit.sae_manifold_fit(
+        "mcp": gamfit.sae.sae_manifold_fit(
             x,
             K=5,
             d_atom=1,

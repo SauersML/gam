@@ -12,7 +12,7 @@ import gamfit
 
 
 def _assert_rejects_nonbinomial_flexible_link(df, formula, *, family, match):
-    with pytest.raises(gamfit.InvalidConfigurationError, match=match):
+    with pytest.raises(gamfit.errors.InvalidConfigurationError, match=match):
         gamfit.fit(df, formula, family=family)
 
 
@@ -22,7 +22,7 @@ def test_flexible_link_kwarg_is_rejected_on_gaussian():
     df = pd.DataFrame({"y": y, "x": x})
 
     with pytest.raises(
-        gamfit.InvalidConfigurationError,
+        gamfit.errors.InvalidConfigurationError,
         match="flexible\\(\\.\\.\\.\\).*non-binomial",
     ):
         gamfit.fit(

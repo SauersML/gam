@@ -75,7 +75,7 @@ def _ensure_bspline_knots(spec: Any, t_np: Any) -> Any:
 
 
 def bspline_evaluate(spec: Any, coords: Any) -> Any:
-    """Evaluate a :class:`gamfit.BSpline` at stacked ``(B, 1)`` coords.
+    """Evaluate a :class:`gamfit.smooth.BSpline` at stacked ``(B, 1)`` coords.
 
     Routes forward + backward through :func:`gamfit.torch._basis.bspline_basis`,
     which wraps the Rust ``bspline_basis`` PyFFI call inside a
@@ -160,7 +160,7 @@ def _periodic_curve_basis(t: Any, n_knots: int, degree: int) -> Any:
 
 
 def duchon_evaluate(spec: Any, coords: Any) -> Any:
-    """Evaluate a :class:`gamfit.Duchon` at stacked ``(B, d)`` coords.
+    """Evaluate a :class:`gamfit.smooth.Duchon` at stacked ``(B, d)`` coords.
 
     Thin descriptor adapter over the canonical Torch Duchon primitive
     :func:`gamfit.torch._basis.duchon_basis`, which owns the autograd engine:
@@ -193,7 +193,7 @@ def duchon_evaluate(spec: Any, coords: Any) -> Any:
 
 
 def matern_evaluate(spec: Any, coords: Any) -> Any:
-    """Evaluate a :class:`gamfit.Matern` kernel at ``(B, d)`` coords.
+    """Evaluate a :class:`gamfit.smooth.Matern` kernel at ``(B, d)`` coords.
 
     Forward and backward both route through Rust:
 
@@ -476,7 +476,7 @@ def pca_evaluate(spec: Any, coords: Any) -> Any:
 
 
 def tensor_bspline_evaluate(spec: Any, coords: Any) -> Any:
-    """Evaluate a :class:`gamfit.TensorBSpline` at ``(B, d)`` coords.
+    """Evaluate a :class:`gamfit.smooth.TensorBSpline` at ``(B, d)`` coords.
 
     Each marginal's 1D basis is evaluated through the Rust ``bspline_basis``
     kernel (via :func:`gamfit.torch._basis.bspline_basis`, with analytic
@@ -619,7 +619,7 @@ def pca_evaluate_numpy(spec: Any, coords: Any) -> Any:
 
 
 def sphere_evaluate(spec: Any, coords: Any) -> Any:
-    """Evaluate a :class:`gamfit.Sphere` basis at ``(B, 2)`` coords.
+    """Evaluate a :class:`gamfit.smooth.Sphere` basis at ``(B, 2)`` coords.
 
     Routes through :func:`gamfit.torch._basis.sphere_basis`, which calls
     the Rust ``sphere_basis`` kernel. Its backward to ``points`` is analytic:

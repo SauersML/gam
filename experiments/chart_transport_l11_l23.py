@@ -179,7 +179,7 @@ def fit_layer_circle(
         lift = vt[:pca_rank]  # (r, ambient)
         x_fit = xc @ lift.T
     with fit_alarm(timeout_s, f"circle@{layer}"):
-        res = gamfit.sae_manifold_fit(
+        res = gamfit.sae.sae_manifold_fit(
             x_fit,
             K=1,
             d_atom=1,
@@ -321,7 +321,7 @@ def hop_evidence(
         chart_from.plane, chart_to.plane
     )
     # DATA level: REML transport map on the shared tokens' angles.
-    out["data_transport"] = gamfit.layer_transport_fit(
+    out["data_transport"] = gamfit.sae.layer_transport_fit(
         chart_from.theta,
         chart_to.theta,
         "circle",
@@ -332,12 +332,12 @@ def hop_evidence(
     # Frame-level alignment: P_to^T P_from as a 2x2 operator (how the plane
     # maps under the identity ambient pushforward — 'is it the same plane,
     # same orientation, same phase').
-    has_transfer_ffi = hasattr(gamfit, "certify_chart_transfer") and hasattr(
-        gamfit, "chart_transfer_operator"
+    has_transfer_ffi = hasattr(gamfit.sae, "certify_chart_transfer") and hasattr(
+        gamfit.sae, "chart_transfer_operator"
     )
     m = chart_to.plane.T @ chart_from.plane
     if has_transfer_ffi:
-        out["frame_alignment"] = gamfit.certify_chart_transfer(
+        out["frame_alignment"] = gamfit.sae.certify_chart_transfer(
             m, CIRCLE_GENERATOR, CIRCLE_GENERATOR
         )
         out["frame_alignment"]["operator"] = m.tolist()
@@ -361,9 +361,9 @@ def hop_evidence(
         jets = np.broadcast_to(
             chart_to.plane[None, :, :], (n, *chart_to.plane.shape)
         ).copy()
-        rep = gamfit.chart_transfer_operator(jets, jvp, weights)
+        rep = gamfit.sae.chart_transfer_operator(jets, jvp, weights)
         mean_op = np.asarray(rep["mean"])
-        cert = gamfit.certify_chart_transfer(
+        cert = gamfit.sae.certify_chart_transfer(
             mean_op, CIRCLE_GENERATOR, CIRCLE_GENERATOR
         )
         out["model_transfer"] = {

@@ -473,13 +473,18 @@ pub fn gaussian_log_loss_from_predictions(
     }
 }
 
-/// The package's standard classification diagnostic panel.
+/// The package's standard classification diagnostic panel. Nagelkerke's
+/// `R²` is taken against an intercept-only null model with mean `null_mean`;
+/// `None` uses the prevalence of the scored labels. Held-out scoring passes
+/// the training prevalence, the null model fitted on the training rows.
 pub fn classification_metrics_from_predictions(
     observed: &[f64],
     predicted_mean: &[f64],
-    null_mean: f64,
+    null_mean: Option<f64>,
 ) -> Result<ClassificationPredictionMetrics, String> {
     validate_probability_inputs("classification_metrics", observed, predicted_mean)?;
+    let null_mean =
+        null_mean.unwrap_or_else(|| observed.iter().sum::<f64>() / observed.len() as f64);
     Ok(ClassificationPredictionMetrics {
         auc: auc_from_predictions(observed, predicted_mean)?,
         precision_recall_auc: precision_recall_auc_from_predictions(observed, predicted_mean)?,
@@ -805,8 +810,8 @@ mod tests {
             expected_calibration_error_from_predictions(&observed, &predicted, 2).unwrap(),
             0.0
         );
-        assert!(classification_metrics_from_predictions(&observed, &[0.5, 2.0], 0.5).is_err());
-        assert!(classification_metrics_from_predictions(&[-0.1, 1.0], &predicted, 0.5).is_err());
+        assert!(classification_metrics_from_predictions(&observed, &[0.5, 2.0], None).is_err());
+        assert!(classification_metrics_from_predictions(&[-0.1, 1.0], &predicted, None).is_err());
     }
 
     /// Predictions are scored as given. A certain prediction costs nothing on
@@ -843,7 +848,7 @@ mod tests {
     fn nagelkerke_and_classification_panel_share_the_core_kernels() {
         let observed = [0.0, 0.0, 1.0, 1.0];
         let predicted = [0.1, 0.2, 0.8, 0.9];
-        let metrics = classification_metrics_from_predictions(&observed, &predicted, 0.5).unwrap();
+        let metrics = classification_metrics_from_predictions(&observed, &predicted, None).unwrap();
         assert_eq!(metrics.auc, 1.0);
         assert_eq!(metrics.precision_recall_auc, 1.0);
         assert_eq!(
@@ -851,6 +856,22 @@ mod tests {
             nagelkerke_r_squared_from_predictions(&observed, &predicted, 0.5).unwrap()
         );
         assert!(metrics.nagelkerke_r_squared.unwrap() > 0.8);
+        // Without a null mean the panel takes the scored labels' prevalence;
+        // an explicit (training) prevalence is used as given.
+        let skewed = [0.0, 0.0, 0.0, 1.0];
+        let skewed_predicted = [0.1, 0.2, 0.3, 0.7];
+        assert_eq!(
+            classification_metrics_from_predictions(&skewed, &skewed_predicted, None)
+                .unwrap()
+                .nagelkerke_r_squared,
+            nagelkerke_r_squared_from_predictions(&skewed, &skewed_predicted, 0.25).unwrap()
+        );
+        assert_eq!(
+            classification_metrics_from_predictions(&skewed, &skewed_predicted, Some(0.5))
+                .unwrap()
+                .nagelkerke_r_squared,
+            nagelkerke_r_squared_from_predictions(&skewed, &skewed_predicted, 0.5).unwrap()
+        );
         assert_eq!(
             nagelkerke_r_squared_from_predictions(&observed, &predicted, 1.0).unwrap(),
             None
