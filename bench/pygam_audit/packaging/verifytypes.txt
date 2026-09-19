@@ -1,0 +1,616 @@
+Module name: "gamfit"
+Package directory: "/tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit"
+Module directory: "/tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit"
+Path of py.typed file: "/tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/py.typed"
+
+Public modules: 40
+   gamfit
+   gamfit.bartlett
+   gamfit.checkpoint_dynamics
+   gamfit.crosscoder
+   gamfit.diagnostics
+   gamfit.diagnostics.anchor_consistency
+   gamfit.diagnostics.aux_richness
+   gamfit.diagnostics.jacobian_sparsity
+   gamfit.examples
+   gamfit.examples.partial_supervision
+   gamfit.examples.sae_supervised
+   gamfit.full_conformal
+   gamfit.geometry
+   gamfit.identifiability
+   gamfit.intervention_calibration
+   gamfit.kernels
+   gamfit.kernels_jax
+   gamfit.kernels_torch
+   gamfit.layer_transport
+   gamfit.manifold_behavior
+   gamfit.manifold_crosscoder
+   gamfit.manifolds
+   gamfit.sklearn
+   gamfit.smooth
+   gamfit.structure_discovery
+   gamfit.topology
+   gamfit.torch
+   gamfit.torch.distributed_reduce
+   gamfit.torch.fit
+   gamfit.torch.geometry
+   gamfit.torch.harvest
+   gamfit.torch.harvest_contract
+   gamfit.torch.hyperbolic
+   gamfit.torch.interchange
+   gamfit.torch.interventions
+   gamfit.torch.manifold_sae
+   gamfit.torch.module
+   gamfit.torch.modules
+   gamfit.torch.penalties
+   gamfit.torch.skip_transcoder
+
+Symbols used in public interface:
+gamfit._sparse_dictionary.BlockSparseDictStream.finalize
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sparse_dictionary.py:1102:9 - error: Return type is partially unknown
+    Return type is "BlockSparseStreamArtifact"
+gamfit._sparse_dictionary.BlockSparseStreamArtifact.to_fit
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sparse_dictionary.py:969:9 - error: Return type is partially unknown
+    Return type is "BlockSparseDictionaryFit"
+gamfit._sparse_dictionary.BlockSparseDictionaryFit.block_seeds
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sparse_dictionary.py:650:9 - error: Return type is partially unknown
+    Return type is "list[dict[Unknown, Unknown]]"
+      Type argument 1 for class "list" has partially unknown type
+gamfit._sparse_dictionary.BlockSparseDictionaryFit.seed_manifest
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sparse_dictionary.py:682:9 - error: Return type is partially unknown
+    Return type is "dict[Unknown, Unknown]"
+      Type argument 1 for class "dict" has unknown type
+      Type argument 2 for class "dict" has unknown type
+gamfit.block_sparse_dictionary_fit
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sparse_dictionary.py:113:5 - error: Return type is partially unknown
+    Return type is "BlockSparseDictionaryFit"
+gamfit.block_sparse_dictionary_fit_begin
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sparse_dictionary.py:114:5 - error: Return type is partially unknown
+    Return type is "BlockSparseDictStream"
+gamfit.fixed_budget_block_sparse_dictionary_fit
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sparse_dictionary.py:115:5 - error: Return type is partially unknown
+    Return type is "BlockSparseDictionaryFit"
+gamfit.ARDPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/__init__.py:263:1 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/__init__.py:263:1 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[ARDPenalty]"
+gamfit._penalty_descriptors.ARDPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:268:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_descriptors.ARDPenalty.target_name
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:269:14 - error: Ambiguous base class override
+    Type inferred in child class is "str"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit.AuxConditionalPriorPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:163:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.BlockOrthogonalityPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:164:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.BlockSparsityPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:165:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.OrderedBetaBernoulliPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:253:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit._penalty_descriptors.OrderedBetaBernoulliPenalty.alpha
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:286:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_descriptors.OrderedBetaBernoulliPenalty.tau
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:287:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_descriptors.OrderedBetaBernoulliPenalty.k_max
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:288:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int | None"
+gamfit._penalty_descriptors.OrderedBetaBernoulliPenalty.target_name
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:289:14 - error: Ambiguous base class override
+    Type inferred in child class is "str"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit.IsometryPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:168:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.IvaeRidgeMeanGauge
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:169:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.SmoothThresholdPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:170:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.MechanismSparsityPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:171:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.NuclearNormPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:172:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.OrthogonalityPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:173:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.ParametricAuxConditionalPriorPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:174:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.PENALTY_MANIFEST
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:176:5 - error: Type argument 1 for class "tuple" has partially unknown type
+    Type is [object Object]
+gamfit.ScadMcpPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:178:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.SoftmaxAssignmentSparsityPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:179:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.SparsityPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:180:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.TopKActivationPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:181:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit.TotalVariationPenalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalties.py:182:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "type[Any]"
+gamfit._select_topology.TopologySelectionError.failures
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_select_topology.py:119:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "tuple[TopologyCandidateFailure, ...]"
+gamfit.smooth.Pca.double_penalty
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/smooth.py:656:14 - error: Ambiguous base class override
+    Type inferred in child class is "bool"
+gamfit.smooth.Pca.shape_constraint
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/smooth.py:657:14 - error: Ambiguous base class override
+    Type inferred in child class is "str | None"
+gamfit._basis_descriptors.PeriodicHarmonic.harmonics
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_basis_descriptors.py:88:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit._penalty_descriptors.BlockOrthogonalityDescriptor.groups
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:314:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "list[list[int]]"
+gamfit._penalty_descriptors.BlockOrthogonalityDescriptor.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:315:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_descriptors.BlockOrthogonalityDescriptor.n_eff
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:316:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int | None"
+gamfit._penalty_descriptors.BlockOrthogonalityDescriptor.target_name
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:317:14 - error: Ambiguous base class override
+    Type inferred in child class is "str"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._penalty_descriptors.MechanismSparsityDescriptor.feature_groups
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:339:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "list[list[int]]"
+gamfit._penalty_descriptors.MechanismSparsityDescriptor.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:340:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_descriptors.MechanismSparsityDescriptor.n_eff
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:341:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float | None"
+gamfit._penalty_descriptors.MechanismSparsityDescriptor.smoothing_eps
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:342:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_descriptors.MechanismSparsityDescriptor.target_name
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_descriptors.py:343:14 - error: Ambiguous base class override
+    Type inferred in child class is "str"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit.examples.sae_supervised.SaeSupervisedFit.sae
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/examples/sae_supervised.py:67:5 - error: Type unknown for variable "gamfit.examples.sae_supervised.SaeSupervisedFit.sae"
+gamfit.sae_supervised
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/examples/__init__.py:270:5 - error: Return type is partially unknown
+    Return type is "SaeSupervisedFit"
+gamfit._model.MultinomialModel.smooth_significance
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1786:9 - error: Return type is partially unknown
+    Return type is "list[dict[Unknown, Unknown]]"
+      Type argument 1 for class "list" has partially unknown type
+gamfit._model.MultinomialPrediction.__init__
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1574:9 - error: Type annotation for parameter "classes" is missing
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1574:9 - error: Type annotation for parameter "mean" is missing
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1574:9 - error: Type annotation for parameter "std_error" is missing
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1574:9 - error: Type annotation for parameter "mean_lower" is missing
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1574:9 - error: Type annotation for parameter "mean_upper" is missing
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1574:9 - error: Type annotation for parameter "level" is missing
+gamfit._model.MultinomialPrediction.classes
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1575:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "list[Unknown]"
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1575:14 - error: Type argument 1 for class "list" has unknown type
+gamfit._model.MultinomialPrediction.mean
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1576:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Unknown"
+gamfit._model.MultinomialPrediction.std_error
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1577:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Unknown"
+gamfit._model.MultinomialPrediction.mean_lower
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1578:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Unknown"
+gamfit._model.MultinomialPrediction.mean_upper
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1579:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Unknown"
+gamfit._model.MultinomialPrediction.level
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_model.py:1580:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_bridge.GumbelTemperatureSchedule.tau_start
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_bridge.py:320:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_bridge.GumbelTemperatureSchedule.tau_min
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_bridge.py:321:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit._penalty_bridge.GumbelTemperatureSchedule.rate
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_bridge.py:326:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float | None"
+gamfit._penalty_bridge.GumbelTemperatureSchedule.steps
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_bridge.py:331:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int | None"
+gamfit._penalty_bridge.GumbelTemperatureSchedule.iter_count
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_penalty_bridge.py:357:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.ManifoldSAE
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sae_manifold.py:362:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Any"
+gamfit.gumbel_geometric_schedule
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sae_manifold.py:364:5 - error: Return type is partially unknown
+    Return type is "GumbelTemperatureSchedule"
+gamfit.gumbel_linear_schedule
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sae_manifold.py:365:5 - error: Return type is partially unknown
+    Return type is "GumbelTemperatureSchedule"
+gamfit.gumbel_reciprocal_iter_schedule
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sae_manifold.py:366:5 - error: Return type is partially unknown
+    Return type is "GumbelTemperatureSchedule"
+gamfit.sae_manifold_fit
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sae_manifold.py:369:5 - error: Type of parameter "schedule" is partially unknown
+    Parameter type is "GumbelTemperatureSchedule | Mapping[str, Any] | None"
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_sae_manifold.py:369:5 - error: Return type is unknown
+gamfit.__getattr__
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/__init__.py:427:5 - error: Return type annotation is missing
+gamfit.examples.sae_supervised
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/examples/sae_supervised.py:22:5 - error: Return type is partially unknown
+    Return type is "SaeSupervisedFit"
+gamfit.examples.sae_supervised.sae_supervised
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/examples/sae_supervised.py:188:5 - error: Return type is partially unknown
+    Return type is "SaeSupervisedFit"
+gamfit.kernels_jax.exc
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/kernels_jax.py:21:23 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "ImportError"
+gamfit.kernels_torch.exc
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/kernels_torch.py:21:23 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "ImportError"
+gamfit._manifold.Circle.compatible_bases
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:244:5 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "frozenset[str]"
+gamfit._manifold.Circle.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:247:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._manifold.CylinderManifold.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:299:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._manifold.Euclidean.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:225:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._manifold.Grassmann.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:336:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._manifold.Spd.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:401:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._manifold.Sphere.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:262:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._manifold.Stiefel.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:371:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit._manifold.Torus.json
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/_manifold.py:276:14 - error: Ambiguous base class override
+    Type inferred in child class is "dict[str, Any]"
+    Inferred child class type is missing type annotation and could be inferred differently by type checkers
+gamfit.sklearn.GAMRegressor
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+   error: Type of base class "gamfit.sklearn._BaseGAMEstimator" is partially unknown
+gamfit.sklearn._BaseGAMEstimator
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.sklearn._BaseGAMEstimator.model_
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/sklearn.py:68:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Model"
+gamfit.sklearn._BaseGAMEstimator.feature_names_in_
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/sklearn.py:77:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "NDArray[Any]"
+gamfit.sklearn._BaseGAMEstimator.n_features_in_
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/sklearn.py:78:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.sklearn.GAMClassifier
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+   error: Type of base class "gamfit.sklearn._BaseGAMEstimator" is partially unknown
+gamfit.torch.manifold_sae.ManifoldSAE
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.manifold_sae.ManifoldSAE.__init__
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/manifold_sae.py:166:9 - error: Type of parameter "fitted" is unknown
+gamfit.torch.manifold_sae.ManifoldSAE.fitted
+   error: Return type is unknown
+gamfit.torch.penalties.ARDPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.ARDPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:310:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.ARDPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:311:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.ARDPenalty.log_precision
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:313:18 - error: Type unknown for variable "gamfit.torch.penalties.ARDPenalty.log_precision"
+gamfit.torch.penalties._RustPenaltyModule
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.penalties.BlockOrthogonalityPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.BlockOrthogonalityPenalty.groups
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:357:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "list[list[int]]"
+gamfit.torch.penalties.BlockOrthogonalityPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:358:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.BlockOrthogonalityPenalty.n_eff
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:359:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int | None"
+gamfit.torch.penalties.BlockOrthogonalityPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:360:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.BlockOrthogonalityPenalty.learnable
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:361:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "bool"
+gamfit.torch.penalties.BlockOrthogonalityPenalty.log_weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:363:18 - error: Type unknown for variable "gamfit.torch.penalties.BlockOrthogonalityPenalty.log_weight"
+gamfit.torch.penalties.OrderedBetaBernoulliPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.OrderedBetaBernoulliPenalty.k_max
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:592:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.penalties.OrderedBetaBernoulliPenalty.alpha
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:593:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.OrderedBetaBernoulliPenalty.tau
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:594:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.OrderedBetaBernoulliPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:595:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.OrderedBetaBernoulliPenalty.learnable
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:596:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "bool"
+gamfit.torch.penalties.OrderedBetaBernoulliPenalty.log_alpha
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:598:18 - error: Type unknown for variable "gamfit.torch.penalties.OrderedBetaBernoulliPenalty.log_alpha"
+gamfit.torch.penalties.IsometryPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.IsometryPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:259:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.IsometryPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:260:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.IvaeRidgeMeanGauge
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.IvaeRidgeMeanGauge.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:645:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.IvaeRidgeMeanGauge.n_eff
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:646:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.penalties.IvaeRidgeMeanGauge.ridge_eps
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:647:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.IvaeRidgeMeanGauge.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:648:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.IvaeRidgeMeanGauge.learnable
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:649:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "bool"
+gamfit.torch.penalties.IvaeRidgeMeanGauge.log_weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:651:18 - error: Type unknown for variable "gamfit.torch.penalties.IvaeRidgeMeanGauge.log_weight"
+gamfit.torch.penalties.LazyPcaBasis
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.penalties.LazyPcaBasis.path
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:865:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Path"
+gamfit.torch.penalties.LazyPcaBasis.device
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:867:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "Any"
+gamfit.torch.penalties.MechanismSparsityPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.MechanismSparsityPenalty.feature_groups
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:542:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "list[list[int]]"
+gamfit.torch.penalties.MechanismSparsityPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:545:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.MechanismSparsityPenalty.n_eff
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:546:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.MechanismSparsityPenalty.smoothing_eps
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:547:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.MechanismSparsityPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:548:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.MechanismSparsityPenalty.learnable
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:549:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "bool"
+gamfit.torch.penalties.MechanismSparsityPenalty.log_weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:551:18 - error: Type unknown for variable "gamfit.torch.penalties.MechanismSparsityPenalty.log_weight"
+gamfit.torch.penalties.MonotonicityPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.MonotonicityPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:417:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.MonotonicityPenalty.n_eff
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:418:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.penalties.MonotonicityPenalty.direction
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:419:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.MonotonicityPenalty.smoothing_eps
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:420:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.MonotonicityPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:421:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.MonotonicityPenalty.learnable
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:422:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "bool"
+gamfit.torch.penalties.MonotonicityPenalty.log_weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:424:18 - error: Type unknown for variable "gamfit.torch.penalties.MonotonicityPenalty.log_weight"
+gamfit.torch.penalties.RiemannianGradientDescent
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.penalties.SmoothThresholdPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.SmoothThresholdPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:726:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.SmoothThresholdPenalty.smoothing_eps
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:727:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.SmoothThresholdPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:728:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.SmoothThresholdPenalty.log_threshold
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:730:18 - error: Type unknown for variable "gamfit.torch.penalties.SmoothThresholdPenalty.log_threshold"
+gamfit.torch.interchange.InterchangeSwapDecoder
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.interchange.InterchangeSwapDecoder.W_dec
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/interchange.py:248:14 - error: Type unknown for variable "gamfit.torch.interchange.InterchangeSwapDecoder.W_dec"
+gamfit.torch.interchange.InterchangeSwapDecoder.gate
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/interchange.py:251:14 - error: Type unknown for variable "gamfit.torch.interchange.InterchangeSwapDecoder.gate"
+gamfit.torch.interchange.InterchangeSwapDecoder.bias
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/interchange.py:253:18 - error: Type unknown for variable "gamfit.torch.interchange.InterchangeSwapDecoder.bias"
+gamfit.torch.hyperbolic.PoincareAtoms
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.hyperbolic.PoincareAtoms.lorentz
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/hyperbolic.py:260:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "bool"
+gamfit.torch.hyperbolic.PoincareAtoms.atoms
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/hyperbolic.py:272:14 - error: Type unknown for variable "gamfit.torch.hyperbolic.PoincareAtoms.atoms"
+gamfit.torch.skip_transcoder
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:97:5 - error: Return type is partially unknown
+    Return type is "SkipAffineSmooth"
+gamfit.torch.skip_transcoder.SkipAffineSmooth
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.skip_transcoder.SkipAffineSmooth.in_dim
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:112:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.out_dim
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:113:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.n_atoms
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:114:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.rank_skip
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:115:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.W_enc
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:118:14 - error: Type unknown for variable "gamfit.torch.skip_transcoder.SkipAffineSmooth.W_enc"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.b_enc
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:119:14 - error: Type unknown for variable "gamfit.torch.skip_transcoder.SkipAffineSmooth.b_enc"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.W_dec
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:120:14 - error: Type unknown for variable "gamfit.torch.skip_transcoder.SkipAffineSmooth.W_dec"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.b_out
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:121:14 - error: Type unknown for variable "gamfit.torch.skip_transcoder.SkipAffineSmooth.b_out"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.skip_U
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:125:18 - error: Type unknown for variable "gamfit.torch.skip_transcoder.SkipAffineSmooth.skip_U"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.skip_V
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:128:18 - error: Type unknown for variable "gamfit.torch.skip_transcoder.SkipAffineSmooth.skip_V"
+gamfit.torch.skip_transcoder.SkipAffineSmooth.smooth_threshold
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:137:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "SmoothThresholdPenalty"
+gamfit.torch.skip_transcoder.SkipTranscoderCandidateFailed.__init__
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:400:9 - error: Type of parameter "failure" is partially unknown
+    Parameter type is "SkipTranscoderFailedCandidate"
+gamfit.torch.skip_transcoder.SkipTranscoderContinuousNonConvergence.__init__
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:411:9 - error: Type of parameter "profile" is partially unknown
+    Parameter type is "SkipTranscoderProfile"
+gamfit.torch.skip_transcoder.SkipTranscoderSelectionResult.smooth
+   error: Return type is partially unknown
+    Return type is "SkipAffineSmooth"
+gamfit.torch.select_skip_transcoder
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:96:5 - error: Return type is partially unknown
+    Return type is "SkipTranscoderSelectionResult"
+gamfit.torch.module.GAM
+   error: Type of metaclass unknown
+   error: Type of base class unknown
+gamfit.torch.distributed_reduce.TreeReducer.start_session
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/distributed_reduce.py:423:9 - error: Return type is partially unknown
+    Return type is "ReductionSession"
+gamfit.torch.distributed_reduce.ReductionSession.tree
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/distributed_reduce.py:447:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "ReductionTree"
+gamfit.torch.distributed_reduce.ReductionSession.rank_ids
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/distributed_reduce.py:448:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "tuple[int, ...]"
+gamfit.torch.distributed_reduce.ReductionSession.combine_id
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/distributed_reduce.py:449:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.distributed_reduce.ReductionSession.input_fingerprint
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/distributed_reduce.py:456:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.distributed_reduce.TreeReducer.tree
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/distributed_reduce.py:402:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "ReductionTree"
+gamfit.torch.distributed_reduce.TreeReducer.combine_id
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/distributed_reduce.py:415:18 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.HarmonicRoughnessPenalty
+   error: Type of metaclass unknown
+   error: Type of base class "gamfit.torch.penalties._RustPenaltyModule" is partially unknown
+gamfit.torch.penalties.HarmonicRoughnessPenalty.n_eff
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:495:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "int"
+gamfit.torch.penalties.HarmonicRoughnessPenalty.weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:496:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "float"
+gamfit.torch.penalties.HarmonicRoughnessPenalty.target
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:497:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "str"
+gamfit.torch.penalties.HarmonicRoughnessPenalty.learnable
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:498:14 - error: Type is missing type annotation and could be inferred differently by type checkers
+    Inferred type is "bool"
+gamfit.torch.penalties.HarmonicRoughnessPenalty.log_weight
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/penalties.py:500:18 - error: Type unknown for variable "gamfit.torch.penalties.HarmonicRoughnessPenalty.log_weight"
+gamfit.torch.skip_transcoder.skip_transcoder
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:273:5 - error: Return type is partially unknown
+    Return type is "SkipAffineSmooth"
+gamfit.torch.skip_transcoder.select_skip_transcoder
+  /tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/packaging/v313/lib/python3.13/site-packages/gamfit/torch/skip_transcoder.py:615:5 - error: Return type is partially unknown
+    Return type is "SkipTranscoderSelectionResult"
+
+Symbols exported by "gamfit": 1299
+  With known type: 1104
+  With ambiguous type: 98
+  With unknown type: 97
+    (Ignoring unknown types imported from other packages)
+
+Other symbols referenced but not exported by "gamfit": 1438
+  With known type: 1370
+  With ambiguous type: 54
+  With unknown type: 14
+
+Symbols without documentation:
+  Functions without docstring: 75
+  Functions without default param: 0
+  Classes without docstring: 18
+
+Type completeness score: 85%
+
+Completed in 18.731sec
+
