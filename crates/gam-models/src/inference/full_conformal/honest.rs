@@ -359,6 +359,8 @@ impl Affine {
 /// symmetric eigendecomposition. Affine quantities are in `z` (`c[0] + c[1]·z`).
 struct Basis {
     n: usize,
+    /// Coefficient count of the design.
+    p: usize,
     /// `ln s_k` for the penalized modes `k ∈ P`.
     ln_s: Vec<f64>,
     /// `τ_k(z) = t0_k + t1_k·z` for `k ∈ P`.
@@ -532,6 +534,7 @@ impl Basis {
         );
         Ok(Ok(Basis {
             n,
+            p,
             ln_s,
             tau,
             projection_residuals,
@@ -1389,7 +1392,9 @@ fn refit_at(basis: &Basis, data: &ChartData, s: f64, required: usize) -> RefitCh
             .ok_or_else(|| refuse(format!("{context}: penalized RSS not positive at ρ={rho}")))
     };
     let (lower, upper) = basis.domain;
+    // The augmented criterion carries the test point as one more row.
     let problem = OuterProblem::new(1)
+        .with_problem_size(basis.n + 1, basis.p)
         .with_gradient(Derivative::Analytic)
         .with_hessian(gam_problem::DeclaredHessianForm::Dense)
         .with_bounds(Array1::from_elem(1, lower), Array1::from_elem(1, upper));
