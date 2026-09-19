@@ -3955,7 +3955,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
 }
 
 #[test]
-fn parse_bounded_linear_term_defaults_to_no_prior() {
+fn parse_bounded_linear_term_defaults_to_shrinkage_prior() {
     let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1) + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
@@ -3970,7 +3970,7 @@ fn parse_bounded_linear_term_defaults_to_no_prior() {
             assert_eq!(name, "mu_hat");
             assert_eq!((*min, *max), (0.0, 1.0));
             match prior {
-                BoundedCoefficientPriorSpec::None => {}
+                BoundedCoefficientPriorSpec::Shrinkage => {}
                 other => panic!("unexpected prior: {other:?}"),
             }
             assert!(!*double_penalty);

@@ -1362,9 +1362,9 @@ fn non_intercept_linear_effects_default_to_null_recovery_with_explicit_opt_out()
         );
     }
 
-    // `bounded()` is an exact interval transform and likewise defaults to
-    // no shrinkage ridge. It also structurally rejects combining the
-    // interval geometry with `double_penalty`.
+    // `bounded()` is an exact interval transform: it recovers the null through
+    // its default latent shrinkage prior, not the double-penalty ridge, and it
+    // structurally rejects combining the interval geometry with `double_penalty`.
     let bounded_parsed =
         parse_formula("y ~ bounded(z, min=-2, max=2)").expect("parse bounded defaults");
     let mut bounded_notes = Vec::new();

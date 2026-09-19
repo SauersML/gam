@@ -310,22 +310,38 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     // `β_j -> β_j/c`, the quadratic functional is unchanged. Keeping each
     // term in its own one-column block also lets REML remove unsupported
     // effects independently instead of forcing unrelated slopes to share λ.
+    //
+    // A `bounded()` coefficient under the default shrinkage prior instead owns
+    // a unit ridge on its latent logit coordinate, centred at the null. The
+    // latent coordinate is dimensionless, so the unit scale carries no
+    // covariate units; the bounded fit applies this block in latent space.
     for (j, linear) in spec.linear_terms.iter().enumerate() {
-        let Some(function_mass) = linear_function_masses.get(j).copied().flatten() else {
-            continue;
+        let (mass, source) = match linear_function_masses.get(j).copied().flatten() {
+            Some(function_mass) => (function_mass, "LinearTermRidge"),
+            None if matches!(
+                linear.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded {
+                    prior: BoundedCoefficientPriorSpec::Shrinkage,
+                    ..
+                }
+            ) =>
+            {
+                (1.0, BOUNDED_SHRINKAGE_PENALTY_SOURCE)
+            }
+            None => continue,
         };
         let col = p_intercept + j;
         let global_index = penalties.len();
         penalties.push(BlockwisePenalty::new(
             col..(col + 1),
-            Array2::from_elem((1, 1), function_mass),
+            Array2::from_elem((1, 1), mass),
         ));
         nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: Some(linear.name.clone()),
             penalty: ActivePenaltyInfo {
-                source: PenaltySource::Other("LinearTermRidge".to_string()),
+                source: PenaltySource::Other(source.to_string()),
                 original_index: j,
                 effective_rank: 1,
                 normalization_scale: 1.0,
