@@ -16,8 +16,10 @@ The contract pinned here:
   — a finite, positive number no larger than the evaluation accuracy — never
   as a point value;
 * a null term's tail is resolved, and equals the evaluated corrected tail;
-* an estimated-scale statistic is scored on its own support, which starts
-  below zero, rather than clamped to zero.
+* a term shrunk to its null is not significant. An estimated-scale statistic
+  is scored on its own support, which starts below zero, rather than clamped
+  to zero; that is pinned exactly by the Rust test
+  `profiled_scale_reference_tests::a_statistic_between_the_offset_and_zero_is_scored_where_it_is`.
 
 Replicates are seeded `default_rng(1000 + rep)` over the pyGAM audit's
 inference cells (bench/pygam_audit; bench/pvalue_calibration/pv-lr-refit).
@@ -74,13 +76,18 @@ def test_poisson_tail_below_the_imhof_accuracy_is_a_bound_not_zero() -> None:
     assert null["p_value"] == null["p_value_corrected"]
 
 
-def test_gaussian_profiled_statistic_below_zero_is_scored_where_it_is() -> None:
-    # With an estimated scale `W = n·ln(1 + Q/V) + B` and `B < 0`: a null term
-    # REML shrinks away lands in `(B, 0)`. It used to be clamped to `W = 0`,
-    # which scored every such replicate as `P(W > 0)` instead of its own tail.
-    row = _rows("gaussian", 0)["s(x2)"]
-    assert row["statistic_lr"] < 0.0, row["statistic_lr"]
-    assert row["p_value"] is not None and 0.0 < row["p_value"] <= 1.0
+def test_gaussian_term_shrunk_to_its_null_is_not_significant() -> None:
+    # Replicate 427's `s(x2)` is shrunk to its penalty null space (`ref_df`
+    # ~3e-6). With an estimated scale `W = n·ln(1 + Q/V) + B`, `B < 0`, and
+    # the statistic used to be clamped to zero and published as `9.4e-16`; on
+    # its own support, against a reduced model refitted from scratch, it was
+    # still `9.0e-4`. The nested null at the full fit's `λ̂` leaves the
+    # constraint as the only difference between the two fits.
+    row = _rows("gaussian", 427)["s(x2)"]
+    assert row["p_value"] is not None and 0.5 < row["p_value"] <= 1.0, (
+        row["statistic_lr"],
+        row["p_value"],
+    )
     assert row["p_value"] == row["p_value_corrected"]
 
 
