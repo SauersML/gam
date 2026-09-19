@@ -658,6 +658,7 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
         .expect("build Matérn provenance fixture")
     };
     let collection = |basis| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {

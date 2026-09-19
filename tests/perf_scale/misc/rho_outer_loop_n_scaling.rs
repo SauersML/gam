@@ -124,6 +124,7 @@ fn spec_2d() -> TermCollectionSpec {
         // Two independent penalised smooths → a real 2-D ρ outer search over a
         // FIXED (θ-invariant) design: the cache-eligible regime.
         smooth_terms: vec![bspline_smooth("f_u", 0), bspline_smooth("f_v", 1)],
+        level: Default::default(),
     }
 }
 

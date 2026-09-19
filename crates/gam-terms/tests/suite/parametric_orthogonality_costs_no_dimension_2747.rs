@@ -191,6 +191,7 @@ fn a_kernel_smooth_is_orthogonal_to_the_intercept_and_keeps_its_width_2747() {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![curvature_term("curv")],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).expect("design builds");
     let block = block_of(&design, "curv");
@@ -250,6 +251,7 @@ fn a_dependent_smooth_is_orthogonal_to_its_owner_and_keeps_its_width_2747() {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![owner_spline_term("s(x1)"), curvature_term("curv")],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).expect("design builds");
     let owner = block_of(&design, "s(x1)");
@@ -267,6 +269,7 @@ fn a_dependent_smooth_is_orthogonal_to_its_owner_and_keeps_its_width_2747() {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![curvature_term("curv")],
+        level: Default::default(),
     };
     let alone_design = build_term_collection_design(data.view(), &alone).expect("design builds");
     assert_eq!(
@@ -285,6 +288,7 @@ fn an_overlapping_linear_term_is_orthogonalized_at_no_cost_2747() {
         linear_terms: vec![linear_term("x1", 0)],
         random_effect_terms: Vec::new(),
         smooth_terms: vec![curvature_term("curv")],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).expect("design builds");
     let block = block_of(&design, "curv");
@@ -300,6 +304,7 @@ fn an_overlapping_linear_term_is_orthogonalized_at_no_cost_2747() {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![curvature_term("curv")],
+        level: Default::default(),
     };
     let alone_design = build_term_collection_design(data.view(), &alone).expect("design builds");
     assert_eq!(
@@ -323,6 +328,7 @@ fn the_residualization_chart_replays_bit_for_bit_on_a_row_subset_2747() {
         linear_terms: vec![linear_term("x1", 0)],
         random_effect_terms: Vec::new(),
         smooth_terms: vec![owner_spline_term("s(x1)"), curvature_term("curv")],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).expect("design builds");
     let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
@@ -433,6 +439,7 @@ fn an_unfrozen_matern_smooth_is_orthogonalized_at_no_cost_2747() {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![matern],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).expect("design builds");
     let block = block_of(&design, "matern");

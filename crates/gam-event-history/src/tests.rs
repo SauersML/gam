@@ -984,6 +984,7 @@ fn linear_spec() -> TermCollectionSpec {
         }],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
@@ -3354,6 +3355,7 @@ fn intercept_only_spec() -> TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
