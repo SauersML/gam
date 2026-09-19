@@ -22,6 +22,7 @@ from sklearn.exceptions import DataConversionWarning, NotFittedError
 from sklearn.model_selection import cross_val_score
 from sklearn.utils.estimator_checks import parametrize_with_checks
 
+import gamfit
 from gamfit.sklearn import GAMClassifier, GAMRegressor
 
 CONTRACT_FORMULA = "x0 + x1"
@@ -59,17 +60,41 @@ def _classification_data(n: int = 300, seed: int = 0):
 # F7: sample_weight reaches the likelihood.
 
 
-def test_sample_weight_is_the_likelihood_prior_weight():
+def test_regressor_sample_weight_is_the_gaussian_prior_weight():
+    # A Gaussian prior weight is a precision, y_i ~ N(mu_i, phi / w_i), exactly
+    # gamfit.fit's `weights=` column. It is not a replication count: a weight-k
+    # row carries one -1/2 log(phi) where k copies carry k, so the profiled
+    # scale (and with it the REML smoothing parameter) depends on the row count.
     X, y = _regression_data()
-    rng = np.random.default_rng(1)
-    w = rng.integers(0, 4, size=y.size).astype(float)
+    w = np.random.default_rng(1).uniform(0.25, 3.0, size=y.size)
     weighted = GAMRegressor(formula=CONTRACT_FORMULA).fit(X, y, sample_weight=w)
-    repeated = GAMRegressor(formula=CONTRACT_FORMULA).fit(
-        np.repeat(X, w.astype(int), axis=0), np.repeat(y, w.astype(int))
+    direct = gamfit.fit(
+        {"x0": X[:, 0], "x1": X[:, 1], "y": y, "w": w}, "y ~ x0 + x1", weights="w"
+    )
+    np.testing.assert_allclose(
+        weighted.predict(X), direct.predict({"x0": X[:, 0], "x1": X[:, 1]}), rtol=1e-12
     )
     unweighted = GAMRegressor(formula=CONTRACT_FORMULA).fit(X, y)
-    np.testing.assert_allclose(weighted.predict(X), repeated.predict(X), rtol=1e-7, atol=1e-9)
     assert not np.allclose(weighted.predict(X), unweighted.predict(X))
+
+
+def test_classifier_integer_sample_weight_equals_repeated_rows():
+    # The Bernoulli likelihood has unit scale and no normalizer, so a weight-k
+    # row is exactly k copies of it: same likelihood, Fisher information and
+    # REML criterion, hence the same fit.
+    X, y = _classification_data()
+    w = np.random.default_rng(1).integers(0, 4, size=y.size)
+    weighted = GAMClassifier(formula=CONTRACT_FORMULA, family="binomial").fit(
+        X, y, sample_weight=w.astype(float)
+    )
+    repeated = GAMClassifier(formula=CONTRACT_FORMULA, family="binomial").fit(
+        np.repeat(X, w, axis=0), np.repeat(y, w)
+    )
+    unweighted = GAMClassifier(formula=CONTRACT_FORMULA, family="binomial").fit(X, y)
+    # Both fits solve the same REML problem in rho; they differ only in where
+    # each outer search stops inside its certified-stationary band.
+    np.testing.assert_allclose(weighted.predict_proba(X), repeated.predict_proba(X), atol=1e-5)
+    assert not np.allclose(weighted.predict_proba(X), unweighted.predict_proba(X))
 
 
 def test_sample_weight_routes_through_cross_val_score_params():

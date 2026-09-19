@@ -147,7 +147,11 @@ The estimators follow the scikit-learn estimator contract and pass
   against a one-column array) is a `ValueError` naming the column and the
   features `X` has.
 - `sample_weight` must be non-negative, one weight per row, and contain at
-  least one non-zero weight.
+  least one non-zero weight. It is the likelihood's prior weight, the same as
+  `gamfit.fit(..., weights=...)`, and may be fractional. For the binomial
+  classifier an integer weight `k` is exactly `k` repeated rows. For a
+  Gaussian regressor it is a precision (`y_i ~ N(mu_i, phi / w_i)`), so the
+  REML scale estimate counts rows, not the weight total.
 - A column-vector `y` of shape `(n, 1)` is ravelled with a
   `DataConversionWarning`; methods called before `fit` raise
   `NotFittedError`.
