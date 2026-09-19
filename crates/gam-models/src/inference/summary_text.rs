@@ -407,7 +407,37 @@ mod tests {
     #[test]
     fn a_fixed_small_model_renders_the_golden_text() {
         let golden = "\
-GOLDEN";
+Family: Gaussian Identity
+Link function: identity
+Formula: y ~ x1 + s(x2)
+Model class: standard
+n: 100
+
+Parametric coefficients:
+           Estimate  Std. Error  t value  Pr(>|t|)
+Intercept       1.5        0.05       30   < 2e-16  ***
+x1            -0.25       0.125       -2    0.0484  *
+
+Approximate significance of smooth terms:
+         edf  Ref.df        F  p-value       lambda
+s(x2)  4.875       9  4.57778  3.10e-7  ***  0.0125
+
+---
+Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Deviance: 23.5
+Null deviance: 94
+Deviance explained: 75%
+Adjusted R-squared: 0.7384
+Scale estimate: 0.2525
+REML score: 81.75
+Log-likelihood: -70.125
+Conditional AIC: 155.5
+Corrected AIC: 157.25
+Effective dof: 6.875
+Coefficient covariance: smoothing-corrected
+Convergence: certified; inner P-IRLS converged; 7 outer iterations; analytic_gradient stationarity: projected gradient 1.5e-09 <= bound 1e-06; Hessian positive semidefinite
+";
         assert_eq!(render_summary_text(&fixed_small_model()), golden);
     }
 
