@@ -247,7 +247,7 @@ pub(crate) struct CrosscoderArgs {
 #[derive(Args, Debug)]
 pub(crate) struct ParameterDecompositionArgs {
     /// Versioned `gam.mpd-request` JSON document: the same bytes
-    /// `gamfit.run_parameter_decomposition` sends.
+    /// `gamfit.sae.run_parameter_decomposition` sends.
     #[arg(long, value_name = "REQUEST.json")]
     pub(crate) request: PathBuf,
 
@@ -303,7 +303,6 @@ pub(crate) struct FitArgs {
             "sigma_time_k",
             "slope_time_k",
             "scale_dimensions",
-            "persistent_warm_start_root"
         ]
     )]
     pub(crate) request: Option<PathBuf>,
@@ -439,10 +438,6 @@ pub(crate) struct FitArgs {
     /// `scale_dims=true` / `scale_dims=false`, which overrides this global flag.
     #[arg(long = "scale-dimensions", default_value_t = false)]
     pub(crate) scale_dimensions: bool,
-    /// Opt in to cross-process warm starts at this exact root. Omit to keep the
-    /// fit disk-silent; no ambient temp/cache path is used.
-    #[arg(long = "persistent-warm-start-root", value_name = "DIR")]
-    pub(crate) persistent_warm_start_root: Option<PathBuf>,
     #[arg(long = "out", required = true)]
     pub(crate) out: Option<PathBuf>,
 }

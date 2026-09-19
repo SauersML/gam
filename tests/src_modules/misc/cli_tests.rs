@@ -1122,7 +1122,6 @@ fn location_scale_fit_args(
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(out),
     }
 }
@@ -1201,7 +1200,6 @@ fn cli_fit_request_replaces_formula_and_scientific_flags() {
         vec!["y ~ x"],
         vec!["--family", "auto"],
         vec!["--transformation-normal"],
-        vec!["--persistent-warm-start-root", "caller-owned/warm"],
     ] {
         let mut argv = vec![
             "gam",
@@ -1220,26 +1218,24 @@ fn cli_fit_request_replaces_formula_and_scientific_flags() {
     }
 }
 
+/// The on-disk warm-start root is a cache directory, not a model input, so
+/// `gam fit` takes no flag for it (PKG-11); the fit stays disk-silent.
 #[test]
-fn cli_persistent_warm_start_root_is_explicit_and_preserved_exactly_2639() {
-    let cli = Cli::try_parse_from([
+fn cli_fit_has_no_persistent_warm_start_root_flag() {
+    let error = Cli::try_parse_from([
         "gam",
         "fit",
         "train.csv",
         "y ~ x",
         "--persistent-warm-start-root",
-        "caller-owned/../warm",
+        "warm",
         "--out",
         "model.json",
     ])
-    .expect("an explicit persistent warm-start root should parse");
-    let Command::Fit(args) = cli.command else {
-        panic!("expected fit command");
-    };
-    assert_eq!(
-        args.persistent_warm_start_root,
-        Some(PathBuf::from("caller-owned/../warm")),
-        "the CLI must not canonicalize or relocate the requested root"
+    .expect_err("the removed cache flag must not parse");
+    assert!(
+        error.to_string().contains("persistent-warm-start-root"),
+        "{error}"
     );
 }
 
@@ -1534,7 +1530,6 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -1663,7 +1658,6 @@ fn cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -1750,7 +1744,6 @@ fn cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2260,7 +2253,6 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2507,7 +2499,6 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2611,7 +2602,6 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(td.path().join("model.json")),
     })
     .expect_err("main formula should reject z-column reuse");
@@ -2656,7 +2646,6 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(td.path().join("model.json")),
     })
     .expect_err("slope formula should reject z-column reuse");
@@ -3131,7 +3120,6 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit should succeed", e));
@@ -3269,7 +3257,6 @@ fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(out),
     }
 }
@@ -3416,7 +3403,6 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        persistent_warm_start_root: None,
         out: Some(model_path.clone()),
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "Firth fit should succeed", e));

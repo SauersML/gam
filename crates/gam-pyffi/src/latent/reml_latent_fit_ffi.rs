@@ -791,10 +791,7 @@ fn glm_reml_fit_latent<'py>(
         .transpose()
         .map_err(py_value_error)?;
     if y_values.ncols() > 1
-        || matches!(
-            family_normalized.as_str(),
-            "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
-        )
+        || gam::families::fit_orchestration::is_multinomial_family_name(&family_normalized)
     {
         // Per-row Fisher-block override is now threaded through the
         // multi-output canonical fitters (issue #349): the multinomial path
@@ -4528,17 +4525,17 @@ fn gaussian_prediction_scores_from_predictions(
     Ok(out.unbind())
 }
 
-#[pyfunction]
+#[pyfunction(signature = (observed, predicted_mean, null_mean = None))]
 fn classification_metrics(
     py: Python<'_>,
     observed: Vec<f64>,
     predicted_mean: Vec<f64>,
-    train_prev: f64,
+    null_mean: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let metrics = gam::inference::diagnostics::classification_metrics_from_predictions(
         &observed,
         &predicted_mean,
-        train_prev,
+        null_mean,
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);

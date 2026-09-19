@@ -106,7 +106,7 @@ def main() -> int:
         if args.assignment == "topk":
             kw["top_k"] = 1
         try:
-            rep = gamfit.sae_manifold_certify_external(
+            rep = gamfit.sae.sae_manifold_certify_external(
                 np.ascontiguousarray(X), **kw)
             ik = rep.get("inner_kkt") or {}
             raw, bound = ik.get("raw_gradient_norm"), ik.get("stationarity_bound")

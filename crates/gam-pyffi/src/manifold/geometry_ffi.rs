@@ -4507,7 +4507,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // the classes here makes them addressable as `gam._rust.GamError`,
     // `gam._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
     // re-exports each one under its public `gamfit.*` name so the class
-    // identity caught by `pytest.raises(gamfit.RemlConvergenceError)`
+    // identity caught by `pytest.raises(gamfit.errors.RemlConvergenceError)`
     // and constructed by `RemlConvergenceError::new_err(...)` on the
     // Rust side is exactly the same object.
     module.add("GamError", module.py().get_type::<GamError>())?;
@@ -4749,7 +4749,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyEncodedTable>()?;
     module.add_function(wrap_pyfunction!(sae_observe_atlas_topology, module)?)?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
-    module.add_function(wrap_pyfunction!(fit_multinomial_formula_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(
         predict_multinomial_formula_pyfunc,
         module
@@ -4811,6 +4810,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
+    module.add_function(wrap_pyfunction!(is_multinomial_family_name, module)?)?;
     module.add("RESPONSE_GEOMETRY_SCHEMA", RESPONSE_GEOMETRY_SCHEMA)?;
     module.add_function(wrap_pyfunction!(saved_model_class_traits, module)?)?;
     module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
@@ -4897,8 +4897,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sphere_basis_jet_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_hessian, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve_basis_locations_1d, module)?)?;
     module.add_function(wrap_pyfunction!(_block_diag, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;

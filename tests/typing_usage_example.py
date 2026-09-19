@@ -19,7 +19,7 @@ import gamfit
 
 def fit_save_load_predict(data: dict[str, list[float]], path: Path) -> Any:
     model: gamfit.Model = gamfit.fit(data, "y ~ s(x)")
-    summary: gamfit.Summary = model.summary()
+    summary: gamfit.results.Summary = model.summary()
     formula: str = summary.formula
     assert formula
     model.save(path)
@@ -48,7 +48,7 @@ def multinomial(data: dict[str, list[Any]]) -> NDArray[np.float64]:
 
 
 def atom_shape(coords: NDArray[np.float64]) -> dict[Any, Any]:
-    return gamfit.adjudicate_atom_shape(coords, folds=5, seed=0)
+    return gamfit.sae.adjudicate_atom_shape(coords, folds=5, seed=0)
 
 
 def compiled_version() -> str:

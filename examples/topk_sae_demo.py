@@ -15,7 +15,7 @@ def main() -> None:
     atom_b = np.c_[0.2 * np.sin(3.0 * t), np.cos(0.5 * t), np.sin(0.5 * t)]
     x = np.where((np.arange(n) % 3 == 0)[:, None], atom_a, atom_b)
     x += 0.04 * rng.standard_normal(x.shape)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         x,
         K=4,
         d_atom=2,

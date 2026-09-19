@@ -252,7 +252,7 @@ impl TermBuilderError {
 
 /// Resolve a bare column name to its index, returning a typed
 /// `DataError::ColumnNotFound` on miss so the FFI boundary can surface a
-/// structured `gamfit.ColumnNotFoundError(column=…, available=…)` rather
+/// structured `gamfit.errors.ColumnNotFoundError(column=…, available=…)` rather
 /// than rely on string-classification of human prose. Internal callers that
 /// still flow `Result<_, String>` get byte-identical text via
 /// `From<DataError> for String`.
