@@ -125,7 +125,7 @@ pub fn build_bspline_basis_1d(
     let periodic_build = match &spec.knotspec {
         BSplineKnotSpec::PeriodicUniform {
             data_range,
-            num_basis,
+            num_basis, ..
         } => {
             if let Some((boundary_start, boundary_end, _)) = spec.boundary.period() {
                 let scale = (boundary_end - boundary_start).abs().max(1.0);

@@ -2,6 +2,8 @@ use super::*;
 use gam_linalg::matrix::LinearOperator;
 use gam_problem::FailureCategory;
 use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
+use crate::inference::model_payload_builders::standard_fit_comparable_reml_score;
+use gam_terms::smooth::AdaptiveResolution;
 
 /// Request-specific inputs to the canonical standard-fit `FitOptions`.
 ///
@@ -1183,8 +1185,7 @@ fn deterministic_gaussian_standard_fit(
         design,
         resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms: adaptive_spatial_term_mask(&request.spec),
-        adaptive_spatial_center_counts: adaptive_spatial_center_counts(&request.spec),
+        adaptive_bases: adaptive_bases(&request.spec),
         kappa_timing: None,
         saved_link_state: gam_solve::estimate::FittedLinkState::Standard(None),
         wiggle_knots: None,
@@ -1758,7 +1759,7 @@ fn fit_expanded_formula_with_notes(
     // `materialize()` callers receive the ordinary fully provisioned basis;
     // activating the structural start without an owner would strand them in an
     // under-resolved function space.
-    config.spatial_center_counts = Some(Vec::new());
+    config.adaptive_resolution = Some(Vec::new());
     let current = fit_from_formula_once_with_notes(formula, data, &config)?;
     finish_adaptive_spatial_fit(formula, data, config, current)
 }
@@ -1783,7 +1784,7 @@ pub(crate) fn fit_materialized_standard_with_notes(
         .clone()
         .resolve()
         .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
-    config.spatial_center_counts = Some(Vec::new());
+    config.adaptive_resolution = Some(Vec::new());
     let current = fit_materialized_once_with_notes(MaterializedModel {
         request: FitRequest::Standard(request),
         inference_notes,
@@ -1793,137 +1794,296 @@ pub(crate) fn fit_materialized_standard_with_notes(
     finish_adaptive_spatial_fit(formula, data, config, current)
 }
 
+/// Grow every formula-default smooth basis until the converged fit's own
+/// evidence stops paying for more resolution (#1689, #3078).
+///
+/// Each round reads two signals per adaptive term from the converged fit: EDF
+/// saturation (λ at its floor, the penalized capacity used up) and the #2774
+/// lack-of-fit score test (residual structure the basis cannot represent while
+/// λ still binds). A term with either signal proposes one level of nested
+/// refinement, bounded by what its covariate support can identify and by the
+/// design rank. The refit is accepted only when it raises the marginal
+/// likelihood: the null-space-normalized REML/LAML score is the model evidence
+/// of the penalized basis, so a larger basis that merely lets the prior absorb
+/// noise is rejected and the smaller fit stands.
 fn finish_adaptive_spatial_fit(
     formula: &str,
     data: &Dataset,
     mut config: FitConfig,
     mut current: FormulaFitResult,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    // Saturation, and the evidence margin below, are read at the same
+    // outer-optimization tolerance that certified the formula fit.
+    // `canonical_standard_fit_options` is the single policy source for that
+    // tolerance, so the decision cannot drift between the CLI and library
+    // entry points.
+    let resolution_tol =
+        canonical_standard_fit_options(&config, StandardFitOptionsInputs::default()).tol;
     loop {
         let Some(current_standard) = standard_result(&current) else {
             return Ok(current);
         };
-        // Saturation is assessed at the same outer-optimization tolerance that
-        // certified this formula fit. `canonical_standard_fit_options` is the
-        // single policy source for that tolerance, so the expansion decision
-        // cannot drift between the CLI and library entry points.
-        let standard_options =
-            canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
-        let resolution_tol = standard_options.tol;
-        let candidates = adaptive_spatial_candidates(current_standard, data, resolution_tol)?;
-        if candidates.is_empty() {
+        let refinements = adaptive_refinements(current_standard, data, resolution_tol)?;
+        if refinements.is_empty() {
             return Ok(current);
         }
+        let Some(current_score) = standard_fit_comparable_reml_score(current_standard)
+            .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?
+        else {
+            // A fit without a marginal likelihood carries no evidence to
+            // compare a refinement against.
+            return Ok(current);
+        };
+        let term_count = current_standard.adaptive_bases.len();
 
-        // Grow one under-resolved term at a time in stable formula order. The
-        // next loop iteration re-fits and re-measures every term, so
-        // interactions between smooths are handled from a converged joint
-        // optimum instead of applying several decisions made against stale
-        // evidence.
-        let term_count = candidates.term_count;
-        let candidate = candidates
-            .terms
-            .into_iter()
-            .next()
-            .expect("non-empty adaptive candidate set");
-        // Expansion is mandatory once a certified fit is under-resolved, so the
-        // old design/covariance can be released before constructing the larger
-        // one. Keeping both complete fits alive would make adaptive resolution
-        // itself an avoidable peak-memory multiplier.
-        drop(current);
-        let mut candidate_config = config.clone();
-        let center_counts = candidate_config
-            .spatial_center_counts
-            .get_or_insert_with(Vec::new);
-        if center_counts.len() < term_count {
-            center_counts.resize(term_count, None);
+        // Every signalling term is refined jointly, so smooths that share
+        // structure grow from one converged optimum. When the joint refit does
+        // not pay, one term's spurious screen may be masking another's real
+        // gain; each refinement is then tried alone, in formula order.
+        let mut attempts = vec![refinements.iter().collect::<Vec<_>>()];
+        if refinements.len() > 1 {
+            attempts.extend(refinements.iter().map(|refinement| vec![refinement]));
         }
-        center_counts[candidate.term_index] = Some(candidate.proposed_centers);
-        let candidate_outcome = fit_from_formula_once_with_notes(formula, data, &candidate_config)
-            .map_err(|error| WorkflowError::SpatialUnderresolved {
-                term: candidate.term_name.clone(),
-                current_centers: candidate.current_centers,
-                attempted_centers: candidate.proposed_centers,
-                reason: error.to_string(),
-                refit_failure: Some(Box::new(error)),
-            })?;
-        if standard_result(&candidate_outcome).is_none() {
-            return Err(WorkflowError::SpatialUnderresolved {
-                term: candidate.term_name.clone(),
-                current_centers: candidate.current_centers,
-                attempted_centers: candidate.proposed_centers,
-                reason: "the certification refit changed estimator representation".to_string(),
-                refit_failure: None,
-            });
+        let mut accepted = None;
+        for attempt in attempts {
+            let candidate_config = config_with_refinements(&config, term_count, &attempt);
+            let candidate = fit_from_formula_once_with_notes(formula, data, &candidate_config)
+                .map_err(|error| refinement_failure(&attempt, error.to_string(), Some(error)))?;
+            let Some(candidate_standard) = standard_result(&candidate) else {
+                return Err(refinement_failure(
+                    &attempt,
+                    "the refinement refit changed estimator representation".to_string(),
+                    None,
+                ));
+            };
+            let candidate_score = standard_fit_comparable_reml_score(candidate_standard)
+                .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?;
+            if candidate_score
+                .is_some_and(|score| evidence_improves(current_score, score, resolution_tol))
+            {
+                accepted = Some((candidate_config, candidate));
+                break;
+            }
         }
-
-        // The current fit was under-resolved; once the larger fit is certified
-        // it is the estimator state to resume from. Comparing raw REML/LAML
-        // values across different center charts is not a valid rejection gate
-        // (and a strict `<` accepts numerical noise), so resolution growth is
-        // controlled solely by the next converged fit's own saturation and
-        // lack-of-fit evidence.
-        config = candidate_config;
-        current = candidate_outcome;
+        match accepted {
+            Some((candidate_config, candidate)) => {
+                config = candidate_config;
+                current = candidate;
+            }
+            None => return Ok(current),
+        }
     }
 }
 
-struct AdaptiveSpatialCandidates {
+/// Whether a refit's comparable REML/LAML score (lower is better) beats the
+/// current one by more than the outer optimizer's own convergence tolerance,
+/// so optimizer noise is never read as evidence.
+fn evidence_improves(current: f64, candidate: f64, tol: f64) -> bool {
+    candidate < current - tol * (1.0 + current.abs())
+}
+
+fn config_with_refinements(
+    config: &FitConfig,
     term_count: usize,
-    terms: Vec<AdaptiveSpatialCandidate>,
+    refinements: &[&AdaptiveRefinement],
+) -> FitConfig {
+    let mut candidate = config.clone();
+    let plan = candidate.adaptive_resolution.get_or_insert_with(Vec::new);
+    if plan.len() < term_count {
+        plan.resize(term_count, None);
+    }
+    for refinement in refinements {
+        plan[refinement.term_index] = Some(refinement.proposed.clone());
+    }
+    candidate
 }
 
-impl AdaptiveSpatialCandidates {
-    fn is_empty(&self) -> bool {
-        self.terms.is_empty()
+fn refinement_failure(
+    refinements: &[&AdaptiveRefinement],
+    reason: String,
+    refit_failure: Option<WorkflowError>,
+) -> WorkflowError {
+    let join = |part: &dyn Fn(&AdaptiveRefinement) -> String| {
+        refinements
+            .iter()
+            .map(|refinement| part(refinement))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    WorkflowError::SpatialUnderresolved {
+        term: join(&|refinement| refinement.term_name.clone()),
+        current_resolution: join(&|refinement| refinement.current.to_string()),
+        attempted_resolution: join(&|refinement| refinement.proposed.to_string()),
+        reason,
+        refit_failure: refit_failure.map(Box::new),
     }
 }
 
-struct AdaptiveSpatialCandidate {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdaptiveRefinement {
     term_index: usize,
     term_name: String,
-    current_centers: usize,
-    proposed_centers: usize,
+    current: AdaptiveResolution,
+    proposed: AdaptiveResolution,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdaptiveCenterDecision {
-    Certified,
-    Expand(usize),
-    Exhausted,
-}
-
-/// Decide one adaptive spatial term's resolution from its converged fit.
-///
-/// Two pieces of evidence say the realized basis is too small. EDF saturation
-/// fires once λ has been driven to its floor and the penalized capacity is used
-/// up. The #2774 lack-of-fit score test (`lacks_fit`) fires while λ still binds,
-/// where saturation is blind: REML trades basis size against λ, so a basis that
-/// is far too small can sit below its algebraic ceiling while the residuals keep
-/// structure it cannot represent. Either one grows the basis.
-///
-/// Only saturation at the validated ceiling is exhaustion. A lack-of-fit verdict
-/// at the ceiling leaves the fit certified with its fit-time advisory, since
-/// growing past the validated default is not this loop's to do.
-fn adaptive_center_decision(
-    current_centers: usize,
-    ceiling_centers: usize,
+/// A refinement one term's evidence asks for, before the design rank is shared
+/// out between the terms asking.
+#[derive(Clone, Debug)]
+struct RefinementRequest {
+    refinement: AdaptiveRefinement,
+    saturated: bool,
     edf: f64,
-    realized_width: usize,
-    nullspace_dim: usize,
-    resolution_tol: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdaptiveTermDecision {
+    Certified,
+    Refine(AdaptiveResolution),
+}
+
+/// Decide one adaptive term's next resolution from its converged fit.
+///
+/// Without saturation or lack of fit the basis is certified. Otherwise the
+/// proposal is one level of nested refinement bounded by the covariate
+/// support. A basis already at its support bound spans every function the
+/// observed covariate values can identify, so there is nothing larger to
+/// resolve and it is certified as well.
+fn adaptive_term_decision(
+    current: &AdaptiveResolution,
+    refined: &AdaptiveResolution,
+    support: &AdaptiveResolution,
+    saturated: bool,
     lacks_fit: bool,
-) -> AdaptiveCenterDecision {
-    let saturated =
-        gam_terms::basis::basis_is_saturated(edf, realized_width, nullspace_dim, resolution_tol);
+) -> AdaptiveTermDecision {
     if !saturated && !lacks_fit {
-        return AdaptiveCenterDecision::Certified;
+        return AdaptiveTermDecision::Certified;
     }
-    match gam_terms::basis::expanded_num_centers(current_centers, ceiling_centers) {
-        Some(proposed) => AdaptiveCenterDecision::Expand(proposed),
-        None if saturated => AdaptiveCenterDecision::Exhausted,
-        None => AdaptiveCenterDecision::Certified,
+    let proposed = refined.clamped(support, current);
+    if proposed.exceeds(current) {
+        AdaptiveTermDecision::Refine(proposed)
+    } else {
+        AdaptiveTermDecision::Certified
     }
+}
+
+/// Whether a lack-of-fit row's enrichment explains more deviance than its
+/// parameters cost. The score statistic is the local approximation of the
+/// deviance the `rank` enrichment directions would remove, and each added
+/// parameter costs two units of deviance in expected predictive loss (AIC).
+/// This is a screen for which terms to refit, not a verdict: the refit's REML
+/// evidence decides.
+fn enrichment_pays_for_itself(row: &crate::fit_orchestration::drivers::BasisAdequacyRow) -> bool {
+    match (row.statistic, row.enrichment_rank) {
+        (Some(statistic), Some(rank)) if rank > 0 => statistic > 2.0 * rank as f64,
+        _ => false,
+    }
+}
+
+/// The smallest nested refinement of `current` that adds at least
+/// `directions` coefficients, within `support`, and never less than one level.
+///
+/// The lack-of-fit screen finds its evidence in a `directions`-dimensional
+/// alternative, so a smaller refinement can miss that structure entirely: a
+/// harmonic basis is orthogonal across degrees, so a degree-8 signal is
+/// invisible to every span below degree 8 and a one-level step shows no
+/// evidence gain. The refit's REML evidence still decides whether the larger
+/// basis is kept.
+fn refinement_spanning(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    values: ndarray::ArrayView2<'_, f64>,
+    current: &AdaptiveResolution,
+    support: &AdaptiveResolution,
+    directions: usize,
+) -> AdaptiveResolution {
+    let width =
+        |resolution: &AdaptiveResolution| {
+            gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
+        };
+    let base = width(current);
+    let mut target = gam_terms::smooth::refined_adaptive_resolution(basis, current);
+    while width(&target).saturating_sub(base) < directions {
+        let next = gam_terms::smooth::refined_adaptive_resolution(basis, &target)
+            .clamped(support, current);
+        if !next.exceeds(&target) {
+            break;
+        }
+        target = next;
+    }
+    target
+}
+
+/// Share the design's residual rank between the requested refinements in
+/// formula order, so the refit keeps at least one residual degree of freedom
+/// (a `p >= n` design is not identified by the data, and the REML surface is
+/// flat along directions the data never see).
+///
+/// `width(term_index, resolution)` is the raw coefficient width a term realizes
+/// at `resolution`. A request that does not fit whole is shortened to the
+/// furthest point on its monotone refinement path that does. A saturated term
+/// that cannot take even one step with the round's whole residual rank is
+/// under-resolved with no identifiable refinement left: that is a typed error,
+/// never a silent certification. A term that only lost the rank to an earlier
+/// one is reconsidered in the next round.
+fn fit_refinements_to_rank(
+    requests: Vec<RefinementRequest>,
+    spare_rank: usize,
+    width: impl Fn(usize, &AdaptiveResolution) -> usize,
+) -> Result<Vec<AdaptiveRefinement>, WorkflowError> {
+    let mut remaining = spare_rank;
+    let mut accepted = Vec::new();
+    for request in requests {
+        let RefinementRequest {
+            refinement,
+            saturated,
+            edf,
+        } = request;
+        let base = width(refinement.term_index, &refinement.current);
+        let cost = |step: usize| {
+            width(
+                refinement.term_index,
+                &refinement.current.toward(&refinement.proposed, step),
+            )
+            .saturating_sub(base)
+        };
+        let steps = refinement.current.steps_to(&refinement.proposed);
+        // `width` is monotone along the path, so the furthest affordable
+        // step is found by bisection.
+        let (mut lo, mut hi) = (0, steps);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if cost(mid) <= remaining {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if lo == 0 {
+            if saturated && steps > 0 && cost(1) > spare_rank {
+                let attempted = refinement.current.toward(&refinement.proposed, 1);
+                return Err(WorkflowError::SpatialUnderresolved {
+                    term: refinement.term_name,
+                    current_resolution: refinement.current.to_string(),
+                    attempted_resolution: attempted.to_string(),
+                    reason: format!(
+                        "term EDF {edf:.6} saturates its realized basis, and the smallest \
+                         refinement adds {} coefficients to a design with {spare_rank} residual \
+                         degrees of freedom",
+                        cost(1)
+                    ),
+                    refit_failure: None,
+                });
+            }
+            continue;
+        }
+        remaining -= cost(lo);
+        let proposed = refinement.current.toward(&refinement.proposed, lo);
+        accepted.push(AdaptiveRefinement {
+            proposed,
+            ..refinement
+        });
+    }
+    Ok(accepted)
 }
 
 fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
@@ -1933,265 +2093,281 @@ fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
     }
 }
 
-/// The largest internal-knot count the adaptive loop may give a formula-default
-/// open B-spline `s(x)` of `degree` on `column`, starting from `current_knots`
-/// in a model that already realizes `model_coefficients` columns on `n_rows`
-/// rows. Two identifiability bounds, no tuning constant:
-///
-/// * **Data support.** A degree-`d` spline with `K` internal knots has
-///   `K + d + 1` coefficients, and a function observed at `u` distinct
-///   covariate values has at most `u` identifiable values; the interpolating
-///   (smoothing-spline) limit is `K + d + 1 = u`. This also keeps every quantile
-///   knot on its own distinct interior value (`u - d - 1 <= u - 2`).
-/// * **Design rank.** Growing the term must leave the whole model with fewer
-///   coefficients than rows (at least one residual degree of freedom): a
-///   `p >= n` design is not identified by the data at all, and in that regime
-///   the double-penalty REML surface is flat along directions the data never
-///   see.
-///
-/// Never below `current_knots`, so an already-resolved basis is never shrunk.
-fn adaptive_bspline_knot_ceiling(
-    column: ndarray::ArrayView1<'_, f64>,
-    degree: usize,
-    current_knots: usize,
-    model_coefficients: usize,
-    n_rows: usize,
-) -> usize {
-    let mut distinct: Vec<f64> = column.iter().copied().filter(|v| v.is_finite()).collect();
-    distinct.sort_by(f64::total_cmp);
-    distinct.dedup();
-    let support_knots = distinct.len().saturating_sub(degree + 1);
-    let spare_rank = n_rows.saturating_sub(1).saturating_sub(model_coefficients);
-    let rank_knots = current_knots.saturating_add(spare_rank);
-    support_knots.min(rank_knots).max(current_knots)
-}
-
-fn adaptive_spatial_candidates(
+/// The refinements the converged `result` asks for, already fitted to the
+/// design rank.
+fn adaptive_refinements(
     result: &StandardFitResult,
     data: &Dataset,
     resolution_tol: f64,
-) -> Result<AdaptiveSpatialCandidates, WorkflowError> {
-    let n_rows = data.values.nrows();
+) -> Result<Vec<AdaptiveRefinement>, WorkflowError> {
     let term_count = result.resolvedspec.smooth_terms.len();
-    if result.adaptive_spatial_terms.len() != term_count
-        || result.adaptive_spatial_center_counts.len() != term_count
-        || result.design.smooth.terms.len() != term_count
+    if result.adaptive_bases.len() != term_count || result.design.smooth.terms.len() != term_count
     {
         return Err(raised_fit_failure(
             FailureCategory::Invariant,
             format!(
-                "adaptive spatial provenance mismatch: resolved terms={term_count}, mask={}, \
-                 requested counts={}, realized terms={}",
-                result.adaptive_spatial_terms.len(),
-                result.adaptive_spatial_center_counts.len(),
+                "adaptive resolution provenance mismatch: resolved terms={term_count}, \
+                 adaptive bases={}, realized terms={}",
+                result.adaptive_bases.len(),
                 result.design.smooth.terms.len(),
             ),
         ));
     }
-
+    let values = data.values.view();
     let smooth_offset = result
         .design
         .design
         .ncols()
         .saturating_sub(result.design.smooth.total_smooth_cols());
-    // The #2774 lack-of-fit verdict this fit already carries, read at the same
-    // family-wise level as its fit-time note.
-    let lacking_fit: Vec<usize> =
-        crate::fit_orchestration::drivers::basis_adequacy_rows_lacking_fit(&result.basis_adequacy)
-            .map(|row| row.term_idx)
-            .collect();
-    let mut candidates = Vec::new();
-    for term_index in 0..term_count {
+    let mut requests = Vec::new();
+    for (term_index, basis) in result.adaptive_bases.iter().enumerate() {
+        let Some(basis) = basis else {
+            continue;
+        };
+        let term_name = &result.resolvedspec.smooth_terms[term_index].name;
+        let invariant = |what: &str| {
+            raised_fit_failure(
+                FailureCategory::Invariant,
+                format!("adaptive smooth term '{term_name}' {what}"),
+            )
+        };
+        let current = gam_terms::smooth::adaptive_resolution_of(basis)
+            .ok_or_else(|| invariant("lost its adaptive provenance"))?;
+        let support = gam_terms::smooth::adaptive_resolution_support(basis, values)
+            .ok_or_else(|| invariant("references covariates the data does not carry"))?;
         let realized = &result.design.smooth.terms[term_index];
-        if result.adaptive_spatial_terms[term_index]
-            && let Some(current_centers) = result.adaptive_spatial_center_counts[term_index]
+        let penalty_range = result
+            .design
+            .smooth_term_penalty_range(term_index)
+            .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?
+            .ok_or_else(|| invariant("emitted no penalty block"))?;
+        let global_range =
+            (smooth_offset + realized.coeff_range.start)..(smooth_offset + realized.coeff_range.end);
+        let edf = result
+            .fit
+            .per_term_edf(global_range, penalty_range.start, penalty_range.len());
+        let saturated = gam_terms::basis::basis_is_saturated(
+            edf,
+            realized.coeff_range.len(),
+            realized.wald_unpenalized_dim(),
+            resolution_tol,
+        );
+        // The widest alternative in which the screen found structure that pays
+        // for itself: the refinement must add at least that many directions.
+        let lack_of_fit_directions = result
+            .basis_adequacy
+            .iter()
+            .filter(|row| row.term_idx == term_index && enrichment_pays_for_itself(row))
+            .filter_map(|row| row.enrichment_rank)
+            .max();
+        let lacks_fit = lack_of_fit_directions.is_some();
+        let refined = refinement_spanning(
+            basis,
+            values,
+            &current,
+            &support,
+            lack_of_fit_directions.unwrap_or(0),
+        );
+        if let AdaptiveTermDecision::Refine(proposed) =
+            adaptive_term_decision(&current, &refined, &support, saturated, lacks_fit)
         {
-            let penalty_range = result
-                .design
-                .smooth_term_penalty_range(term_index)
-                .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?
-                .ok_or_else(|| {
-                    raised_fit_failure(
-                        FailureCategory::Invariant,
-                        format!(
-                            "adaptive spatial term '{}' emitted no penalty block",
-                            result.resolvedspec.smooth_terms[term_index].name,
-                        ),
-                    )
-                })?;
-            let spatial_dimension = result.resolvedspec.smooth_terms[term_index]
-                .basis
-                .structural_feature_cols()
-                .len();
-            if spatial_dimension == 0 {
-                return Err(raised_fit_failure(
-                    FailureCategory::Invariant,
-                    format!(
-                        "adaptive spatial term '{}' has no structural feature columns",
-                        result.resolvedspec.smooth_terms[term_index].name,
-                    ),
-                ));
-            }
-            // The formula-default `s(x)` B-spline is bounded by its covariate's
-            // distinct values and the design rank, not by a center-count rule.
-            let bspline = match &result.resolvedspec.smooth_terms[term_index].basis {
-                gam_terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, spec }
-                    if *feature_col < data.values.ncols() =>
-                {
-                    Some((*feature_col, spec.degree))
-                }
-                _ => None,
-            };
-            // Tiny samples can force the materializer's exact polynomial floor
-            // above the generic `n / 4` conditioning ceiling. The realized
-            // request is already the smallest admissible basis in that case, so
-            // it is also the ceiling; never report a nonsensical attempted
-            // center count below the basis that just converged.
-            let ceiling_centers = match bspline {
-                Some((feature_col, degree)) => adaptive_bspline_knot_ceiling(
-                    data.values.column(feature_col),
-                    degree,
-                    current_centers,
-                    result.design.design.ncols(),
-                    n_rows,
-                ),
-                None => gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
-                    .max(current_centers),
-            };
-            let global_range = (smooth_offset + realized.coeff_range.start)
-                ..(smooth_offset + realized.coeff_range.end);
-            let edf =
-                result
-                    .fit
-                    .per_term_edf(global_range, penalty_range.start, penalty_range.len());
-            let nullspace_dim = realized.wald_unpenalized_dim();
-            match adaptive_center_decision(
-                current_centers,
-                ceiling_centers,
+            requests.push(RefinementRequest {
+                refinement: AdaptiveRefinement {
+                    term_index,
+                    term_name: term_name.clone(),
+                    current,
+                    proposed,
+                },
+                saturated,
                 edf,
-                realized.coeff_range.len(),
-                nullspace_dim,
-                resolution_tol,
-                lacking_fit.contains(&term_index),
-            ) {
-                AdaptiveCenterDecision::Certified => {}
-                // A B-spline at its ceiling already spans every identifiable
-                // direction its covariate and the design rank allow; there is no
-                // larger default basis to certify against, so the converged fit
-                // stands with its fit-time adequacy advisory.
-                AdaptiveCenterDecision::Exhausted if bspline.is_some() => {}
-                AdaptiveCenterDecision::Expand(proposed_centers) => {
-                    candidates.push(AdaptiveSpatialCandidate {
-                        term_index,
-                        term_name: result.resolvedspec.smooth_terms[term_index].name.clone(),
-                        current_centers,
-                        proposed_centers,
-                    });
-                }
-                AdaptiveCenterDecision::Exhausted => {
-                    return Err(WorkflowError::SpatialUnderresolved {
-                        term: result.resolvedspec.smooth_terms[term_index].name.clone(),
-                        current_centers,
-                        attempted_centers: ceiling_centers,
-                        reason: format!(
-                            "term EDF {edf:.6} remains at its realized basis ceiling with all \
-                             {ceiling_centers} validated default centers already requested"
-                        ),
-                        refit_failure: None,
-                    });
-                }
-            }
+            });
         }
     }
-    Ok(AdaptiveSpatialCandidates {
-        term_count,
-        terms: candidates,
+    let spare_rank = values
+        .nrows()
+        .saturating_sub(1)
+        .saturating_sub(result.design.design.ncols());
+    fit_refinements_to_rank(requests, spare_rank, |term_index, resolution| {
+        result.adaptive_bases[term_index]
+            .as_ref()
+            .map_or(0, |basis| {
+                gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
+            })
     })
 }
 
 #[cfg(test)]
 mod adaptive_spatial_resolution_tests {
-    use super::{AdaptiveCenterDecision, adaptive_center_decision};
+    use super::{
+        AdaptiveRefinement, AdaptiveResolution, AdaptiveTermDecision, RefinementRequest,
+        adaptive_term_decision, evidence_improves, fit_refinements_to_rank,
+    };
+    use crate::fit_orchestration::error::WorkflowError;
+
+    fn request(
+        term_index: usize,
+        current: AdaptiveResolution,
+        proposed: AdaptiveResolution,
+        saturated: bool,
+    ) -> RefinementRequest {
+        RefinementRequest {
+            refinement: AdaptiveRefinement {
+                term_index,
+                term_name: format!("s{term_index}"),
+                current,
+                proposed,
+            },
+            saturated,
+            edf: 0.0,
+        }
+    }
+
+    fn knots_width(resolution: &AdaptiveResolution) -> usize {
+        match resolution {
+            AdaptiveResolution::InternalKnots(k) => k + 4,
+            AdaptiveResolution::MarginDims(dims) => dims.iter().product(),
+            AdaptiveResolution::Centers(c) | AdaptiveResolution::PeriodicBasis(c) => *c,
+            AdaptiveResolution::HarmonicDegree(l) => (l + 1).pow(2),
+        }
+    }
 
     #[test]
-    fn unsaturated_basis_is_certified_without_a_probe_refit() {
+    fn unsignalled_basis_is_certified_without_a_refit() {
+        use AdaptiveResolution::Centers;
         assert_eq!(
-            adaptive_center_decision(8, 100, 5.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Certified
+            adaptive_term_decision(&Centers(8), &Centers(16), &Centers(500), false, false),
+            AdaptiveTermDecision::Certified
         );
     }
 
     #[test]
-    fn saturated_basis_expands_geometrically_and_respects_validated_ceiling() {
+    fn either_signal_refines_by_one_nested_level() {
+        use AdaptiveResolution::InternalKnots;
+        for (saturated, lacks_fit) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                adaptive_term_decision(
+                    &InternalKnots(8),
+                    &InternalKnots(17),
+                    &InternalKnots(996),
+                    saturated,
+                    lacks_fit
+                ),
+                AdaptiveTermDecision::Refine(InternalKnots(17))
+            );
+        }
+    }
+
+    #[test]
+    fn refinement_is_bounded_by_covariate_support_not_a_constant() {
+        use AdaptiveResolution::{Centers, MarginDims};
+        // Far beyond any fixed default: only the data's distinct rows bound it.
         assert_eq!(
-            adaptive_center_decision(8, 100, 10.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Expand(16)
+            adaptive_term_decision(&Centers(4096), &Centers(8192), &Centers(6000), true, false),
+            AdaptiveTermDecision::Refine(Centers(6000))
         );
         assert_eq!(
-            adaptive_center_decision(64, 100, 10.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Expand(100)
+            adaptive_term_decision(
+                &MarginDims(vec![5, 5]),
+                &MarginDims(vec![9, 9]),
+                &MarginDims(vec![7, 40]),
+                false,
+                true
+            ),
+            AdaptiveTermDecision::Refine(MarginDims(vec![7, 9]))
         );
     }
 
     #[test]
-    fn saturated_basis_at_validated_ceiling_is_typed_exhaustion() {
+    fn basis_at_its_support_bound_is_certified() {
+        use AdaptiveResolution::PeriodicBasis;
         assert_eq!(
-            adaptive_center_decision(100, 100, 10.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Exhausted
+            adaptive_term_decision(
+                &PeriodicBasis(12),
+                &PeriodicBasis(24),
+                &PeriodicBasis(12),
+                true,
+                true
+            ),
+            AdaptiveTermDecision::Certified
         );
     }
 
     #[test]
-    fn unsaturated_basis_lacking_fit_expands_1561() {
-        // The 2-D default-rank Duchon pilot at n=1500: 30 centers, penalized
-        // EDF 24.7 of 27, below the saturation ceiling while λ still binds.
-        assert_eq!(
-            adaptive_center_decision(30, 187, 27.7, 30, 3, 1.0e-6, true),
-            AdaptiveCenterDecision::Expand(60)
-        );
+    fn refinements_share_the_residual_rank_in_formula_order() {
+        use AdaptiveResolution::InternalKnots;
+        let accepted = fit_refinements_to_rank(
+            vec![
+                request(0, InternalKnots(8), InternalKnots(17), true),
+                request(1, InternalKnots(8), InternalKnots(17), true),
+                request(2, InternalKnots(8), InternalKnots(17), false),
+            ],
+            12,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect("rank remains for the first two terms");
+        // The first term takes its whole 9-knot refinement, the second the 3
+        // knots left, and the third waits for the next round.
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[0].proposed, InternalKnots(17));
+        assert_eq!(accepted[1].proposed, InternalKnots(11));
     }
 
     #[test]
-    fn lack_of_fit_at_validated_ceiling_stays_certified_1561() {
-        assert_eq!(
-            adaptive_center_decision(187, 187, 27.7, 190, 3, 1.0e-6, true),
-            AdaptiveCenterDecision::Certified
-        );
+    fn tensor_refinement_is_shortened_along_its_monotone_path() {
+        use AdaptiveResolution::MarginDims;
+        let accepted = fit_refinements_to_rank(
+            vec![request(0, MarginDims(vec![5, 5]), MarginDims(vec![9, 9]), true)],
+            30,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect("a partial tensor refinement fits");
+        // 7x7 adds 24 columns; 8x8 would add 39.
+        assert_eq!(accepted[0].proposed, MarginDims(vec![7, 7]));
     }
 
     #[test]
-    fn bspline_knot_ceiling_is_the_covariate_support_when_rank_is_ample() {
-        // 50 distinct values, cubic: the interpolating limit is 50 - 4 = 46
-        // internal knots. Duplicates and non-finite rows add no support.
-        let mut values: Vec<f64> = (0..50).map(|i| i as f64 / 49.0).collect();
-        values.extend_from_slice(&[0.0, 1.0, f64::NAN, f64::INFINITY]);
-        let column = ndarray::Array1::from(values);
-        assert_eq!(
-            super::adaptive_bspline_knot_ceiling(column.view(), 3, 8, 13, 10_000),
-            46
-        );
+    fn saturated_term_without_identifiable_rank_is_typed_underresolution() {
+        use AdaptiveResolution::InternalKnots;
+        let error = fit_refinements_to_rank(
+            vec![request(0, InternalKnots(8), InternalKnots(17), true)],
+            0,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect_err("a saturated basis with no residual rank is under-resolved");
+        match error {
+            WorkflowError::SpatialUnderresolved {
+                term,
+                current_resolution,
+                attempted_resolution,
+                refit_failure,
+                ..
+            } => {
+                assert_eq!(term, "s0");
+                assert_eq!(current_resolution, "8 internal knots");
+                assert_eq!(attempted_resolution, "9 internal knots");
+                assert!(refit_failure.is_none());
+            }
+            other => panic!("expected SpatialUnderresolved, got {other:?}"),
+        }
     }
 
     #[test]
-    fn bspline_knot_ceiling_keeps_a_residual_degree_of_freedom() {
-        // 120 rows, 4 smooths of 12 coefficients plus an intercept: 49
-        // coefficients, so one term may add at most 120 - 1 - 49 = 70 knots.
-        let column = ndarray::Array1::from_iter((0..120).map(|i| i as f64));
-        assert_eq!(
-            super::adaptive_bspline_knot_ceiling(column.view(), 3, 8, 49, 120),
-            78
-        );
+    fn lack_of_fit_without_rank_waits_instead_of_failing() {
+        use AdaptiveResolution::Centers;
+        let accepted = fit_refinements_to_rank(
+            vec![request(0, Centers(30), Centers(60), false)],
+            0,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect("an unsaturated term is not under-resolved");
+        assert!(accepted.is_empty());
     }
 
     #[test]
-    fn bspline_knot_ceiling_never_shrinks_the_current_basis() {
-        // Five distinct values support one internal knot, and the design is
-        // already square; the ceiling stays at the basis that just converged.
-        let column = ndarray::Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
-        assert_eq!(
-            super::adaptive_bspline_knot_ceiling(column.view(), 3, 4, 6, 6),
-            4
-        );
+    fn evidence_margin_is_the_outer_tolerance() {
+        assert!(evidence_improves(1000.0, 999.0, 1.0e-6));
+        assert!(!evidence_improves(1000.0, 1000.0 - 1.0e-4, 1.0e-6));
+        assert!(!evidence_improves(1000.0, 1000.5, 1.0e-6));
     }
 }
 

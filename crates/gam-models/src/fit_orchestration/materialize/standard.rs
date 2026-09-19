@@ -92,7 +92,7 @@ pub(crate) fn materialize_standard<'a>(
         &mut inference_notes,
         config.scale_dimensions,
         config.smooth_overrides.as_ref(),
-        config.spatial_center_counts.as_deref(),
+        config.adaptive_resolution.as_deref(),
     )?;
     // #1074: the Duchon default penalty is a Hilbert scale (curvature +
     // mass/tension operator dials). REML deselects the lower orders faithfully

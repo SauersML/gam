@@ -16,20 +16,20 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     inference_notes: &mut FitNotes,
     scale_dimensions: bool,
     smooth_overrides: Option<&JsonValue>,
-    spatial_center_counts: Option<&[Option<usize>]>,
+    adaptive_resolution: Option<&[Option<gam_terms::smooth::AdaptiveResolution>]>,
 ) -> Result<TermCollectionSpec, WorkflowError> {
     let mut spec = build_termspec(terms, data, col_map, inference_notes)?;
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
-    // The standard formula path starts auto-sized multivariate radial smooths at
-    // their structural minimum. Univariate radial smooths retain the canonical
-    // formula resolution because that resolution is derived from the competing
-    // univariate spline basis. Per-term evidence-backed expansions return through
-    // this same materializer. Explicit formula counts are not `Auto`, and Python
-    // overrides apply afterward, so both remain authoritative.
-    if let Some(counts) = spatial_center_counts {
-        apply_adaptive_spatial_center_counts(&mut spec, data, counts)?;
+    // The standard formula path starts every formula-default smooth at its
+    // data-derived pilot resolution; auto-sized multivariate radial smooths
+    // start at their penalized-resolution count. Per-term evidence-backed
+    // refinements return through this same materializer. Explicit sizes carry
+    // no adaptive provenance, and Python overrides apply afterward, so both
+    // remain authoritative.
+    if let Some(plan) = adaptive_resolution {
+        apply_adaptive_resolution_plan(&mut spec, data, plan)?;
     }
     if let Some(overrides) = smooth_overrides {
         gam_terms::smooth_overrides::apply_smooth_overrides(
@@ -45,86 +45,54 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 
 /// Apply the standard workflow's per-term adaptive resolution plan.
 ///
-/// Eligibility (never clobber a pinned basis):
-/// * spatial radial families with a validated saturation contract (thin-plate /
-///   Duchon / constant-curvature / measure-jet); Matérn has a separately learned
-///   kernel range whose basin and numerical rank both move with the center count,
-///   so it retains its established full/default count until a Matérn-specific
-///   saturation proof exists;
-/// * the formula-default 1-D `s(x)` B-spline, whose knot count nobody chose
-///   (`BSplineKnotSpec::Automatic { adaptive: true, .. }`); an explicit `k=` /
-///   `knots=` is a fixed spec and is untouched;
-/// * the current strategy must retain [`CenterStrategy::Auto`] provenance;
-///   every explicit formula/programmatic strategy is therefore left alone;
-/// Python `smooths={...}` overrides are applied by the caller AFTER this, so they
-/// override the escalated value unconditionally.
-fn apply_adaptive_spatial_center_counts(
+/// Only a smooth whose size nobody chose carries an adaptive resolution
+/// ([`gam_terms::smooth::adaptive_resolution_of`]); every explicit
+/// formula/programmatic size is left alone. A missing plan entry keeps the
+/// formula pilot, except that an auto-sized multivariate radial smooth starts
+/// at [`gam_terms::basis::starting_num_centers`]. Center counts are held
+/// between the term's structural minimum and one center per row. Python
+/// `smooths={...}` overrides are applied by the caller AFTER this, so they
+/// override the refined value unconditionally.
+fn apply_adaptive_resolution_plan(
     spec: &mut TermCollectionSpec,
     data: &Dataset,
-    requested_counts: &[Option<usize>],
+    plan: &[Option<gam_terms::smooth::AdaptiveResolution>],
 ) -> Result<(), WorkflowError> {
-    use gam_terms::basis::{
-        center_strategy_is_auto, center_strategy_with_num_centers, starting_num_centers,
-    };
+    use gam_terms::basis::starting_num_centers;
+    use gam_terms::smooth::{AdaptiveResolution, adaptive_resolution_of, apply_adaptive_resolution};
     let n = data.values.nrows();
     if n == 0 {
         return Ok(());
     }
     for (term_index, term) in spec.smooth_terms.iter_mut().enumerate() {
-        if let gam_terms::smooth::SmoothBasisSpec::BSpline1D {
-            spec:
-                gam_terms::basis::BSplineBasisSpec {
-                    knotspec:
-                        gam_terms::basis::BSplineKnotSpec::Automatic {
-                            num_internal_knots,
-                            adaptive: true,
-                            ..
-                        },
-                    ..
-                },
-            ..
-        } = &mut term.basis
-        {
-            // The formula default `s(x)` keeps its `adaptive` provenance while
-            // taking the knot count this loop proposed, so every refit is still
-            // owned (and measured) by the same loop.
-            if let Some(proposed) = requested_counts.get(term_index).copied().flatten() {
-                *num_internal_knots = proposed;
-            }
-            continue;
-        }
-        let structural_minimum = gam_terms::smooth::spatial_term_min_center_count(term)
-            .saturating_add(1)
-            .min(n);
-        let Some((strategy, feature_cols)) = spatial_center_strategy_mut(&mut term.basis) else {
+        let Some(current) = adaptive_resolution_of(&term.basis) else {
             continue;
         };
-        let d = feature_cols.len();
-        if d == 0 {
+        let proposed = plan.get(term_index).cloned().flatten();
+        let target = if let AdaptiveResolution::Centers(planned) = current {
+            let nullspace_dim = gam_terms::smooth::spatial_term_min_center_count(term);
+            let structural_minimum = nullspace_dim.saturating_add(1).min(n);
+            let radial_dim = spatial_center_strategy_mut(&mut term.basis).map(|(_, cols)| cols.len());
+            let count = match (&proposed, radial_dim) {
+                (Some(AdaptiveResolution::Centers(requested)), _) => *requested,
+                (_, Some(d)) if d > 1 => starting_num_centers(n, d, nullspace_dim),
+                _ => planned,
+            };
+            AdaptiveResolution::Centers(count.max(structural_minimum).min(n))
+        } else {
+            proposed.unwrap_or_else(|| current.clone())
+        };
+        if adaptive_resolution_of(&term.basis).as_ref() == Some(&target) {
             continue;
         }
-        if !center_strategy_is_auto(strategy) {
-            continue;
-        }
-        let proposed = requested_counts.get(term_index).copied().flatten();
-        let target = proposed
-            .unwrap_or_else(|| {
-                if d == 1 {
-                    strategy.planned_num_centers(d)
-                } else {
-                    starting_num_centers(n, d)
-                }
-            })
-            .max(structural_minimum)
-            .min(n);
-        *strategy = center_strategy_with_num_centers(strategy, target, d).map_err(|error| {
-            WorkflowError::InvalidConfig {
+        apply_adaptive_resolution(&mut term.basis, data.values.view(), &target).map_err(
+            |error| WorkflowError::InvalidConfig {
                 reason: format!(
-                    "failed to set adaptive center count for spatial term '{}': {error}",
+                    "failed to set the adaptive resolution of smooth term '{}': {error}",
                     term.name
                 ),
-            }
-        })?;
+            },
+        )?;
     }
     Ok(())
 }
