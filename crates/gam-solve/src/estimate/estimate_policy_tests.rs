@@ -730,8 +730,10 @@ fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
 
 /// F4 (bench/pygam_audit): a smooth's null space is penalized only by its
 /// double-penalty ridge, which REML releases along a separator, so a separator
-/// in that null space certifies like one in a parametric column. A response only
-/// the smooth's roughness-penalized directions can follow keeps them out.
+/// in that null space certifies like one in a parametric column, and so does a
+/// quasi-complete one (margin zero) that the strict certificate cannot claim. A
+/// response only the smooth's roughness-penalized directions can follow keeps
+/// them out, as do classes that interleave.
 #[test]
 fn prefit_binomial_separation_reads_a_smooth_null_space_but_not_its_range() {
     // An intercept and seven hat functions on the knots 0, 1/6, ..., 1. The

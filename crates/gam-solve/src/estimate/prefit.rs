@@ -512,17 +512,6 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
         return Ok(None);
     }
 
-    let Some(statistics) = prefit_column_statistics(&class, x, &column_indices)? else {
-        return Ok(None);
-    };
-    for direction in prefit_threshold_separator_proposals(&statistics)? {
-        if let Some(diagnostic) =
-            certify_prefit_binomial_linear_separator(&class, x, &column_indices, &direction)?
-        {
-            return Ok(Some(diagnostic));
-        }
-    }
-
     let p = x.ncols();
     let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
     let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
@@ -589,16 +578,13 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
     certify_prefit_binomial_linear_separator(&class, x, &column_indices, &direction)
 }
 
-/// Per-class extrema, Gram matrix and column sums of the design's `columns`
-/// over the rows that carry a class, from one streaming pass.
+/// Per-class extrema of the design's `columns` over the rows that carry a
+/// class, from one streaming pass.
 struct PrefitColumnStatistics {
     min_pos: Vec<f64>,
     max_pos: Vec<f64>,
     min_neg: Vec<f64>,
     max_neg: Vec<f64>,
-    gram: Array2<f64>,
-    column_sums: Array1<f64>,
-    active_rows: usize,
 }
 
 impl PrefitColumnStatistics {
@@ -626,11 +612,7 @@ fn prefit_column_statistics(
         max_pos: vec![f64::NEG_INFINITY; q],
         min_neg: vec![f64::INFINITY; q],
         max_neg: vec![f64::NEG_INFINITY; q],
-        gram: Array2::<f64>::zeros((q, q)),
-        column_sums: Array1::<f64>::zeros(q),
-        active_rows: 0,
     };
-    let mut z = vec![0.0_f64; q];
     let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
     let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
     for start in (0..x.nrows()).step_by(chunk_rows) {
@@ -639,20 +621,18 @@ fn prefit_column_statistics(
         x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
             .map_err(|err| {
                 EstimationError::LayoutError(format!(
-                    "pre-fit binomial threshold-separation check failed to stream design rows: {err}"
+                    "pre-fit binomial quasi-separation check failed to stream design rows: {err}"
                 ))
             })?;
         for local_row in 0..rows {
             let Some(is_positive) = class[start + local_row] else {
                 continue;
             };
-            statistics.active_rows += 1;
             for (k, &column) in columns.iter().enumerate() {
                 let value = chunk[[local_row, column]];
                 if !value.is_finite() {
                     return Ok(None);
                 }
-                z[k] = value;
                 if is_positive {
                     statistics.min_pos[k] = statistics.min_pos[k].min(value);
                     statistics.max_pos[k] = statistics.max_pos[k].max(value);
@@ -661,79 +641,9 @@ fn prefit_column_statistics(
                     statistics.max_neg[k] = statistics.max_neg[k].max(value);
                 }
             }
-            for a in 0..q {
-                statistics.column_sums[a] += z[a];
-                for b in 0..=a {
-                    statistics.gram[[a, b]] += z[a] * z[b];
-                }
-            }
-        }
-    }
-    for a in 0..q {
-        for b in 0..a {
-            statistics.gram[[b, a]] = statistics.gram[[a, b]];
         }
     }
     Ok(Some(statistics))
-}
-
-/// Exact separator proposals, one per column whose values the two classes do
-/// not interleave: `±(e_k − t·a)`, with `t` the midpoint of the gap and `a` the
-/// least-squares representation of the constant in the columns.
-///
-/// The perceptron needs on the order of `(R/γ)²` updates, and a step response
-/// on a grid of `n` points has a margin `γ` near `R/n`, so it cannot find the
-/// separator of the very step it exists for. A threshold on one column is that
-/// separator whenever the constant lies in the columns' span; when it does not,
-/// the proposal fails the certificate and nothing is claimed.
-fn prefit_threshold_separator_proposals(
-    statistics: &PrefitColumnStatistics,
-) -> Result<Vec<Vec<f64>>, EstimationError> {
-    let PrefitColumnStatistics {
-        min_pos,
-        max_pos,
-        min_neg,
-        max_neg,
-        gram,
-        column_sums,
-        active_rows,
-    } = statistics;
-    let q = min_pos.len();
-
-    // `a = G⁺ Zᵀ1`, the pseudo-inverse cut at the Gram's rounding floor, the
-    // same floor the pre-fit rank check reads.
-    let (eigenvalues, eigenvectors) = gram
-        .eigh(Side::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
-    if eigenvalues.iter().any(|value| !value.is_finite()) {
-        return Ok(Vec::new());
-    }
-    let spectral_scale = eigenvalues
-        .iter()
-        .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
-    let floor = ((*active_rows).max(q) as f64) * f64::EPSILON * spectral_scale;
-    let mut constant = Array1::<f64>::zeros(q);
-    for (i, &value) in eigenvalues.iter().enumerate() {
-        if value > floor {
-            let v = eigenvectors.column(i);
-            constant.scaled_add(v.dot(column_sums) / value, &v);
-        }
-    }
-
-    let mut proposals = Vec::new();
-    for k in 0..q {
-        let (threshold, sign) = if min_pos[k] > max_neg[k] {
-            (0.5 * (min_pos[k] + max_neg[k]), 1.0)
-        } else if min_neg[k] > max_pos[k] {
-            (0.5 * (min_neg[k] + max_pos[k]), -1.0)
-        } else {
-            continue;
-        };
-        let mut direction: Vec<f64> = constant.iter().map(|&c| -sign * threshold * c).collect();
-        direction[k] += sign;
-        proposals.push(direction);
-    }
-    Ok(proposals)
 }
 
 fn prefit_binomial_separation_supported_link(link: &InverseLink) -> bool {

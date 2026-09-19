@@ -11,13 +11,10 @@ These fixtures used to fail: the perfectly separated step ground for more than
 ``RemlConvergenceError`` with the outer search stalled at ``|g| = 0.23``. Both
 came from the #784 block quadrature correction integrating the flat-prior
 posterior on a Firth fit, which is improper along the separating direction.
-On the default path the step also never reached the Firth rescue: the pre-fit
-separation certificate read only parametric columns and missed the separator
-in the smooth's null space (the intercept plus its linear direction). The
-quasi-separated fixture has no strict separator, and its flat-prior fit
-returned an optimum with the null-space ridge's lambda railed at zero, so the
-pre-fit check also certifies quasi-complete separation along a null-space
-direction.
+The Firth rescue engages only on certified separation, and the quasi-separated
+fixture has no strict separator: its flat-prior fit returned an optimum with
+the null-space ridge's lambda railed at zero. So the pre-fit check also
+certifies quasi-complete separation along a null-space direction.
 
 Each fit must carry a convergence certificate, and its posterior-mean
 predictions must lie in (0, 1) with finite intervals.

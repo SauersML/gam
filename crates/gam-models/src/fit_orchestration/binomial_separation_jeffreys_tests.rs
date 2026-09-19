@@ -12,14 +12,11 @@
 //! The #784 block quadrature correction integrates the flat-prior posterior,
 //! so on a Firth fit of separated data it integrated an improper posterior:
 //! the order search ground without end on the step, and its spliced gradient
-//! stalled the outer search on the quasi-separated fixture. On the default
-//! path the step never reached the Firth rescue at all: the pre-fit separation
-//! certificate read only parametric columns, so it missed the separator in the
-//! smooth's null space and the flat-prior fit ground on instead of refusing.
-//! The quasi-separated fixture has no strict separator to certify, and its
-//! flat-prior fit returns an optimum with the null-space ridge's λ railed at 0
-//! and |η| near 50, so the pre-fit check also certifies quasi-complete
-//! separation along a null-space direction.
+//! stalled the outer search on the quasi-separated fixture. The Firth rescue
+//! engages only on certified separation, and the quasi-separated fixture has
+//! no strict separator to certify: its flat-prior fit returns an optimum with
+//! the null-space ridge's λ railed at 0 and |η| near 50. So the pre-fit check
+//! also certifies quasi-complete separation along a null-space direction.
 
 use super::entry::fit_from_formula;
 use super::request::{FitConfig, FitResult, StandardFitResult};
