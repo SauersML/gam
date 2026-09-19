@@ -117,10 +117,12 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
         .iter()
         .filter(|&&trial| value_3017(trial) > value_3017(SEED_3017))
         .count();
+    // Two stalls at one incumbent that bought nothing stop a run (#3018), so the
+    // defect needs two trials above the seed.
     assert!(
-        rejected > ARC_COST_STALL_WINDOW,
-        "the fixture must spend more trials above the seed than one stall window, or \
-         it does not exercise the defect: {rejected} over {seed_trajectory:?}",
+        rejected >= 2,
+        "the fixture must spend at least two trials above the seed, or it does not \
+         exercise the defect: {rejected} over {seed_trajectory:?}",
     );
 }
 
@@ -157,12 +159,15 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    // The guard exactly as the dense ARC route builds and seeds it.
+    // The guard exactly as the dense ARC route builds and seeds it. The scripted
+    // criterion publishes no evidence, so its values carry the criterion's
+    // resolution (#3018).
     let resolution = outer_criterion_resolution(&config);
-    let mut guard = CostStallGuard::new(resolution, ARC_COST_STALL_WINDOW, &config, exit);
+    let mut guard = CostStallGuard::new(resolution, &config, exit);
     guard.observe_second_order_seed(
         &array![SEED_3017],
         value_3017(SEED_3017),
+        resolution,
         gradient_3017(SEED_3017).abs(),
         Some(true),
     );
@@ -200,16 +205,16 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
     outcomes
 }
 
-/// The guard counts ARC's iterates, not its trials. Two stall windows of
-/// rejected trials at one iterate are σ growing toward the curvature's scale,
-/// not steps that bought nothing, so they never stop the run. The control arm
+/// The guard counts ARC's iterates, not its trials. Eight rejected trials at one
+/// iterate are σ growing toward the curvature's scale, not steps that bought
+/// nothing, so they never stop the run. The control arm
 /// feeds the same trials as accepted steps, which is what the bridge did with
 /// every trial before the repair, and the guard does stop there.
 #[test]
 fn arc_bridge_rejected_trials_never_fill_the_stall_window_3017() {
     // The issue's rejected trials, shrinking from the Newton overshoot at 8.78;
     // each stays above the seed's criterion.
-    let trials: Vec<f64> = (0..2 * ARC_COST_STALL_WINDOW + 2)
+    let trials: Vec<f64> = (0..8)
         .map(|k| SEED_3017 + 3.3443 - 0.05 * k as f64)
         .collect();
     assert!(
@@ -230,8 +235,8 @@ fn arc_bridge_rejected_trials_never_fill_the_stall_window_3017() {
     assert_eq!(
         accepted.last(),
         Some(&Err(ARC_UNPROGRESSING_STALL_SENTINEL.to_string())),
-        "the same trials as accepted non-improving iterates fill two windows and \
-         stop the run: {accepted:?}"
+        "the same trials as accepted non-improving iterates stall twice and stop \
+         the run: {accepted:?}"
     );
 }
 
@@ -268,8 +273,9 @@ const BETA_TR_3017: f64 = 1.0e12;
 /// boundary: `s = r`, predicted decrease `k·r`, actual `k·(r − β·r⁴/4)`. The
 /// ratio `1 − β·r³/4` stays below `η = 0.1` while `r > (3.6/β)^(1/3) = 1.53e-4`.
 /// From opt's initial radius 1, quartered per rejection, the seven trials
-/// `r = 4^(−j)`, `j = 0..=6`, are rejected: two full stall windows of
-/// `ARC_COST_STALL_WINDOW = 3` and one more. `r = 6.1e-5` is then accepted
+/// `r = 4^(−j)`, `j = 0..=6`, are rejected: two full three-trial stall windows
+/// and one more, before #3018 deleted the window; a rejected trial reaches no
+/// verdict. `r = 6.1e-5` is then accepted
 /// (ratio 0.943), and the run must go on to `ρ* = 1e-4`.
 #[test]
 fn rejected_trust_region_trials_do_not_fill_the_stall_window_3017() {
