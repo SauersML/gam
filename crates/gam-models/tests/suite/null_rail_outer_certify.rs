@@ -1,7 +1,6 @@
-//! pyGAM audit B2 (`bench/pygam_audit`, lane `null-rail-certify`): a Poisson or
-//! binomial additive fit whose smoothing parameter rails to the top of the box,
-//! so that its penalty's limit projects the term onto the penalty's null space,
-//! must still end on a certified outer optimum.
+//! pyGAM audit B2 (`bench/pygam_audit`, lane `null-rail-certify`): Poisson and
+//! binomial additive fits that the released wheel left stalled against a
+//! railed smoothing parameter must end on a certified outer optimum.
 //!
 //! The fixtures are the audit's Monte Carlo draws (`inference/mc.py`, cells
 //! `pois` and `binom`): `y ~ s(x1) + s(x2) + s(x3)` with truth
@@ -22,6 +21,14 @@
 //! * Poisson rep 163: `railed=[4] theta=30`, `|Pg|=1.577e-3 > bound=1.494e-3`;
 //! * Poisson rep 92: `railed=[4] theta=30`, `|Pg|=6.170e-4 > bound=2.477e-4`,
 //!   after 24-40 s.
+//!
+//! That rail was not the optimum. With the ρ-guard barrier retired (#2902) and
+//! the outer box being the resolvability domain of each penalty (#2812), every
+//! fixture certifies at an interior stationary point: `railed=[]`, ρ₄ = 5.82,
+//! 7.23 and 1.58 for Poisson reps 163 and 92 and binomial rep 0, with a
+//! positive-semidefinite analytic outer Hessian. A fit that does rail is
+//! certified on its face by the exact λ→∞ limit model
+//! (`gam_solve::reml::rail_face_limit`), not at the box edge.
 //!
 //! A fit is only minted from a converged optimization, so a returned standard
 //! fit is itself the certificate; the time bound is the audit's acceptance bar
