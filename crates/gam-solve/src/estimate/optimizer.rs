@@ -3873,15 +3873,19 @@ where
         // a caller asks for with `skip_rho_posterior_inference = false`. A
         // default fit has no reader for them, so it publishes the
         // `NotComputed(InferenceNotRequested)` initialized above and spends no
-        // criterion evaluation here; the fitted model is the same either way.
+        // criterion evaluation here; the fitted model, its search-work counters
+        // included, is the same either way.
         if !opts.skip_rho_posterior_inference {
-            (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-                &final_rho,
-                // The searched and certified box is the posterior's support.
-                &rho_model_domain,
-                &certified_railed_rho,
-                None,
-            );
+            (rho_posterior, rho_posterior_escalation) =
+                reml_state.arena.without_charging_the_search(|| {
+                    reml_state.rho_posterior_inference(
+                        &final_rho,
+                        // The searched and certified box is the posterior's support.
+                        &rho_model_domain,
+                        &certified_railed_rho,
+                        None,
+                    )
+                });
         }
 
         // Standard errors: prefer the diagonal of the full inverse when
