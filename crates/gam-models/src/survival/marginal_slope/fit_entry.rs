@@ -1861,22 +1861,28 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // the gradient everywhere. Its ψψ and ρψ curvature is served where the rigid frame contracts
         // every ψ-moved trace Hessian in one pass, which covers baseline-chart and design axes on a
         // time-constant slope; any other such θ declares no curvature.
-        let psi_moves_priced_completion = initial_family.joint_jeffreys_term_required()
-            && initial_family.jeffreys_completion_outer_derivatives().is_some()
+        let completion_moves_with_psi = initial_family.jeffreys_completion_outer_derivatives().is_some()
             && initial_family.joint_jeffreys_information_depends_on_psi();
+        let psi_moves_priced_completion =
+            initial_family.joint_jeffreys_term_required() && completion_moves_with_psi;
         // gam#2945: a learned log σ moves the priced completion too, and the completion's explicit σ
         // derivative `∂C/∂σ|_β` needs the σ-mixed third information derivative, which has no closed
-        // form here. Such a θ has neither an exact outer gradient nor a curvature certificate, so the
-        // fit is refused once, by name, before the smoothing search. Without this rule every
-        // value+gradient evaluation refuses at the completion's σ column action; before the completion
-        // was priced in every eval mode, the search ran and the curvature guard refused its point as
-        // unevaluated (219 s on the #2930 minimal fixture with a learned σ).
-        if psi_moves_priced_completion && learned_sigma_initial.is_some() {
+        // form here. An armed member with such a θ has neither an exact outer gradient nor a
+        // curvature certificate. Either member refuses it, by name, before its smoothing search: the
+        // unarmed member refits armed on typed evidence (#979), which is known only after the unarmed
+        // search, so refusing on the armed member alone would make the same configuration fit or
+        // refuse depending on the data, after a full unarmed search. Without this rule every armed value+gradient evaluation refuses at
+        // the completion's σ column action; before the completion was priced in every eval mode, the
+        // search ran and the curvature guard refused its point as unevaluated (219 s on the #2930
+        // minimal fixture with a learned σ). Where the likelihood does not identify σ at all
+        // (gam#2938) that refusal comes first.
+        if completion_moves_with_psi && learned_sigma_initial.is_some() {
             return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
                 reason: "a learned Gaussian frailty σ with the armed Jeffreys completion is refused: the \
-                         completion's explicit σ derivative needs the σ-mixed third information \
-                         derivative, which is not derived, so the fit has neither an exact outer \
-                         gradient nor a curvature certificate (gam#2945)"
+                         fit refits armed on typed evidence (#979), and the armed completion's explicit \
+                         σ derivative needs the σ-mixed third information derivative, which is not \
+                         derived, so the armed fit would have neither an exact outer gradient nor a \
+                         curvature certificate; it is refused before the unarmed fit as well (gam#2945)"
                     .to_string(),
             }
             .into());
@@ -2021,11 +2027,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &[marginal_terms.clone(), slope_terms.clone()],
             kappa_options_ref,
             &setup,
-            crate::seeding::SeedRiskProfile::Survival,
             analytic_joint_gradient_available,
             analytic_joint_hessian_available,
             true,
-            None,
             Some(walk_signals.clone()),
             outer_policy,
             |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
@@ -2163,13 +2167,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
                 let outer_options = crate::outer_subsample::exact_outer_options(&tolerance_options);
                 let cycle_budget_evidence = || {
-                    let load_cap = |cap: &Option<Arc<AtomicUsize>>| {
-                        cap.as_ref().map(|value| value.load(std::sync::atomic::Ordering::Relaxed))
-                    };
                     format!(
-                        "inner cycle budget inputs: base={}, screening_cap={:?}",
+                        "inner cycle budget inputs: base={}",
                         outer_options.inner_max_cycles,
-                        load_cap(&outer_options.screening_max_inner_iterations),
                     )
                 };
                 let selection = if let Some(value_selection) = owned_value_mode {

@@ -1896,24 +1896,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         true
     }
 
-    /// Non-spatial location-scale seeding classification — see
-    /// `GaussianLocationScaleFamily::outer_seed_config` for the full rationale.
-    /// The wiggle variant has the identical non-profiled log-σ predictor, so it
-    /// needs the same `GaussianLocationScale` classification (flexible Gaussian
-    /// seed grid + lowest-cost keep-best + interior-extreme promotion) on the
-    /// rho-only path; without it the log-σ block over-smooths exactly as the
-    /// non-wiggle family does.
-    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
-        if n_params == 0 {
-            return crate::seeding::SeedConfig::default();
-        }
-        let mut config = crate::seeding::SeedConfig::default();
-        config.risk_profile = crate::seeding::SeedRiskProfile::GaussianLocationScale;
-        config.max_seeds = 4;
-        config.seed_budget = 2;
-        config
-    }
-
     fn block_linear_constraints(
         &self,
         block_states: &[ParameterBlockState],

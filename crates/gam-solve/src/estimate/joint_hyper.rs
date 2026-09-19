@@ -430,10 +430,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .resolved_scale()
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         let k = self.reml_state.canonical_penalties.len();
-        let seed_config = super::optimizer::external_reml_seed_config(
-            k,
-            self.reml_state.config.likelihood.spec.is_gaussian_identity(),
-        );
 
         self.reml_state.without_persistent_warm_start_store(|| {
             super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
@@ -441,7 +437,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 &resolved_likelihood_scale,
                 k,
                 None,
-                &seed_config,
                 external_hyper_count,
             )
         })
