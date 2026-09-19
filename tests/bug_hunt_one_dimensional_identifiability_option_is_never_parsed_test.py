@@ -104,7 +104,7 @@ def test_control_siblings_honour_identifiability_none(term: str) -> None:
 )
 def test_control_siblings_reject_an_invalid_identifiability_token(term: str) -> None:
     """Green today: an unknown token raises for every multi-d smooth."""
-    with pytest.raises(gamfit.GamError):
+    with pytest.raises(gamfit.GamfitError):
         _fit(f"y ~ {term[:-1]}, identifiability='totally_bogus')")
 
 
@@ -122,7 +122,7 @@ def test_one_dimensional_smooth_honours_identifiability_none() -> None:
 
 
 def test_one_dimensional_smooth_rejects_an_invalid_identifiability_token() -> None:
-    with pytest.raises(gamfit.GamError):
+    with pytest.raises(gamfit.GamfitError):
         _fit("y ~ s(x, k=8, identifiability='totally_bogus')")
 
 

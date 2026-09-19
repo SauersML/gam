@@ -1,7 +1,7 @@
 """Regression tests for issue #520 — periodic B-spline dense derivative.
 
 `gamfit.bspline_basis_derivative(..., periodic=True)` used to raise
-``GamError: periodic B-spline first-derivative as a dense (N, K) matrix is no
+``GamfitError: periodic B-spline first-derivative as a dense (N, K) matrix is no
 longer exposed`` for *every* call, even though the exact periodic first
 derivative is already computed by the Rust core
 (``periodic_bspline_first_derivative_nd``). These tests pin the dense periodic

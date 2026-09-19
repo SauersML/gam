@@ -4509,3 +4509,135 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
         "try_from_dense_psd's dim·1e-10·λmax cutoff truncates a resolved eigenvalue"
     );
 }
+
+/// A continuous `x` with distinct values beside a categorical `g` whose level
+/// labels are `levels`; row `i` holds level `i % levels.len()`.
+fn categorical_coordinate_dataset(levels: &[&str]) -> Dataset {
+    let n = 120usize;
+    let rows = (0..n)
+        .map(|i| {
+            let x = i as f64 / (n as f64 - 1.0);
+            let g = (i % levels.len()) as f64;
+            vec![x + g, x, g]
+        })
+        .collect::<Vec<_>>();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular categorical test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: levels.iter().map(|level| level.to_string()).collect(),
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+fn build_formula(formula: &str, ds: &Dataset) -> Result<TermCollectionSpec, TermBuilderError> {
+    let parsed = parse_formula(formula).expect("formula parses");
+    build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new())
+}
+
+/// pyGAM audit F4: a smooth, tensor or explicit linear term over a categorical
+/// column used to fit silently over the arbitrary level codes. It is refused
+/// at formula resolution as a formula error that names the column and the
+/// categorical alternatives.
+#[test]
+fn a_categorical_column_is_refused_as_a_numeric_coordinate() {
+    let ds = categorical_coordinate_dataset(&["a", "b", "c"]);
+    for (formula, term) in [
+        ("y ~ s(g)", "s(g)"),
+        ("y ~ s(x) + s(g)", "s(g)"),
+        ("y ~ te(x, g)", "te(x, g)"),
+        ("y ~ linear(g)", "linear(g)"),
+    ] {
+        let err = build_formula(formula, &ds).expect_err(formula);
+        let TermBuilderError::CategoricalCoordinate {
+            column,
+            level_count,
+            first_non_numeric,
+            ..
+        } = &err
+        else {
+            panic!("{formula}: expected CategoricalCoordinate, got {err:?}");
+        };
+        assert_eq!(column, "g", "{formula}");
+        assert_eq!(*level_count, 3, "{formula}");
+        assert_eq!(
+            first_non_numeric.as_ref(),
+            Some(&NonNumericCell {
+                value: "a".to_string(),
+                row: 1
+            }),
+            "{formula}"
+        );
+        assert_eq!(err.error_category(), ErrorCategory::Formula);
+        let message = err.to_string();
+        assert!(message.contains(term), "{formula}: {message}");
+        for alternative in ["factor(g)", "group(g)", "s(x, by=g)", "fs(x, g)", "bs=\"re\""] {
+            assert!(message.contains(alternative), "{formula}: {message}");
+        }
+    }
+}
+
+/// The categorical smooths stay valid: a factor `by=`, the factor slot of
+/// `fs`, and a random-effect smooth over the grouping column.
+#[test]
+fn a_categorical_column_is_accepted_where_a_smooth_takes_a_factor() {
+    let ds = categorical_coordinate_dataset(&["a", "b", "c"]);
+    for formula in [
+        "y ~ s(x, by=g)",
+        "y ~ fs(x, g)",
+        "y ~ s(g, bs=\"re\")",
+        "y ~ factor(g) + s(x)",
+    ] {
+        build_formula(formula, &ds).unwrap_or_else(|err| panic!("{formula}: {err}"));
+    }
+}
+
+/// A numeric column made categorical by one stray string reports that string
+/// and its 1-based row, and says how to keep the column numeric.
+#[test]
+fn a_stray_string_in_a_numeric_column_is_reported_with_its_row() {
+    // Rows cycle through the levels, so the first `oops` sits at row 3.
+    let ds = categorical_coordinate_dataset(&["1.5", "2.5", "oops"]);
+    let err = build_formula("y ~ s(g)", &ds).expect_err("s(g) on a categorical column");
+    let TermBuilderError::CategoricalCoordinate {
+        first_non_numeric, ..
+    } = &err
+    else {
+        panic!("expected CategoricalCoordinate, got {err:?}");
+    };
+    assert_eq!(
+        first_non_numeric.as_ref(),
+        Some(&NonNumericCell {
+            value: "oops".to_string(),
+            row: 3
+        })
+    );
+    let message = err.to_string();
+    assert!(message.contains("'oops' at row 3"), "{message}");
+    assert!(message.contains("meant to be numeric"), "{message}");
+}

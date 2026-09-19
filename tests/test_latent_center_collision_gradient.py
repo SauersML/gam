@@ -66,6 +66,6 @@ def test_a_c1_latent_kernel_fits_through_a_center_collision(formula: str, d: int
 
 
 def test_a_cone_point_latent_kernel_is_refused_by_name_not_by_a_panic() -> None:
-    with pytest.raises(gamfit.GamError, match="cone point") as refusal:
+    with pytest.raises(gamfit.GamfitError, match="cone point") as refusal:
         _fit("y ~ s(t, type='matern', nu=1/2, centers=12)", 1)
     assert "panicked inside Rust boundary" not in str(refusal.value)

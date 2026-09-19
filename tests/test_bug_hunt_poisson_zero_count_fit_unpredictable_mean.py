@@ -21,7 +21,7 @@ def test_all_zero_count_fit_refuses_with_family_owned_error(
     n = 200
     data = {"x": np.linspace(0.0, 1.0, n), "y": np.zeros(n)}
 
-    with pytest.raises(gamfit.GamError) as excinfo:
+    with pytest.raises(gamfit.GamfitError) as excinfo:
         gamfit.fit(data, formula, family=family)
 
     message = str(excinfo.value)

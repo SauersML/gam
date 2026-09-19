@@ -83,7 +83,7 @@ def test_the_latent_coordinate_fit_refuses_an_isometry_penalty_by_name() -> None
     y = np.sin(2.0 * t0[:, 0]) + 0.1 * rng.normal(size=n)
 
     with pytest.raises(
-        gamfit.GamError, match="supplies no decoder jets for an isometry penalty"
+        gamfit.GamfitError, match="supplies no decoder jets for an isometry penalty"
     ):
         gamfit.fit(
             pd.DataFrame({"y": y}),

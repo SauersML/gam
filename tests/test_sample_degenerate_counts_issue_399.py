@@ -4,7 +4,7 @@ with a clean, typed configuration error *before* the sampling engine is invoked
 
 The pre-fix behaviour was:
 
-    samples=0 -> GamError: sample_table panicked inside Rust boundary:
+    samples=0 -> GamfitError: sample_table panicked inside Rust boundary:
                  expected thread to succeed in generating observation.
 
 i.e. the panic-payload was caught at the FFI boundary and surfaced as a
@@ -45,7 +45,7 @@ def _logit_model():
 
 
 def _assert_clean_config_error(rows, model, **bad_cfg) -> None:
-    with pytest.raises(gamfit.GamError) as exc_info:
+    with pytest.raises(gamfit.GamfitError) as exc_info:
         model.sample(rows, **bad_cfg)
     message = str(exc_info.value)
     assert "panicked inside Rust boundary" not in message, (

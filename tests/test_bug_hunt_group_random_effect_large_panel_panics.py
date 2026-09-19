@@ -8,7 +8,7 @@ case.
 
 Observed (with 300 groups):
 
-    GamError: fit_table panicked inside Rust boundary: Assertion failed at
+    GamfitError: fit_table panicked inside Rust boundary: Assertion failed at
     faer-0.24.0/.../cholesky/llt/solve.rs:20
     Assertion failed: rhs.nrows() == n
     - rhs.nrows() = 301

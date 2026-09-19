@@ -703,6 +703,7 @@ fn encoded_table_from_columns(
 /// allocate level labels.
 #[pyfunction]
 fn encoded_table_from_arrow(
+    py: Python<'_>,
     headers: Vec<String>,
     source: &Bound<'_, PyAny>,
 ) -> PyResult<PyEncodedTable> {
@@ -725,7 +726,7 @@ fn encoded_table_from_arrow(
         .map_err(|error| py_value_error(format!("failed to import Arrow C stream: {error}")))?;
     let dataset =
         gam::data::encode_arrow_record_batch_reader_with_inferred_schema(&mut reader, headers)
-            .map_err(|error| py_value_error(error.to_string()))?;
+            .map_err(|error| workflow_error_to_pyerr(py, error.into()))?;
     Ok(PyEncodedTable { dataset })
 }
 
@@ -1902,13 +1903,11 @@ fn competing_risks_cif_impl(
         .iter()
         .map(|hazard| hazard.view())
         .collect::<Vec<_>>();
-    // `ndarray::stack` is a pure shape contract violation — keep it as a
-    // bare `PyValueError` rather than forcing it through a typed engine
-    // enum it does not belong to.
+    // Endpoints whose hazard grids differ in shape cannot be stacked.
     let cumulative_hazard =
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
-    // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
+    // `Result<_, SurvivalError>`, raised as the class of its fit category.
     let result =
         gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
             .map_err(survival_error_to_pyerr)?;
@@ -1988,8 +1987,8 @@ fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
 ) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
-    // Typed engine path: `SurvivalError` → `gamfit.SurvivalError` (issue
-    // #343), no string flattening.
+    // Typed engine path: `SurvivalError` → the class of its fit category
+    // (issue #343), no string flattening.
     let result = gam::families::survival::assemble_competing_risks_cif_from_endpoints(
         times,
         cumulative_hazards,

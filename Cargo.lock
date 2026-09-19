@@ -3642,6 +3642,7 @@ version = "0.3.157"
 dependencies = [
  "arrow",
  "csv",
+ "gam-spec",
  "log",
  "ndarray 0.17.2",
  "parquet",

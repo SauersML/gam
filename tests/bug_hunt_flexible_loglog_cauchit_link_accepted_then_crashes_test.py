@@ -23,8 +23,8 @@ or be rejected *up front* with a clear link/configuration error. Instead:
 The three gates that decide "is this link supported" disagree, and the
 permissive one runs first — so an advertised link config is accepted and then
 blows up with an internal integration error instead of being handled cleanly.
-A dedicated ``UnsupportedLinkError`` type even exists for exactly this situation
-but is not used here.
+A dedicated ``InvalidSpecificationError`` type even exists for exactly this
+situation but is not used here.
 
 This test pins the graceful-handling contract in a way that is robust to either
 reasonable fix (teach the wiggle solver these links, or reject them up front):
@@ -52,7 +52,6 @@ import gamfit
 # Reasonable, non-opaque outcomes if a link truly cannot be fit with a flexible
 # warp: an up-front, actionable link/configuration rejection.
 _CLEAN_REJECTIONS = (
-    gamfit.UnsupportedLinkError,
     gamfit.InvalidConfigurationError,
     gamfit.InvalidSpecificationError,
     gamfit.FormulaError,

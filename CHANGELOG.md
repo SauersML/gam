@@ -1,5 +1,26 @@
 ## Unreleased
 
+- **One exception hierarchy, chosen by the engine's error category.** Every engine
+  error now reports one Rust `ErrorCategory` (formula, data, convergence, not fitted,
+  internal). Python raises a class under that category's base, and the CLI exits
+  with that category's code (2, 3, 4, 5, 70), so the two classify a failure the same
+  way without reading its message. The bases are `GamfitError(Exception)`,
+  `FormulaError(GamfitError, ValueError)`, `DataError(GamfitError, ValueError)`,
+  `ConvergenceError(GamfitError, RuntimeError)`, `NotFittedError` (the bases of
+  scikit-learn's `NotFittedError`) and `InternalError(GamfitError, RuntimeError)`.
+  Every other class sits under exactly one of them. Classes that no engine path
+  raised are removed. `gamfit.sklearn` estimators raise `gamfit.NotFittedError`
+  before `fit`. **Migration:** `GamError` is now `GamfitError` and no longer a
+  `ValueError`. Code that caught `ValueError` for a solver failure should catch
+  `ConvergenceError`, and code that caught `FitError` should catch `ConvergenceError`
+  or the category it means.
+- **`s()` / `te()` / `linear()` on a string or categorical column is a formula error.**
+  These fits used to succeed silently on the column's level codes, and a stray string in
+  a numeric column raised pyarrow's `ArrowInvalid`. Formula resolution in Rust now refuses it,
+  for the CLI and Python alike. The message names the column and its first
+  non-numeric value and row, and lists the terms that accept the column:
+  `factor(g)` / `group(g)`, `s(x, by=g)`, `fs(x, g)` and `s(g, bs="re")`.
+
 - **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
   accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
   `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`

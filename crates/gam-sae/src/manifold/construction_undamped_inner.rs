@@ -1383,7 +1383,7 @@ impl SaeManifoldTerm {
                 // spectral deflation `solve_arrow_newton_step_with_options` errors,
                 // the whole `if let Ok(..)` is skipped, and a perfectly good fit is
                 // refused to the non-convergence sentinel (#1095: public
-                // sae_manifold_fit K=1 circle → GamError at every N).
+                // sae_manifold_fit K=1 circle → GamfitError at every N).
                 //
                 // Ensure the stationary EVIDENCE system opts into per-row spectral
                 // discovery (installing an empty-per-row `row_gauge_deflation` is

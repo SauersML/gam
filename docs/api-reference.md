@@ -649,7 +649,9 @@ topical guides for narrative explanations.
 
 ## Exceptions
 
-::: gamfit.GamError
+See [Exceptions](exceptions.md) for the hierarchy and when each is raised.
+
+::: gamfit.GamfitError
     options:
       show_root_heading: true
       heading_level: 3
@@ -659,12 +661,22 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.SchemaMismatchError
+::: gamfit.DataError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PredictionError
+::: gamfit.ConvergenceError
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.NotFittedError
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.InternalError
     options:
       show_root_heading: true
       heading_level: 3
@@ -674,22 +686,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.AloError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.ArrowSchurError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.BasisError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.CacheStoreError
     options:
       show_root_heading: true
       heading_level: 3
@@ -704,27 +701,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.CorrectedCovarianceError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.CubicCellKernelError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.CustomFamilyError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.DataError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.DeviationRuntimeError
+::: gamfit.DictionaryConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
@@ -735,16 +712,6 @@ topical guides for narrative explanations.
       heading_level: 3
 
 ::: gamfit.FitConvergenceError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.InnerModeConvergenceError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.FitError
     options:
       show_root_heading: true
       heading_level: 3
@@ -769,22 +736,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.FittedModelError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.GamlssError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.GeometryError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.GpuError
     options:
       show_root_heading: true
       heading_level: 3
@@ -799,17 +751,12 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.HmcError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.IdentifiabilityCompilerError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.IllConditionedError
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.InnerModeConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
@@ -834,47 +781,12 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.JointPenaltyError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.LatentSurvivalError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.LayoutError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.LinearAlgebraError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.LinearSystemSolveError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.LognormalKernelError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.MapUniquenessError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.MatrixError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.MatrixMaterializationError
     options:
       show_root_heading: true
       heading_level: 3
@@ -890,11 +802,6 @@ topical guides for narrative explanations.
       heading_level: 3
 
 ::: gamfit.MonotoneRootError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.OuterStrategyError
     options:
       show_root_heading: true
       heading_level: 3
@@ -919,7 +826,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.PredictInputError
+::: gamfit.PredictionError
     options:
       show_root_heading: true
       heading_level: 3
@@ -929,52 +836,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.ScaleDesignError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.SmoothError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.SurvivalConstructionError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.SurvivalError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.SurvivalLocationScaleError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.SurvivalMarginalSlopeError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.SurvivalPredictError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.TermBuilderError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.TransformationNormalError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.UnsupportedLinkError
+::: gamfit.SchemaMismatchError
     options:
       show_root_heading: true
       heading_level: 3

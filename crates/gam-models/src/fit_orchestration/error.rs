@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gam_problem::{CustomFamilyError, EstimationError, FailureCategory};
+use gam_problem::{CustomFamilyError, ErrorCategory, EstimationError, FailureCategory};
 
 use crate::survival::marginal_slope::SurvivalMarginalSlopeError;
 
@@ -125,6 +125,15 @@ pub enum WorkflowError {
     TransformationNormalConflict {
         conflict: TransformationNormalConflict,
     },
+    /// Term construction refused the formula's terms or their data. The typed
+    /// source keeps its category ([`TermBuilderError::error_category`]), so a
+    /// categorical column used as a smooth coordinate reaches every front end
+    /// as a formula error naming the column.
+    ///
+    /// [`TermBuilderError::error_category`]: gam_terms::term_builder::TermBuilderError::error_category
+    TermBuilder(gam_terms::term_builder::TermBuilderError),
+    /// The data layer refused a cell or table (unparseable, non-finite, empty).
+    Data(gam_data::DataError),
 }
 
 impl std::fmt::Display for WorkflowError {
@@ -215,6 +224,8 @@ impl std::fmt::Display for WorkflowError {
                 };
                 write!(f, "transformation_normal cannot be combined with {control}")
             }
+            WorkflowError::TermBuilder(source) => std::fmt::Display::fmt(source, f),
+            WorkflowError::Data(source) => std::fmt::Display::fmt(source, f),
         }
     }
 }
@@ -233,6 +244,9 @@ impl std::error::Error for WorkflowError {
             | WorkflowError::ColumnNotFound { .. }
             | WorkflowError::MarginalSlopeLink { .. }
             | WorkflowError::TransformationNormalConflict { .. } => None,
+            // Render exactly their source, so they are transparent to the chain.
+            WorkflowError::TermBuilder(source) => source.source(),
+            WorkflowError::Data(source) => source.source(),
         }
     }
 }
@@ -256,7 +270,30 @@ impl WorkflowError {
                  and that the formula terms match."
                     .to_string(),
             ),
+            Self::Data(source) => source.advice(),
             _ => None,
+        }
+    }
+
+    /// Who has to act on this failure: the one category every front end
+    /// classifies it by (Python exception base, CLI exit code). Exhaustive with
+    /// no wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> ErrorCategory {
+        match self {
+            Self::Fit(failure) => failure.error_category(),
+            Self::SpatialUnderresolved { refit_failure, .. } => refit_failure
+                .as_deref()
+                .map_or(ErrorCategory::Convergence, Self::error_category),
+            Self::TermBuilder(source) => source.error_category(),
+            Self::Data(source) => source.error_category(),
+            Self::SchemaMismatch { .. } | Self::InvalidData { .. } => ErrorCategory::Data,
+            Self::InvalidConfig { .. }
+            | Self::MissingDependency { .. }
+            | Self::FormulaDsl { .. }
+            | Self::ColumnNotFound { .. }
+            | Self::MarginalSlopeLink { .. }
+            | Self::TransformationNormalConflict { .. } => ErrorCategory::Formula,
         }
     }
 
@@ -280,7 +317,9 @@ impl WorkflowError {
             // A marginal-slope link the fit cannot declare: a configuration refusal.
             | Self::MarginalSlopeLink { .. }
             // Controls that select another response model: a configuration refusal.
-            | Self::TransformationNormalConflict { .. } => FailureCategory::Input,
+            | Self::TransformationNormalConflict { .. }
+            | Self::TermBuilder(_)
+            | Self::Data(_) => FailureCategory::Input,
         }
     }
 
@@ -309,6 +348,8 @@ impl WorkflowError {
             Self::TransformationNormalConflict { .. } => {
                 "WorkflowError::TransformationNormalConflict"
             }
+            Self::TermBuilder(source) => source.variant_name(),
+            Self::Data(source) => source.variant_name(),
         }
     }
 }
@@ -523,6 +564,22 @@ impl FitFailure {
             Self::SurvivalMarginalSlope(err) => err.failure_category(),
             Self::Workflow(err) => err.failure_category(),
             Self::Raised { category, .. } => *category,
+        }
+    }
+
+    /// Who has to act on the error this failure ends in; see
+    /// [`WorkflowError::error_category`].
+    #[must_use]
+    pub fn error_category(&self) -> ErrorCategory {
+        match self {
+            Self::Context { source, .. } | Self::Annotated { source, .. } => {
+                source.error_category()
+            }
+            Self::Estimation(err) => err.error_category(),
+            Self::CustomFamily(err) => err.error_category(),
+            Self::SurvivalMarginalSlope(err) => err.failure_category().error_category(),
+            Self::Workflow(err) => err.error_category(),
+            Self::Raised { category, .. } => category.error_category(),
         }
     }
 
@@ -1076,9 +1133,8 @@ impl From<gam_terms::inference::formula_dsl::FormulaDslError> for WorkflowError 
 /// preserves the structured fields (name, role, available, similar,
 /// tsv_hint) through to the FFI boundary so `gam-pyffi` can raise a
 /// `gamfit.ColumnNotFoundError` with attributes set from the payload —
-/// not from re-parsed prose. Other variants degrade into the closest
-/// generic workflow bucket; the dedicated typed channels for those
-/// failure classes can be added incrementally as their dispatch arrives.
+/// not from re-parsed prose. Every other variant is kept whole, so its
+/// [`ErrorCategory`] survives to the front ends.
 impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
     fn from(err: gam_terms::term_builder::TermBuilderError) -> Self {
         use gam_terms::term_builder::TermBuilderError;
@@ -1096,12 +1152,7 @@ impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
                 similar,
                 tsv_hint,
             },
-            TermBuilderError::MissingColumn { reason }
-            | TermBuilderError::MalformedFormula { reason } => Self::SchemaMismatch { reason },
-            TermBuilderError::IncompatibleConfig { reason }
-            | TermBuilderError::InvalidOption { reason }
-            | TermBuilderError::UnsupportedFeature { reason }
-            | TermBuilderError::DegenerateData { reason } => Self::InvalidConfig { reason },
+            other => Self::TermBuilder(other),
         }
     }
 }
@@ -1109,10 +1160,8 @@ impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
 /// Typed lift from leaf data-layer errors. `DataError::ColumnNotFound` is
 /// the variant of immediate interest — it preserves the structured fields
 /// so `gam-pyffi` can dispatch to `ColumnNotFoundError` without parsing
-/// human text. Other `DataError` variants degrade to the appropriate
-/// workflow bucket (`SchemaMismatch` for row/column shape problems,
-/// `InvalidConfig` for parse / encoding / empty / invalid-value sources)
-/// since they don't have a dedicated structured destination yet.
+/// human text. Schema and degenerate-column refusals take their workflow
+/// buckets; every other variant is kept whole under [`WorkflowError::Data`].
 impl From<gam_data::DataError> for WorkflowError {
     fn from(err: gam_data::DataError) -> Self {
         use gam_data::DataError;
@@ -1131,10 +1180,10 @@ impl From<gam_data::DataError> for WorkflowError {
                 tsv_hint,
             },
             DataError::SchemaMismatch { reason } => Self::SchemaMismatch { reason },
-            DataError::ParseError { reason }
-            | DataError::EncodingFailure { reason }
-            | DataError::EmptyInput { reason }
-            | DataError::InvalidValue { reason } => Self::InvalidConfig { reason },
+            other @ (DataError::ParseError { .. }
+            | DataError::EncodingFailure { .. }
+            | DataError::EmptyInput { .. }
+            | DataError::InvalidValue { .. }) => Self::Data(other),
             DataError::DegenerateColumn { column, problem } => {
                 Self::InvalidData { column, problem }
             }

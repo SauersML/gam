@@ -57,7 +57,7 @@ def test_circle_cylinder_ambient_dim_matches_rust_source_of_truth() -> None:
     """Regression for issue #397: the Python descriptor's documented contract
     must agree with the Rust manifold, which uses the 1-D angle
     parameterization (ambient == intrinsic). Following the old ``R^2``
-    "unit 2-vector" docstring raised a hard ``GamError``."""
+    "unit 2-vector" docstring raised a hard ``GamfitError``."""
     from gamfit.manifolds import CylinderManifold
 
     circle = ManifoldCircle()

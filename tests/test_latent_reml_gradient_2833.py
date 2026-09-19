@@ -88,7 +88,7 @@ def test_cached_adjoint_cannot_drop_an_identity_penalty_mode():
     fit = gamfit.gaussian_reml_fit(x, y, penalty)
     assert fit["cache_penalty_rank"] == 5
     corrupted = dict(fit, cache_penalty_rank=4, cache_nullity=1)
-    with pytest.raises(gamfit.GamError, match="null modes must be exactly zero"):
+    with pytest.raises(gamfit.GamfitError, match="null modes must be exactly zero"):
         gamfit.gaussian_reml_fit_backward(
             x, y, penalty, grad_reml_score=1.0, forward_state=corrupted
         )

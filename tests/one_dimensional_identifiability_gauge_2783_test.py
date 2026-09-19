@@ -190,7 +190,7 @@ def test_unsatisfiable_or_unknown_gauges_are_refused_with_a_reason(
     formula: str, expected: str
 ) -> None:
     data = _data(120)
-    with pytest.raises(gamfit.GamError) as excinfo:
+    with pytest.raises(gamfit.GamfitError) as excinfo:
         _fit(formula, data)
     assert expected in str(excinfo.value), (
         f"{formula} should be refused with a message naming {expected!r}, "

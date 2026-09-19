@@ -2618,7 +2618,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         persistent_warm_start_root: None,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("main formula should reject z-column reuse");
+    .expect_err("main formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("main formula"), "{err}");
@@ -2664,7 +2665,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         persistent_warm_start_root: None,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("slope formula should reject z-column reuse");
+    .expect_err("slope formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("slope_formula"), "{err}");
@@ -7604,7 +7606,7 @@ fn run_fit_request_document(data: PathBuf, out: PathBuf, document: &str) -> Resu
     args.formula_positional = None;
     args.predict_noise = None;
     args.survival_likelihood = None;
-    run_fit(args)
+    run_fit(args).map_err(|error| error.to_string())
 }
 
 /// Integration test: a small survival dataset (6 rows, intercept-only

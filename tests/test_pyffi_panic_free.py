@@ -19,7 +19,7 @@ def test_manifold_constructors_reject_nonpositive_dimensions_with_gam_error(
     constructor: object, keyword: str, value: int, message: str
 ) -> None:
     """Bad dimensions must raise, rather than reaching indexing-heavy geometry code."""
-    with pytest.raises(gamfit.GamError, match=message):
+    with pytest.raises(gamfit.GamfitError, match=message):
         constructor(**{keyword: value})
 
 
@@ -35,6 +35,6 @@ def test_manifold_dimension_setters_preserve_valid_boundary(
     manifold: object, attribute: str
 ) -> None:
     """Mutation cannot bypass the same constructor validation."""
-    with pytest.raises(gamfit.GamError, match="must be a positive integer .*got 0"):
+    with pytest.raises(gamfit.GamfitError, match="must be a positive integer .*got 0"):
         setattr(manifold, attribute, 0)
     assert getattr(manifold, attribute) == 2

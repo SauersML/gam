@@ -1024,7 +1024,7 @@ def fit(
         For missing response-geometry fields, invalid penalty targets, invalid
         Fisher-Rao blocks, or formula/data mismatches surfaced before the Rust
         fit.
-    GamError
+    GamfitError
         Rust engine errors are mapped into the typed gamfit exception
         hierarchy.
     """
@@ -1430,7 +1430,7 @@ def loads(model_bytes: bytes) -> Any:
 
     Raises
     ------
-    GamError
+    GamfitError
         If the payload is malformed or incompatible with the current engine.
 
     Examples
@@ -1616,7 +1616,7 @@ def explain_error(exc: BaseException) -> str:
 
     Inspects the exception type and returns a one-line suggestion tailored to
     the gamfit error hierarchy (:class:`FormulaError`,
-    :class:`SchemaMismatchError`, :class:`PredictionError`, :class:`GamError`,
+    :class:`SchemaMismatchError`, :class:`PredictionError`, :class:`GamfitError`,
     :class:`RustExtensionUnavailableError`). Unrecognized exceptions fall back
     to a generic message.
 
@@ -1634,7 +1634,7 @@ def explain_error(exc: BaseException) -> str:
     --------
     >>> try:
     ...     gamfit.fit(df, "y ~ s(nope)")
-    ... except gamfit.GamError as exc:
+    ... except gamfit.GamfitError as exc:
     ...     print(gamfit.explain_error(exc))
     Check the formula syntax and confirm every referenced column exists.
     """
@@ -1643,7 +1643,7 @@ def explain_error(exc: BaseException) -> str:
     from ._exceptions import (
         ColumnNotFoundError,
         FormulaError,
-        GamError,
+        GamfitError,
         PredictionError,
         SchemaMismatchError,
     )
@@ -1682,7 +1682,7 @@ def explain_error(exc: BaseException) -> str:
         return "Compare the serving data with the training schema using model.check(...)."
     if isinstance(exc, PredictionError):
         return "Prediction failed. Validate the new data and confirm the fitted model is supported by the Python binding."
-    if isinstance(exc, GamError):
+    if isinstance(exc, GamfitError):
         return "The Rust engine returned an error. Inspect the exception message for the underlying failure detail."
     return "Unexpected error. Inspect the full traceback and the original exception message."
 

@@ -6,9 +6,9 @@ from typing import Any, TypeVar
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.utils.validation import check_is_fitted
 
 from ._binding import rust_module
+from ._exceptions import NotFittedError
 from ._api import fit as fit_model
 from ._model import Model
 from ._tables import attach_target, detect_table_kind, table_columns
@@ -55,6 +55,20 @@ def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str
     return bound_columns, fit_formula, list(feature_names)
 
 
+def _require_fitted(estimator: BaseEstimator) -> None:
+    """Raise :class:`gamfit.NotFittedError` unless ``fit`` has run.
+
+    ``gamfit.NotFittedError`` has the bases of scikit-learn's own
+    ``NotFittedError`` (``ValueError`` and ``AttributeError``), so handlers
+    written for either catch it.
+    """
+    if not hasattr(estimator, "model_"):
+        raise NotFittedError(
+            f"This {type(estimator).__name__} instance is not fitted yet. "
+            "Call 'fit' with appropriate arguments before using this estimator."
+        )
+
+
 @dataclass
 class _BaseGAMEstimator(BaseEstimator):
     formula: str
@@ -79,11 +93,11 @@ class _BaseGAMEstimator(BaseEstimator):
         return self
 
     def summary(self) -> Any:
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         return self.model_.summary()
 
     def report(self, path: str) -> Any:
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         if not isinstance(self.model_, Model):
             raise TypeError(
                 "report() is only supported for scalar GAM models; "
@@ -92,7 +106,7 @@ class _BaseGAMEstimator(BaseEstimator):
         return self.model_.report(path)
 
     def check(self, X: Any) -> Any:
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         if not isinstance(self.model_, Model):
             raise TypeError(
                 "check() is only supported for scalar GAM models; "
@@ -180,7 +194,7 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
         >>> reg.predict(X_test)[:3]
         array([1.02, 0.98, 1.41])
         """
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         predicted = self.model_.predict(X, return_type="dict")
         return np.asarray(predicted["posterior_mean"], dtype=float)
 
@@ -346,7 +360,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         >>> clf.predict_proba(X_test).shape
         (100, 2)
         """
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         serving = self._strip_response_column(X)
         predicted = self.model_.predict(serving, return_type="dict")
         positive = np.clip(
@@ -364,7 +378,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         needed to predict, yet callers naturally re-serve the SAME frame (which
         still holds the ORIGINAL string / ``{1, 2}`` / ``{-1, +1}`` labels);
         validated against the ``{0, 1}`` schema those labels are rejected with a
-        ``GamError``. Dropping the column keeps inference consistent with
+        ``GamfitError``. Dropping the column keeps inference consistent with
         fitting. The carrier kind is preserved so downstream dtype-based
         categorical inference is unchanged; only the response column goes.
 
@@ -443,7 +457,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         >>> clf.metrics(X_test, y_test)["auc"]
         0.91
         """
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         observed = self._encode_labels(y)
         positive = self.predict_proba(X)[:, 1].astype(float)
         train_prev = float(np.mean(observed)) if observed.size else 0.0
@@ -488,7 +502,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         >>> clf.score(X_test, y_test)
         0.91
         """
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         observed = self._encode_labels(y)
         positive = self.predict_proba(X)[:, 1].astype(float)
         if sample_weight is None:

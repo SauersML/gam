@@ -86,7 +86,7 @@ def test_nonconvergence_is_typed_evidence_with_resumable_checkpoint_879():
 @pytest.mark.parametrize("grad_tol", [np.inf, -np.inf, np.nan, 0.0, -1.0])
 def test_invalid_stationarity_tolerance_cannot_certify_a_fit_954(grad_tol):
     n, t, y, centers, penalty = _problem()
-    with pytest.raises(gamfit.GamError, match="grad_tol must be finite and positive"):
+    with pytest.raises(gamfit.GamfitError, match="grad_tol must be finite and positive"):
         gamfit.gaussian_reml_optimize_latent(
             y=y,
             n_obs=n,

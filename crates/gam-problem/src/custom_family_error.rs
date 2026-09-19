@@ -1636,6 +1636,19 @@ impl CustomFamilyError {
         }
     }
 
+    /// Who has to act on this failure: the [`crate::ErrorCategory`] every
+    /// front end classifies it by. A configuration the family does not
+    /// implement is a defect of the request; everything else follows its
+    /// [`Self::failure_category`].
+    #[must_use]
+    pub fn error_category(&self) -> crate::ErrorCategory {
+        match self {
+            Self::UnsupportedConfiguration { .. } => crate::ErrorCategory::Formula,
+            Self::OuterSmoothingFailed { outer_error, .. } => outer_error.error_category(),
+            _ => self.failure_category().error_category(),
+        }
+    }
+
     /// The `Enum::Variant` name of this error, the one a front end prints
     /// beside the message (#2937). A whole-search refusal is named by the
     /// outer search's verdict it carries.

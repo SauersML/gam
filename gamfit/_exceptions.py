@@ -1,154 +1,101 @@
 """Public exception hierarchy for gamfit.
 
-Every gamfit exception is defined in Rust via ``pyo3::create_exception!``
-(see ``crates/gam-pyffi/src/lib.rs``) and re-exported here under its public
-``gamfit.*`` name. The class identity caught by user code with
-``except gamfit.RemlConvergenceError`` is exactly the same Python type
-object that the Rust extension constructs via ``RemlConvergenceError::new_err``;
-there is no parallel Python-defined class shadowing the Rust one.
+Every gamfit exception is defined in Rust (``crates/gam-pyffi/src/ffi/ffi_errors.rs``)
+and re-exported here under its public ``gamfit.*`` name. The class caught by
+``except gamfit.RemlConvergenceError`` is the same type object the Rust extension
+constructs; there is no parallel Python-defined class.
 
-Architecture (issue #343):
+The engine classifies every failure into one ``ErrorCategory``
+(``crates/gam-spec/src/error_category.rs``). The FFI boundary raises a class
+under the category's base, and the CLI exits with the category's code, so both
+front ends classify a failure identically without reading its message::
 
-* The Rust engine has rich ``thiserror``-typed error enums.
-  ``EstimationError`` (in ``src/solver/estimate.rs``) has ~20 variants;
-  ``crates/gam-pyffi/src/lib.rs::estimation_error_to_pyerr`` dispatches
-  each variant to its corresponding subclass below. No ``err.to_string()``
-  flattening, no message-regex reclassification.
-* ``GamError`` inherits from :class:`ValueError`, so callers can catch either
-  the package umbrella or Python's standard value-contract exception.
-* The remaining ``Result<_, String>`` error paths at the FFI boundary
-  (formula validation, schema-mismatch during predict, basis builders
-  not wrapped in ``EstimationError``, etc.) still flow through
-  :func:`map_exception`. They will be migrated to typed dispatch one enum at a
-  time; until then,
-  NEW error variants for already-typed enums MUST extend the Rust-side
-  dispatcher, never the regex classifier.
+    GamfitError(Exception)
+    ├── FormulaError(GamfitError, ValueError)      the request: formula, option, column name
+    ├── DataError(GamfitError, ValueError)         the data cannot support the request
+    ├── ConvergenceError(GamfitError, RuntimeError) a valid problem whose solve did not finish
+    ├── NotFittedError(GamfitError, ValueError, AttributeError)
+    └── InternalError(GamfitError, RuntimeError)   an engine defect; please report it
+
+``NotFittedError`` has exactly the bases of ``sklearn.exceptions.NotFittedError``,
+so ``except ValueError`` / ``except AttributeError`` handlers written for scikit-learn
+catch it, without gamfit importing scikit-learn.
 """
 
 from __future__ import annotations
 
 from ._binding import RustExtensionUnavailableError, rust_module
 
-# Pull every gamfit exception class out of the Rust extension. This
-# happens at import time so the public ``gamfit.GamError`` name is the
-# same type object as ``gam._rust.GamError``.
 _rust = rust_module()
 
-GamError: type = _rust.GamError
+# The five category bases.
+GamfitError: type = _rust.GamfitError
 FormulaError: type = _rust.FormulaError
-# `ColumnNotFoundError` subclasses `FormulaError` (referencing a missing
-# column is a formula authoring error). Instances carry structured
-# attributes set by the Rust FFI boundary at raise time — `column` (str),
-# `role` (Optional[str]), `available` (list[str]), `similar` (list[str]),
-# `tsv_hint` (bool) — so `explain_error(...)` and any other consumer can
-# read the failure context without parsing the formatted message.
+DataError: type = _rust.DataError
+ConvergenceError: type = _rust.ConvergenceError
+NotFittedError: type = _rust.NotFittedError
+InternalError: type = _rust.InternalError
+
+# FormulaError subclasses. `ColumnNotFoundError` instances carry `column`,
+# `role`, `available`, `similar` and `tsv_hint` attributes set at raise time.
 ColumnNotFoundError: type = _rust.ColumnNotFoundError
+InvalidSpecificationError: type = _rust.InvalidSpecificationError
+InvalidConfigurationError: type = _rust.InvalidConfigurationError
+BasisError: type = _rust.BasisError
+MissingDependencyError: type = _rust.MissingDependencyError
+
+# DataError subclasses.
 SchemaMismatchError: type = _rust.SchemaMismatchError
 PredictionError: type = _rust.PredictionError
+PerfectSeparationError: type = _rust.PerfectSeparationError
+ModelOverparameterizedError: type = _rust.ModelOverparameterizedError
+IllConditionedError: type = _rust.IllConditionedError
+InvalidInputError: type = _rust.InvalidInputError
+GeometryError: type = _rust.GeometryError
+FitInputError: type = _rust.FitInputError
 
-# EstimationError variant subclasses. Each one corresponds to exactly
-# one variant of ``gam::estimate::EstimationError``; the Rust side
-# selects the right class via ``estimation_error_to_pyerr``.
-BasisError: type = _rust.BasisError
+# ConvergenceError subclasses. A fit's solve failure raises the class of its
+# fit category (#2937); instances carry `variant`, `category`, `error_category`,
+# `causes` and `fields`.
+FitConvergenceError: type = _rust.FitConvergenceError
+PirlsConvergenceError: type = _rust.PirlsConvergenceError
+RemlConvergenceError: type = _rust.RemlConvergenceError
+InnerModeConvergenceError: type = _rust.InnerModeConvergenceError
+FitSeedError: type = _rust.FitSeedError
+FitNumericalError: type = _rust.FitNumericalError
 LinearSystemSolveError: type = _rust.LinearSystemSolveError
 EigendecompositionError: type = _rust.EigendecompositionError
 PenaltySpectrumError: type = _rust.PenaltySpectrumError
 ParameterConstraintError: type = _rust.ParameterConstraintError
-PirlsConvergenceError: type = _rust.PirlsConvergenceError
-PerfectSeparationError: type = _rust.PerfectSeparationError
 HessianNotPositiveDefiniteError: type = _rust.HessianNotPositiveDefiniteError
-RemlConvergenceError: type = _rust.RemlConvergenceError
+MonotoneRootError: type = _rust.MonotoneRootError
+IntegrationError: type = _rust.IntegrationError
+CalibratorError: type = _rust.CalibratorError
 DictionaryConvergenceError: type = _rust.DictionaryConvergenceError
+
+# InternalError subclasses.
+FitInvariantError: type = _rust.FitInvariantError
 GradientUnavailableError: type = _rust.GradientUnavailableError
 LayoutError: type = _rust.LayoutError
-ModelOverparameterizedError: type = _rust.ModelOverparameterizedError
-IllConditionedError: type = _rust.IllConditionedError
-InvalidInputError: type = _rust.InvalidInputError
-MonotoneRootError: type = _rust.MonotoneRootError
-CalibratorError: type = _rust.CalibratorError
-InvalidSpecificationError: type = _rust.InvalidSpecificationError
-
-# Remaining engine error enum subclasses (issue #343 follow-up). Each one
-# corresponds to a `pub enum *Error` in `src/`; the Rust side selects the
-# right class via the per-enum `*_error_to_pyerr` dispatcher.
-GeometryError: type = _rust.GeometryError
-MatrixMaterializationError: type = _rust.MatrixMaterializationError
-GpuError: type = _rust.GpuError
-LinearAlgebraError: type = _rust.LinearAlgebraError
-MatrixError: type = _rust.MatrixError
-CacheStoreError: type = _rust.CacheStoreError
-SmoothError: type = _rust.SmoothError
-ArrowSchurError: type = _rust.ArrowSchurError
-OuterStrategyError: type = _rust.OuterStrategyError
-TermBuilderError: type = _rust.TermBuilderError
-CorrectedCovarianceError: type = _rust.CorrectedCovarianceError
-PredictInputError: type = _rust.PredictInputError
-HmcError: type = _rust.HmcError
-AloError: type = _rust.AloError
-SurvivalError: type = _rust.SurvivalError
-CubicCellKernelError: type = _rust.CubicCellKernelError
-SurvivalConstructionError: type = _rust.SurvivalConstructionError
-TransformationNormalError: type = _rust.TransformationNormalError
-CustomFamilyError: type = _rust.CustomFamilyError
-GamlssError: type = _rust.GamlssError
-SurvivalMarginalSlopeError: type = _rust.SurvivalMarginalSlopeError
-LatentSurvivalError: type = _rust.LatentSurvivalError
-SurvivalPredictError: type = _rust.SurvivalPredictError
-DeviationRuntimeError: type = _rust.DeviationRuntimeError
-DataError: type = _rust.DataError
-FittedModelError: type = _rust.FittedModelError
-LognormalKernelError: type = _rust.LognormalKernelError
-ScaleDesignError: type = _rust.ScaleDesignError
-IdentifiabilityCompilerError: type = _rust.IdentifiabilityCompilerError
-JointPenaltyError: type = _rust.JointPenaltyError
-SurvivalLocationScaleError: type = _rust.SurvivalLocationScaleError
-MapUniquenessError: type = _rust.MapUniquenessError
-UnsupportedLinkError: type = _rust.UnsupportedLinkError
-InvalidConfigurationError: type = _rust.InvalidConfigurationError
-MissingDependencyError: type = _rust.MissingDependencyError
-
-# Fit-failure categories (#2937). A failure of a fit's solve raises the class of
-# its category; instances carry `variant`, `category`, `causes` and `fields`. `FitError`
-# itself is a failure with no category to claim. `PirlsConvergenceError`,
-# `RemlConvergenceError` and `InnerModeConvergenceError` (gam#2943) are
-# `FitConvergenceError` subclasses, and `IntegrationError` is now raised only for
-# genuine quadrature failures.
-FitError: type = _rust.FitError
-FitConvergenceError: type = _rust.FitConvergenceError
-InnerModeConvergenceError: type = _rust.InnerModeConvergenceError
-FitSeedError: type = _rust.FitSeedError
-FitInvariantError: type = _rust.FitInvariantError
-FitInputError: type = _rust.FitInputError
-FitNumericalError: type = _rust.FitNumericalError
-IntegrationError: type = _rust.IntegrationError
 
 
 def map_exception(exc: BaseException) -> BaseException:
     """Normalize an exception caught at the gamfit Python boundary.
 
-    Typed errors raised by the Rust extension (any subclass of
-    :class:`GamError`) pass through unchanged — the FFI boundary already
-    selected the correct subclass via variant dispatch
-    (``estimation_error_to_pyerr``, ``workflow_error_to_pyerr``,
-    ``geometry_error_to_pyerr``, etc. in ``crates/gam-pyffi/src/lib.rs``),
-    so there is nothing to reclassify. The message-regex classifier is gone
-    (issue #343); structured engine errors no longer
-    round-trip through stringly-typed text.
+    Errors raised by the Rust extension (any :class:`GamfitError`) pass through
+    unchanged: the FFI boundary already chose the class from the engine's
+    ``ErrorCategory``, so there is nothing to reclassify.
 
-    ``TypeError`` / ``LookupError`` / ``ArithmeticError`` describe
-    Python-native contract violations rather than gamfit engine errors,
-    so they pass through unwrapped. Every other ``ValueError`` is
-    promoted to :class:`GamError` to preserve the documented
-    ``except gamfit.GamError`` umbrella from issue #330 — this is a
-    type-hierarchy widening, never a narrowing, because ``GamError``
-    inherits from ``ValueError``.
+    ``TypeError`` / ``LookupError`` / ``ArithmeticError`` describe Python-native
+    contract violations and pass through unwrapped. A remaining ``ValueError``
+    comes from argument validation in the Python layer, which is a request the
+    caller got wrong, so it becomes :class:`FormulaError` (still a
+    ``ValueError``, so existing handlers keep catching it).
     """
-    if isinstance(exc, RustExtensionUnavailableError):
-        return exc
-    if isinstance(exc, GamError):
+    if isinstance(exc, (RustExtensionUnavailableError, GamfitError)):
         return exc
     if isinstance(exc, (TypeError, LookupError, ArithmeticError)):
         return exc
     if isinstance(exc, ValueError):
-        return GamError(str(exc))
+        return FormulaError(str(exc))
     return exc

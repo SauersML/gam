@@ -117,6 +117,20 @@ def normalize_table(data: Any, *, required_columns=None) -> tuple[list[str], Any
         # schema. `drop=True` preserves every data column and pandas' copy-on-write
         # frame keeps this a metadata operation rather than a numeric-table copy.
         arrow_source = data.reset_index(drop=True) if kind == "pandas" else data
+        if kind == "pandas":
+            # A pandas `object` column is categorical (`categorical_dtype_columns`).
+            # Export it as Arrow strings so the Rust encoder reads it as labels,
+            # instead of letting pyarrow guess a type — which raises a bare
+            # `ArrowInvalid` for a numeric column holding one stray string and
+            # disagrees with the non-Arrow path for an all-number object column.
+            objects = [
+                name for name in arrow_source.columns
+                if arrow_source[name].dtype == object
+            ]
+            if objects:
+                arrow_source = arrow_source.astype(
+                    {name: "string" for name in objects}
+                )
         return (
             headers,
             rust_module().encoded_table_from_arrow(headers, arrow_source),

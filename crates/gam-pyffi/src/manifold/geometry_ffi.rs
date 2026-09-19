@@ -4502,219 +4502,33 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam_runtime::process_monitor::start();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    // gamfit exception hierarchy (see the comment block at the
-    // `create_exception!` definitions above and issue #343). Registering
-    // the classes here makes them addressable as `gam._rust.GamError`,
-    // `gam._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
+    // gamfit exception hierarchy (see `ffi/ffi_errors.rs`). Registering the
+    // classes here makes them addressable as `gamfit._rust.GamfitError`,
+    // `gamfit._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
     // re-exports each one under its public `gamfit.*` name so the class
-    // identity caught by `pytest.raises(gamfit.RemlConvergenceError)`
-    // and constructed by `RemlConvergenceError::new_err(...)` on the
-    // Rust side is exactly the same object.
-    module.add("GamError", module.py().get_type::<GamError>())?;
-    module.add("FormulaError", module.py().get_type::<FormulaError>())?;
-    module.add(
-        "ColumnNotFoundError",
-        module.py().get_type::<ColumnNotFoundError>(),
-    )?;
-    module.add(
-        "SchemaMismatchError",
-        module.py().get_type::<SchemaMismatchError>(),
-    )?;
-    module.add("PredictionError", module.py().get_type::<PredictionError>())?;
-    module.add("BasisError", module.py().get_type::<BasisError>())?;
-    module.add(
-        "LinearSystemSolveError",
-        module.py().get_type::<LinearSystemSolveError>(),
-    )?;
-    module.add(
-        "EigendecompositionError",
-        module.py().get_type::<EigendecompositionError>(),
-    )?;
-    module.add(
-        "PenaltySpectrumError",
-        module.py().get_type::<PenaltySpectrumError>(),
-    )?;
-    module.add(
-        "ParameterConstraintError",
-        module.py().get_type::<ParameterConstraintError>(),
-    )?;
-    module.add(
-        "PirlsConvergenceError",
-        module.py().get_type::<PirlsConvergenceError>(),
-    )?;
-    module.add(
-        "PerfectSeparationError",
-        module.py().get_type::<PerfectSeparationError>(),
-    )?;
-    module.add(
-        "HessianNotPositiveDefiniteError",
-        module.py().get_type::<HessianNotPositiveDefiniteError>(),
-    )?;
-    module.add(
-        "RemlConvergenceError",
-        module.py().get_type::<RemlConvergenceError>(),
-    )?;
-    module.add(
-        "DictionaryConvergenceError",
-        module.py().get_type::<DictionaryConvergenceError>(),
-    )?;
-    module.add(
-        "GradientUnavailableError",
-        module.py().get_type::<GradientUnavailableError>(),
-    )?;
-    module.add("LayoutError", module.py().get_type::<LayoutError>())?;
-    module.add(
-        "ModelOverparameterizedError",
-        module.py().get_type::<ModelOverparameterizedError>(),
-    )?;
-    module.add(
-        "IllConditionedError",
-        module.py().get_type::<IllConditionedError>(),
-    )?;
-    module.add(
-        "InvalidInputError",
-        module.py().get_type::<InvalidInputError>(),
-    )?;
-    module.add(
-        "MonotoneRootError",
-        module.py().get_type::<MonotoneRootError>(),
-    )?;
-    module.add("CalibratorError", module.py().get_type::<CalibratorError>())?;
-    module.add(
-        "InvalidSpecificationError",
-        module.py().get_type::<InvalidSpecificationError>(),
-    )?;
-    // Remaining engine error enum subclasses (issue #343 follow-up).
-    module.add("GeometryError", module.py().get_type::<GeometryError>())?;
-    module.add(
-        "MatrixMaterializationError",
-        module.py().get_type::<MatrixMaterializationError>(),
-    )?;
-    module.add("GpuError", module.py().get_type::<GpuError>())?;
-    module.add(
-        "LinearAlgebraError",
-        module.py().get_type::<LinearAlgebraError>(),
-    )?;
-    module.add("MatrixError", module.py().get_type::<MatrixError>())?;
-    module.add("CacheStoreError", module.py().get_type::<CacheStoreError>())?;
-    module.add("SmoothError", module.py().get_type::<SmoothError>())?;
-    module.add("ArrowSchurError", module.py().get_type::<ArrowSchurError>())?;
-    module.add(
-        "OuterStrategyError",
-        module.py().get_type::<OuterStrategyError>(),
-    )?;
-    module.add(
-        "TermBuilderError",
-        module.py().get_type::<TermBuilderError>(),
-    )?;
-    module.add(
-        "CorrectedCovarianceError",
-        module.py().get_type::<CorrectedCovarianceError>(),
-    )?;
-    module.add(
-        "PredictInputError",
-        module.py().get_type::<PredictInputError>(),
-    )?;
-    module.add("HmcError", module.py().get_type::<HmcError>())?;
-    module.add("AloError", module.py().get_type::<AloError>())?;
-    module.add("SurvivalError", module.py().get_type::<SurvivalError>())?;
-    module.add(
-        "CubicCellKernelError",
-        module.py().get_type::<CubicCellKernelError>(),
-    )?;
-    module.add(
-        "SurvivalConstructionError",
-        module.py().get_type::<SurvivalConstructionError>(),
-    )?;
-    module.add(
-        "TransformationNormalError",
-        module.py().get_type::<TransformationNormalError>(),
-    )?;
-    module.add(
-        "CustomFamilyError",
-        module.py().get_type::<CustomFamilyError>(),
-    )?;
-    module.add("GamlssError", module.py().get_type::<GamlssError>())?;
-    module.add(
-        "SurvivalMarginalSlopeError",
-        module.py().get_type::<SurvivalMarginalSlopeError>(),
-    )?;
-    module.add(
-        "LatentSurvivalError",
-        module.py().get_type::<LatentSurvivalError>(),
-    )?;
-    module.add(
-        "SurvivalPredictError",
-        module.py().get_type::<SurvivalPredictError>(),
-    )?;
-    module.add(
-        "DeviationRuntimeError",
-        module.py().get_type::<DeviationRuntimeError>(),
-    )?;
-    module.add("DataError", module.py().get_type::<DataError>())?;
-    module.add(
-        "FittedModelError",
-        module.py().get_type::<FittedModelError>(),
-    )?;
-    module.add(
-        "LognormalKernelError",
-        module.py().get_type::<LognormalKernelError>(),
-    )?;
-    module.add(
-        "ScaleDesignError",
-        module.py().get_type::<ScaleDesignError>(),
-    )?;
-    module.add(
-        "IdentifiabilityCompilerError",
-        module.py().get_type::<IdentifiabilityCompilerError>(),
-    )?;
-    module.add(
-        "JointPenaltyError",
-        module.py().get_type::<JointPenaltyError>(),
-    )?;
-    module.add(
-        "SurvivalLocationScaleError",
-        module.py().get_type::<SurvivalLocationScaleError>(),
-    )?;
-    module.add(
-        "MapUniquenessError",
-        module.py().get_type::<MapUniquenessError>(),
-    )?;
-    module.add(
-        "UnsupportedLinkError",
-        module.py().get_type::<UnsupportedLinkError>(),
-    )?;
-    module.add(
-        "InvalidConfigurationError",
-        module.py().get_type::<InvalidConfigurationError>(),
-    )?;
-    module.add(
-        "MissingDependencyError",
-        module.py().get_type::<MissingDependencyError>(),
-    )?;
-    module.add(
-        "IntegrationError",
-        module.py().get_type::<IntegrationError>(),
-    )?;
-    module.add("FitError", module.py().get_type::<FitError>())?;
-    module.add(
-        "FitConvergenceError",
-        module.py().get_type::<FitConvergenceError>(),
-    )?;
-    module.add(
-        "InnerModeConvergenceError",
-        module.py().get_type::<InnerModeConvergenceError>(),
-    )?;
-    module.add("FitSeedError", module.py().get_type::<FitSeedError>())?;
-    module.add(
-        "FitInvariantError",
-        module.py().get_type::<FitInvariantError>(),
-    )?;
-    module.add("FitInputError", module.py().get_type::<FitInputError>())?;
-    module.add(
-        "FitNumericalError",
-        module.py().get_type::<FitNumericalError>(),
-    )?;
+    // identity caught by `pytest.raises(gamfit.RemlConvergenceError)` and
+    // constructed by `RemlConvergenceError::new_err(...)` on the Rust side is
+    // exactly the same object.
+    macro_rules! register_exceptions {
+        ($($class:ident),+ $(,)?) => {
+            $(module.add(stringify!($class), module.py().get_type::<$class>())?;)+
+        };
+    }
+    register_exceptions!(
+        GamfitError, FormulaError, DataError,
+        ConvergenceError, NotFittedError, InternalError,
+        ColumnNotFoundError, InvalidSpecificationError, InvalidConfigurationError,
+        BasisError, MissingDependencyError, SchemaMismatchError,
+        PredictionError, PerfectSeparationError, ModelOverparameterizedError,
+        IllConditionedError, InvalidInputError, GeometryError,
+        FitInputError, FitConvergenceError, PirlsConvergenceError,
+        RemlConvergenceError, InnerModeConvergenceError, FitSeedError,
+        FitNumericalError, LinearSystemSolveError, EigendecompositionError,
+        PenaltySpectrumError, ParameterConstraintError, HessianNotPositiveDefiniteError,
+        MonotoneRootError, IntegrationError, CalibratorError,
+        DictionaryConvergenceError, FitInvariantError, GradientUnavailableError,
+        LayoutError,
+    );
 
     // #773: `create_exception!` stamps every gamfit exception with
     // `__module__ = "_rust"`, but the compiled extension is importable only as
@@ -4724,10 +4538,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // `ProcessPoolExecutor` worker is masked by an opaque `PicklingError` that
     // hides the real failure and takes down the whole pool. Repoint each
     // exception class at its true importable module so the type round-trips
-    // through pickle. Walking the module dict for `GamError` subclasses keeps
+    // through pickle. Walking the module dict for `GamfitError` subclasses keeps
     // this correct as exceptions are added — no parallel name list to drift.
     {
-        let gam_error = module.py().get_type::<GamError>();
+        let gam_error = module.py().get_type::<GamfitError>();
         for (_name, value) in module.dict().iter() {
             let Ok(ty) = value.cast::<PyType>() else {
                 continue;
@@ -5695,7 +5509,7 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
     let message = error.to_string();
     match error {
         LinearDictionaryError::InvalidInput { .. } => InvalidInputError::new_err(message),
-        LinearDictionaryError::NumericalFailure { .. } => GamError::new_err(message),
+        LinearDictionaryError::NumericalFailure { .. } => FitNumericalError::new_err(message),
         LinearDictionaryError::NonConvergence {
             iterations,
             explained_variance,
