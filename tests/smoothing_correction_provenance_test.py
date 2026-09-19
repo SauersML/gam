@@ -146,7 +146,13 @@ CUBATURE_FOLDS = sorted(set(FIXTURES) - BLOCK_CORRECTION_FOLDS - NO_IDENTIFIED_D
 # Folds whose Laplace Gaussian puts under 1/M of its mass inside the rho domain
 # (an identified but nearly flat direction): the truncated proposal cannot
 # supply M draws within M^2 and says so (#3010).
-PROPOSAL_OUTSIDE_SUPPORT = {"mc_pois_rep0", "cake_fold3", "haberman_k20_fold2", "haberman_k20_fold4"}
+PROPOSAL_OUTSIDE_SUPPORT = {
+    "mc_pois_rep0",
+    "cake_fold0",
+    "cake_fold3",
+    "haberman_k20_fold2",
+    "haberman_k20_fold4",
+}
 OUTSIDE_SUPPORT_REASON = "of its mass inside the rho domain"
 
 
