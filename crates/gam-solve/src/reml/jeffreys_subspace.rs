@@ -2002,6 +2002,12 @@ impl JointJeffreysPlan {
         (self.lambda_min, self.lambda_max)
     }
 
+    /// The numerical zero [`Self::reduced_information_is_singular`] compares
+    /// `λ_min` against, for a consumer that reports the verdict's evidence.
+    pub fn floor(&self) -> f64 {
+        self.floor
+    }
+
     /// Smooth conditioning-gate weight in `[0, 1]` evaluated from
     /// [`Self::information_extrema`].
     pub fn conditioning_gate_weight(&self) -> f64 {

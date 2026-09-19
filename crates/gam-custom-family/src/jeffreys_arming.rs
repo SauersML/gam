@@ -32,9 +32,10 @@ pub trait JeffreysArming: CustomFamily + Clone {
 /// - A refusal carrying [`CustomFamilyError::jeffreys_arming_evidence`] arms the
 ///   refit from the caller's specs. There is no certified mode to start from. A
 ///   refusal without evidence is returned unchanged.
-/// - A certified fit whose cone-truncated posterior is proved improper arms the
-///   refit, warm-started from the unarmed fit's coefficients and smoothing
-///   strengths.
+/// - A certified fit whose own posterior is proved improper arms the refit,
+///   warm-started from the unarmed fit's coefficients and smoothing strengths:
+///   either its cone-truncated posterior, or, unconstrained, the posterior along
+///   a direction no penalty reaches (`ker(S_λ)` carrying singular information).
 ///
 /// The armed fit publishes its evidence on
 /// `FitArtifacts::jeffreys_arming_evidence`.
@@ -92,7 +93,7 @@ pub enum Arming<'a, T> {
     /// The unarmed objective, which every lifecycle fits first.
     Unarmed,
     /// The armed objective, on the evidence the unarmed run produced. `unarmed`
-    /// is that run's result when it certified (its cone posterior was proved
+    /// is that run's result when it certified (its posterior was proved
     /// improper), for a warm start; a refused unarmed run leaves it `None`.
     Armed {
         evidence: &'a JeffreysArmingEvidence,
@@ -110,8 +111,9 @@ pub enum Arming<'a, T> {
 /// - an unarmed result that certifies with no evidence is returned as it is;
 /// - a refusal whose `refusal_evidence` is `Some` arms the refit, with no
 ///   certified mode to start from; any other refusal is returned unchanged;
-/// - a certified result whose cone-truncated posterior is proved improper arms
-///   the refit, handed that result for a warm start.
+/// - a certified result whose posterior is proved improper (its cone-truncated
+///   posterior, or its unconstrained posterior on `ker(S_λ)`) arms the refit,
+///   handed that result for a warm start.
 ///
 /// `fit` reads a result's fitted model. The armed result publishes its evidence
 /// on `FitArtifacts::jeffreys_arming_evidence`.
@@ -121,7 +123,7 @@ pub fn arm_on_evidence<T, E>(
     refusal_evidence: impl Fn(&E) -> Option<JeffreysArmingEvidence>,
 ) -> Result<T, E> {
     let (evidence, unarmed) = match run(Arming::Unarmed) {
-        Ok(mut result) => match improper_cone_posterior_evidence(fit(&mut result)) {
+        Ok(mut result) => match certified_fit_evidence(fit(&mut result)) {
             None => return Ok(result),
             Some(evidence) => (evidence, Some(result)),
         },
@@ -141,6 +143,17 @@ pub fn arm_on_evidence<T, E>(
     })?;
     fit(&mut armed).artifacts.jeffreys_arming_evidence = Some(evidence);
     Ok(armed)
+}
+
+/// The evidence a certified fit carries that its own posterior is improper:
+/// the unconstrained posterior's singular information on the penalty null space
+/// (#3164), recorded by the terminal posterior assembly, or the constrained
+/// mode's cone-truncated posterior (#979).
+fn certified_fit_evidence(fit: &UnifiedFitResult) -> Option<JeffreysArmingEvidence> {
+    fit.artifacts
+        .improper_penalty_null_posterior
+        .clone()
+        .or_else(|| improper_cone_posterior_evidence(fit))
 }
 
 /// The face evidence a certified fit carries: its constrained mode's

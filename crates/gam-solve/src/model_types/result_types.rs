@@ -2543,6 +2543,16 @@ pub struct FitArtifacts {
     /// which objective its coefficients are the mode of, and why.
     #[serde(default)]
     pub jeffreys_arming_evidence: Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
+    /// Set when this fit certified an unarmed, unconstrained mode whose
+    /// penalized information is singular on the directions no smoothing
+    /// parameter reaches (#3164): its Laplace posterior is improper, which is
+    /// the evidence the custom-family arming lifecycle arms on. The terminal
+    /// posterior assembly measures it from the same precision it publishes.
+    /// Re-derivable from that precision and consumed only by the lifecycle, so
+    /// not serialized.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub improper_penalty_null_posterior:
+        Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
     /// Set when this fit could have published a coefficient covariance and
     /// deliberately did not (gam#2718). `None` is the ordinary case and carries
     /// NO claim either way: a covariance may be present, or absent because it
@@ -2831,6 +2841,10 @@ impl std::fmt::Debug for FitArtifacts {
                 &self.coefficient_mode_selection,
             )
             .field("jeffreys_arming_evidence", &self.jeffreys_arming_evidence)
+            .field(
+                "improper_penalty_null_posterior",
+                &self.improper_penalty_null_posterior,
+            )
             .field(
                 "outer_warm_start",
                 &self
