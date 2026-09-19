@@ -57,6 +57,10 @@ use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_solve::estimate::EstimationError;
 use gam_solve::psis::pareto_smooth_weights;
+use gam_math::probability::{
+    log1mexp_positive, normal_logcdf, normal_logsf, standard_normal_quantile_from_log_cdf,
+};
+use gam_math::special::logaddexp;
 use ndarray::{Array1, Array2};
 
 // The `ρ`-posterior adequacy/escalation DATA types were contract-downed to
@@ -121,8 +125,8 @@ const ESCALATION_NUTS_SEED: u64 = 0x938_5EED_0938_5EED;
 const DEFAULT_M: usize = 64;
 const ADEQUACY_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Deterministic standard-normal stream (splitmix64 + Box–Muller). No RNG / env
-/// dependency: the same seed yields the same draws every run.
+/// Deterministic uniform stream (splitmix64) driving the proposal's inverse-CDF
+/// draws. No RNG / env dependency: the same seed yields the same draws every run.
 pub(crate) struct DetNormal {
     state: u64,
 }
@@ -130,16 +134,10 @@ impl DetNormal {
     fn new(seed: u64) -> Self {
         Self { state: seed }
     }
+    /// `(k + ½)/2⁵³`, strictly inside (0, 1): `ln u` and `ln(1 − u)` are finite.
     fn uniform(&mut self) -> f64 {
         let z = gam_linalg::utils::splitmix64(&mut self.state);
         (((z >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
-    }
-    fn normal(&mut self) -> f64 {
-        // `uniform` returns `(k + ½)/2⁵³`, strictly inside (0, 1): `ln(u1)` is
-        // finite by construction.
-        let u1 = self.uniform();
-        let u2 = self.uniform();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }
 }
 
@@ -532,18 +530,66 @@ where
     }
 }
 
+/// `ln(Φ(b) − Φ(a))` for `a < b`, formed where no term is close to one: the
+/// upper tail `Q(a) − Q(b)` when `a ≥ 0`, the lower tail `Φ(b) − Φ(a)` when
+/// `b ≤ 0`, and for an interval straddling 0 the sum of the two positive
+/// half-masses `½erf(b/√2) + ½erf(−a/√2)`. `−∞` only when a one-sided
+/// interval's two log-probabilities round to the same value, which is the
+/// interval's own rounding, not a threshold.
+fn log_standard_normal_interval_mass(a: f64, b: f64) -> f64 {
+    if a >= 0.0 {
+        let (log_sf_a, log_sf_b) = (normal_logsf(a), normal_logsf(b));
+        log_sf_a + log1mexp_positive(log_sf_a - log_sf_b)
+    } else if b <= 0.0 {
+        let (log_cdf_a, log_cdf_b) = (normal_logcdf(a), normal_logcdf(b));
+        log_cdf_b + log1mexp_positive(log_cdf_b - log_cdf_a)
+    } else {
+        // An interval around 0 holds `½(erf(b/√2) + erf(−a/√2))`: a sum of two
+        // positive terms, exact down to the narrowest representable interval.
+        let half_erf = |x: f64| 0.5 * libm::erf(x / std::f64::consts::SQRT_2);
+        (half_erf(b) + half_erf(-a)).ln()
+    }
+}
+
+/// The standard normal truncated to `[a, b]`, drawn by inverting its CDF at
+/// `u ∈ (0, 1)`: `Φ(x) = Φ(a) + u·p` with `p = Φ(b) − Φ(a)`, `log_mass = ln p`.
+///
+/// Both `ln Φ(x) = ln(Φ(a) + u p)` and `ln Q(x) = ln(Q(b) + (1 − u) p)` are
+/// formed in log space, and the smaller of the two, which is at most `ln ½`,
+/// is inverted, so neither tail forms a probability-space subtraction. `Φ⁻¹`
+/// is monotone, so the exact `x` lies in `[a, b]`; the final projection onto
+/// `[a, b]` removes only the quantile's rounding.
+fn truncated_standard_normal(a: f64, b: f64, log_mass: f64, u: f64) -> f64 {
+    let log_cdf = logaddexp(normal_logcdf(a), u.ln() + log_mass);
+    let log_sf = logaddexp(normal_logsf(b), (-u).ln_1p() + log_mass);
+    let x = if log_cdf <= log_sf {
+        standard_normal_quantile_from_log_cdf(log_cdf)
+    } else {
+        standard_normal_quantile_from_log_cdf(log_sf).map(|x| -x)
+    }
+    .expect("the smaller of ln Φ(x) and ln Q(x) is finite and at most ln ½");
+    x.clamp(a, b)
+}
+
 /// The Laplace proposal of `π(ρ|y)` restricted to `ρ`'s domain (#3010).
 ///
 /// The support of `π(ρ|y)` is the box the outer arm searched and certified. A
 /// coordinate held on a face (railed by the certificate, or with `ρ̂` at a face
 /// of the box) is a boundary of that support, not a direction to sample, so it
 /// stays at `ρ̂`. The free coordinates `f` are drawn from the Laplace
-/// approximation conditioned on the held ones at `ρ̂`: mean `ρ̂_f` and precision
-/// the free block `H_ff` of the outer Hessian. That Gaussian is truncated to the
-/// box by rejecting every draw outside it before anyone evaluates the criterion
-/// there. The truncated density is `exp(−½‖z‖²)` times the box indicator over a
-/// normalizer that is the same for every draw, so it cancels from
-/// self-normalized importance weights and from the scale-free Pareto tail fit.
+/// approximation conditioned on the held ones at `ρ̂`, mean `ρ̂_f` and precision
+/// the free block `H_ff` of the outer Hessian, restricted to the box.
+///
+/// The restriction is drawn exactly, with no rejection: `ρ_f = ρ̂_f + U z` with
+/// `U = R⁻ᵀ` upper triangular, so coordinate `a` depends on `z_a, …, z_{k−1}`
+/// only. Sweeping `a` from the last coordinate to the first, the box confines
+/// `z_a` to an interval given the `z` already drawn, and `z_a` is drawn from
+/// the standard normal truncated to it (Geweke–Hajivassiliou–Keane). Every draw
+/// lies in the box, whatever share of the Gaussian the box holds. The draw's
+/// density is `∏_a φ(z_a) / p_a` with `p_a` the mass of `z_a`'s interval, so
+/// its negative log-density is `½‖z‖² + Σ_a ln p_a` up to a constant that is
+/// the same for every draw and cancels from self-normalized importance weights
+/// and from the scale-free Pareto tail fit.
 ///
 /// This is the one proposal the Tier-0 diagnostic draws from.
 pub(crate) struct DomainLaplaceProposal {
@@ -551,8 +597,8 @@ pub(crate) struct DomainLaplaceProposal {
     lower: Array1<f64>,
     upper: Array1<f64>,
     free: Vec<usize>,
-    /// `R_ff⁻ᵀ` for `H_ff = R_ff R_ffᵀ`: `ρ_f = ρ̂_f + L_inv z` has covariance
-    /// `H_ff⁻¹` and `‖z‖² = (ρ_f − ρ̂_f)ᵀ H_ff (ρ_f − ρ̂_f)`.
+    /// `R_ff⁻ᵀ` for `H_ff = R_ff R_ffᵀ` (upper triangular): `ρ_f = ρ̂_f + L_inv z`
+    /// has covariance `H_ff⁻¹` and `‖z‖² = (ρ_f − ρ̂_f)ᵀ H_ff (ρ_f − ρ̂_f)`.
     l_inv: Array2<f64>,
 }
 
@@ -604,55 +650,44 @@ impl DomainLaplaceProposal {
         self.free.len()
     }
 
-    /// One Gaussian draw: `Some((ρ, ½‖z‖²))` when it lies in the box, `None`
-    /// when it does not.
-    fn draw(&self, rng: &mut DetNormal) -> Option<(Array1<f64>, f64)> {
+    /// One draw `(ρ, ½‖z‖² + Σ_a ln p_a)`: the point in the box and its
+    /// negative log proposal density up to the shared constant.
+    ///
+    /// Refused as [`RhoPosteriorRefusal::DegenerateProposalInterval`] only when
+    /// an interval's two log-probabilities round to the same value, so its mass
+    /// is not representable and the density of the draw is not defined.
+    fn draw(&self, rng: &mut DetNormal) -> Result<(Array1<f64>, f64), RhoPosteriorRefusal> {
         let kf = self.free.len();
-        let z: Array1<f64> = Array1::from_iter((0..kf).map(|_| rng.normal()));
+        let mut z = Array1::<f64>::zeros(kf);
         let mut rho = self.rho_hat.clone();
-        for (a, &i) in self.free.iter().enumerate() {
-            let mut acc = 0.0;
-            for b in 0..kf {
-                acc += self.l_inv[[a, b]] * z[b];
+        let mut neg_log_density = 0.0;
+        for a in (0..kf).rev() {
+            let i = self.free[a];
+            let shift: f64 = (a + 1..kf).map(|b| self.l_inv[[a, b]] * z[b]).sum();
+            let scale = self.l_inv[[a, a]];
+            let lo = (self.lower[i] - self.rho_hat[i] - shift) / scale;
+            let hi = (self.upper[i] - self.rho_hat[i] - shift) / scale;
+            let log_mass = log_standard_normal_interval_mass(lo, hi);
+            if !log_mass.is_finite() {
+                return Err(RhoPosteriorRefusal::DegenerateProposalInterval { coordinate: i });
             }
-            rho[i] += acc;
-            if !(rho[i] >= self.lower[i] && rho[i] <= self.upper[i]) {
-                return None;
-            }
+            z[a] = truncated_standard_normal(lo, hi, log_mass, rng.uniform());
+            // `z_a ∈ [lo, hi]` puts `ρ_i` in its box exactly; the projection
+            // removes only the rounding of the affine map back to `ρ`.
+            rho[i] = (self.rho_hat[i] + shift + scale * z[a]).clamp(self.lower[i], self.upper[i]);
+            neg_log_density += 0.5 * z[a] * z[a] + log_mass;
         }
-        Some((rho, 0.5 * z.iter().map(|&v| v * v).sum::<f64>()))
+        Ok((rho, neg_log_density))
     }
 
-    /// `m` draws of the truncated proposal, each `(ρ, ½‖z‖²)`.
-    ///
-    /// A rejection sampler with acceptance rate `a` needs `m / a` attempts on
-    /// average. After `m²` attempts with fewer than `m` accepted, the rate is
-    /// below `1 / m`: the box holds less of the proposal than one of the `m`
-    /// draws the diagnostic reads, and the sample is refused as
-    /// [`RhoPosteriorRefusal::NoInteriorProposal`]. The attempts are Gaussian
-    /// draws only; the criterion is never evaluated for them.
+    /// `m` draws of the proposal, each `(ρ, ½‖z‖² + Σ_a ln p_a)`. Every draw is
+    /// in the box, and the criterion is evaluated for none of them here.
     pub(crate) fn sample(
         &self,
         m: usize,
         rng: &mut DetNormal,
     ) -> Result<Vec<(Array1<f64>, f64)>, RhoPosteriorRefusal> {
-        let max_attempts = m.saturating_mul(m);
-        let mut draws = Vec::with_capacity(m);
-        let mut attempts = 0usize;
-        while draws.len() < m {
-            if attempts == max_attempts {
-                return Err(RhoPosteriorRefusal::NoInteriorProposal {
-                    accepted: draws.len(),
-                    attempts,
-                    required: m,
-                });
-            }
-            attempts += 1;
-            if let Some(draw) = self.draw(rng) {
-                draws.push(draw);
-            }
-        }
-        Ok(draws)
+        (0..m).map(|_| self.draw(rng)).collect()
     }
 }
 
@@ -676,7 +711,7 @@ impl DomainLaplaceProposal {
 /// Returns the typed [`RhoPosteriorRefusal`] naming the site when the diagnostic
 /// cannot be formed — an outer Hessian whose shape does not match `ρ̂` or whose
 /// free block is not positive definite, an infeasible or non-finite criterion at
-/// `ρ̂`, a box that holds less than `1/M` of the proposal, no proposal draw with a
+/// `ρ̂`, a proposal interval whose mass rounds to zero, no proposal draw with a
 /// finite criterion, too few finite weights for the Pareto tail fit, a non-finite
 /// tail shape, or smoothed weights that do not normalize.
 pub fn rho_posterior_adequacy<F>(
@@ -706,9 +741,9 @@ where
     let raw_weights: Vec<f64> = proposal
         .sample(m, &mut rng)?
         .iter()
-        // log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖².
-        .map(|(rho_m, half_norm_sq)| match criterion(rho_m) {
-            Some(c) if c.is_finite() => -c + cost_hat + half_norm_sq,
+        // log w_m = −criterion(ρ_m) + criterion(ρ̂) − ln q(ρ_m).
+        .map(|(rho_m, neg_log_q)| match criterion(rho_m) {
+            Some(c) if c.is_finite() => -c + cost_hat + neg_log_q,
             // Infeasible / non-finite criterion ⇒ zero importance weight.
             _ => f64::NEG_INFINITY,
         })
@@ -880,9 +915,11 @@ mod tests {
     fn effective_sample_size_is_bounded_and_deterministic() {
         let rho_hat = array![1.0];
         let h = array![[1.0]];
+        // A quartic target, so the weights are not all one and the bounds on
+        // the ESS are exercised away from `M`.
         let crit = |rho: &Array1<f64>| {
             let d = rho[0] - 1.0;
-            Some(0.5 * d * d)
+            Some(0.5 * d * d + d.powi(4) / 24.0)
         };
         let a = rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], crit, Some(64))
             .expect("a formed")
@@ -936,8 +973,11 @@ mod tests {
         ));
     }
 
-    /// Counts every criterion evaluation and records where it happened.
-    fn recording_gaussian<'a>(
+    /// Counts every criterion evaluation and records where it happened. The
+    /// criterion is the Laplace quadratic plus a quartic `Σ d_i⁴ / 24`, so the
+    /// importance weights vary from draw to draw and the Pareto tail has
+    /// excesses to fit.
+    fn recording_quartic<'a>(
         rho_hat: &'a Array1<f64>,
         h: &'a Array2<f64>,
         seen: &'a std::cell::RefCell<Vec<Array1<f64>>>,
@@ -945,37 +985,36 @@ mod tests {
         move |rho: &Array1<f64>| {
             seen.borrow_mut().push(rho.clone());
             let d = rho - rho_hat;
-            Some(0.5 * d.dot(&h.dot(&d)))
+            Some(0.5 * d.dot(&h.dot(&d)) + d.mapv(|v| v.powi(4)).sum() / 24.0)
         }
     }
 
     /// #3010: every criterion evaluation lies in `ρ`'s domain, and a coordinate
     /// held on a face (here `ρ̂_0` at its lower face, and `ρ_3`, which the
-    /// certificate railed) stays at `ρ̂` bit for bit. The free block's flat
-    /// direction `(1, −1)/√2` has proposal standard deviation 10 against a box
-    /// of half-width 1 on `ρ_1`, so the untruncated proposal lands outside the
-    /// box on about nine draws in ten.
+    /// certificate railed) stays at `ρ̂` bit for bit. The free block has
+    /// proposal standard deviation 10 on `ρ_1` and `ρ_2` against boxes of
+    /// half-width 1 and 3, so an untruncated proposal lands outside the box on
+    /// more than nine draws in ten.
     ///
-    /// The criterion is the Laplace quadratic itself. With the held coordinates
-    /// at `ρ̂` it is `½ d_fᵀ H_ff d_f`, which is the truncated proposal's own
-    /// log-density up to the constant that cancels, so every importance weight
-    /// is 1 and the ESS is `M`. The held coordinates couple to the free ones, so
-    /// a proposal on the marginal covariance `(H⁻¹)_ff` instead of the
-    /// conditional `H_ff⁻¹` would not weight uniformly.
+    /// The proposal is the conditional Laplace `N(ρ̂_f, H_ff⁻¹)`: with the held
+    /// coordinates at `ρ̂`, its reported `−ln q` minus `½ d_fᵀ H_ff d_f` is
+    /// `Σ_a ln p_a`, and with a diagonal `H_ff` every sequential interval is the
+    /// same for every draw, so that difference is one constant. The held
+    /// coordinates couple to the free ones, so a proposal on the marginal
+    /// covariance `(H⁻¹)_ff` instead would not reproduce it.
     #[test]
     fn draws_stay_in_the_domain_and_held_coordinates_stay_at_rho_hat_3010() {
         let rho_hat = array![-2.0, 0.2, 1.0, 0.5];
         let lower = array![-2.0, -1.0, -3.0, -3.0];
         let upper = array![2.0, 1.0, 3.0, 3.0];
-        let flat = 1.0e-2;
         let h = array![
-            [1.0, 0.1, 0.1, 0.0],
-            [0.1, 0.5 + flat, 0.5, -0.1],
-            [0.1, 0.5, 0.5 + flat, -0.1],
-            [0.0, -0.1, -0.1, 1.0]
+            [1.0, 0.05, 0.05, 0.0],
+            [0.05, 1.0e-2, 0.0, -0.05],
+            [0.05, 0.0, 1.0e-2, -0.05],
+            [0.0, -0.05, -0.05, 1.0]
         ];
         let seen = std::cell::RefCell::new(Vec::new());
-        let crit = recording_gaussian(&rho_hat, &h, &seen);
+        let crit = recording_quartic(&rho_hat, &h, &seen);
         let graded = rho_posterior_adequacy(
             &rho_hat,
             &h,
@@ -987,7 +1026,7 @@ mod tests {
         .expect("diagnostic formed")
         .expect("diagnostic present");
         let seen = seen.into_inner();
-        assert_eq!(seen.len(), 1 + graded.n_samples, "rho_hat plus one call per accepted draw");
+        assert_eq!(seen.len(), 1 + graded.n_samples, "rho_hat plus one call per draw");
         for rho in &seen {
             for i in 0..4 {
                 assert!(
@@ -998,37 +1037,127 @@ mod tests {
             assert_eq!(rho[0].to_bits(), rho_hat[0].to_bits(), "the face coordinate moved");
             assert_eq!(rho[3].to_bits(), rho_hat[3].to_bits(), "the railed coordinate moved");
         }
-        let m = graded.n_samples as f64;
-        assert!(
-            (graded.effective_sample_size - m).abs() <= m * 1e-9,
-            "the truncated H_ff proposal is the target: ESS {} of M = {m}",
-            graded.effective_sample_size
-        );
-        assert_eq!(graded.adequacy, RhoProposalAdequacy::PlugInAdequate);
+        let proposal =
+            DomainLaplaceProposal::new(&rho_hat, &h, &(lower.clone(), upper.clone()), &[3])
+                .expect("proposal formed");
+        let mut rng = DetNormal::new(ADEQUACY_SEED);
+        let draws = proposal.sample(graded.n_samples, &mut rng).expect("draws");
+        let log_box_mass: Vec<f64> = draws
+            .iter()
+            .map(|(rho, neg_log_q)| {
+                let d = rho - &rho_hat;
+                neg_log_q - 0.5 * d.dot(&h.dot(&d))
+            })
+            .collect();
+        for v in &log_box_mass {
+            assert!(
+                (v - log_box_mass[0]).abs() <= 1e-9,
+                "the conditional H_ff proposal has one interval mass per draw: {v} vs {}",
+                log_box_mass[0]
+            );
+        }
     }
 
-    /// #3010: a box holding less than one proposal draw in `M` is refused as
-    /// `NoInteriorProposal` after `M²` Gaussian draws, and the criterion is
-    /// evaluated only at `ρ̂`. Proposal standard deviation 100 against a box
-    /// of half-width `10⁻³` accepts about `8·10⁻⁶` of the draws.
+    /// #3010: a box holding a sliver of the Gaussian is sampled exactly, with
+    /// no rejection. Proposal standard deviation 100 against a box of
+    /// half-width `10⁻³` holds about `8·10⁻⁶` of the Gaussian, which a
+    /// rejection sampler would need `10⁵` draws per accepted point to reach.
+    /// Every one of the `M` draws is in the box, the criterion is evaluated
+    /// once per draw, and the importance weights are finite, so the ESS lies in
+    /// `[1, M]`. The criterion's curvature `10⁶` is the one the box's width
+    /// resolves: across the sliver it moves by `½`, so the weights are not
+    /// flat to rounding.
     #[test]
-    fn a_domain_holding_less_than_one_draw_in_m_is_refused_before_any_criterion_call_3010() {
+    fn a_domain_holding_a_sliver_of_the_proposal_is_sampled_exactly_3010() {
         let rho_hat = array![0.0];
         let h = array![[1.0e-4]];
+        let (lower, upper) = (array![-1.0e-3], array![1.0e-3]);
         let seen = std::cell::RefCell::new(Vec::new());
-        let crit = recording_gaussian(&rho_hat, &h, &seen);
-        let refusal =
-            rho_posterior_adequacy(&rho_hat, &h, &(array![-1.0e-3], array![1.0e-3]), &[], crit, Some(64))
-                .expect_err("the proposal has no interior sample");
-        match refusal {
-            RhoPosteriorRefusal::NoInteriorProposal { accepted, attempts, required } => {
-                assert_eq!(required, 64);
-                assert_eq!(attempts, 64 * 64);
-                assert!(accepted < required);
-            }
-            other => panic!("expected NoInteriorProposal, got {other}"),
+        let target_h = array![[1.0e6]];
+        let crit = recording_quartic(&rho_hat, &target_h, &seen);
+        let graded =
+            rho_posterior_adequacy(&rho_hat, &h, &(lower.clone(), upper.clone()), &[], crit, Some(64))
+                .expect("diagnostic formed")
+                .expect("diagnostic present");
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 1 + graded.n_samples);
+        assert!(seen.iter().all(|rho| rho[0] >= lower[0] && rho[0] <= upper[0]));
+        let m = graded.n_samples as f64;
+        assert!(graded.effective_sample_size >= 1.0 && graded.effective_sample_size <= m);
+    }
+
+    /// The proposal's density is the one it reports. For a draw `ρ` with
+    /// `z = U⁻¹(ρ_f − ρ̂_f)`, the importance weight of the untruncated Gaussian
+    /// target `exp(−½‖z‖²)` against the proposal is `∏_a p_a`, so its mean over
+    /// draws is the Gaussian probability of the box. With a correlation of
+    /// `−0.8` the sequential intervals move with the earlier draws, and the
+    /// probability is the bivariate normal rectangle. The band is four
+    /// standard errors of the sample mean, read from the sample itself.
+    #[test]
+    fn the_sequential_proposal_weights_integrate_to_the_box_probability_3010() {
+        let rho_hat = array![0.3, -0.4];
+        let (s0, s1, r) = (2.0_f64, 0.5_f64, -0.8_f64);
+        let cov = array![[s0 * s0, r * s0 * s1], [r * s0 * s1, s1 * s1]];
+        let det = cov[[0, 0]] * cov[[1, 1]] - cov[[0, 1]] * cov[[1, 0]];
+        let h = array![
+            [cov[[1, 1]] / det, -cov[[0, 1]] / det],
+            [-cov[[1, 0]] / det, cov[[0, 0]] / det]
+        ];
+        let (lower, upper) = (array![-1.0, -0.6], array![2.5, 0.2]);
+        let proposal =
+            DomainLaplaceProposal::new(&rho_hat, &h, &(lower.clone(), upper.clone()), &[])
+                .expect("proposal");
+        let n = 20_000;
+        let mut rng = DetNormal::new(ADEQUACY_SEED);
+        let weights: Vec<f64> = proposal
+            .sample(n, &mut rng)
+            .expect("draws")
+            .into_iter()
+            .map(|(rho, neg_log_q)| {
+                assert!((0..2).all(|i| rho[i] >= lower[i] && rho[i] <= upper[i]));
+                let d = &rho - &rho_hat;
+                (neg_log_q - 0.5 * d.dot(&h.dot(&d))).exp()
+            })
+            .collect();
+        let mean = weights.iter().sum::<f64>() / n as f64;
+        let var = weights.iter().map(|w| (w - mean).powi(2)).sum::<f64>() / (n - 1) as f64;
+        let std_err = (var / n as f64).sqrt();
+        let std = |v: f64, i: usize| (v - rho_hat[i]) / [s0, s1][i];
+        let cdf = |a: f64, b: f64| {
+            gam_math::bivariate_normal::bivariate_normal_cdf(a, b, r).expect("bivariate CDF")
+        };
+        let (a0, b0, a1, b1) =
+            (std(lower[0], 0), std(upper[0], 0), std(lower[1], 1), std(upper[1], 1));
+        let exact = cdf(b0, b1) - cdf(a0, b1) - cdf(b0, a1) + cdf(a0, a1);
+        assert!(
+            (mean - exact).abs() <= 4.0 * std_err,
+            "mean weight {mean} vs box probability {exact} (s.e. {std_err})"
+        );
+    }
+
+    /// The truncated standard normal inverts its own CDF: at `u` the draw
+    /// sits at `Φ(a) + u(Φ(b) − Φ(a))`, and intervals deep in either tail,
+    /// where `Φ(b) − Φ(a)` underflows in probability space, still return a
+    /// point inside the interval with a finite log mass.
+    #[test]
+    fn truncated_standard_normal_inverts_its_cdf_in_both_tails() {
+        let (a, b) = (-1.0, 2.0);
+        let log_mass = log_standard_normal_interval_mass(a, b);
+        let mass = gam_math::probability::normal_cdf(b) - gam_math::probability::normal_cdf(a);
+        assert!((log_mass - mass.ln()).abs() <= 16.0 * f64::EPSILON);
+        for u in [1.0e-9, 0.25, 0.5, 0.75, 1.0 - 1.0e-9] {
+            let x = truncated_standard_normal(a, b, log_mass, u);
+            let target = gam_math::probability::normal_cdf(a) + u * mass;
+            assert!((gam_math::probability::normal_cdf(x) - target).abs() <= 64.0 * f64::EPSILON);
         }
-        assert_eq!(seen.into_inner().len(), 1, "only rho_hat is evaluated");
+        for (a, b) in [(40.0, 40.5), (-41.0, -40.0), (-1.0e-300, 1.0e-300), (38.0, f64::INFINITY)] {
+            let log_mass = log_standard_normal_interval_mass(a, b);
+            assert!(log_mass.is_finite(), "[{a}, {b}] has log mass {log_mass}");
+            for u in [1.0e-12, 0.5, 1.0 - 1.0e-12] {
+                let x = truncated_standard_normal(a, b, log_mass, u);
+                assert!(x >= a && x <= b, "draw {x} outside [{a}, {b}]");
+            }
+        }
     }
 
     /// #3010: with every coordinate on a face of its domain there is no free
@@ -1038,7 +1167,7 @@ mod tests {
         let rho_hat = array![-1.0, 4.0];
         let h = array![[1.0e-6, 0.0], [0.0, 1.0e-6]];
         let seen = std::cell::RefCell::new(Vec::new());
-        let crit = recording_gaussian(&rho_hat, &h, &seen);
+        let crit = recording_quartic(&rho_hat, &h, &seen);
         let graded =
             rho_posterior_adequacy(&rho_hat, &h, &(array![-1.0, -4.0], array![1.0, 4.0]), &[], crit, None);
         assert!(matches!(graded, Ok(None)));

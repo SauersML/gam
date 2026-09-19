@@ -108,11 +108,11 @@ pub enum RhoPosteriorRefusal {
     CriterionInfeasibleAtRhoHat,
     /// The criterion at `ρ̂` is not finite.
     CriterionNotFiniteAtRhoHat,
-    /// The Laplace proposal restricted to `ρ`'s domain accepts fewer than one
-    /// draw in `M`: `attempts = M²` Gaussian draws produced only `accepted < M`
-    /// inside the box, so no `M`-draw sample of the proposal exists at that
-    /// rate. No criterion was evaluated off `ρ̂` (#3010).
-    NoInteriorProposal { accepted: usize, attempts: usize, required: usize },
+    /// A sequential interval of the Laplace proposal restricted to `ρ`'s domain
+    /// has a mass whose two log-probabilities round to the same value, so the
+    /// draw's density on free coordinate `coordinate` is not representable.
+    /// No criterion was evaluated off `ρ̂` (#3010).
+    DegenerateProposalInterval { coordinate: usize },
     /// No proposal draw has a finite criterion.
     NoFiniteProposal,
     /// Too few finite importance weights for the Pareto tail fit.
@@ -134,10 +134,10 @@ impl fmt::Display for RhoPosteriorRefusal {
             }
             Self::CriterionInfeasibleAtRhoHat => f.write_str("criterion is infeasible at rho_hat"),
             Self::CriterionNotFiniteAtRhoHat => f.write_str("criterion at rho_hat is not finite"),
-            Self::NoInteriorProposal { accepted, attempts, required } => write!(
+            Self::DegenerateProposalInterval { coordinate } => write!(
                 f,
-                "the Laplace proposal restricted to the rho domain accepted {accepted} of \
-                 {attempts} draws, short of the {required} the diagnostic needs"
+                "the Laplace proposal restricted to the rho domain has an interval of \
+                 unrepresentable mass on rho coordinate {coordinate}"
             ),
             Self::NoFiniteProposal => f.write_str("no proposal draw has a finite criterion"),
             Self::TooFewFiniteWeights => {
