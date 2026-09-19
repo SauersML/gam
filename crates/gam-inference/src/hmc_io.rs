@@ -3412,8 +3412,8 @@ mod tests {
     #[test]
     fn composite_axis_resolves_a_quartic_axis_784() {
         // ΔF = a t⁴: the composite value agrees with a Gauss–Hermite rule of order 40
-        // (whose paired difference is below 1e-15 here) to within the composite's own
-        // error, and that error resolves min(|Δ|, remainder).
+        // to within the two rules' own errors, and the composite's error resolves
+        // min(|Δ|, remainder).
         let target = AnharmonicBlock {
             lambdas: array![2.0],
             a: 0.05,
@@ -3423,11 +3423,12 @@ mod tests {
             .expect("a quartic axis resolves");
         let reference = super::block_quadrature_marginal_correction(&target, &[40])
             .expect("order-40 reference");
-        assert!(reference.quadrature_error < 1e-15, "reference {}", reference.quadrature_error);
+        assert!(reference.quadrature_error < remainder, "reference {:e}", reference.quadrature_error);
         let marginal = &out.marginal;
         assert!(marginal.quadrature_error < marginal.value.abs().min(remainder));
         assert!(
-            (marginal.value - reference.value).abs() <= marginal.quadrature_error + 1e-15,
+            (marginal.value - reference.value).abs()
+                <= marginal.quadrature_error + reference.quadrature_error,
             "composite {} (error {:e}) against Gauss–Hermite {}",
             marginal.value,
             marginal.quadrature_error,
@@ -3520,11 +3521,11 @@ mod tests {
     }
 
     #[test]
-    fn composite_axis_refuses_an_indivisible_cell_784() {
-        // A hard feasibility step at z = 0.1 against a resolution target below any
-        // representable cell: the cell holding the step carries error in proportion
-        // to its mass until its midpoint rounds onto an end, and that is refused,
-        // typed, rather than accepted.
+    fn composite_axis_refuses_below_its_rounding_floor_784() {
+        // A hard feasibility step at z = 0.1 against a resolution target below the
+        // rounding of any node mass: bisection resolves the step down to working
+        // precision, and then every cell's error share is inside its rounding band.
+        // That is refused, typed and in finite time, rather than bisected without end.
         let target = WallAxis {
             lambdas: array![1.0],
             b: 0.0,
@@ -3534,10 +3535,19 @@ mod tests {
         let refusal = super::composite_axis_marginal_correction(&target, adapt(f64::MIN_POSITIVE))
             .expect_err("an unresolvable step is refused");
         match refusal.cause {
-            super::BlockQuadratureRefusal::IndivisibleCompositeCell {
-                lower_z, upper_z, ..
-            } => assert!(lower_z <= 0.1 && 0.1 <= upper_z, "cell [{lower_z}, {upper_z}]"),
-            other => panic!("expected an indivisible cell, got {other}"),
+            super::BlockQuadratureRefusal::CompositeRoundingFloor {
+                cells,
+                rounding_floor,
+            } => {
+                assert!(cells > 1, "{cells} cells");
+                assert!(
+                    rounding_floor.is_finite() && rounding_floor > refusal.resolution_target,
+                    "floor {rounding_floor:e} against {:e}",
+                    refusal.resolution_target
+                );
+                assert!(refusal.paired_error < 1e-12, "error {:e}", refusal.paired_error);
+            }
+            other => panic!("expected the rounding floor, got {other}"),
         }
         // The same step against a representable target resolves.
         let resolved = super::composite_axis_marginal_correction(&target, adapt(1e-10))
@@ -7174,13 +7184,21 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
 const COMPOSITE_GAUSS_NODES: usize = 7;
 
 /// The composite rule's Gauss–Kronrod pair on `[-1, 1]` in log form: per Kronrod node
-/// its abscissa, `ln w_K`, and the log magnitude and sign of `w_K − w_G` (the Gauss
-/// weight is zero at the Kronrod-only nodes).
+/// its abscissa, `ln w_K`, the log magnitude and sign of `w_K − w_G` (the Gauss
+/// weight is zero at the Kronrod-only nodes), and `ln(w_K + w_G)`.
+///
+/// `defect` is the computed pair's own disagreement: both rules integrate every
+/// polynomial through degree `2n − 1` exactly, so `Σ (w_K − w_G) xᵏ` vanishes in exact
+/// arithmetic, and its largest computed value relative to `Σ (w_K + w_G) |xᵏ|` is the
+/// relative move the stored weights make on a smooth integrand that no refinement
+/// removes.
 struct CompositeKronrodRule {
     nodes: Vec<f64>,
     ln_kronrod_weights: Vec<f64>,
     ln_abs_weight_differences: Vec<f64>,
     weight_difference_signs: Vec<f64>,
+    ln_weight_sums: Vec<f64>,
+    defect: f64,
 }
 
 impl CompositeKronrodRule {
@@ -7197,10 +7215,30 @@ impl CompositeKronrodRule {
             .zip(&rule.gauss_weights)
             .map(|(&kronrod, &gauss)| kronrod - gauss)
             .collect();
+        let sums: Vec<f64> = rule
+            .kronrod_weights
+            .iter()
+            .zip(&rule.gauss_weights)
+            .map(|(&kronrod, &gauss)| kronrod + gauss)
+            .collect();
+        let defect = (0..2 * COMPOSITE_GAUSS_NODES)
+            .map(|degree| {
+                let power = |x: f64| x.powi(degree as i32);
+                let moved: f64 = differences
+                    .iter()
+                    .zip(&rule.nodes)
+                    .map(|(&d, &x)| d * power(x))
+                    .sum();
+                let mass: f64 = sums.iter().zip(&rule.nodes).map(|(&s, &x)| s * power(x).abs()).sum();
+                moved.abs() / mass
+            })
+            .fold(0.0_f64, f64::max);
         Ok(Self {
             ln_kronrod_weights: rule.kronrod_weights.iter().map(|w| w.ln()).collect(),
             ln_abs_weight_differences: differences.iter().map(|d| d.abs().ln()).collect(),
             weight_difference_signs: differences.iter().map(|d| d.signum()).collect(),
+            ln_weight_sums: sums.iter().map(|s| s.ln()).collect(),
+            defect,
             nodes: rule.nodes,
         })
     }
@@ -7227,13 +7265,15 @@ fn ln_abs_expm1(x: f64) -> (f64, f64) {
 
 /// One cell of a composite partition of the logistic coordinate `v ∈ (0, 1)`,
 /// `z = ln v − ln(1 − v)`, with its Kronrod nodes. `ln_psi` is the log of the node's
-/// mass `h·φ(z)·dz/dv` before the Kronrod weight, and `x = −ΔF` (`−∞` at an
-/// infeasible node) is filled by an evaluation.
+/// mass `h·φ(z)·dz/dv` before the Kronrod weight, `ln_psi_error` a running-error
+/// bound (Higham, *ASNA* 2nd ed., §3.3) on its computed value from the cell's exact
+/// ends, and `x = −ΔF` (`−∞` at an infeasible node) is filled by an evaluation.
 struct CompositeCell {
     lower: AxisBreakpoint,
     upper: AxisBreakpoint,
     z: Vec<f64>,
     ln_psi: Vec<f64>,
+    ln_psi_error: Vec<f64>,
     x: Vec<f64>,
 }
 
@@ -7256,8 +7296,15 @@ impl CompositeCell {
         let center_w = 0.5 * (lower.one_minus_v + upper.one_minus_v);
         let ln_half_width = half_width.ln();
         let ln_sqrt_two_pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+        // Each rounded operation adds `u` times its result's magnitude to the bound, and
+        // each operand carries its own: the half-width and centres round once from the
+        // exact ends, `2π` once before its logarithm.
+        let u = gam_linalg::roundoff::UNIT_ROUNDOFF;
+        let ln_half_width_error = u + u * ln_half_width.abs();
+        let ln_sqrt_two_pi_error = 0.5 * u + u * ln_sqrt_two_pi;
         let mut z = Vec::with_capacity(rule.len());
         let mut ln_psi = Vec::with_capacity(rule.len());
+        let mut ln_psi_error = Vec::with_capacity(rule.len());
         for &node in &rule.nodes {
             let v = center_v + half_width * node;
             let w = center_w - half_width * node;
@@ -7270,8 +7317,28 @@ impl CompositeCell {
             }
             let (ln_v, ln_w) = (v.ln(), w.ln());
             let node_z = ln_v - ln_w;
+            let half_square = 0.5 * node_z * node_z;
+            let node_ln_psi = ln_half_width - half_square - ln_sqrt_two_pi - ln_v - ln_w;
+            // `v = c + h·node`: the centre's rounding, the half-width's and the
+            // product's, and the sum's; a logarithm turns relative error into absolute.
+            let offset = (half_width * node).abs();
+            let ln_v_error = u * (center_v + 2.0 * offset + v) / v + u * ln_v.abs();
+            let ln_w_error = u * (center_w + 2.0 * offset + w) / w + u * ln_w.abs();
+            let z_error = ln_v_error + ln_w_error + u * node_z.abs();
+            let half_square_error = node_z.abs() * z_error + u * half_square;
+            // The four differences of `ln ψ`, left to right, each round their result.
+            let first = ln_half_width - half_square;
+            let second = first - ln_sqrt_two_pi;
+            let third = second - ln_v;
+            let error = ln_half_width_error
+                + half_square_error
+                + ln_sqrt_two_pi_error
+                + ln_v_error
+                + ln_w_error
+                + u * (first.abs() + second.abs() + third.abs() + node_ln_psi.abs());
             z.push(node_z);
-            ln_psi.push(ln_half_width - 0.5 * node_z * node_z - ln_sqrt_two_pi - ln_v - ln_w);
+            ln_psi.push(node_ln_psi);
+            ln_psi_error.push(error);
         }
         Ok(Self {
             lower,
@@ -7279,6 +7346,7 @@ impl CompositeCell {
             x: vec![f64::NAN; z.len()],
             z,
             ln_psi,
+            ln_psi_error,
         })
     }
 
@@ -7304,11 +7372,140 @@ impl CompositeCell {
     }
 }
 
-/// A composite rule's value and Gauss–Kronrod error from its cells' node values.
+/// A composite rule's value and Gauss–Kronrod error from its cells' node values, with
+/// the combined normalisers each cell's share is measured against.
 struct CompositeSums {
     value: f64,
     cell_errors: Vec<f64>,
     error: f64,
+    factors: Vec<f64>,
+    a_hat: f64,
+    n_hat: f64,
+    s_hat: f64,
+}
+
+impl CompositeSums {
+    /// Cell `c`'s rounding band in the units of its error share: its moves' bands
+    /// through the same linearisation, with the target's excess band `excess_band_s`.
+    fn share_band(&self, c: usize, share: &CompositeCellSums, excess_band_s: f64) -> f64 {
+        let factor = self.factors[c];
+        (share.band_s + excess_band_s) * factor / self.n_hat
+            + (self.s_hat.abs() / self.n_hat) * (share.band_a * factor / self.a_hat)
+    }
+}
+
+/// One cell's share of a composite rule's sums, each scaled by `e^{−scale}` with the
+/// cell's own `scale = max(ln A_c, ln N_c)`: `A_c = Σ w_K ψ`, `N_c = Σ w_K ψ e^x`,
+/// `S_c = Σ w_K ψ (e^x − 1)`, and the embedded Gauss rule's signed moves `δS_c`, `δA_c`.
+/// A cell's share depends on its own nodes alone, so an adaptive pass that bisects
+/// one cell re-forms only the two halves.
+///
+/// `band_s` and `band_a` bound how far the computed moves can sit from the exact moves
+/// of the same node values' arithmetic, `x` taken as given: each term's formation, by
+/// the running bounds on `ln ψ` and on `ln |e^x − 1|`, the rule pair's `defect` on the
+/// terms, and the sum of the formed terms. The target's own rounding of `x` enters
+/// `δS` through [`CompositeCellSums::excess_band_s`].
+#[derive(Clone, Copy)]
+struct CompositeCellSums {
+    scale: f64,
+    ln_a: f64,
+    ln_n: f64,
+    s: f64,
+    delta_s: f64,
+    delta_a: f64,
+    band_s: f64,
+    band_a: f64,
+}
+
+impl CompositeCellSums {
+    /// The band `δS` carries from the target's rounding of `x`, on this cell's scale:
+    /// an excess within `b` of its exact value moves `e^x − 1` by at most `e^x·b`.
+    /// `excess_bands[i]` is the target's band at node `i`; an infeasible node is decided
+    /// exactly and carries none.
+    fn excess_band_s(
+        &self,
+        cell: &CompositeCell,
+        rule: &CompositeKronrodRule,
+        excess_bands: &[f64],
+    ) -> f64 {
+        (0..rule.len())
+            .filter(|&i| cell.x[i] != f64::NEG_INFINITY)
+            .map(|i| {
+                let ln_term = rule.ln_abs_weight_differences[i] + cell.ln_psi[i] - self.scale + cell.x[i];
+                // A node whose mass underflows moves nothing, whatever its band.
+                let term = ln_term.exp();
+                if term == 0.0 { 0.0 } else { term * excess_bands[i] }
+            })
+            .sum()
+    }
+
+    fn of(cell: &CompositeCell, rule: &CompositeKronrodRule) -> Self {
+        let log_sum_exp = |term: &dyn Fn(usize) -> f64| -> f64 {
+            let max = (0..rule.len()).map(term).fold(f64::NEG_INFINITY, f64::max);
+            if max == f64::NEG_INFINITY {
+                return max;
+            }
+            max + (0..rule.len()).map(|i| (term(i) - max).exp()).sum::<f64>().ln()
+        };
+        let ln_a = log_sum_exp(&|i| rule.ln_kronrod_weights[i] + cell.ln_psi[i]);
+        let ln_n = log_sum_exp(&|i| rule.ln_kronrod_weights[i] + cell.ln_psi[i] + cell.x[i]);
+        let scale = ln_a.max(ln_n);
+        let u = gam_linalg::roundoff::UNIT_ROUNDOFF;
+        let (mut s, mut delta_s, mut delta_a) = (0.0_f64, 0.0_f64, 0.0_f64);
+        // Per move: the formation bound Σ|term|·ρ, the rule's pair mass Σ (w_K + w_G)·|f|,
+        // and the formed terms' absolute sum.
+        let (mut formation_s, mut pair_mass_s, mut absolute_s) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let (mut formation_a, mut pair_mass_a, mut absolute_a) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for i in 0..rule.len() {
+            let (ln_excess_gap, gap_sign) = ln_abs_expm1(cell.x[i]);
+            let ln_psi = cell.ln_psi[i] - scale;
+            s += gap_sign * (rule.ln_kronrod_weights[i] + ln_psi + ln_excess_gap).exp();
+            let ln_d = rule.ln_abs_weight_differences[i] + ln_psi;
+            let d_sign = rule.weight_difference_signs[i];
+            let term_s = (ln_d + ln_excess_gap).exp();
+            let term_a = ln_d.exp();
+            delta_s += d_sign * gap_sign * term_s;
+            delta_a += d_sign * term_a;
+            // `ln|w_K − w_G|` rounds its difference and its logarithm; the scale is one
+            // float shared by every term and by the factor that later undoes it, so only
+            // the differences that apply it round.
+            let ln_d_error = u + u * rule.ln_abs_weight_differences[i].abs()
+                + cell.ln_psi_error[i]
+                + u * (ln_psi.abs() + ln_d.abs());
+            // `ln|e^x − 1|`: `expm1` rounds once and the logarithm once more; for `x > 0`
+            // the logarithm is of `1 − e^{−x}` and the sum `x + ln(1 − e^{−x})` rounds
+            // too. `x = −∞` is the exact gap −1 and `x = 0` the exact zero.
+            let ln_gap_error = if gap_sign == 0.0 || cell.x[i] == f64::NEG_INFINITY {
+                0.0
+            } else if cell.x[i] > 0.0 {
+                u * (1.0 + (ln_excess_gap - cell.x[i]).abs() + ln_excess_gap.abs())
+            } else {
+                u * (1.0 + ln_excess_gap.abs())
+            };
+            // The exponential rounds its result once more.
+            if gap_sign != 0.0 {
+                let ln_term_s_error = ln_d_error + ln_gap_error + u * (ln_d + ln_excess_gap).abs();
+                formation_s += term_s * (ln_term_s_error + u);
+            }
+            formation_a += term_a * (ln_d_error + u);
+            absolute_s += term_s;
+            absolute_a += term_a;
+            let ln_pair = rule.ln_weight_sums[i] + ln_psi;
+            pair_mass_s += gap_sign.abs() * (ln_pair + ln_excess_gap).exp();
+            pair_mass_a += ln_pair.exp();
+        }
+        let accumulation = gam_linalg::roundoff::accumulation_growth(rule.len() - 1);
+        Self {
+            scale,
+            ln_a,
+            ln_n,
+            s,
+            delta_s,
+            delta_a,
+            band_s: formation_s + rule.defect * pair_mass_s + accumulation * absolute_s,
+            band_a: formation_a + rule.defect * pair_mass_a + accumulation * absolute_a,
+        }
+    }
 }
 
 /// The self-normalised `Δ = ln N − ln A` of a composite rule, `A = Σ w_K ψ` and
@@ -7318,51 +7515,38 @@ struct CompositeSums {
 /// cancels `ψ` against `ψ`: a Gaussian axis (`x ≡ 0`) has `S = 0` and `Δ = 0` exactly.
 /// Linearising `Δ` in the two sums, a cell whose embedded Gauss rule moves them by
 /// `δS` and `δA` moves `Δ` by `δS/N − (S/N)·δA/A`, and the cell's error share is that
-/// bound. Every sum is scaled by `e^{−max(ln A, ln N)}`, so none overflows.
+/// bound. Every sum is rescaled from its cell's scale to the largest, so none overflows.
 fn composite_sums(
     cells: &[CompositeCell],
     rule: &CompositeKronrodRule,
 ) -> Result<CompositeSums, BlockQuadratureRefusal> {
-    let log_sum_exp = |terms: &mut dyn Iterator<Item = f64>| -> f64 {
-        let terms: Vec<f64> = terms.collect();
-        let max = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        if max == f64::NEG_INFINITY {
-            return max;
-        }
-        max + terms.iter().map(|&term| (term - max).exp()).sum::<f64>().ln()
-    };
-    let nodes = || {
-        cells.iter().flat_map(|cell| {
-            (0..rule.len()).map(move |i| (i, cell.ln_psi[i], cell.x[i]))
-        })
-    };
-    let ln_a = log_sum_exp(&mut nodes().map(|(i, ln_psi, _)| rule.ln_kronrod_weights[i] + ln_psi));
-    let ln_n = log_sum_exp(
-        &mut nodes().map(|(i, ln_psi, x)| rule.ln_kronrod_weights[i] + ln_psi + x),
-    );
+    let shares: Vec<CompositeCellSums> =
+        cells.iter().map(|cell| CompositeCellSums::of(cell, rule)).collect();
+    combine_composite_sums(&shares)
+}
+
+fn combine_composite_sums(
+    shares: &[CompositeCellSums],
+) -> Result<CompositeSums, BlockQuadratureRefusal> {
+    let scale = shares
+        .iter()
+        .map(|share| share.scale)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let (mut a_hat, mut n_hat, mut s_hat) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let mut factors = Vec::with_capacity(shares.len());
+    for share in shares {
+        let factor = (share.scale - scale).exp();
+        a_hat += (share.ln_a - scale).exp();
+        n_hat += (share.ln_n - scale).exp();
+        s_hat += share.s * factor;
+        factors.push(factor);
+    }
+    let (ln_a, ln_n) = (scale + a_hat.ln(), scale + n_hat.ln());
     if !ln_a.is_finite() || !ln_n.is_finite() {
         return Err(BlockQuadratureRefusal::Integration(format!(
             "composite Gauss–Kronrod rule: ln Σ w_K ψ = {ln_a}, ln Σ w_K ψ e^(−ΔF) = {ln_n} (every \
              node infeasible or a non-finite node mass)"
         )));
-    }
-    let scale = ln_a.max(ln_n);
-    let a_hat = (ln_a - scale).exp();
-    let n_hat = (ln_n - scale).exp();
-    let mut s_hat = 0.0_f64;
-    let mut cell_shares = Vec::with_capacity(cells.len());
-    for cell in cells {
-        let (mut delta_s, mut delta_a) = (0.0_f64, 0.0_f64);
-        for i in 0..rule.len() {
-            let (ln_excess_gap, gap_sign) = ln_abs_expm1(cell.x[i]);
-            let ln_psi = cell.ln_psi[i] - scale;
-            s_hat += gap_sign * (rule.ln_kronrod_weights[i] + ln_psi + ln_excess_gap).exp();
-            let ln_d = rule.ln_abs_weight_differences[i] + ln_psi;
-            let d_sign = rule.weight_difference_signs[i];
-            delta_s += d_sign * gap_sign * (ln_d + ln_excess_gap).exp();
-            delta_a += d_sign * ln_d.exp();
-        }
-        cell_shares.push((delta_s.abs(), delta_a.abs()));
     }
     // 1 + S/A is exact to rounding while N/A ≥ 1/2 (Sterbenz); below that the direct
     // difference of the logs carries the relative precision the ratio loses.
@@ -7371,9 +7555,13 @@ fn composite_sums(
     } else {
         ln_n - ln_a
     };
-    let cell_errors: Vec<f64> = cell_shares
-        .into_iter()
-        .map(|(delta_s, delta_a)| delta_s / n_hat + (s_hat.abs() / n_hat) * (delta_a / a_hat))
+    let cell_errors: Vec<f64> = shares
+        .iter()
+        .zip(&factors)
+        .map(|(share, &factor)| {
+            let (delta_s, delta_a) = (share.delta_s.abs() * factor, share.delta_a.abs() * factor);
+            delta_s / n_hat + (s_hat.abs() / n_hat) * (delta_a / a_hat)
+        })
         .collect();
     let error = cell_errors.iter().sum::<f64>();
     if !value.is_finite() || !error.is_finite() {
@@ -7385,6 +7573,10 @@ fn composite_sums(
         value,
         cell_errors,
         error,
+        factors,
+        a_hat,
+        n_hat,
+        s_hat,
     })
 }
 
@@ -7420,9 +7612,10 @@ fn reserve_composite_chunk(
 /// channels as [`block_quadrature_marginal_correction`] (#784).
 ///
 /// Under `Adapt` the partition starts as the whole axis and the cell with the largest
-/// error share is bisected until the error resolves `min(|Δ|, next_order_remainder)`,
-/// evaluating the excess alone. A cell whose midpoint rounds onto an end is refused,
-/// typed. The final partition, or the `Latched` one, is then integrated once with the
+/// error share above its own rounding band is bisected until the error resolves
+/// `min(|Δ|, next_order_remainder)`, evaluating the excess alone. Two stops are
+/// refused, typed: a cell whose midpoint rounds onto an end, and an unresolved error
+/// no cell of which is above its rounding band. The final partition, or the `Latched` one, is then integrated once with the
 /// displaced scores; its value, error and moments all come from that pass, whose
 /// weights `w_K ψ e^{−ΔF}` depend on the node only through `z`, and whose nodes are
 /// `t = z/√λ`, exactly the Gauss–Hermite moment contract.
@@ -7538,22 +7731,91 @@ fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
         CompositeAxisPartition::Adapt { .. } => {
             let mut cells = vec![CompositeCell::new(whole_lower, whole_upper, &rule).map_err(early)?];
             evaluate_excess(&mut cells, table_bytes(1)).map_err(early)?;
+            let mut shares: Vec<CompositeCellSums> =
+                cells.iter().map(|cell| CompositeCellSums::of(cell, &rule)).collect();
+            // Each cell's `δS` band from the target's rounding of `x`, read only once the
+            // cell is a candidate for bisection: it costs one target evaluation a node.
+            let mut excess_bands: Vec<Option<f64>> = vec![None; cells.len()];
+            let excess_band_of = |cell: &CompositeCell,
+                                  share: &CompositeCellSums,
+                                  cell_count: usize|
+             -> Result<f64, BlockQuadratureRefusal> {
+                let (reservation, _) = reserve_composite_chunk(table_bytes(cell_count), node_bytes, 1)
+                    .map_err(|reason| working_memory(cell_count * rule.len(), reason))?;
+                let mut t = Array1::<f64>::zeros(1);
+                let mut bands = Vec::with_capacity(rule.len());
+                for (&z, &x) in cell.z.iter().zip(&cell.x) {
+                    if x == f64::NEG_INFINITY {
+                        bands.push(0.0);
+                        continue;
+                    }
+                    t[0] = z * inv_sqrt_lambda;
+                    let band = target.excess_rounding_band(&t);
+                    if !(band >= 0.0) {
+                        return Err(Integration(format!(
+                            "composite_axis_marginal_correction: the target's excess rounding band \
+                             at t = {:e} is {band}, not a non-negative bound",
+                            t[0]
+                        )));
+                    }
+                    bands.push(band);
+                }
+                drop(reservation);
+                Ok(share.excess_band_s(cell, &rule, &bands))
+            };
             loop {
                 let node_count = cells.len() * rule.len();
-                let sums = composite_sums(&cells, &rule).map_err(|cause| {
+                let sums = combine_composite_sums(&shares).map_err(|cause| {
                     refuse(cause, node_count, f64::INFINITY, next_order_remainder)
                 })?;
                 let resolution_target = sums.value.abs().min(next_order_remainder);
                 if sums.error == 0.0 || sums.error < resolution_target {
                     break;
                 }
-                let worst = sums
-                    .cell_errors
-                    .iter()
-                    .enumerate()
-                    .fold(0usize, |best, (c, &e)| {
-                        if e > sums.cell_errors[best] { c } else { best }
-                    });
+                // Bisect the largest error share that is a measurement: above the band
+                // its own arithmetic can leave. A share inside it is noise, and splitting
+                // the cell splits the noise without reducing it.
+                let measurable = |c: usize, excess_band: f64| {
+                    sums.cell_errors[c] > sums.share_band(c, &shares[c], excess_band)
+                };
+                let worst = loop {
+                    let candidate = (0..cells.len())
+                        .filter(|&c| sums.cell_errors[c] > 0.0)
+                        .filter(|&c| excess_bands[c].is_none_or(|band| measurable(c, band)))
+                        .max_by(|&a, &b| sums.cell_errors[a].total_cmp(&sums.cell_errors[b]));
+                    match candidate {
+                        Some(c) if excess_bands[c].is_some() => break Some(c),
+                        Some(c) => {
+                            excess_bands[c] = Some(
+                                excess_band_of(&cells[c], &shares[c], cells.len()).map_err(|cause| {
+                                    refuse(cause, node_count, sums.error, resolution_target)
+                                })?,
+                            );
+                        }
+                        None => break None,
+                    }
+                };
+                let Some(worst) = worst else {
+                    let mut rounding_floor = 0.0;
+                    for c in 0..cells.len() {
+                        let band = match excess_bands[c] {
+                            Some(band) => band,
+                            None => excess_band_of(&cells[c], &shares[c], cells.len()).map_err(
+                                |cause| refuse(cause, node_count, sums.error, resolution_target),
+                            )?,
+                        };
+                        rounding_floor += sums.share_band(c, &shares[c], band);
+                    }
+                    return Err(refuse(
+                        BlockQuadratureRefusal::CompositeRoundingFloor {
+                            cells: cells.len(),
+                            rounding_floor,
+                        },
+                        node_count,
+                        sums.error,
+                        resolution_target,
+                    ));
+                };
                 let Some(mid) = cells[worst].midpoint() else {
                     let (lower_z, upper_z) = cells[worst].z_bounds();
                     return Err(refuse(
@@ -7577,6 +7839,10 @@ fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
                 .map_err(|cause| refuse(cause, node_count, sums.error, resolution_target))?;
                 evaluate_excess(&mut halves, table_bytes(cells.len() + 1))
                     .map_err(|cause| refuse(cause, node_count, sums.error, resolution_target))?;
+                let half_shares: Vec<CompositeCellSums> =
+                    halves.iter().map(|cell| CompositeCellSums::of(cell, &rule)).collect();
+                shares.splice(worst..=worst, half_shares);
+                excess_bands.splice(worst..=worst, [None, None]);
                 cells.splice(worst..=worst, halves);
             }
             cells

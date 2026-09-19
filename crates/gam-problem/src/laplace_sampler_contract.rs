@@ -156,6 +156,12 @@ pub enum BlockQuadratureRefusal {
         upper_z: f64,
         cell_error: f64,
     },
+    /// The adaptive composite rule of a one-axis piece is unresolved, but every cell's
+    /// Gauss–Kronrod error share sits inside that share's own rounding band, the
+    /// spread the arithmetic forming it (the node masses and the target's excess) can
+    /// leave. The estimate is then noise, and bisecting would chase it without end
+    /// (#784). `rounding_floor` is the sum of the cells' bands.
+    CompositeRoundingFloor { cells: usize, rounding_floor: f64 },
     /// Any other failure of the integration itself (non-positive curvature,
     /// infeasible nodes, non-finite output, a malformed order list).
     Integration(String),
@@ -204,6 +210,15 @@ impl std::fmt::Display for BlockQuadratureRefusal {
                 "the composite Gauss–Kronrod cell z ∈ [{lower_z:.6e}, {upper_z:.6e}] carries \
                  error {cell_error:.4e} and its midpoint rounds onto an endpoint, so it cannot \
                  be bisected"
+            ),
+            Self::CompositeRoundingFloor {
+                cells,
+                rounding_floor,
+            } => write!(
+                f,
+                "every cell of the {cells}-cell composite Gauss–Kronrod partition carries an \
+                 error share inside its rounding band (the bands sum to {rounding_floor:.4e}), \
+                 so the remaining error is not measurable at working precision"
             ),
             Self::Integration(reason) => f.write_str(reason),
         }
