@@ -5218,31 +5218,37 @@ impl FittedModel {
         out
     }
 
-    /// Frozen level vocabularies for FIXED-factor terms (`factor(g)` or a bare
-    /// `+ g`, i.e. `lenient_unseen == false`) whose feature column is *numeric*
-    /// in the data schema.
+    /// Refuse the out-of-vocabulary levels of FIXED-factor terms (`factor(g)`
+    /// or a bare `+ g`, i.e. `lenient_unseen == false`) whose feature column is
+    /// *numeric* in the data schema, one error per such column naming its first
+    /// unseen level.
     ///
-    /// A string factor is a `Categorical` schema column, so the strict schema
-    /// re-encode already rejects (and `check` reports) an out-of-vocabulary
-    /// label. A numeric-coded `factor(year)`, however, reaches the model as a
-    /// `Continuous`/`Binary` column with no categorical schema, so the encode
-    /// path has no level set to validate against — the unseen-level guard is
-    /// silently skipped (#2137). This exposes each such column's frozen numeric
-    /// vocabulary (canonical `f64` bit patterns, signed-zero/NaN normalized) so
-    /// the `check`/`predict` schema layer can enforce the same fixed-factor
-    /// contract the design operator (`build_random_effect_block`) enforces.
+    /// A string factor is a `Categorical` schema column, so the schema
+    /// projection already refuses an out-of-vocabulary label. A numeric-coded
+    /// `factor(year)`, however, reaches the model as a `Continuous`/`Binary`
+    /// column with no categorical schema, so the projection has no level set to
+    /// validate against (#2137). This checks each such column against its frozen
+    /// numeric vocabulary (canonical `f64` bit patterns, signed-zero/NaN
+    /// normalized) with the same typed [`gam_data::DataError::InvalidCell`] the
+    /// projection gives a string factor, so `predict` and `check` on every front
+    /// end refuse the level before the design operator
+    /// (`build_random_effect_block`) is reached.
     ///
     /// Only terms with concrete `frozen_levels` (captured at fit) and the full
     /// one-hot block (`!drop_first_level`, so the frozen set is the complete
-    /// training vocabulary) are returned, matching the operator's strict gate.
-    pub fn numeric_fixed_factor_vocabularies(&self) -> Vec<(String, HashSet<u64>)> {
+    /// training vocabulary) are checked, matching the operator's strict gate.
+    pub fn unseen_numeric_factor_levels(
+        &self,
+        headers: &[String],
+        values: ndarray::ArrayView2<'_, f64>,
+    ) -> Vec<gam_data::DataError> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return Vec::new();
         };
         let Some(schema) = self.data_schema.as_ref() else {
             return Vec::new();
         };
-        let mut out = Vec::<(String, HashSet<u64>)>::new();
+        let mut out = Vec::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
                 if term.lenient_unseen || term.drop_first_level {
@@ -5255,7 +5261,7 @@ impl FittedModel {
                     continue;
                 };
                 // Skip string factors: they are Categorical in the schema and
-                // are already validated by the typed encode.
+                // are already validated by the schema projection.
                 let is_numeric = schema
                     .columns
                     .iter()
@@ -5265,11 +5271,31 @@ impl FittedModel {
                 if !is_numeric {
                     continue;
                 }
+                let Some(index) = headers.iter().position(|header| header == name) else {
+                    continue;
+                };
                 let vocab: HashSet<u64> = levels
                     .iter()
                     .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
                     .collect();
-                out.push((name.clone(), vocab));
+                let column = values.column(index);
+                let Some((row, value)) = column
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !vocab.contains(&gam_data::canonical_level_bits(**value)))
+                else {
+                    continue;
+                };
+                let known_levels = levels
+                    .iter()
+                    .map(|&b| f64::from_bits(b).to_string())
+                    .collect::<Vec<_>>();
+                out.push(gam_data::DataError::unseen_level_cell(
+                    name,
+                    row + 1,
+                    &value.to_string(),
+                    &known_levels,
+                ));
             }
         }
         out

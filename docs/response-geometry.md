@@ -25,7 +25,16 @@ For simplex responses, the base point is the Aitchison Fréchet mean
 base point is computed by Karcher iteration on the sphere.
 
 ```python
+import numpy as np
+import pandas as pd
 import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 4, 300)
+sand = 0.2 + 0.08 * np.sin(x) + rng.normal(0, 0.01, 300)
+silt = 0.3 + 0.08 * np.cos(x) + rng.normal(0, 0.01, 300)
+train = pd.DataFrame({"x": x, "sand": sand, "silt": silt, "clay": 1 - sand - silt})
+test = pd.DataFrame({"x": [0.5, 2.0, 3.5]})
 
 model = gamfit.fit(
     train,

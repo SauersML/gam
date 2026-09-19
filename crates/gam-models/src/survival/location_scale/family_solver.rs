@@ -81,6 +81,26 @@ pub(crate) fn aft_absolute_newton_direction(
     })
 }
 
+/// Number of backtracking trials, starting at `alpha0` and contracting by
+/// `contraction`, whose predicted gain `α·g·δ` stays above the objective's
+/// rounding band. Below that band the Armijo sufficient-increase test compares
+/// log-likelihoods that round to the same value, so a further trial can only
+/// accept rounding noise (#3185).
+pub(crate) fn aft_resolvable_trial_count(
+    alpha0: f64,
+    directional: f64,
+    contraction: f64,
+    objective_band: f64,
+) -> usize {
+    let mut trials = 0_usize;
+    let mut predicted_gain = alpha0 * directional;
+    while predicted_gain.is_finite() && predicted_gain > objective_band {
+        trials += 1;
+        predicted_gain *= contraction;
+    }
+    trials
+}
+
 impl SurvivalLocationScaleFamily {
     /// Recompute every block's linear predictor `η_b = D_b · β_b + o_b` from
     /// the joint coefficient vector `theta` (block-concatenated) and the block
@@ -174,11 +194,11 @@ impl SurvivalLocationScaleFamily {
     /// certifies stationarity uniformly across `n`, and its own round-off floor
     /// (`~ n·ε²·κ(H)`) stays vanishingly far below any usable tolerance.
     ///
-    /// If, near the optimum, the Newton ascent direction admits no
-    /// Armijo-sufficient step (`ℓ` cannot be increased to numerical precision)
-    /// while `½λ²` is already below [`REDUCED_AFT_NEWTON_STALL_TOL`], the iterate
-    /// is accepted as the numerical MLE; a large decrement at such a stall is a
-    /// genuine curvature-model failure and is surfaced as an error.
+    /// The backtracking tries steps only while their predicted gain `α·g·δ`
+    /// exceeds the objective's rounding band ([`aft_resolvable_trial_count`]).
+    /// If none of them is Armijo-sufficient, `ℓ` disagrees with its own
+    /// derivatives at a point whose decrement is still above tolerance: that is
+    /// not an MLE and is surfaced as an error, never accepted.
     ///
     /// Returns the converged block states, the log-likelihood at the MLE, and
     /// the joint negative-log-likelihood Hessian `H` (the observed information),
@@ -394,27 +414,16 @@ impl SurvivalLocationScaleFamily {
             // sufficient-increase condition on ℓ is well posed. The directional
             // derivative is exactly the Newton decrement computed above.
             let directional = newton_decrement;
-            const MIN_ALPHA: f64 = 1e-12;
-            // The pre-migration loop halved from the feasibility-capped α
-            // while `alpha >= MIN_ALPHA`; count those trials by the same
-            // halving recurrence (exact, unlike a log — zero trials when α₀
-            // already sits below the floor, leaving the search exhausted).
-            let max_steps = {
-                let mut n = 0_usize;
-                let mut a = alpha;
-                while a >= MIN_ALPHA {
-                    n += 1;
-                    a *= 0.5;
-                }
-                n
-            };
+            let contraction = constants::BACKTRACK_CONTRACTION;
+            let max_steps =
+                aft_resolvable_trial_count(alpha, directional, contraction, objective_band);
             // A trial whose block-state rebuild or likelihood evaluation errors
             // is INVALID (`Ok(None)`): halve without consulting the Armijo test.
             let accepted = match backtracking_line_search::<_, Infallible>(
                 BacktrackConfig {
                     initial_step: alpha,
+                    contraction,
                     max_steps,
-                    ..BacktrackConfig::default()
                 },
                 |alpha| {
                     let trial_theta = &theta + &(alpha * &delta);
@@ -442,26 +451,11 @@ impl SurvivalLocationScaleFamily {
                     states = new_states;
                     ll = new_ll;
                 }
-                // The Newton ascent direction admits no Armijo-sufficient
-                // step: ℓ can no longer be increased to numerical precision. If
-                // the Newton decrement is also small, this is the numerical MLE —
-                // a near-stationary iterate whose step no longer improves ℓ
-                // (gam#2112) — so accept it. This is the correct terminal state
-                // of a maximizer: an iterate at which the objective cannot be
-                // increased IS the optimum, even if the raw (n-scaled) gradient
-                // has not reached an absolute floor. A LARGE decrement here means
-                // the quadratic model is badly wrong (ill-conditioning / a bad
-                // local curvature model), not an MLE; that stays a structured
-                // error, keeping the reduced-AFT route consistent with the coupled
-                // location-scale solvers rather than handing an unconverged /
-                // possibly indefinite Hessian to downstream linear algebra, where
-                // panic=abort builds can terminate the CLI.
+                // No trial with a resolvable predicted gain is Armijo-sufficient,
+                // yet the decrement is above tolerance (a smaller one converged
+                // above): ℓ disagrees with its own gradient and curvature here, so
+                // this iterate is not certified as the MLE (#3185).
                 None => {
-                    if 0.5 * newton_decrement <= REDUCED_AFT_NEWTON_STALL_TOL {
-                        certify_maximum()?;
-                        converged = true;
-                        break;
-                    }
                     return Err(SurvivalLocationScaleError::NumericalFailure {
                         reason: format!(
                             "direct parametric-AFT MLE: line search failed before convergence \

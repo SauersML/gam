@@ -2289,8 +2289,9 @@ mod native_certificate_index_tests {
             value_gap: 0.0,
             estimand_travel_bound: 0.0,
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: 0.0,
-                curvature_margin: 0.0,
+                route: crate::model_types::FacePositivityRoute::PositiveForm,
+                statistic: 0.0,
+                band: 0.0,
             },
         }
     }

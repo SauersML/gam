@@ -1490,19 +1490,19 @@ fn run_predict_conformal(
     Ok(())
 }
 
-pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
+pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
     validate_level(args.level)?;
     // A multinomial model persists as its own softmax-envelope file, not a
     // scalar `SavedModel`; dispatch on the file discriminator before the
     // standard load so `SavedModel::load_from_path` is never handed one.
     if is_multinomial_model_file(&args.model) {
         if args.conformal {
-            return Err("--conformal supports standard models only".to_string());
+            return Err("--conformal supports standard models only".to_string().into());
         }
-        return run_predict_multinomial(&args);
+        return run_predict_multinomial(&args).map_err(CliError::from);
     }
     let phase_start = std::time::Instant::now();
-    let model = SavedModel::load_from_path(&args.model)?;
+    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
     log::debug!(
         "[PHASE] predict load-model done elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
@@ -1569,7 +1569,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
             prepend_id_column_to_prediction_csv(&args.out, id_column, values)?;
         }
     }
-    result
+    result.map_err(CliError::from)
 }
 
 /// Evaluate the labelled-data CTM score used as a generated regressor by a
@@ -1647,10 +1647,11 @@ pub(crate) fn run_transformation_score(args: TransformationScoreArgs) -> Result<
 /// marginal-slope model on a dataset, through the map its fit applied
 /// (gam#3016). gamfit returns the same values from
 /// `Model.latent_conditional_residual`.
-pub(crate) fn run_latent_residual(args: LatentResidualArgs) -> Result<(), String> {
-    let model = SavedModel::load_from_path(&args.model)?;
+pub(crate) fn run_latent_residual(args: LatentResidualArgs) -> CliResult<()> {
+    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
     let columns = model
-        .latent_conditional_residual_columns()?
+        .latent_conditional_residual_columns()
+        .map_err(|error| error.to_string())?
         .into_iter()
         .collect::<Vec<_>>();
     let dataset = load_datasetwith_model_schema_columns(&args.data, &model, &columns)?;
