@@ -6,7 +6,8 @@ the returned plan together with its plan-aware applied-dose observation. This
 scorer never re-computes or overwrites ``predicted_nats``. It accepts only an
 ``exact_full`` or ``exact_directional`` public prediction, learns the readout-KL
 radius exclusively from calibration prompts, freezes that radius, and scores
-held-out prompts below it.
+held-out prompts inside the region the calibration occupies: from the lowest
+calibration dose up to the radius.
 
 The historical private-driver monkeypatch is intentionally gone. A ledger that
 does not carry strict public-plan values, stable intervention identifiers, and
@@ -162,16 +163,22 @@ def _relative_readout_error(row: dict[str, Any]) -> float:
     return abs(measured - predicted) / predicted
 
 
-def _calibrate_readout_radii(
+def _calibrate_readout_regions(
     rows: list[dict[str, Any]], *, tolerance: float
-) -> dict[int, float]:
+) -> dict[int, tuple[float, float]]:
+    """Each atom's calibrated dose region, ``(lowest calibration dose, radius)``.
+
+    A calibration certifies only the doses its rows occupy. The radius extends the
+    region upward through contiguous passing strata; nothing extends it below the
+    lowest calibration dose, where no calibration row measured the readout.
+    """
     if not math.isfinite(tolerance) or not 0.0 <= tolerance < 1.0:
         raise ValueError("readout tolerance must be a finite fraction in [0,1)")
     calibration = [row for row in rows if row["split"] == "calibration"]
     if not calibration:
         raise ValueError("readout-radius calibration needs calibration rows")
     atoms = sorted({int(row["atom"]) for row in rows})
-    radii: dict[int, float] = {}
+    regions: dict[int, tuple[float, float]] = {}
     for atom in atoms:
         ordered = sorted(
             (row for row in calibration if int(row["atom"]) == atom),
@@ -198,8 +205,8 @@ def _calibrate_readout_radii(
             raise ValueError(
                 f"atom {atom} has no contiguous calibration dose inside readout tolerance"
             )
-        radii[atom] = radius
-    return radii
+        regions[atom] = (float(ordered[0]["predicted_nats"]), radius)
+    return regions
 
 
 def _score(rows: list[dict[str, Any]]) -> dict[str, float | int]:
@@ -258,12 +265,14 @@ def acceptance_report(
     ledger: dict[str, Any], *, readout_tol_rel: float, bootstrap_draws: int, seed: int
 ) -> dict[str, Any]:
     rows = _validate_ledger(ledger)
-    radii = _calibrate_readout_radii(rows, tolerance=readout_tol_rel)
+    regions = _calibrate_readout_regions(rows, tolerance=readout_tol_rel)
     heldout = [row for row in rows if row["split"] == "heldout"]
     included = [
         row
         for row in heldout
-        if float(row["predicted_nats"]) <= radii[int(row["atom"])]
+        if regions[int(row["atom"])][0]
+        <= float(row["predicted_nats"])
+        <= regions[int(row["atom"])][1]
     ]
     excluded = [row for row in heldout if row not in included]
     report: dict[str, Any] = dict(_score(included))
@@ -271,13 +280,15 @@ def acceptance_report(
     report.update(
         slope_cluster_bootstrap_95_ci=ci,
         readout_tol_rel=readout_tol_rel,
-        readout_radius_nats_by_atom={str(key): value for key, value in radii.items()},
+        readout_region_nats_by_atom={
+            str(key): list(value) for key, value in regions.items()
+        },
         row_counts={
             "total": len(rows),
             "calibration": sum(row["split"] == "calibration" for row in rows),
             "heldout": len(heldout),
-            "heldout_in_readout_radius": len(included),
-            "heldout_outside_readout_radius": len(excluded),
+            "heldout_in_calibrated_region": len(included),
+            "heldout_outside_calibrated_region": len(excluded),
         },
         included_intervention_ids=[row["intervention_id"] for row in included],
         excluded_intervention_ids=[row["intervention_id"] for row in excluded],
@@ -285,15 +296,16 @@ def acceptance_report(
             sorted(Counter(row["resident_metric_nats_kind"] for row in rows).items())
         ),
         by_atom=_group_report(included, lambda row: f"atom_{int(row['atom'])}"),
-        out_of_readout_radius=(
+        outside_calibrated_region=(
             _score(excluded) if len(excluded) >= 3 else {"n": len(excluded)}
         ),
         protocol=ledger["protocol"],
         prediction="public exact_full/exact_directional Fisher dose of effective_delta",
         measurement="KL(p_base || p_patched) for the same effective_delta",
         validity_rule=(
-            "readout radii learned only from split=calibration, then frozen; "
-            "heldout predicted_nats <= the matching atom radius"
+            "readout regions learned only from split=calibration, then frozen; "
+            "heldout predicted_nats between the matching atom's lowest calibration "
+            "dose and its radius"
         ),
     )
     report["acceptance"] = {

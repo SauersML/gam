@@ -65,15 +65,19 @@ def _row(
 
 def _ledger() -> dict[str, object]:
     rows = [
-        _row("c0", atom=0, prompt="c-a", split="calibration", predicted=0.01, measured=0.0102),
-        _row("c1", atom=0, prompt="c-b", split="calibration", predicted=0.02, measured=0.024),
-        _row("c2", atom=1, prompt="c-c", split="calibration", predicted=0.02, measured=0.0198),
-        _row("c3", atom=1, prompt="c-d", split="calibration", predicted=0.04, measured=0.06),
-        _row("h0", atom=0, prompt="same-index", split="heldout", predicted=0.004, measured=0.004),
-        _row("h1", atom=0, prompt="other", split="heldout", predicted=0.008, measured=0.0081),
-        _row("h2", atom=1, prompt="same-index", split="heldout", predicted=0.01, measured=0.0101),
-        _row("h3", atom=1, prompt="third", split="heldout", predicted=0.015, measured=0.0149),
+        _row("c0", atom=0, prompt="c-a", split="calibration", predicted=0.005, measured=0.00505),
+        _row("c1", atom=0, prompt="c-b", split="calibration", predicted=0.01, measured=0.0102),
+        _row("c2", atom=0, prompt="c-e", split="calibration", predicted=0.02, measured=0.024),
+        _row("c3", atom=1, prompt="c-c", split="calibration", predicted=0.01, measured=0.0101),
+        _row("c4", atom=1, prompt="c-f", split="calibration", predicted=0.02, measured=0.0198),
+        _row("c5", atom=1, prompt="c-d", split="calibration", predicted=0.04, measured=0.06),
+        _row("h0", atom=0, prompt="same-index", split="heldout", predicted=0.008, measured=0.008),
+        _row("h1", atom=0, prompt="other", split="heldout", predicted=0.01, measured=0.0101),
+        _row("h2", atom=1, prompt="same-index", split="heldout", predicted=0.015, measured=0.0149),
+        _row("h3", atom=1, prompt="third", split="heldout", predicted=0.02, measured=0.0201),
         _row("h4", atom=0, prompt="outside", split="heldout", predicted=0.015, measured=0.02),
+        _row("h5", atom=0, prompt="below", split="heldout", predicted=0.002, measured=0.02),
+        _row("h6", atom=1, prompt="below", split="heldout", predicted=0.004, measured=0.04),
     ]
     return {"protocol": _protocol(len(rows)), "rows": rows}
 
@@ -82,15 +86,16 @@ def test_acceptance_uses_calibration_radius_and_stable_atom_prompt_clusters() ->
     report = replay.acceptance_report(
         _ledger(), readout_tol_rel=0.1, bootstrap_draws=200, seed=2249
     )
-    assert report["readout_radius_nats_by_atom"] == {"0": 0.01, "1": 0.02}
+    assert report["readout_region_nats_by_atom"] == {"0": [0.005, 0.01], "1": [0.01, 0.02]}
     assert report["row_counts"] == {
-        "total": 9,
-        "calibration": 4,
-        "heldout": 5,
-        "heldout_in_readout_radius": 4,
-        "heldout_outside_readout_radius": 1,
+        "total": 13,
+        "calibration": 6,
+        "heldout": 7,
+        "heldout_in_calibrated_region": 4,
+        "heldout_outside_calibrated_region": 3,
     }
     assert report["included_intervention_ids"] == ["h0", "h1", "h2", "h3"]
+    assert report["excluded_intervention_ids"] == ["h4", "h5", "h6"]
     assert report["r2_through_origin"] > 0.99
     # The repeated prompt token belongs to two atoms and therefore two clusters;
     # the old base-index-only key would collapse these into one.
@@ -127,8 +132,26 @@ def test_readout_radius_never_uses_heldout_measurements() -> None:
     second = replay.acceptance_report(
         ledger, readout_tol_rel=0.1, bootstrap_draws=20, seed=1
     )
-    assert first["readout_radius_nats_by_atom"] == second["readout_radius_nats_by_atom"]
+    assert first["readout_region_nats_by_atom"] == second["readout_region_nats_by_atom"]
     assert first["included_intervention_ids"] == second["included_intervention_ids"]
+
+
+def test_heldout_rows_below_the_calibrated_region_are_not_certified() -> None:
+    # h5 and h6 sit below every calibration dose of their atom, where no
+    # calibration row measured the readout, and their measurements are ten times
+    # their predictions. Scoring them as certified would let an unmeasured dose
+    # range into the acceptance; they must be reported outside the region and must
+    # not move the certified score by any amount.
+    ledger = _ledger()
+    report = replay.acceptance_report(ledger, readout_tol_rel=0.1, bootstrap_draws=50, seed=3)
+    assert {"h5", "h6"} <= set(report["excluded_intervention_ids"])
+    assert not {"h5", "h6"} & set(report["included_intervention_ids"])
+
+    ledger["rows"] = [row for row in ledger["rows"] if row["intervention_id"] not in {"h5", "h6"}]
+    ledger["protocol"]["row_count"] = len(ledger["rows"])
+    without = replay.acceptance_report(ledger, readout_tol_rel=0.1, bootstrap_draws=50, seed=3)
+    for key in ("slope_through_origin", "r2_through_origin", "slope_cluster_bootstrap_95_ci"):
+        assert report[key] == without[key]
 
 
 def test_one_failure_blocks_the_entire_equal_dose_calibration_stratum() -> None:
@@ -141,8 +164,8 @@ def test_one_failure_blocks_the_entire_equal_dose_calibration_stratum() -> None:
             atom=0,
             prompt="c-fail",
             split="calibration",
-            predicted=0.01,
-            measured=0.02,
+            predicted=0.005,
+            measured=0.01,
         ),
     )
     ledger["protocol"]["row_count"] = len(rows)
