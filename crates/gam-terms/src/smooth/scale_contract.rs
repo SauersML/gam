@@ -836,6 +836,7 @@ mod tests {
                 flavour,
                 group_frozen_levels: Some(vec![0.0_f64.to_bits(), 1.0_f64.to_bits()]),
                 frozen_global_orthogonality: None,
+                adaptive: false,
             },
         }
     }
@@ -876,6 +877,7 @@ mod tests {
                     knotspec: BSplineKnotSpec::PeriodicUniform {
                         data_range: (0.0, 1.0),
                         num_basis: 8,
+                        adaptive: false,
                     },
                     boundary: OneDimensionalBoundary::Cyclic {
                         start: 0.0,
@@ -1153,6 +1155,7 @@ mod tests {
             knotspec: BSplineKnotSpec::PeriodicUniform {
                 data_range: (-0.4 * scale, 1.6 * scale),
                 num_basis: 9,
+                adaptive: false,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
@@ -1271,6 +1274,7 @@ mod tests {
                 flavour,
                 group_frozen_levels: Some(levels.clone()),
                 frozen_global_orthogonality: None,
+                adaptive: false,
             },
         };
         match family {

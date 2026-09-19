@@ -591,6 +591,12 @@ pub struct FactorSmoothSpec {
     /// persisted; replayed verbatim by `apply_global_smooth_identifiability`.
     #[serde(default)]
     pub frozen_global_orthogonality: Option<Array2<f64>>,
+    /// `true` when nobody chose the shared marginal's size: it is the formula
+    /// default's starting resolution, which the standard formula workflow
+    /// refines from the converged fit's own evidence. An explicit `k=` is
+    /// `false` and honoured verbatim.
+    #[serde(default)]
+    pub adaptive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1072,10 +1078,21 @@ pub(crate) struct RawSmoothDesign {
     pub linear_constraints: Option<LinearInequalityConstraints>,
 }
 
+/// Penalty-source tag of the latent-scale ridge a `bounded()` coefficient
+/// carries under [`BoundedCoefficientPriorSpec::Shrinkage`].
+pub const BOUNDED_SHRINKAGE_PENALTY_SOURCE: &str = "BoundedShrinkage";
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
+    /// Constrained MLE: no prior term on the bounded coefficient (`prior=none`).
     #[default]
     None,
+    /// The formula default: a Gaussian prior on the latent logit coordinate,
+    /// centred at the null, whose precision REML estimates like any other
+    /// smoothing parameter. The null is `beta = 0` when zero lies strictly
+    /// inside `(min, max)`; otherwise zero is not an admissible value and the
+    /// prior centres at the box midpoint, the latent origin.
+    Shrinkage,
     Uniform,
     Beta {
         a: f64,
@@ -1520,7 +1537,9 @@ impl TermCollectionSpec {
                     .into());
                 }
                 match prior {
-                    BoundedCoefficientPriorSpec::None | BoundedCoefficientPriorSpec::Uniform => {}
+                    BoundedCoefficientPriorSpec::None
+                    | BoundedCoefficientPriorSpec::Shrinkage
+                    | BoundedCoefficientPriorSpec::Uniform => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
                             return Err(SmoothError::invalid_config(format!(
@@ -2422,6 +2441,7 @@ impl TermCollectionDesign {
                     &info.penalty.source,
                     crate::basis::PenaltySource::Other(source)
                         if source == "LinearTermRidge"
+                            || source == BOUNDED_SHRINKAGE_PENALTY_SOURCE
                             || source.starts_with("RandomEffectRidge(")
                 )
             })
@@ -5915,7 +5935,7 @@ pub(crate) fn build_tensor_bspline_basis(
             (
                 BSplineKnotSpec::PeriodicUniform {
                     data_range,
-                    num_basis,
+                    num_basis, ..
                 },
                 _,
             ) => Array1::linspace(data_range.0, data_range.1, *num_basis),

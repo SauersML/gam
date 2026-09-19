@@ -1533,7 +1533,7 @@ fn fit_table(
     // CLI uses, so callers read the model kind off the returned bytes
     // (`saved_model_kind`) instead of re-deriving it from the family name.
     // A refused configuration is an `InvalidConfigurationError` here exactly as
-    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamError`.
+    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamfitError`.
     let fit_config = parse_fit_config(config_json.as_deref())
         .map_err(|reason| {
             workflow_error_to_pyerr(
@@ -3444,6 +3444,7 @@ fn sphere_basis<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let penalty = built
@@ -3553,6 +3554,7 @@ fn sphere_basis_with_centers<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let penalty = built
@@ -3638,6 +3640,7 @@ fn sphere_basis_jet<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
@@ -3689,6 +3692,7 @@ fn sphere_basis_jet_with_centers<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
@@ -3754,6 +3758,7 @@ fn sphere_basis_hessian<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let hessian = spherical_spline_design_hessian(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(hessian.into_pyarray(py).unbind())
@@ -3963,6 +3968,7 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "linear_predictor_plugin",
     "mean_plugin",
     "posterior_mean",
+    "linear_predictor_standard_error",
     "posterior_mean_standard_error",
     "posterior_mean_lower",
     "posterior_mean_upper",

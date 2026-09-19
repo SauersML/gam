@@ -437,7 +437,7 @@ SPEC classes: **C** cap, **F** fallback/retry, **M** magic constant, **B** box, 
 | `opt/src/lib.rs:6780-6800` | ARC tol 1e−5, max_iter 100, σ_min 1e−10, σ_max 1e12, subproblem_max_iterations 80, AutoBfgs, history_cap 12 | M, C | tolerances from bands; no caps; exact-Hessian mode mandatory for the outer path |
 | `opt/src/lib.rs:~903-960` | within_noise_floor → ρ = 1; RejectFloor radius clamp | M, F | Sun–Nocedal relaxed ratio plus audit |
 | `opt/src/lib.rs:7500-7560` | σ_max saturation | C | delete (CGT Lemma 5.2 bound) |
-| `newton_polish.rs:118-126`, `367-372` | "stopped contracting", SC budget | M (false premise) | delete; Kantorovich terminal phase |
+| `newton_polish.rs:118-126`, `367-372` | "stopped contracting", SC budget | M (false premise) | "stopped contracting" **deleted**; the λ₊ ≤ 2λ² face-ordering test remains |
 | `run.rs:1683` | ArcUnprogressingStallCheckpoint | F | delete; audit plus face candidate |
 | `run.rs:14` | OPERATOR_TRUST_RESTART_RADIUS_FLOOR=1e−6 | M, F | delete |
 | `run.rs:3080` | MAX_EXPANSIONS=64 | C | delete |

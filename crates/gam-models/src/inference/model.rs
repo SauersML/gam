@@ -142,10 +142,19 @@ use std::path::Path;
 // bound δ/√12 of the standardized response, which replaced the fixed floor 0.01. The field carries
 // a serde default so every other family's older payload reads through; a Gaussian location-scale
 // payload without it was fitted under the old floor, and the saved-fit validator refuses it by name.
-pub const MODEL_PAYLOAD_VERSION: u32 = 31;
+// v32 records each moving-law arm's Gaussian-residual adequacy screen
+// (`MovingLawArmScore::adequacy`, gam#2926): an arm whose residual the screen rejects is
+// scored but not a candidate. It carries a serde default, so an older payload loads with no
+// screen, which reads as the rule it was chosen by, where every arm was a candidate; a v31
+// binary refuses a v32 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 32;
+
+/// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
+/// difference is that field's absence.
+const MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION: u32 = 31;
 
 /// The schema before the Gaussian location-scale σ floor record, whose only difference
-/// is that field's absence.
+/// from [`MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 30;
 
 /// The schema whose Newton-polish record may carry its step budget (#2954), or already
@@ -209,8 +218,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 14] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 15] = [
     MODEL_PAYLOAD_VERSION,
+    MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
     SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
     POLISH_STEP_BUDGET_PAYLOAD_VERSION,
     TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
@@ -7874,6 +7884,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
@@ -7893,9 +7904,10 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
+        assert_eq!(MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
         assert_eq!(
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
-            MODEL_PAYLOAD_VERSION - 1
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,
