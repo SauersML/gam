@@ -2246,6 +2246,14 @@ fn attach_basis_adequacy(
             unidentified_scalar_terms,
         };
     };
+    // The random-effect test needs only the design and the converged fit, so
+    // it runs whether or not the covariate frame is available.
+    standard.fit.artifacts.random_effect_tests =
+        crate::fit_orchestration::drivers::random_effect_test_records(
+            &standard.design,
+            &standard.resolvedspec,
+            &standard.fit,
+        );
     if let Some(data) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
             data.view(),
