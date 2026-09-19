@@ -153,8 +153,11 @@ pub enum SmoothLrReferenceSource {
 /// DIFFERENCE and adds it to the exact conditional value:
 ///
 /// ```text
-/// p_selection = p_conditional + [ P̂(W_sel ≥ w) − P̂(W_cond ≥ w) ]
+/// p_selection = p_conditional(w) + [ P̂(W_sel ≥ w_sel) − P̂(W_cond ≥ w) ]
 /// ```
+///
+/// where `w_sel` is the observation under the replay's own selection (see
+/// [`Self::observed`]; `w_sel = w` when no score was supplied).
 ///
 /// a textbook control variate. The bracket is a difference of two indicators
 /// that agree on most draws, so its variance is a fraction of either term's, and
@@ -4375,7 +4378,7 @@ mod selection_replay_tests {
     use super::{
         AxisSlice, DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream,
         SelectionFactor, SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline,
-        SmoothLrSelectionReplay, split_mix64,
+        SmoothLrReferenceDf, SmoothLrReferenceSource, SmoothLrSelectionReplay, split_mix64,
     };
     use ndarray::Array2;
 
@@ -4599,6 +4602,138 @@ mod selection_replay_tests {
                 panic!("expected a replay, declined: {}", reason.label())
             }
         }
+    }
+
+    /// `N(0, 1)` draws for the calibration study below, from a counter stream
+    /// the replay's own strata do not share (Box–Muller on SplitMix64 words).
+    fn observation(rep: u64, dimension: usize) -> Vec<f64> {
+        let unit = |counter: u64| {
+            ((split_mix64(0xC0FF_EE00_0000_0000 ^ counter) >> 11) as f64 + 0.5)
+                * (-53.0_f64).exp2()
+        };
+        (0..dimension as u64)
+            .map(|j| {
+                let base = 2 * (rep * dimension as u64 + j);
+                let (u, v) = (unit(base), unit(base + 1));
+                (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+            })
+            .collect()
+    }
+
+    /// Two-sided calibration of the selection-corrected tail, seeded.
+    ///
+    /// In the replay's own world the observation is a whitened score
+    /// `z ~ N(0, I)` and its statistic at the fitted scale is
+    /// `x = W_q(0; z) = Σ_j w_j z_j²`. The p-value the corrected reference
+    /// assigns it must be `U(0, 1)` over the WHOLE range — not merely sized at
+    /// one α — because a conservative p is as wrong as an anti-conservative one.
+    ///
+    /// Reading the selection arm at the observed `x` itself asks the wrong
+    /// question: `x` is the observation under the fitted `λ̂`, and the replay's
+    /// selected law is a law of the statistic under the replay's selection. On
+    /// the same observations that version fails this test (asserted below), so
+    /// the test pins the rescoring and not just the arithmetic.
+    ///
+    /// Two Monte-Carlo errors are in play and both are carried: the `R`
+    /// observations' (`√(α(1−α)/R)`) and the replay's own finite `N` draws
+    /// (`√(α(1−α)/N)`), which fix one empirical selected law for every
+    /// observation. The tolerances are three combined standard errors for the
+    /// sizes and the Kolmogorov `0.999` quantile `1.949·√(1/R + 1/N)` for `D`.
+    #[test]
+    fn the_rescored_selection_tail_is_uniform_on_both_sides() {
+        let generalized = spectrum();
+        let dimension = generalized.len();
+        let window = (-30.0_f64, 30.0);
+        let draws = SMOOTH_LR_SELECTION_DRAWS;
+        let weights: Vec<f64> = generalized
+            .iter()
+            .map(|&nu| {
+                let share = nu / (1.0 + nu);
+                1.0 - share * share
+            })
+            .collect();
+        let base = replay_from(&generalized, window, draws);
+        let replications = 600_u64;
+        let mut rescored = Vec::new();
+        let mut unscored = Vec::new();
+        for rep in 0..replications {
+            let z = observation(rep, dimension);
+            let statistic: f64 = z
+                .iter()
+                .zip(weights.iter())
+                .map(|(value, weight)| weight * value * value)
+                .sum();
+            let replay = match SmoothLrSelectionReplay::from_geometry(
+                &diagonal(&generalized),
+                &[window],
+                draws,
+                draws,
+                Some(&z),
+            ) {
+                SmoothLrSelection::Replayed(replay) => replay,
+                SmoothLrSelection::Declined(reason) => {
+                    panic!("rep {rep}: declined: {}", reason.label())
+                }
+            };
+            // The observation does not move the draws, and its conditional
+            // statistic is the one the fit reports.
+            assert_eq!(replay.selection_sample, base.selection_sample);
+            let observed = replay.observed.expect("an observed selection");
+            assert!(
+                (observed.conditional - statistic).abs() <= 1e-12 * statistic.max(1.0),
+                "rep {rep}: W_q(0; z) = {} but Σ w z² = {statistic}",
+                observed.conditional
+            );
+            let p_value = |selection| {
+                let mut reference = SmoothLrReferenceDf {
+                    weights: weights.clone(),
+                    mean: weights.iter().sum(),
+                    second_moment: weights.iter().map(|w| w * w).sum(),
+                    chi_square_df: 1.0,
+                    scale: 1.0,
+                    moment_residual: None,
+                    edf: 0.0,
+                    null_dim: 0,
+                    source: SmoothLrReferenceSource::NullSpectrum,
+                    selection,
+                    profiled_scale: None,
+                };
+                reference.chi_square_df = reference.mean * reference.mean / reference.second_moment;
+                reference.scale = reference.second_moment / reference.mean;
+                reference.tail_probability_with_bound(statistic).0
+            };
+            rescored.push(p_value(SmoothLrSelection::Replayed(replay.clone())));
+            let mut blind = replay;
+            blind.observed = None;
+            unscored.push(p_value(SmoothLrSelection::Replayed(blind)));
+        }
+        let r = replications as f64;
+        let n = draws as f64;
+        let kolmogorov = |sample: &[f64]| {
+            let mut sorted = sample.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (p - i as f64 / r).max((i as f64 + 1.0) / r - p))
+                .fold(0.0_f64, f64::max)
+        };
+        let ks_limit = 1.949 * (1.0 / r + 1.0 / n).sqrt();
+        let d = kolmogorov(&rescored);
+        assert!(d <= ks_limit, "two-sided KS D = {d:.4} > {ks_limit:.4}");
+        for alpha in [0.10_f64, 0.05, 0.01] {
+            let size = rescored.iter().filter(|&&p| p <= alpha).count() as f64 / r;
+            let tolerance = 3.0 * (alpha * (1.0 - alpha) * (1.0 / r + 1.0 / n)).sqrt();
+            assert!(
+                (size - alpha).abs() <= tolerance,
+                "size at {alpha}: {size:.4}, outside {alpha} ± {tolerance:.4}"
+            );
+        }
+        let blind_d = kolmogorov(&unscored);
+        assert!(
+            blind_d > ks_limit,
+            "the unrescored tail must fail this test (D = {blind_d:.4})"
+        );
     }
 
     /// The replay is a p-value input, so it must not depend on a thread, a
