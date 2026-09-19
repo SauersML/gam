@@ -756,22 +756,24 @@ impl ArrowSchurSystem {
             // `a` — each `y[a] += Σ_b hbb[a,b]·x[b]` accumulates in the SAME order
             // as serial, so the result is bit-identical to serial (not merely
             // deterministic run-to-run), the #1017 gate. Same `dense_parallel`
-            // guard as `penalty_ridge_prologue_into`: only when not nested in a
-            // rayon worker (the topology race fans candidates) and above the
+            // guard as `penalty_ridge_prologue_into`: only at top level, not
+            // nested (the topology race fans candidates), and above the
             // width floor, so it never oversubscribes and small `k` avoids rayon
             // overhead on a trivial GEMV.
             let dense_parallel = self.hbb.dim() == (k, k)
                 && k >= SCHUR_PROLOGUE_PARALLEL_K_MIN
-                && rayon::current_thread_index().is_none();
+                && gam_runtime::parallel::at_top_level();
             if dense_parallel {
                 use rayon::prelude::*;
                 let hbb = &self.hbb;
-                y.par_iter_mut().enumerate().for_each(|(a, ya)| {
-                    let mut acc = 0.0_f64;
-                    for b in 0..k {
-                        acc += hbb[[a, b]] * x[b];
-                    }
-                    *ya += acc;
+                gam_runtime::parallel::fan_out(|| {
+                    y.par_iter_mut().enumerate().for_each(|(a, ya)| {
+                        let mut acc = 0.0_f64;
+                        for b in 0..k {
+                            acc += hbb[[a, b]] * x[b];
+                        }
+                        *ya += acc;
+                    })
                 });
             } else {
                 for a in 0..k {
@@ -824,12 +826,14 @@ impl ArrowSchurSystem {
         if dense_parallel {
             use rayon::prelude::*;
             let hbb = &self.hbb;
-            y.par_iter_mut().enumerate().for_each(|(a, ya)| {
-                let mut acc = 0.0_f64;
-                for b in 0..k {
-                    acc += hbb[[a, b]] * x[b];
-                }
-                *ya = acc + ridge * x[a];
+            gam_runtime::parallel::fan_out(|| {
+                y.par_iter_mut().enumerate().for_each(|(a, ya)| {
+                    let mut acc = 0.0_f64;
+                    for b in 0..k {
+                        acc += hbb[[a, b]] * x[b];
+                    }
+                    *ya = acc + ridge * x[a];
+                })
             });
         } else {
             self.penalty_matvec_add(x, y);
@@ -1598,11 +1602,11 @@ impl StreamingArrowSchur {
         // is bit-identical regardless of which thread produced each segment (the
         // #1017 verification gate). At the SAE LLM shape (`n` in the thousands)
         // the per-row factor + solve is the whole cost; below the threshold, or
-        // when already inside a rayon worker (the topology race fans candidates
+        // when nested (the topology race fans candidates
         // with `run_topology_race_parallel`), stay sequential to avoid
         // nested-rayon oversubscription — the same guard `schur_matvec` uses.
         let parallel =
-            self.n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+            self.n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             use rayon::prelude::*;
             const CHUNK: usize = 64;
@@ -1637,18 +1641,20 @@ impl StreamingArrowSchur {
             };
             // Collect per-row segments under rayon, then scatter into the disjoint
             // slices. Errors are surfaced via `collect::<Result<…>>`.
-            let segments: Vec<(usize, Array1<f64>)> = (0..self.n_rows)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map(|idxs| {
-                    idxs.into_iter()
-                        .map(&row_solve)
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect();
+            let segments: Vec<(usize, Array1<f64>)> = gam_runtime::parallel::fan_out(|| {
+                (0..self.n_rows)
+                    .into_par_iter()
+                    .chunks(CHUNK)
+                    .map(|idxs| {
+                        idxs.into_iter()
+                            .map(&row_solve)
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+            .into_iter()
+            .flatten()
+            .collect();
             for (base, seg) in &segments {
                 for (c, &v) in seg.iter().enumerate() {
                     delta_t[base + c] = v;

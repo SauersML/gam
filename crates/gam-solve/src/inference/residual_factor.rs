@@ -617,8 +617,8 @@ impl StructuredResidualModel {
         // #974 metric install (n_rows × O(p³) on one core while the inner fit
         // parallelizes cleanly). Same engagement discipline as
         // `scaled_second_moment`: only above a row threshold (serial avoids
-        // rayon overhead on small stacks) and only when not already inside a
-        // rayon worker (nested calls keep the outer region's cores). Error
+        // rayon overhead on small stacks) and only at top level
+        // (nested calls keep the outer region's cores). Error
         // selection stays deterministic: the indexed collect preserves row
         // order, and the first `Some` scanned in that order is the same
         // lowest-row error the serial loop returned.
@@ -646,15 +646,17 @@ impl StructuredResidualModel {
                 "StructuredResidualModel::row_metric: factor stack must be standard-layout"
                     .to_string()
             })?;
-            if p > 0 && n_rows >= PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
-                u_flat
-                    .par_chunks_mut(p * p)
-                    .enumerate()
-                    .map(|(row, urow)| build_row(row, urow))
-                    .collect::<Vec<Option<String>>>()
-                    .into_iter()
-                    .flatten()
-                    .next()
+            if p > 0 && n_rows >= PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level() {
+                gam_runtime::parallel::fan_out(|| {
+                    u_flat
+                        .par_chunks_mut(p * p)
+                        .enumerate()
+                        .map(|(row, urow)| build_row(row, urow))
+                        .collect::<Vec<Option<String>>>()
+                })
+                .into_iter()
+                .flatten()
+                .next()
             } else if p > 0 {
                 u_flat
                     .chunks_mut(p * p)
@@ -775,7 +777,7 @@ impl StructuredResidualModel {
         // in [`Self::row_metric`]: rows are independent (each writes only its
         // own p² chunk of `u`, no cross-row reduction), so the parallel stack is
         // bit-identical to the serial one, with the same engagement discipline
-        // (row threshold, never nested inside a rayon worker) and the same
+        // (row threshold, only at top level, never nested) and the same
         // deterministic lowest-row error selection.
         let mut u = Array2::<f64>::zeros((n_rows, p * p));
         let first_error = {
@@ -796,15 +798,17 @@ impl StructuredResidualModel {
             let u_flat = u
                 .as_slice_mut()
                 .ok_or_else(|| "StructuredResidualModel::row_metric_damped: factor stack must be standard-layout".to_string())?;
-            if p > 0 && n_rows >= PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
-                u_flat
-                    .par_chunks_mut(p * p)
-                    .enumerate()
-                    .map(|(row, urow)| build_row(row, urow))
-                    .collect::<Vec<Option<String>>>()
-                    .into_iter()
-                    .flatten()
-                    .next()
+            if p > 0 && n_rows >= PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level() {
+                gam_runtime::parallel::fan_out(|| {
+                    u_flat
+                        .par_chunks_mut(p * p)
+                        .enumerate()
+                        .map(|(row, urow)| build_row(row, urow))
+                        .collect::<Vec<Option<String>>>()
+                })
+                .into_iter()
+                .flatten()
+                .next()
             } else if p > 0 {
                 u_flat
                     .chunks_mut(p * p)

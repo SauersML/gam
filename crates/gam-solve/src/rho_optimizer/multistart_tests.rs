@@ -396,12 +396,13 @@ fn a_working_set_over_the_budget_runs_the_searches_serially_2359() {
     assert_eq!(serial_winner, winner);
 }
 
-/// Inside a Rayon pool the lanes are that pool's tasks (the path a caller such as
-/// gnomon's calibrate pool takes), outside one they are OS threads; at pool
-/// widths 1, 4 and 12 and on both paths the same seed wins with the same bits,
-/// and the pool's width bounds the lanes.
+/// Called from outside every Rayon pool the lanes are tasks of gam's process
+/// pool; called inside a caller's own pool (the path gnomon's calibrate pool
+/// takes) they are that pool's tasks. At pool widths 1, 4 and 12 and on both
+/// paths the same seed wins with the same bits, and the pool's width bounds the
+/// lanes.
 #[test]
-fn the_winner_is_the_same_on_every_pool_width_and_lane_kind_2359() {
+fn the_winner_is_the_same_on_every_pool_width_and_pool_2359() {
     let (problem, levels) = problem_with_starts(0.0, &[3.5, 4.0]);
     let run = |problem: &OuterProblem| {
         let outcome = problem
@@ -424,7 +425,7 @@ fn the_winner_is_the_same_on_every_pool_width_and_lane_kind_2359() {
             .expect("a test pool");
         let (lanes, inside) = pool.install(|| run(&problem));
         assert!(lanes <= width, "{lanes} lanes on a pool of {width}");
-        assert_eq!(inside, outside, "pool width {width}: same winner and bits as OS-thread lanes");
+        assert_eq!(inside, outside, "pool width {width}: same winner and bits as on the process pool");
     }
 }
 

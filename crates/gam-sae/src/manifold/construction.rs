@@ -427,19 +427,20 @@ pub(super) fn normalized_reconstruction_energy(
 /// `K ×` that, on one core, which is precisely the "unparallelised, ~1.0 of 16
 /// cores" #2757 records against this function.
 ///
-/// The nesting guard is the crate's standing rule: a caller already inside a
-/// rayon worker stays serial so the outer region keeps its cores. A single-atom
-/// model never fans out, since one work item cannot be shared.
+/// The nesting guard is the crate's standing rule: a caller not at top level
+/// (already inside a parallel region) stays serial so the outer region keeps
+/// its cores. A single-atom model never fans out, since one work item cannot be
+/// shared.
 fn atom_certificates_in_parallel<T, F>(k_atoms: usize, certificate: F) -> Vec<T>
 where
     T: Send,
     F: Fn(usize) -> T + Sync + Send,
 {
-    if k_atoms <= 1 || rayon::current_thread_index().is_some() {
+    if k_atoms <= 1 || !gam_runtime::parallel::at_top_level() {
         return (0..k_atoms).map(certificate).collect();
     }
     use rayon::prelude::*;
-    (0..k_atoms).into_par_iter().map(certificate).collect()
+    gam_runtime::parallel::fan_out(|| (0..k_atoms).into_par_iter().map(certificate).collect())
 }
 
 /// Wilkinson's accumulation factor `γ_k = k·u/(1 − k·u)`, `u = ε/2`, as
@@ -1985,8 +1986,8 @@ impl SaeManifoldTerm {
         // collect, so the output vector is in atom order and every element is
         // computed by the identical serial arithmetic — bit-identical to the
         // sweep it replaces, not merely equal in distribution. The nesting guard
-        // keeps a caller already inside a rayon worker on the serial path so the
-        // outer region keeps its cores.
+        // keeps a caller already inside a parallel region on the serial path so
+        // the outer region keeps its cores.
         let k_atoms = self.k_atoms();
 
         // #2081 — per-atom coordinate-fidelity certificate (uniformity + arc-length
@@ -3277,7 +3278,7 @@ impl SaeManifoldTerm {
         // immutable `&self`/prior arrays and writes ONLY its own output row), so
         // the row-parallel paths are bit-identical to the serial sweeps
         // (disjoint-writes determinism — no cross-row float reduction).
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         // Gate map: order-preserving parallel collect == serial push.
         let assignments = self.assignments_all_parallel(n)?;
         // Full fitted reconstruction `Σ_k a_k decoded_k`, so the per-atom partial
@@ -3296,28 +3297,30 @@ impl SaeManifoldTerm {
             let assignments_ref = &assignments;
             if parallel {
                 use rayon::prelude::*;
-                fitted
-                    .axis_iter_mut(ndarray::Axis(0))
-                    .into_par_iter()
-                    .enumerate()
-                    .for_each_init(
-                        || vec![0.0_f64; p],
-                        |dbuf, (row, mut frow)| {
-                            // #1557 — pin any faer GEMM reachable via `fill_decoded_row`.
-                            with_nested_parallel(|| {
-                                for atom_idx in 0..k_atoms {
-                                    let a = assignments_ref[row][atom_idx];
-                                    if a == 0.0 {
-                                        continue;
+                gam_runtime::parallel::fan_out(|| {
+                    fitted
+                        .axis_iter_mut(ndarray::Axis(0))
+                        .into_par_iter()
+                        .enumerate()
+                        .for_each_init(
+                            || vec![0.0_f64; p],
+                            |dbuf, (row, mut frow)| {
+                                // #1557 — pin any faer GEMM reachable via `fill_decoded_row`.
+                                with_nested_parallel(|| {
+                                    for atom_idx in 0..k_atoms {
+                                        let a = assignments_ref[row][atom_idx];
+                                        if a == 0.0 {
+                                            continue;
+                                        }
+                                        atoms[atom_idx].fill_decoded_row(row, dbuf);
+                                        for c in 0..p {
+                                            frow[c] += a * dbuf[c];
+                                        }
                                     }
-                                    atoms[atom_idx].fill_decoded_row(row, dbuf);
-                                    for c in 0..p {
-                                        frow[c] += a * dbuf[c];
-                                    }
-                                }
-                            });
-                        },
-                    );
+                                });
+                            },
+                        );
+                });
             } else {
                 let mut dbuf = vec![0.0_f64; p];
                 for row in 0..n {
@@ -3400,13 +3403,15 @@ impl SaeManifoldTerm {
                 .collect();
             let block: Option<Array2<f64>> = if parallel {
                 use rayon::prelude::*;
-                chunks
-                    .into_par_iter()
-                    .map(chunk_block)
-                    .reduce_with(|mut left, right| {
-                        left += &right;
-                        left
-                    })
+                gam_runtime::parallel::fan_out(|| {
+                    chunks
+                        .into_par_iter()
+                        .map(chunk_block)
+                        .reduce_with(|mut left, right| {
+                            left += &right;
+                            left
+                        })
+                })
             } else {
                 chunks.into_iter().map(chunk_block).reduce(|mut left, right| {
                     left += &right;
@@ -3777,27 +3782,29 @@ impl SaeManifoldTerm {
                 }
             }
         };
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             use rayon::prelude::*;
             const CHUNK: usize = 32;
             // #1557 — pin any faer GEMM reached via `fill_decoded_row` / `image.fill_row`
             // to `Par::Seq` so nested faer does not re-fan the pool (bit-identical).
-            out.axis_chunks_iter_mut(ndarray::Axis(0), CHUNK)
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(chunk, mut block)| {
-                    with_nested_parallel(|| {
-                        let start = chunk * CHUNK;
-                        let mut g_buf = vec![0.0_f64; p];
-                        for local in 0..block.nrows() {
-                            let row = start + local;
-                            let mut out_row = block.row_mut(local);
-                            let out_row = out_row.as_slice_mut().expect("contiguous out row");
-                            fill_out_row(row, out_row, &mut g_buf);
-                        }
-                    });
-                });
+            gam_runtime::parallel::fan_out(|| {
+                out.axis_chunks_iter_mut(ndarray::Axis(0), CHUNK)
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(chunk, mut block)| {
+                        with_nested_parallel(|| {
+                            let start = chunk * CHUNK;
+                            let mut g_buf = vec![0.0_f64; p];
+                            for local in 0..block.nrows() {
+                                let row = start + local;
+                                let mut out_row = block.row_mut(local);
+                                let out_row = out_row.as_slice_mut().expect("contiguous out row");
+                                fill_out_row(row, out_row, &mut g_buf);
+                            }
+                        });
+                    })
+            });
         } else {
             let mut g_buf = vec![0.0_f64; p];
             for row in 0..n {
@@ -4121,16 +4128,18 @@ impl SaeManifoldTerm {
             }
             Ok(())
         };
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             use rayon::prelude::*;
-            out.axis_iter_mut(ndarray::Axis(0))
-                .into_par_iter()
-                .enumerate()
-                .try_for_each(|(row, mut out_row)| {
-                    let out_row = out_row.as_slice_mut().expect("contiguous output row");
-                    fill_row(row, out_row)
-                })?;
+            gam_runtime::parallel::fan_out(|| {
+                out.axis_iter_mut(ndarray::Axis(0))
+                    .into_par_iter()
+                    .enumerate()
+                    .try_for_each(|(row, mut out_row)| {
+                        let out_row = out_row.as_slice_mut().expect("contiguous output row");
+                        fill_row(row, out_row)
+                    })
+            })?;
         } else {
             for (row, mut out_row) in out.axis_iter_mut(ndarray::Axis(0)).enumerate() {
                 let out_row = out_row.as_slice_mut().expect("contiguous output row");
@@ -4227,7 +4236,7 @@ impl SaeManifoldTerm {
                 }
                 Ok(())
             };
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             use rayon::prelude::*;
             const CHUNK: usize = 32;
@@ -4235,22 +4244,24 @@ impl SaeManifoldTerm {
             // `g_buf` scratch. #1557 — wrap the chunk body in `with_nested_parallel`
             // so any faer GEMM reached via `fill_decoded_row` / `image.fill_row`
             // pins to `Par::Seq` rather than re-fanning the pool (bit-identical).
-            out.axis_chunks_iter_mut(ndarray::Axis(0), CHUNK)
-                .into_par_iter()
-                .enumerate()
-                .try_for_each(|(chunk, mut block)| -> Result<(), String> {
-                    with_nested_parallel(|| {
-                        let start = chunk * CHUNK;
-                        let mut g_buf = vec![0.0_f64; p];
-                        for local in 0..block.nrows() {
-                            let row = start + local;
-                            let mut out_row = block.row_mut(local);
-                            let out_row = out_row.as_slice_mut().expect("contiguous out row");
-                            fill_out_row(row, out_row, &mut g_buf)?;
-                        }
-                        Ok(())
+            gam_runtime::parallel::fan_out(|| {
+                out.axis_chunks_iter_mut(ndarray::Axis(0), CHUNK)
+                    .into_par_iter()
+                    .enumerate()
+                    .try_for_each(|(chunk, mut block)| -> Result<(), String> {
+                        with_nested_parallel(|| {
+                            let start = chunk * CHUNK;
+                            let mut g_buf = vec![0.0_f64; p];
+                            for local in 0..block.nrows() {
+                                let row = start + local;
+                                let mut out_row = block.row_mut(local);
+                                let out_row = out_row.as_slice_mut().expect("contiguous out row");
+                                fill_out_row(row, out_row, &mut g_buf)?;
+                            }
+                            Ok(())
+                        })
                     })
-                })?;
+            })?;
         } else {
             let mut g_buf = vec![0.0_f64; p];
             for row in 0..n {
@@ -5001,7 +5012,7 @@ impl SaeManifoldTerm {
         // block rather than per row, and each base block pins its faer GEMMs to
         // `Par::Seq` (the topology race owns the outer pool) to avoid nested
         // oversubscription.
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         let row_data_fit = |row: usize,
                             g_buf: &mut [f64],
                             fitted_row: &mut [f64],
@@ -5068,36 +5079,38 @@ impl SaeManifoldTerm {
         // its own scratch and folds its rows through `pairwise_sum`); the
         // sequential branch materialises the same per-row scalars and calls
         // `pairwise_sum` directly. Both are pure functions of the ordered row
-        // values, so a nested K=1 fit (where `current_thread_index()` is `None`
-        // and the parallel branch is taken) matches the top-level serial sweep to
+        // values, so a nested K=1 fit (where `at_top_level()` holds and the
+        // parallel branch is taken) matches the top-level serial sweep to
         // the last bit. A per-chunk running sum would associate differently from
         // the whole-slice fold and silently perturb the objective (#2228).
         let data_fit = if parallel {
             use gam_linalg::pairwise_reduce::{pairwise_sum, par_deterministic_try_block_fold};
-            par_deterministic_try_block_fold(
-                n,
-                |range: core::ops::Range<usize>| -> Result<f64, String> {
-                    // #1557 — pin any faer GEMM reached from this base block to
-                    // `Par::Seq` (no nested Rayon re-fan); the per-row reductions
-                    // are tiny, so the result is bit-identical.
-                    with_nested_parallel(|| {
-                        let mut g_buf = vec![0.0_f64; p];
-                        let mut fitted_row = vec![0.0_f64; p];
-                        let mut assign_buf = vec![0.0_f64; k_atoms];
-                        let mut block = Vec::with_capacity(range.len());
-                        for row in range {
-                            block.push(row_data_fit(
-                                row,
-                                &mut g_buf,
-                                &mut fitted_row,
-                                &mut assign_buf,
-                            )?);
-                        }
-                        Ok(pairwise_sum(&block))
-                    })
-                },
-                |a, b| Ok(a + b),
-            )?
+            gam_runtime::parallel::fan_out(|| {
+                par_deterministic_try_block_fold(
+                    n,
+                    |range: core::ops::Range<usize>| -> Result<f64, String> {
+                        // #1557 — pin any faer GEMM reached from this base block to
+                        // `Par::Seq` (no nested Rayon re-fan); the per-row reductions
+                        // are tiny, so the result is bit-identical.
+                        with_nested_parallel(|| {
+                            let mut g_buf = vec![0.0_f64; p];
+                            let mut fitted_row = vec![0.0_f64; p];
+                            let mut assign_buf = vec![0.0_f64; k_atoms];
+                            let mut block = Vec::with_capacity(range.len());
+                            for row in range {
+                                block.push(row_data_fit(
+                                    row,
+                                    &mut g_buf,
+                                    &mut fitted_row,
+                                    &mut assign_buf,
+                                )?);
+                            }
+                            Ok(pairwise_sum(&block))
+                        })
+                    },
+                    |a, b| Ok(a + b),
+                )
+            })?
             .unwrap_or(0.0)
         } else {
             use gam_linalg::pairwise_reduce::pairwise_sum;

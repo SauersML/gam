@@ -3,7 +3,7 @@ use super::*;
 #[inline]
 pub(crate) fn should_use_survival_rayon(work_items: u64) -> bool {
     rayon::current_num_threads() > 1
-        && rayon::current_thread_index().is_none()
+        && gam_runtime::parallel::at_top_level()
         && work_items >= DENSE_WEIGHTED_CROSSPROD_PARALLEL_FLOP_THRESHOLD
 }
 
@@ -109,24 +109,26 @@ pub(crate) fn weighted_crossprod_dense_stable(
 
         let chunk_count = dense_row_chunk_count(nrows);
         let chunk_rows = nrows.div_ceil(chunk_count);
-        let partials: Vec<Array2<f64>> = (0..chunk_count)
-            .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * chunk_rows;
-                let end = (start + chunk_rows).min(nrows);
-                let mut local = Array2::<f64>::zeros(out_dim);
-                if start < end {
-                    accumulate_weighted_crossprod_dense_stable_rows(
-                        &mut local,
-                        left,
-                        weights,
-                        right,
-                        start..end,
-                    );
-                }
-                local
-            })
-            .collect();
+        let partials: Vec<Array2<f64>> = gam_runtime::parallel::fan_out(|| {
+            (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_rows;
+                    let end = (start + chunk_rows).min(nrows);
+                    let mut local = Array2::<f64>::zeros(out_dim);
+                    if start < end {
+                        accumulate_weighted_crossprod_dense_stable_rows(
+                            &mut local,
+                            left,
+                            weights,
+                            right,
+                            start..end,
+                        );
+                    }
+                    local
+                })
+                .collect()
+        });
 
         let mut reduced = Array2::<f64>::zeros(out_dim);
         for local in partials {
@@ -192,26 +194,28 @@ pub(crate) fn weighted_crossprod_dense_with_parallelism(
         let out_dim = (left.ncols(), right.ncols());
         let chunk_count = dense_row_chunk_count(nrows);
         let chunk_rows = nrows.div_ceil(chunk_count);
-        let partials: Vec<Option<Array2<f64>>> = (0..chunk_count)
-            .into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * chunk_rows;
-                let end = (start + chunk_rows).min(nrows);
-                let mut local = Array2::<f64>::zeros(out_dim);
-                if start < end
-                    && !accumulate_weighted_crossprod_dense_rows(
-                        &mut local,
-                        left,
-                        &sanitized_weights,
-                        right,
-                        start..end,
-                    )
-                {
-                    return None;
-                }
-                Some(local)
-            })
-            .collect();
+        let partials: Vec<Option<Array2<f64>>> = gam_runtime::parallel::fan_out(|| {
+            (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_rows;
+                    let end = (start + chunk_rows).min(nrows);
+                    let mut local = Array2::<f64>::zeros(out_dim);
+                    if start < end
+                        && !accumulate_weighted_crossprod_dense_rows(
+                            &mut local,
+                            left,
+                            &sanitized_weights,
+                            right,
+                            start..end,
+                        )
+                    {
+                        return None;
+                    }
+                    Some(local)
+                })
+                .collect()
+        });
 
         if partials.iter().all(Option::is_some) {
             let mut out = Array2::<f64>::zeros(out_dim);
@@ -279,23 +283,25 @@ pub(crate) fn scale_dense_rows(
 
     if mat.nrows() > 1
         && rayon::current_num_threads() > 1
-        && rayon::current_thread_index().is_none()
+        && gam_runtime::parallel::at_top_level()
         && work >= DENSE_ROW_SCALE_PARALLEL_ELEM_THRESHOLD
     {
         use rayon::prelude::*;
 
         let chunk_count = dense_row_chunk_count(mat.nrows());
         let chunk_rows = mat.nrows().div_ceil(chunk_count);
-        out.axis_chunks_iter_mut(Axis(0), chunk_rows)
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(chunk_idx, mut rows)| {
-                let start = chunk_idx * chunk_rows;
-                for (local_i, mut row) in rows.rows_mut().into_iter().enumerate() {
-                    let coeff = sanitized_coeffs[start + local_i];
-                    row.mapv_inplace(|value| safe_product(value, coeff));
-                }
-            });
+        gam_runtime::parallel::fan_out(|| {
+            out.axis_chunks_iter_mut(Axis(0), chunk_rows)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(chunk_idx, mut rows)| {
+                    let start = chunk_idx * chunk_rows;
+                    for (local_i, mut row) in rows.rows_mut().into_iter().enumerate() {
+                        let coeff = sanitized_coeffs[start + local_i];
+                        row.mapv_inplace(|value| safe_product(value, coeff));
+                    }
+                })
+        });
     } else {
         for i in 0..out.nrows() {
             let coeff = sanitized_coeffs[i];

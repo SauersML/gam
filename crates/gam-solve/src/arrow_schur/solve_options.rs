@@ -1144,24 +1144,25 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // bit-for-bit (no cross-row reduction; each block factored once). #1557 —
         // pin any nested faer GEMM inside each row worker to `Par::Seq`.
         let n = rows.len();
-        let parallel =
-            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         let results = if parallel {
             use rayon::prelude::*;
-            (0..n)
-                .into_par_iter()
-                .map(|row_idx| {
-                    gam_problem::with_nested_parallel(|| {
-                        factor_one_row_with_escalation(
-                            &rows[row_idx],
-                            ridge_t,
-                            d,
-                            row_idx,
-                            evidence_factorization,
-                        )
+            gam_runtime::parallel::fan_out(|| {
+                (0..n)
+                    .into_par_iter()
+                    .map(|row_idx| {
+                        gam_problem::with_nested_parallel(|| {
+                            factor_one_row_with_escalation(
+                                &rows[row_idx],
+                                ridge_t,
+                                d,
+                                row_idx,
+                                evidence_factorization,
+                            )
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, ArrowSchurError>>()?
+                    .collect::<Result<Vec<_>, ArrowSchurError>>()
+            })?
         } else {
             let mut results = Vec::with_capacity(n);
             for (row_idx, row) in rows.iter().enumerate() {

@@ -1646,17 +1646,19 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
     };
 
     // Per-block penalty assembly and eigendecomposition are independent.
-    // Use rayon only from non-rayon callers so inner operator/eigendecomp work
-    // does not nest under an existing worker. Collecting an indexed range into
+    // Fan out only from top level so inner operator/eigendecomp work does not
+    // nest under an enclosing parallel region. Collecting an indexed range into
     // a Vec preserves block order; totals are accumulated sequentially below
     // to keep floating-point summation deterministic.
     let block_terms: Vec<Result<(Array2<f64>, f64), CustomFamilyError>> =
-        if specs.len() > 1 && rayon::current_thread_index().is_none() {
+        if specs.len() > 1 && gam_runtime::parallel::at_top_level() {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..specs.len())
-                .into_par_iter()
-                .map(compute_block_logdet_term)
-                .collect()
+            gam_runtime::parallel::fan_out(|| {
+                (0..specs.len())
+                    .into_par_iter()
+                    .map(compute_block_logdet_term)
+                    .collect()
+            })
         } else {
             (0..specs.len()).map(compute_block_logdet_term).collect()
         };

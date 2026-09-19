@@ -211,34 +211,13 @@ pub(crate) use smooth_warnings::*;
 /// `cudart` at-exit teardown bug described in [`main`].
 const HARD_EXIT: fn(i32) -> ! = std::process::exit;
 
-/// Stack reserved for the CLI worker thread that drives every command.
-///
-/// The fit drivers keep large fixed-size structures live on the call stack:
-/// the survival location-scale row kernel evaluates a `Tower4<9>` jet program
-/// (9⁴ fourth-order entries, ≈59 KiB per scalar held by value, with several
-/// towers live at once), and the dense linear-algebra recursions fan out over
-/// every penalty block. On a model with many penalized smooths this comfortably
-/// exceeds the 8 MiB default main-thread stack and aborts with
-/// "thread 'main' has overflowed its stack" before the first outer iteration
-/// even completes. The library's own survival-LS tests already side-step this
-/// by spawning a 64 MiB-stack worker; the CLI must do the same so real models
-/// fit instead of crashing. The reservation is virtual address space — pages
-/// commit lazily, so the headroom costs nothing until the deep paths use it.
-const CLI_WORKER_STACK_SIZE: usize = 512 << 20;
-
 fn main() {
     gam::init_parallelism();
-    gam_runtime::process_monitor::start();
-    // Drive the whole command on a dedicated wide-stack thread (see
-    // `CLI_WORKER_STACK_SIZE`). `run` returns the same `CliResult` it would on
-    // the main thread; a `join` error means `run` itself panicked, which the
-    // default panic hook has already reported, so we flush and exit non-zero.
-    let worker = std::thread::Builder::new()
-        .name("gam-cli".to_string())
-        .stack_size(CLI_WORKER_STACK_SIZE)
-        .spawn(run)
-        .expect("spawn gam CLI worker thread");
-    let result = match worker.join() {
+    // Drive the whole command on the process worker pool, whose workers carry
+    // the wide stack the fit drivers need (`gam::parallel::WORKER_STACK_SIZE`).
+    // A panic in `run` has already been reported by the default panic hook, so
+    // we flush and exit non-zero.
+    let result = match std::panic::catch_unwind(|| gam::parallel::install(run)) {
         Ok(command_result) => command_result,
         Err(_) => {
             drop(std::io::Write::flush(&mut std::io::stdout()));
@@ -274,6 +253,11 @@ fn run() -> CliResult<()> {
     let cli = Cli::parse();
     // Solver diagnostics reach stderr only when asked for with `-v`/`-vv`.
     gam::progress_log::init_logging_at(log_level_for_verbosity(cli.verbose));
+    // The process monitor's heartbeat is a debug line: run it only when debug
+    // output is on.
+    if log::max_level() >= log::LevelFilter::Debug {
+        gam_runtime::process_monitor::start();
+    }
     // #2738 — a SETTING and a CAPACITY are not enough; report the policy too.
     //
     // This line used to print `rayon_current_num_threads` beside

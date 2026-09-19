@@ -63,42 +63,20 @@ pub mod getting_started {
 extern crate self as gam;
 
 
-/// Stack reserved for each worker in the global Rayon pool.
+/// Register the engine's cross-crate hooks (GPU dispatch, the higher-order
+/// LAML corrector, the rho-posterior escalator). Idempotent: only the first
+/// call has effect.
 ///
-/// The deep numerical kernels run on Rayon workers, not just the calling
-/// thread: the survival location-scale row Hessian/derivative operators
-/// contract a `Tower4<9>` jet program (9⁴ fourth-order entries, ≈59 KiB per
-/// scalar held by value, several towers live at once — see
-/// `families::survival::location_scale::row_kernel::row_nll_tower`) inside
-/// `RowSet::par_reduce_fold` and `into_par_iter` reductions, and faer's matmul
-/// / factorization recursions fan out over the pool too. A single
-/// `[Tower4<9>; 9]` array is already ≈0.5 MiB, so one row evaluation plus its
-/// temporaries overruns Rayon's default ~2 MiB worker stack and aborts with
-/// "thread '…' has overflowed its stack". The CLI entry point already drives
-/// the *serial* path on a wide-stack worker (`CLI_WORKER_STACK_SIZE` in
-/// `main.rs`); the Rayon pool that evaluates the identical kernel in parallel
-/// for `n ≥ EVALUATE_PARALLEL_ROW_THRESHOLD` models must get the same headroom
-/// or the parallel path overflows where the serial path no longer does. The
-/// reservation is virtual address space — pages commit lazily, so the headroom
-/// costs nothing until the deep jet paths actually use it.
-const RAYON_WORKER_STACK_SIZE: usize = 64 << 20;
-
-/// Build the global Rayon pool the numerics fan out through. Rayon's pool
-/// honors the standard `RAYON_NUM_THREADS` environment variable on first use,
-/// so callers that need to constrain the worker count (e.g. the benchmark
-/// harnesses) set it once on the spawned subprocess and rayon picks it up
-/// natively.
-///
-/// The global pool is built explicitly here with a wide per-worker stack
-/// (`RAYON_WORKER_STACK_SIZE`) so the survival-LS `Tower4<9>` jet kernel — and
-/// every other deep recursion that dispatches onto Rayon — has the same stack
-/// headroom on a pool worker as it does on the CLI's wide-stack driver thread.
-/// `build_global` only succeeds on the first thread to touch the pool; if some
-/// earlier caller already initialized it we keep that pool rather than failing,
-/// because the CLI drives `init_parallelism` before any Rayon use and so always
-/// wins the race that matters.
-///
-/// Idempotent: only the first call has effect (guarded by `std::sync::Once`).
+/// Parallelism needs no setup. Every entry point runs its computation on the
+/// process's own worker pool through [`parallel::install`], which builds the
+/// pool on first use — sized by `RAYON_NUM_THREADS` when set, otherwise by the
+/// available parallelism — and builds a fresh one in a `fork()`ed child. gam
+/// never builds rayon's global pool, which a forked child could not rebuild.
+/// It also keeps ndarray's dense products on the calling pool worker instead of
+/// `matrixmultiply`'s own thread tree
+/// ([`parallel::confine_matrixmultiply_to_the_pool`]), which a forked child
+/// could not use either; that has to happen before the process's first
+/// product, so it is done here, first.
 ///
 /// faer's process-global parallelism is deliberately left alone (#2627). gam's
 /// factorizations and products pass their degree to faer per call
@@ -106,6 +84,7 @@ const RAYON_WORKER_STACK_SIZE: usize = 64 << 20;
 /// so a fit does not depend on how many threads the pool has, and gam sets no
 /// policy another faer user in the process would inherit.
 pub fn init_parallelism() {
+    parallel::confine_matrixmultiply_to_the_pool();
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
         gam_linalg::gpu_hook::register_gpu_dispatch(Box::new(
@@ -124,14 +103,6 @@ pub fn init_parallelism() {
         drop(gam_problem::rho_posterior::set_rho_posterior_escalator(
             Box::new(gam_inference::rho_posterior::HmcIoRhoPosteriorEscalator),
         ));
-        // Ignore the error returned when the global pool was already built by
-        // an earlier caller: we cannot resize an existing pool, and the only
-        // path that strictly needs the wide stack (the CLI) reaches this first.
-        drop(
-            rayon::ThreadPoolBuilder::new()
-                .stack_size(RAYON_WORKER_STACK_SIZE)
-                .build_global(),
-        );
     });
 }
 
@@ -145,6 +116,7 @@ mod gpu_dispatch_registration_tests {
 }
 
 pub use gam_config as config_resolve;
+pub use gam_runtime::parallel;
 pub use gam_geometry as geometry;
 pub use gam_gpu as gpu;
 pub use gam_identifiability as identifiability;

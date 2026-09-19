@@ -233,10 +233,13 @@ where
         return acc;
     }
     let mid = lo + left_split(len);
-    let (left, right) = rayon::join(
-        move || par_reduce_index_range(lo, mid, map, combine, identity),
-        move || par_reduce_index_range(mid, hi, map, combine, identity),
-    );
+    // The subtrees are nested work, whoever runs them.
+    let (left, right) = gam_runtime::parallel::fan_out(|| {
+        rayon::join(
+            move || par_reduce_index_range(lo, mid, map, combine, identity),
+            move || par_reduce_index_range(mid, hi, map, combine, identity),
+        )
+    });
     combine(left, right)
 }
 
@@ -368,10 +371,12 @@ where
         return base(lo..hi);
     }
     let mid = lo + left_split_over_leaves(len, leaf);
-    let (left, right) = rayon::join(
-        || par_try_block_fold_range(lo, mid, leaf, base, combine),
-        || par_try_block_fold_range(mid, hi, leaf, base, combine),
-    );
+    let (left, right) = gam_runtime::parallel::fan_out(|| {
+        rayon::join(
+            || par_try_block_fold_range(lo, mid, leaf, base, combine),
+            || par_try_block_fold_range(mid, hi, leaf, base, combine),
+        )
+    });
     combine(left?, right?)
 }
 
@@ -386,10 +391,12 @@ where
         return base(lo..hi);
     }
     let mid = lo + left_split_over_leaves(len, leaf);
-    let (left, right) = rayon::join(
-        || par_block_fold_range(lo, mid, leaf, base, combine),
-        || par_block_fold_range(mid, hi, leaf, base, combine),
-    );
+    let (left, right) = gam_runtime::parallel::fan_out(|| {
+        rayon::join(
+            || par_block_fold_range(lo, mid, leaf, base, combine),
+            || par_block_fold_range(mid, hi, leaf, base, combine),
+        )
+    });
     combine(left, right)
 }
 

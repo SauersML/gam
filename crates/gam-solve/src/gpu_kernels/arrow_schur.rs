@@ -1126,37 +1126,39 @@ fn build_row_procedural_matvec(
             // margin, where the near-tie winner can flip — not an exact no-move
             // guarantee (#1211). Stay
             // sequential below
-            // `SCHUR_MATVEC_PARALLEL_ROW_MIN` rows and when already inside a
-            // rayon worker (the topology race fans candidates with
-            // `run_topology_race_parallel`) — the same nested-rayon guard the
+            // `SCHUR_MATVEC_PARALLEL_ROW_MIN` rows and when nested (the
+            // topology race fans candidates with
+            // `run_topology_race_parallel`) — the same nesting guard the
             // CPU `schur_matvec` uses. Buffers (`v_i`, `neg`) are reused across
             // rows within a chunk, so the per-row allocation churn is gone.
             let parallel = n >= crate::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN
-                && rayon::current_thread_index().is_none();
+                && gam_runtime::parallel::at_top_level();
             if parallel {
                 use rayon::prelude::*;
                 const CHUNK: usize = 64;
-                let partials: Vec<Array1<f64>> = (0..n)
-                    .into_par_iter()
-                    .chunks(CHUNK)
-                    .map(|idxs| {
-                        // One length-`K` scatter accumulator per chunk; the
-                        // per-row latent vector `v_i` (length `d_i ≲ 32`) is the
-                        // only per-row buffer, sized to the row's own `d_i`.
-                        let mut neg = Array1::<f64>::zeros(k);
-                        for i in idxs {
-                            let di = row_dims[i];
-                            // v_i = H_tβ^(i)·x (sparse Kronecker gather).
-                            let mut v_i = Array1::<f64>::zeros(di);
-                            forward(i, x.view(), &mut v_i);
-                            // w_i = (H_tt^(i) + ρ_t·I)^{-1} v_i via L_i L_iᵀ.
-                            let w_i = cholesky_solve_vector(factors[i].view(), v_i.view());
-                            // neg += H_βt^(i)·w_i (sparse scatter).
-                            transpose(i, w_i.view(), &mut neg);
-                        }
-                        neg
-                    })
-                    .collect();
+                let partials: Vec<Array1<f64>> = gam_runtime::parallel::fan_out(|| {
+                    (0..n)
+                        .into_par_iter()
+                        .chunks(CHUNK)
+                        .map(|idxs| {
+                            // One length-`K` scatter accumulator per chunk; the
+                            // per-row latent vector `v_i` (length `d_i ≲ 32`) is the
+                            // only per-row buffer, sized to the row's own `d_i`.
+                            let mut neg = Array1::<f64>::zeros(k);
+                            for i in idxs {
+                                let di = row_dims[i];
+                                // v_i = H_tβ^(i)·x (sparse Kronecker gather).
+                                let mut v_i = Array1::<f64>::zeros(di);
+                                forward(i, x.view(), &mut v_i);
+                                // w_i = (H_tt^(i) + ρ_t·I)^{-1} v_i via L_i L_iᵀ.
+                                let w_i = cholesky_solve_vector(factors[i].view(), v_i.view());
+                                // neg += H_βt^(i)·w_i (sparse scatter).
+                                transpose(i, w_i.view(), &mut neg);
+                            }
+                            neg
+                        })
+                        .collect()
+                });
                 // #1017/#1175 floating-point parity contract: Rayon may
                 // schedule chunks on any worker, but `.chunks(CHUNK).collect()`
                 // returns partials in chunk-index order. Each chunk's row sum
@@ -7821,9 +7823,9 @@ mod tests {
             );
         }
 
-        // Inside a rayon worker: auto-selects the serial path (nested-rayon
-        // guard). `install` runs the closure on a pool thread, so
-        // `current_thread_index()` is `Some`. The serial running sum and the
+        // Nested: auto-selects the serial path. A foreign pool's `install`
+        // runs the closure on a pool thread, so
+        // `gam_runtime::parallel::at_top_level()` is false. The serial running sum and the
         // chunk-ordered parallel fold differ only by f64 reassociation.
         let mut out_serial = Array1::<f64>::zeros(k);
         rayon::ThreadPoolBuilder::new()

@@ -17,6 +17,8 @@ use gam::families::survival::{
     SurvivalSurfaceKind, cumulative_hazard_from_survival, failure_probability_from_survival,
 };
 use ndarray::{Array1, Array2, ArrayView1, s};
+
+use crate::DetachOnPool;
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArrayDyn,
@@ -35,10 +37,9 @@ pub(crate) fn interpolate_rows<'py>(
     kind: &str,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let kind = SurvivalSurfaceKind::parse(kind).map_err(py_value_error)?;
-    let surface =
-        SurvivalSurface::new(kind, grid.as_array(), surface.as_array()).map_err(py_value_error)?;
-    let out = surface
-        .interpolate(query.as_array())
+    let (grid, surface, query) = (grid.as_array(), surface.as_array(), query.as_array());
+    let out = py
+        .detach_on_pool(move || SurvivalSurface::new(kind, grid, surface)?.interpolate(query))
         .map_err(py_value_error)?;
     Ok(out.into_pyarray(py))
 }
@@ -117,7 +118,7 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
     let values = surface.as_array().to_owned();
     let times = times.as_array().to_owned();
     let out = py
-        .detach(move || {
+        .detach_on_pool(move || {
             let surface = SurvivalSurface::new(kind, grid.view(), values.view())?;
             surface.interpolate_chunked(
                 times.view(),
@@ -224,7 +225,7 @@ pub(crate) fn write_survival_csv(
         }
     }
     let path_owned = path.to_string();
-    py.detach(move || -> Result<String, String> {
+    py.detach_on_pool(move || -> Result<String, String> {
         source.validate()?;
         let chunks = SurvivalSurfaceChunkPolicy::default().chunks(
             n_rows,

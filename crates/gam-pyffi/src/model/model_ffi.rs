@@ -2604,14 +2604,17 @@ fn duchon_basis_with_jet<'py>(
     // no second, independently-scaled forward pipeline that could drift out of
     // lockstep on the amplification, the null-space basis, or the polynomial
     // column ordering. This is the model the issue prescribes.
-    let (phi, jet) = duchon_sae_atom_basis_with_jet(pts, ctrs, requested_nullspace)
+    let (phi, jet) = py
+        .detach_on_pool(|| duchon_sae_atom_basis_with_jet(pts, ctrs, requested_nullspace))
         .map_err(basis_error_to_pyerr)?;
 
     // The penalty matrix `S = Zᵀ K_CC Z` is the conditionally-PD penalty of the
     // *same* basis. It comes from the forward builder over the identical spec,
     // which uses the same `Z` and `α` as the helper above, so `S` is the
     // penalty of exactly the `Φ` returned here.
-    let built = build_duchon_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
+    let built = py
+        .detach_on_pool(|| build_duchon_basis(pts, &spec))
+        .map_err(basis_error_to_pyerr)?;
     let penalty = built
         .active_penalties
         .iter()
@@ -2741,16 +2744,19 @@ fn duchon_basis_with_jets<'py>(
         }
     }
 
-    let (phi, jet, hess) = gam::terms::basis::build_duchon_basis_design_and_jets(
-        pts,
-        ctrs,
-        cfg.length_scale,
-        cfg.power,
-        cfg.nullspace_order,
-        &periodic_flags,
-        &periods,
-    )
-    .map_err(basis_error_to_pyerr)?;
+    let (phi, jet, hess) = py
+        .detach_on_pool(|| {
+            gam::terms::basis::build_duchon_basis_design_and_jets(
+                pts,
+                ctrs,
+                cfg.length_scale,
+                cfg.power,
+                cfg.nullspace_order,
+                &periodic_flags,
+                &periods,
+            )
+        })
+        .map_err(basis_error_to_pyerr)?;
 
     Ok((
         phi.into_pyarray(py).unbind(),
@@ -2815,11 +2821,13 @@ fn matern_basis<'py>(
     // Honor an explicit all-zero `aniso_log_scales` literally as the isotropic
     // metric — this is a caller's explicit request, NOT the κ-optimizer's
     // geometry-seeding sentinel (#1042).
-    let built = build_matern_basis_literal_aniso(pts, &spec).map_err(basis_error_to_pyerr)?;
-    let design = built
-        .design
-        .try_to_dense_by_chunks("matern_basis")
-        .map_err(py_value_error)?;
+    let design = py.detach_on_pool(move || {
+        let built = build_matern_basis_literal_aniso(pts, &spec).map_err(basis_error_to_pyerr)?;
+        built
+            .design
+            .try_to_dense_by_chunks("matern_basis")
+            .map_err(py_value_error)
+    })?;
     Ok(design.into_pyarray(py).unbind())
 }
 
@@ -3144,9 +3152,13 @@ fn duchon_basis<'py>(
             periodic: None,
             boundary: OneDimensionalBoundary::Open,
         };
-        let built = build_duchon_basis_mixed_periodicity_auto(pts, &spec, &periodic_flags, None)
+        let design = py
+            .detach_on_pool(|| {
+                build_duchon_basis_mixed_periodicity_auto(pts, &spec, &periodic_flags, None)
+                    .map(|built| built.design.to_dense())
+            })
             .map_err(basis_error_to_pyerr)?;
-        return Ok(built.design.to_dense().into_pyarray(py).unbind());
+        return Ok(design.into_pyarray(py).unbind());
     }
     let spec = DuchonBasisSpec {
         radial_reparam: None,
@@ -3167,8 +3179,12 @@ fn duchon_basis<'py>(
     // `cols = min(K, n_points + d + 1)`, measured — the same 12-center d=2 spec
     // gave 4 columns on 1 row and 12 on 30. Deriving the chart from the centers
     // makes the width `K` for every frame size (63 of 63 configurations).
-    let built = build_duchon_basis_spec_chart(pts, &spec).map_err(basis_error_to_pyerr)?;
-    Ok(built.design.to_dense().into_pyarray(py).unbind())
+    let design = py
+        .detach_on_pool(|| {
+            build_duchon_basis_spec_chart(pts, &spec).map(|built| built.design.to_dense())
+        })
+        .map_err(basis_error_to_pyerr)?;
+    Ok(design.into_pyarray(py).unbind())
 }
 
 /// The knots or centers a 1-D basis-evaluation helper builds on `t`:
@@ -3238,16 +3254,19 @@ fn duchon_operator_penalties<'py>(
         return Err(py_value_error("Duchon m must be at least 1".to_string()));
     }
     let center_matrix = column_array(centers.as_array());
-    let matrices = build_duchon_operator_penalty_matrices(
-        center_matrix.view(),
-        None,
-        None,
-        0.0,
-        duchon_nullspace_order_from_m(m),
-        None,
-        None,
-    )
-    .map_err(basis_error_to_pyerr)?;
+    let matrices = py
+        .detach_on_pool(|| {
+            build_duchon_operator_penalty_matrices(
+                center_matrix.view(),
+                None,
+                None,
+                0.0,
+                duchon_nullspace_order_from_m(m),
+                None,
+                None,
+            )
+        })
+        .map_err(basis_error_to_pyerr)?;
     Ok((
         matrices.mass.into_pyarray(py).unbind(),
         matrices.tension.into_pyarray(py).unbind(),
@@ -3402,7 +3421,9 @@ fn sphere_basis<'py>(
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
-    let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
+    let built = py
+        .detach_on_pool(|| build_spherical_spline_basis(pts, &spec))
+        .map_err(basis_error_to_pyerr)?;
     let penalty = built
         .active_penalties
         .iter()
@@ -3511,7 +3532,9 @@ fn sphere_basis_with_centers<'py>(
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
-    let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
+    let built = py
+        .detach_on_pool(|| build_spherical_spline_basis(pts, &spec))
+        .map_err(basis_error_to_pyerr)?;
     let penalty = built
         .active_penalties
         .iter()
@@ -4225,7 +4248,7 @@ fn stack_topologies_gaussian(
         )));
     }
     let solved = py
-        .detach(|| {
+        .detach_on_pool(|| {
             gam::solver::topology_stack_gaussian::stack_topologies_gaussian(
                 &y,
                 &means,
@@ -4541,7 +4564,7 @@ fn gaussian_weighted_ridge_batch_backward<'py>(
     let coef_owned = coef.as_array().to_owned();
     let row_counts_owned = row_counts.map(|counts| counts.as_array().to_owned());
     let (grad_x, grad_y, grad_penalty, grad_weights) = py
-        .detach(move || {
+        .detach_on_pool(move || {
             gam::linalg::gaussian_weighted_ridge_backward::gaussian_weighted_ridge_batch_backward(
                 grad_coef_owned.view(),
                 grad_fitted_owned.view(),
