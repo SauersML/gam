@@ -101,6 +101,63 @@ class TestCensus(unittest.TestCase):
         self.assertEqual(census.difference(lumped_before, lumped_after)["unit_test_decreases"], {})
 
 
+    def test_macro_generated_tests_are_named_by_their_invocation_3241(self):
+        """#3145's shape: the name after `#[test] fn` is a metavariable, so the invocation names each test."""
+        source = GENERATOR + """
+        generate! {
+            first_cell_3241 => (Family::A, Link::Log);
+            second_cell =>
+                (Family::B, Link::Sqrt);
+        }
+        #[test] fn ordinary_12() {}
+        """
+        self.assertEqual(list(census.rust_test_names(source)), ["first_cell_3241", "second_cell", "ordinary_12"])
+
+    def test_a_generated_test_removed_or_renamed_is_visible_3241(self):
+        before = names_snapshot(GENERATOR + "generate! { kept => (A, B); pinned_3241 => (A, C); gone => (B, C); }")
+        after = names_snapshot(GENERATOR + "generate! { kept => (A, B); renamed => (A, C); }")
+        self.assertEqual(census.difference(before, after), {
+            "test_count_decrease": 1, "removed_pins": {"pinned_3241": 1}, "unit_test_decreases": {}})
+
+    def test_a_test_generator_the_census_cannot_read_refuses_3241(self):
+        unreadable = {
+            "two rules": "macro_rules! g { ($t:ident) => { #[test] fn $t() {} }; () => {}; }",
+            "no repetition": "macro_rules! g { ($t:ident) => { #[test] fn $t() {} }; }",
+            "nested repetition": "macro_rules! g { ($($t:ident $(, $u:ident)*);*) => {$( #[test] fn $t() {} )*}; }",
+            "name not first": "macro_rules! g { ($(($a:expr) $t:ident;)*) => {$( #[test] fn $t() {} )*}; }",
+            "two tests per item": "macro_rules! g { ($($t:ident;)*) => {$( #[test] fn $t() {} #[test] fn $t() {} )*}; }",
+        }
+        for label, source in unreadable.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                list(census.rust_test_names(source))
+        with self.assertRaisesRegex(ValueError, "does not match its pattern"):
+            list(census.rust_test_names(GENERATOR + "generate! { cell -> (A, B); }"))
+
+    def test_a_macro_writing_a_literal_test_name_is_read_in_place_3241(self):
+        """Only a metavariable-named test makes a generator; a fixed name is one source declaration, as before."""
+        source = "macro_rules! helper { () => { #[test] fn fixed_12() {} }; }\nhelper!();\nhelper!();"
+        self.assertEqual(list(census.rust_test_names(source)), ["fixed_12"])
+
+
+GENERATOR = """
+macro_rules! generate {
+    ($($test:ident => ($family:expr, $link:expr);)*) => {$(
+        #[test]
+        fn $test() {
+            check($family, $link);
+        }
+    )*};
+}
+"""
+
+
+def names_snapshot(source):
+    names = Counter(census.rust_test_names(source))
+    return {"revision": "synthetic", "tests": sum(names.values()),
+            "pins": Counter({name: count for name, count in names.items() if census.PIN.search(name)}),
+            "units": Counter()}
+
+
 def snapshot(tests, pins, units=None):
     return {"revision": "base", "tests": tests, "pins": Counter(pins), "units": Counter(units or {})}
 

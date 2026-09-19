@@ -1816,5 +1816,13 @@
     ],
     "reason": "#3022 and #2998: the rigid BMS row kernel builds each row's derivative tensors once and hands the same tensors to every consumer, so the per-row third/fourth full-tensor caches (RigidThirdFull, RigidFourthFull, their get/insert helpers and the third_full_cache/fourth_full_cache accessors) and the cache-length validator that policed them (validate_row_kernel_cache_lengths with its test) have no remaining purpose. The empirical third directional trace is contracted in factored form through gam-math jet_trace, whose cost does not depend on the flex width, so the fixed-width third-trace dispatch (empirical_fixed_third_trace_dispatch, empirical_fixed_third_trace_from_plan) is deleted. The degree-9 cell cache flag is gone, so build_row_exact_context_with_stats_and_cell_cache is renamed build_row_exact_context.",
     "evidence": "source_removal_guard.py and public_api_census.py run against base 26afd99f5f report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-models third_trace_2998, rigid_row_tensors_3022 (3), multistart_member_2359, flex_measure_932 pass; gam-math jet_trace 2/2; gam-custom-family warm_start 14/14."
+  },
+  {
+    "base": "de32bc5c716e7595df9b36f3fc358029ae1b3975",
+    "items": [
+      "crates/gam-models/src/gpu_kernels/survival_rowjet.rs:fn:survival_rigid_row_vgh_device_selected"
+    ],
+    "reason": "#3000 slice 2: the survival row jet's own admission (a bool from the fused-kernel threshold, which ignored gpu=required and let G::ANCHORED / G::FOLLOW_UP_VARYING bypass the policy) is replaced by survival_rigid_row_vgh_decision in the same file, which decides through gam_gpu::decide_row_kernel from the row jet's declared SURVIVAL_ROWJET_CAPABILITY and returns the typed GpuDecision. Its two callers, SurvivalMarginalSlopeRowKernel::batched_value_grad_hess_all and rigid_row_jet_device_admission_and_parity_2900, now call rigid_row_jet_decision::<P, G>, which forwards to it.",
+    "evidence": "In the landing tree the name occurs 0 times (git grep -c). The replacement is declared in crates/gam-models/src/gpu_kernels/survival_rowjet.rs and crates/gam-models/src/survival/marginal_slope/row_kernel.rs, added by the same landing, and rigid_row_jet_device_admission_and_parity_2900 plus rigid_row_jet_capability_follows_the_frame_declarations_3000 exercise it."
   }
 ]
