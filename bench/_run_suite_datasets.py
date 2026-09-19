@@ -707,41 +707,12 @@ def _survival_eval_horizon(train_df: pd.DataFrame, time_col: str) -> float:
     return horizon
 
 
-def _rust_survival_fit_options_for_scenario(scenario_name: typing.Any) -> typing.Any:
+def _rust_survival_fit_cli_args() -> list[str]:
     # Survival time effects must use a structurally monotone basis so the
-    # fitted cumulative baseline cannot violate survival semantics.
-    if scenario_name in {"icu_survival_death", "icu_survival_los"}:
-        return {
-            "time_basis": "ispline",
-            "time_degree": 3,
-            "time_num_internal_knots": 10,
-        }
-    if scenario_name in {"heart_failure_survival", "cirrhosis_survival"}:
-        return {
-            "time_basis": "ispline",
-            "time_degree": 3,
-            "time_num_internal_knots": 8,
-        }
-    return {
-        "time_basis": "ispline",
-        "time_degree": 3,
-        "time_num_internal_knots": 8,
-    }
-
-
-def _rust_survival_fit_cli_args(scenario_name: str) -> list[str]:
-    cfg = _rust_survival_fit_options_for_scenario(scenario_name)
-    args: list[str] = []
-    for key in (
-        "time_basis",
-        "time_degree",
-        "time_num_internal_knots",
-    ):
-        if key not in cfg:
-            continue
-        cli_key = "--" + key.replace("_", "-")
-        args.extend([cli_key, str(cfg[key])])
-    return args
+    # fitted cumulative baseline cannot violate survival semantics. The basis's
+    # degree and knot count are the library's: gam fit has no flags for them
+    # since 9419ed8fa4 (#2899).
+    return ["--time-basis", "ispline"]
 
 
 def _load_lidar_dataset() -> typing.Any:
