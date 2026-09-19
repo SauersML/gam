@@ -368,8 +368,9 @@ converges, the basis is checked for two signs that it is too small: an edf
 pressed against the basis dimension, and a rejection by the residual
 lack-of-fit test that
 [`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
-reports. If either appears, the knot count doubles and the model is refit,
-until the basis passes. Only the data bound the growth:
+reports, at a family-wise level of `1e-3` Bonferroni-corrected over the
+tested smooths. If either appears, the knot count doubles and the model is
+refit, until neither does. Only the data bound the growth:
 
 - a smooth never gets more coefficients than its covariate has distinct
   values, which is the interpolating limit;
@@ -429,10 +430,14 @@ for formula in ["y ~ s(x, k=12)", "y ~ s(x)"]:
 ```
 
 Six full periods of a sine need more than a dozen basis functions. The
-fixed `k=12` basis runs out: its edf presses against the basis dimension
-and the basis check rejects it. The default `s(x)` starts from the same
-dozen functions, sees the same rejection, and keeps doubling its knots
-until the check passes. Nobody had to tell it how many.
+fixed `k=12` basis runs out: its edf (10.4) presses against the basis
+dimension (11 after centering), the basis check's p-value is about
+`1e-309`, and the error against the truth is 0.63. The default `s(x)`
+starts from the same dozen functions, sees the same rejection, and doubles
+its knots until the check's p-value clears the engine's basis-adequacy
+level (`1e-3`, Bonferroni-corrected over the tested smooths). Here it
+stops at 19 dimensions with an edf of 17.8, a basis check p of about
+0.007, and an error of 0.07. Nobody had to tell it how many.
 
 ### Shape-constrained smooths {#shape-constrained-smooths}
 
