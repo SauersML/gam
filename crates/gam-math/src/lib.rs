@@ -9,6 +9,9 @@ mod jet_algebra;
 pub mod jet_partitions;
 pub mod jet_scalar;
 pub mod jet_tower;
+pub mod jet_trace;
+#[cfg(test)]
+mod jet_trace_tests;
 pub mod nested_dual;
 // One paired, interleaved, order-randomised timing harness for every "does A
 // beat B" gate in the workspace. Fifteen separate harnesses in three

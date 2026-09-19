@@ -1086,7 +1086,7 @@ fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
         .build_exact_eval_cache(&block_states)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact eval cache", e));
     let row_ctx = family
-        .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
+        .build_row_exact_context(0, &block_states, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "row context", e));
     let bad_dir = array![1.0];
     let good_dir = array![0.0, 1.0];
@@ -2495,7 +2495,7 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         .build_exact_eval_cache(&block_states)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "eval cache", e));
     let row_ctx = family
-        .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
+        .build_row_exact_context(0, &block_states, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "row context", e));
     let (nll, grad, hess) = family
         .compute_row_primary_gradient_hessian(0, &block_states, &primary, &row_ctx)
@@ -3786,7 +3786,7 @@ fn rigid_fast_path_matches_loglik_finite_differences() {
         .build_exact_eval_cache(&block_states)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "rigid exact eval cache", e));
     let row_ctx = family
-        .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
+        .build_row_exact_context(0, &block_states, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "rigid row context", e));
     let (_, primary_grad, primary_hess) = family
         .compute_row_primary_gradient_hessian(0, &block_states, &cache.primary, &row_ctx)
@@ -3882,7 +3882,7 @@ fn w_only_gradient_hessian_finite_and_symmetric() {
     // regimes (negative tail, near zero, positive tail).
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
         let (_, grad, hess) = family
@@ -3975,7 +3975,7 @@ fn h_only_gradient_hessian_finite_and_symmetric() {
 
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
         let (_, grad, hess) = family
@@ -4348,7 +4348,7 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut max_abs_fourth = 0.0_f64;
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4455,7 +4455,7 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut max_abs_fourth = 0.0_f64;
     for row in 0..seed.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4528,7 +4528,7 @@ fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut max_abs_fourth = 0.0_f64;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4579,7 +4579,7 @@ fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
     let zero = Array1::<f64>::zeros(cache.primary.total);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
@@ -4608,7 +4608,7 @@ fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
     let zero = Array1::<f64>::zeros(cache.primary.total);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
@@ -4637,7 +4637,7 @@ fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
     let zero = Array1::<f64>::zeros(cache.primary.total);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
@@ -4779,7 +4779,7 @@ fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
             .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
@@ -4832,7 +4832,7 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
     let neg_dir_u = dir_u.mapv(|value| -value);
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -4888,7 +4888,7 @@ fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
             .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
@@ -4934,7 +4934,7 @@ fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
             .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
@@ -4973,7 +4973,7 @@ fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir)
@@ -5022,7 +5022,7 @@ fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
 
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir)
@@ -5294,7 +5294,7 @@ fn dual_flex_row_primary_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -5345,7 +5345,7 @@ fn h_only_row_primary_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
@@ -5396,7 +5396,7 @@ fn w_only_row_primary_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     for row in 0..family.z.len() {
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
+            .build_row_exact_context(row, &block_states, None)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)

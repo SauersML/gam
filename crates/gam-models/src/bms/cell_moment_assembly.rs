@@ -20,6 +20,7 @@ use gam_math::jet_scalar::{
     DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeedBatch,
     FixedRuntimeJet, OneSeed, TwoSeed,
 };
+use gam_math::jet_trace::{DynamicTraceJet, TraceJetWorkspace};
 
 thread_local! {
     /// Per-worker empirical FLEX third-order workspace. The largest batch is
@@ -31,6 +32,9 @@ thread_local! {
     /// evaluate several `(u,v)` contractions in one row-plan traversal.
     static EMPIRICAL_BMS_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
         std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
+    /// Per-worker empirical FLEX third-trace workspace (gam#2998).
+    static EMPIRICAL_BMS_TRACE_WORKSPACE: std::cell::RefCell<TraceJetWorkspace> =
+        std::cell::RefCell::new(TraceJetWorkspace::new(1));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +118,7 @@ pub(super) struct SharedExactCacheStore {
 }
 
 impl SharedExactCacheStore {
-    const CAPACITY: usize = 2;
+    pub(super) const CAPACITY: usize = 2;
 
     pub(super) fn empty() -> Self {
         Self {
@@ -1162,64 +1166,6 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn empirical_fixed_third_trace_from_plan<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        gram: &[f64],
-    ) -> Result<Array1<f64>, String> {
-        let point: &[f64; K] = point.try_into().map_err(|_| {
-            format!(
-                "fixed empirical BMS point length {} != specialization width {K}",
-                point.len()
-            )
-        })?;
-        if gram.len() != K * K {
-            return Err(format!(
-                "fixed empirical BMS trace gram length {} != {}",
-                gram.len(),
-                K * K
-            ));
-        }
-        let mut gradient = Array1::<f64>::zeros(K);
-        for direction_axis in 0..K {
-            let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
-                FixedRuntimeJet::from_inner(OneSeed::seed_direction(
-                    point[axis],
-                    axis,
-                    f64::from(axis == direction_axis),
-                ))
-            });
-            let contracted = plan
-                .evaluate(&vars, 3, &())?
-                .into_inner()
-                .contracted_third();
-            gradient[direction_axis] = contracted
-                .iter()
-                .flatten()
-                .zip(gram)
-                .map(|(third, weight)| third * weight)
-                .sum();
-        }
-        Ok(gradient)
-    }
-
-    fn empirical_fixed_third_trace_dispatch(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        gram: &[f64],
-        r: usize,
-    ) -> Result<Array1<f64>, String> {
-        match r {
-            4 => Self::empirical_fixed_third_trace_from_plan::<4>(plan, point, gram),
-            8 => Self::empirical_fixed_third_trace_from_plan::<8>(plan, point, gram),
-            12 => Self::empirical_fixed_third_trace_from_plan::<12>(plan, point, gram),
-            18 => Self::empirical_fixed_third_trace_from_plan::<18>(plan, point, gram),
-            _ => Err(format!(
-                "unsupported fixed empirical BMS third-trace specialization width {r}"
-            )),
-        }
-    }
-
     pub(super) fn empirical_fixed_fourth_many_from_plan<const K: usize>(
         plan: &BmsFlexRowProgram,
         point: &[f64],
@@ -1411,10 +1357,14 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    /// Trace-contract every Hessian index of the full third derivative from one
-    /// row plan. Direction `c` is seeded by basis vector `e_c`, then reduced
-    /// immediately to `sum_ab gram[ab] * d3[abc]`; no rank-three tensor is
-    /// materialized.
+    /// `g_c = Σ_ab gram[ab] · D³f[a,b,c]` from one row plan.
+    ///
+    /// D³f is symmetric in `(a, b)`, so only `S = (gram + gramᵀ)/2` enters,
+    /// and with `S = Σ_k λ_k v_k v_kᵀ`, `g = Σ_k λ_k D³f[v_k, v_k, ·]`. One
+    /// [`DynamicTraceJet`] pass carries every `D³f[v_k, v_k, ·]` at `O(r)`
+    /// floats per lane, where seeding one contraction lane per output axis
+    /// carries an `r × r` Hessian in each (gam#2998). No rank-three tensor is
+    /// materialized and no width has its own schedule.
     pub(super) fn empirical_flex_row_third_trace_gradient(
         &self,
         row: usize,
@@ -1438,6 +1388,20 @@ impl BernoulliMarginalSlopeFamily {
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in third trace gradient".into());
         }
+        let symmetric = Array2::from_shape_fn((r, r), |(a, b)| 0.5 * (gram[a * r + b] + gram[b * r + a]));
+        let (scales, directions) =
+            gam_linalg::faer_ndarray::FaerEigh::eigh(&symmetric, faer::Side::Lower).map_err(
+                |error| {
+                    format!(
+                        "bernoulli empirical flex third trace: gram eigendecomposition failed: {error}"
+                    )
+                },
+            )?;
+        let lanes: Vec<usize> = (0..r).filter(|&k| scales[k] != 0.0).collect();
+        let mut gradient = Array1::<f64>::zeros(r);
+        if lanes.is_empty() {
+            return Ok(gradient);
+        }
         let plan = self.compile_empirical_bms_row_program(
             row,
             primary,
@@ -1449,41 +1413,23 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_third_jet_schedule(r) {
-            EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
-                Self::empirical_fixed_third_trace_dispatch(&plan, &point, gram, r)
+        EMPIRICAL_BMS_TRACE_WORKSPACE.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            workspace.reset(lanes.len());
+            let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                DynamicTraceJet::seed_directions(point[axis], axis, r, &workspace, |lane| {
+                    directions[[axis, lanes[lane]]]
+                })
+            });
+            let jet = plan.evaluate(vars, 3, &workspace)?;
+            for (lane, &k) in lanes.iter().enumerate() {
+                let scale = scales[k];
+                for (out, &third) in gradient.iter_mut().zip(jet.second_directional_gradient(lane)) {
+                    *out += scale * third;
+                }
             }
-            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => EMPIRICAL_BMS_THIRD_WORKSPACE
-                .with(|workspace| {
-                    let mut workspace = workspace.borrow_mut();
-                    let mut gradient = Array1::<f64>::zeros(r);
-                    for axis_start in (0..r).step_by(lanes) {
-                        let active_lanes = (r - axis_start).min(lanes);
-                        workspace.reset(active_lanes);
-                        let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                            DynamicOneSeedBatch::seed_directions(
-                                point[axis],
-                                axis,
-                                r,
-                                &workspace,
-                                |lane| {
-                                    if axis_start + lane == axis { 1.0 } else { 0.0 }
-                                },
-                            )
-                        });
-                        let jet = plan.evaluate(vars, 3, &workspace)?;
-                        for lane in 0..active_lanes {
-                            gradient[axis_start + lane] = jet
-                                .contracted_third(lane)
-                                .iter()
-                                .zip(gram)
-                                .map(|(third, weight)| third * weight)
-                                .sum();
-                        }
-                    }
-                    Ok(gradient)
-                }),
-        }
+            Ok(gradient)
+        })
     }
 
     pub(super) fn empirical_flex_row_fourth_contracted(
@@ -2917,8 +2863,7 @@ impl BernoulliMarginalSlopeFamily {
         // ~0.1% hit rate at large scale while pinning multiple GiB of resident
         // moment entries and serialising every row behind its mutex (insert +
         // eviction churn). Intra-β reuse of a single row's moments is already
-        // served by the per-row `degree9_cells` cache and the
-        // `RowCellMomentsBundle`; the cross-row layer buys nothing here. Skip it
+        // served by the `RowCellMomentsBundle`; the cross-row layer buys nothing here. Skip it
         // and evaluate uncached — bit-identical to a cold LRU miss, which still
         // honours the affine tail-cell memo inside `evaluate_cell_moments`.
         if self.flex_active() {
@@ -4925,7 +4870,6 @@ mod empirical_flex_jet_oracle_tests {
                 intercept,
                 m_a: f_a,
                 intercept_fast_path: false,
-                degree9_cells: None,
             },
         )
     }
