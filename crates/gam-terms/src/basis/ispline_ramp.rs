@@ -321,8 +321,8 @@ pub fn monotone_warp_knots(
     Ok(Array1::from(knots))
 }
 
-/// [`monotone_warp_knots`] over the range a seed sample spans, with the same
-/// degenerate-sample widening [`initializewiggle_knots_from_seed`] applies.
+/// [`monotone_warp_knots`] over [`seed_knot_range`], the same seed domain
+/// [`initializewiggle_knots_from_seed`] uses.
 ///
 /// This is the warp-block entry point; the clamped
 /// [`initializewiggle_knots_from_seed`] stays for consumers whose basis is
@@ -333,24 +333,10 @@ pub fn monotone_warp_knots_from_seed(
     degree: usize,
     num_internal_knots: usize,
 ) -> Result<Array1<f64>, String> {
-    let mut low = seed.iter().copied().fold(f64::INFINITY, f64::min);
-    let mut high = seed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !low.is_finite() || !high.is_finite() {
-        return Err("non-finite seed for monotone warp knot initialization".to_string());
-    }
-    if (high - low).abs() < MIN_WARP_SEED_SPAN {
-        let center = 0.5 * (low + high);
-        low = center - DEFAULT_WARP_HALF_RANGE;
-        high = center + DEFAULT_WARP_HALF_RANGE;
-    }
+    let (low, high) = seed_knot_range(seed)
+        .ok_or_else(|| "non-finite seed for monotone warp knot initialization".to_string())?;
     monotone_warp_knots(low, high, degree, num_internal_knots)
 }
-
-/// Below this the seed is treated as constant and widened, so the generated
-/// spans stay well-conditioned. Same values, same reason, as the clamped
-/// generator this one mirrors.
-const MIN_WARP_SEED_SPAN: f64 = 1e-8;
-const DEFAULT_WARP_HALF_RANGE: f64 = 3.0;
 
 #[cfg(test)]
 mod tests {

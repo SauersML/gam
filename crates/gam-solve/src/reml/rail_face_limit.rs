@@ -696,8 +696,8 @@ mod rail_face_limit_tests {
     }
 
     /// THE REFUSAL IS ALSO A MEASUREMENT. Give the same design a truth the
-    /// released directions genuinely explain. The face form goes indefinite and
-    /// the certificate refuses — and it is RIGHT to: the production criterion
+    /// released directions genuinely explain. The face's pencil constant goes
+    /// negative and the certificate refuses — and it is RIGHT to: the production criterion
     /// at the same point is still *rising* in `ρ_0`, so the descent runs INWARD
     /// and λ=∞ is not the optimum at all. A certificate that minted here would
     /// be shipping a fit the optimizer was still trying to leave.
@@ -728,8 +728,8 @@ mod rail_face_limit_tests {
             .expect("a Gaussian dense fixture is inside the closed form");
         match certify_rail_face(&limit) {
             RailFaceVerdict::Refused { reason } => assert!(
-                reason.contains("not positive definite"),
-                "the refusal must name the failed curvature gate: {reason}"
+                reason.contains("lowers the criterion"),
+                "the refusal must name the descending coordinate: {reason}"
             ),
             RailFaceVerdict::Certified(proof) => panic!(
                 "a face the data wants released must NOT certify; got λ_min(C)={:.3e}",
@@ -1133,6 +1133,114 @@ mod rail_face_limit_tests {
         );
     }
 
+    /// THE PROFILED SCALE ON AN OVERLAPPING FACE USES THE JOINT PENALTY RANK.
+    ///
+    /// The criterion's `M_p = p − rank(Σ_k S_k)` is the joint structural rank
+    /// its penalty pseudo-logdet reports. On the overlapping fixture the
+    /// per-penalty ranks sum to `2 + 1 + 1 = 4 = p` while the joint rank is 3
+    /// (the coalesced penalty lives inside the bend's range), so a Σ-rank
+    /// bookkeeping gives `M_p = 0` against the criterion's 1, and the limit's
+    /// profiled scale `D_p/(n − M_p)` is off by the factor `(n−1)/n`.
+    ///
+    /// The overlap test above cannot see that: at `NULL_CURVATURE` the fit term
+    /// `g_Qg_Qᵀ/φ̂` of `C` is negligible, so `φ̂` barely enters. Here the truth
+    /// carries enough curvature that the fit term is a sizable share of the joint
+    /// constant, and `n` is small enough that `(n−1)/n` moves that share well
+    /// outside the pencil's tail correction. The joint pencil
+    /// `−e^ρ(∂V/∂ρ_0 + ∂V/∂ρ_1)` from the production gradient is then the
+    /// arbiter of which `M_p` the criterion uses.
+    ///
+    /// The same truth also makes the JOINT release descend: the joint law
+    /// `½tr((A_0 + A_1)⁻¹C)` is negative although no single coordinate's own
+    /// law is, so the face is refuted on the release simplex — and the
+    /// production gradient's joint pencil agrees in sign and size.
+    #[test]
+    fn overlapping_face_profiled_scale_uses_the_joint_penalty_rank() {
+        const N: usize = 12;
+        const CURVATURE: f64 = 0.5;
+        let (y, weights, x) = cubic_fixture_sized(CURVATURE, N);
+        let offset = Array1::<f64>::zeros(y.len());
+        let config = gaussian_config();
+        let state = RemlState::newwith_offset(
+            y.view(),
+            x.clone(),
+            weights.view(),
+            offset.view(),
+            overlapping_face_penalties(),
+            4,
+            &config,
+            Some(vec![2, 3, 3]),
+            None,
+            None,
+        )
+        .expect("build the overlapping-face fixture state");
+
+        let rho_face = 12.0_f64;
+        let rho = Array1::from(vec![rho_face, rho_face, 1.0]);
+        let limit = expect_available(
+            state
+                .rail_face_limit(&rho, &[0, 1])
+                .expect("the analytic face limit must not error"),
+            "overlapping two-coordinate face at small n",
+        );
+        match certify_rail_face(&limit) {
+            RailFaceVerdict::Refused { reason } => assert!(
+                reason.contains("ranges overlap") && reason.contains("lowers the criterion"),
+                "the jointly descending overlapping face must be refuted on its simplex: {reason}"
+            ),
+            RailFaceVerdict::Certified(proof) => panic!(
+                "a face whose joint release descends must NOT certify; got {:?} statistic {:.3e}",
+                proof.route, proof.statistic
+            ),
+        }
+
+        // The joint law `c_joint = ½tr((A_0 + A_1)⁻¹C)`, and the fit term's
+        // share of it, `½g_Qᵀ(ΣA_j)⁻¹g_Q/φ̂`: the lever the scale
+        // mis-statement acts through.
+        let joint_released = &limit.released_penalties[0] + &limit.released_penalties[1];
+        let (values, vectors) = design_gram_eigh(&joint_released);
+        let joint_tail_constant: f64 = 0.5
+            * (0..values.len())
+                .map(|a| {
+                    let u = vectors.column(a);
+                    u.dot(&limit.first_order_form.dot(&u)) / values[a]
+                })
+                .sum::<f64>();
+        assert!(
+            joint_tail_constant < 0.0,
+            "the fixture's joint release must descend: c_joint={joint_tail_constant:.6e}"
+        );
+        let rotated_score = vectors.t().dot(&limit.released_score);
+        let fit_term: f64 = 0.5
+            * rotated_score
+                .iter()
+                .zip(values.iter())
+                .map(|(g, sigma)| g * g / sigma)
+                .sum::<f64>()
+            / limit.limit_dispersion;
+        let fit_share = (fit_term / joint_tail_constant).abs();
+        let scale_shift = fit_share / (N as f64 - 1.0);
+        assert!(
+            scale_shift > 1.0e-2,
+            "the fixture must make the M_p bookkeeping visible: the fit term is \
+             {fit_share:.4} of the joint constant, so an (n−1)/n scale error moves it by \
+             only {scale_shift:.3e}"
+        );
+
+        let eval = state
+            .compute_outer_eval_with_order(&rho, OuterEvalOrder::ValueAndGradient)
+            .expect("the production REML gradient must evaluate");
+        let measured_joint = -(rho_face.exp()) * (eval.gradient[0] + eval.gradient[1]);
+        let joint_rel = (joint_tail_constant - measured_joint).abs() / measured_joint.abs();
+        assert!(
+            joint_rel < 0.1 * scale_shift,
+            "the face limit's profiled scale must use the criterion's joint penalty rank: \
+             analytic={:.9e} measured={measured_joint:.9e} rel={joint_rel:.4e} against the \
+             {scale_shift:.3e} a Σ-rank M_p would cost",
+            joint_tail_constant
+        );
+    }
+
     // ═══════════════════ the LAML closed form (#2349) ═══════════════════
 
     /// Binomial sibling of the cubic fixture: logistic truth `η = a + b·t +
@@ -1450,7 +1558,8 @@ mod rail_face_limit_tests {
     }
 
     /// A binomial truth with real curvature: the released directions earn
-    /// their Occam cost, `C_LAML` goes indefinite, the certificate refuses —
+    /// their Occam cost, the face's pencil constant goes negative, the
+    /// certificate refuses —
     /// and the production criterion agrees (its gradient still runs inward).
     #[test]
     fn laml_face_refuses_when_the_released_directions_earn_their_cost() {
@@ -1468,8 +1577,8 @@ mod rail_face_limit_tests {
         );
         match certify_rail_face(&limit) {
             RailFaceVerdict::Refused { reason } => assert!(
-                reason.contains("not positive definite"),
-                "the refusal must name the failed curvature gate: {reason}"
+                reason.contains("lowers the criterion"),
+                "the refusal must name the descending coordinate: {reason}"
             ),
             RailFaceVerdict::Certified(proof) => panic!(
                 "a face the data wants released must NOT certify; got λ_min(C)={:.3e}",
