@@ -6205,17 +6205,38 @@ fn validate_frozen_term_collectionspec(
 /// saved before that has one λ fewer for each such term. The refusal names those
 /// terms when the spec has any.
 ///
-/// `spec` is the mean predictor's spec, so the saved count is the Mean block's
-/// λ when the fit records one, and the fit's λ otherwise.
+/// `spec` is the mean predictor's spec, so the saved count is the λ of the
+/// block that spec builds: the Mean block of a single-predictor fit, or the
+/// Location block of a location-scale fit, whose trailing Scale block carries
+/// the noise predictor's own λ. Counting every λ of a location-scale fit against
+/// the location spec refused every such summary as a stale layout. The walk
+/// reads λ from global index 0, so that block must lead the fit; a fit with
+/// neither role counts all of its λ.
 pub fn saved_lambdas_index_rebuilt_layout(
     spec: &TermCollectionSpec,
     rebuilt_penalties: usize,
     fit: &UnifiedFitResult,
     context: &str,
 ) -> Result<(), FittedModelError> {
-    let saved_lambdas = fit
+    let spec_block = fit
         .block_by_role(BlockRole::Mean)
-        .map_or(fit.lambdas.len(), |block| block.lambdas.len());
+        .or_else(|| fit.block_by_role(BlockRole::Location));
+    if let Some(block) = spec_block {
+        if !fit
+            .blocks
+            .first()
+            .is_some_and(|first| std::ptr::eq(first, block))
+        {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "{context}: the {} block the saved spec builds is not the fit's leading block, \
+                     so its smoothing parameters do not start at global index 0",
+                    block.role.name()
+                ),
+            });
+        }
+    }
+    let saved_lambdas = spec_block.map_or(fit.lambdas.len(), |block| block.lambdas.len());
     if rebuilt_penalties == saved_lambdas {
         return Ok(());
     }
@@ -8069,6 +8090,39 @@ mod tests {
                 .to_string();
         assert!(generic.contains("different penalty layout"), "{generic}");
         assert!(!generic.contains("third-order"), "{generic}");
+    }
+
+    /// A location-scale fit's resolved spec is the location predictor's, so the
+    /// rebuilt layout is checked against the Location block's λ alone; the
+    /// trailing Scale block's λ belong to the noise predictor. Counting both
+    /// refused every Gaussian location-scale summary table as a stale layout.
+    #[test]
+    fn a_location_scale_fit_checks_the_location_block_lambdas() {
+        let block = |role, width: usize, lambdas: usize| FittedBlock {
+            beta: Array1::zeros(width),
+            role,
+            edf: 1.0,
+            lambdas: Array1::ones(lambdas),
+        };
+        let spec = matern_termspec_2953(None);
+        let fit = saved_fit(vec![
+            block(BlockRole::Location, 3, 4),
+            block(BlockRole::Scale, 2, 2),
+        ]);
+        assert!(saved_lambdas_index_rebuilt_layout(&spec, 4, &fit, "replay").is_ok());
+        let stale = saved_lambdas_index_rebuilt_layout(&spec, 6, &fit, "replay")
+            .expect_err("a rebuild that disagrees with the Location block must refuse")
+            .to_string();
+        assert!(stale.contains("4 smoothing parameters"), "{stale}");
+
+        let scale_first = saved_fit(vec![
+            block(BlockRole::Scale, 2, 2),
+            block(BlockRole::Location, 3, 4),
+        ]);
+        let shifted = saved_lambdas_index_rebuilt_layout(&spec, 4, &scale_first, "replay")
+            .expect_err("a Location block that does not lead the fit must refuse")
+            .to_string();
+        assert!(shifted.contains("not the fit's leading block"), "{shifted}");
     }
 
     /// #2953, through a real replay: the saved per-smooth summary rebuilds the

@@ -98,6 +98,12 @@ pub fn smooth_term_summary_rows(
         SmoothTestScale::Known
     };
 
+    let gauge_free_gram = whitening_gram.map(|gram| {
+        intercept_projected_gram(gram, design.intercept_range.clone())
+            .unwrap_or_else(|| gram.clone())
+    });
+    let whitening_gram = gauge_free_gram.as_ref();
+
     let mut rows = Vec::<SmoothTermSummary>::new();
 
     // The fit's GLOBAL penalty layout (and thus `penalty_block_trace`) opens with
@@ -233,6 +239,49 @@ pub fn smooth_term_summary_rows(
     rows
 }
 
+/// The whitening Gram with the intercept direction projected out,
+/// `G − G[:, 0]·G[0, :] / G[0, 0]`, whose term block is the Gram of the term's
+/// columns residualized on the intercept in the same metric.
+///
+/// A centered smooth is identified only up to a constant: its columns are
+/// `B·Z` with `Z` spanning the null space of a sum-to-zero constraint, and the
+/// constant it gives up lives in the intercept. Which constraint picks `Z` is a
+/// gauge choice that leaves the fitted function unchanged, and moves every block
+/// Gram `Z'B'WBZ` by a rank-one constant component. The rank-truncated statistic
+/// follows the Gram, so it depended on the gauge. The concrete case: the
+/// constraint sums over training rows without their prior weights, so a fit with
+/// integer frequency weights and the fit on the duplicated rows, which are the
+/// same model with the same fitted function, get different centerings and
+/// different p-values. Residualizing on the intercept removes the constant
+/// component from every term block, so the statistic is invariant to the
+/// centering. It is the Gram the Wood (2013) statistic whitens by whenever the
+/// constraint already holds in the Gram's metric, as it does for the unweighted
+/// Gaussian training Gram, where `G[0, j] = 1'X_j = 0` and nothing changes.
+///
+/// `None` (use `gram` as is) when the design has no single intercept column or
+/// the intercept's Gram entry is not positive.
+fn intercept_projected_gram(
+    gram: &Array2<f64>,
+    intercept: std::ops::Range<usize>,
+) -> Option<Array2<f64>> {
+    if intercept.len() != 1 || intercept.start >= gram.nrows() || gram.nrows() != gram.ncols() {
+        return None;
+    }
+    let col = intercept.start;
+    let pivot = gram[[col, col]];
+    if !(pivot.is_finite() && pivot > 0.0) {
+        return None;
+    }
+    let cross = gram.column(col).to_owned();
+    let mut projected = gram.clone();
+    for i in 0..gram.nrows() {
+        for j in 0..gram.ncols() {
+            projected[[i, j]] -= cross[i] * cross[j] / pivot;
+        }
+    }
+    Some(projected)
+}
+
 /// The reason a smooth of this shape has no valid significance reference, if
 /// any. One predicate for every p-value surface (the Wald summary table and the
 /// likelihood-ratio `smooth_significance`), so they cannot disagree about which
@@ -300,4 +349,138 @@ fn continuous_order_for_term(
         normalized_scale(term_penalty_start + 2)?,
     ];
     Some(compute_continuous_smoothness_order(lambda_tilde, scales))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::intercept_projected_gram;
+    use gam_terms::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
+    use ndarray::{Array1, Array2};
+
+    fn weighted_gram(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
+        let wx = x * &w.view().insert_axis(ndarray::Axis(1));
+        x.t().dot(&wx)
+    }
+
+    /// Gauss-Jordan inverse with partial pivoting, for the small SPD test matrix.
+    fn inverse(m: &Array2<f64>) -> Array2<f64> {
+        let n = m.nrows();
+        let mut a = m.clone();
+        let mut inv = Array2::<f64>::eye(n);
+        for col in 0..n {
+            let pivot = (col..n)
+                .max_by(|&i, &j| a[[i, col]].abs().total_cmp(&a[[j, col]].abs()))
+                .expect("a non-empty column");
+            for k in 0..n {
+                a.swap([col, k], [pivot, k]);
+                inv.swap([col, k], [pivot, k]);
+            }
+            let d = a[[col, col]];
+            for k in 0..n {
+                a[[col, k]] /= d;
+                inv[[col, k]] /= d;
+            }
+            for row in (0..n).filter(|&row| row != col) {
+                let f = a[[row, col]];
+                for k in 0..n {
+                    a[[row, k]] -= f * a[[col, k]];
+                    inv[[row, k]] -= f * inv[[col, k]];
+                }
+            }
+        }
+        inv
+    }
+
+    fn statistic(beta: &Array1<f64>, cov: &Array2<f64>, gram: &Array2<f64>) -> f64 {
+        wood_smooth_test(SmoothTestInput {
+            beta: beta.view(),
+            covariance: cov,
+            influence_matrix: None,
+            whitening_gram: Some(gram),
+            coeff_range: 1..5,
+            edf: 2.6,
+            nullspace_dim: 0,
+            residual_df: None,
+            scale: SmoothTestScale::Known,
+        })
+        .expect("the smooth test is defined")
+        .statistic
+    }
+
+    /// Two centerings of one smooth give the same model: the term columns
+    /// `X₂ = X₁·A + 1·cᵀ` span the same space as `X₁` once the intercept is
+    /// included, and the coefficients map as `β₁ = P·β₂` with
+    /// `P = [[1, cᵀ], [0, A]]`. This is the weighted-rows versus duplicated-rows
+    /// case, where the sum-to-zero constraint is taken over different row
+    /// multisets. The statistic whitened by the intercept-residualized Gram is the
+    /// same in both gauges; whitened by the raw block Gram it is not.
+    #[test]
+    fn the_whitened_statistic_does_not_depend_on_the_smooth_centering() {
+        let n = 40;
+        let x = Array1::from_shape_fn(n, |i| i as f64 / (n - 1) as f64);
+        let w = Array1::from_shape_fn(n, |i| 1.0 + (i % 3) as f64);
+        let raw = |i: usize, j: usize| {
+            let t = x[i];
+            match j {
+                0 => t,
+                1 => t * t,
+                2 => (3.0 * t).sin(),
+                _ => (5.0 * t).cos(),
+            }
+        };
+        // Gauge 1: term columns centered over the rows, ignoring the weights.
+        let mut x1 = Array2::<f64>::ones((n, 5));
+        for j in 0..4 {
+            let mean = (0..n).map(|i| raw(i, j)).sum::<f64>() / n as f64;
+            for i in 0..n {
+                x1[[i, j + 1]] = raw(i, j) - mean;
+            }
+        }
+        let a = Array2::from_shape_fn((4, 4), |(i, j)| {
+            if i == j { 1.5 + 0.1 * i as f64 } else { 0.2 / (1.0 + (i + 2 * j) as f64) }
+        });
+        let c = Array1::from(vec![0.3, -0.2, 0.15, 0.05]);
+        let mut p = Array2::<f64>::eye(5);
+        for j in 0..4 {
+            p[[0, j + 1]] = c[j];
+            for i in 0..4 {
+                p[[i + 1, j + 1]] = a[[i, j]];
+            }
+        }
+        // X₂ = X₁·P keeps the fitted values: X₂·β₂ = X₁·P·β₂ = X₁·β₁.
+        let x2 = x1.dot(&p);
+        let beta2 = Array1::from(vec![0.4, 0.8, -0.5, 0.3, 0.1]);
+        let beta1 = p.dot(&beta2);
+        let g2 = weighted_gram(&x2, &w);
+        let mut h2 = g2.clone();
+        for i in 1..5 {
+            h2[[i, i]] += 5.0 * (i * i) as f64;
+        }
+        let v2 = inverse(&h2);
+        let v1 = p.dot(&v2).dot(&p.t());
+        let g1 = weighted_gram(&x1, &w);
+
+        let raw_1 = statistic(&beta1, &v1, &g1);
+        let raw_2 = statistic(&beta2, &v2, &g2);
+        assert!(
+            (raw_1 - raw_2).abs() > 1e-3 * raw_1.abs(),
+            "the raw block Gram must be gauge-dependent for this check to mean anything: {raw_1} vs {raw_2}"
+        );
+        let projected_1 = statistic(&beta1, &v1, &intercept_projected_gram(&g1, 0..1).unwrap());
+        let projected_2 = statistic(&beta2, &v2, &intercept_projected_gram(&g2, 0..1).unwrap());
+        assert!(
+            (projected_1 - projected_2).abs() <= 1e-9 * projected_1.abs(),
+            "{projected_1} vs {projected_2}"
+        );
+    }
+
+    #[test]
+    fn a_design_without_a_single_intercept_column_keeps_its_gram() {
+        let gram = Array2::<f64>::eye(3);
+        assert!(intercept_projected_gram(&gram, 0..0).is_none());
+        assert!(intercept_projected_gram(&gram, 0..2).is_none());
+        let mut singular = gram.clone();
+        singular[[0, 0]] = 0.0;
+        assert!(intercept_projected_gram(&singular, 0..1).is_none());
+    }
 }

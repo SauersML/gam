@@ -681,9 +681,21 @@ impl SummaryInformationCriteria {
     }
 }
 
+/// Why a fit with no single response family (a location-scale or other
+/// multi-block fit) reports no AIC.
+pub const NO_AIC_WITHOUT_A_SCALAR_FAMILY: &str =
+    "the fit models its response through several linear predictors and has no single \
+     response family or scalar dispersion, which both AICs and their scale degrees of \
+     freedom are defined from";
+
 fn summary_information_criteria(
     fit: &UnifiedFitResult,
 ) -> Result<SummaryInformationCriteria, String> {
+    if fit.likelihood_family.is_none() {
+        return Ok(SummaryInformationCriteria::unavailable(
+            NO_AIC_WITHOUT_A_SCALAR_FAMILY,
+        ));
+    }
     let Some(log_likelihood) = fit.reported_log_likelihood() else {
         return Ok(SummaryInformationCriteria::unavailable(NO_AIC_AT_EXACT_FIT));
     };
