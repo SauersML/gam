@@ -67,6 +67,14 @@ pub struct NestedFixedLambdaFit {
     /// Profiled Gaussian only: the residual degrees of freedom `ν₀ = n₊ − edf₀`
     /// whose `σ̂₀² = D₀/ν₀` the log-likelihood was evaluated at.
     pub profiled_residual_df: Option<f64>,
+    /// `∂ℓ_i/∂η_i` at the reduced optimum, in the units of the full fit's
+    /// unscaled Hessian `H = XᵀWX + S`: under the fitted dispersion for every
+    /// family whose working weight carries it, and at unit dispersion for a
+    /// profiled Gaussian, whose `H` is written at `σ² = 1`.
+    ///
+    /// `X_jᵀ` of it is the score of the dropped block at the constrained
+    /// optimum, where every kept block's penalized score is zero.
+    pub eta_score: Array1<f64>,
 }
 
 /// Outcome of the reduced fit. Only [`Self::Converged`] carries a likelihood:
@@ -326,9 +334,24 @@ pub fn fit_nested_at_fitted_log_lambdas(
         inputs.weights,
     )?
     .total();
+    let eta = result.final_eta.to_owned();
+    let mut score_likelihood = reporting;
+    if profiled_residual_df.is_some() {
+        score_likelihood.scale = LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 };
+    }
+    let mut eta_score = Array1::<f64>::zeros(eta.len());
+    pirls::eta_log_likelihood_value_and_score_into(
+        inputs.y,
+        &eta,
+        &score_likelihood,
+        &config.link_kind,
+        inputs.weights,
+        &mut eta_score,
+    )?;
     Ok(NestedFixedLambdaOutcome::Converged(NestedFixedLambdaFit {
         log_likelihood,
-        eta: result.final_eta.to_owned(),
+        eta,
         profiled_residual_df,
+        eta_score,
     }))
 }
