@@ -92,6 +92,18 @@ for seed in range(start, stop):
 """
 
 
+def test_seed_that_shared_the_budget_is_not_charged(tmp_path: Path, monkeypatch: Any) -> None:
+    # Seed 4 dies after seeds 0-3 spent part of the chunk's budget, so the
+    # kill says nothing about seed 4 alone: only the finished seeds come back.
+    from . import run as run_mod
+
+    fake = tmp_path / "fake_worker.py"
+    fake.write_text(FAKE_WORKER.format(hang=4))
+    monkeypatch.setattr(run_mod, "WORKER", fake)
+    recs = run_mod.run_chunk(Cell("gaussian", 60, "smooth"), 0, 8, ("gamfit",), 5.0, 1e9, str(tmp_path))
+    assert [(r["seed"], r["status"]) for r in recs] == [(s, "ok") for s in range(4)]
+
+
 def test_seeds_after_a_killed_rep_are_run_not_blamed(tmp_path: Path, monkeypatch: Any) -> None:
     # One rep that outlives the safety net must be the only rep charged with
     # it: the seeds queued behind it in the same chunk never started, and

@@ -96,12 +96,13 @@ def run_chunk(
     """Run one policed worker over ``range(start, stop)``.
 
     The worker runs its seeds in order and prints one ``RESULT`` line per
-    finished seed. Returns one record per finished seed, then, if the worker
-    stopped early, one record for the seed it died on, carrying the safety
-    net's status (``timeout``/``memcap``) or ``crash``. Seeds after that one
-    were never started, so they get no record here: ``run_plan`` runs them in
-    a continuation chunk rather than blaming them for the seed that killed the
-    chunk.
+    finished seed. Returns one record per finished seed. If the worker stopped
+    early, the seed it died on is charged (a record carrying the safety net's
+    status, ``timeout``/``memcap``, or ``crash``) only when it is ``start``:
+    then it had the whole worker, budget included, to itself. A later seed
+    shared the budget with the seeds before it, and the seeds after it never
+    started, so none of them gets a record here: ``run_plan`` runs them in a
+    continuation chunk that starts at the seed the worker died on.
     """
     cmd = [
         sys.executable,
@@ -126,6 +127,8 @@ def run_chunk(
         died_here = rec is None
         if died_here:
             # The first seed with no RESULT line is the rep the chunk died on.
+            if seed != start:
+                break
             rec = dict(
                 family=cell.family,
                 n=cell.n,
@@ -205,7 +208,7 @@ def run_plan(
 
         def one(chunk: tuple[Cell, int, int]) -> None:
             cell, start, stop = chunk
-            # A chunk that died leaves its later seeds unstarted; each pass
+            # A chunk that died leaves its later seeds unrecorded; each pass
             # records at least one seed, so this ends after at most stop-start.
             while start < stop:
                 recs = run_chunk(
