@@ -28,7 +28,7 @@ Every claim below carries one of three tags:
 
 6. **Proposed derived tolerance: τ_stat = 1/(2n) in absolute log-likelihood units.** Equivalently, the fit must be within n^{−1/2} sampling SDs of the exact optimum. This is the accuracy order of the Laplace approximation and of first-order inference, so resolving the criterion further buys nothing. Certify when ½·δ² + band ≤ τ_stat, where δ² is the Newton decrement (taken in γ coordinates on faces, with projection) and band is the numerical band. If the numerical band alone exceeds τ_stat, the fit fails with a typed error: numerically unresolvable at statistical precision. Applied to the failing multinomial fit (N = 200, ½δ² = 4.7×10⁻⁵ against the current resolution 2.7×10⁻⁵), this would certify it.
 
-7. **gamfit's smooth-term p-values are conservative under the default double penalty**, and the brief counts conservative p-values as a bug. The Wood-type Wald statistic has an atom at 0 of mass ≈ 0.5, because f̂ ≡ 0 when both λ̂ = ∞. Its χ²/F(ref_df) reference ignores that atom. Simulated size under H0 is about half of nominal (§4.3). The equivalent chi-bar ½χ²₀ + ½χ²₁ reference for the RLRT is also conservative for splines by a factor of about 2 (size 0.025 at nominal 0.05) **[checked, `tables.out`]**.
+7. **gamfit's smooth-term p-values are conservative under the default double penalty**, and the brief counts conservative p-values as a bug. The Wood-type Wald statistic has an atom at 0 of mass ≈ 0.5, because f̂ ≡ 0 when both λ̂ = ∞. Its χ²/F(ref_df) reference ignores that atom. Simulated size under H0 is 0.029–0.034 at nominal 0.05 and 0.115–0.143 at 0.20, i.e. 55–70% of nominal (n = 100, 400) **[checked, §4.3]**. The exact-mixture null is calibrated. With a single penalty, where there is no atom, gamfit's p-value is calibrated (0.053 at 0.05). So the defect is the atom, not the boundary. The equivalent chi-bar ½χ²₀ + ½χ²₁ reference for the RLRT is also conservative for splines by a factor of about 2 (size 0.025 at nominal 0.05) **[checked, `tables.out`]**.
 
 8. **Calibrated replacement: the test statistic is the boundary certificate's own first-order quantity.** The variance-component score U = y'P₀ZZ'P₀y / y'P₀y has an *exact* Gaussian null law, a ratio of quadratic forms, computed deterministically by Imhof inversion. For GLMs it has the first-order null law Σκ_s χ²₁ with κ = eig(Z'P_WZ) (Lin 1997). The Gaussian version is exactly calibrated **[proven]** and the simulations match nominal (§4.4). Other options: the pivotal-T exact null (simulation) and the RLRT with the Crainiceanu–Ruppert exact null.
 
@@ -296,11 +296,11 @@ The quadratic model promises that no feasible point improves V by more than G_mo
 
 ### 3.7 The exact null for smooth-term tests with a boundary λ̂
 
-**The atom [proven, checked].** With the default double penalty (both the null space and the range penalized), H0: f ≡ 0 puts both γ_j at 0 with probability ≈ 0.5. This is 0.505 at n = 100 in the smoke test; the final figure is in §4.3. At such a fit f̂ ≡ 0 exactly and any Wald statistic T = 0. The null law of T is therefore
+**The atom [proven, checked].** With the default double penalty (both the null space and the range penalized), H0: f ≡ 0 puts both γ_j at 0 with probability ≈ 0.5. The simulated figure is 0.477 at n = 100 and 0.485 at n = 400 (§4.3). At such a fit f̂ ≡ 0 exactly and any Wald statistic T = 0. The null law of T is therefore
 
   L_H0(T) = π₀·δ₀ + (1 − π₀)·L_H0(T | T > 0),  π₀ = P_H0(all γ̂_j = 0).
 
-**Correct p-value.** The correct p-value is p(t) = P_H0(T ≥ t), where p(0) = 1. No χ² or F reference with continuous d.f. has this form. gamfit's present reference (`smooth_test.rs:180–199`) is χ²_{ref_df} or F(ref_df, n − edf), with rank = round(edf) floored at 1 and ref_df ≥ rank_used. It treats T as a continuous χ²-like quantity with at least one d.f., and so it is conservative whenever π₀ is large. The simulated size is roughly half of nominal (§4.3).
+**Correct p-value.** The correct p-value is p(t) = P_H0(T ≥ t), where p(0) = 1. No χ² or F reference with continuous d.f. has this form. gamfit's present reference (`smooth_test.rs:180–199`) is χ²_{ref_df} or F(ref_df, n − edf), with rank = round(edf) floored at 1 and ref_df ≥ rank_used. It treats T as a continuous χ²-like quantity with at least one d.f., and so it is conservative whenever π₀ is large. The simulated size is 55–70% of nominal (§4.3). With a single penalty, π₀ ≈ 0 and the same reference is calibrated.
 
 **Pivotality (Gaussian, one tested smooth, parametric X₀) [proven].** Under y → ay + X₀c:
 
@@ -401,11 +401,49 @@ The random-intercept row approaches nominal, as Stram–Lee predicts.
 
 REML is maximized exactly over γ ≥ 0 using test-code L-BFGS-B, with the boundary included. The "exact-mix" p-value is the empirical P_H0(T ≥ t) from independent reference draws. The model is Gaussian with a cubic B-spline, k = 10, and f ≡ 0.
 
-CALIB_RESULTS_PLACEHOLDER
+Runs: double penalty with 1500 test draws and 2500 reference draws per n; single penalty with 3000 and 6000 (n = 100). MC s.e. of a size is 0.0026 / 0.0056 / 0.0077 / 0.0103 at α = .01 / .05 / .10 / .20. The exact-mix column has additional reference-sample error of about the same size.
+
+| variant | n | P(all λ̂=∞) | P(any λ̂=∞) | P(bending λ̂=∞) | P(T<10⁻⁶) | mean edf | mean ref_df |
+|---|---|---|---|---|---|---|---|
+| double (default) | 100 | 0.477 | 0.929 | 0.684 | 0.477 | 0.39 | 1.76 |
+| double (default) | 400 | 0.485 | 0.918 | 0.694 | 0.485 | 0.40 | 1.79 |
+| single | 100 | 0.663 | 0.663 | 0.663 | 0.001 | 1.25 | 1.41 |
+
+Size, P(p ≤ α) under H0:
+
+| variant, n | p-value | α=.01 | .05 | .10 | .20 |
+|---|---|---|---|---|---|
+| double, 100 | gamfit (χ²/F ref_df) | 0.0060 | **0.0287** | 0.0687 | **0.1153** |
+| double, 100 | exact mixture (pivotal T) | 0.0073 | 0.0480 | 0.0900 | 0.1847 |
+| double, 400 | gamfit (χ²/F ref_df) | 0.0053 | **0.0340** | 0.0740 | **0.1433** |
+| double, 400 | exact mixture (pivotal T) | 0.0087 | 0.0593 | 0.1060 | 0.2227 |
+| single, 100 | gamfit (χ²/F ref_df) | 0.0087 | 0.0527 | 0.0980 | 0.2013 |
+| single, 100 | exact mixture (pivotal T) | 0.0107 | 0.0353 | 0.0867 | 0.1733 |
+
+Exact H0 quantiles of T (double): 0.95 → 5.02 (n=100), 4.62 (n=400); 0.99 → 8.92, 9.02. Single: 0.95 → 6.49, 0.99 → 10.11.
+
+Reading:
+
+- **Double penalty (the default, `formula_dsl.rs:3713`): gamfit's p-value is conservative [checked].** Size is 0.029–0.034 at nominal 0.05 and 0.115–0.143 at 0.20, i.e. 55–70% of nominal. It is 4.6 and 2.9 MC s.e. below 0.05, and 8.2 and 5.5 s.e. below 0.20. The cause is the atom: T = 0 exactly with probability 0.48 (= P(all λ̂ = ∞), as predicted in §3.7), which the continuous F(ref_df, ·) reference does not represent. The exact-mixture p-value is calibrated within MC error at both n.
+- **Single penalty: gamfit's p-value is calibrated [checked].** The unpenalized null space is always fitted, so T has no atom (P(T<10⁻⁶) = 0.001), even though λ̂_bend = ∞ in 66% of fits. The one deviation in the exact-mix row (0.035 at .05) is 2.1 combined s.e. from nominal (test + reference error ≈ 0.007). I read it as noise, not a finding. So the miscalibration is specific to the default double penalty: the atom, not the boundary itself, breaks the reference.
+- P(bending λ̂ = ∞) = 0.68–0.69 is the boundary probability of §3.2 (π for m = 2, k = 10 is 0.675). P(any λ̂ = ∞) ≈ 0.92–0.93: **under H0 more than nine fits in ten have at least one hyperparameter on the boundary face.**
 
 ### 4.4 Score-test calibration (`scoretest.py → scoretest.out`)
 
-SCORE_RESULTS_PLACEHOLDER
+**(a) Range of π(κ) = P(Σκ_s(χ²₁ − 1) ≤ 0) [numerical check of Conjecture 1].** Over 400 random κ vectors (K uniform on 1..29, κ = Exp(1)^a with a ~ U(0.5, 6), so both flat and steeply decaying spectra occur), min π = 0.5433 and max π = 0.6827 = P(χ²₁ ≤ 1). The maximum is attained by one-dominant-eigenvalue spectra. Nothing falls outside (1/2, P(χ²₁ ≤ 1)], which is consistent with Conjecture 1.
+
+**(b) Gaussian double-penalty score test (3.6), exact Imhof p-value, f ≡ 0, k = 10.** Size P(p ≤ α):
+
+| n | draws | α=.01 | .05 | .10 | .20 | MC s.e. (.01/.05/.10/.20) |
+|---|---|---|---|---|---|---|
+| 100 | 3000 | 0.0097 | 0.0473 | 0.0987 | 0.2103 | .0018/.0040/.0055/.0073 |
+| 400 | 2000 | 0.0115 | 0.0520 | 0.1015 | 0.2085 | .0022/.0049/.0067/.0089 |
+
+All eight entries are within 1.4 MC s.e. of nominal. This is expected, since (3.6) is an exact finite-sample law [proven], so the check is really of the implementation. No refit and no simulation are needed per p-value.
+
+**(c) Bernoulli-logit Lin score test.** r'ZZ'r at the null fit, with p-value from Σκ_sχ²₁ by Imhof, κ = eig(Z'P_WZ).
+
+BINOMIAL_SCORE_PLACEHOLDER
 
 ### 4.5 LAML derivative and GLM boundary law (`glm.py → glm.out`)
 
