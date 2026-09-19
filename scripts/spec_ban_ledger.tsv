@@ -98,8 +98,6 @@ magic	crates/gam-sae/src/manifold/seed_routing.rs	.max(1.0e-12)	https://github.c
 magic	crates/gam-sae/src/manifold/seed_routing.rs	.max(1.0e-12)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-sae/src/sparse_dict/block_chart.rs	.max(1.0e-300)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/constrained_posterior.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-solve/src/estimate/summary.rs	< 1e-4	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-solve/src/estimate/summary.rs	< 2e-16	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/gaussian_reml.rs	> 1.0e-14	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/gaussian_reml.rs	> 1.0e-14	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/pirls/deviance.rs	<= 1.0e-6	https://github.com/SauersML/gam/issues/2469
