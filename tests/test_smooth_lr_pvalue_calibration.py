@@ -36,12 +36,12 @@ gamfit = pytest.importorskip("gamfit")
 REPS = 600
 FORMULA = "y ~ s(x1) + s(x2) + s(x3)"
 CELLS = {
-    # name: (family, n, b0, a1, a3, sigma, power of the replaced reference
-    # at 0.05 on these 600 datasets)
-    "gaussian_n60": ("gaussian", 60, 0.0, 1.0, 0.30, 0.5, 434 / 600),
-    "gaussian_n200": ("gaussian", 200, 0.0, 1.0, 0.30, 1.0, 409 / 600),
-    "binomial_n400": ("binomial", 400, 0.0, 1.5, 0.60, None, 537 / 600),
-    "poisson_n200": ("poisson", 200, 0.5, 0.8, 0.25, None, 490 / 600),
+    # name: (family, n, b0, a1, a3, sigma, power at 0.05 of the reference on
+    # main before this lane, on these datasets)
+    "gaussian_n60": ("gaussian", 60, 0.0, 1.0, 0.30, 0.5, 440 / 600),
+    "gaussian_n200": ("gaussian", 200, 0.0, 1.0, 0.30, 1.0, 407 / 600),
+    "binomial_n400": ("binomial", 400, 0.0, 1.5, 0.60, None, 542 / 596),
+    "poisson_n200": ("poisson", 200, 0.5, 0.8, 0.25, None, 491 / 600),
 }
 
 
