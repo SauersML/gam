@@ -3164,7 +3164,7 @@ pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
         return Ok(JointFeasibilityLimit::Unlimited);
     }
     if joint_alpha <= 0.0 {
-        log::debug!(
+        log::trace!(
             "[PIRLS/joint-Newton] feasibility blocked by an active face (block {:?}); \
              leaving the step for the cone projection",
             limiting_block,
@@ -3174,7 +3174,7 @@ pub(crate) fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
         });
     }
     trial_delta.mapv_inplace(|v| joint_alpha * v);
-    log::debug!(
+    log::trace!(
         "[PIRLS/joint-Newton] feasibility scaled joint step by α={:.3e} (block {:?} binding)",
         joint_alpha,
         limiting_block,
@@ -3717,7 +3717,7 @@ pub(crate) mod whitened_spectrum {
                 .count();
             if band_modes > 0 {
                 let cert_null_modes = gamma.iter().filter(|g| g.abs() <= null_cutoff).count();
-                log::warn!(
+                log::debug!(
                     "[joint-newton spectrum gam#979] λ_max={:.6e} null_cutoff={:.6e} numerical_floor={:.6e} band_modes={} cert_null_modes={} (band now resolved by the step; cert still classifies on null_cutoff)",
                     lambda_max_abs,
                     null_cutoff,
@@ -5779,7 +5779,7 @@ pub(crate) fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     let shift =
         exact_newton_stabilizing_shift_psd_penalized(&lhs, h_joint, ridge_floor).unwrap_or(0.0);
     if shift > 0.0 {
-        log::debug!(
+        log::trace!(
             "[PIRLS/joint-Newton] stabilized dense penalized Hessian with diagonal shift {:.3e}",
             shift
         );

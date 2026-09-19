@@ -1196,7 +1196,7 @@ fn support_arrow_majorizer_inverse(
             )
         })?;
         if !report.converged() {
-            log::debug!(
+            log::trace!(
                 "support outer differential: reduced-Schur preconditioner iterate at relative \
                  residual {:.3e} (floor {:.3e}) after its {}-direction span; flexible GMRES \
                  certifies the physical residual",
@@ -2415,7 +2415,7 @@ impl SaeSupportSparseTerm {
                 let across = (total - along).max(0.0);
                 let resolution = total / probes as f64 / (probes as f64).powi(2);
                 if total > 0.0 && across <= resolution * probes as f64 {
-                    log::debug!(
+                    log::trace!(
                         "atom {atom_index}: periodic image is degenerate to a segment \
                          (across/total = {:.3e}); unrolling",
                         across / total
@@ -4104,7 +4104,7 @@ impl SaeSupportSparseTerm {
         match certificate {
             Ok(certificate) => {
                 let BandProvenance::Dense { scaled_frobenius } = certificate.band;
-                log::debug!(
+                log::trace!(
                     "support saddle classifier certified A − τ·B ≻ 0 without an eigensystem: \
                      dim {}, τ {:.3e}, band {:.3e}, ‖S₀‖_F {:.3e}",
                     certificate.dim,
@@ -4127,7 +4127,7 @@ impl SaeSupportSparseTerm {
                         format!("the factorization stopped at pivot {pivot:?} under band {delta:.3e}")
                     }
                 };
-                log::debug!(
+                log::trace!(
                     "support saddle classifier could not certify positive curvature ({reason}); \
                      solving the generalized eigensystem"
                 );
@@ -4905,7 +4905,7 @@ impl SaeSupportSparseTerm {
             coordinates: displacement.t.clone(),
             decoder: displacement.beta.clone(),
         };
-        log::info!(
+        log::debug!(
             "support Newton displacement: max {:.3e} (decoder {:.3e}, coordinate {:.3e}) over \
              {coordinate_dim} coordinates and border {beta_dim}; assemble, differential rows, \
              row factors and gradient band {:.2}s, exact-A FGMRES {iterations} iterations {:.2}s",
@@ -5687,7 +5687,7 @@ impl SaeSupportSparseTerm {
             lambda = next_lambda;
             ard = next_ard;
             sweeps += 1;
-            log::info!(
+            log::debug!(
                 "joint sweep {sweeps}: lambda_move={lambda_move:.4e} ard_move={ard_move:.4e}                  lambda_med={:.4e} alpha_med={:.4e}",
                 {
                     let mut v = lambda.clone();
@@ -6241,7 +6241,7 @@ impl SaeSupportSparseTerm {
             let widest = classes.iter().map(|c| c.len()).max().unwrap_or(0);
             let narrowest = classes.iter().map(|c| c.len()).min().unwrap_or(0);
             let mean = self.k_atoms() as f64 / classes.len() as f64;
-            log::info!(
+            log::debug!(
                 "decoder sweep colouring: {} classes over {} atoms (widest {}, narrowest {}, mean {:.1} atoms/class)",
                 classes.len(), self.k_atoms(), widest, narrowest, mean
             );
@@ -7001,7 +7001,7 @@ impl SaeSupportSparseTerm {
                 // unresolvable at f64. Taking no step leaves the row's KKT high, so the
                 // outer certificate honestly refuses to certify; erroring instead would
                 // discard a whole fitted model over one unmeasurable row.
-                log::debug!(
+                log::trace!(
                     "coordinate row {row}: line search unmeasurable \
                      (rhs_dot_delta={directional:.3e}, delta_max={delta_max:.3e}, \
                      objective resolution {objective_resolution:.3e}, best_step={best_step:.3e}, \
@@ -7576,7 +7576,7 @@ impl SaeSupportSparseTerm {
                     scaled_step,
                     &mut trial_coordinates,
                 )?;
-                log::info!(
+                log::debug!(
                     "support exact saddle escape: generalized curvature {:.6e} (backward error \
                      {:.3e}), B-radius {:.3e}, objective {:.6e} -> {:.6e}",
                     mode.curvature,
@@ -7747,14 +7747,14 @@ impl SaeSupportSparseTerm {
                         diagnostics.final_relative_residual,
                         stationarity_tolerance,
                     );
-                    log::debug!(
+                    log::trace!(
                         "support joint Newton linear solve refused at ridge {ridge:.3e} \
                          (attempt {attempt}): {solve_refusal}"
                     );
                 }
                 Err(error) => {
                     solve_refusal = error.to_string();
-                    log::debug!(
+                    log::trace!(
                         "support joint Newton refused at ridge {ridge:.3e} (attempt {attempt}): {error}"
                     );
                 }
@@ -7768,7 +7768,7 @@ impl SaeSupportSparseTerm {
         let (delta_t, delta_beta) = match step_pair {
             Some(pair) => pair,
             None => {
-                log::info!(
+                log::debug!(
                     "support joint Newton: linear solve refused after {solve_attempts} attempt(s) \
                      and {solve_iterations} PCG iterations ({solve_refusal}); assemble {:.2}s, \
                      solve {:.2}s",
@@ -8001,7 +8001,7 @@ impl SaeSupportSparseTerm {
                 // from, so the ratio reads that model's accuracy along this step.
                 let predicted = -(scale * model_linear + 0.5 * scale * scale * model_quadratic);
                 let searched = step_start.elapsed();
-                log::info!(
+                log::debug!(
                     "support joint Newton: accepted scale={scale:.6e} (2^-{halving} of \
                      {first_scale:.6e}, {model} model) predicted={predicted:+.3e} \
                      actual={:+.3e} ratio={:.3} objective={objective:.9e} -> {trial:.9e}; \
@@ -8032,7 +8032,7 @@ impl SaeSupportSparseTerm {
             }
             halving += 1;
         }
-        log::info!(
+        log::debug!(
             "support joint Newton: no measurable decrease along the {model} step after {} \
              objective evaluation(s); assemble {:.2}s, solve {:.2}s ({solve_iterations} PCG \
              iterations over {solve_attempts} attempt(s)), exact curvature {:.2}s, line search \
@@ -8275,7 +8275,7 @@ impl SaeSupportSparseTerm {
                 taken_step.resize(self.coordinate_state_len(), 0.0);
                 last_objective = None;
                 previous_candidate = false;
-                log::info!(
+                log::debug!(
                     "support fixed point: cycle {iteration} made no measured progress (objective \
                      {objective:.9e}, raw KKT norm {kkt_norm:.3e}); arming the coupled \
                      (Schur-eliminated joint Newton) phase"
@@ -8506,7 +8506,7 @@ impl SaeSupportSparseTerm {
                     // carrying `solve_coordinates_fixed_decoder did not recur
                     // within 256 cycles` as its refusal (#2575).
                     if self.has_same_support_as(&moved) {
-                        log::info!(
+                        log::debug!(
                             "support move at cycle {iteration} retained every discrete support; \
                              treating it as the no-op it is"
                         );
@@ -8526,21 +8526,21 @@ impl SaeSupportSparseTerm {
                             trust_radius,
                         );
                         if let Err(error) = &polish {
-                            log::info!(
+                            log::debug!(
                                 "support move polish did not recur at cycle {iteration}; \
                                  comparing the objective it reached: {error}"
                             );
                         }
                         match moved.penalized_objective(target, lambda_smooth, ard_precisions) {
                             Err(error) => {
-                                log::info!(
+                                log::debug!(
                                     "support move unevaluable at cycle {iteration}, \
                                      rejected: {error}"
                                 );
                             }
                             Ok(after) => {
                                 if objective - after > self.objective_descent_resolution(objective) {
-                                    log::info!(
+                                    log::debug!(
                                         "support move accepted at cycle {iteration}: objective \
                                          {objective:.6e} -> {after:.6e}"
                                     );
@@ -8559,7 +8559,7 @@ impl SaeSupportSparseTerm {
                                     previous_candidate = false;
                                     continue;
                                 }
-                                log::info!(
+                                log::debug!(
                                     "support move rejected at cycle {iteration}: objective \
                                      {objective:.6e} -> {after:.6e}"
                                 );
@@ -8654,7 +8654,7 @@ impl SaeSupportSparseTerm {
                         &mut trial_fitted,
                     )? {
                         Some(stepped_objective) => {
-                            log::info!(
+                            log::debug!(
                                 "support fixed-point cycle {iteration}: exact Newton displacement \
                                  {:.3e} (decoder {:.3e}, coordinate {:.3e}) exceeds {:.3e} while \
                                  the screen passed; Newton step installed, objective \
@@ -8688,7 +8688,7 @@ impl SaeSupportSparseTerm {
                         }
                     }
                 }
-                log::info!(
+                log::debug!(
                     "support fixed-point cycle {iteration}: raw KKT max={:.3e} rel={:.3e} \
                      diagonal-scaled max={:.3e} rel={:.3e} exact Newton displacement={:.3e} \
                      rel={:.3e} max_change={:.3e} objective={:.6e} \
@@ -8751,7 +8751,7 @@ impl SaeSupportSparseTerm {
                         self.reroute_fixed_decoder_ard(target, support_k, 0, ard_precisions)?;
                     moved.set_decoder_fista_passes(self.decoder_fista_passes);
                     if self.has_same_support_as(&moved) {
-                        log::info!(
+                        log::debug!(
                             "plateau support move at cycle {iteration} retained every discrete \
                              support; treating it as the no-op it is"
                         );
@@ -8763,7 +8763,7 @@ impl SaeSupportSparseTerm {
                             trust_radius,
                         );
                         if let Err(error) = &polish {
-                            log::info!(
+                            log::debug!(
                                 "plateau support move polish did not recur at cycle {iteration}; \
                                  comparing the objective it reached: {error}"
                             );
@@ -8772,13 +8772,13 @@ impl SaeSupportSparseTerm {
                             Err(error) => {
                                 // fall through to the normal cycle tail: the
                                 // accelerator bookkeeping must see every cycle.
-                                log::info!(
+                                log::debug!(
                                     "plateau support move unevaluable at cycle {iteration}: {error}"
                                 );
                             }
                             Ok(after) => {
                                 if objective - after > self.objective_descent_resolution(objective) {
-                                    log::info!(
+                                    log::debug!(
                                         "plateau support move accepted at cycle {iteration}: \
                                          objective {objective:.6e} -> {after:.6e}"
                                     );
@@ -8791,7 +8791,7 @@ impl SaeSupportSparseTerm {
                                     previous_candidate = false;
                                     continue;
                                 }
-                                log::info!(
+                                log::debug!(
                                     "plateau support move rejected at cycle {iteration}: \
                                      objective {objective:.6e} -> {after:.6e}"
                                 );
@@ -8858,7 +8858,7 @@ impl SaeSupportSparseTerm {
                 last_kkt_norm = None;
                 last_gradient_band = None;
             }
-            log::info!(
+            log::debug!(
                 "support fixed-point cycle {iteration}: raw KKT max={:.3e} rel={:.3e} \
                  parameter KKT max={:.3e} rel={:.3e} max_change={:.3e} objective={:.6e} \
                  anderson={}/{} order={} joint={}",
@@ -8875,14 +8875,14 @@ impl SaeSupportSparseTerm {
             );
             // #2576: whether the coupled phase's terminal motion lies along the
             // Euclidean atoms' affine gauge orbits.
-            if joint_armed && log::log_enabled!(log::Level::Info) {
+            if joint_armed && log::log_enabled!(log::Level::Debug) {
                 match self.euclidean_affine_motion_share(&cycle_start, &cycle_residual) {
-                    (share, Some((atom, atom_share, energy))) => log::info!(
+                    (share, Some((atom, atom_share, energy))) => log::debug!(
                         "support fixed-point cycle {iteration}: Euclidean line coordinate motion \
                          affine share={share:.3}; largest-motion atom {atom} share={atom_share:.3} \
                          energy={energy:.3e}"
                     ),
-                    (_, None) => log::info!(
+                    (_, None) => log::debug!(
                         "support fixed-point cycle {iteration}: no Euclidean line atom moved"
                     ),
                 }

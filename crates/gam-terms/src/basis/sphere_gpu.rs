@@ -308,7 +308,7 @@ impl Drop for PinnedF64 {
         if let Err(err) =
             unsafe { cudarc::driver::result::free_host(self.ptr as *mut std::ffi::c_void) }
         {
-            log::debug!(
+            log::trace!(
                 "PinnedF64::drop: cuMemFreeHost failed ({err}); the pinned host allocation \
                  is leaked for the remaining process lifetime"
             );

@@ -88,6 +88,18 @@ PLANS: dict[str, Plan] = {
             timeout_s=3_600.0,
         ),
         Plan(
+            name="n1e6_memory",
+            description=(
+                "n=1e6, {gaussian, poisson} x {p1, p5}, 1 rep: peak RSS and"
+                " user/sys CPU against the dense design (pyGAM audit F11)"
+            ),
+            cells=tuple(
+                Cell(f, 1_000_000, d) for f in ("gaussian", "poisson") for d in ("p1", "p5")
+            ),
+            reps=1,
+            timeout_s=3_600.0,
+        ),
+        Plan(
             name="full",
             description="n in {1e3, 1e4, 1e5}, every family x every design, 3 reps",
             cells=_grid((1_000, 10_000, 100_000), ALL_DESIGNS),

@@ -895,7 +895,7 @@ pub(crate) fn build_outer_hessian_operator(
         precomputed
     } else if effective_deriv.has_corrections() {
         if effective_deriv.has_batched_hessian_derivative_corrections() {
-            log::info!(
+            log::debug!(
                 "[STAGE] outer_hessian coord_corrections mode=batched k={} ext_dim={} n={} dim={}",
                 k,
                 ext_dim,

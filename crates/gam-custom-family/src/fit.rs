@@ -131,7 +131,7 @@ fn pre_fit_coefficient_coordinates<F: CustomFamily + ?Sized>(
         .map(|(spec, _)| spec.name.as_str())
         .collect();
     if !structural.is_empty() {
-        log::info!(
+        log::debug!(
             "[CANON] structural coefficient coordinate(s) declared: [{}] — these blocks keep \
              their basis AND their width through canonicalisation (#2748)",
             structural.join(", "),
@@ -252,7 +252,7 @@ fn audit_converged_identifiability<F: CustomFamily + ?Sized>(
                 .iter()
                 .map(|dropped| format!("{}[{}]", dropped.block, dropped.column))
                 .collect();
-            log::info!(
+            log::debug!(
                 "[AUDIT-DRIFT] converged identifiability accepted a representative swap: the pivot \
                  chose other members of the same alias classes (rank {}, pilot gauge rank {} at \
                  convergence); newly_dropped=[{}] recovered=[{}]",
@@ -313,7 +313,7 @@ fn audit_converged_identifiability<F: CustomFamily + ?Sized>(
     match drift.pilot_certificate_transported {
         Some(false) => {
             let (excursion, radius) = drift.excursion_vs_radius.unwrap_or((f64::NAN, f64::NAN));
-            log::info!(
+            log::debug!(
                 "[AUDIT-TRANSPORT] converged identifiability accepted on ENDPOINT AGREEMENT \
                  ONLY (rank={}): the pilot certificate's transport radius {radius:.3e} was \
                  exhausted by an excursion of at least {excursion:.3e}, so the pilot verdict is \
@@ -323,7 +323,7 @@ fn audit_converged_identifiability<F: CustomFamily + ?Sized>(
         }
         Some(true) => {
             let (excursion, radius) = drift.excursion_vs_radius.unwrap_or((f64::NAN, f64::NAN));
-            log::debug!(
+            log::trace!(
                 "[AUDIT-TRANSPORT] converged identifiability rank={} TRANSPORTED from the pilot \
                  (excursion {excursion:.3e} within radius {radius:.3e})",
                 drift.current_rank
@@ -866,7 +866,7 @@ pub(crate) fn resolvability_rho_domain_and_limit_faces(
         lower_is_limit[outer] = seen[outer] && identified[outer] && lo == interval.0;
         upper_is_limit[outer] = seen[outer] && hi == interval.1;
     }
-    log::debug!(
+    log::trace!(
         "[RHO-DOMAIN] resolvability domain per coordinate: lower={:.3?} upper={:.3?} \
          lower_is_limit={lower_is_limit:?} upper_is_limit={upper_is_limit:?}",
         lower.to_vec(),
@@ -1554,7 +1554,7 @@ pub(crate) fn certify_refined_continuation<P: RefinedContinuationPath>(
                     });
                 }
                 refinements += 1;
-                log::info!(
+                log::debug!(
                     "[OUTER] {} continuation refining {steps}→{refined} steps after waypoint \
                      {waypoint_index} did not certify",
                     path.label(),
@@ -1579,7 +1579,7 @@ pub(crate) fn certify_refined_continuation<P: RefinedContinuationPath>(
             // A mode-valued ladder's discrepancy sequence alternates between two
             // scales; printing one ratio out of it reads as a convergence rate
             // and is not one.
-            log::info!(
+            log::debug!(
                 "[OUTER] {} continuation refinement: steps={steps} discrepancy={discrepancy:.6e} \
                  previous={} criterion={:.9e} -> {:.9e} (agreement={agreement:.6e} vs resolution \
                  {criterion_resolution:.6e}, consecutive={consecutive_agreements}/{}) \
@@ -1934,7 +1934,7 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
             // partway is indistinguishable from one that landed differently by
             // accumulation. `|eta|inf` is the coordinate the discrepancy is
             // taken in, so the two readings are the same instrument.
-            log::info!(
+            log::debug!(
                 "[OUTER] coefficient-objective homotopy: steps={steps} waypoint={step} \
                  progress={progress:.6} inner_merit={:.9e} |eta|inf={:.6e} \
                  inner(loglik={} penalty={} cycles={} converged={})",
@@ -2286,7 +2286,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let canonical_started = std::time::Instant::now();
     let canonical_n_rows = raw_specs.first().map(|s| s.design.nrows()).unwrap_or(0);
     let canonical_n_cols_raw: usize = raw_specs.iter().map(|s| s.design.ncols()).sum();
-    log::info!(
+    log::debug!(
         "[STAGE] identifiability canonicalise: start blocks={} n={} p_total_raw={}",
         raw_specs.len(),
         canonical_n_rows,
@@ -2303,7 +2303,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .iter()
         .map(|s| s.design.ncols())
         .sum();
-    log::info!(
+    log::debug!(
         "[STAGE] identifiability canonicalise: end elapsed={:.3}s alias_pairs={} dropped_cols={} \
          p_total_raw={} p_total_reduced={} fatal_attributed={}",
         canonical_started.elapsed().as_secs_f64(),
@@ -2314,7 +2314,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         canonical.audit.fatal,
     );
     if !canonical.audit.aliased_pairs.is_empty() {
-        log::info!("[identifiability audit] {}", canonical.audit.summary);
+        log::debug!("[identifiability audit] {}", canonical.audit.summary);
         // Aggregate by (block_a, block_b) so the log stays bounded by the
         // block-pair count rather than the quadratic direction-pair count
         // — a few wide blocks alone produce 100+ pair-lines and bury the
@@ -2339,13 +2339,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 .map(|p| p.overlap)
                 .fold(f64::INFINITY, f64::min);
             let near_one = pairs.iter().filter(|p| p.overlap >= 0.9999).count();
-            log::info!(
+            log::debug!(
                 "[identifiability audit] alias-cluster {a} ~ {b}: {count} direction-pair{plural} \
                  (overlap {min:.4}..{max:.4}; {near_one} ≥0.9999)",
                 plural = if count == 1 { "" } else { "s" },
             );
         }
-        if log::log_enabled!(log::Level::Debug) {
+        if log::log_enabled!(log::Level::Trace) {
             for ((a, b), pairs) in &by_pair {
                 let mut sorted = pairs.clone();
                 sorted.sort_by(|p, q| {
@@ -2354,7 +2354,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 for pair in sorted.iter().take(3) {
-                    log::debug!(
+                    log::trace!(
                         "[identifiability audit]   sample {a}[{ai}] ~ {b}[{bi}] overlap={ov:.4}",
                         ai = pair.direction_a,
                         bi = pair.direction_b,
@@ -2365,7 +2365,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         }
     }
     for drop in &canonical.audit.dropped_columns {
-        log::info!(
+        log::debug!(
             "[identifiability audit] dropped: block='{}' local_col={} ({})",
             drop.block,
             drop.column,
@@ -2636,7 +2636,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let derivative_policy = family.outer_derivative_policy(specs, &outer_options);
     let hessian = cap_hessian;
     let need_outer_hessian = hessian.is_analytic();
-    log::info!(
+    log::debug!(
         "[OUTER] custom family derivative-policy: n_params={} gradient={:?} hessian={:?} capability={:?} requested_outer_hessian={} inner_hvp_available={} outer_hvp_available={} outer_dense_available={}",
         n_rho,
         cap_gradient,
@@ -2751,7 +2751,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     ) {
         Ok(seed) => seed,
         Err(refusal) => {
-            log::warn!(
+            log::debug!(
                 "[OUTER] coefficient-objective continuation declined with typed refusal: \
                  {refusal}. The armed coefficient mode is therefore selected by the caller's \
                  seed rather than by the continuation, so it is not the #2366 canonical mode \
@@ -2763,7 +2763,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // The rule that selected the mode is recorded on the fit (#2661), so a
     // declined continuation is visible to a caller, not only in this log.
     let mode_seed = if let Some(certified) = objective_homotopy_seed {
-        log::info!(
+        log::debug!(
             "[OUTER] coefficient-objective continuation certified at {} steps: endpoint \
              discrepancy {:.3e} <= inner tolerance {:.3e}; observed contraction factor {:?}",
             certified.certificate.steps,
@@ -2790,7 +2790,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &rho0,
         ) {
             Ok(certified) => {
-                log::info!(
+                log::debug!(
                     "[OUTER] #2661 anchored continuation certified at {} steps: endpoint \
                      discrepancy {:.3e} <= inner tolerance {:.3e}; observed contraction \
                      factor {:?}",
@@ -2808,7 +2808,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 )
             }
             Err(refusal) => {
-                log::info!(
+                log::debug!(
                     "[OUTER] #2661 anchored continuation declined with typed refusal: {refusal}"
                 );
                 (
@@ -2950,7 +2950,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // screen runs unchanged — cold fits keep their multi-seed robustness.
     let warm_start_present = persistent_warm_start.is_some();
     if warm_start_present {
-        log::info!(
+        log::debug!(
             "[OUTER] custom family: warm-start present (ρ/β seed already near-optimal); \
              skipping cold seed-screening cascade, proceeding straight to BFGS/Newton certificate"
         );
@@ -2977,7 +2977,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let outer_cache_attached = cache_session.is_some();
     let problem = if let Some(session) = cache_session {
         let key_hex = session.key().to_hex();
-        log::info!(
+        log::debug!(
             "[CACHE] attach key={}.. family-tag={} backend=outer-strategy mirrors={}",
             &key_hex[..8.min(key_hex.len())],
             std::any::type_name::<F>()
@@ -3233,7 +3233,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             hyper_values: Array1::zeros(0),
             inner: eval_result.inner,
         };
-        log::debug!(
+        log::trace!(
             "[OUTER-EVAL] order={order:?} request_hessian={request_hessian} cost={objective:.6e} \
              |g|={:.6e} warm={} rho0={:.4}",
             gradient.iter().map(|g| g * g).sum::<f64>().sqrt(),
@@ -3816,7 +3816,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                          outer published none"
                     .to_string(),
             })?;
-            log::info!(
+            log::debug!(
                 "[smoothing-correction] branch=unavailable reason={reason} rho_dimension={}",
                 rho_star.len(),
             );

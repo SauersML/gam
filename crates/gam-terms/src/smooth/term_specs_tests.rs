@@ -153,9 +153,10 @@ mod spatial_psi_bound_coordinate_tests {
                     },
                     input_scale: Some(input_scale),
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         spatial_term_psi_bounds(data.view(), &spec, 0).expect("finite spatial ψ bounds")
     }
@@ -215,9 +216,10 @@ mod spatial_psi_bound_coordinate_tests {
                         },
                         input_scale: Some(input_scale),
                     },
-                    shape: ShapeConstraint::None,
+                    shape: ShapeConstraint::None.into(),
                     joint_null_rotation: None,
                 }],
+                level: Default::default(),
             };
             let geometry =
                 spatial_term_psi_bounds(source.view(), &spec, 0).expect("finite geometry window");
@@ -912,7 +914,7 @@ mod factor_smooth_heldout_group_tests {
                     frozen_global_orthogonality: None,
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }
@@ -1024,7 +1026,7 @@ mod frozen_factor_level_collection_tests {
             frozen_parametric_residualization: None,
             name: name.to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }
@@ -1062,6 +1064,7 @@ mod frozen_factor_level_collection_tests {
                     spec: marginal(),
                 },
             )],
+            level: Default::default(),
         };
 
         let levels = spec.frozen_factor_levels_by_col();
@@ -1138,6 +1141,7 @@ mod frozen_factor_level_collection_tests {
                 smooth("nested", nested),
                 smooth("numeric", numeric_wrappers),
             ],
+            level: Default::default(),
         };
 
         let levels = spec.frozen_factor_levels_by_col();

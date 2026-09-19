@@ -50,6 +50,7 @@ These are the plans (see `plans.py`):
 | `small_n`   | n ∈ {50, 200, 500}, all families × {`p1`, `p3`, `p5`} (fixed per-fit overhead) | 3 |
 | `n1e4_core` | n=1e4, all families × {`p1`, `p5`, `te`} | 3 |
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
+| `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
 
 Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.

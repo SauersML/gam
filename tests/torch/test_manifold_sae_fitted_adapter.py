@@ -17,7 +17,7 @@ gt = pytest.importorskip("gamfit.torch")
 def _native_fit():
     path = Path(__file__).parents[1] / "fixtures" / "manifold_sae" / "golden_full.json"
     payload = json.loads(path.read_text())
-    return gamfit.ManifoldSAE.from_dict(payload)
+    return gamfit.sae.ManifoldSAE.from_dict(payload)
 
 
 def _residual_energy(x: np.ndarray, reconstruction: torch.Tensor) -> float:

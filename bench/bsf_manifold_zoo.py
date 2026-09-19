@@ -15,7 +15,7 @@ including a full-height 2-D Swiss-roll sheet, then applies the paper's
 per-instance center/RMS normalization and clean additive-superposition protocol.
 It scores:
 
-* ``ours_rust``  -- ``gamfit.sae_manifold_fit`` (the production Rust REML path)
+* ``ours_rust``  -- ``gamfit.sae.sae_manifold_fit`` (the production Rust REML path)
   at its DEFAULTS. Atoms are genuinely curved charts, so a circle costs ONE
   intrinsic coordinate where a block-sparse featurizer spends a 2-D block, and
   the recovered coordinate IS the factor's intrinsic parameter.
@@ -387,7 +387,7 @@ def _fit_ours_rust(
             "structured_residual_passes": 0,
         }
     fit_start = time.perf_counter()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=train_x,
         K=atoms,
         assignment="topk" if top_k is not None else "softmax",

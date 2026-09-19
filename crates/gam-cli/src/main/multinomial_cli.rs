@@ -175,14 +175,14 @@ pub(crate) fn run_fit_multinomial(
     require_dataset_rows("fit", &args.data, ds.values.nrows())?;
 
     let phase_start = std::time::Instant::now();
-    log::info!("[PHASE] multinomial fit start n={}", ds.values.nrows());
+    log::debug!("[PHASE] multinomial fit start n={}", ds.values.nrows());
     let saved = fit_penalized_multinomial_formula(&MultinomialFitRequest::new(
         &ds,
         formula_text,
         fit_config,
     ))
     .map_err(|e| format!("multinomial fit failed: {e}"))?;
-    log::info!(
+    log::debug!(
         "[PHASE] multinomial fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );

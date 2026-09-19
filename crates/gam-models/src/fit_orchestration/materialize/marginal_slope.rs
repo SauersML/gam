@@ -213,7 +213,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         "Bernoulli marginal-slope",
     )?;
 
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
     // Bernoulli marginal-slope: structurally operator-only at large scale, so
     // flip the hint regardless of n to keep dense fallbacks blocked.
     let policy = resolved_resource_policy(

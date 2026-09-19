@@ -109,8 +109,8 @@ def explained_variance(
 class TieredComposition:
     """The single composed artifact: additive T1 + T2 reconstruction."""
 
-    t1: gamfit.SparseDictionaryFit
-    t2: Any  # gamfit.ManifoldSAE
+    t1: gamfit.sae.SparseDictionaryFit
+    t2: Any  # gamfit.sae.ManifoldSAE
     t1_recon: np.ndarray
     t2_recon: np.ndarray
     combined_recon: np.ndarray
@@ -155,13 +155,13 @@ def compose_tiers(
         raise ValueError(f"curved tier K must stay small (K<=64); got {k2}")
 
     # --- Tier 1: collapsed-linear sparse dictionary over the FULL corpus -----
-    t1 = gamfit.sparse_dictionary_fit(
+    t1 = gamfit.sae.sparse_dictionary_fit(
         x, K=k1, active=t1_active, max_epochs=t1_max_epochs
     )
     t1_recon = t1.fitted
 
     def _fit_joint(sub: np.ndarray) -> Any:
-        return gamfit.sae_manifold_fit(
+        return gamfit.sae.sae_manifold_fit(
             sub,
             K=k2,
             d_atom=d_atom,
@@ -192,7 +192,7 @@ def compose_tiers(
     if alternation:
         t2_recon_full = np.asarray(t2.reconstruct(residual), dtype=np.float32)
         deflated = np.ascontiguousarray(x - t2_recon_full)
-        t1 = gamfit.sparse_dictionary_fit(
+        t1 = gamfit.sae.sparse_dictionary_fit(
             deflated, K=k1, active=t1_active, max_epochs=max(1, t1_max_epochs // 3)
         )
         t1_recon = t1.fitted
@@ -230,7 +230,7 @@ class BlockNurseryComposition:
     is the executable direction ⊂ block ⊂ chart ladder.
     """
 
-    t1: Any  # gamfit.BlockSparseDictionaryFit
+    t1: Any  # gamfit.sae.BlockSparseDictionaryFit
     manifest: dict
     per_block: list[dict]
     t1_block_ev: float
@@ -352,7 +352,7 @@ def compose_block_charts(
     stages stay decoupled (a different T2 fitter can consume the same manifest).
     """
     x = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
-    t1 = gamfit.block_sparse_dictionary_fit(
+    t1 = gamfit.sae.block_sparse_dictionary_fit(
         x,
         n_blocks,
         block_size=block_size,
@@ -380,7 +380,7 @@ def compose_block_charts(
         }
         # One tiny curved chart in the block's own coordinates.
         try:
-            chart = gamfit.sae_manifold_fit(
+            chart = gamfit.sae.sae_manifold_fit(
                 np.ascontiguousarray(coords, dtype=np.float64),
                 K=1,
                 # d_atom is the atom manifold's embedding dim (a circle is 2), not
@@ -465,7 +465,7 @@ def compose_charts_from_manifest(
         b = int(q.shape[1])
         rec: dict[str, Any] = {"block": g, "block_dim": b}
         try:
-            chart = gamfit.sae_manifold_fit(
+            chart = gamfit.sae.sae_manifold_fit(
                 np.ascontiguousarray(z, dtype=np.float64),
                 K=1,
                 d_atom=min(chart_d_atom, b),

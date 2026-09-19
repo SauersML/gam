@@ -49,13 +49,13 @@
 //!   active-constraint projection, or a frame mismatch — anything that means
 //!   the caller's `H` is not the matrix assembled here),
 //! * a disagreement with the assembled log-determinant larger than the
-//!   assembled route's OWN error bound `p·ε·κ(H)` (the correction must be
-//!   explicable as that route's error, not as a different quantity).
+//!   assembled route's OWN error bound `p·ε·σ_max·tr(H⁻¹)` (the correction
+//!   must be explicable as that route's error, not as a different quantity).
 //!
 //! The gate that decides whether to pay for it at all is the same
 //! `√EPSILON` envelope the outer value-agreement audit is derived from
 //! (`rho_optimizer::run::outer_value_agreement_bound`): pay when the assembled
-//! route's error bound `p·ε·κ(H)` exceeds `√ε·(1+|log|H||)`, i.e. exactly when
+//! route's error bound `p·ε·σ_max·tr(H⁻¹)` exceeds `√ε·(1+|log|H||)`, i.e. exactly when
 //! the criterion cannot be reproduced to the tolerance its own consumers apply.
 
 use gam_linalg::faer_ndarray::FaerSvd;
@@ -152,26 +152,30 @@ fn data_root_rows(inputs: &HessianRootInputs<'_>) -> Result<std::sync::Arc<DataR
 
 /// How far `Σ log σ_i` off the assembled spectrum can be from the truth.
 ///
-/// `eigh` perturbs `H` by `O(p·ε·‖H‖)`, and `Δ log|H| = tr(H⁻¹ΔH)`, so the
-/// bound is `p·ε·σ_max/σ_min` summed over the modes — `p·ε·κ` up to the same
-/// constant. This is the quantity the whole module is about, so it is derived
-/// here once and used both to decide whether to pay and to bound the accepted
-/// correction.
+/// `eigh` perturbs `H` by `‖ΔH‖₂ = O(p·ε·σ_max)`, and to first order
+/// `Δ log|H| = tr(H⁻¹ΔH)`, which for a positive definite `H` is at most
+/// `‖ΔH‖₂·tr(H⁻¹)`. The bound is therefore `p·ε·σ_max/σ_i` SUMMED over the
+/// modes. It is not `p·ε·κ`: every weak mode carries the full `ε·σ_max` of
+/// absolute error, so a spectrum with many modes near `σ_min` (a wide design,
+/// `p > n`, where the penalty alone holds up every direction the data do not
+/// reach) is off by their count times `p·ε·κ`. This is the quantity the whole
+/// module is about, so it is derived here once and used both to decide whether
+/// to pay and to bound the accepted correction.
 pub(crate) fn assembled_logdet_error_bound(spectrum: &[f64]) -> f64 {
     let p = spectrum.len();
     if p == 0 {
         return 0.0;
     }
     let mut max = 0.0_f64;
-    let mut min = f64::INFINITY;
+    let mut inverse_trace = 0.0_f64;
     for &s in spectrum {
         if !s.is_finite() || s <= 0.0 {
             return f64::INFINITY;
         }
         max = max.max(s);
-        min = min.min(s);
+        inverse_trace += s.recip();
     }
-    (p as f64) * f64::EPSILON * (max / min)
+    (p as f64) * f64::EPSILON * max * inverse_trace
 }
 
 /// `true` when the assembled spectrum resolves `log|H|` more tightly than the
@@ -239,7 +243,7 @@ pub(crate) fn root_scale_hessian_operator(
     ) {
         Ok(value) => Some(value),
         Err(reason) => {
-            log::debug!("[2644-logdet] declined: {reason}");
+            log::trace!("[2644-logdet] declined: {reason}");
             None
         }
     }
@@ -271,7 +275,7 @@ pub(crate) fn root_scale_hessian_operator_for_refused_assembly(
     match root_scale_hessian_operator_inner(inputs, h_assembled, None, mode) {
         Ok(value) => Some(value),
         Err(reason) => {
-            log::debug!("[2644-logdet] refused assembly stands: {reason}");
+            log::trace!("[2644-logdet] refused assembly stands: {reason}");
             None
         }
     }
@@ -462,13 +466,13 @@ fn root_scale_hessian_operator_inner(
                 (logdet - assembled_logdet).abs(),
             ));
         }
-        log::debug!(
+        log::trace!(
             "[2644-logdet] installed: {logdet:.12e} (assembled {assembled_logdet:.12e}, \
              correction {:.3e}, assembled error bound {bound:.3e})",
             logdet - assembled_logdet,
         );
     } else {
-        log::debug!(
+        log::trace!(
             "[2644-logdet] installed over a refused assembly: {logdet:.12e} (root rounding band \
              {root_band:.3e})"
         );
@@ -769,7 +773,46 @@ mod tests {
         let spectrum = [1.0_f64, 2.0, 3.5, 10.0];
         let logdet: f64 = spectrum.iter().map(|s| s.ln()).sum();
         assert!(assembled_logdet_is_resolved(&spectrum, logdet));
-        assert!(assembled_logdet_error_bound(&spectrum) < 1.0e-14);
+        // Four modes at `κ = 10`: `4·ε·10·Σ 1/σ_i ≈ 76 ε`, a few dozen ulps.
+        assert!(assembled_logdet_error_bound(&spectrum) < 1.0e2 * f64::EPSILON);
+    }
+
+    /// The bound must cover every backward error `eigh` is allowed, including
+    /// the coherent one `ΔH = p·ε·σ_max·I` that moves all modes up together.
+    /// That one shifts `log|H|` by `Σ_i log(1 + p·ε·σ_max/σ_i)`, one term per
+    /// weak mode. A wide design (`p > n`) has a whole block of them: here 120
+    /// penalized modes at `2e11` beside 60 modes held up by the data alone, at
+    /// `0.2`–`0.4`, the spectrum of `20 × s(k = 10)` at `n = 100` near its REML
+    /// optimum. `p·ε·κ` prices only the weakest mode, so it is short by the
+    /// block's size. On that fit the root disagreed with the assembled value by
+    /// `0.58` where `16·p·ε·κ` allowed `0.55`, so the root was declined, those
+    /// probes fell back to the noisy assembled value, and the criterion jumped by
+    /// `0.3` between neighbouring `ρ` as the route switched.
+    #[test]
+    fn the_assembled_error_bound_covers_a_coherent_shift_of_every_weak_mode() {
+        let weak = 60usize;
+        let strong = 120usize;
+        let spectrum: Vec<f64> = (0..weak)
+            .map(|i| 0.2 + 0.2 * (i as f64) / (weak as f64))
+            .chain(std::iter::repeat(2.0e11).take(strong))
+            .collect();
+        let p = spectrum.len() as f64;
+        let max = spectrum.iter().fold(0.0_f64, |acc, &s| acc.max(s));
+        let min = spectrum.iter().fold(f64::INFINITY, |acc, &s| acc.min(s));
+        let shift = p * f64::EPSILON * max;
+        let moved: f64 = spectrum.iter().map(|s| (1.0 + shift / s).ln()).sum::<f64>();
+        let weakest_mode_only = p * f64::EPSILON * max / min;
+        assert!(
+            moved > 16.0 * weakest_mode_only,
+            "the fixture must be one where pricing only the weakest mode falls short: \
+             moved {moved:.3e}, weakest-mode bound {weakest_mode_only:.3e}"
+        );
+        let bound = assembled_logdet_error_bound(&spectrum);
+        assert!(
+            moved <= bound,
+            "a backward error eigh is allowed moved log|H| by {moved:.3e}, beyond the \
+             assembled route's own error bound {bound:.3e}"
+        );
     }
 
     /// `Q·diag(d)·Qᵀ` over the leading `d.len()` columns of `Q`, symmetrized.

@@ -56,7 +56,7 @@ impl ConfiguredWarmStartStore {
             .get_or_init(
                 || match WarmStartStore::open(self.root.clone(), self.options.clone()) {
                     Ok(store) => {
-                        log::info!(
+                        log::debug!(
                             "[warm-start-cache] opened explicit root={}",
                             self.root.display()
                         );
@@ -90,7 +90,7 @@ impl ConfiguredWarmStartStore {
         match error {
             StoreError::Io(error) => self.mark_unavailable(operation, error),
             StoreError::Json(error) => {
-                log::warn!(
+                log::debug!(
                     "[warm-start-cache] persistence defect operation={} explicit_root={}: {}",
                     operation,
                     self.root.display(),
@@ -108,7 +108,7 @@ impl ConfiguredWarmStartStore {
     /// environmental I/O failures, not serialization or contract defects.
     pub fn mark_unavailable(&self, operation: &str, error: &dyn std::fmt::Display) {
         if self.available.swap(false, Ordering::Relaxed) {
-            log::warn!(
+            log::debug!(
                 "[warm-start-cache] persistence unavailable operation={} explicit_root={}: {}; \
                  continuing without on-disk warm starts",
                 operation,

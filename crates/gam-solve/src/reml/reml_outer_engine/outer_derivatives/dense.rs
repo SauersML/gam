@@ -420,7 +420,7 @@ pub(crate) fn compute_outer_hessian(
     // `compute_ift_correction_trace`.
     let rho_pair_count = k * (k + 1) / 2;
     let rho_pair_start = std::time::Instant::now();
-    log::debug!(
+    log::trace!(
         "[compute_outer_hessian rho-rho] starting {} pair(s), k={}",
         rho_pair_count,
         k,
@@ -532,7 +532,7 @@ pub(crate) fn compute_outer_hessian(
                             values.len()
                         ));
                     }
-                    log::info!(
+                    log::debug!(
                         "[compute_outer_hessian rho-rho] {rho_pair_count} pair correction \
                          trace(s) from the family row kernel in {:.3}s",
                         traced_start.elapsed().as_secs_f64(),
@@ -674,7 +674,7 @@ pub(crate) fn compute_outer_hessian(
         }
     }
 
-    log::debug!(
+    log::trace!(
         "[compute_outer_hessian rho-rho] {} pair(s) done in {:.3}s",
         rho_pair_count,
         rho_pair_start.elapsed().as_secs_f64(),
@@ -911,7 +911,7 @@ pub(crate) fn compute_outer_hessian(
                                 }
                             }
                         }
-                        log::warn!(
+                        log::debug!(
                             "[OUTER ext-ext non-finite] ({},{}): cross_trace={} base={} m_terms={} correction={} pair.a={} pair.ld_s={} g.dot(v_jj)={} pair_g_finite={} first_bad_pair_g={:?} b_mat_finite={} first_bad_b_mat={:?} b_operator_present={} b_mat_dim={}x{} ext_v[ii]_finite={} ext_v[jj]_finite={} coord_i.b_depends_on_beta={} coord_j.b_depends_on_beta={}",
                             ii,
                             jj,
@@ -971,7 +971,7 @@ pub(crate) fn compute_outer_hessian(
         // instead of just flagging the final outer-Hessian entry.
         let report_finite = |name: &str, value: f64, ii: usize, jj: usize| {
             if !value.is_finite() {
-                log::warn!(
+                log::debug!(
                     "[OUTER non-finite] {} at ({}, {}) = {}",
                     name,
                     ii,
@@ -984,7 +984,7 @@ pub(crate) fn compute_outer_hessian(
             report_finite("rho_a_vals[kk]", rho_a_vals[kk], kk, kk);
             for entry in penalty_a_k_betas[kk].iter() {
                 if !entry.is_finite() {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER non-finite] penalty_a_k_betas[{}] has non-finite",
                         kk
                     );
@@ -993,7 +993,7 @@ pub(crate) fn compute_outer_hessian(
             }
             for entry in v_ks[kk].iter() {
                 if !entry.is_finite() {
-                    log::warn!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
+                    log::debug!("[OUTER non-finite] v_ks[{}] has non-finite", kk);
                     break;
                 }
             }
@@ -1008,7 +1008,7 @@ pub(crate) fn compute_outer_hessian(
         if let Some(ref h_g) = leverage {
             for entry in h_g.iter() {
                 if !entry.is_finite() {
-                    log::warn!("[OUTER non-finite] leverage h^G has non-finite entries");
+                    log::debug!("[OUTER non-finite] leverage h^G has non-finite entries");
                     break;
                 }
             }
@@ -1016,7 +1016,7 @@ pub(crate) fn compute_outer_hessian(
         if let Some(ref z_c) = adjoint_z_c {
             for entry in z_c.iter() {
                 if !entry.is_finite() {
-                    log::warn!("[OUTER non-finite] adjoint_z_c has non-finite entries");
+                    log::debug!("[OUTER non-finite] adjoint_z_c has non-finite entries");
                     break;
                 }
             }
