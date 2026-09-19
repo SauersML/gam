@@ -4563,6 +4563,135 @@ mod glm_eta_observation_fd_tests {
         assert_eq!(excluded.log_likelihood, 0.0);
     }
 
+    fn resolved_row(
+        likelihood: &gam_spec::GlmLikelihoodSpec,
+        y: f64,
+        eta: f64,
+    ) -> Result<StandardFamilyObservationState, EstimationError> {
+        evaluate_resolved_standard_family_observations(
+            likelihood,
+            None,
+            None,
+            None,
+            &array![y],
+            &array![1.0],
+            &array![eta],
+        )
+    }
+
+    /// Log-density of one observation, written independently of the row code
+    /// from each family's textbook density at mean `μ` and dispersion `φ`.
+    fn log_density(response: &ResponseFamily, phi: f64, y: f64, mu: f64) -> f64 {
+        match response {
+            ResponseFamily::Gaussian => {
+                -0.5 * (2.0 * std::f64::consts::PI * phi).ln() - (y - mu).powi(2) / (2.0 * phi)
+            }
+            ResponseFamily::Gamma => {
+                let shape = 1.0 / phi;
+                shape * (shape * y / mu).ln() - shape * y / mu - y.ln() - libm::lgamma(shape)
+            }
+            ResponseFamily::InverseGaussian => {
+                -0.5 * (2.0 * std::f64::consts::PI * phi * y.powi(3)).ln()
+                    - (y - mu).powi(2) / (2.0 * phi * mu * mu * y)
+            }
+            other => panic!("no reference density for {}", other.name()),
+        }
+    }
+
+    /// Inverse Gaussian (inverse-squared and log links) and Gamma / Gaussian under
+    /// the inverse link: every row of the derivative tower the inner PIRLS and the
+    /// outer REML/LAML consume (`s`, `H`, `H′`, `H″`, `H‴`) is the exact
+    /// `η`-derivative of the one below it, the log-likelihood differs from the
+    /// textbook log-density only by a `η`-free constant carrying the dispersion,
+    /// and the Fisher weight is the expected observed curvature (`H` is affine in
+    /// `y`, so `E[H] = H` at `y = μ`).
+    #[test]
+    fn reciprocal_and_inverse_gaussian_rows_are_the_exact_derivative_tower() {
+        let cases = [
+            (ResponseFamily::InverseGaussian, StandardLink::InverseSquared, 0.7, 1.3, 0.45),
+            (ResponseFamily::InverseGaussian, StandardLink::Log, 0.7, 1.3, 0.2),
+            (ResponseFamily::Gamma, StandardLink::Inverse, 0.4, 2.1, 0.6),
+            (ResponseFamily::Gaussian, StandardLink::Inverse, 0.3, 1.7, 0.8),
+        ];
+        let h = 1e-5;
+        for (response, link, phi, y, eta) in cases {
+            let label = format!("{} / {}", response.name(), link.name());
+            let scale = match response {
+                ResponseFamily::Gamma => gam_spec::LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 / phi },
+                _ => gam_spec::LikelihoodScaleMetadata::EstimatedDispersion { phi },
+            };
+            let likelihood = gam_spec::GlmLikelihoodSpec {
+                spec: LikelihoodSpec::try_new(response.clone(), InverseLink::Standard(link))
+                    .expect("legal cell"),
+                scale,
+            };
+            let at = |e: f64| resolved_row(&likelihood, y, e).expect("row evaluates");
+            let mean = |e: f64| match link {
+                StandardLink::Log => e.exp(),
+                StandardLink::Inverse => 1.0 / e,
+                StandardLink::InverseSquared => e.powf(-0.5),
+                _ => unreachable!(),
+            };
+            let (s0, sp, sm) = (at(eta), at(eta + h), at(eta - h));
+            let fd = |plus: f64, minus: f64| (plus - minus) / (2.0 * h);
+            let close = |analytic: f64, numeric: f64, what: &str| {
+                assert!(
+                    (analytic - numeric).abs() <= 1e-6 * (1.0 + analytic.abs()),
+                    "{label}: {what} {analytic} vs FD {numeric}"
+                );
+            };
+            close(s0.score[0], fd(sp.log_likelihood, sm.log_likelihood), "score");
+            close(s0.neghessian_eta[0], -fd(sp.score[0], sm.score[0]), "H");
+            close(
+                s0.neghessian_eta_derivative[0],
+                fd(sp.neghessian_eta[0], sm.neghessian_eta[0]),
+                "H'",
+            );
+            close(
+                s0.neghessian_eta_second_derivative[0],
+                fd(sp.neghessian_eta_derivative[0], sm.neghessian_eta_derivative[0]),
+                "H''",
+            );
+            close(
+                s0.neghessian_eta_third_derivative[0],
+                fd(
+                    sp.neghessian_eta_second_derivative[0],
+                    sm.neghessian_eta_second_derivative[0],
+                ),
+                "H'''",
+            );
+
+            let other = 1.6 * eta;
+            let kernel_gap = at(eta).log_likelihood - at(other).log_likelihood;
+            let density_gap = log_density(&response, phi, y, mean(eta))
+                - log_density(&response, phi, y, mean(other));
+            assert!(
+                (kernel_gap - density_gap).abs() <= 1e-12 * (1.0 + density_gap.abs()),
+                "{label}: log-likelihood gap {kernel_gap} vs density gap {density_gap}"
+            );
+
+            let at_mean = resolved_row(&likelihood, mean(eta), eta).expect("row evaluates");
+            assert!(
+                (at_mean.fisherweight[0] - at_mean.neghessian_eta[0]).abs()
+                    <= 1e-12 * at_mean.fisherweight[0],
+                "{label}: Fisher weight {} vs H at y = mu {}",
+                at_mean.fisherweight[0],
+                at_mean.neghessian_eta[0]
+            );
+
+            if link != StandardLink::Log {
+                for outside in [0.0, -0.3] {
+                    match resolved_row(&likelihood, y, outside) {
+                        Err(EstimationError::InverseLinkDomainViolation { link: name, .. }) => {
+                            assert_eq!(name, link.name(), "{label}")
+                        }
+                        other => panic!("{label}: eta = {outside} must leave the domain, got {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn bounded_covariance_requires_a_certified_strict_spd_precision() {
         let covariance = certified_bounded_posterior_covariance(

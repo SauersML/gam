@@ -974,6 +974,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inverse_gaussian_quantile_inverts_the_cdf() {
+        // (p, μ, λ, scipy.stats.invgauss(μ/λ, scale=λ).ppf(p)).
+        let cases = [
+            (0.025, 1.0, 1.0, 0.149_804_321_724_041_93),
+            (0.975, 1.0, 1.0, 3.771_837_954_732_6),
+            (0.025, 2.0, 400.0, 1.737_184_562_740_362_1),
+            (0.975, 3.0, 0.5, 21.436_074_647_884_915),
+        ];
+        for (p, mu, lambda, reference) in cases {
+            let q = inverse_gaussian_quantile(p, mu, lambda);
+            assert!(
+                ((q - reference) / reference).abs() <= 1e-12,
+                "Q({p}; {mu}, {lambda}) = {q}, reference {reference}"
+            );
+        }
+        assert!(inverse_gaussian_quantile(0.0, 1.0, 1.0).is_nan());
+        assert!(inverse_gaussian_quantile(0.5, -1.0, 1.0).is_nan());
+    }
+
+    #[test]
+    fn inverse_gaussian_interval_is_the_conditional_law_at_zero_estimation_variance() {
+        // V = φμ³ is the conditional variance, so the moment-matched law is
+        // IG(μ, 1/φ) exactly: μ = 1, φ = 1 reproduces the λ = 1 quantiles.
+        let (lo, hi) = inverse_gaussian_moment_matched_interval(1.0, 1.0, 0.025, 0.975)
+            .expect("finite interval");
+        assert!((lo - 0.149_804_321_724_041_93).abs() <= 1e-12);
+        assert!((hi - 3.771_837_954_732_6).abs() <= 1e-12);
+        // Right skew: the upper edge sits further from the mean than the lower.
+        assert!(hi - 1.0 > 1.0 - lo);
+        assert!(inverse_gaussian_moment_matched_interval(1.0, 0.0, 0.025, 0.975).is_none());
+    }
+
+    #[test]
     fn signed_log_sum_exp_propagates_positive_infinities() {
         // A single +∞ positive-sign term dominates ⇒ S = +∞ ⇒ (+∞, +1).
         let (lm, s) = signed_log_sum_exp(&[f64::INFINITY], &[1.0]);

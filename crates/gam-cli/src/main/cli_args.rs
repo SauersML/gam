@@ -606,6 +606,9 @@ pub(crate) enum FamilyArg {
     PoissonLog,
     NegativeBinomial,
     GammaLog,
+    /// Inverse-Gaussian (`V(μ) = φμ³`) with its canonical `1/μ²` link; the
+    /// log link is selected in the formula with `link(type=log)`.
+    InverseGaussian,
     Tweedie,
     Beta,
     RoystonParmar,

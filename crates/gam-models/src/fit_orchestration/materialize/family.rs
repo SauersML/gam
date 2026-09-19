@@ -50,11 +50,10 @@ fn require_legal_link(response: &ResponseFamily, link: LinkFunction) -> Result<(
     }
     Err(WorkflowError::InvalidConfig {
         reason: format!(
-            "link '{}' is not supported for family '{}'; legal links for '{}': {}",
+            "link `{}` is not supported for family `{}`; {}",
             link.name(),
             response.name(),
-            response.name(),
-            LinkFunction::join_names(&legal)
+            LikelihoodSpec::legal_links_clause(response)
         ),
     }
     .into())
@@ -713,12 +712,9 @@ pub fn resolve_family(
                 if !LikelihoodSpec::is_legal_cell(&explicit_spec.response, &from_link.link) {
                     return Err(WorkflowError::InvalidConfig {
                         reason: format!(
-                            "a mixture link is not supported for family '{}'; legal links for '{}': {}",
+                            "a mixture link is not supported for family `{}`; {}",
                             explicit_spec.response.name(),
-                            explicit_spec.response.name(),
-                            LinkFunction::join_names(&LikelihoodSpec::legal_links_for(
-                                &explicit_spec.response
-                            ))
+                            LikelihoodSpec::legal_links_clause(&explicit_spec.response)
                         ),
                     }
                     .into());

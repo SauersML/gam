@@ -3461,7 +3461,8 @@ pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
     LinkFunction::from_name(v).ok_or_else(|| FormulaDslError::UnknownIdentifier {
         reason: format!(
             "{}, blended(...)/mixture(...) or flexible(...). \
-             Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set.",
+             The formula term `link(type=<type>)`, the mgcv-style `family(<type>)` and \
+             Python's `link=` accept the same set.",
             gam_problem::types::UnknownLinkName(v.trim().to_string())
         ),
     })

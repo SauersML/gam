@@ -386,7 +386,9 @@ pub fn normal_cdf(x: f64) -> f64 {
 ///
 /// and `0` on `x ≤ 0`. The second term is formed as `exp(2λ/μ + ln Φ(·))`, so a
 /// large shape `λ/μ` never overflows the exponential against the vanishing
-/// normal tail.
+/// normal tail. Both terms are nonnegative and their exact sum is at most one;
+/// the final `min(1)` only removes the last-ulp excess of the rounded sum in
+/// the far upper tail, it never changes a probability the terms resolve.
 pub fn inverse_gaussian_cdf(x: f64, mu: f64, lambda: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
@@ -1930,6 +1932,30 @@ mod tests {
     use super::*;
 
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn inverse_gaussian_cdf_matches_high_precision_reference() {
+        // (x, μ, λ, F) with F evaluated at 40 digits from the closed form.
+        let cases = [
+            (0.5, 1.0, 1.0, 0.364_975_548_172_959_89),
+            (1.0, 1.0, 1.0, 0.668_102_001_223_170_61),
+            (3.0, 1.0, 1.0, 0.953_187_920_742_788_36),
+            (2.0, 2.0, 50.0, 0.539_506_694_101_386_00),
+            // Large shape λ/μ: exp(2λ/μ) = e^400 alone overflows nothing here.
+            (1.9, 2.0, 400.0, 0.244_904_095_166_497_34),
+            (0.05, 1.0, 0.2, 0.055_367_143_620_662_102),
+            (10.0, 1.0, 0.2, 0.987_810_624_142_217_36),
+        ];
+        for (x, mu, lambda, reference) in cases {
+            let value = inverse_gaussian_cdf(x, mu, lambda);
+            assert!(
+                (value - reference).abs() <= 1e-13,
+                "F({x}; {mu}, {lambda}) = {value}, reference {reference}"
+            );
+        }
+        assert_eq!(inverse_gaussian_cdf(0.0, 1.0, 1.0), 0.0);
+        assert_eq!(inverse_gaussian_cdf(-1.0, 1.0, 1.0), 0.0);
+    }
 
     #[test]
     fn normal_left_tail_ratios_refuse_what_they_do_not_describe() {

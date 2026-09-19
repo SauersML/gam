@@ -508,12 +508,8 @@ pub fn require_reciprocal_link_domain(
     if eta.is_finite() && eta > 0.0 {
         return Ok(());
     }
-    let link_name = match link {
-        StandardLink::Inverse => crate::mixture_link::INVERSE_LINK_NAME,
-        _ => crate::mixture_link::INVERSE_SQUARED_LINK_NAME,
-    };
     Err(EstimationError::InverseLinkDomainViolation {
-        link: link_name,
+        link: link.name(),
         eta,
         lower: 0.0,
         upper: f64::MAX,

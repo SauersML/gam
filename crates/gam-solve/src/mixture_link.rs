@@ -110,8 +110,9 @@ pub(crate) fn reciprocal_power_link_jet6(
     Ok(out)
 }
 
-pub(crate) const INVERSE_LINK_NAME: &str = "inverse link 1/mu";
-pub(crate) const INVERSE_SQUARED_LINK_NAME: &str = "inverse-squared link 1/mu^2";
+/// Canonical names of the reciprocal links, from the one link vocabulary.
+pub(crate) const INVERSE_LINK_NAME: &str = StandardLink::Inverse.name();
+pub(crate) const INVERSE_SQUARED_LINK_NAME: &str = StandardLink::InverseSquared.name();
 
 /// [`reciprocal_power_link_jet6`] for the standard link, `None` for every link
 /// that is not a reciprocal power.

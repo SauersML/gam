@@ -1661,6 +1661,16 @@ impl LikelihoodSpec {
             .collect()
     }
 
+    /// The clause ``legal links for `family`: a|b`` every illegal-cell error
+    /// ends with, generated from [`LikelihoodSpec::legal_links_for`].
+    pub fn legal_links_clause(response: &ResponseFamily) -> String {
+        format!(
+            "legal links for `{}`: {}",
+            response.name(),
+            LinkFunction::join_names(&Self::legal_links_for(response))
+        )
+    }
+
     /// Fallible constructor over an arbitrary `(response, link)` pair. Validates
     /// the legal matrix ([`LikelihoodSpec::is_legal_cell`]) so that an illegal
     /// cell — one whose stored link would drive a wrong response transformation
@@ -4133,5 +4143,105 @@ mod tests {
         assert!(!mixed.upper_tail_gradient_vanishes_everywhere(2));
         // Out of range is malformed, not flat.
         assert!(!mixed.upper_tail_gradient_vanishes(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Link vocabulary and the legality table
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_link_name_round_trips_through_the_one_vocabulary() {
+        for link in LinkFunction::ALL {
+            assert_eq!(LinkFunction::from_name(link.name()), Some(link));
+            assert_eq!(
+                LinkFunction::from_name(&link.name().to_ascii_uppercase().replace('-', "_")),
+                Some(link),
+                "case and `_`/`-` spelling must not matter for {}",
+                link.name()
+            );
+        }
+        // Other packages' spellings of the reciprocal links.
+        assert_eq!(LinkFunction::from_name("inv_squared"), Some(LinkFunction::InverseSquared));
+        assert_eq!(LinkFunction::from_name("1/mu^2"), Some(LinkFunction::InverseSquared));
+        assert_eq!(LinkFunction::from_name("1/mu"), Some(LinkFunction::Inverse));
+        assert_eq!(LinkFunction::from_name("sqrt"), None);
+    }
+
+    #[test]
+    fn unknown_link_message_lists_the_whole_vocabulary() {
+        let message = UnknownLinkName("sqrt".to_string()).to_string();
+        assert!(message.contains("'sqrt'"), "{message}");
+        for link in LinkFunction::ALL {
+            assert!(message.contains(link.name()), "{message} is missing {}", link.name());
+        }
+    }
+
+    #[test]
+    fn legality_table_admits_the_reciprocal_links_only_on_positive_mean_families() {
+        use ResponseFamily as R;
+        let legal = |response: &ResponseFamily| LikelihoodSpec::legal_links_for(response);
+        assert_eq!(legal(&R::Gaussian), vec![LinkFunction::Identity, LinkFunction::Inverse]);
+        assert_eq!(legal(&R::Gamma), vec![LinkFunction::Log, LinkFunction::Inverse]);
+        assert_eq!(
+            legal(&R::InverseGaussian),
+            vec![LinkFunction::Log, LinkFunction::InverseSquared]
+        );
+        assert_eq!(legal(&R::Poisson), vec![LinkFunction::Log]);
+        for link in [LinkFunction::Inverse, LinkFunction::InverseSquared] {
+            assert!(!legal(&R::Binomial).contains(&link));
+            assert!(!legal(&R::Poisson).contains(&link));
+        }
+        // Every listed link is a legal cell, and every cell `try_new` accepts
+        // is listed: the listing is the table, not a copy of it.
+        for response in [R::Gaussian, R::Gamma, R::InverseGaussian, R::Poisson, R::Binomial] {
+            for link in LinkFunction::ALL {
+                let probe = legality_probe(link);
+                assert_eq!(
+                    LikelihoodSpec::try_new(response.clone(), probe).is_ok(),
+                    legal(&response).contains(&link),
+                    "{} / {}",
+                    response.name(),
+                    link.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn illegal_cell_error_lists_the_family_legal_links() {
+        let err = LikelihoodSpec::try_new(
+            ResponseFamily::Gamma,
+            InverseLink::Standard(StandardLink::Identity),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("legal links for `gamma`: log|inverse"), "{message}");
+
+        let err = LikelihoodSpec::try_new(
+            ResponseFamily::InverseGaussian,
+            InverseLink::Standard(StandardLink::Inverse),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("legal links for `inverse-gaussian`: log|inverse-squared"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn inverse_gaussian_support_is_the_strictly_positive_reals() {
+        let spec = LikelihoodSpec::new(
+            ResponseFamily::InverseGaussian,
+            InverseLink::Standard(StandardLink::InverseSquared),
+        );
+        assert!(spec.response.validate_response_support(arr1(&[0.5, 2.0]).view()).is_ok());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let violation = spec
+                .response
+                .validate_response_support(arr1(&[1.0, bad]).view())
+                .unwrap_err();
+            assert_eq!(violation.total_violations, 1, "y = {bad}");
+        }
     }
 }
