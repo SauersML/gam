@@ -12,8 +12,10 @@
 //! wrong fit is invisible to a Gaussian-only gate.
 //!
 //! Audit: `y ~ s(x1) + s(x2)` with a real `s(x1)` and a TRUE-NULL `s(x2)`
-//! (`x2` is drawn independently of `y`), `n = 200`, 500 seeded replications
-//! per family. The p-value read is the production summary row — the shared
+//! (`x2` is drawn independently of `y`), `n = 200`, 200 seeded replications
+//! per family (the 500-replication acceptance run, at n = 60, 200 and 2000, is
+//! the bench; this is its standing CI-sized gate). The p-value read is the
+//! production summary row — the shared
 //! `smooth_term_summary_rows` walk with the fit's exact weighted Gram, the same
 //! call `saved_model_summary` makes for CLI and Python. At
 //! `α ∈ {0.10, 0.05, 0.01}` the empirical size must not exceed
@@ -39,7 +41,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::f64::consts::PI;
 
 const N_OBS: usize = 200;
-const N_REPLICATIONS: u64 = 500;
+const N_REPLICATIONS: u64 = 200;
 const ALPHAS: [f64; 3] = [0.10, 0.05, 0.01];
 const SEED: u64 = 0x5A17_3051_0000;
 /// A fit the outer optimizer refuses to certify returns an error, not a

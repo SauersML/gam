@@ -223,7 +223,9 @@ regression test fails when it is removed (below).
 ## Regression test
 
 `tests/inference/misc/sbc_wood_smooth_test_family_size_curve.rs`: one test
-per family, n = 200, 500 seeded replications (rayon-parallel), gate
+per family, n = 200, 200 seeded replications (rayon-parallel; the 500-rep
+run above is the bench, and 500 reps × 7 families overruns the per-test CI
+kill), gate
 `size ≤ α + 2·√(α(1−α)/m)` at α ∈ {.10, .05, .01}; also `ref_df ≥ 1` and
 finite for every replicate and `p > .5` for edf < 0.01. It uses the Rust
 simulator (same DGPs, different RNG stream from the Python bench).
