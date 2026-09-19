@@ -36,8 +36,11 @@ it off whether `y` happens to be integer-valued:
 ```python
 gamfit.fit(df, "count ~ s(x)")                 # integer counts -> Poisson/log (auto)
 gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
-gamfit.fit(df, "cost ~ s(x)", family="gamma", link="log")     # explicit
-gamfit.fit(df, "cost ~ s(x)", link="log")      # error: name one with family=
+gamfit.fit(df, "prop ~ s(x)", family="gamma", link="log")     # explicit
+try:
+    gamfit.fit(df, "prop ~ s(x)", link="log")
+except gamfit.errors.GamError as err:          # name one with family=
+    print(err)
 ```
 
 ## Setting family and link
@@ -45,7 +48,8 @@ gamfit.fit(df, "cost ~ s(x)", link="log")      # error: name one with family=
 The `family=` kwarg accepts `"gaussian"`, `"binomial"` (aliases
 `"binomial-logit"`, `"binomial-probit"`, `"binomial-cloglog"`),
 `"latent-cloglog-binomial"`, `"poisson"`, `"negative-binomial"`,
-`"beta"`, `"gamma"`, `"inverse-gaussian"`, `"tweedie"`, `"royston-parmar"`,
+`"beta"`, `"gamma"`, `"inverse-gaussian"`, `"tweedie"`, `"student-t"` (see
+[Student-t](#student-t)), `"royston-parmar"`,
 `"expectile"` (see [Expectile regression](#expectile-regression)), and
 `"multinomial"` / `"softmax"`. Omitting
 `family=` triggers auto-detection. Survival, transformation-normal,
@@ -72,17 +76,19 @@ Inverse link `eta`. Default for continuous Gaussian responses.
 
 ### `logit`
 
-Inverse link `1 / (1 + exp(-eta))`. Default for binary `{0, 1}` responses.
+Inverse link `1 / (1 + exp(-eta))` (alias `binomial-logit`). Default for
+binary `{0, 1}` responses.
 
 ### `probit`
 
-Inverse link `Phi(eta)`, the standard normal CDF. Required for the
-Bernoulli marginal-slope family (see [marginal-slope.md](marginal-slope.md)).
+Inverse link `Phi(eta)` (alias `binomial-probit`), the standard normal CDF.
+Required for the Bernoulli marginal-slope family (see
+[marginal-slope.md](marginal-slope.md)).
 
 ### `cloglog`
 
-Inverse link `1 - exp(-exp(eta))`. Used for grouped discrete-time hazards
-and rare-event Bernoulli data.
+Inverse link `1 - exp(-exp(eta))` (alias `binomial-cloglog`). Used for
+grouped discrete-time hazards and rare-event Bernoulli data.
 
 ### `log`
 
@@ -175,6 +181,27 @@ gamfit.fit(df, "claim ~ te(age, year)", family="tweedie(p=1.5)", link="log")
 
 `negative_binomial_theta` / `--negative-binomial-theta` fixes the
 negative-binomial size parameter when a constant-size model is desired.
+
+### Student-t
+
+`family="student-t"` (aliases `"student_t"`, `"t"`) is a heavy-tailed
+alternative to the Gaussian for a continuous response with outliers. The
+link is the identity. The scale `σ` and the degrees of freedom `ν` are
+estimated by LAML jointly with the smoothing parameters. The fitted model
+reports them as `model.student_t_sigma` and `model.student_t_nu`, which are
+`None` for any other family.
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+y = np.sin(2 * np.pi * x) + rng.standard_t(3, x.size) * 0.3
+model = gamfit.fit(pd.DataFrame({"x": x, "y": y}), "y ~ s(x)", family="student-t")
+print(model.student_t_sigma, model.student_t_nu)
+```
 
 ### Multinomial
 

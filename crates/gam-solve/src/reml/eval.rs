@@ -1205,8 +1205,8 @@ impl<'a> RemlState<'a> {
         outer_hessian: Option<&Array2<f64>>,
         caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
         // The ρ coordinates the outer certificate judged railed on a face of
-        // `rho_domain`. The cubature conditions on them (see
-        // [`sigma_cubature_axes`]).
+        // `rho_domain`. The first-order inverse gives them zero variance and
+        // the cubature conditions on them (see [`sigma_cubature_axes`]).
         railed_coordinates: &[usize],
     ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
@@ -1218,6 +1218,7 @@ impl<'a> RemlState<'a> {
             final_lambdas,
             final_fit,
             outer_gradient,
+            railed_coordinates,
             outer_hessian,
             caller_measured_hessian_error,
         );

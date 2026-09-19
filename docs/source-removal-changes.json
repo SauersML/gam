@@ -1572,7 +1572,15 @@
     "evidence": "git grep -w finds none of imhof_integrand, imhof_log_rho, imhof_phase_slack, imhof_amplitude_panel, imhof_amplitude_bound, imhof_survival, IMHOF_MAX_PANELS, GAUSS_LEGENDRE_16, signed_weighted_chi_square_sf_to_tolerance, regularized_beta_lower_from_log_x, SMOOTH_LR_TAIL_ROUNDOFF_FLOOR, SMOOTH_LR_TAIL_COARSEST or selection_standard_error under crates, src or tests at the landing tree. WeightedChiSquareTerm, term and the_f_tail_is_the_two_term_signed_combination_at_zero are declared in crates/gam-math/src/probability/weighted_chi_square.rs. crates/gam-math/tests/tail_references.rs passes all five tests against stored 25-digit mpmath references: worst relative error 5.0e-12 (chi-square), 7.9e-12 (F), 1.85e-11 (t) and 1.1e-13 (weighted, within its returned bound, which is at most 1e-10), plus the monotonicity property. The gam-math lib tests pass, 364 of 364. Without this entry, source_removal_guard.py at base e110c67a94 refused exactly these items."
   },
   {
-    "base": "43aafb450367831f5789510d2d737be2a2181134",
+    "base": "0b0d0120c207ebec5299e3cbe19e8cc9a3d6335d",
+    "items": [
+      "crates/gam-solve/src/topology_selector.rs:fn:bic_score"
+    ],
+    "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
+    "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
+  },
+  {
+    "base": "99940493b293bb2f90f4b70d67f21794b9d3c084",
     "items": [
       "crates/gam-custom-family/src/blockwise_solve.rs:fn:capped_inner_max_cycles",
       "crates/gam-custom-family/src/blockwise_solve.rs:fn:custom_family_seed_screening_proxy_labeled",

@@ -37,7 +37,7 @@ fn certify_row_summed_quadratic_2954(
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -251,7 +251,7 @@ fn an_evaluation_without_parts_takes_no_decrement_verdict_2954() {
 fn a_cancelling_gradient_is_charged_on_its_channels_not_its_sum_2954() {
     let n_obs = 1_000;
     let config = OuterConfig {
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -328,7 +328,7 @@ fn certify_scripted_2954(
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -709,7 +709,7 @@ fn a_tail_toward_an_unidentified_unpenalized_fit_is_certified_inside_the_box_301
 fn the_objective_band_charges_the_channels_and_the_inner_factor_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(1_000),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -827,7 +827,7 @@ fn a_coupled_tail_is_railed_as_one_face_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -940,7 +940,7 @@ fn projected_newton_path_rails_the_tail_and_leaves_the_interior_free_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -1105,7 +1105,7 @@ fn certify_two_route_walk_2954(
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -1259,7 +1259,7 @@ fn an_inner_mode_without_a_residual_takes_no_decrement_verdict_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(2_000.0),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(2_000),
             p_coefficients: Some(COEFFICIENTS_2954),
         },

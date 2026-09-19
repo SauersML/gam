@@ -168,7 +168,7 @@ fn cauchit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
 /// the SAME `eta` used to evaluate the value.  Keeping the pair inseparable is
 /// important: the block-local REML correction consumes both and must never
 /// differentiate a projected/floored surrogate of the objective it sampled.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct DevianceEtaRow {
     pub half_deviance: f64,
     pub eta_score: f64,
@@ -1461,24 +1461,12 @@ pub fn deviance_eta_row_on_measure(
     })
 }
 
-pub(crate) fn deviance_eta_rows(
+fn validate_deviance_row_inputs(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     likelihood: &GlmLikelihoodSpec,
-    inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
-) -> Result<Vec<DevianceEtaRow>, EstimationError> {
-    deviance_eta_rows_with_log_measure_scale(y, eta, likelihood, inverse_link, priorweights, 0.0)
-}
-
-pub(crate) fn deviance_eta_rows_with_log_measure_scale(
-    y: ArrayView1<f64>,
-    eta: &Array1<f64>,
-    likelihood: &GlmLikelihoodSpec,
-    inverse_link: &InverseLink,
-    priorweights: ArrayView1<f64>,
-    log_measure_scale: f64,
-) -> Result<Vec<DevianceEtaRow>, EstimationError> {
+) -> Result<(), EstimationError> {
     if y.len() != eta.len() || priorweights.len() != eta.len() {
         crate::bail_invalid_estim!(
             "deviance row length mismatch: y={}, eta={}, prior_weights={}",
@@ -1493,23 +1481,31 @@ pub(crate) fn deviance_eta_rows_with_log_measure_scale(
             likelihood.spec.response.name()
         ))
     })?;
-    let rows: Vec<Result<DevianceEtaRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            deviance_eta_row_with_log_measure_scale(
-                i,
-                y[i],
-                eta[i],
-                likelihood,
-                inverse_link,
-                priorweights[i],
-                log_measure_scale,
-            )
-        })
-        .collect();
+    Ok(())
+}
+
+pub(crate) fn deviance_eta_rows_with_log_measure_scale(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+    log_measure_scale: f64,
+) -> Result<Vec<DevianceEtaRow>, EstimationError> {
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
     // Parallel evaluation, ordered certification: the smallest invalid row is
     // deterministic, and no caller-visible output exists until all rows pass.
-    rows.into_iter().collect()
+    super::par_certified_rows(eta.len(), |i| {
+        deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            log_measure_scale,
+        )
+    })
 }
 
 pub fn calculate_deviance_from_eta(
@@ -1519,8 +1515,21 @@ pub fn calculate_deviance_from_eta(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    let rows = deviance_eta_rows(y, eta, likelihood, inverse_link, priorweights)?;
-    let half_values: Vec<f64> = rows.iter().map(|row| row.half_deviance).collect();
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
+    // Only the half-deviance summands are needed; the eta score is never
+    // materialized, so the transient is one n-vector.
+    let half_values = super::par_certified_rows(eta.len(), |i| {
+        deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            0.0,
+        )
+        .map(|row| row.half_deviance)
+    })?;
     let half = stable_finite_signed_sum(&half_values, "deviance half-sum")?;
     let value = 2.0 * half;
     if value.is_finite() {
@@ -1553,67 +1562,63 @@ pub(crate) fn binomial_deviance_and_log_kernel_from_mean(
             priorweights.len()
         )));
     }
-    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..y.len())
-        .into_par_iter()
-        .map(|row| {
-            let weight = priorweights[row];
-            if !(weight.is_finite() && weight >= 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial prior weight at row {row} must be finite and non-negative; got {weight}"
-                )));
-            }
-            if weight == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            let yi = y[row];
-            let mui = mu[row];
-            if !(yi.is_finite() && (0.0..=1.0).contains(&yi)) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial response at row {row} must lie in [0, 1]; got {yi}"
-                )));
-            }
-            if !(mui.is_finite() && (0.0..=1.0).contains(&mui)) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial mean at row {row} must lie in [0, 1]; got {mui}"
-                )));
-            }
+    let rows: Vec<(f64, f64)> = super::par_certified_rows(y.len(), |row| {
+        let weight = priorweights[row];
+        if !(weight.is_finite() && weight >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial prior weight at row {row} must be finite and non-negative; got {weight}"
+            )));
+        }
+        if weight == 0.0 {
+            return Ok((0.0, 0.0));
+        }
+        let yi = y[row];
+        let mui = mu[row];
+        if !(yi.is_finite() && (0.0..=1.0).contains(&yi)) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial response at row {row} must lie in [0, 1]; got {yi}"
+            )));
+        }
+        if !(mui.is_finite() && (0.0..=1.0).contains(&mui)) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial mean at row {row} must lie in [0, 1]; got {mui}"
+            )));
+        }
 
-            let half_unit = bd0(yi, mui) + bd0(1.0 - yi, 1.0 - mui);
-            if !(half_unit.is_finite() && half_unit >= 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "integrated binomial half-deviance at row {row} is not representable for y={yi}, mu={mui}: {half_unit}"
-                )));
-            }
-            let half_deviance = if half_unit == 0.0 {
-                0.0
-            } else {
-                match representable_half(weight * half_unit) {
-                    Some(value) => value,
-                    None => finite_signed_from_log(
-                        row,
-                        "integrated binomial half-deviance",
-                        mui,
-                        1.0,
-                        weight.ln() + half_unit.ln(),
-                    )?,
-                }
-            };
-            let saturated_unit = xlogy(yi, yi) + xlogy(1.0 - yi, 1.0 - yi);
-            let saturated_log_kernel = if saturated_unit == 0.0 {
-                0.0
-            } else {
-                finite_signed_from_log(
+        let half_unit = bd0(yi, mui) + bd0(1.0 - yi, 1.0 - mui);
+        if !(half_unit.is_finite() && half_unit >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "integrated binomial half-deviance at row {row} is not representable for y={yi}, mu={mui}: {half_unit}"
+            )));
+        }
+        let half_deviance = if half_unit == 0.0 {
+            0.0
+        } else {
+            match representable_half(weight * half_unit) {
+                Some(value) => value,
+                None => finite_signed_from_log(
                     row,
-                    "integrated binomial saturated log-kernel",
+                    "integrated binomial half-deviance",
                     mui,
-                    -1.0,
-                    weight.ln() + (-saturated_unit).ln(),
-                )?
-            };
-            Ok((half_deviance, saturated_log_kernel))
-        })
-        .collect();
-    let rows: Vec<(f64, f64)> = rows.into_iter().collect::<Result<_, _>>()?;
+                    1.0,
+                    weight.ln() + half_unit.ln(),
+                )?,
+            }
+        };
+        let saturated_unit = xlogy(yi, yi) + xlogy(1.0 - yi, 1.0 - yi);
+        let saturated_log_kernel = if saturated_unit == 0.0 {
+            0.0
+        } else {
+            finite_signed_from_log(
+                row,
+                "integrated binomial saturated log-kernel",
+                mui,
+                -1.0,
+                weight.ln() + (-saturated_unit).ln(),
+            )?
+        };
+        Ok((half_deviance, saturated_log_kernel))
+    })?;
     let half_values: Vec<f64> = rows.iter().map(|row| row.0).collect();
     let saturated_values: Vec<f64> = rows.iter().map(|row| row.1).collect();
     let half_deviance =
@@ -2183,20 +2188,16 @@ fn eta_log_likelihood_geometry_omitting_constants(
         priorweights.view(),
         log_measure_scale,
     )?;
-    let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
-        .into_par_iter()
-        .map(|i| {
-            omitted_log_likelihood_row(
-                i,
-                y[i],
-                eta[i],
-                priorweights[i],
-                &likelihood.spec.response,
-                deviance_rows[i],
-            )
-        })
-        .collect();
-    let log_likelihood_rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
+    let log_likelihood_rows = super::par_certified_rows(y.len(), |i| {
+        omitted_log_likelihood_row(
+            i,
+            y[i],
+            eta[i],
+            priorweights[i],
+            &likelihood.spec.response,
+            deviance_rows[i],
+        )
+    })?;
     let value = stable_finite_signed_sum(&log_likelihood_rows, "log-likelihood reduction")?;
     Ok((value, deviance_rows))
 }
@@ -2234,8 +2235,10 @@ pub fn eta_log_likelihood_value_and_score_into(
         inverse_link,
         priorweights,
     )?;
-    let score = Array1::from_iter(rows.into_iter().map(|row| -row.eta_score));
-    eta_score.assign(&score);
+    eta_score
+        .iter_mut()
+        .zip(rows.iter())
+        .for_each(|(out, row)| *out = -row.eta_score);
     Ok(value)
 }
 
@@ -2246,8 +2249,30 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    eta_log_likelihood_geometry_omitting_constants(y, eta, likelihood, inverse_link, priorweights)
-        .map(|(value, _)| value)
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
+    let log_measure_scale = eta_log_measure_scale(likelihood)?;
+    // The value alone needs only its summands: each row's deviance geometry is
+    // consumed in place instead of being retained for a score.
+    let log_likelihood_rows = super::par_certified_rows(y.len(), |i| {
+        let deviance_row = deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            log_measure_scale,
+        )?;
+        omitted_log_likelihood_row(
+            i,
+            y[i],
+            eta[i],
+            priorweights[i],
+            &likelihood.spec.response,
+            deviance_row,
+        )
+    })?;
+    stable_finite_signed_sum(&log_likelihood_rows, "log-likelihood reduction")
 }
 
 /// Return the data log-kernel carried by a P-IRLS working state.
@@ -2492,14 +2517,18 @@ fn full_log_likelihood_row(
                 ));
             }
         }
+        // A binomial prior weight need not be an integer trial count: the
+        // normalizer is the continuous extension `ln C(w, wy)` (see
+        // `binomial_log_coefficient_from_proportion`), which is exactly zero for
+        // a 0/1 response under any real weight, so a fractional sample weight on
+        // Bernoulli data is the weighted Bernoulli log-mass.
         ResponseFamily::Binomial => {
-            let successes = weight * y;
-            if !exact_integer(weight) || !exact_integer(successes) {
+            if !(weight.is_finite() && weight > 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     row,
-                    "fully-normalized binomial trials/successes (exact integers required)",
+                    "fully-normalized binomial prior weight (finite and positive required)",
                     eta,
-                    successes,
+                    weight,
                 ));
             }
         }
@@ -2614,30 +2643,27 @@ pub fn evaluate_full_log_likelihood_from_eta(
         );
     }
     let log_measure_scale = eta_log_measure_scale(likelihood)?;
-    let rows: Vec<Result<f64, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|row| {
-            let geometry = deviance_eta_row_with_log_measure_scale(
-                row,
-                y[row],
-                eta[row],
-                likelihood,
-                &likelihood.spec.link,
-                priorweights[row],
-                log_measure_scale,
-            )?;
-            full_log_likelihood_row(
-                row,
-                y[row],
-                eta[row],
-                priorweights[row],
-                likelihood,
-                log_measure_scale,
-                geometry,
-            )
-        })
-        .collect();
-    let pointwise = Array1::from_vec(rows.into_iter().collect::<Result<Vec<_>, _>>()?);
+    let rows: Vec<f64> = super::par_certified_rows(eta.len(), |row| {
+        let geometry = deviance_eta_row_with_log_measure_scale(
+            row,
+            y[row],
+            eta[row],
+            likelihood,
+            &likelihood.spec.link,
+            priorweights[row],
+            log_measure_scale,
+        )?;
+        full_log_likelihood_row(
+            row,
+            y[row],
+            eta[row],
+            priorweights[row],
+            likelihood,
+            log_measure_scale,
+            geometry,
+        )
+    })?;
+    let pointwise = Array1::from_vec(rows);
     let total = stable_finite_signed_sum(
         pointwise.as_slice().ok_or_else(|| {
             EstimationError::InvalidInput(

@@ -125,14 +125,26 @@ use std::path::Path;
 // and names its coordinates `theta` (the `rho` of a v25 to v27 record reads as its alias). Both
 // fields carry serde defaults, so an older point loads without them and can only join a search,
 // never resume one; a v27 binary refuses a v28 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 28;
+// v29 stops persisting per-row training data in a standard fit (speed F6): the exact
+// full-conformal field keeps only the p × p frozen penalty `s_lambda` (the labeled rows are
+// supplied again at prediction time), and `FitGeometry::working` (the final PIRLS weights and
+// working response, n each) is no longer serialized, so a saved standard GAM no longer grows
+// with the training rows. A v28 or older payload still loads: its conformal `x` and `y` and
+// its working geometry are read past and dropped. A v28 binary refuses a v29 payload by
+// version instead of failing on the conformal field's missing `x`.
+pub const MODEL_PAYLOAD_VERSION: u32 = 29;
+
+/// The schema before the saved model stopped persisting training rows (speed F6), whose
+/// only difference is the conformal field's `x` and `y` and the serialized working
+/// geometry, both of which this binary reads past.
+const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = 28;
 
 /// The schema before the certified point's value and input fingerprint (gam#3002), whose only
-/// difference is those fields' absence.
+/// difference from [`TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION`] is those fields' absence.
 const WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION: u32 = 27;
 
-/// The schema before the coefficient-mode record (gam#2661), whose only difference is that
-/// field's absence.
+/// The schema before the coefficient-mode record (gam#2661), whose only difference from
+/// [`WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 26;
 
 /// The first payload version whose survival location-scale kernel divides the whole
@@ -177,8 +189,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 11] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 12] = [
     MODEL_PAYLOAD_VERSION,
+    TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
     WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
     MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
     LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
@@ -879,25 +892,26 @@ pub struct FittedModelPayload {
     pub resolved_slopespec: Option<TermCollectionSpec>,
     #[serde(default)]
     pub resolved_slopespecs: Option<Vec<TermCollectionSpec>>,
-    /// Precomputed substrate for the EXACT Gaussian-identity full-conformal set
+    /// Frozen penalty `Sλ` for the EXACT Gaussian-identity full-conformal set
     /// (#942 Layer 1 + the frozen-ρ self-diagnostic).
     ///
     /// Populated only for a standard Gaussian-identity fit with unit prior
-    /// weights, no offset and no link wiggle. It
-    /// persists the training design + response + frozen penalty `Sλ` so the
-    /// prediction set that is exact GIVEN `Sλ` (a union of intervals, valid for
-    /// any penalized smooth) can be replayed per test point — one Cholesky each,
-    /// zero refits. Because λ̂ was selected from all training responses, the
-    /// frozen-λ construction is not permutation symmetric in the augmented
-    /// points; the distribution-free finite-sample coverage theorem is asserted
-    /// only per row where the surfaced frozen-ρ certificate accepts (under the
-    /// global-ρ grid-Lipschitz assumption). `None` for any
-    /// ineligible model or an older payload, in which case the exact-set predict
-    /// path errors with a clear message and the caller uses split conformal or
-    /// the posterior band. `#[serde(default)]` so pre-existing models deserialize
-    /// as no exact substrate available.
+    /// weights, no offset and no link wiggle. It persists only the p × p frozen
+    /// penalty: the prediction set that is exact GIVEN `Sλ` (a union of
+    /// intervals, valid for any penalized smooth) is replayed per test point
+    /// against labeled rows the caller supplies again at prediction time — one
+    /// Cholesky each, zero refits — so the saved model never grows with the
+    /// training rows. Because λ̂ was selected from all training responses, the
+    /// frozen-λ construction on the training rows is not permutation symmetric
+    /// in the augmented points; the distribution-free finite-sample coverage
+    /// theorem is asserted only per row where the surfaced frozen-ρ certificate
+    /// accepts (under the global-ρ grid-Lipschitz assumption). `None` for any
+    /// ineligible model, in which case the exact-set predict path errors with a
+    /// clear message and the caller uses split conformal or the posterior band.
+    /// Payloads through version 28 stored the training `x` and `y` beside
+    /// `s_lambda` here; only `s_lambda` is read back.
     #[serde(default)]
-    pub full_conformal: Option<crate::inference::full_conformal::ExactFullConformalSubstrate>,
+    pub full_conformal: Option<crate::inference::full_conformal::ExactFullConformalPenalty>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1176,6 +1190,30 @@ impl FittedModelPayload {
                 random_effect_terms: Vec::new(),
                 level: Default::default(),
             });
+    }
+
+    /// Offsets and prior weights are real-valued by role, whatever values the
+    /// training rows happened to hold: an all-zero or 0/1 offset column infers
+    /// as `Binary` at load time, and that kind must not refuse a prediction
+    /// with any other offset. Role columns are stored as `Continuous`, here and
+    /// on the frozen score transform.
+    fn synchronize_role_column_kinds(&mut self) {
+        if let Some(schema) = self.data_schema.as_mut() {
+            let roles = [
+                self.offset_column.as_deref(),
+                self.noise_offset_column.as_deref(),
+                self.weight_column.as_deref(),
+            ];
+            for column in &mut schema.columns {
+                if column.kind == ColumnKindTag::Binary && roles.contains(&Some(column.name.as_str()))
+                {
+                    column.kind = ColumnKindTag::Continuous;
+                }
+            }
+        }
+        if let Some(transform) = self.score_transform.as_mut() {
+            transform.synchronize_role_column_kinds();
+        }
     }
 
     /// Write the persistable time-basis snapshot for a survival model.
@@ -3589,6 +3627,7 @@ impl FittedModel {
             .or(payload.unified.as_ref())
             .is_some_and(|fit| fit.used_device);
         payload.synchronize_empty_feature_contract();
+        payload.synchronize_role_column_kinds();
         let Some(fit) = payload.fit_result.as_ref().or(payload.unified.as_ref()) else {
             return;
         };
@@ -6815,6 +6854,7 @@ mod tests {
                 outer_warm_start: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
+                random_effect_tests: Vec::new(),
             },
             inner_cycles: 0,
         })
@@ -7651,6 +7691,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
             WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
@@ -7667,9 +7708,10 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
+        assert_eq!(TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
         assert_eq!(
             WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
-            MODEL_PAYLOAD_VERSION - 1
+            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,

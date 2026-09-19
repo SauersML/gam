@@ -234,7 +234,6 @@ impl RemlState<'_> {
         };
         let penalty = crate::pirls::PenaltyConfig {
             canonical_penalties: &reduced_penalties,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p: pinned,
             coefficient_lower_bounds: None,

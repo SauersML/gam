@@ -1,6 +1,5 @@
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
-use crate::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::pirls::assemble_and_factor_sparse_penalized_system;
 use gam_linalg::sparse_exact::SparseExactFactor;
 use gam_problem::OuterEval;
@@ -940,7 +939,7 @@ mod tests {
 
     #[test]
     pub(crate) fn eval_cache_manager_stores_first_order_outer_eval() {
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let rho = array![0.25, -0.0];
         let rho_key = super::rho_key::sanitized_rhokey(&rho);
         let eval = OuterEval {
@@ -996,7 +995,7 @@ mod tests {
                     .all(|(x, y)| x.to_bits() == y.to_bits())
         };
 
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
 
         // (1) Round-trip fidelity: store at rho_a, then a forced hit must equal
         // the stored eval bit-for-bit (the "hit == miss" guarantee).
@@ -1044,7 +1043,7 @@ mod tests {
         // (3) Honest eviction: overflow the LRU with fresh keys. The
         // least-recently-used entry must be evicted and then MISS (forcing a
         // recompute), while a still-resident key returns its exact stored bits.
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let mut keys = Vec::new();
         let mut evals = Vec::new();
         for i in 0..OUTER_EVAL_LRU_CAPACITY {
@@ -4427,6 +4426,9 @@ pub(crate) struct SparseRemlDecision {
 pub(crate) struct SparseExactEvalData {
     pub(crate) factor: Arc<SparseExactFactor>,
     pub(crate) takahashi: Option<Arc<gam_linalg::sparse_exact::TakahashiInverse>>,
+    /// The upper-triangular penalized Hessian `factor` factors, so trace
+    /// kernels can read its sparsity pattern.
+    pub(crate) hessian: Arc<faer::sparse::SparseColMat<usize, f64>>,
     pub(crate) logdet_h: f64,
     pub(crate) logdet_s_pos: f64,
     pub(crate) penalty_rank: usize,
@@ -4723,9 +4725,9 @@ pub(crate) struct EvalShared {
     /// hold the bare `RemlGeometry` label, so every consumer that reported
     /// `backend {:?}` reported a two-valued enum and nothing that could
     /// falsify it: `select_reml_geometry` measures a penalized-Hessian
-    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its six routes
-    /// and never measures it on the other five, and the label is identical
-    /// across all six. Storing the decision rather than its outcome makes a
+    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its routes
+    /// and never measures it on the others, and the label is identical
+    /// across all of them. Storing the decision rather than its outcome makes a
     /// bundle unrepresentable without the basis for its own label.
     pub(crate) geometry: SparseRemlDecision,
     /// The exact H_total matrix used for LAML cost computation.
@@ -4854,7 +4856,7 @@ pub(crate) fn applied_canonical_penalties_for(
     let projected = canonical_penalties
         .iter()
         .map(|penalty| {
-            split.project_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
+            split.projected_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -4863,18 +4865,19 @@ pub(crate) fn applied_canonical_penalties_for(
                  subspace failed: {error}"
             ))
         })?;
-    // `project_canonical` returns the penalty itself when the projection is
-    // below the root's own noise, so an all-unchanged result IS the identity
-    // and is handed back as the original `Arc` rather than as a copy.
-    if projected
-        .iter()
-        .zip(canonical_penalties.iter())
-        .all(|(a, b)| a.root == b.root && a.col_range == b.col_range)
-    {
-        Ok(Arc::clone(canonical_penalties))
-    } else {
-        Ok(Arc::new(projected))
+    // `projected_canonical` returns `None` when the projection is below the
+    // root's own noise, so an all-`None` result IS the identity and is handed
+    // back as the original `Arc` rather than as a copy.
+    if projected.iter().all(Option::is_none) {
+        return Ok(Arc::clone(canonical_penalties));
     }
+    Ok(Arc::new(
+        projected
+            .into_iter()
+            .zip(canonical_penalties.iter())
+            .map(|(projected, penalty)| projected.unwrap_or_else(|| penalty.clone()))
+            .collect(),
+    ))
 }
 
 impl EvalShared {
@@ -5025,9 +5028,11 @@ impl SparseRemlDecision {
 /// Eviction is byte-budgeted rather than entry-count-budgeted: each entry
 /// records its own estimated footprint (the surviving n-length vectors plus
 /// the two p×p Hessians plus per-entry overhead) and the cache evicts in
-/// LRU order until the running total fits under the budget. An entry that
-/// individually exceeds the budget is rejected silently rather than poisoning
-/// the cache.
+/// LRU order until the running total fits under the budget. The newest entry
+/// is always kept, alone if it alone exceeds the budget, so the next
+/// evaluation at its ρ (a gradient after a value) reuses the solve: the cache
+/// holds at most the larger of its budget and one solve, which the evaluation
+/// that produced it held anyway.
 pub(crate) struct PirlsLruCache {
     // Stored tuple: (compacted result, last-touched clock, estimated bytes).
     pub(crate) map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
@@ -5059,19 +5064,10 @@ impl PirlsLruCache {
     pub(crate) fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
         self.clock += 1;
         let bytes = pirls_result_cache_bytes(&value);
-        // Refuse entries that on their own already exceed the entire budget;
-        // caching one would force eviction of every other entry without
-        // leaving room for the new one anyway.
-        if bytes > self.byte_budget {
-            if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
-                self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
-            }
-            return;
-        }
         if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
             self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
         }
-        while self.current_bytes + bytes > self.byte_budget {
+        while !self.map.is_empty() && self.current_bytes + bytes > self.byte_budget {
             let evict_key = self
                 .map
                 .iter()
@@ -5150,6 +5146,27 @@ impl PenaltySubspaceCacheKey {
             penalty_matrix_fingerprint: hasher.finish(),
         }
     }
+}
+
+/// Byte budget of one fit's PIRLS result cache.
+///
+/// A cache hit saves one P-IRLS solve, and a solve costs passes over the
+/// design, so the memo may hold as many bytes as the dense design it
+/// memoizes and no more: at any `n` and any number of outer evaluations it is
+/// one further design-sized store, or the newest solve alone where one solve
+/// outgrows the design (see [`PirlsLruCache::insert`]). The
+/// host bound is the governor's stationary per-operation ceiling rather than
+/// live availability, so which evaluations hit the cache never depends on
+/// what else the machine is doing (SPEC-20).
+///
+/// A fixed budget was pyGAM audit speed F11: 128 MiB regardless of the
+/// design, so a Poisson fit at n = 1e5 with an 8.8 MB design pinned 133 MB of
+/// cached solves.
+pub(crate) fn pirls_cache_byte_budget(x: &DesignMatrix) -> usize {
+    let host_ceiling =
+        gam_runtime::resource::MemoryGovernor::global().single_materialization_cap_bytes();
+    gam_runtime::resource::dense_f64_bytes(x.nrows(), x.ncols())
+        .map_or(host_ceiling, |design_bytes| design_bytes.min(host_ceiling))
 }
 
 /// Estimate the in-cache footprint of a (compacted) PIRLS result.
@@ -5312,9 +5329,11 @@ pub(crate) struct EvalCacheManager {
 }
 
 impl EvalCacheManager {
-    pub(crate) fn new() -> Self {
+    /// `pirls_cache_byte_budget` is the fit's PIRLS result-cache budget,
+    /// derived once per fit by [`pirls_cache_byte_budget`].
+    pub(crate) fn new(pirls_cache_byte_budget: usize) -> Self {
         Self {
-            pirls_cache: RwLock::new(PirlsLruCache::new(PIRLS_CACHE_BYTE_BUDGET)),
+            pirls_cache: RwLock::new(PirlsLruCache::new(pirls_cache_byte_budget)),
             penalty_subspace_cache: RwLock::new(PenaltySubspaceCache::new()),
             current_eval_bundle: RwLock::new(None),
             current_outer_eval: RwLock::new(None),
@@ -5507,9 +5526,8 @@ pub(crate) struct RemlState<'a> {
     /// This is the single canonical penalty representation — no full-width
     /// `rank × p` roots are stored separately.
     pub(crate) canonical_penalties: Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
-    pub(crate) balanced_penalty_root: Array2<f64>,
     pub(crate) reparam_invariant: ReparamInvariant,
-    pub(crate) sparse_penalty_block_count: Option<usize>,
+    pub(crate) sparse_penalty_block_count: usize,
     pub(crate) p: usize,
     pub(crate) config: Arc<RemlConfig>,
     pub(crate) runtime_mixture_link_state: Option<gam_problem::MixtureLinkState>,
@@ -5902,4 +5920,8 @@ pub(crate) struct RemlState<'a> {
     pub(crate) gaussian_dp_floor_scale_cache: std::sync::OnceLock<f64>,
     pub(crate) positive_weight_observation_count_cache: std::sync::OnceLock<usize>,
     pub(crate) rho_weight_anchor_cache: std::sync::OnceLock<f64>,
+    /// The data half `R_G` (`R_GᵀR_G = XᵀWX`) of the root-scale Hessian
+    /// operator, kept for the weights it was formed at. Keyed to `x`, so
+    /// `reset_surface` clears it.
+    pub(crate) data_root_cache: laml_logdet::DataRootCache,
 }
