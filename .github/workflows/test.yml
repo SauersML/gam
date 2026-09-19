@@ -1275,7 +1275,7 @@ jobs:
           python -m pip install \
             'pytest>=8' 'pytest-xdist>=3' 'pytest-timeout>=2' \
             'numpy>=1.26' 'pandas>=2.0' \
-            'pyarrow>=14' 'matplotlib>=3.8' 'scikit-learn>=1.4' \
+            'pyarrow>=14' 'polars>=1' 'matplotlib>=3.8' 'scikit-learn>=1.4' \
             'lifelines>=0.28'
 
       - name: Install cargo-nextest
@@ -1554,7 +1554,7 @@ jobs:
           python -m pip install \
             'pytest>=8' 'pytest-xdist>=3' 'pytest-timeout>=2' \
             'numpy>=1.26' 'pandas>=2.0' \
-            'pyarrow>=14' 'matplotlib>=3.8' 'scikit-learn>=1.4' \
+            'pyarrow>=14' 'polars>=1' 'matplotlib>=3.8' 'scikit-learn>=1.4' \
             'lifelines>=0.28'
 
       - name: Install CPU torch wheel

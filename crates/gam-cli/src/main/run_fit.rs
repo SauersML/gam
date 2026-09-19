@@ -90,10 +90,39 @@ pub(crate) fn resolve_fit_invocation(
     }
 }
 
+/// Expand an automatic `.` term against every column of the data file with the
+/// same engine rule the library and Python fits use
+/// (`gam::families::fit_orchestration::expand_automatic_fit_formula`), and
+/// report the fitted formula and any dropped column. Every later step of
+/// `gam fit` then sees the explicit formula.
+fn expand_cli_automatic_formula(
+    args: &FitArgs,
+    formula: String,
+    fit_config: &FitConfig,
+) -> Result<String, String> {
+    use gam::terms::inference::automatic_formula::{
+        formula_has_automatic_term, formula_without_automatic_term,
+    };
+    if !formula_has_automatic_term(&formula)? {
+        return Ok(formula);
+    }
+    let explicit = parse_formula(&formula_without_automatic_term(&formula)?)?;
+    // `.` ranges over the whole table, so no column projection: an empty
+    // request loads every column.
+    let dataset = load_fit_dataset_with_roles(&args.data, &[], &explicit, false)?;
+    let automatic = gam::families::fit_orchestration::expand_automatic_fit_formula(
+        &formula, &dataset, fit_config,
+    )
+    .map_err(|error| error.to_string())?;
+    print_inference_summary(&automatic.notes);
+    Ok(automatic.formula)
+}
+
 pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
     let resolved_invocation = resolve_fit_invocation(&args)?;
-    let formula_text = resolved_invocation.formula;
     let fit_config = resolved_invocation.fit_config;
+    let formula_text =
+        expand_cli_automatic_formula(&args, resolved_invocation.formula, &fit_config)?;
     let parsed = parse_formula(&formula_text)?;
     if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
         let out = args.out.as_ref().ok_or("CTN fitting requires --out")?;

@@ -6363,6 +6363,11 @@ mod stratum_boundary_2939_tests;
 #[path = "run_plan_measurement_point_2953_tests.rs"]
 mod run_plan_measurement_point_2953_tests;
 
+// #2953: a trust-region run that stops without a convergence claim keeps the iterate it
+// stopped at as a checkpoint, whichever stop it was.
+#[path = "run_plan_stopped_run_2953_tests.rs"]
+mod run_plan_stopped_run_2953_tests;
+
 /// #2370: an inverted per-coordinate ρ-box (lower > upper) must surface as a
 /// typed `EstimationError::InvalidInput` from the outer runner. The
 /// custom-family effective-df ceiling once emitted an upper bound below

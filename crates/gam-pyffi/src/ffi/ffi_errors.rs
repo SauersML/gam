@@ -589,6 +589,15 @@ pub(crate) fn py_value_error(message: String) -> PyErr {
     FormulaError::new_err(message)
 }
 
+/// A table gam-data refuses to encode, on every ingestion path whichever
+/// transport the table crossed the boundary in. The class follows the error's
+/// category like every other engine error: a requested column the table lacks
+/// is a `ColumnNotFoundError`, an unsupported value or a malformed layout a
+/// `DataError`.
+pub(crate) fn data_error_to_pyerr(error: gam::data::DataError) -> PyErr {
+    Python::attach(|py| workflow_error_to_pyerr(py, error.into()))
+}
+
 /// A Rust panic caught at the boundary is an engine defect whatever the input,
 /// so it reaches Python as `InternalError`, never as an abort.
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {

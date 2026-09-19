@@ -626,12 +626,18 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         )));
     }
     let z_primary = spec.z.column(0).to_owned();
+    // The pilot reads score 0, so its variance is that score's conditional
+    // variance `Σ(a_i)₀₀` from the field the fitted likelihood reads (gam#2952).
+    let z_primary_variance = Array1::from_shape_fn(z_primary.len(), |row| {
+        score_covariance.at_row(row).to_dense()[[0, 0]]
+    });
     let baseline_started = std::time::Instant::now();
     let baseline_slope = pooled_survival_baseline(
         &spec.event_target,
         &spec.weights,
         &entry_at_origin,
         &z_primary,
+        &z_primary_variance,
         &spec.time_block.offset_entry,
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,

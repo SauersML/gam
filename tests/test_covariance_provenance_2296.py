@@ -111,10 +111,11 @@ def test_default_uncertainty_publishes_conditional_when_no_correction_exists() -
     # refuses rather than delivering the conditional band under a corrected
     # label. The producing seam is
     # `crates/gam-pyffi/src/manifold/geometry_ffi.rs`,
-    # `.map_err(|err| format!("prediction failed: {err}"))`.
-    with pytest.raises(gamfit.GamfitError) as raised:
+    # `.map_err(|err| format!("prediction failed: {err}"))`, which the predict
+    # boundary raises as `PredictionError`, a `DataError`.
+    with pytest.raises(gamfit.DataError) as raised:
         model.predict(grid, interval=0.9, covariance_mode="smoothing", return_type="dict")
-    assert type(raised.value) is gamfit.GamfitError
+    assert type(raised.value) is gamfit.PredictionError
     assert str(raised.value) == (
         "prediction failed: Invalid input: fit result does not "
         "contain smoothing-corrected covariance"

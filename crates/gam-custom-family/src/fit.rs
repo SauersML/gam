@@ -428,6 +428,8 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     )>,
     /// Why no correction was minted on a fit that selected ρ (#2677).
     pub(crate) smoothing_correction_absence: Option<gam_solve::model_types::SmoothingCorrectionAbsence>,
+    /// Which rule selected the coefficient mode the fit reports (#2366, #2661).
+    pub(crate) coefficient_mode_selection: gam_solve::model_types::CoefficientModeSelection,
 }
 
 /// The family's classical deviance at the converged mode, as a typed
@@ -462,6 +464,7 @@ pub(crate) fn assemble_custom_family_fit_result(
         joint_log_lambdas,
         smoothing_corrected,
         smoothing_correction_absence,
+        coefficient_mode_selection,
     } = assembly;
     let log_lambdas = rho_physical;
     let lambdas =
@@ -494,7 +497,7 @@ pub(crate) fn assemble_custom_family_fit_result(
             )
         };
 
-    blockwise_fit_from_parts(
+    let mut fit = blockwise_fit_from_parts(
         BlockwiseFitResultParts {
             block_states,
             log_likelihood: inner.log_likelihood,
@@ -516,7 +519,9 @@ pub(crate) fn assemble_custom_family_fit_result(
             smoothing_correction_absence,
         },
         result_specs,
-    )
+    )?;
+    fit.artifacts.coefficient_mode_selection = coefficient_mode_selection;
+    Ok(fit)
 }
 
 /// Install the channel-aware `AdditiveBlockJacobian` callbacks declared by a
@@ -1347,6 +1352,16 @@ pub(crate) fn continuation_refinement_decision(
         ));
     }
     Ok(ContinuationRefinement::Refine)
+}
+
+/// The record a declined #2661 continuation leaves on the fit: the mode is the
+/// one the caller's seed reached, for the reason the continuation refused.
+pub(crate) fn declined_continuation_selection(
+    refusal: &AnchoredContinuationRefusal,
+) -> gam_solve::model_types::CoefficientModeSelection {
+    gam_solve::model_types::CoefficientModeSelection::SeedSelected {
+        reason: refusal.to_string(),
+    }
 }
 
 pub(crate) fn anchored_continuation_seed<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -2575,6 +2590,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 joint_log_lambdas: None,
                 smoothing_corrected: None,
                 smoothing_correction_absence: None,
+                coefficient_mode_selection: if family.exact_newton_joint_hessian_beta_dependent()
+                    && !family.inner_coefficient_objective_is_globally_convex()
+                {
+                    gam_solve::model_types::CoefficientModeSelection::SeedSelected {
+                        reason: "the fit has no smoothing parameter to anchor at".to_string(),
+                    }
+                } else {
+                    gam_solve::model_types::CoefficientModeSelection::UniqueMode
+                },
             },
         );
     }
@@ -2731,7 +2755,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             None
         }
     };
-    let initial_warm_cache = if let Some(certified) = objective_homotopy_seed {
+    // The rule that selected the mode is recorded on the fit (#2661), so a
+    // declined continuation is visible to a caller, not only in this log.
+    let mode_seed = if let Some(certified) = objective_homotopy_seed {
         log::info!(
             "[OUTER] coefficient-objective continuation certified at {} steps: endpoint \
              discrepancy {:.3e} <= inner tolerance {:.3e}; observed contraction factor {:?}",
@@ -2740,7 +2766,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             certified.certificate.inner_tolerance,
             certified.certificate.observed_contraction_factor,
         );
-        Some(certified.warm_start)
+        (
+            Some(certified.warm_start),
+            gam_solve::model_types::CoefficientModeSelection::ObjectiveHomotopy {
+                steps: certified.certificate.steps,
+            },
+        )
     } else if family.exact_newton_joint_hessian_beta_dependent()
         && !family.inner_coefficient_objective_is_globally_convex()
     {
@@ -2763,18 +2794,31 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     certified.certificate.inner_tolerance,
                     certified.certificate.observed_contraction_factor,
                 );
-                Some(certified.warm_start)
+                (
+                    Some(certified.warm_start),
+                    gam_solve::model_types::CoefficientModeSelection::AnchoredContinuation {
+                        steps: certified.certificate.steps,
+                        endpoint_discrepancy: certified.certificate.endpoint_discrepancy,
+                    },
+                )
             }
             Err(refusal) => {
                 log::info!(
                     "[OUTER] #2661 anchored continuation declined with typed refusal: {refusal}"
                 );
-                persistent_warm_start.clone()
+                (
+                    persistent_warm_start.clone(),
+                    declined_continuation_selection(&refusal),
+                )
             }
         }
     } else {
-        persistent_warm_start.clone()
+        (
+            persistent_warm_start.clone(),
+            gam_solve::model_types::CoefficientModeSelection::UniqueMode,
+        )
     };
+    let (initial_warm_cache, coefficient_mode_selection) = mode_seed;
     // What "cold" means when the stall guard drops the warm cache. Dropping it
     // to `None` sends the inner solve back to whatever coefficients the caller
     // supplied — trajectory-independent, but arbitrary, and for a nonconvex
@@ -3833,6 +3877,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             joint_log_lambdas,
             smoothing_corrected,
             smoothing_correction_absence,
+            coefficient_mode_selection,
         },
     )?;
     fit.artifacts.outer_warm_start = Some(outer_warm_start);
@@ -4089,6 +4134,10 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             joint_log_lambdas,
             smoothing_corrected: None,
             smoothing_correction_absence: None,
+            // These entries take their mode from CustomFamilyJointHyperModeSelection,
+            // which does not yet carry the rule it applied (#2661).
+            coefficient_mode_selection:
+                gam_solve::model_types::CoefficientModeSelection::NotRecorded,
         },
     )
 }
@@ -4343,6 +4392,10 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             joint_log_lambdas: None,
             smoothing_corrected: None,
             smoothing_correction_absence: None,
+            // These entries take their mode from CustomFamilyJointHyperModeSelection,
+            // which does not yet carry the rule it applied (#2661).
+            coefficient_mode_selection:
+                gam_solve::model_types::CoefficientModeSelection::NotRecorded,
         },
     )
 }

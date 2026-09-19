@@ -76,7 +76,7 @@ struct PyPredictOptions {
 /// immutable value instead of reparsing and revalidating the JSON archive on
 /// every batch. `Arc` makes detaching prediction from the GIL a constant-time
 /// ownership transfer without cloning the potentially large fitted payload.
-#[pyclass(name = "_FittedModel", frozen)]
+#[pyclass(module = "gamfit._rust", name = "_FittedModel", frozen)]
 struct PyFittedModel {
     model: Arc<FittedModel>,
 }
@@ -569,122 +569,155 @@ impl PyEncodedTable {
     }
 }
 
-fn validate_column_partition(
-    n_columns: usize,
-    numeric_positions: &[usize],
-    categorical_positions: &[usize],
-) -> Result<(), String> {
-    let mut seen = vec![false; n_columns];
-    for (kind, positions) in [
-        ("numeric", numeric_positions),
-        ("categorical", categorical_positions),
-    ] {
-        for &position in positions {
-            if position >= n_columns {
-                return Err(format!(
-                    "{kind} column position {position} is outside 0..{n_columns}"
-                ));
-            }
-            if std::mem::replace(&mut seen[position], true) {
-                return Err(format!("column position {position} is repeated"));
-            }
-        }
-    }
-    if let Some(position) = seen.iter().position(|present| !present) {
-        return Err(format!(
-            "column position {position} is missing from the numeric/categorical partition"
-        ));
-    }
-    Ok(())
+/// One table column crossing the Python boundary, in the layout its source
+/// declared. The Python adapter only reads that declaration (a NumPy dtype, a
+/// categorical dtype); every decision about what the values mean is made in
+/// gam-data.
+#[derive(FromPyObject)]
+enum PyTableColumn<'py> {
+    /// A numeric vector, already `float64`.
+    Numeric(PyReadonlyArray1<'py, f64>),
+    /// A declared categorical: codes (`-1` = missing) into the level values.
+    Categorical(PyReadonlyArray1<'py, i64>, Vec<Bound<'py, PyAny>>),
+    /// A sequence of Python values with no declared type.
+    Untyped(Bound<'py, PyAny>),
 }
 
-/// Construct an encoded table from one homogeneous numeric matrix plus the
-/// genuinely categorical string columns. Numeric cells cross through
-/// rust-numpy; only categorical labels are Python strings.
+fn py_display_text(value: &Bound<'_, PyAny>) -> Result<String, gam::data::DataError> {
+    value
+        .str()
+        .and_then(|text| text.to_str().map(str::to_owned))
+        .map_err(|error| gam::data::DataError::InvalidValue {
+            reason: format!("could not render a value as text: {error}"),
+        })
+}
+
+/// Classify one Python value for [`gam::data::encode_untyped_column`]: text,
+/// `None`, anything `float()` accepts (NaN is missing), or unsupported.
+fn untyped_cell<'a>(value: &'a Bound<'_, PyAny>) -> gam::data::UntypedCell<'a> {
+    use gam::data::UntypedCell;
+    use pyo3::types::PyString;
+
+    if let Ok(text) = value.cast::<PyString>() {
+        return match text.to_str() {
+            Ok(text) => UntypedCell::Text(text),
+            Err(_) => UntypedCell::Unsupported("str"),
+        };
+    }
+    if value.is_none() {
+        return UntypedCell::Missing;
+    }
+    match value.extract::<f64>() {
+        Ok(number) if number.is_nan() => UntypedCell::Missing,
+        Ok(number) => UntypedCell::Number(number),
+        Err(_) => UntypedCell::Unsupported(""),
+    }
+}
+
+fn encode_py_table_column(
+    name: &str,
+    column: &PyTableColumn<'_>,
+) -> Result<(SchemaColumn, Vec<f64>), gam::data::DataError> {
+    match column {
+        PyTableColumn::Numeric(values) => {
+            let values = values.as_array().to_vec();
+            let kind = gam::data::infer_numeric_column_kind(values.iter().copied());
+            Ok((
+                SchemaColumn {
+                    name: name.to_string(),
+                    kind,
+                    levels: Vec::new(),
+                },
+                values,
+            ))
+        }
+        PyTableColumn::Categorical(codes, levels) => {
+            let codes = codes.as_array().to_vec();
+            let levels = levels
+                .iter()
+                .map(py_display_text)
+                .collect::<Result<Vec<_>, _>>()?;
+            gam::data::encode_categorical_codes(name, &codes, &levels)
+        }
+        PyTableColumn::Untyped(source) => {
+            let objects = source
+                .try_iter()
+                .and_then(|values| values.collect::<PyResult<Vec<_>>>())
+                .map_err(|error| gam::data::DataError::InvalidValue {
+                    reason: format!("column '{name}' is not a sequence of values: {error}"),
+                })?;
+            // Only the first unsupported cell is reported, so only its type is named.
+            let unsupported_type: String;
+            let mut cells = objects.iter().map(untyped_cell).collect::<Vec<_>>();
+            if let Some(row) = cells
+                .iter()
+                .position(|cell| matches!(cell, gam::data::UntypedCell::Unsupported(_)))
+            {
+                unsupported_type = objects[row]
+                    .get_type()
+                    .fully_qualified_name()
+                    .and_then(|type_name| type_name.to_str().map(str::to_owned))
+                    .map_err(|error| gam::data::DataError::InvalidValue {
+                        reason: format!(
+                            "could not name the type of the value at row {}, column '{name}': {error}",
+                            row + 1
+                        ),
+                    })?;
+                cells[row] = gam::data::UntypedCell::Unsupported(&unsupported_type);
+            }
+            gam::data::encode_untyped_column(name, &cells, |row| py_display_text(&objects[row]))
+        }
+    }
+}
+
+/// Construct an encoded table from columns in their declared layouts: `float64`
+/// vectors and categorical codes cross through rust-numpy without Python
+/// objects, and untyped columns are classified cell by cell here and encoded by
+/// gam-data's single untyped-column rule.
 #[pyfunction]
 fn encoded_table_from_columns(
     headers: Vec<String>,
-    numeric_values: PyReadonlyArray2<'_, f64>,
-    numeric_positions: Vec<usize>,
-    categorical_values: Vec<Vec<Option<String>>>,
-    categorical_positions: Vec<usize>,
+    columns: Vec<PyTableColumn<'_>>,
 ) -> PyResult<PyEncodedTable> {
     ensure_unique_headers(&headers).map_err(py_value_error)?;
-    validate_column_partition(headers.len(), &numeric_positions, &categorical_positions)
-        .map_err(py_value_error)?;
-    let numeric = numeric_values.as_array();
-    if numeric.ncols() != numeric_positions.len() {
+    if columns.len() != headers.len() {
         return Err(py_value_error(format!(
-            "numeric matrix has {} columns but {} numeric positions were supplied",
-            numeric.ncols(),
-            numeric_positions.len()
+            "received {} columns for {} headers",
+            columns.len(),
+            headers.len()
         )));
     }
-    if categorical_values.len() != categorical_positions.len() {
-        return Err(py_value_error(format!(
-            "received {} categorical columns but {} categorical positions",
-            categorical_values.len(),
-            categorical_positions.len()
-        )));
-    }
-    let n_rows = if !numeric_positions.is_empty() {
-        numeric.nrows()
-    } else {
-        categorical_values.first().map(Vec::len).unwrap_or(0)
-    };
-    if n_rows == 0 {
-        return Err(py_value_error("table data cannot be empty".to_string()));
-    }
-    for (index, column) in categorical_values.iter().enumerate() {
-        if column.len() != n_rows {
-            return Err(py_value_error(format!(
-                "categorical column '{}' has {} rows but expected {n_rows}",
-                headers[categorical_positions[index]],
-                column.len()
-            )));
-        }
-    }
-
-    let mut values = Array2::<f64>::zeros((n_rows, headers.len()));
-    let mut schema_columns = vec![None::<SchemaColumn>; headers.len()];
-    let mut column_kinds = vec![ColumnKindTag::Continuous; headers.len()];
-    for (matrix_column, &table_column) in numeric_positions.iter().enumerate() {
-        let column = numeric.column(matrix_column);
-        let kind = gam::data::infer_numeric_column_kind(column.iter().copied());
-        for (row, value) in column.iter().enumerate() {
-            values[[row, table_column]] = *value;
-        }
-        column_kinds[table_column] = kind;
-        schema_columns[table_column] = Some(SchemaColumn {
-            name: headers[table_column].clone(),
-            kind,
-            levels: Vec::new(),
-        });
-    }
-    for (source_column, &table_column) in
-        categorical_values.iter().zip(categorical_positions.iter())
-    {
-        let labels = source_column
-            .iter()
-            .map(|value| value.as_deref())
-            .collect::<Vec<_>>();
-        let (schema, encoded) = gam::data::encode_optional_categorical_column(
-            &headers[table_column],
-            &labels,
-        )
-        .map_err(|error| py_value_error(error.to_string()))?;
-        values
-            .column_mut(table_column)
-            .assign(&ndarray::ArrayView1::from(&encoded));
-        column_kinds[table_column] = schema.kind;
-        schema_columns[table_column] = Some(schema);
-    }
-    let schema_columns = schema_columns
-        .into_iter()
-        .enumerate()
-        .map(|(column, schema)| schema.ok_or_else(|| format!("missing schema for column {column}")))
+    let encoded = headers
+        .iter()
+        .zip(&columns)
+        .map(|(name, column)| encode_py_table_column(name, column))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(py_value_error)?;
+        .map_err(data_error_to_pyerr)?;
+    let n_rows = encoded.first().map_or(0, |(_, values)| values.len());
+    if n_rows == 0 {
+        return Err(data_error_to_pyerr(gam::data::DataError::EmptyInput {
+            reason: "table data cannot be empty".to_string(),
+        }));
+    }
+    let mut values = Array2::<f64>::zeros((n_rows, headers.len()));
+    let mut schema_columns = Vec::with_capacity(headers.len());
+    let mut column_kinds = Vec::with_capacity(headers.len());
+    for (column, (schema, encoded_values)) in encoded.into_iter().enumerate() {
+        if encoded_values.len() != n_rows {
+            return Err(data_error_to_pyerr(gam::data::DataError::SchemaMismatch {
+                reason: format!(
+                    "column '{}' has {} rows but expected {n_rows}",
+                    schema.name,
+                    encoded_values.len()
+                ),
+            }));
+        }
+        values
+            .column_mut(column)
+            .assign(&ndarray::ArrayView1::from(&encoded_values));
+        column_kinds.push(schema.kind);
+        schema_columns.push(schema);
+    }
     Ok(PyEncodedTable {
         dataset: EncodedDataset {
             headers,
@@ -697,13 +730,12 @@ fn encoded_table_from_columns(
     })
 }
 
-/// Import a pandas/Polars/PyArrow provider through the Arrow C Stream
+/// Import a Polars/PyArrow provider through the Arrow C Stream
 /// PyCapsule protocol. The producer owns its buffers until arrow-rs consumes
 /// the stream; numeric primitives are read directly and only string columns
 /// allocate level labels.
 #[pyfunction]
 fn encoded_table_from_arrow(
-    py: Python<'_>,
     headers: Vec<String>,
     source: &Bound<'_, PyAny>,
 ) -> PyResult<PyEncodedTable> {
@@ -722,11 +754,14 @@ fn encoded_table_from_arrow(
     // protocol guarantees a writable, initialized FFI_ArrowArrayStream. The
     // move nulls the capsule's release callback, so ownership is unique.
     let stream = unsafe { FFI_ArrowArrayStream::from_raw(stream_pointer) };
-    let mut reader = ArrowArrayStreamReader::try_new(stream)
-        .map_err(|error| py_value_error(format!("failed to import Arrow C stream: {error}")))?;
+    let mut reader = ArrowArrayStreamReader::try_new(stream).map_err(|error| {
+        data_error_to_pyerr(gam::data::DataError::ParseError {
+            reason: format!("failed to import Arrow C stream: {error}"),
+        })
+    })?;
     let dataset =
         gam::data::encode_arrow_record_batch_reader_with_inferred_schema(&mut reader, headers)
-            .map_err(|error| workflow_error_to_pyerr(py, error.into()))?;
+            .map_err(data_error_to_pyerr)?;
     Ok(PyEncodedTable { dataset })
 }
 
