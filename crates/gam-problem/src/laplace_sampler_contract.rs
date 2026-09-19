@@ -615,12 +615,20 @@ pub trait BlockExcessTarget {
 /// estimator installs the deterministic quadrature implementation; alternate
 /// embeddings may install another implementation before process initialization.
 pub trait LaplaceMarginalCorrector: Send + Sync {
-    /// Per-direction standardized cubic skewness `γ_r` of the local posterior:
-    /// returns `(max_r |γ_r|, γ)`. Pure eigen-diagnostic (no sampling), but kept
-    /// behind the trait because it lives in the sampler module up-tier.
+    /// Per-direction standardized cubic skewness `γ_r` of the local posterior
+    /// along the caller's Hessian eigenpairs `(eigenvalues[r], eigenvectors[:, r])`:
+    /// returns `(max_r |γ_r|, γ)` with `γ[r]` aligned to pair `r`. Pure
+    /// eigen-diagnostic (no sampling), but kept behind the trait because it
+    /// lives in the sampler module up-tier.
+    ///
+    /// The caller supplies the eigensystem so that `γ` is indexed by the SAME
+    /// pairs the caller builds its block from, and so that those pairs can be
+    /// the criterion's own spectral operator rather than a second
+    /// eigendecomposition of the assembled `H`.
     fn directional_cubic_diagnostic(
         &self,
-        hessian: &Array2<f64>,
+        eigenvalues: &Array1<f64>,
+        eigenvectors: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
         refine_supremum: bool,
