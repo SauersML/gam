@@ -741,7 +741,9 @@ impl SurvivalMarginalSlopeFamily {
         // OWN slope frame. Pinning this to `STATIC_SLOPE_PRIMARIES` evaluated
         // the time-constant row program — a different model — whenever the slope
         // varies along follow-up, and truncated the six-primary directions it
-        // was handed to four (#2765). Mirrors `row_primary_third_contracted`.
+        // was handed to four (#2765); dispatching on follow-up variation alone
+        // evaluated the unanchored program under a declared latent law (#3123).
+        // Mirrors `row_primary_third_contracted`.
         fn to_array<const P: usize>(r: [[f64; P]; P]) -> Array2<f64> {
             let mut out = Array2::<f64>::zeros((P, P));
             for a in 0..P {
@@ -751,17 +753,14 @@ impl SurvivalMarginalSlopeFamily {
             }
             out
         }
-        if self.slope_is_follow_up_varying() {
-            Ok(to_array(self.row_primary_fourth_contracted_tower::<
-                DYNAMIC_SLOPE_PRIMARIES,
-                DynamicSlopeGeometry,
-            >(row, block_states, dir_u, dir_v)?))
-        } else {
-            Ok(to_array(self.row_primary_fourth_contracted_tower::<
-                STATIC_SLOPE_PRIMARIES,
-                StaticSlopeGeometry,
-            >(row, block_states, dir_u, dir_v)?))
-        }
+        in_slope_frame!(self, P, Frame, {
+            Ok(to_array(self.row_primary_fourth_contracted_tower::<P, Frame>(
+                row,
+                block_states,
+                dir_u,
+                dir_v,
+            )?))
+        })
     }
 
     pub(crate) fn row_primary_fourth_contracted_general(

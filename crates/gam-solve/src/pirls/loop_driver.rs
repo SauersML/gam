@@ -185,6 +185,7 @@ pub(crate) fn exact_lambdas_from_rho(rho: LogSmoothingParamsView<'_>) -> Array1<
 
 pub(super) fn default_beta_guess_external(
     p: usize,
+    response: &ResponseFamily,
     link_function: LinkFunction,
     y: ArrayView1<f64>,
     priorweights: ArrayView1<f64>,
@@ -263,6 +264,7 @@ pub(super) fn default_beta_guess_external(
                     // if these are ever reached unexpectedly.
                     LinkFunction::Log
                     | LinkFunction::Identity
+                    | LinkFunction::Sqrt
                     | LinkFunction::Inverse
                     | LinkFunction::InverseSquared => (prevalence / (1.0 - prevalence)).ln(),
                 };
@@ -288,6 +290,22 @@ pub(super) fn default_beta_guess_external(
                 beta[intercept_col] = weighted_sum / totalweight;
             }
         }
+        LinkFunction::Log if matches!(response, ResponseFamily::Binomial) => {
+            // Relative-risk regression: the intercept-only root of the
+            // Bernoulli score under `μ = exp(η)` is `η = ln p̂`. The
+            // Jeffreys-smoothed prevalence `(Σwy + ½)/(Σw + 1)` lies strictly
+            // inside (0, 1), so the seed lies strictly inside the feasible set
+            // `η < 0` even when every response is one.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                beta[intercept_col] = ((weighted_sum + 0.5) / (totalweight + 1.0)).ln();
+            }
+        }
         LinkFunction::Log => {
             // For log link, intercept = ln(weighted mean of y)
             let mut weighted_sum = 0.0;
@@ -304,6 +322,25 @@ pub(super) fn default_beta_guess_external(
                 // of an invented floor (#2469).
                 if mean_y > 0.0 {
                     beta[intercept_col] = mean_y.ln();
+                }
+            }
+        }
+        LinkFunction::Sqrt => {
+            // The intercept-only root of every variance function's score under
+            // `μ = η²` is `μ = ȳ` (weighted), i.e. `η = √ȳ`, inside the link's
+            // branch `η > 0`. A non-positive mean has no such root; the
+            // intercept keeps its zero seed and the solve reports the domain
+            // violation itself.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                let mean_y = weighted_sum / totalweight;
+                if mean_y > 0.0 {
+                    beta[intercept_col] = mean_y.sqrt();
                 }
             }
         }
@@ -729,7 +766,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             path: PirlsLinearSolvePath::DenseTransformed,
             reason: "gaussian_sufficient_statistics",
             p: x_original.ncols(),
-            nnz_x: 0,
+            nnz_x: None,
             nnz_xtwx_symbolic: None,
             nnz_s_lambda: 0,
             nnz_h_est: None,
@@ -1216,7 +1253,12 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             last_step_halving: 0,
             max_abs_eta,
             constraint_kkt: linear_constraints.as_ref().map(|lin| {
-                compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)
+                compute_constraint_kkt_diagnostics(
+                    beta_transformed.as_ref(),
+                    &gradient,
+                    score_norm + s_beta_norm,
+                    lin,
+                )
             }),
             min_penalized_deviance: if zero_iter_penalized.is_finite() {
                 zero_iter_penalized
@@ -1344,6 +1386,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         .unwrap_or_else(|| {
             Coefficients::new(default_beta_guess_external(
                 penalty.p,
+                &config.likelihood.spec.response,
                 link_function,
                 y,
                 priorweights,
@@ -1447,8 +1490,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
         // independent of the total outer-iteration cap. Tying the two
-        // together collapsed step halving to 3 under seed screening (where
-        // max_iterations is intentionally capped low), turning recoverable
+        // together collapsed step halving to 3 under a low outer-imposed
+        // iteration cap, turning recoverable
         // damping into spurious failures.
         max_step_halving: base_max_step_halving,
         firth_bias_reduction: firth_active,
@@ -1505,7 +1548,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // so the gain ratio compares one objective. That lock is correct *within* a
     // solve, but it pins ν to whatever η the solve started from. When the fit
     // cold-starts (the final dedicated fit at the converged ρ passes
-    // `warm_start_beta = None`, and seed screening starts from a default guess),
+    // `warm_start_beta = None`, and the first outer eval starts from a default guess),
     // that warm-start η has not yet captured the mean structure; the leftover
     // spread of μ inflates the Gamma deviance term `mean[y/μ − ln(y/μ) − 1]` and
     // biases ν **down** (φ up) by >2× whenever μ varies appreciably. The mean
@@ -1546,6 +1589,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_SHAPE_REFRESH {
             let refreshed_shape = super::estimate_gamma_shape_from_eta(
+                &working_model.likelihood.spec.link,
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,

@@ -79,8 +79,34 @@ pub fn symmetric_spectrum_rounding_band(eigenvalues: &[f64]) -> f64 {
 /// inside the band is not resolved from zero by the decomposition that produced
 /// it, and its sign carries no information.
 pub fn resolved_eigenvalue_count(eigenvalues: &[f64], assembly_band: f64) -> usize {
-    let band = symmetric_spectrum_rounding_band(eigenvalues) + assembly_band;
+    let band = resolved_eigenvalue_band(eigenvalues, assembly_band);
     eigenvalues.iter().filter(|&&value| value > band).count()
+}
+
+/// The threshold [`resolved_eigenvalue_count`] compares against:
+/// [`symmetric_spectrum_rounding_band`] plus `assembly_band`. Exposed for
+/// callers that act on each resolved eigenpair (a pseudo-inverse inverts
+/// exactly the eigenvalues above it) so the rank and the inversion read one
+/// predicate.
+pub fn resolved_eigenvalue_band(eigenvalues: &[f64], assembly_band: f64) -> f64 {
+    symmetric_spectrum_rounding_band(eigenvalues) + assembly_band
+}
+
+/// Spectral-norm bound on the rounding a weighted Gram `AᵀWA` picks up when it
+/// is formed as the inner products of `terms` rows, each product rounding
+/// `formation_roundings` times before the additions.
+///
+/// Entrywise the error is at most `γ_k·(|A|ᵀ|W||A|)`, `k = terms − 1 +
+/// formation_roundings` (Higham, *ASNA* 2nd ed., §3.1). That majorant is PSD,
+/// so its spectral norm — and by Perron–Frobenius monotonicity the error's —
+/// is bounded by its trace `Σᵢ |wᵢ|·‖aᵢ‖²`, which the caller passes as
+/// `weighted_row_norm_sum`.
+pub fn weighted_gram_assembly_band(
+    terms: usize,
+    formation_roundings: usize,
+    weighted_row_norm_sum: f64,
+) -> f64 {
+    accumulation_growth(terms.saturating_sub(1) + formation_roundings) * weighted_row_norm_sum
 }
 
 /// Forward-error band of a **compensated** summation (Kahan–Babuška–Neumaier)

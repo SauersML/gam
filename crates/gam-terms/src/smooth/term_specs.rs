@@ -1182,20 +1182,13 @@ pub(crate) const fn default_pca_chunk_size() -> usize {
 /// Random-effects term specification.
 ///
 /// The selected feature column is interpreted as a categorical grouping variable.
-/// The term contributes a one-hot dummy block with an identity penalty on group
-/// coefficients, equivalent to i.i.d. Gaussian random effects.
+/// The term contributes a full one-hot dummy block, one column per level, with
+/// a REML-estimated identity ridge on the group coefficients (i.i.d. Gaussian
+/// random effects).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RandomEffectTermSpec {
     pub name: String,
     pub feature_col: usize,
-    /// If true, drop the lexicographically first group level to use treatment coding.
-    /// If false, keep all levels (full one-hot block, still identifiable under ridge).
-    pub drop_first_level: bool,
-    /// If true, add a ridge penalty and estimate this block as a random effect.
-    /// If false, leave the one-hot/treatment-coded block unpenalized so it is a
-    /// fixed categorical main effect.  The default preserves older saved models.
-    #[serde(default = "default_random_effect_penalized")]
-    pub penalized: bool,
     /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
     /// When present, prediction uses exactly these columns to avoid design drift.
     #[serde(default)]
@@ -1209,23 +1202,11 @@ pub struct RandomEffectTermSpec {
     /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
     /// materialized as a penalized one-hot block, must raise on an
     /// out-of-vocabulary level at predict rather than being silently mapped to
-    /// the factor's centering point (#2102/#2137). `factor(g)` originally shared
-    /// the `group()`/`re()` parse arm and so wrongly inherited the lenient policy
-    /// (#2137). For a string factor the typed schema encode rejects the unseen
-    /// level upstream; for a numeric-coded `factor(year)` the reject is enforced
-    /// by `build_random_effect_block`, which owns the frozen vocabulary. The
-    /// `true` default preserves the pre-#2102 (uniformly lenient) behavior for
-    /// models serialized before this field existed.
-    #[serde(default = "default_random_effect_lenient_unseen")]
+    /// the factor's centering point (#2102/#2137). For a string factor the typed
+    /// schema encode rejects the unseen level upstream; for a numeric-coded
+    /// `factor(year)` the reject is enforced by `build_random_effect_block`,
+    /// which owns the frozen vocabulary.
     pub lenient_unseen: bool,
-}
-
-pub(crate) fn default_random_effect_penalized() -> bool {
-    true
-}
-
-pub(crate) fn default_random_effect_lenient_unseen() -> bool {
-    true
 }
 
 pub(crate) fn validate_measure_jet_positive_vec_len(
@@ -1268,36 +1249,27 @@ pub struct TermCollectionSpec {
 /// Where a model's constant level lives.
 ///
 /// The constant is carried at most once, and always in an unpenalized
-/// direction, so a shift of the response shifts the fit and nothing else. With
-/// the default global intercept it is the unpenalized all-ones column and
-/// every other term is centred against it. A formula that removes the
-/// intercept (`0 + …`, `… - 1`) hands the level to one term, in this order:
+/// direction, so a shift of the response shifts the fit and nothing else: it
+/// is the unpenalized all-ones column, and every other term is centred against
+/// it. A formula that removes the intercept (`0 + …`, `… - 1`) still keeps it
+/// when some term spans the constant: a fixed factor block (`+ g`,
+/// `factor(g)`, or the main effect of a factor `by=`), a
+/// pure-indicator interaction over the full level cross (`g:h`), or a
+/// B-spline / tensor smooth whose gauge would keep the constant (the default
+/// sum-to-zero centring, or `identifiability=none`). Such a model has the
+/// column space the formula asked for, with only the constant free; every
+/// other direction keeps its default penalty (a full-level ridge beside the
+/// intercept is the ridge on the level contrasts).
 ///
-/// 1. the first fixed factor block (`+ g`, `factor(g)`, `C(g)`, or the main
-///    effect of a factor `by=`), which already spans the constant with its
-///    full dummy coding and is made unpenalized, giving the cell-means model;
-/// 2. else the first pure-indicator interaction (`g:h`), which keeps every
-///    cell, its reference cell included;
-/// 3. else the first B-spline / tensor smooth whose explicit
-///    `identifiability=none` already keeps the constant, or failing that the
-///    first one with the default gauge, whose sum-to-zero centring is
-///    released. Either way it becomes `level_smooth`, and its null-space
-///    ridge is dropped unless `double_penalty=true` was written.
-///
-/// A genuine random effect (`group(g)`, `re(g)`) never carries the level: its
-/// levels are mean-zero deviations. When no term can carry it the model has
-/// no level: every surviving effect passes through the origin, as a
-/// parametric no-intercept fit does.
+/// Only when no term spans the constant is it removed (`NoIntercept`): every
+/// effect then passes through the origin, as a parametric no-intercept fit
+/// does. A genuine random effect (`group(g)`, `re(g)`) never spans it: its
+/// levels are mean-zero deviations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ModelLevel {
     #[default]
     Intercept,
-    NoIntercept {
-        /// Index into `smooth_terms` of the smooth whose centring was released
-        /// to carry the level. Its parametric constraint block omits the
-        /// constant column so the identifiability pass does not re-centre it.
-        level_smooth: Option<usize>,
-    },
+    NoIntercept,
 }
 
 pub(crate) fn validate_smooth_basis_frozen(
@@ -6448,20 +6420,8 @@ pub fn build_random_effect_block(
         if levels.is_empty() {
             crate::bail_invalid_basis!("random-effect term '{}' has no observed levels", spec.name);
         }
-        let start_idx = if spec.drop_first_level && levels.len() > 1 {
-            1usize
-        } else {
-            0usize
-        };
-        levels[start_idx..].to_vec()
+        levels
     };
-
-    if kept_levels.is_empty() {
-        crate::bail_invalid_basis!(
-            "random-effect term '{}' drops all levels; keep at least one level",
-            spec.name
-        );
-    }
 
     let q = kept_levels.len();
     let mut level_to_col = BTreeMap::<u64, usize>::new();
@@ -6480,14 +6440,11 @@ pub fn build_random_effect_block(
     // encode rejects the unseen level before we get here; a *numeric-coded*
     // `factor(year)` column, however, reaches Rust as a plain numeric column
     // with no categorical schema, so the operator that owns the frozen level
-    // vocabulary is the enforcement point that closes the same gap. Only when
-    // the full one-hot block is kept (`!drop_first_level`) does an absent level
-    // unambiguously mean "unseen" — with treatment coding the dropped baseline
-    // is a legitimate absent column, so we do not gate that path. `frozen_levels`
-    // presence marks the predict/frozen context; at fit the vocabulary is
-    // derived from this very data, so no row is unseen.
-    let strict_unseen =
-        !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
+    // vocabulary is the enforcement point that closes the same gap. The block
+    // keeps every level, so a level absent from the frozen set is unseen.
+    // `frozen_levels` presence marks the predict/frozen context; at fit the
+    // vocabulary is derived from this very data, so no row is unseen.
+    let strict_unseen = !spec.lenient_unseen && spec.frozen_levels.is_some();
     let mut group_ids = Vec::with_capacity(n);
     for (row, &v) in col.iter().enumerate() {
         let bits = gam_data::canonical_level_bits(v);
@@ -7076,7 +7033,7 @@ pub(crate) fn defer_inner_model_centering_to_factor_level_wrapper(basis: &mut Sm
 /// Whether a B-spline smooth (1-D or tensor) carries its default model-space
 /// centring, the gauge that removes the constant so the smooth cannot compete
 /// with a global intercept. Other bases report `false`: they keep their own
-/// gauge and never take part in the level-carrier rule (see [`ModelLevel`]).
+/// gauge and never count as spanning the constant (see [`ModelLevel`]).
 pub(crate) fn bspline_smooth_is_default_centred(basis: &SmoothBasisSpec) -> bool {
     match basis {
         SmoothBasisSpec::BSpline1D { spec, .. } => matches!(
@@ -7101,43 +7058,6 @@ pub(crate) fn bspline_smooth_spans_constant(basis: &SmoothBasisSpec) -> bool {
             matches!(spec.identifiability, TensorBSplineIdentifiability::None)
         }
         _ => false,
-    }
-}
-
-/// Hand the model's constant level to this smooth when the formula removed
-/// the intercept (the level-carrier rule of [`ModelLevel`]): release the
-/// default model-space centring so the constant stays in the smooth's span.
-///
-/// The level must sit in an unpenalized direction, or the fit would shrink the
-/// whole curve toward zero and change under a shift of the response. The
-/// wiggliness penalty already leaves the constant free (it lies in its null
-/// space); the double-penalty null-space ridge would not, so when
-/// `keep_null_ridge` is false the ridge is dropped and the smooth's null space
-/// (the constant and the polynomials the penalty annihilates) is left
-/// unpenalized, as for a smooth fitted alongside an intercept without a
-/// null-space penalty. An explicit `double_penalty=true` keeps it: the user
-/// asked for the whole null space, level included, to be shrunk. Only a basis
-/// for which [`bspline_smooth_is_default_centred`] or
-/// [`bspline_smooth_spans_constant`] holds is ever handed the level; any other
-/// basis is left untouched.
-pub(crate) fn release_model_centring_for_level(basis: &mut SmoothBasisSpec, keep_null_ridge: bool) {
-    if let SmoothBasisSpec::TensorBSpline { spec, .. } = basis {
-        if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) {
-            spec.identifiability = TensorBSplineIdentifiability::None;
-        }
-        if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
-            spec.double_penalty &= keep_null_ridge;
-        }
-    } else if let SmoothBasisSpec::BSpline1D { spec, .. } = basis {
-        if matches!(
-            spec.identifiability,
-            BSplineIdentifiability::WeightedSumToZero { .. }
-        ) {
-            spec.identifiability = BSplineIdentifiability::None;
-        }
-        if matches!(spec.identifiability, BSplineIdentifiability::None) {
-            spec.double_penalty &= keep_null_ridge;
-        }
     }
 }
 
