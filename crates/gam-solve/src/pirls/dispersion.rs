@@ -28,6 +28,31 @@ fn certified_log_means(eta: &Array1<f64>) -> Result<Vec<f64>, EstimationError> {
     super::par_certified_rows(eta.len(), |i| crate::mixture_link::log_link_solver_exp(eta[i]))
 }
 
+/// The mean `μ = g⁻¹(η)` on the same inverse-link surface as the PIRLS working
+/// state of the positive-mean families: a reciprocal power `μ = η^{−a}` (the
+/// canonical Gamma and inverse Gaussian links) or the log link, and the
+/// identity only where the family admits it. Any other link, or an `η` outside
+/// the link domain, fails exactly as the PIRLS row does.
+fn certified_link_mean(
+    inverse_link: &InverseLink,
+    allow_identity: bool,
+    eta: f64,
+) -> Result<f64, EstimationError> {
+    match (reciprocal_power_link(inverse_link), inverse_link) {
+        (Some((link, exponent)), _) => {
+            require_reciprocal_link_domain(link, eta)?;
+            Ok((-exponent * eta.ln()).exp())
+        }
+        (None, InverseLink::Standard(StandardLink::Log)) => {
+            crate::mixture_link::log_link_solver_exp(eta)
+        }
+        (None, InverseLink::Standard(StandardLink::Identity)) if allow_identity => Ok(eta),
+        (None, other) => {
+            crate::bail_invalid_estim!("nuisance-scale estimation has no inverse link surface for {other:?}")
+        }
+    }
+}
+
 #[inline]
 fn certified_prior_weight(row: usize, eta: f64, weight: f64) -> Result<f64, EstimationError> {
     if weight.is_finite() && weight >= 0.0 {
@@ -87,12 +112,17 @@ fn gamma_shape_statistic(response: f64, mean: f64) -> f64 {
     }
 }
 
+/// Exact Gamma shape MLE at a fixed linear predictor. `μ` is read from the
+/// fit's own inverse link (log or the canonical reciprocal `μ = 1/η`), so the
+/// deviance statistic is the one the PIRLS working state minimizes.
 pub(crate) fn estimate_gamma_shape_from_eta(
+    inverse_link: &InverseLink,
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<f64, EstimationError> {
-    let means = certified_log_means(eta)?;
+    let means: Vec<f64> =
+        super::par_certified_rows(eta.len(), |i| certified_link_mean(inverse_link, false, eta[i]))?;
     let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
         let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
         if wi == 0.0 {
@@ -307,30 +337,12 @@ pub(crate) fn estimate_dispersion_phi_from_eta(
             "dispersion φ̂ is defined for the Gaussian and inverse Gaussian families, not {other:?}"
         ),
     };
-    let reciprocal = reciprocal_power_link(inverse_link);
-    let mean = |i: usize| -> Result<f64, EstimationError> {
-        match (reciprocal, inverse_link) {
-            (Some((link, exponent)), _) => {
-                require_reciprocal_link_domain(link, eta[i])?;
-                Ok((-exponent * eta[i].ln()).exp())
-            }
-            (None, InverseLink::Standard(StandardLink::Log)) => {
-                crate::mixture_link::log_link_solver_exp(eta[i])
-            }
-            (None, InverseLink::Standard(StandardLink::Identity)) if !inverse_gaussian => {
-                Ok(eta[i])
-            }
-            (None, other) => crate::bail_invalid_estim!(
-                "dispersion φ̂ has no inverse link surface for {other:?}"
-            ),
-        }
-    };
     let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
         let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
         if wi == 0.0 {
             return Ok((0.0, 0.0));
         }
-        let mu = mean(i)?;
+        let mu = certified_link_mean(inverse_link, !inverse_gaussian, eta[i])?;
         if !mu.is_finite() {
             return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "mean", eta[i], mu));
         }
@@ -391,6 +403,8 @@ pub(crate) fn estimate_dispersion_phi_from_eta(
 mod gamma_tweedie_profile_math_tests {
     use super::*;
 
+    const LOG: InverseLink = InverseLink::Standard(StandardLink::Log);
+
     #[test]
     fn gamma_statistic_retains_near_unit_ratios_and_underflowed_ratios() {
         for response in [1.0_f64 - 1.0e-8, 1.0 + 1.0e-8] {
@@ -419,7 +433,7 @@ mod gamma_tweedie_profile_math_tests {
         let y = Array1::from(vec![1.0 - 1.0e-8, 1.0 + 1.0e-8]);
         let eta = Array1::zeros(2);
         let weights = Array1::ones(2);
-        let shape = estimate_gamma_shape_from_eta(y.view(), &eta, weights.view())
+        let shape = estimate_gamma_shape_from_eta(&LOG, y.view(), &eta, weights.view())
             .expect("a nonzero dispersion has a finite Gamma shape");
         let mean_square = 0.5 * ((y[0] - 1.0).powi(2) + (y[1] - 1.0).powi(2));
         assert!((shape * mean_square - 1.0).abs() < 1.0e-7);
@@ -428,11 +442,11 @@ mod gamma_tweedie_profile_math_tests {
         assert!(gamma_shape_score(1.01 * shape, target) < 0.0);
 
         let large_y = Array1::from(vec![1.0e200]);
-        let shape = estimate_gamma_shape_from_eta(large_y.view(), &Array1::zeros(1), Array1::ones(1).view())
+        let shape = estimate_gamma_shape_from_eta(&LOG, large_y.view(), &Array1::zeros(1), Array1::ones(1).view())
             .expect("a large profile target has a small finite Gamma shape");
         assert!((shape * large_y[0] - 1.0).abs() < 1.0e-12);
 
-        assert!(estimate_gamma_shape_from_eta(Array1::ones(2).view(), &eta, weights.view()).is_err());
+        assert!(estimate_gamma_shape_from_eta(&LOG, Array1::ones(2).view(), &eta, weights.view()).is_err());
     }
 
     #[test]

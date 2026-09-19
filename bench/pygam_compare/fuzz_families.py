@@ -366,6 +366,7 @@ def _draw_response(
 class Draw:
     train: dict[str, FloatArray]
     test: dict[str, FloatArray]
+    mu_train: FloatArray
     mu_test: FloatArray
     weights: bool
 
@@ -389,6 +390,7 @@ def draw(label: str, n: int, regime: str, seed: int) -> Draw:
     return Draw(
         train=train,
         test={"x0": t0, "x1": t1},
+        mu_train=mu,
         mu_test=_mean(case, regime, t0, t1),
         weights=w is not None,
     )
@@ -492,12 +494,74 @@ def _message_head(record: dict[str, Any]) -> str:
     return head[:160]
 
 
+# A fitted scale further than this many oracle standard errors from the truth
+# is a broken dispersion estimate, not sampling noise. The oracle standard
+# error (see :func:`scale_z`) prices only the draw's own noise, not the fit's
+# smoothing bias, so clean fits reach a few standard errors at n=50; every
+# broken estimate the fuzzer has found sits above ten.
+SCALE_Z_MAX = 10.0
+
+
+def _true_scale(
+    case: Case, regime: str
+) -> tuple[float, Callable[[FloatArray], FloatArray]] | None:
+    """``(phi, V)`` with ``Var(y) = phi V(mu)`` in the gauge gamfit reports
+    as ``scale``, or ``None`` where the scale is not a free dispersion, the
+    regime's draw is not the family's law (the continuous ``zeros`` rows), or
+    the truth is not resolvable at the noise level (``lowdisp``: there the
+    basis's approximation error of the shape is as large as the noise, so a
+    correct fit's scale carries it, and its distance from the noise-only
+    truth grows as sqrt(n) — gaussian(inverse) at n=5000 sits 25 standard
+    errors out on a saturated basis)."""
+    if regime == "lowdisp":
+        return None
+    kind, _, param = case.kind.partition(":")
+    if kind == "gamma" and regime != "zeros":
+        return 1.0 / _disp("gamma", regime), lambda m: m**2
+    if kind == "invgauss" and regime != "zeros":
+        units = SCALE_FACTOR if regime == "scale" else 1.0
+        return _disp("invgauss", regime) / units, lambda m: m**3
+    if kind == "tweedie":
+        p = float(param)
+        return _disp("tweedie", regime), lambda m: m**p
+    if kind == "gaussian":
+        return _disp("gaussian", regime) ** 2, np.ones_like
+    if kind == "beta":
+        return 1.0 / (1.0 + _disp("beta", regime)), lambda m: m * (1.0 - m)
+    return None
+
+
+def scale_z(record: dict[str, Any]) -> float | None:
+    """How many standard errors the fitted scale sits from the truth, on the
+    log scale, or ``None`` when the family has no free dispersion.
+
+    The standard error is the oracle Pearson estimate's: the relative spread
+    of ``(y - mu)^2 / V(mu)`` at the true mean over sqrt(n), recomputed from
+    the rep's seeded draw, so it grows with the law's tails and shrinks with
+    n the way a correct dispersion estimate's error does."""
+    scale = record.get("scale")
+    case = CASE_BY_LABEL.get(str(record.get("family")))
+    design = str(record.get("design", ""))
+    if scale is None or case is None or not is_fuzz_design(design):
+        return None
+    regime = design[len(DESIGN_PREFIX) :]
+    truth = _true_scale(case, regime)
+    if truth is None or not (np.isfinite(scale) and scale > 0):
+        return None
+    phi, variance = truth
+    data = draw(case.label, int(record["n"]), regime, int(record["seed"]))
+    q = (data.train["y"] - data.mu_train) ** 2 / variance(data.mu_train)
+    se = float(np.std(q) / np.mean(q) / np.sqrt(q.shape[0]))
+    return float(np.log(scale / phi) / se)
+
+
 def failure_cause(record: dict[str, Any]) -> str | None:
     """The failure cause of one fuzz record, or ``None`` for a clean fit.
 
     A rep fails when it hung (hit the harness safety net), crashed, raised in
-    any phase, did not certify its optimum, predicted a non-finite value, or
-    reported a non-finite or non-positive scale.
+    any phase, did not certify its optimum, predicted a non-finite value,
+    reported a non-finite or non-positive scale, or reported a scale more
+    than :data:`SCALE_Z_MAX` standard errors from the truth.
     """
     status = record.get("status")
     if status in ("timeout", "memcap", "crash") or str(status).startswith("not_run"):
@@ -515,6 +579,9 @@ def failure_cause(record: dict[str, Any]) -> str | None:
         return "nonfinite or zero scale"
     if record.get("nonfinite"):
         return "nonfinite output " + ",".join(sorted(record["nonfinite"]))
+    z = scale_z(record)
+    if z is not None and abs(z) > SCALE_Z_MAX:
+        return "scale off truth"
     return None
 
 

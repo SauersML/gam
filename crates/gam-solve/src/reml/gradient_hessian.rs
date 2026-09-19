@@ -3692,6 +3692,17 @@ impl<'a> RemlState<'a> {
     /// carries the working-weight magnitude, `exp(ρ_j)` is already the correctly
     /// scaled `λ_j` (no separate weight anchoring needed).
     ///
+    /// `W` is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the pilot fit at
+    /// `base`, not the prior weight: only the working weight makes the seed
+    /// equivariant under a change of units of `y`. Rescaling `y → c·y` scales
+    /// the working weight of a non-log link by a power of `c` (`μ³/4` for the
+    /// inverse-Gaussian `1/μ²` link, `μ²` for the Gamma inverse link) and the
+    /// optimal `λ` with it; a prior-weight seed stays put, so in small units it
+    /// sits on the over-smoothing plateau `λ → ∞`, where the REML gradient
+    /// vanishes and the outer solve certifies the intercept-only fit. For the
+    /// Gaussian identity link the working weight IS the prior weight, so no
+    /// pilot fit is needed there.
+    ///
     /// This replaces the banned log-λ **grid** prepass (#2069 / #1575): a single
     /// data-derived estimate, no lattice search. A smooth whose penalized
     /// subspace carries little data support has a small `tr(XᵀWX)` there and so
@@ -3703,8 +3714,8 @@ impl<'a> RemlState<'a> {
     /// `ρ[j] ↔ canonical_penalties[j]` for the leading smoothing coordinates (the
     /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
     /// `base` are not smoothing parameters and are passed through unchanged.
-    /// Returns `None` (caller keeps `base`) when the design Gram is unavailable
-    /// or its width does not match `p`.
+    /// Returns `None` (caller keeps `base`) when the pilot fit at `base` or the
+    /// design Gram is unavailable, or the Gram's width does not match `p`.
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
@@ -3715,7 +3726,15 @@ impl<'a> RemlState<'a> {
         if n_rho == 0 {
             return None;
         }
-        let weights = self.weights.to_owned();
+        let weights = if reml_is_gaussian_identity(&self.config.likelihood) {
+            self.weights.to_owned()
+        } else {
+            let pilot = self.execute_pirls_if_needed(base).ok()?;
+            if pilot.solveweights.len() != self.weights.len() {
+                return None;
+            }
+            pilot.solveweights.to_owned()
+        };
         let gram_diag = self.x.diag_gram(&weights).ok()?;
         if gram_diag.len() != self.p {
             return None;
@@ -7290,6 +7309,7 @@ impl<'a> RemlState<'a> {
             // requires. It only makes the captured ν the ML shape at a
             // converged mean instead of at a half-converged one.
             let shape = pirls::estimate_gamma_shape_from_eta(
+                &reml_spec(&self.config.likelihood).link,
                 self.y,
                 &pirls_result.final_eta.to_owned(),
                 self.weights,

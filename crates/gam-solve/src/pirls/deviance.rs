@@ -2518,13 +2518,12 @@ fn full_log_likelihood_row(
             }
         }
         ResponseFamily::Binomial => {
-            let successes = weight * y;
-            if !exact_integer(weight) || !exact_integer(successes) {
+            if super::family_state::binomial_success_count(weight, y).is_none() {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     row,
-                    "fully-normalized binomial trials/successes (exact integers required)",
+                    "fully-normalized binomial trials/successes (integer trials and a proportion of an integer success count required)",
                     eta,
-                    successes,
+                    weight * y,
                 ));
             }
         }

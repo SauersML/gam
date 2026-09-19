@@ -2583,10 +2583,10 @@ mod tests {
         );
     }
 
-    #[test]
-    pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
-        let x = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
-        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+    /// Intercept-only Gamma PIRLS fit under `link`: returns the fitted shape,
+    /// the shape re-profiled at the converged η, and the fitted mean.
+    fn intercept_only_gamma_fit(link: StandardLink, y: &Array1<f64>) -> (f64, f64, f64) {
+        let x = Array2::<f64>::ones((y.len(), 1));
         let w = Array1::ones(y.len());
         let offset = Array1::zeros(y.len());
         let rho = array![0.0];
@@ -2610,9 +2610,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(StandardLink::Log),
+                InverseLink::Standard(link),
             )),
-            link_kind: InverseLink::Standard(StandardLink::Log),
+            link_kind: InverseLink::Standard(link),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -2648,10 +2648,26 @@ mod tests {
             .likelihood
             .gamma_shape()
             .expect("gamma fit should expose fitted shape");
-        let profiled_shape =
-            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta.to_owned(), w.view())
-                .expect("converged Gamma shape must be representable");
+        let profiled_shape = super::estimate_gamma_shape_from_eta(
+            &config.link_kind,
+            y.view(),
+            &result.final_eta.to_owned(),
+            w.view(),
+        )
+        .expect("converged Gamma shape must be representable");
+        let eta = result.final_eta[0];
+        let mean = match link {
+            StandardLink::Log => eta.exp(),
+            StandardLink::Inverse => eta.recip(),
+            other => panic!("not a Gamma link: {other:?}"),
+        };
+        (fitted_shape, profiled_shape, mean)
+    }
 
+    #[test]
+    pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
+        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+        let (fitted_shape, profiled_shape, _) = intercept_only_gamma_fit(StandardLink::Log, &y);
         assert!(fitted_shape > 1.0, "shape should not stay fixed at one");
         assert_relative_eq!(
             fitted_shape,
@@ -2659,6 +2675,48 @@ mod tests {
             epsilon = 1e-10,
             max_relative = 1e-10
         );
+    }
+
+    /// The shape MLE reads μ through the fit's own link. An intercept-only fit
+    /// has μ̂ = ȳ under every link, so the inverse-link shape must equal the
+    /// log-link one; reading μ = exp(η) at the inverse-link η = 1/ȳ instead
+    /// profiled the shape against the wrong mean (the fuzzer's gamma(inverse)
+    /// cells reported φ ≈ 1.5 on data drawn at φ = 1/3).
+    #[test]
+    pub(crate) fn gamma_inverse_fit_profiles_shape_on_its_own_link() {
+        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+        let ybar = y.mean().expect("nonempty response");
+        let (log_shape, _, log_mean) = intercept_only_gamma_fit(StandardLink::Log, &y);
+        let (inv_shape, inv_profiled, inv_mean) =
+            intercept_only_gamma_fit(StandardLink::Inverse, &y);
+        assert_relative_eq!(log_mean, ybar, max_relative = 1e-8);
+        assert_relative_eq!(inv_mean, ybar, max_relative = 1e-8);
+        assert_relative_eq!(inv_shape, inv_profiled, epsilon = 1e-10, max_relative = 1e-10);
+        assert_relative_eq!(inv_shape, log_shape, max_relative = 1e-6);
+    }
+
+    /// A binomial proportion `k/w` stored as `fl(k/w)` does not satisfy
+    /// `w·y == k` exactly (`1/49·49 = 0.9999999999999999`); the success count
+    /// is recovered exactly and a non-proportion is still refused.
+    #[test]
+    pub(crate) fn binomial_success_count_recovers_rounded_proportions() {
+        let mut inexact = 0usize;
+        for w in 1..=2000u32 {
+            let w = f64::from(w);
+            for k in [0.0, 1.0, w - 1.0, w, (w / 3.0).floor(), (0.7 * w).floor()] {
+                let y = k / w;
+                if w * y != k {
+                    inexact += 1;
+                }
+                assert_eq!(super::super::binomial_success_count(w, y), Some(k), "k={k} w={w}");
+            }
+        }
+        assert!(inexact > 0, "the grid must exercise a proportion whose product misses k");
+        assert_ne!(49.0 * (1.0 / 49.0), 1.0);
+        assert_eq!(super::super::binomial_success_count(49.0, 1.0 / 49.0), Some(1.0));
+        assert_eq!(super::super::binomial_success_count(10.0, 0.25), None);
+        assert_eq!(super::super::binomial_success_count(2.5, 0.4), None);
+        assert_eq!(super::super::binomial_success_count(10.0, 1.5), None);
     }
 
     #[test]

@@ -1631,6 +1631,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_SHAPE_REFRESH {
             let refreshed_shape = super::estimate_gamma_shape_from_eta(
+                &working_model.likelihood.spec.link,
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,

@@ -744,6 +744,24 @@ pub fn valid_count_response(y: f64) -> bool {
     y.is_finite() && y >= 0.0 && y == y.round()
 }
 
+/// The success count `k` of a binomial row given as a proportion `y` of `w`
+/// trials, or `None` when `y` is not a proportion of an integer count.
+///
+/// Unlike a raw count, a proportion passes through one rounding step: the data
+/// hold `y = fl(k / w)`, and `fl(w · y)` can then miss `k` by an ulp (`k = 1`,
+/// `w = 49` gives `0.9999999999999999`). The test is still exact rather than a
+/// tolerance: the nearest integer to `w · y` is the count if and only if its
+/// correctly rounded quotient by `w` reproduces the stored proportion bit for
+/// bit, which admits every `fl(k / w)` and nothing else.
+#[inline]
+pub fn binomial_success_count(w: f64, y: f64) -> Option<f64> {
+    if !valid_count_response(w) || !(y.is_finite() && (0.0..=1.0).contains(&y)) {
+        return None;
+    }
+    let k = (w * y).round();
+    (k <= w && k / w == y).then_some(k)
+}
+
 /// Certify a whole count response against [`valid_count_response`], reporting
 /// the first offending positive-weight row.
 ///
