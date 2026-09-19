@@ -33,7 +33,7 @@ import pandas as pd
 import pytest
 
 import gamfit
-from gamfit.errors import InvalidConfigurationError
+from gamfit.errors import FitConvergenceError, InvalidConfigurationError
 
 ALPHA = 0.1
 # alpha * (n + 1) is an integer, so the conformal quantile has no rounding
@@ -97,6 +97,23 @@ def test_glm_full_conformal_set_is_a_set_in_the_support(family: str) -> None:
         assert np.all(hi <= 1.0)
 
 
+def _penalty_model(family: str, rng: np.random.Generator):
+    """A fit on an independent draw that supplies the frozen penalty.
+
+    The draw is independent of the labeled and test rows, so redrawing it when
+    the smoothing-parameter search refuses to certify an optimum leaves the
+    n + 1 augmented rows exchangeable and the coverage unbiased.
+    """
+
+    refusals = []
+    for _ in range(5):
+        try:
+            return gamfit.fit(_draw(family, rng, N_TRAIN), "y ~ s(x, k=6)", family=family)
+        except FitConvergenceError as err:
+            refusals.append(err)
+    raise AssertionError(f"{family}: every penalty fit refused: {refusals}")
+
+
 @pytest.mark.parametrize("family", FAMILIES)
 def test_glm_full_conformal_covers_at_the_nominal_level(family: str) -> None:
     """Seeded Monte Carlo: coverage within 2 MCSE of 1 - alpha, both ways.
@@ -119,10 +136,9 @@ def test_glm_full_conformal_covers_at_the_nominal_level(family: str) -> None:
     per_rep = []
     fragmented = []
     for _ in range(REPS):
-        penalty_rows = _draw(family, rng, N_TRAIN)
+        model = _penalty_model(family, rng)
         train = _draw(family, rng, N_TRAIN)
         test = _draw(family, rng, M_TEST)
-        model = gamfit.fit(penalty_rows, "y ~ s(x, k=6)", family=family)
         out = model.predict(
             test[["x"]],
             interval="conformal",
