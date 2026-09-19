@@ -7,6 +7,7 @@
 //! differences the analytic *gradient* in ρ and requires the analytic
 //! Hessian to match it for binomial-logit, binomial-probit,
 //! binomial-cloglog, Poisson-log and Gamma-log.
+#![cfg(test)]
 
 use super::{RemlConfig, RemlState};
 use crate::rho_optimizer::OuterEvalOrder;
