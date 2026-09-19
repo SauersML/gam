@@ -1448,7 +1448,15 @@
     "evidence": "source_removal_guard.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly these two identities: resolve_marginal_slope_base_link (public, 0 production occurrences) and the test (test_scoped). git grep -c -w resolve_marginal_slope_base_link and MarginalSlopeLinkRefusal::Flexible find 0 files under crates, src, tests and gamfit at the landing tree. test_census.py: 12036 -> 12038 tests. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
   },
   {
-    "base": "7f489def6c615cc000a9b90f58bfca8b48415a2b",
+    "base": "ae20ed3b52b554c6379b92ae588611a08d2376a3",
+    "items": [
+      "crates/gam-model-api/src/families/custom_family/family_trait.rs:struct:GradientAccumulation"
+    ],
+    "reason": "#2822/#2976: GradientAccumulation moves unchanged (the same two pub fields, accumulation_depth and absolute_sums) into gam_linalg::roundoff beside accumulation_growth and accumulation_band, which own the gamma_m it is read with, so the SAE arrow assembly, which does not depend on gam-model-api, carries the same record for its gradient. family_trait.rs re-exports it at its old path (pub use gam_linalg::roundoff::GradientAccumulation), so every existing path resolves to the one definition.",
+    "evidence": "Direct gate dy7 sf-a1v2-p4 at 9ba55dfa34 (patch md5 c72cd8f1, tree 57fa8adf, this move plus the #2822 unit that reuses the type) without this entry: source_removal_guard.py names exactly this one item, kind struct, public, production_occurrences 0 (direct-dy7-sf-a1v2-p4.log.guard). In the same gate the workspace --all-targets check and the gam-pyffi check exit 0 with every existing user of the old path compiling through the re-export, and the public-API census exits 0."
+  },
+  {
+    "base": "d608f329a5f8215f955a9760ab9ebda26c08fb8b",
     "items": [
       "crates/gam-terms/src/basis/bspline_eval.rs:fn:create_difference_penalty_matrix",
       "crates/gam-terms/src/basis/duchon_thinplate/owed_bughunt_splines_tests.rs:fn:clamped_cubic_knots",

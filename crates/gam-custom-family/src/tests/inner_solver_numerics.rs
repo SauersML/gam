@@ -7355,3 +7355,99 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
          tol={tol:.3e}"
     );
 }
+
+/// gam#3019: a refusal is `active_set_incomplete` only when the active set it
+/// reads pins a row. The joint path scatters an empty row list into every
+/// constrained block, so "the block has constraints" is not "rows were pinned".
+/// The survival link-deviation fixture exited early 23 times under that label, each
+/// with `active_set_rows_total=0` (s4b job 1332832 arm A). In each of those solves the
+/// rejected trials repeated one objective increase at every trust radius: the
+/// objective jumps along the step, and no constraint row owns the residual.
+///
+/// Both arms share a well-conditioned `H = I` and the #3019 seed-0 residual,
+/// 3.772 on the unconstrained block, far above tolerance. Only the active set
+/// differs. With the row `β₀ ≥ 0` slack and nothing pinned, the refusal is a
+/// phantom multiplier whose guidance names the jump. With the row binding and
+/// pinned, it is an incomplete active set (the positive control).
+#[test]
+fn kkt_refusal_names_an_incomplete_active_set_only_when_it_holds_a_row_3019() {
+    use gam_problem::test_support::spec_from_dense;
+    let specs = vec![
+        spec_from_dense("constrained", Array2::<f64>::zeros((1, 1))),
+        spec_from_dense("free", Array2::<f64>::zeros((1, 1))),
+    ];
+    let s_lambdas = vec![Array2::<f64>::zeros((1, 1)), Array2::<f64>::zeros((1, 1))];
+    let ranges = vec![(0usize, 1usize), (1, 2)];
+    let block_constraints = vec![
+        Some(ConstraintSet::Dense(LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        })),
+        None,
+    ];
+    let source = JointHessianSource::Dense(Array2::<f64>::eye(2));
+    let joint_grad = array![0.0, 3.772];
+    let residual_tol = 5.932e-11;
+    let refuse = |constrained_beta: f64, active: Vec<Option<Vec<usize>>>| {
+        let states = vec![
+            ParameterBlockState {
+                beta: array![constrained_beta],
+                eta: Array1::zeros(1),
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: Array1::zeros(1),
+            },
+        ];
+        compute_kkt_refusal_report(
+            25,
+            &states,
+            &specs,
+            &s_lambdas,
+            &ranges,
+            Some(&joint_grad),
+            &active,
+            &block_constraints,
+            Some(&source),
+            2,
+            1.034e-11,
+            7.596e-2,
+            2.245e-10,
+            residual_tol,
+            1.486e-8,
+            2.082e-11,
+            2.069e-11,
+            3.772,
+            None,
+        )
+    };
+
+    let unpinned = refuse(0.5, vec![Some(Vec::new()), None]);
+    assert_eq!(unpinned.hpen_nullity_at_rank_tol, 0, "H = I has no null space");
+    assert_eq!(unpinned.active_set_rows_total, 0);
+    assert_eq!(
+        unpinned.diagnosis,
+        KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
+        "an active set that pins no row cannot be missing one from a projection that captured \
+         nothing; got {:?}",
+        unpinned.diagnosis,
+    );
+    assert_eq!(unpinned.carrying_block_name().as_deref(), Some("free"));
+    let bubbled = unpinned.format_bubbled_error();
+    assert!(
+        bubbled.contains("active_set_rows_total=0")
+            && bubbled.contains("jump or kink")
+            && bubbled.contains("a discontinuity, not a multiplier"),
+        "a zero-row refusal must point at the objective along the step: {bubbled}",
+    );
+
+    let pinned = refuse(0.0, vec![Some(vec![0]), None]);
+    assert_eq!(pinned.active_set_rows_total, 1);
+    assert_eq!(
+        pinned.diagnosis,
+        KktRefusalDiagnosis::ActiveSetIncomplete,
+        "a pinned row with the projected residual above tolerance is an incomplete active set; \
+         got {:?}",
+        pinned.diagnosis,
+    );
+}
