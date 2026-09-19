@@ -9,23 +9,24 @@
 //! the empirical size — the fraction of null replicates rejected at level `α` —
 //! exceeds the nominal `α`. The Bartlett correction rescales `W` by
 //! `c = E[W]/d` so the corrected statistic's mean returns to `d` and the size
-//! returns to nominal. This harness measures that directly, comparing three
+//! returns to nominal. This harness measures that directly, comparing two
 //! lanes from the SAME live driver (`smooth_term_lr_inference_forspec`):
 //!
-//!   (a) first-order χ²        — `p_value_uncorrected`,
-//!   (b) fixed-λ Bartlett      — `p_value_corrected` with the conditional factor,
-//!   (c) estimated-λ Bartlett  — `p_value_corrected` with the ρ̂-variation factor
-//!                                (`correction == LawleyLrEstimatedLambda`).
+//!   (a) first-order           — `p_value_uncorrected`,
+//!   (b) corrected             — `p_value_corrected`: the fixed-λ Lawley factor
+//!                                (`correction == LawleyLrFixedLambda`) on the
+//!                                reference whose selection replay carries λ̂'s
+//!                                sampling variation.
 //!
 //! Empirical size at `α` is `#{p ≤ α}/R`. Its Monte-Carlo standard error is
 //! `√(α(1−α)/R)`; the assertions use a `±k·SE` band so they are robust to the
 //! finite simulation budget. The defining claims (#939 deliverable 4):
 //!
 //!   1. WHERE FIRST-ORDER IS DISTORTED (small `n`): the first-order size is
-//!      materially above nominal, and the corrected lanes pull it back — the
-//!      estimated-λ size is at least as close to nominal as the first-order size
+//!      materially above nominal, and the corrected lane pulls it back — the
+//!      corrected size is at least as close to nominal as the first-order size
 //!      AND lands inside the MC band, across families and penalty ranks.
-//!   2. ESTIMATED-λ NEVER WORSE: across the whole grid the estimated-λ size's
+//!   2. CORRECTED NEVER WORSE: across the whole grid the corrected size's
 //!      distance from nominal never exceeds the first-order distance by more than
 //!      MC noise — the correction is safe to apply everywhere.
 //!   3. MATERIALITY: the per-test `material` flag fires exactly when the applied
@@ -171,56 +172,35 @@ struct SizeCounts {
     used: usize,
     // Rejections at α = 0.05 / 0.01 for each lane.
     rej_first_05: usize,
-    rej_fixed_05: usize,
-    rej_est_05: usize,
+    rej_corrected_05: usize,
     rej_first_01: usize,
-    rej_est_01: usize,
-    // How many replicates actually reached the estimated-λ correction.
-    est_lambda_applied: usize,
+    rej_corrected_01: usize,
+    // How many replicates actually reached the Lawley correction.
+    corrected_applied: usize,
 }
 
 impl SizeCounts {
     fn ingest(&mut self, r: &SmoothTermLrInference) {
-        // The fixed-λ corrected p-value is recoverable per replicate even when the
-        // applied correction was estimated-λ: when the applied lane is estimated-λ,
-        // `bartlett_factor_conditional` carries the fixed-λ factor; otherwise the
-        // applied `bartlett_factor` IS the fixed-λ factor. We reconstruct the
-        // fixed-λ corrected statistic from whichever factor is the conditional one.
         let p_first = r.p_value_uncorrected;
-        let p_est = r.p_value_corrected; // applied lane (estimated-λ where available)
-        let c_fixed = r
-            .bartlett_factor_conditional
-            .unwrap_or(r.bartlett_factor)
-            .max(f64::MIN_POSITIVE);
-        // Read the fixed-λ lane off the SAME reference the driver used, through
-        // the report's own accessor. Reconstructing it as `P(χ²_{ref_df} > W/c)`
-        // was correct only while `ref_df` was a chi-square degrees of freedom;
-        // it is the null MEAN now, and the reference is the `(ν, g)` pair.
-        let p_fixed = r
-            .ref_df_provenance
-            .tail_probability_with_bound(r.statistic_lr / c_fixed)
-            .0;
-        if !(p_first.is_finite() && p_est.is_finite() && p_fixed.is_finite()) {
+        let p_corrected = r.p_value_corrected;
+        if !(p_first.is_finite() && p_corrected.is_finite()) {
             return;
         }
         self.used += 1;
-        if matches!(r.correction, SmoothLrCorrection::LawleyLrEstimatedLambda) {
-            self.est_lambda_applied += 1;
+        if matches!(r.correction, SmoothLrCorrection::LawleyLrFixedLambda) {
+            self.corrected_applied += 1;
         }
         if p_first <= 0.05 {
             self.rej_first_05 += 1;
         }
-        if p_fixed <= 0.05 {
-            self.rej_fixed_05 += 1;
-        }
-        if p_est <= 0.05 {
-            self.rej_est_05 += 1;
+        if p_corrected <= 0.05 {
+            self.rej_corrected_05 += 1;
         }
         if p_first <= 0.01 {
             self.rej_first_01 += 1;
         }
-        if p_est <= 0.01 {
-            self.rej_est_01 += 1;
+        if p_corrected <= 0.01 {
+            self.rej_corrected_01 += 1;
         }
     }
     fn size(&self, rej: usize) -> f64 {
@@ -239,12 +219,11 @@ struct CellResult {
     /// Replicates whose FIT refused (the LR call returned `Err`). Counted rather
     /// than fatal: a refusal is a missing datum, not a calibration verdict.
     refused: usize,
-    est_applied: usize,
+    corrected_applied: usize,
     size_first_05: f64,
-    size_fixed_05: f64,
-    size_est_05: f64,
+    size_corrected_05: f64,
     size_first_01: f64,
-    size_est_01: f64,
+    size_corrected_01: f64,
 }
 
 /// Monte-Carlo standard error of an empirical size estimate at level `alpha` from
@@ -316,12 +295,11 @@ fn exhaustive_null_simulation_size_grid() {
                     label: family.label(),
                     used: counts.used,
                     refused,
-                    est_applied: counts.est_lambda_applied,
+                    corrected_applied: counts.corrected_applied,
                     size_first_05: counts.size(counts.rej_first_05),
-                    size_fixed_05: counts.size(counts.rej_fixed_05),
-                    size_est_05: counts.size(counts.rej_est_05),
+                    size_corrected_05: counts.size(counts.rej_corrected_05),
                     size_first_01: counts.size(counts.rej_first_01),
-                    size_est_01: counts.size(counts.rej_est_01),
+                    size_corrected_01: counts.size(counts.rej_corrected_01),
                 });
             }
         }
@@ -409,12 +387,11 @@ fn null_simulation_size_is_calibrated_small_n() {
                     label: family.label(),
                     used: counts.used,
                     refused,
-                    est_applied: counts.est_lambda_applied,
+                    corrected_applied: counts.corrected_applied,
                     size_first_05: counts.size(counts.rej_first_05),
-                    size_fixed_05: counts.size(counts.rej_fixed_05),
-                    size_est_05: counts.size(counts.rej_est_05),
+                    size_corrected_05: counts.size(counts.rej_corrected_05),
                     size_first_01: counts.size(counts.rej_first_01),
-                    size_est_01: counts.size(counts.rej_est_01),
+                    size_corrected_01: counts.size(counts.rej_corrected_01),
                 });
             }
         }
@@ -433,23 +410,22 @@ fn assert_grid_calibration(cells: &[CellResult], reps: usize, tag: &str) {
     // Diagnostic dump (printed on failure / with --nocapture).
     eprintln!("=== #939 null-simulation size grid ({tag}), REPS={reps} ===");
     eprintln!(
-        "{:>16} {:>4} {:>3} {:>5} {:>4} {:>6} | size@.05  first/fixed/est   size@.01 first/est",
-        "family", "n", "k", "used", "ref!", "estΛ"
+        "{:>16} {:>4} {:>3} {:>5} {:>4} {:>6} | size@.05 first/corr   size@.01 first/corr",
+        "family", "n", "k", "used", "ref!", "corr"
     );
     for c in cells {
         eprintln!(
-            "{:>16} {:>4} {:>3} {:>5} {:>4} {:>6} |   {:.3} / {:.3} / {:.3}     {:.3} / {:.3}",
+            "{:>16} {:>4} {:>3} {:>5} {:>4} {:>6} |   {:.3} / {:.3}         {:.3} / {:.3}",
             c.label,
             c.n,
             c.k,
             c.used,
             c.refused,
-            c.est_applied,
+            c.corrected_applied,
             c.size_first_05,
-            c.size_fixed_05,
-            c.size_est_05,
+            c.size_corrected_05,
             c.size_first_01,
-            c.size_est_01,
+            c.size_corrected_01,
         );
     }
 
@@ -467,7 +443,7 @@ fn assert_grid_calibration(cells: &[CellResult], reps: usize, tag: &str) {
     //
     //     n         30      50     100     200     400
     //     first  0.141   0.111   0.080   0.060   0.065
-    //     est    0.106   0.096   0.070   0.055   0.065      (MC s.e. 0.0154)
+    //     est-λ  0.106   0.096   0.070   0.055   0.065      (MC s.e. 0.0154)
     //
     // — a residual that falls monotonically toward nominal with `n` and is
     // inside the MC band by `n = 200`, with the quasi-separation rate `0.0`
@@ -483,7 +459,7 @@ fn assert_grid_calibration(cells: &[CellResult], reps: usize, tag: &str) {
     // how far that design point is from the asymptotic regime, and the claim the
     // slack encodes is a claim about the correction rather than a tolerance:
     //
-    //     the estimated-λ correction removes AT LEAST HALF of the first-order
+    //     the correction removes AT LEAST HALF of the first-order
     //     distortion, and lands inside the Monte-Carlo band of nominal on top
     //     of that.
     //
@@ -509,55 +485,55 @@ fn assert_grid_calibration(cells: &[CellResult], reps: usize, tag: &str) {
             c.refused
         );
 
-        // CLAIM 1 — estimated-λ size lands inside the MC band of nominal at α=0.05,
+        // CLAIM 1 — corrected size lands inside the MC band of nominal at α=0.05,
         // widened only by half of whatever first-order distortion this cell
         // exhibits (see `residual_slack` above).
         let band05 = 3.0 * se05 + residual_slack(c.size_first_05, 0.05);
         let band01 = 3.0 * se01 + residual_slack(c.size_first_01, 0.01);
         assert!(
-            (c.size_est_05 - 0.05).abs() <= band05,
-            "{} n={} k={}: estimated-λ size@.05 = {:.3} is outside the nominal band \
+            (c.size_corrected_05 - 0.05).abs() <= band05,
+            "{} n={} k={}: corrected size@.05 = {:.3} is outside the nominal band \
              0.05 ± {:.3} (3·SE = {:.3} plus half of the first-order distortion, \
              which was {:.3}). The correction must remove at least half of what \
              first-order gets wrong AND land inside the MC band of nominal.",
             c.label,
             c.n,
             c.k,
-            c.size_est_05,
+            c.size_corrected_05,
             band05,
             3.0 * se05,
             c.size_first_05
         );
         // And at the tighter α=0.01.
         assert!(
-            (c.size_est_01 - 0.01).abs() <= band01,
-            "{} n={} k={}: estimated-λ size@.01 = {:.3} is outside the nominal band \
+            (c.size_corrected_01 - 0.01).abs() <= band01,
+            "{} n={} k={}: corrected size@.01 = {:.3} is outside the nominal band \
              0.01 ± {:.3} (3·SE = {:.3} plus half of the first-order distortion, \
              which was {:.3})",
             c.label,
             c.n,
             c.k,
-            c.size_est_01,
+            c.size_corrected_01,
             band01,
             3.0 * se01,
             c.size_first_01
         );
 
-        // CLAIM 2 — estimated-λ is NEVER materially worse-calibrated than
+        // CLAIM 2 — the corrected lane is NEVER materially worse-calibrated than
         // first-order: its distance from nominal does not exceed first-order's by
         // more than MC noise.
         let d_first = (c.size_first_05 - 0.05).abs();
-        let d_est = (c.size_est_05 - 0.05).abs();
+        let d_corrected = (c.size_corrected_05 - 0.05).abs();
         assert!(
-            d_est <= d_first + 2.0 * se05,
-            "{} n={} k={}: estimated-λ size@.05 ({:.3}) must not be worse-calibrated \
+            d_corrected <= d_first + 2.0 * se05,
+            "{} n={} k={}: corrected size@.05 ({:.3}) must not be worse-calibrated \
              than first-order ({:.3}) beyond MC noise (|Δ|={:.3} > {:.3})",
             c.label,
             c.n,
             c.k,
-            c.size_est_05,
+            c.size_corrected_05,
             c.size_first_05,
-            d_est,
+            d_corrected,
             d_first + 2.0 * se05
         );
 
@@ -567,23 +543,23 @@ fn assert_grid_calibration(cells: &[CellResult], reps: usize, tag: &str) {
         // distortion, and it is silent (not satisfied) on the ones that do not.
         if c.size_first_05 > 0.05 + 2.0 * se05 {
             assert!(
-                d_est <= d_first + 1e-9,
+                d_corrected <= d_first + 1e-9,
                 "{} n={} k={}: where first-order is anti-conservative \
-                 (size@.05={:.3} > nominal), the estimated-λ correction must pull \
-                 size toward nominal: est={:.3} (|Δest|={:.3}) vs first (|Δfirst|={:.3})",
+                 (size@.05={:.3} > nominal), the correction must pull \
+                 size toward nominal: corrected={:.3} (|Δcorrected|={:.3}) vs first (|Δfirst|={:.3})",
                 c.label,
                 c.n,
                 c.k,
                 c.size_first_05,
-                c.size_est_05,
-                d_est,
+                c.size_corrected_05,
+                d_corrected,
                 d_first
             );
         }
 
         pooled_used += c.used;
-        pooled_rej_05 += c.size_est_05 * c.used as f64;
-        pooled_rej_01 += c.size_est_01 * c.used as f64;
+        pooled_rej_05 += c.size_corrected_05 * c.used as f64;
+        pooled_rej_01 += c.size_corrected_01 * c.used as f64;
     }
 
     // ANTI-VACUITY, pooled over the whole grid.
@@ -619,14 +595,14 @@ fn assert_grid_calibration(cells: &[CellResult], reps: usize, tag: &str) {
     );
     assert!(
         (pooled_size_05 - 0.05).abs() <= pooled_band05,
-        "pooled over the {tag} grid the estimated-λ size@.05 is {pooled_size_05:.4}, \
+        "pooled over the {tag} grid the corrected size@.05 is {pooled_size_05:.4}, \
          outside 0.05 ± {pooled_band05:.4} on {pooled_used} usable replicates. \
          Pooling is what makes a test that never rejects fail: at this budget \
          size 0.000 misses by 0.05 against a band of {pooled_band05:.4}."
     );
     assert!(
         (pooled_size_01 - 0.01).abs() <= pooled_band01,
-        "pooled over the {tag} grid the estimated-λ size@.01 is {pooled_size_01:.4}, \
+        "pooled over the {tag} grid the corrected size@.01 is {pooled_size_01:.4}, \
          outside 0.01 ± {pooled_band01:.4} on {pooled_used} usable replicates"
     );
 }
@@ -699,12 +675,11 @@ fn gaussian_null_size_is_calibrated_where_the_expansion_is_exact_2672() {
                 label: NullFamily::GaussianIdentity.label(),
                 used: counts.used,
                 refused,
-                est_applied: counts.est_lambda_applied,
+                corrected_applied: counts.corrected_applied,
                 size_first_05: counts.size(counts.rej_first_05),
-                size_fixed_05: counts.size(counts.rej_fixed_05),
-                size_est_05: counts.size(counts.rej_est_05),
+                size_corrected_05: counts.size(counts.rej_corrected_05),
                 size_first_01: counts.size(counts.rej_first_01),
-                size_est_01: counts.size(counts.rej_est_01),
+                size_corrected_01: counts.size(counts.rej_corrected_01),
             });
         }
     }

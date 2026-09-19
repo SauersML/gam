@@ -705,8 +705,8 @@ class Model:
         :math:`\\nu` and ``reference_scale`` :math:`g` (the two-moment summary),
         ``reference_residual_df``/``reference_deterministic_offset`` (the
         estimated-scale channel above, ``None`` off the profiled Gaussian),
-        ``bartlett_factor``
-        :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
+        ``bartlett_factor`` :math:`c` (the fixed-λ Lawley scale),
+        ``statistic_corrected`` :math:`W^* = W/c`, ``p_value_uncorrected``,
         ``p_value_corrected`` (the magic-by-default value), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and

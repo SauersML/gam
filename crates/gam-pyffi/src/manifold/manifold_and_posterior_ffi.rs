@@ -1068,13 +1068,9 @@ struct SmoothTermLrRow {
     /// quadrature's truncation bound plus twice the selection replay's own
     /// Monte-Carlo standard error. `0.0` on the closed-form lanes.
     p_value_bound: f64,
-    /// Lawley LR Bartlett factor `c = 1 + Δε/d` (1.0 when uncorrected).
+    /// Lawley LR Bartlett factor `c = 1 + Δε/d`, the fixed-λ scale of the
+    /// reference (1.0 when uncorrected).
     bartlett_factor: f64,
-    /// Fixed-λ conditional Lawley factor when the applied factor also includes
-    /// estimated-λ rho variation.
-    bartlett_factor_conditional: Option<f64>,
-    /// Mean-shift increment from ρ̂ sampling variation, when present.
-    rho_variation_shift: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
     statistic_corrected: f64,
     /// Uncorrected p-value `P(χ²_d > W)`.
@@ -1086,9 +1082,8 @@ struct SmoothTermLrRow {
     /// `n` is too small for first-order inference on this term. `false` when no
     /// correction was applied.
     material: bool,
-    /// `"lawley_lr_estimated_lambda"` when the full estimated-λ Bartlett
-    /// correction was applied, `"lawley_lr_fixed_lambda"` for the conditional
-    /// fixed-λ factor, else `"none"`.
+    /// `"lawley_lr_fixed_lambda"` when the Lawley factor was applied, else
+    /// `"none"`.
     correction_provenance: &'static str,
 }
 
@@ -1307,8 +1302,6 @@ fn smooth_term_lr_inference_dataset_json_impl(
             p_value_conditional: r.p_value_conditional,
             p_value_bound: r.p_value_bound,
             bartlett_factor: r.bartlett_factor,
-            bartlett_factor_conditional: r.bartlett_factor_conditional,
-            rho_variation_shift: r.rho_variation_shift,
             statistic_corrected: r.statistic_corrected,
             p_value_uncorrected: r.p_value_uncorrected,
             p_value_corrected: r.p_value_corrected,
