@@ -18,8 +18,9 @@ use super::shape_constraints::{
 };
 use super::structure_analysis::smooth_has_frozen_identifiability;
 use crate::basis::{
-    ConstantCurvatureIdentifiability, MaternIdentifiability, MeasureJetIdentifiability,
-    SphericalSplineIdentifiability, orthogonality_transform_for_design,
+    BSplineBoundaryConditions, ConstantCurvatureIdentifiability, MaternIdentifiability,
+    MeasureJetIdentifiability, OneDimensionalBoundary, SphericalSplineIdentifiability,
+    orthogonality_transform_for_design,
 };
 use gam_linalg::matrix::{CoefficientTransformOperator, RandomEffectOperator};
 use ndarray::ArrayView1;
@@ -2128,10 +2129,17 @@ fn apply_global_smooth_identifiability(
 /// under-recover it (the per-group log-cumulative-hazard offset leaks out — the
 /// #900 weibull-AFT-by-factor surface miscalibration). Centering against the
 /// gated level indicator instead removes the within-level constant cleanly,
-/// leaving the per-group level entirely to the factor main effect (mgcv's
-/// by-factor convention), while the per-level slope/curvature deviation stays
-/// in the smooth (we deliberately do NOT project the overlapping continuous
-/// axis out of a by-level smooth — that deviation is the by-factor signal).
+/// leaving the per-group level entirely to the factor main effect.
+///
+/// The per-level LINEAR direction `x·1_g` is the same story one degree up, for
+/// every slope axis [`factor_by_level_slope_axes`] reports. Left in the level
+/// smooth it sits in that smooth's penalty null space, where only the level's
+/// own null-space ridge prices it — so `G` level smooths carry `G` independent
+/// slope strengths, while the likelihood sees only the one combination the
+/// shared `+ x` term does not already fix, and the outer Hessian is singular
+/// in the rest. The slope deviations are therefore projected out of each level
+/// smooth too, and carried once, by the `LevelSlopes` term `build_termspec`
+/// adds: `G − 1` contrast columns `(x − c)·Q[g, ·]` under ONE strength.
 fn factor_by_level_gate(termspec: &SmoothTermSpec) -> Option<(usize, u64)> {
     match &termspec.basis {
         SmoothBasisSpec::ByVariable {
@@ -2143,6 +2151,71 @@ fn factor_by_level_gate(termspec: &SmoothTermSpec) -> Option<(usize, u64)> {
     }
 }
 
+/// The continuous axes whose per-level linear direction `x·1_g` a factor-by
+/// level smooth hands to the collection's `LevelSlopes` term.
+///
+/// An axis qualifies only when BOTH halves of the hand-off hold:
+/// * the level smooth's inner basis carries `x` in its penalty null space — an
+///   open B-spline in `x` of degree `≥ 1` with roughness order `≥ 2` and free
+///   endpoints, or a thin plate with `x` among its non-periodic coordinates — so the
+///   projection removes a direction that only a null-space ridge priced;
+/// * the collection carries a plain linear `x` main effect, so the shared slope
+///   the deviations are measured from is in the model.
+///
+/// A shape-constrained smooth keeps its own geometry and hands off nothing.
+/// `build_termspec` (which adds the `LevelSlopes` term) and the constraint
+/// block below read this one predicate, so the two can never disagree.
+pub(crate) fn factor_by_level_slope_axes(
+    linear_terms: &[LinearTermSpec],
+    termspec: &SmoothTermSpec,
+) -> Vec<usize> {
+    let SmoothBasisSpec::ByVariable {
+        inner,
+        by: ByVariableSpec::Level { .. },
+        ..
+    } = &termspec.basis
+    else {
+        return Vec::new();
+    };
+    if !termspec.shape.is_none() {
+        return Vec::new();
+    }
+    let null_axes: Vec<usize> = match inner.as_ref() {
+        SmoothBasisSpec::BSpline1D { feature_col, spec }
+            if spec.degree >= 1
+                && spec.penalty_order >= 2
+                && matches!(spec.boundary, OneDimensionalBoundary::Open)
+                && spec.boundary_conditions == BSplineBoundaryConditions::default() =>
+        {
+            vec![*feature_col]
+        }
+        SmoothBasisSpec::ThinPlate {
+            feature_cols, spec, ..
+        } => feature_cols
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| {
+                spec.periodic
+                    .as_ref()
+                    .is_none_or(|periods| periods.get(*k).is_none_or(Option::is_none))
+            })
+            .map(|(_, &axis)| axis)
+            .collect(),
+        _ => Vec::new(),
+    };
+    null_axes
+        .into_iter()
+        .filter(|&axis| {
+            linear_terms.iter().any(|linear| {
+                linear.categorical_levels.is_empty()
+                    && linear.feature_col == axis
+                    && linear.feature_cols.len() <= 1
+                    && linear.feature_cols.iter().all(|&col| col == axis)
+            })
+        })
+        .collect()
+}
+
 fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
@@ -2151,9 +2224,11 @@ fn build_parametric_constraint_block_for_term(
     let n = data.nrows();
     let p_data = data.ncols();
 
-    // Factor-by-level smooth: center against the gated level indicator so the
-    // within-level constant is removed (it belongs to the treatment-coded
-    // factor main effect), not against the global `[1 | overlapping axes]`.
+    // Factor-by-level smooth: center against the gated level indicator `1_g`
+    // so the within-level constant is removed (it belongs to the
+    // treatment-coded factor main effect), and against `x·1_g` for every
+    // handed-off slope axis (it belongs to the `LevelSlopes` term) — not
+    // against the global `[1 | overlapping axes]`.
     if let Some((by_col, value_bits)) = factor_by_level_gate(termspec) {
         if by_col >= p_data {
             gam_problem::bail_dim_basis!(
@@ -2161,12 +2236,22 @@ fn build_parametric_constraint_block_for_term(
                 termspec.name
             );
         }
-        let mut c = Array2::<f64>::zeros((n, 1));
+        let slope_axes = factor_by_level_slope_axes(linear_terms, termspec);
+        if let Some(&axis) = slope_axes.iter().find(|&&axis| axis >= p_data) {
+            gam_problem::bail_dim_basis!(
+                "factor-by smooth term '{}' slope axis {axis} out of bounds for {p_data} columns",
+                termspec.name
+            );
+        }
+        let mut c = Array2::<f64>::zeros((n, 1 + slope_axes.len()));
         let by = data.column(by_col);
         let value_bits = gam_data::canonical_level_bits(f64::from_bits(value_bits));
         for (row, &value) in by.iter().enumerate() {
             if gam_data::canonical_level_bits(value) == value_bits {
                 c[[row, 0]] = 1.0;
+                for (j, &axis) in slope_axes.iter().enumerate() {
+                    c[[row, j + 1]] = data[[row, axis]];
+                }
             }
         }
         return Ok(c);

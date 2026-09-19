@@ -556,6 +556,15 @@ pub enum FactorSmoothFlavour {
     Fs {},
     Sz,
     Re,
+    /// Per-level slope deviations of a factor-by smooth `s(x, by=g) + x`
+    /// (docs/convergence_theory, Thm 4.1). Each level's smooth is centered
+    /// against its own `[1_g, x·1_g]`, so the per-level linear directions live
+    /// here instead: the design is `(x − c)·1_g` contrasted by an orthonormal
+    /// Helmert `Q` (`G×(G−1)`, `1ᵀQ = 0`), under ONE identity penalty. In level
+    /// coordinates `b = Qγ` that penalty is `‖γ‖² = Σ_g (b_g − b̄)²`, the
+    /// exchangeable random-slope prior with a flat mean, the mean slope being
+    /// the linear `x` term. Built by the term builder, never parsed.
+    LevelSlopes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7582,6 +7591,9 @@ pub(crate) fn build_factor_smooth(
         joint_null_rotation: None,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
+    if matches!(spec.flavour, FactorSmoothFlavour::LevelSlopes) {
+        return build_factor_level_slopes(data, spec, term_name, levels, inner);
+    }
     let mut base = inner
         .design
         .try_to_dense_by_chunks("factor smooth marginal")
@@ -7596,12 +7608,7 @@ pub(crate) fn build_factor_smooth(
         // at the frozen marginal domain, so fit-time and replay-time rows use
         // the same well-conditioned parametric columns on and off the training
         // interval.
-        let center = match &inner.metadata {
-            BasisMetadata::BSpline1D { knots, .. } if !knots.is_empty() => {
-                0.5 * (knots[0] + knots[knots.len() - 1])
-            }
-            _ => 0.0,
-        };
+        let center = factor_smooth_marginal_center(&inner.metadata);
         let mut linear = Array2::<f64>::ones((data.nrows(), 2));
         linear
             .column_mut(1)
@@ -7791,6 +7798,9 @@ pub(crate) fn build_factor_smooth(
         FactorSmoothFlavour::Fs { .. } => "fs",
         FactorSmoothFlavour::Sz => "sz",
         FactorSmoothFlavour::Re => "re",
+        FactorSmoothFlavour::LevelSlopes => {
+            unreachable!("level slopes return from build_factor_level_slopes above")
+        }
     }
     .to_string();
     let metadata = BasisMetadata::FactorSmooth {
@@ -7816,6 +7826,129 @@ pub(crate) fn build_factor_smooth(
         joint_null_rotation,
         dropped_penalties,
         metadata,
+        linear_constraints: None,
+        shape_lower_bounds: None,
+    })
+}
+
+/// Midpoint `c` of a factor smooth's frozen marginal domain `[a, b]`, the
+/// centering point of the `re` and level-slope columns `x − c`.
+fn factor_smooth_marginal_center(metadata: &BasisMetadata) -> f64 {
+    match metadata {
+        BasisMetadata::BSpline1D { knots, .. } if !knots.is_empty() => {
+            0.5 * (knots[0] + knots[knots.len() - 1])
+        }
+        _ => 0.0,
+    }
+}
+
+/// Orthonormal Helmert contrasts: a `G×(G−1)` matrix `Q` with `1ᵀQ = 0` and
+/// `QᵀQ = I`, so `QQᵀ = I − 11ᵀ/G`. Column `k` is
+/// `(1, …, 1, −(k+1), 0, …)/√((k+1)(k+2))` with `k + 1` leading ones. It
+/// depends only on `G`, so a replay on the frozen levels rebuilds it exactly.
+pub(crate) fn orthonormal_helmert_contrasts(n_levels: usize) -> Array2<f64> {
+    let mut q = Array2::<f64>::zeros((n_levels, n_levels.saturating_sub(1)));
+    for k in 0..n_levels.saturating_sub(1) {
+        let m = (k + 1) as f64;
+        let norm = (m * (m + 1.0)).sqrt();
+        for j in 0..=k {
+            q[[j, k]] = 1.0 / norm;
+        }
+        q[[k + 1, k]] = -m / norm;
+    }
+    q
+}
+
+/// The [`FactorSmoothFlavour::LevelSlopes`] block: row `i` of level `g` is
+/// `(x_i − c)·Q[g, ·]`, one identity penalty over the `G − 1` contrasts.
+///
+/// The penalty is the gauge-invariant exchangeable prior on the level slopes
+/// `b = Qγ`: `‖γ‖² = bᵀ(I − 11ᵀ/G)b = Σ_g (b_g − b̄)²`. The common slope `b̄`
+/// is not in this block at all — it is the linear `x` term — so no second
+/// strength can trade against this one (docs/convergence_theory, Thm 4.1).
+/// An unseen level at replay has no slope deviation to evaluate and is an
+/// error, as for `fs`/`sz`.
+fn build_factor_level_slopes(
+    data: ArrayView2<'_, f64>,
+    spec: &FactorSmoothSpec,
+    term_name: &str,
+    levels: Vec<u64>,
+    inner: LocalSmoothTermBuild,
+) -> Result<LocalSmoothTermBuild, BasisError> {
+    let feature_col = spec.continuous_cols[0];
+    let group_col = spec.group_col;
+    let n_levels = levels.len();
+    if n_levels < 2 {
+        crate::bail_invalid_basis!(
+            "level-slope term '{}' needs at least two grouping levels, found {}",
+            term_name,
+            n_levels
+        );
+    }
+    let center = factor_smooth_marginal_center(&inner.metadata);
+    let contrasts = orthonormal_helmert_contrasts(n_levels);
+    let q = n_levels - 1;
+    let n = data.nrows();
+    let mut dense = Array2::<f64>::zeros((n, q));
+    for i in 0..n {
+        let bits = gam_data::canonical_level_bits(data[[i, group_col]]);
+        let Some(level_idx) = levels.iter().position(|b| *b == bits) else {
+            return Err(BasisError::InvalidInput(format!(
+                "level-slope term '{term_name}' saw an unseen grouping level at row {}",
+                i + 1
+            )));
+        };
+        let dx = data[[i, feature_col]] - center;
+        dense
+            .row_mut(i)
+            .assign(&(&contrasts.row(level_idx) * dx));
+    }
+    let (penalty, scale) = normalize_penalty_in_constrained_space(&Array2::<f64>::eye(q));
+    let filtered = crate::basis::filter_penalty_candidates(vec![PenaltyCandidate {
+        matrix: ConstructiveQuadratic::try_from_dense_psd(penalty, "level-slope contrast penalty")?,
+        source: PenaltySource::Primary,
+        normalization_scale: scale,
+        kronecker_factors: None,
+        op: None,
+    }])?;
+    let joint_null_rotation = crate::basis::compute_joint_null_rotation(&filtered.active)?;
+    let (knots, degree, periodic) = match &inner.metadata {
+        BasisMetadata::BSpline1D {
+            knots,
+            periodic,
+            degree,
+            ..
+        } => (
+            knots.clone(),
+            degree.unwrap_or(spec.marginal.degree),
+            *periodic,
+        ),
+        other => {
+            crate::bail_invalid_basis!(
+                "level-slope term '{}' produced an unexpected marginal metadata variant {:?}",
+                term_name,
+                other
+            );
+        }
+    };
+    // The marginal only fixes `c`; its own penalties are not this block's.
+    Ok(LocalSmoothTermBuild {
+        dim: q,
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense)),
+        affine_offset: None,
+        active_penalties: filtered.active,
+        joint_null_rotation,
+        dropped_penalties: filtered.dropped,
+        metadata: BasisMetadata::FactorSmooth {
+            continuous_cols: spec.continuous_cols.clone(),
+            group_col,
+            knots,
+            degree,
+            periodic,
+            group_levels: levels,
+            flavour: "level_slopes".to_string(),
+            marginal_is_cr: false,
+        },
         linear_constraints: None,
         shape_lower_bounds: None,
     })

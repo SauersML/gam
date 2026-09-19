@@ -212,6 +212,17 @@ fn factor_sum_to_zero_group_col(term: &SmoothTermSpec) -> Option<usize> {
 }
 
 fn smooth_is_owned_by_prior_term(owner: &SmoothTermSpec, target: &SmoothTermSpec) -> bool {
+    // The level-slope block is the span `{x·1_g}` the factor-by level smooths
+    // handed off (`factor_by_level_slope_axes`), measured from the linear `x`
+    // its own `[1 | x]` block already removes. Every prior owner over `(x, g)`
+    // is either one of those level smooths — orthogonal to it by construction —
+    // or a population smooth whose residualization would bend a line family
+    // into something that is no longer a slope. Its identifiability is its own.
+    if let SmoothBasisSpec::FactorSmooth { spec } = &target.basis
+        && matches!(spec.flavour, FactorSmoothFlavour::LevelSlopes)
+    {
+        return false;
+    }
     // A factor-`by=` level smooth is row-gated (zero off its level), so its
     // columns lie outside the span of any owner that is not gated to the SAME
     // (by_col, level): the un-gated population smooth `s(x)` does not span the
