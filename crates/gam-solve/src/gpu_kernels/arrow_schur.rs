@@ -3739,7 +3739,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 // log it (the historical silent collapse to `Unavailable` is what
                 // masked the missing `--gpu-architecture` for so long) and fall
                 // back to the CPU.
-                log::warn!("[#1551] pcg_vector_module get_or_compile failed: {err}");
+                log::debug!("[#1551] pcg_vector_module get_or_compile failed: {err}");
                 ArrowSchurGpuFailure::Unavailable
             })
     }
@@ -6266,7 +6266,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         // (hence per LM ridge-ladder trial) — operand bytes by category + the
         // ridge pair, so the a100 job (RUST_LOG=info) confirms the sub-lane and
         // sizes the per-trial re-upload a base-resident frame would remove.
-        log::info!(
+        log::debug!(
             "#1017/#2230 {} ridge_t={ridge_t:e} ridge_beta={ridge_beta:e}",
             data.operand_byte_report()
         );
@@ -6496,7 +6496,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             // (its `#1017/#2230 …` info line fires once per trial); against a
             // ladder of `T` trials the resident frame removes `(T − 1) ×` this,
             // re-uploading only the per-row `ainv` (n_rows·max_q² f64) per trial.
-            log::info!(
+            log::debug!(
                 "#1017 SAE resident frame ENGAGED: {} uploaded ONCE for the ladder; \
                  per-trial re-upload now only ainv ({}rows × {}²·8B)",
                 data.operand_byte_report(),
@@ -6752,7 +6752,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         // #1017/#2230 residency measurement (legacy sparse ⊗I_p lane): see the
         // framed twin — one line per solve/ladder-trial for the a100 job to size
         // the per-trial operand re-upload.
-        log::info!(
+        log::debug!(
             "#1017/#2230 {} ridge_t={ridge_t:e} ridge_beta={ridge_beta:e}",
             data.operand_byte_report()
         );

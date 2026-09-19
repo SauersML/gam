@@ -12,11 +12,18 @@
 /// kinds here are the closed-form `Standard` links plus `identity`, which
 /// is the full set the FFI surface promises for posterior-band quantiles.
 pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>, String> {
-    let kind = family_kind.trim().to_ascii_lowercase();
+    use gam_problem::LinkFunction;
+
+    let kind = family_kind.trim();
+    let link = if kind.is_empty() {
+        Some(LinkFunction::Identity)
+    } else {
+        LinkFunction::from_name(kind)
+    };
     let mut out = Vec::with_capacity(eta.len());
-    match kind.as_str() {
-        "" | "identity" => out.extend_from_slice(eta),
-        "logit" => {
+    match link {
+        Some(LinkFunction::Identity) => out.extend_from_slice(eta),
+        Some(LinkFunction::Logit) => {
             for &e in eta {
                 out.push(if e >= 0.0 {
                     1.0 / (1.0 + (-e).exp())
@@ -26,7 +33,7 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 });
             }
         }
-        "probit" => {
+        Some(LinkFunction::Probit) => {
             for &e in eta {
                 // Φ(η) = ½·erfc(−η/√2). The naive ½(1+erf(η/√2)) form cancels
                 // in the deep negative tail (erf saturates at −1.0 for η ≲ −8.3,
@@ -35,7 +42,7 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 out.push(gam_math::probability::normal_cdf(e));
             }
         }
-        "cloglog" => {
+        Some(LinkFunction::CLogLog) => {
             for &e in eta {
                 // μ = 1 − exp(−exp(η)); use -expm1(-exp(η)) to preserve precision
                 // in the deep negative tail where exp(-exp(η)) rounds to 1.0 and
@@ -57,7 +64,7 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 out.push(-(-e.exp()).exp_m1());
             }
         }
-        "loglog" => {
+        Some(LinkFunction::LogLog) => {
             for &e in eta {
                 // μ = exp(−exp(−η)): the complement of cloglog (the reflected
                 // extreme-value link). Matches the canonical solver kernel
@@ -68,7 +75,7 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 out.push((-(-e).exp()).exp());
             }
         }
-        "cauchit" => {
+        Some(LinkFunction::Cauchit) => {
             for &e in eta {
                 // Reflect atan through the reciprocal in the tails: subtracting
                 // atan(|eta|)/pi from 1/2 discards representable small CDFs.
@@ -81,7 +88,7 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 });
             }
         }
-        "log" => {
+        Some(LinkFunction::Log) => {
             for &e in eta {
                 // Canonical EXACT public log inverse link: bare `exp(η)` with the
                 // correct IEEE semantics — finite wherever `exp(η)` is representable,
@@ -97,7 +104,25 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 out.push(e.exp());
             }
         }
-        other => {
+        Some(reciprocal @ (LinkFunction::Inverse | LinkFunction::InverseSquared)) => {
+            // μ = η^(−a), a = 1 (inverse) or ½ (inverse-squared), defined only on
+            // η > 0; an η outside the link's domain has no response-scale mean.
+            let exponent = if reciprocal == LinkFunction::Inverse { 1.0 } else { 0.5 };
+            for &e in eta {
+                if !(e > 0.0) {
+                    return Err(format!(
+                        "the {} link maps only eta > 0 to a positive mean; got eta={e}",
+                        reciprocal.name()
+                    ));
+                }
+                out.push(e.powf(-exponent));
+            }
+        }
+        None => {
+            return Err(gam_problem::UnknownLinkName(kind.to_string()).to_string());
+        }
+        Some(other @ (LinkFunction::Sas | LinkFunction::BetaLogistic)) => {
+            let other = other.name();
             return Err(format!(
                 "posterior fitted-mean draws on response scale are not wired for \
                  family_kind={other:?} from the bare string tag; the parameterized \
@@ -137,23 +162,14 @@ pub fn apply_inverse_link_spec_vec(
     eta: &[f64],
     link: &gam_problem::InverseLink,
 ) -> Result<Vec<f64>, String> {
-    use gam_problem::{InverseLink, StandardLink};
+    use gam_problem::InverseLink;
 
     // Standard links have a documented EXACT public response transform (notably
     // unrestricted `exp(eta)` for Log) that accepts inputs outside the solver
     // derivative domain. Keep them on the string path so the public contract is
     // preserved regardless of which entry point is used.
     if let InverseLink::Standard(std_link) = link {
-        let tag = match std_link {
-            StandardLink::Identity => "identity",
-            StandardLink::Log => "log",
-            StandardLink::Logit => "logit",
-            StandardLink::Probit => "probit",
-            StandardLink::CLogLog => "cloglog",
-            StandardLink::LogLog => "loglog",
-            StandardLink::Cauchit => "cauchit",
-        };
-        return apply_inverse_link_vec(eta, tag);
+        return apply_inverse_link_vec(eta, std_link.name());
     }
 
     let mut out = Vec::with_capacity(eta.len());

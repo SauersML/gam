@@ -554,7 +554,7 @@ pub fn run_per_atom_efs(
                         shared_border_correction(topology, &operator, &rho, &gradient)
                     }
                     _ => {
-                        log::debug!(
+                        log::trace!(
                             "[PER-ATOM-EFS] no usable outer Hessian; shared-border \
                              correction deferred to decoupled step for this iter"
                         );
@@ -568,7 +568,7 @@ pub fn run_per_atom_efs(
                         }
                     }
                     Err(err) => {
-                        log::debug!("[PER-ATOM-EFS] shared-border correction skipped: {err}");
+                        log::trace!("[PER-ATOM-EFS] shared-border correction skipped: {err}");
                     }
                 }
             }
@@ -582,7 +582,7 @@ pub fn run_per_atom_efs(
             break;
         }
         if progress.observe(efs.cost, step_inf) {
-            log::info!(
+            log::debug!(
                 "[PER-ATOM-EFS] stopping at an unprogressing walk after {iterations} \
                  iteration(s) at cost={:.6e}: a window bought no resolved improvement and no \
                  smaller step since the previous one; reporting stall (#2817)",
@@ -603,7 +603,7 @@ pub fn run_per_atom_efs(
                 // the coordinator's fallback ladder routes a stalled frontier
                 // fit to a gradient-based primary, exactly as the EFS bridge
                 // does for the dense-K path.
-                log::info!(
+                log::debug!(
                     "[PER-ATOM-EFS] step rejected after {} halvings at cost={:.6e} \
                      (rho_dim={}, border={}); reporting stall",
                     PER_ATOM_MAX_BACKTRACK,

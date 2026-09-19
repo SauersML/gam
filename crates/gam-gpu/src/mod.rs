@@ -170,7 +170,7 @@ pub fn configure_global_policy(policy: GpuPolicy) {
     // First-writer-wins semantics; a late call is ignored, but which policy was
     // dropped is exactly what explains a process that ran on the wrong backend.
     if let Err(rejected) = POLICY.set(policy) {
-        log::debug!(
+        log::trace!(
             "gam-gpu: global policy already configured as {:?}; ignoring the later {rejected:?}",
             POLICY.get()
         );
@@ -339,7 +339,7 @@ impl GpuDecision {
     }
 
     pub fn log(self) {
-        log::debug!(
+        log::trace!(
             "[GPU backend] kernel={} policy={} selected={} reason={} missing_capability={}",
             self.kernel.as_str(),
             self.policy.as_str(),
@@ -361,7 +361,7 @@ pub fn log_backend_inventory_once() {
         } else {
             "none"
         };
-        log::debug!(
+        log::trace!(
             "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference",
             global_policy().as_str(),
             compiled_backends

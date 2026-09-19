@@ -1,7 +1,8 @@
-"""Bug hunt: the automatic-knot ``GamInferenceWarning`` states a rule the engine
-does not implement. It announces a ceiling of ``max(20, cbrt(unique))`` and then
-reports a count that is capped at 8 -- on every default 1-D ``s()`` fit with more
-than 35 unique covariate values, i.e. essentially every real dataset.
+"""Bug hunt: the automatic-knot note (once a ``GamInferenceWarning``, now an
+informational entry in ``model.notes``) states a rule the engine does not
+implement. It announces a ceiling of ``max(20, cbrt(unique))`` and then reports
+a count that is capped at 8 -- on every default 1-D ``s()`` fit with more than
+35 unique covariate values, i.e. essentially every real dataset.
 
 The note is self-describing: it prints the rule, the unique count, the resolved
 ceiling, and the value it chose, so its internal consistency is checkable without
@@ -96,17 +97,18 @@ DIVERGENT = [40, 60, 100, 5000, 100000]
 
 
 def _note_for(unique: int) -> tuple[int, int, int, int]:
-    """Return ``(applied, unique, announced_ceiling, n_coefficients)``."""
-    warnings_mod = importlib.import_module("warnings")
+    """Return ``(applied, unique, announced_ceiling, n_coefficients)``.
+
+    The note is informational (a default the engine chose, not a departure from
+    the request), so it is read from ``model.notes`` rather than from warnings.
+    """
     rng = np.random.default_rng(1)
     x = np.linspace(0.0, 1.0, unique)
     y = np.sin(4.0 * np.pi * x) + 0.3 * rng.standard_normal(unique)
-    with warnings_mod.catch_warnings(record=True) as caught:
-        warnings_mod.simplefilter("always")
-        model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family="gaussian")
-    notes = [_NOTE.search(str(w.message)) for w in caught]
+    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family="gaussian")
+    notes = [_NOTE.search(note) for note in model.notes]
     matched = [m for m in notes if m is not None]
-    assert matched, f"unique={unique}: no automatic-knot note was emitted"
+    assert matched, f"unique={unique}: no automatic-knot note was recorded"
     hit = matched[0]
     return (
         int(hit.group("applied")),

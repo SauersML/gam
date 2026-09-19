@@ -153,7 +153,7 @@ mod spatial_psi_bound_coordinate_tests {
                     },
                     input_scale: Some(input_scale),
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
             level: Default::default(),
@@ -216,7 +216,7 @@ mod spatial_psi_bound_coordinate_tests {
                         },
                         input_scale: Some(input_scale),
                     },
-                    shape: ShapeConstraint::None,
+                    shape: ShapeConstraint::None.into(),
                     joint_null_rotation: None,
                 }],
                 level: Default::default(),
@@ -944,7 +944,7 @@ mod factor_smooth_heldout_group_tests {
                     frozen_global_orthogonality: None,
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }
@@ -1056,7 +1056,7 @@ mod frozen_factor_level_collection_tests {
             frozen_parametric_residualization: None,
             name: name.to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }

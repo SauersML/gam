@@ -74,7 +74,7 @@ struct CapturingLogger {
 
 impl log::Log for CapturingLogger {
     fn enabled(&self, meta: &log::Metadata<'_>) -> bool {
-        meta.level() <= log::Level::Info
+        meta.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         if !self.enabled(record.metadata()) {
@@ -100,7 +100,7 @@ fn install_logger() {
             sink: log_sink().clone(),
         }));
         if log::set_logger(logger).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
 }

@@ -2213,7 +2213,7 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         return (a, b, groups, multiplier_dependence);
     }
     if rank == 0 {
-        log::debug!(
+        log::trace!(
             "rank-reduced active constraints from {} to 0 rows (all active rows numerically zero)",
             k
         );
@@ -2312,7 +2312,7 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
     }
 
     if rank < k {
-        log::debug!(
+        log::trace!(
             "rank-reduced active constraints from {} to {} rows (rank deficiency {})",
             k,
             rank,

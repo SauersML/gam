@@ -24,7 +24,7 @@ pub use gam_linalg_test_support::{
     coefficient_difference_penalty, dense_to_upper_csc, no_densify_design,
 };
 
-// The stderr backend for production's `log::info!` diagnostics is `log` in,
+// The stderr backend for production's `log::debug!` diagnostics is `log` in,
 // stderr out — it owns no model-layer type, so by the rule above it lives in
 // `gam-runtime` (which already owns `span`/`process_monitor`/`loop_progress` and
 // already depends on `log`) and is re-exported here. Without a backend installed

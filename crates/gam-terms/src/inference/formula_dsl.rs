@@ -1631,7 +1631,7 @@ mod tests {
         let c = parse_formula("y ~ C(g) + x").expect("C() parses");
         let f = parse_formula("y ~ factor(g) + x").expect("factor() parses");
         assert_eq!(format!("{:?}", c.terms), format!("{:?}", f.terms));
-        assert!(!random_effect_lenient_unseen("y ~ C(g)"));
+        assert!(categorical_term_is_fixed("y ~ C(g)"));
         // Lowercase `c()` is R's vector constructor, not patsy's C().
         let err = parse_formula("y ~ c(g)").expect_err("c() is not a term");
         assert!(err.to_string().contains("C()"), "{err}");
@@ -3162,12 +3162,11 @@ fn unquote_parsed_term(term: ParsedTerm) -> ParsedTerm {
             prior,
             double_penalty,
         },
-        ParsedTerm::RandomEffect {
-            name,
-            lenient_unseen,
-        } => ParsedTerm::RandomEffect {
+        ParsedTerm::RandomEffect { name } => ParsedTerm::RandomEffect {
             name: unquote_column(&name),
-            lenient_unseen,
+        },
+        ParsedTerm::Factor { name } => ParsedTerm::Factor {
+            name: unquote_column(&name),
         },
         ParsedTerm::Smooth {
             label,
@@ -3904,25 +3903,17 @@ pub fn parse_link_choice(
     }))
 }
 
+/// Parse a link name through the canonical vocabulary in
+/// [`LinkFunction::from_name`]; the error lists [`LinkFunction::ALL`].
 pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
-    match v.trim() {
-        "identity" => Ok(LinkFunction::Identity),
-        "log" => Ok(LinkFunction::Log),
-        "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
-        "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
-        "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
-        "loglog" => Ok(LinkFunction::LogLog),
-        "cauchit" => Ok(LinkFunction::Cauchit),
-        "sas" => Ok(LinkFunction::Sas),
-        "beta-logistic" => Ok(LinkFunction::BetaLogistic),
-        other => Err(FormulaDslError::UnknownIdentifier {
-            reason: format!(
-                "unsupported link type '{other}'; \
-                 use one of identity|log|logit|probit|cloglog|loglog|cauchit|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
-                 Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
-            ),
-        }),
-    }
+    LinkFunction::from_name(v).ok_or_else(|| FormulaDslError::UnknownIdentifier {
+        reason: format!(
+            "{}, blended(...)/mixture(...) or flexible(...). \
+             The formula term `link(type=<type>)`, the mgcv-style `family(<type>)` and \
+             Python's `link=` accept the same set.",
+            gam_problem::types::UnknownLinkName(v.trim().to_string())
+        ),
+    })
 }
 
 pub(crate) fn parse_link_component(v: &str) -> Result<LinkComponent, String> {

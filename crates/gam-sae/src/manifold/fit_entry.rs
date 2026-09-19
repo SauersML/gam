@@ -743,7 +743,7 @@ fn fit_outer_stage_to_boundary(
                         // returns the right verdict; a refusal means the same
                         // thing for the fit, so it returns the same verdict.
                         Err(error) => {
-                            log::debug!(
+                            log::trace!(
                                 "SAE vanished-atom boundary probe refused at the terminal rho \
                                  ({error}); reporting the outer non-convergence it classifies"
                             );
@@ -774,7 +774,7 @@ fn fit_outer_stage_to_boundary(
                         // returns the right verdict; a refusal means the same
                         // thing for the fit, so it returns the same verdict.
                         Err(error) => {
-                            log::debug!(
+                            log::trace!(
                                 "SAE vanished-atom boundary probe refused at the terminal rho \
                                  ({error}); reporting the outer-run failure it classifies"
                             );
@@ -793,7 +793,7 @@ fn fit_outer_stage_to_boundary(
                     // does not get to overwrite the fixed-rho failure it is
                     // classifying.
                     Err(error) => {
-                        log::debug!(
+                        log::trace!(
                             "SAE vanished-atom boundary probe refused at the fixed rho \
                              ({error}); reporting the fit failure it classifies"
                         );

@@ -616,7 +616,7 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
         family, specs, options, layout, rho_prior, start, rho, eval_mode,
     ) {
         Ok(continuation) => {
-            log::info!(
+            log::debug!(
                 "[branch continuation] rho=[{}] from rho=[{}]: {} sub-step attempt(s), certified \
                  contractions [{}]",
                 join_rho(rho),
@@ -632,7 +632,7 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
             Ok(continuation.eval)
         }
         Err(refusal) => {
-            log::info!("[branch continuation] refused: {refusal}");
+            log::debug!("[branch continuation] refused: {refusal}");
             Err(refusal.into_trial_point())
         }
     }

@@ -116,6 +116,12 @@ pub fn render_summary_text(summary: &SummaryPayload) -> String {
             convergence_text,
         ),
     );
+    if !summary.notes.is_empty() {
+        out.push_str("\n  Notes:");
+        for note in &summary.notes {
+            write!(out, "\n    - {note}").expect("writing to a String cannot fail");
+        }
+    }
     out
 }
 
@@ -498,6 +504,7 @@ mod tests {
                     text: "penalized likelihood".to_string(),
                 },
             }),
+            notes: Vec::new(),
         }
     }
 
@@ -624,7 +631,7 @@ Parametric coefficients:
 Intercept       1.5        0.05       30   < 2e-16  ***
 x1            -0.25       0.125       NA        NA
 g[b]            0.5        0.25        2    0.0484  *
-g[c]         -0.125        0.25     -0.5     0.618
+g[c]         -0.125        0.25     -0.5    0.6180
   x1: the coefficient is bounded, so the null can sit on the constraint boundary where the normal reference does not hold; no p-value is reported
   Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
 

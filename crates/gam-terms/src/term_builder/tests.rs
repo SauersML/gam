@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::basis::{OperatorPenaltySpec, PenaltySource};
+use crate::smooth::ShapeConstraint;
 use crate::inference::formula_dsl::parse_formula;
 use gam_data::{DataSchema, SchemaColumn};
 use ndarray::{Array1, Array2, array};
@@ -665,7 +666,7 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
             frozen_parametric_residualization: None,
             name: "spatial".to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2416,6 +2417,51 @@ fn tensor_margin_leaves_cr_only_when_the_request_needs_a_bspline() {
         BSplineKnotSpec::PeriodicUniform { .. }
     ));
     assert!(is_cr(&periodic[1]));
+}
+
+/// A shaped te() needs every margin to be a non-negative B-spline basis: the
+/// shaped margin for its control-point cone, the others because they weight
+/// the shaped fibres. Unset `bs=` therefore becomes all-ps, and an explicit
+/// cr margin is refused rather than fitted with an uncertified shape.
+#[test]
+fn shaped_tensor_defaults_every_margin_to_a_bspline_and_refuses_cr() {
+    let ds = continuous_dataset(
+        &["y", "x", "z"],
+        (0..200)
+            .map(|i| {
+                let x = (i % 20) as f64 / 19.0;
+                let z = (i / 20) as f64 / 9.0;
+                vec![x + z, x, z]
+            })
+            .collect(),
+    );
+    let col_map = ds.column_map();
+    let build = |formula: &str| {
+        let parsed = parse_formula(formula).expect("parse");
+        let mut notes = Vec::new();
+        build_termspec(&parsed.terms, &ds, &col_map, &mut notes).map_err(|e| e.to_string())
+    };
+    let terms = build("y ~ te(x, z, k=5, shape=[monotone_increasing, none])")
+        .expect("shaped te builds");
+    let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("expected a tensor spec");
+    };
+    assert!(
+        spec.marginalspecs.iter().all(|m| !matches!(
+            m.knotspec,
+            BSplineKnotSpec::NaturalCubicRegression { .. }
+        )),
+        "a shaped te() must not default any margin to cr"
+    );
+    crate::smooth::build_term_collection_design(ds.values.view(), &terms)
+        .expect("the all-ps shaped tensor realizes its cone");
+
+    let explicit_cr = build("y ~ te(x, z, k=5, bs=[ps, cr], shape=[monotone_increasing, none])")
+        .expect("the term spec itself is well formed");
+    let err = crate::smooth::build_term_collection_design(ds.values.view(), &explicit_cr)
+        .expect_err("a cr margin cannot weight shaped fibres")
+        .to_string();
+    assert!(err.contains("negative values"), "{err}");
 }
 
 /// #2781/#2782/#2783 guard: no whitelisted smooth option may be accepted
