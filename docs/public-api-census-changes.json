@@ -4604,5 +4604,13 @@
     },
     "reason": "gh#2263 F3: kl_measurement_floor is now the one owner of a KL measurement's floor, max(B, control), and returns the band B beside it. kl_measurement_band_nats stays as its private component, so a caller cannot rebuild the floor as band.max(control) beside the owner. The function and its formula are unchanged; only its visibility narrows.",
     "evidence": "public_api_census.py, run with this base and the landing commit, reports exactly this identity. git grep -w kl_measurement_band_nats finds it only in crates/gam-sae/src/inference/intervention_shard.rs at the head tree: its definition, kl_measurement_floor, and the module's tests. cargo nextest run -p gam-sae --lib on the intervention_shard tests passes, including a_measurement_floor_is_its_band_raised_only_by_stochastic_control_evidence_2263."
+  },
+  {
+    "base": "c14c88d3ab59a78e5741d37a295c4132826cab29",
+    "removed": {
+      "crates/gam-models/src/survival/location_scale/time_block.rs::append_linear_constraints": 1
+    },
+    "reason": "gam#3037: append_linear_constraints concatenated the flexible survival location-scale time block's coordinate cone with its per-row derivative-guard rows. The cone implies every guard row, so the block now declares the cone alone and nothing concatenates two time constraint systems. It was pub(crate), with one caller.",
+    "evidence": "public_api_census.py, run without this acknowledgement against a candidate with this change, reported exactly this identity as removed (13546 public function declarations before, 13545 after). git grep finds append_linear_constraints only at its declaration and its one call in prepare_identified_time_block, both in time_block.rs, which this commit replaces."
   }
 ]
