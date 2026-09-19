@@ -249,6 +249,7 @@ fn value_central_difference(
         estimates.push((step, (plus - minus) / (2.0 * step), plus.abs().max(minus.abs())));
         step *= 0.5;
     }
+    eprintln!("[2930-LADDER] j={j} rungs={:?}", estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>());
     let (index, settle) = (1..estimates.len())
         .map(|i| (i, (estimates[i - 1].1 - estimates[i].1).abs()))
         .min_by(|left, right| left.1.total_cmp(&right.1))
