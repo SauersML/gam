@@ -2974,10 +2974,9 @@ pub(crate) fn build_smooth_basis(
             // effects by default. An explicit `double_penalty=false` is the
             // MLE-style opt-out.
             let double_penalty = smooth_double_penalty;
-            // Clamp the marginal difference penalty to `<= effective_degree`
-            // so it stays well-defined when the per-axis degree was reduced
-            // (mirrors the tensor margin path: `create_difference_penalty_matrix`
-            // requires order < num_basis_functions).
+            // Clamp the derivative-penalty order to `<= effective_degree` so
+            // `∫(f^(m))²` stays well-defined (nonzero `m`-th derivative) when the
+            // per-axis degree was reduced; the tensor margin path clamps the same way.
             let penalty_order = option_usize(options, "penalty_order")
                 .unwrap_or(DEFAULT_PENALTY_ORDER)
                 .min(effective_degree);
@@ -3917,9 +3916,8 @@ pub(crate) fn build_smooth_basis(
                 // shared `degree=` request. We mirror that: if the caller
                 // explicitly asks for `k < degree + 1`, drop the degree on
                 // THAT axis only to the largest feasible spline, and track the
-                // penalty order so the marginal difference penalty stays
-                // well-defined (`order < num_basis_functions` is required by
-                // `create_difference_penalty_matrix`). Apply the same
+                // penalty order so the marginal derivative penalty `∫(f^(m))²`
+                // stays well-defined (`m ≤ degree`). Apply the same
                 // per-margin degree shrinkage to periodic tensor margins too:
                 // a cyclic marginal basis with k=3 cannot be cubic, but it is
                 // still a valid lower-degree cyclic margin with dimension k,
@@ -4550,7 +4548,7 @@ pub(crate) fn default_cyclic_basis_dim(default_internal: usize, degree: usize) -
 fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
     let d = cols.len().max(1);
     let degree = DEFAULT_BSPLINE_DEGREE;
-    let min_k = degree + 2; // smallest margin that carries a difference penalty
+    let min_k = degree + 2; // smallest margin that carries a roughness penalty
     let n = ds.values.nrows();
 
     // Per-margin 1-D ceiling: never request more basis functions than the
