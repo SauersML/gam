@@ -238,16 +238,27 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
                          (skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null) \
                          + bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
         },
-        // Wood smooth Wald test + Bartlett/Lawley LR correction (#1873).
-        // The family sweep gates the size per response family (IRLS weights,
-        // scale predicate, χ²/F reference all change with the family).
+        // Wood smooth Wald test + Bartlett/Lawley LR correction (#1873), for
+        // smooths with an unpenalized null space.
         CalibrationTarget {
             name: "wood_smooth_test_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
             guards: &[1873],
-            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test \
-                         + sbc_wood_smooth_test_family_size_curve",
+            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
+        },
+        // Variance-component score test (exact spectral reference) of
+        // random-effect blocks and of smooths whose penalties cover every
+        // direction, the default double-penalty `s()` included. The family
+        // sweeps gate size two-sided (IRLS weights, scale predicate and
+        // reference law all change with the family).
+        CalibrationTarget {
+            name: "variance_component_test_pvalue",
+            kind: SurfaceKind::TestPValue,
+            mode: AuditMode::TestSizeCurve,
+            guards: &[],
+            audited_by: "sbc_double_penalty_smooth_family_size_curve \
+                         + sbc_random_effect_variance_component_size_curve",
         },
         // Multinomial per-class Wood smooth test (#1891 follow-up): the SAME
         // shared `wood_smooth_test` primitive as `wood_smooth_test_pvalue`

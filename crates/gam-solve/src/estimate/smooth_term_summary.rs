@@ -48,7 +48,9 @@ use crate::estimate::summary::{
 };
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_terms::basis::{BasisMetadata, PenaltySource};
-use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
+use gam_terms::inference::variance_component_test::{
+    VarianceComponentTestOutcome, VarianceComponentTestRecord,
+};
 use gam_terms::inference::smooth_test::{
     SmoothTestInput, SmoothTestScale, wood_smooth_test,
 };
@@ -67,11 +69,14 @@ use ndarray::Array2;
 /// covariance, which is the documented behaviour for a persisted model whose
 /// Gram was not serialized.
 ///
-/// Random-effect rows do not use the Wald test: their null `σ²_b = 0` is on the
-/// boundary, where a coefficient Wald `χ²` has no valid reference. They carry
-/// the variance-component score test the fit recorded in
-/// `FitArtifacts::random_effect_tests` (exact spectral reference; see
-/// `gam_terms::inference::random_effect_test`), or its typed absence.
+/// Random-effect rows, and the rows of smooths whose penalties cover every
+/// coefficient direction (the default double-penalty smooth, shrinkage bases,
+/// tensor smooths with a null-space penalty), do not use the Wald test: their
+/// null "every variance is 0" is on the boundary, where a coefficient Wald `χ²`
+/// has no valid reference. They carry the variance-component score test the
+/// fit recorded in `FitArtifacts::variance_component_tests` (exact spectral
+/// reference; see `gam_terms::inference::variance_component_test`), or its
+/// typed absence.
 pub fn smooth_term_summary_rows(
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -160,29 +165,8 @@ pub fn smooth_term_summary_rows(
         // the score test the fit recorded for this exact term — matched by name
         // AND coefficient range, so a replayed design whose layout drifted from
         // the training one finds no record rather than a neighbour's.
-        let recorded = fit
-            .artifacts
-            .random_effect_tests
-            .iter()
-            .find(|record| record.term == *name && record.coefficient_range == *range)
-            .map(|record| &record.outcome);
-        let (ref_df, chi_sq, pvalue, pvalue_unavailable) = match recorded {
-            Some(RandomEffectTestOutcome::Tested(test)) => {
-                (test.reference_df, Some(test.statistic), Some(test.p_value), None)
-            }
-            Some(RandomEffectTestOutcome::Unavailable { reason }) => (
-                edf.max(0.0),
-                None,
-                None,
-                Some(SmoothPValueUnavailable::RandomEffect(*reason)),
-            ),
-            None => (
-                edf.max(0.0),
-                None,
-                None,
-                Some(SmoothPValueUnavailable::RandomEffectTestNotRecorded),
-            ),
-        };
+        let (ref_df, chi_sq, pvalue, pvalue_unavailable) =
+            variance_component_row(recorded_test(fit, name, range), edf);
         rows.push(SmoothTermSummary {
             name: name.clone(),
             edf,
@@ -221,6 +205,25 @@ pub fn smooth_term_summary_rows(
         let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k);
         penalty_cursor += k;
+        // A smooth whose penalties cover every direction has its null on the
+        // variance boundary, so its row is the recorded variance-component
+        // test, exactly as for a random effect above.
+        if design.smooth_variance_component_penalties(term).is_some() {
+            let (ref_df, chi_sq, pvalue, pvalue_unavailable) =
+                variance_component_row(recorded_test(fit, &term.name, &global_range), edf);
+            rows.push(SmoothTermSummary {
+                name: term.name.clone(),
+                edf,
+                ref_df,
+                chi_sq,
+                pvalue,
+                continuous_order: continuous_order_for_term(design, fit, term_penalty_start, k),
+                basis_note: basis_note(term),
+                edf_rank_bound,
+                pvalue_unavailable,
+            });
+            continue;
+        }
         let pvalue_unavailable = smooth_pvalue_unavailable(&term.shape);
         let smooth_test = if pvalue_unavailable.is_none() {
             cov_forwald.and_then(|cov| {
@@ -253,18 +256,62 @@ pub fn smooth_term_summary_rows(
             chi_sq: smooth_test.as_ref().map(|test| test.statistic),
             pvalue: smooth_test.as_ref().map(|test| test.p_value),
             continuous_order: continuous_order_for_term(design, fit, term_penalty_start, k),
-            basis_note: match &term.metadata {
-                BasisMetadata::BSpline1D {
-                    auto_shrink_note, ..
-                } => auto_shrink_note.clone(),
-                _ => None,
-            },
+            basis_note: basis_note(term),
             edf_rank_bound,
             pvalue_unavailable,
         });
     }
 
     rows
+}
+
+fn basis_note(term: &gam_terms::smooth::SmoothTerm) -> Option<String> {
+    match &term.metadata {
+        BasisMetadata::BSpline1D {
+            auto_shrink_note, ..
+        } => auto_shrink_note.clone(),
+        _ => None,
+    }
+}
+
+/// The variance-component test the fit recorded for this exact term — matched
+/// by name AND global coefficient range, so a replayed design whose layout
+/// drifted from the training one finds no record rather than a neighbour's.
+fn recorded_test<'a>(
+    fit: &'a UnifiedFitResult,
+    name: &str,
+    range: &std::ops::Range<usize>,
+) -> Option<&'a VarianceComponentTestRecord> {
+    fit.artifacts
+        .variance_component_tests
+        .iter()
+        .find(|record| record.term == name && record.coefficient_range == *range)
+}
+
+/// `(ref_df, statistic, p-value, reason)` of a row read from its recorded
+/// variance-component test; without a p-value the row's reference d.f. is its
+/// EDF.
+fn variance_component_row(
+    record: Option<&VarianceComponentTestRecord>,
+    edf: f64,
+) -> (f64, Option<f64>, Option<f64>, Option<SmoothPValueUnavailable>) {
+    match record.map(|record| &record.outcome) {
+        Some(VarianceComponentTestOutcome::Tested(test)) => {
+            (test.reference_df, Some(test.statistic), Some(test.p_value), None)
+        }
+        Some(VarianceComponentTestOutcome::Unavailable { reason }) => (
+            edf.max(0.0),
+            None,
+            None,
+            Some(SmoothPValueUnavailable::VarianceComponent(*reason)),
+        ),
+        None => (
+            edf.max(0.0),
+            None,
+            None,
+            Some(SmoothPValueUnavailable::VarianceComponentTestNotRecorded),
+        ),
+    }
 }
 
 /// The whitening Gram with the intercept direction projected out,

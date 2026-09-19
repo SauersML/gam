@@ -56,13 +56,17 @@ pub enum SmoothPValueUnavailable {
     ///   REML-selected λ shrink every face together, and the mixture weights
     ///   move with them.
     ShapeConstrained,
-    /// A random-effect term whose variance-component score test
-    /// (`gam_terms::inference::random_effect_test`) could not be computed, with
-    /// the test's own reason.
-    RandomEffect(gam_terms::inference::random_effect_test::RandomEffectTestUnavailable),
-    /// A random-effect term the fit carries no test record for: a model saved
-    /// before the test existed, or a fit route that does not compute it.
-    RandomEffectTestNotRecorded,
+    /// A random-effect term, or a smooth whose penalties cover every direction,
+    /// whose variance-component score test
+    /// (`gam_terms::inference::variance_component_test`) could not be computed,
+    /// with the test's own reason.
+    VarianceComponent(
+        gam_terms::inference::variance_component_test::VarianceComponentTestUnavailable,
+    ),
+    /// A term tested by the variance-component test that the fit carries no
+    /// record for: a model saved before the test covered it, or a fit route
+    /// that does not compute it.
+    VarianceComponentTestNotRecorded,
 }
 
 impl SmoothPValueUnavailable {
@@ -70,8 +74,8 @@ impl SmoothPValueUnavailable {
     pub fn label(self) -> &'static str {
         match self {
             Self::ShapeConstrained => "shape_constrained",
-            Self::RandomEffect(reason) => reason.label(),
-            Self::RandomEffectTestNotRecorded => "random_effect_test_not_recorded",
+            Self::VarianceComponent(reason) => reason.label(),
+            Self::VarianceComponentTestNotRecorded => "variance_component_test_not_recorded",
         }
     }
 
@@ -83,9 +87,9 @@ impl SmoothPValueUnavailable {
                  chi-square, spectral or chi-bar-square reference is valid for the truncated \
                  posterior mean; no p-value is reported"
             }
-            Self::RandomEffect(reason) => reason.explanation(),
-            Self::RandomEffectTestNotRecorded => {
-                "the fit carries no variance-component test for this random effect"
+            Self::VarianceComponent(reason) => reason.explanation(),
+            Self::VarianceComponentTestNotRecorded => {
+                "the fit carries no variance-component test for this term"
             }
         }
     }

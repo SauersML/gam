@@ -262,10 +262,11 @@ mod whitening_gram_tests {
 /// This is marshalling, not a second summary: the table comes from
 /// `gam_solve::estimate::smooth_term_summary_rows`, the one walk of the
 /// fit's penalty layout that the in-process CLI summary also uses (#2470).
-/// Random-effect blocks get the variance-component score test the fit recorded
-/// (`FitArtifacts::random_effect_tests`, scored against its exact boundary null
-/// law, not a Wald χ²), and penalized smooth terms get the Wood (2013)
-/// rank-truncated Wald statistic and p-value.
+/// Random-effect blocks and smooths whose penalties cover every direction get
+/// the variance-component score test the fit recorded
+/// (`FitArtifacts::variance_component_tests`, scored against its exact boundary
+/// null law, not a Wald χ²), and the other penalized smooth terms get the Wood
+/// (2013) rank-truncated Wald statistic and p-value.
 ///
 /// The "Mirrors `main.rs::build_model_summary`'s smooth-term loop" this
 /// sentence used to open with was accurate and was the problem: a comment
@@ -896,11 +897,11 @@ pub struct SummaryCoefficientRow {
 
 /// Per-smooth significance row for the FFI summary — the canonical mgcv
 /// `summary.gam` smooth-term table (`edf`, reference d.f., test statistic, and
-/// p-value). Random-effect blocks carry the score test of their variance
-/// component `σ²_b = 0` scored against its exact finite-sample null law (the
-/// boundary null is not a Wald χ²; see
-/// `gam_terms::inference::random_effect_test`), with `ref_df` its effective
-/// d.f.; penalized smooth terms carry the
+/// p-value). Random-effect blocks and fully penalized smooths carry the score
+/// test of their variance components at zero scored against its exact
+/// finite-sample null law (the boundary null is not a Wald χ²; see
+/// `gam_terms::inference::variance_component_test`), with `ref_df` its
+/// effective d.f.; the other penalized smooth terms carry the
 /// Wood (2013) rank-truncated Wald `chi_sq` / `p_value`. The shape mirrors the
 /// CLI's `SmoothTermSummary`.
 ///

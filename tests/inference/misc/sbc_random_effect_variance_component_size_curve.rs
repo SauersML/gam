@@ -8,7 +8,7 @@
 //! p-value at all. It now carries the Lin (1997) / Wood (2013) score test of
 //! `σ²_b = 0` scored against its exact finite-sample null law (a weighted sum
 //! of `χ²₁`, ratioed against the residual `χ²` when the scale is estimated);
-//! `gam_terms::inference::random_effect_test` derives it.
+//! `gam_terms::inference::variance_component_test` derives it.
 //!
 //! Audit: `y ~ s(x1) + group(g)` with a real `s(x1)`, `L = 20` UNBALANCED
 //! levels (level shares proportional to the squares of a uniform draw, every

@@ -162,9 +162,10 @@ include!("smooth_term_lr.rs");
 // as the LR test above: a self-contained inference subsystem over the driver's
 // fit, kept out of the driver file for the same reason.
 include!("basis_adequacy.rs");
-// The per-term random-effect variance-component test. Reads the same retained
-// IRLS row state as the basis-adequacy report above.
-include!("random_effect_test.rs");
+// The per-term variance-component test (random effects and fully penalized
+// smooths). Reads the same retained IRLS row state as the basis-adequacy report
+// above.
+include!("variance_component_test.rs");
 
 #[cfg(test)]
 mod test_support {
