@@ -15,7 +15,8 @@ seeded ``default_rng``, so a failing record is reproduced exactly by
 
 Triage a run with ``python -m pygam_compare.fuzz_terms RUN_DIR [...]``: every
 rep that raised, hung, did not certify or predicted a non-finite value is
-tabulated by cause, term kind, family and n.
+tabulated by cause, term kind, family and n. A later input overrides an
+earlier record of the same rep, so a ``--designs`` re-run folds into its run.
 
 Held-out rows reuse the training levels of every *fixed* categorical column
 (a level unseen in training is a documented schema mismatch for a fixed
@@ -164,14 +165,22 @@ def _term_formula(t: TermSpec) -> str:
 
 
 def _level_codes(
-    rng: np.random.Generator, rows: int, levels: int, alpha: float, singleton: bool
+    rng: np.random.Generator,
+    rows: int,
+    train_rows: int,
+    levels: int,
+    alpha: float,
+    singleton: bool,
 ) -> NDArray[np.int64]:
     probs = rng.dirichlet(np.full(levels, alpha))
     codes = rng.choice(levels, size=rows, p=probs)
     if singleton and levels >= 2 and rows >= 2:
-        # Force the last level to hold exactly one training row.
+        # Force the last level to hold exactly one training row. The draw is
+        # folded into the training half (the first ``train_rows`` rows), so the
+        # level is never held out only; folding rather than redrawing keeps the
+        # generator stream, so every other case draws the same data as before.
         codes[codes == levels - 1] = 0
-        codes[int(rng.integers(rows))] = levels - 1
+        codes[int(rng.integers(rows)) % train_rows] = levels - 1
     return codes
 
 
@@ -186,7 +195,11 @@ class FuzzData:
 
 
 def _signal(
-    t: TermSpec, rng: np.random.Generator, rows: int, cols: dict[str, Any]
+    t: TermSpec,
+    rng: np.random.Generator,
+    rows: int,
+    train_rows: int,
+    cols: dict[str, Any],
 ) -> FloatArray:
     c = t.col
     p = t.params
@@ -205,7 +218,9 @@ def _signal(
         return np.sin(2 * np.pi * a) + (b - 0.5) ** 2 + 2 * (a - 0.5) * (b - 0.5)
     if t.kind == "by_factor":
         x = u()
-        codes = _level_codes(rng, rows, p["levels"], p["alpha"], p["singleton"])
+        codes = _level_codes(
+            rng, rows, train_rows, p["levels"], p["alpha"], p["singleton"]
+        )
         cols[c("bx")] = x
         cols[c("bg")] = codes
         phase = rng.uniform(0.0, 2 * np.pi, p["levels"])
@@ -217,11 +232,13 @@ def _signal(
         cols[c("nx")], cols[c("nz")] = x, z
         return z * np.sin(2 * np.pi * x) * 0.5
     if t.kind == "factor":
-        codes = _level_codes(rng, rows, p["levels"], p["alpha"], p["singleton"])
+        codes = _level_codes(
+            rng, rows, train_rows, p["levels"], p["alpha"], p["singleton"]
+        )
         cols[c("fg")] = codes
         return rng.normal(0.0, 0.5, p["levels"])[codes]
     if t.kind == "group":
-        codes = _level_codes(rng, rows, p["levels"], p["alpha"], False)
+        codes = _level_codes(rng, rows, train_rows, p["levels"], p["alpha"], False)
         cols[c("gg")] = codes
         return rng.normal(0.0, 0.4, p["levels"])[codes]
     if t.kind == "cyclic":
@@ -257,7 +274,7 @@ def draw(case: int, n: int, family: str, seed: int) -> FuzzData:
     cols: dict[str, Any] = {}
     eta = np.zeros(rows)
     for t in terms:
-        eta += _signal(t, rng, rows, cols)
+        eta += _signal(t, rng, rows, n, cols)
     eta = eta - eta.mean()
     scale = np.std(eta)
     if scale > 0:
@@ -408,18 +425,29 @@ def triage(records: list[dict[str, Any]]) -> str:
 
 
 def _load(paths: list[str]) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
+    """Records of every input; a rep recorded again in a later input (a
+    ``--designs`` re-run) replaces the earlier record of the same rep."""
+    records: dict[tuple[Any, ...], dict[str, Any]] = {}
     for raw in paths:
         path = Path(raw)
         if path.is_dir():
             path = path / "records.jsonl"
-        records.extend(json.loads(ln) for ln in path.read_text().splitlines() if ln)
-    return records
+        for ln in path.read_text().splitlines():
+            if ln:
+                rec = json.loads(ln)
+                key = (rec["lib"], rec["family"], rec["n"], rec["design"], rec["seed"])
+                records[key] = rec
+    return list(records.values())
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Triage fuzz_terms records by failure cause.")
-    ap.add_argument("inputs", nargs="+", help="run directories or records.jsonl files")
+    ap.add_argument(
+        "inputs",
+        nargs="+",
+        help="run directories or records.jsonl files; a later input's record "
+        "of a rep replaces an earlier one",
+    )
     ap.add_argument("--out", type=Path, help="write the markdown here instead of stdout")
     args = ap.parse_args(argv)
     text = triage(_load(args.inputs))
