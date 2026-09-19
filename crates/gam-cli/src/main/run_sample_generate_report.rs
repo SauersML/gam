@@ -368,9 +368,17 @@ pub(crate) fn run_generate_unified(
 pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
     reject_multinomial_model(&args.model, "summary")?;
     let model = SavedModel::load_from_path(&args.model)?;
-    // One renderer owns the text; gamfit's `Model.summary()` prints the same
-    // string from the same payload.
-    let text = render_summary_text(&saved_model_summary(&model)?);
+    let summary = saved_model_summary(&model)?;
+    // `--json` prints the payload itself, the document gamfit's
+    // `Model.summary()` reads; otherwise one renderer owns the text, and
+    // gamfit prints the same string from the same payload.
+    let text = if args.json {
+        serde_json::to_string_pretty(&summary)
+            .map(|json| json + "\n")
+            .map_err(|err| format!("failed to serialize summary: {err}"))?
+    } else {
+        render_summary_text(&summary)
+    };
     use std::io::Write as _;
     std::io::stdout()
         .write_all(text.as_bytes())

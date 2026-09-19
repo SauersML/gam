@@ -4784,19 +4784,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
+    module.add_class::<PyFittedModel>()?;
     module.add_function(wrap_pyfunction!(compile_model, module)?)?;
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
-    module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
-    module.add_function(wrap_pyfunction!(fit_notes_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        required_saved_model_payload_string,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
     module.add_function(wrap_pyfunction!(is_multinomial_family_name, module)?)?;
     module.add("RESPONSE_GEOMETRY_SCHEMA", RESPONSE_GEOMETRY_SCHEMA)?;
-    module.add_function(wrap_pyfunction!(saved_model_predict_class_name, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_class_traits, module)?)?;
     module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
@@ -4815,6 +4809,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_model_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(transformation_score_table, module)?)?;
+    module.add_function(wrap_pyfunction!(residuals_table, module)?)?;
     module.add_function(wrap_pyfunction!(ctn_required_fit_columns, module)?)?;
     module.add_function(wrap_pyfunction!(required_model_columns, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table_conformal, module)?)?;
@@ -6937,8 +6932,8 @@ fn load_model_impl(model_bytes: &[u8]) -> Result<FittedModel, String> {
     Ok(model)
 }
 
-fn extend_model_with_group_impl(model_bytes: &[u8], request_json: &str) -> Result<Vec<u8>, String> {
-    let mut model = load_model_impl(model_bytes)?;
+fn extend_model_with_group_impl(model: &FittedModel, request_json: &str) -> Result<Vec<u8>, String> {
+    let mut model = model.clone();
     // Refuse non-standard model classes here rather than leaning on the core
     // guard, so the Python error keeps naming the fine-grained saved-family
     // label (`competing risks survival`, `latent binary`, …) that only the FFI
@@ -7144,11 +7139,10 @@ fn predict_encoded_table_configured_impl(
 }
 
 fn predict_array_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     x: ArrayView2<'_, f64>,
     options_json: Option<&str>,
 ) -> Result<Array2<f64>, String> {
-    let model = load_model_impl(model_bytes)?;
     let model_class = model.predict_model_class();
     let dataset = dataset_from_x_array_with_model_schema(&model, x)?;
     if matches!(model_class, PredictModelClass::Survival) {
@@ -7535,13 +7529,12 @@ fn predict_columns(
 }
 
 fn predict_encoded_table_conformal_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
     calibration_source: EncodedDataset,
     conformal_level: f64,
     options_json: Option<&str>,
 ) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
     let options = parse_predict_options(options_json)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let calibration = dataset_with_model_schema_from_encoded(&model, &calibration_source)?;
@@ -7596,18 +7589,28 @@ fn predict_encoded_table_conformal_impl(
 /// calibration fold.
 ///
 /// Evaluated by `gam_predict::conformal_routes::full_conformal_prediction_columns`
-/// on the prediction rows projected onto the model schema.
+/// on the prediction rows and the labeled rows, both projected onto the model
+/// schema.
 fn predict_encoded_table_full_conformal_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
+    training_source: EncodedDataset,
     conformal_level: f64,
 ) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
-    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
+    let dataset = dataset_with_model_schema_from_encoded(model, &source)?;
+    let training = dataset_with_model_schema_from_encoded(model, &training_source)?;
+    let test_col_map = dataset.column_map();
+    let training_col_map = training.column_map();
     let columns = gam_predict::conformal_routes::full_conformal_prediction_columns(
-        &model,
-        dataset.values.view(),
-        &dataset.column_map(),
+        model,
+        &gam_predict::conformal_routes::DesignRows {
+            data: dataset.values.view(),
+            col_map: &test_col_map,
+        },
+        &gam_predict::conformal_routes::DesignRows {
+            data: training.values.view(),
+            col_map: &training_col_map,
+        },
         conformal_level,
     )?;
     serde_json::to_string(&PredictionPayload {
@@ -7634,9 +7637,11 @@ fn predict_encoded_table_full_conformal_impl(
 /// Full-conformal prediction intervals at frozen smoothing parameters — no
 /// held-out calibration fold required (#1098 / #942 Layer 1).
 ///
-/// Routes `predict(interval='conformal')` without a calibration fold to the
-/// `ExactFullConformalSubstrate` precomputed at fit time. The set is exact
-/// given the frozen `Sλ`; the distribution-free finite-sample
+/// Routes `predict(interval='conformal', training_data=...)` to the exact
+/// full-conformal set: the saved model carries only the frozen `p x p` penalty
+/// `Sλ`, and the labeled `(training_headers, training_rows)` — which must
+/// contain the response column — supply the design and responses the set
+/// augments. The set is exact given the frozen `Sλ`; the distribution-free finite-sample
 /// ≥`conformal_level` marginal-coverage theorem additionally requires the
 /// symmetric ρ-re-selecting fit and is certified per row only where the
 /// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, on the
@@ -7645,18 +7650,25 @@ fn predict_encoded_table_full_conformal_impl(
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,
 /// weighted, scan-routed, …) directing the user to split conformal.
-#[pyfunction(signature = (model_bytes, headers, rows, conformal_level=0.9))]
+#[pyfunction(signature = (model, headers, rows, training_headers, training_rows, conformal_level=0.9))]
 fn predict_table_full_conformal(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
+    training_headers: Vec<String>,
+    training_rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
+    training_rows
+        .require_headers(&training_headers)
+        .map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
+    let training = training_rows.dataset.clone();
     detach_py_result(py, "predict_table_full_conformal", move || {
-        predict_encoded_table_full_conformal_impl(&model_bytes, dataset, conformal_level)
+        predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level)
     })
 }
 
@@ -7676,16 +7688,17 @@ fn predict_table_full_conformal(
 #[pyfunction]
 fn generative_replicates(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     n_draws: usize,
     seed: u64,
 ) -> PyResult<PyObject> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let result =
-        py.detach(|| generative_replicates_encoded_impl(&model_bytes, dataset, 0, n_draws, seed));
+        py.detach(|| generative_replicates_encoded_impl(&model, dataset, 0, n_draws, seed));
     match result {
         Ok((flat, n_rows)) => {
             let arr = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat)
@@ -7704,17 +7717,18 @@ fn generative_replicates(
 #[pyfunction]
 fn generative_replicate_chunk(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     draw_start: usize,
     n_draws: usize,
     seed: u64,
 ) -> PyResult<PyObject> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let result = py.detach(|| {
-        generative_replicates_encoded_impl(&model_bytes, dataset, draw_start, n_draws, seed)
+        generative_replicates_encoded_impl(&model, dataset, draw_start, n_draws, seed)
     });
     match result {
         Ok((flat, n_rows)) => {
@@ -7728,14 +7742,13 @@ fn generative_replicate_chunk(
 }
 
 fn generative_replicates_encoded_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
     draw_start: usize,
     n_draws: usize,
     seed: u64,
 ) -> Result<(Vec<f64>, usize), String> {
     use gam::inference::generative::sampleobservation_seeded_replicates;
-    let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let col_map = dataset.column_map();
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
@@ -7893,19 +7906,17 @@ fn affine_design_for_dataset(
 }
 
 fn affine_design_encoded_table_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
 ) -> Result<DenseAffineDesign, String> {
-    let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     affine_design_for_dataset(&model, dataset)
 }
 
 fn affine_design_array_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     x: ArrayView2<'_, f64>,
 ) -> Result<DenseAffineDesign, String> {
-    let model = load_model_impl(model_bytes)?;
     let dataset = dataset_from_x_array_with_model_schema(&model, x)?;
     affine_design_for_dataset(&model, dataset)
 }
@@ -7922,11 +7933,10 @@ struct PartialDependenceOutput {
 /// `gam_predict::term_diagnostics::term_partial_dependence` on the model's
 /// mean-block design at the grid rows, with the covariance the fit publishes.
 fn model_partial_dependence_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     term: &str,
     grid: gam::inference::partial_dependence::PartialDependenceGrid,
 ) -> Result<PartialDependenceOutput, String> {
-    let model = load_model_impl(model_bytes)?;
     let payload = model.payload();
     let schema = payload
         .data_schema
@@ -7970,7 +7980,7 @@ fn model_partial_dependence_impl(
          partial-dependence standard errors"
             .to_string()
     })?;
-    let blocks = term_blocks_for_model_impl(model_bytes)?;
+    let blocks = term_blocks_for_model_impl(model)?;
     let (start, end) = blocks
         .iter()
         .find(|(name, _, _, _)| name.as_str() == term)
@@ -7998,15 +8008,14 @@ fn model_partial_dependence_impl(
 /// `gam_predict::term_diagnostics::term_variance_shares` on the model's
 /// mean-block design at the caller's grid rows.
 fn model_variance_share_encoded_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
     term: Option<String>,
 ) -> Result<Vec<(String, f64)>, String> {
-    let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let x = standard_mean_design_dense(&model, dataset)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model_bytes)?
+    let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model)?
         .into_iter()
         .filter(|(name, kind, _, _)| {
             kind.as_str() != "intercept" && term.as_deref().is_none_or(|t| name.as_str() == t)
@@ -8019,11 +8028,12 @@ fn model_variance_share_encoded_impl(
 #[pyfunction]
 fn model_partial_dependence<'py>(
     py: Python<'py>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     term: String,
     grid: Option<PyReadonlyArray2<'py, f64>>,
     n_points: usize,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     use gam::inference::partial_dependence::{
         HeldValue, PARTIAL_DEPENDENCE_SCALE, PartialDependenceGrid,
     };
@@ -8032,7 +8042,7 @@ fn model_partial_dependence<'py>(
         None => PartialDependenceGrid::TrainingRange { n_points },
     };
     let output = detach_py_result(py, "model_partial_dependence", move || {
-        model_partial_dependence_impl(&model_bytes, &term, grid)
+        model_partial_dependence_impl(&model, &term, grid)
     })?;
     let contribution = output.table.contribution();
     let table = output.table;
@@ -8056,18 +8066,19 @@ fn model_partial_dependence<'py>(
     Ok(out.unbind())
 }
 
-#[pyfunction(signature = (model_bytes, headers, rows, term = None))]
+#[pyfunction(signature = (model, headers, rows, term = None))]
 fn model_variance_share(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     term: Option<String>,
 ) -> PyResult<Vec<(String, f64)>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "model_variance_share", move || {
-        model_variance_share_encoded_impl(&model_bytes, dataset, term)
+        model_variance_share_encoded_impl(&model, dataset, term)
     })
 }
 

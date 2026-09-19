@@ -71,7 +71,7 @@ pub(crate) fn outer_decrement_bands(
     cost: f64,
     evidence: &CertificateEvidence,
 ) -> Result<(opt::DecrementBands, ObjectiveBand), DecrementVerdictNotTaken> {
-    let size = &config.rho_uncertainty_problem_size;
+    let size = &config.problem_size;
     let (Some(n_obs), Some(p_coefficients)) = (size.n_obs, size.p_coefficients) else {
         return Err(DecrementVerdictNotTaken::NoProblemSize);
     };
