@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import importlib
 import math
-import numbers
+import sys
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from ._rust import _EncodedTable
 
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
 
@@ -44,141 +46,120 @@ class PreNormalizedTable:
 
     __slots__ = ("headers", "rows", "kind")
 
-    def __init__(self, headers: list[str], rows: Any, kind: str) -> None:
+    def __init__(self, headers: list[str], rows: _EncodedTable, kind: str) -> None:
         self.headers = headers
         self.rows = rows
         self.kind = kind
 
 
-def _try_import(name: str) -> Any | None:
-    try:
-        return importlib.import_module(name)
-    except ImportError as e:
-        if getattr(e, "name", None) != name:
-            raise
-        return None
-
-
-# Sentinel prefix marking a cell that originates from a genuinely-categorical
-# (string / object / categorical-dtype) source column. The Rust column-kind
-# inference (`infer_and_encode_column_major`) treats any sentinel-prefixed cell
-# as categorical regardless of whether its text parses as a number, then strips
-# the sentinel before recording the level. This preserves the dtype intent of a
-# pandas/polars/pyarrow column whose level labels happen to be numeric strings
-# ("0", "1", "2"): without it such a column is silently lowered to a numeric
-# by-variable, annihilating the "0" level and forcing amplitude ∝ label (#1317).
-# A leading NUL never appears in a numeric literal and is stripped on the Rust
-# side before any level matching, so predict frames (which re-run this same
-# stringification) match the clean training levels.
+# Mirror of gam-data's `CATEGORICAL_CELL_SENTINEL`: a rendered row of an encoded
+# table prefixes each categorical cell with it, so a level whose label parses as
+# a number ("0", "1") keeps its categorical source intent when the row is
+# re-read by the string-row entry points (#1317). A leading NUL never appears in
+# a numeric literal and is stripped before any level matching.
 CATEGORICAL_CELL_SENTINEL = "\x00"
 
 
-def normalize_table(data: Any, *, required_columns=None) -> tuple[list[str], Any, str]:
+def normalize_table(
+    data: Any, *, required_columns: Sequence[str] | None = None
+) -> tuple[list[str], _EncodedTable, str]:
+    """Encode ``data`` as a Rust-owned typed table.
+
+    This is a transport adapter only. Polars and PyArrow tables hand Rust an
+    Arrow C stream. Every other input crosses column by column in the layout its
+    source declares: a NumPy numeric vector as ``float64``, a pandas categorical
+    as codes plus levels, and anything else as the raw cell values. gam-data
+    decides what every column means, so all input libraries share one set of
+    inference rules and one set of ``DataError`` messages. pandas needs no
+    pyarrow for any of this.
+    """
     if isinstance(data, PreNormalizedTable):
         return data.headers, data.rows, data.kind
+    columns, kind = _table_column_views(data)
     if required_columns is not None:
-        columns, kind = _table_column_views(data)
         names = list(required_columns)
         missing = set(names) - set(columns)
         if missing:
             raise ValueError(f"missing required columns: {sorted(missing)}")
-        if kind == "pandas":
-            data = data.loc[:, names]
-        elif kind in {"polars", "pyarrow"}:
+        columns = {name: columns[name] for name in names}
+        if kind in _ARROW_TABLE_KINDS:
             data = data.select(names)
-        else:
-            data = {name: columns[name] for name in names}
-    columns, kind = _table_column_views(data)
     headers = list(columns)
     if not headers:
         from ._exceptions import DataError
         raise DataError("column '<table>' has no columns")
     reject_duplicate_column_names(headers, kind)
     validate_column_lengths(columns)
-    row_count = len(columns[headers[0]])
-    if row_count == 0:
+    if len(columns[headers[0]]) == 0:
         from ._exceptions import DataError
         raise DataError("column '<table>' has no observations")
 
-    # Arrow-capable providers hand ownership of a fresh C stream capsule to
-    # arrow-rs.  Numeric buffers are then decoded directly from Arrow memory and
-    # only genuine string/dictionary-string columns allocate labels.  This is
-    # the preferred path for PyArrow and Polars, and for pandas versions that
-    # expose the Arrow PyCapsule protocol.
-    if kind in {"pandas", "polars", "pyarrow"} and hasattr(
-        data, "__arrow_c_stream__"
-    ):
-        from ._binding import rust_module
-
-        # A pandas index is row identity, never a model variable. Pandas 3's
-        # Arrow C stream materializes a non-RangeIndex as an extra schema field,
-        # while `data.columns` correctly excludes it. Canonicalize row identity
-        # before export so the Arrow schema is exactly the declared data-column
-        # schema. `drop=True` preserves every data column and pandas' copy-on-write
-        # frame keeps this a metadata operation rather than a numeric-table copy.
-        arrow_source = data.reset_index(drop=True) if kind == "pandas" else data
-        return (
-            headers,
-            rust_module().encoded_table_from_arrow(headers, arrow_source),
-            kind,
-        )
-
-    categorical = categorical_dtype_columns(data, kind, columns=columns)
-    numeric_positions = [
-        index for index, header in enumerate(headers) if header not in categorical
-    ]
-    categorical_positions = [
-        index for index, header in enumerate(headers) if header in categorical
-    ]
-
-    # rust-numpy borrows this one typed block at the boundary.  `column_stack`
-    # may make one homogeneous numeric copy for a mixed-dtype frame, but it
-    # never creates Python scalar objects and the Rust engine's final N×P f64
-    # matrix is the only retained dense representation.
-    import numpy as np
-
-    if numeric_positions:
-        numeric_values = np.column_stack(
-            [
-                np.asarray(columns[headers[index]], dtype=np.float64)
-                for index in numeric_positions
-            ]
-        )
-        numeric_values = np.ascontiguousarray(numeric_values, dtype=np.float64)
-    else:
-        numeric_values = np.empty((row_count, 0), dtype=np.float64)
-
-    # Strings are the one column kind for which Python objects are intrinsic.
-    # Convert those columns only, column-major, and let Rust infer/canonicalize
-    # their levels without ever constructing a row-major Python table.
-    categorical_values = [
-        [
-            nullable_categorical_cell(_external_scalar(columns[headers[index]][row]))
-            for row in range(row_count)
-        ]
-        for index in categorical_positions
-    ]
-
     from ._binding import rust_module
 
+    if kind in _ARROW_TABLE_KINDS:
+        return headers, rust_module().encoded_table_from_arrow(headers, data), kind
     native = rust_module().encoded_table_from_columns(
-        headers,
-        numeric_values,
-        numeric_positions,
-        categorical_values,
-        categorical_positions,
+        headers, [_column_payload(header, columns[header]) for header in headers]
     )
     return headers, native, kind
 
 
-def _external_scalar(value: Any) -> Any:
-    """Unwrap a scalar owned by an external table library.
+# Table kinds whose frames export the Arrow C stream themselves (Polars natively,
+# PyArrow by definition), so Rust reads their buffers without a Python copy.
+_ARROW_TABLE_KINDS = frozenset({"polars", "pyarrow"})
 
-    Arrow scalar wrappers expose ``as_py``; converting only categorical cells
-    here avoids the former all-column ``to_pylist`` expansion.
+# NumPy dtype kinds that are numbers: bool, signed and unsigned int, float.
+_NUMERIC_DTYPE_KINDS = "biuf"
+# NumPy dtype kinds whose cells cross as raw values: object, str, bytes.
+_CELL_DTYPE_KINDS = "OUS"
+
+
+def _column_payload(name: str, values: Any) -> Any:
+    """One column in the layout ``encoded_table_from_columns`` accepts.
+
+    Returns a ``float64`` ndarray for a declared numeric column, a
+    ``(codes, levels)`` tuple for a pandas categorical, or a list or object
+    array of raw values for everything else. Reads declared dtypes only; a
+    declared dtype that is neither numbers nor cells (datetime, timedelta,
+    complex) is refused for the whole column, as the Arrow reader refuses an
+    unsupported Arrow type, because its values would cast to meaningless floats.
     """
-    as_py = getattr(value, "as_py", None)
-    return as_py() if callable(as_py) else value
+    import numpy as np
+
+    pd = sys.modules.get("pandas")
+    if pd is not None and isinstance(values, pd.Series):
+        dtype = values.dtype
+        if isinstance(dtype, pd.CategoricalDtype):
+            return (
+                np.asarray(values.cat.codes, dtype=np.int64),
+                list(dtype.categories),
+            )
+        _reject_unsupported_dtype(name, dtype)
+        if dtype.kind in _NUMERIC_DTYPE_KINDS:
+            # Nullable extension dtypes (Int64, boolean, Float64) map NA to NaN.
+            return values.to_numpy(dtype=np.float64, na_value=np.nan)
+        return values.to_numpy(dtype=object, na_value=None)
+    if isinstance(values, np.ndarray) or (
+        hasattr(values, "__array__") and not isinstance(values, (list, tuple))
+    ):
+        array = np.asarray(values)
+        _reject_unsupported_dtype(name, array.dtype)
+        if array.dtype.kind in _NUMERIC_DTYPE_KINDS:
+            return np.ascontiguousarray(array, dtype=np.float64)
+        return array.astype(object, copy=False)
+    # A plain sequence is passed as a list, never through ``np.asarray``, which
+    # would render a NaN beside a string as the text 'nan'.
+    return list(values)
+
+
+def _reject_unsupported_dtype(name: str, dtype: Any) -> None:
+    if dtype.kind not in _NUMERIC_DTYPE_KINDS + _CELL_DTYPE_KINDS:
+        from ._exceptions import DataError
+
+        raise DataError(
+            f"unsupported column dtype {dtype} for column '{name}'; "
+            "columns must hold numbers, strings or categories"
+        )
 
 
 def _table_column_views(data: Any) -> tuple[dict[str, Any], str]:
@@ -220,8 +201,7 @@ def _table_column_views(data: Any) -> tuple[dict[str, Any], str]:
         validate_column_lengths(columns)
         return columns, "mapping"
     # Record and row inputs are Python objects already; their existing
-    # columnisation is the minimal representation and still avoids the former
-    # second N×P string matrix.
+    # columnisation is the minimal representation.
     return table_columns(data)
 
 
@@ -242,113 +222,6 @@ def _vector_view(values: Any) -> Any:
     if hasattr(values, "__len__") and hasattr(values, "__getitem__"):
         return values
     raise TypeError("target values must be a 1D array-like sequence")
-
-
-def _stringify_marked(value: Any, is_categorical: bool, *, column: str | None = None, row: int | None = None) -> str:
-    text = stringify_cell(value, column=column, row=row)
-    if is_categorical:
-        return CATEGORICAL_CELL_SENTINEL + text
-    return text
-
-
-def _infer_categorical_from_values(columns: dict[str, list[Any]]) -> frozenset[str]:
-    # Mirror what pandas infers for a Python list / object column: a column is
-    # categorical iff its values are NOT a uniform numeric (or bool) vector —
-    # i.e. it carries at least one Python ``str``. The presence of ANY string
-    # makes the whole column object-dtype-like, exactly as `pd.Series(...).dtype`
-    # reports `object` (→ categorical) for a list that mixes strings with
-    # anything else.
-    #
-    # Earlier this used an "ALL non-null values must be str" rule, which under-
-    # detected MIXED string+numeric columns: `["a", 1, "b"]` is `object` dtype in
-    # pandas (→ categorical) but the all-str rule saw the `1` and lowered the
-    # column to a NUMERIC covariate — the same typed-vs-untyped parity gap as
-    # #1467/#1468/#1469, one boundary case further out. A single string anywhere
-    # is enough (and is correct): a column that cannot be parsed as uniformly
-    # numeric is categorical, matching the pandas/polars/pyarrow branches.
-    #
-    # `bool` is NOT a `str`, so a pure-bool column (`[True, False]`, pandas `bool`
-    # dtype) stays numeric, while a `bool`+`str` mix (`[True, "a"]`, pandas
-    # `object`) becomes categorical via the string. `None`/`NaN` are nulls and
-    # never make a column categorical on their own (an all-null column carries no
-    # string and stays numeric, as pandas reports `float64` for an all-`NaN`
-    # list). `numpy.str_` is a `str` subclass, so it is covered too.
-    out = set()
-    for name, values in columns.items():
-        if any(isinstance(value, str) for value in values):
-            out.add(name)
-    return frozenset(out)
-
-
-def categorical_dtype_columns(
-    data: Any, kind: str, *, columns: dict[str, list[Any]] | None = None
-) -> frozenset[str]:
-    """Names of columns whose *source dtype* is non-numeric (string / object /
-    categorical), independent of whether the rendered cell text parses as a
-    number.
-
-    Typed table libraries (pandas/polars/pyarrow) carry this signal in their
-    declared schema, so the dtype is read directly. Untyped inputs (mappings,
-    record/row sequences, numpy, plain row sequences) have no declared dtype, so
-    the signal is inferred from the *values*: a column is categorical iff it
-    carries at least one Python ``str`` (``numpy.str_`` is a ``str`` subclass, so
-    it is covered too), mirroring how pandas assigns `object` dtype to any list
-    that is not a uniform numeric/bool vector. A pure ``int``/``float``/``bool``/
-    numpy-number column stays numeric (a genuinely-numeric ``by=`` covariate is
-    preserved); a column that mixes a string with numerics (``["a", 1]``) is
-    `object` in pandas and is therefore categorical here too. ``None`` and
-    ``NaN`` are nulls and never make a column categorical on their own. This
-    closes the dict/records/numpy gap (#1467/#1468/#1469) where a string column
-    with numeric-looking labels ("0"/"1") was lowered to a numeric covariate, and
-    its mixed-column corollary (a string+numeric column was likewise mis-lowered).
-    """
-    try:
-        if kind == "pandas":
-            import pandas as pd
-
-            out = set()
-            for index, name in enumerate(str(c) for c in data.columns):
-                dtype = data.iloc[:, index].dtype
-                if isinstance(dtype, pd.CategoricalDtype) or not (
-                    pd.api.types.is_numeric_dtype(dtype)
-                    or pd.api.types.is_bool_dtype(dtype)
-                ):
-                    out.add(name)
-            return frozenset(out)
-        if kind == "polars":
-            import polars as pl
-
-            out = set()
-            for name in (str(c) for c in data.columns):
-                dtype = data.schema[name]
-                if dtype in (pl.Utf8, pl.Categorical, pl.Enum) or dtype == pl.Object:
-                    out.add(name)
-            return frozenset(out)
-        if kind == "pyarrow":
-            import pyarrow as pa
-
-            out = set()
-            for field in data.schema:
-                t = field.type
-                if (
-                    pa.types.is_string(t)
-                    or pa.types.is_large_string(t)
-                    or pa.types.is_dictionary(t)
-                ):
-                    out.add(str(field.name))
-            return frozenset(out)
-    except (ImportError, AttributeError, TypeError, KeyError, ValueError):
-        # Dtype introspection is a best-effort enhancement; if a library's
-        # introspection API shifts, fall back to value-based inference rather
-        # than fail the fit.
-        pass
-
-    # Untyped inputs (mappings, records, numpy, row sequences) have no
-    # declared dtype, or we hit an introspection error above: infer
-    # categoricality from the column values.
-    if columns is None:
-        columns, _ = table_columns(data)
-    return _infer_categorical_from_values(columns)
 
 
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
@@ -409,28 +282,26 @@ def restore_output_table(
         )
     if target == "dict":
         return PredictionResult(columns)
-    if target == "pandas":
-        import pandas as pd
-
-        return pd.DataFrame(columns)
-    if target == "polars":
-        pl = _try_import("polars")
-        if pl is None:
-            raise ImportError("return_type 'polars' requires the polars package")
-
-        return pl.DataFrame(columns)
     if target == "numpy":
         import numpy as np
 
         ordered = list(columns)
         return np.column_stack([columns[name] for name in ordered])
+    library = _import_output_library(target)
     if target == "pyarrow":
-        pa = _try_import("pyarrow")
-        if pa is None:
-            raise ImportError("return_type 'pyarrow' requires the pyarrow package")
+        return library.table(columns)
+    return library.DataFrame(columns)
 
-        return pa.table(columns)
-    raise ValueError(f"unsupported return_type '{target}'")
+
+def _import_output_library(name: str) -> Any:
+    """Import the table library an output kind names; only an explicit output
+    request (or an input already of that kind) reaches here."""
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            raise
+        raise ImportError(f"return_type '{name}' requires the {name} package") from exc
 
 
 def preferred_output_kind(input_kind: str, training_kind: str) -> str:
@@ -441,25 +312,22 @@ def preferred_output_kind(input_kind: str, training_kind: str) -> str:
     return "dict"
 
 
+# Table kind (the library's module name) -> its table type. A value can only be
+# an instance of a library's table type once that library is imported, so
+# detection reads ``sys.modules`` and never imports anything.
+_TABLE_TYPES = (
+    ("pandas", "DataFrame"),
+    ("polars", "DataFrame"),
+    ("pyarrow", "Table"),
+    ("numpy", "ndarray"),
+)
+
+
 def detect_table_kind(data: Any) -> str:
-    if data is None:
-        return "unknown"
-    pd = _try_import("pandas")
-    if pd is not None and isinstance(data, pd.DataFrame):
-        return "pandas"
-
-    pl = _try_import("polars")
-    if pl is not None and isinstance(data, pl.DataFrame):
-        return "polars"
-
-    pa = _try_import("pyarrow")
-    if pa is not None and isinstance(data, pa.Table):
-        return "pyarrow"
-
-    np = _try_import("numpy")
-    if np is not None and isinstance(data, np.ndarray):
-        return "numpy"
-
+    for kind, type_name in _TABLE_TYPES:
+        table_type = getattr(sys.modules.get(kind), type_name, None)
+        if isinstance(table_type, type) and isinstance(data, table_type):
+            return kind
     return "unknown"
 
 
@@ -546,59 +414,6 @@ def collect_record_headers(rows: list[Mapping[str, Any]]) -> tuple[list[str], di
                 headers.append(key_str)
                 key_map[key] = key_str
     return headers, key_map
-
-
-def stringify_cell(value: Any, *, column: str | None = None, row: int | None = None) -> str:
-    if isinstance(value, bool) or type(value).__name__ == "bool_":
-        return "1" if value else "0"
-    if value is None:
-        if column and row is not None:
-            raise ValueError(f"column '{column}' has None at row {row + 1}")
-        elif column:
-            raise ValueError(f"column '{column}' contains None")
-        else:
-            raise ValueError("table cells cannot be None")
-    if isinstance(value, (numbers.Real, Decimal)):
-        numeric_value = float(value)
-        if not math.isfinite(numeric_value):
-            if column and row is not None:
-                raise ValueError(f"column '{column}' has non-finite numeric value at row {row + 1}")
-            elif column:
-                raise ValueError(f"column '{column}' contains non-finite numeric value")
-            else:
-                raise ValueError("table cells cannot be non-finite numeric value")
-        if isinstance(value, numbers.Integral):
-            return repr(int(value))
-        return repr(numeric_value)
-    text = str(value)
-    if not text:
-        if column and row is not None:
-            raise ValueError(f"column '{column}' has empty string at row {row + 1}")
-        elif column:
-            raise ValueError(f"column '{column}' contains empty string")
-        else:
-            raise ValueError("table cells cannot be empty strings")
-    return text
-
-
-def nullable_categorical_cell(value: Any) -> str | None:
-    """Render a present category and preserve a missing cell as ``None``.
-
-    Table normalization cannot know which columns a formula or fitted model
-    will consume. Missing categorical cells therefore cross the native boundary
-    explicitly and become typed missing values there; model-aware validation is
-    responsible for rejecting them only when the column is actually required.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (numbers.Real, Decimal)):
-        numeric_value = float(value)
-        if not math.isfinite(numeric_value):
-            return None
-    text = str(value)
-    if not text:
-        return None
-    return text
 
 
 def coerce_numeric_vector(values: Sequence[Any], *, label: str) -> list[float]:

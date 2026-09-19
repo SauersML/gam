@@ -208,7 +208,8 @@ class SkipAffineSmooth(nn.Module):
         ``lambda_sparse`` so different ``lambda_sparse`` give different values.
         """
         z_pre = self.encode(x_in)
-        return self.smooth_threshold(z_pre)
+        penalty: torch.Tensor = self.smooth_threshold(z_pre)
+        return penalty
 
     def loss(self, x_in: torch.Tensor, y_out: torch.Tensor) -> torch.Tensor:
         """Canonical training objective: reconstruction MSE + sparsity penalty.
@@ -564,10 +565,12 @@ def _continuously_profile_rank(
             loss = logs.new_tensor(profiled.negative_log_evidence) + (
                 (logs - logs.detach()) * gradient
             ).sum()
-            loss.backward()
+            # torch leaves ``Tensor.backward`` unannotated.
+            loss.backward()  # type: ignore[no-untyped-call]
             return loss
 
-        optimizer.step(closure)
+        # torch leaves ``LBFGS.step`` unannotated.
+        optimizer.step(closure)  # type: ignore[no-untyped-call]
         current = evaluate("continuous", current.smooth)
         coordinates = tuple(float(value) for value in logs.detach())
         if coordinates == previous_coordinates:
@@ -663,10 +666,11 @@ def select_skip_transcoder(
 
     while True:
         neighbours: list[SkipTranscoderProfile] = []
-        for candidate_rank, direction in (
+        moves: tuple[tuple[int, Literal["death", "birth"]], ...] = (
             (current.rank_skip - 1, "death"),
             (current.rank_skip + 1, "birth"),
-        ):
+        )
+        for candidate_rank, direction in moves:
             if not 0 <= candidate_rank <= structural_max_rank:
                 continue
             candidate = profiles.get(candidate_rank)
@@ -715,7 +719,7 @@ def select_skip_transcoder(
                     accepted=improves and neighbour is best_neighbour,
                 )
             )
-        if not improves:
+        if not improves or best_neighbour is None:
             death = profiles.get(current.rank_skip - 1)
             birth = profiles.get(current.rank_skip + 1)
             certificate = SkipTranscoderSelectionCertificate(

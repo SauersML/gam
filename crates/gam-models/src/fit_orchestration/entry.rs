@@ -1582,7 +1582,26 @@ pub struct FormulaFitResult {
 /// Resolve, materialize, and fit a formula without making front ends repeat any
 /// model construction. Unlike `fit_from_formula`, this service also returns the
 /// materializer's user-facing advisories for CLI/Python presentation.
+///
+/// An automatic `.` term is expanded against `data` first; its notes (the
+/// first of which spells out the fitted formula) lead the returned notes.
 pub fn fit_from_formula_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
+    let automatic = expand_automatic_fit_formula(formula, data, config)?;
+    if automatic.notes.is_empty() {
+        return fit_expanded_formula_with_notes(formula, data, config);
+    }
+    let mut outcome = fit_expanded_formula_with_notes(&automatic.formula, data, config)?;
+    let mut notes = automatic.notes;
+    notes.append(&mut outcome.inference_notes);
+    outcome.inference_notes = notes;
+    Ok(outcome)
+}
+
+fn fit_expanded_formula_with_notes(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
@@ -2150,9 +2169,9 @@ pub(crate) fn fit_expectile_if_requested(
 /// the current asymmetric weights. The returned fit is an ordinary
 /// [`FitResult::Standard`] whose coefficients ARE the penalized τ-expectile —
 /// every downstream consumer (predict, posterior bands, persistence) works
-/// unchanged. The reported scale is the asymmetric working variance, so
-/// expectile standard errors are the sandwich-free Gaussian-form bands of the
-/// converged weighted problem (a deliberate first-rung choice; see #1100).
+/// unchanged. Its published coefficient covariance is the penalized
+/// Newey–Powell sandwich of [`publish_expectile_sandwich_covariance`], never
+/// the Gaussian working-model `φ̂·H⁻¹` of the last inner solve.
 fn fit_expectile_laws(
     formula: &str,
     data: &Dataset,
@@ -2336,6 +2355,14 @@ fn fit_expectile_laws(
         })?;
         let kkt_bound = options.tol;
         if kkt <= kkt_bound {
+            let mut result = result;
+            publish_expectile_sandwich_covariance(
+                &mut result.fit,
+                &result.design.design,
+                residual.view(),
+                weights.view(),
+                tau,
+            )?;
             return Ok(result);
         }
         last_kkt = (kkt, kkt_bound);
@@ -2370,6 +2397,140 @@ fn fit_expectile_laws(
             last_kkt.0, last_kkt.1,
         ),
     ))
+}
+
+/// Replace the working-model covariance of a certified LAWS fixed point with
+/// the penalized Newey–Powell sandwich.
+///
+/// The expectile is an M-estimator, not a likelihood fit: `β̂` solves
+/// `ψ(β) = Xᵀ(w ∘ r) − S_λβ = 0` with `wᵢ = baseᵢ·|τ − 1[rᵢ < 0]|`, whose
+/// Jacobian is `−H`, `H = XᵀWX + S_λ` — the unscaled penalized Hessian the
+/// last inner solve already factored. The inner fit publishes
+/// `Vb = φ̂·H⁻¹`, which is correct only if `Var(wᵢrᵢ) = φ̂·wᵢ`, i.e. only if
+/// the asymmetric weights were inverse variances. They are not: they are the
+/// loss asymmetry, and under heteroscedastic noise the working model
+/// under-covers wherever the noise is large (τ = 0.05/0.95 bands covered
+/// 0.81/0.73 at nominal 0.95).
+///
+/// Newey & Powell (1987, Thm 3) give the unpenalized law
+/// `√n(β̂ − β) → N(0, A⁻¹BA⁻¹)`, `A = E[w xxᵀ]`, `B = E[w²r² xxᵀ]`, with no
+/// dispersion factor anywhere: the scale lives in `r` itself. The penalized
+/// analogue keeps the smoothing prior `β ~ N(0, φ̂·S_λ⁻)` that makes `Vb`
+/// Bayesian (Wahba 1983; Nychka 1988), so the published covariance is the
+/// prior-inclusive sandwich
+///
+///   `V = H⁻¹ (c·Xᵀ diag(w²r²) X + φ̂·S_λ) H⁻¹`,   `c = n₊ / (n₊ − edf)`,
+///
+/// the Bayesian ("penalty as prior") form of the Huber–White sandwich.
+/// Three limits pin every constant:
+///
+/// * `S_λ → 0` recovers the Newey–Powell `A⁻¹BA⁻¹` exactly (up to `c`).
+/// * Under the working model, `E[c·w²r²] = φ̂·w` row by row, so `V → Vb`: the
+///   sandwich changes nothing where the Gaussian form was already right.
+/// * `c` is the HC1 degrees-of-freedom correction, the same `n₊ − edf` the
+///   inner fit's `φ̂ = Σwr² / (n₊ − edf)` divides by (mgcv `gam.scale`), so the
+///   meat and the prior term are debiased on one scale; `n₊` counts the rows
+///   with positive weight, exactly as `φ̂` does.
+///
+/// `φ̂` enters only through the prior term, where it is the posterior
+/// variance's own scale; it never multiplies the meat.
+///
+/// Because `φ̂·S_λ = φ̂·H − φ̂·XᵀWX`, the sandwich is an exact rank-`n`
+/// correction of the published `Vb` that needs neither `S_λ` nor `H`:
+///
+///   `V = Vb + Vb Xᵀ diag(d) X Vb`,   `dᵢ = c·wᵢ²rᵢ²/φ̂² − wᵢ/φ̂`.
+///
+/// It holds verbatim for a constraint-projected `Vb = φ̂·Z(ZᵀHZ)⁻¹Zᵀ`, so the
+/// identifiability and active-constraint gauge the fit already chose carries
+/// over. The correction is added to the conditional AND smoothing-corrected
+/// stores through the one seam that keeps them consistent, so the
+/// smoothing-parameter uncertainty term `Vp − Vb` survives and every consumer
+/// — predict bands, posterior draws, summary SEs, the CLI, Python — reads the
+/// same matrix. A fit on the zero-dispersion boundary (`φ̂ = 0`, every
+/// residual zero) has a zero meat and nothing to correct.
+///
+/// A fit with no dense `Vb` (the memory governor refused it and published only
+/// a factorized diagonal, or inference was off) cannot carry the sandwich, so
+/// its covariance is declined with a typed reason instead of leaving the
+/// working-model diagonal or Hessian to be read under the expectile's name.
+fn publish_expectile_sandwich_covariance(
+    fit: &mut gam_solve::estimate::UnifiedFitResult,
+    design: &gam_linalg::matrix::DesignMatrix,
+    residual: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    tau: f64,
+) -> Result<(), WorkflowError> {
+    let invariant = |reason: String| {
+        raised_fit_failure(
+            FailureCategory::Invariant,
+            format!("expectile sandwich covariance (tau={tau}): {reason}"),
+        )
+    };
+    let Some(vb) = fit.covariance_conditional.clone() else {
+        // The declination is also what stops every Hessian reconstruction
+        // (summary, predict, sampling) from rebuilding the working-model `Vb`.
+        let declined = gam_solve::estimate::CovarianceDeclined::
+            ExpectileSandwichRequiresDenseCovariance {
+                coefficients: fit.beta.len(),
+            };
+        log::warn!("[expectile] {}", declined.explain());
+        fit.covariance_corrected = None;
+        if let Some(inference) = fit.inference.as_mut() {
+            inference.factorized_standard_errors = None;
+        }
+        fit.artifacts.covariance_declined = Some(declined);
+        return Ok(());
+    };
+    let n = design.nrows();
+    if residual.len() != n || weights.len() != n {
+        return Err(invariant(format!(
+            "design rows={n}, residual={}, weights={}",
+            residual.len(),
+            weights.len()
+        )));
+    }
+    let phi = fit
+        .coefficient_covariance_scale()
+        .map_err(|error| invariant(error.to_string()))?;
+    if !(phi.is_finite() && phi >= 0.0) {
+        return Err(invariant(format!(
+            "coefficient covariance scale must be finite and non-negative, got {phi:?}"
+        )));
+    }
+    if phi == 0.0 {
+        return Ok(());
+    }
+    let edf = fit.edf_total().ok_or_else(|| {
+        invariant("a fit that publishes a covariance must carry its effective degrees of freedom".to_string())
+    })?;
+    let n_positive = weights.iter().filter(|&&w| w > 0.0).count() as f64;
+    let residual_df = n_positive - edf;
+    if !(residual_df.is_finite() && residual_df > 0.0) {
+        return Err(invariant(format!(
+            "residual degrees of freedom n₊ − edf = {n_positive} − {edf} must be positive"
+        )));
+    }
+    let hc1 = n_positive / residual_df;
+    let row_correction = Array1::from_shape_fn(n, |i| {
+        let score = weights[i] * residual[i];
+        hc1 * score * score / (phi * phi) - weights[i] / phi
+    });
+    let certified = gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(&row_correction)
+        .map_err(invariant)?;
+    let middle = gam_linalg::matrix::xt_diag_x_signed(design, certified)
+        .map_err(invariant)?
+        .to_dense();
+    if middle.dim() != vb.dim() {
+        return Err(invariant(format!(
+            "design Gram is {:?} but the published covariance is {:?}",
+            middle.dim(),
+            vb.dim()
+        )));
+    }
+    let mut correction = vb.dot(&middle).dot(&vb);
+    gam_linalg::matrix::symmetrize_in_place(&mut correction);
+    fit.add_coefficient_covariance_correction(&correction)
+        .map_err(|error| invariant(error.to_string()))
 }
 /// Detection seam for the exact O(n) cubic-smoothing-spline fast path.
 ///

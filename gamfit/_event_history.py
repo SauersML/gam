@@ -10,11 +10,14 @@ killed process. See ``docs/event-history.md``.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import numpy as np
 
 from ._binding import rust_module
+
+if TYPE_CHECKING:
+    from . import _rust
 
 def _positional_index(value: Any, name: str) -> int:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
@@ -33,7 +36,8 @@ def _column(frame: Any, name: str) -> np.ndarray:
         raise KeyError(f"missing column {name!r}")
     column = frame[name]
     if hasattr(column, "to_numpy"):
-        return column.to_numpy()
+        values: np.ndarray = column.to_numpy()
+        return values
     return np.asarray(column)
 
 
@@ -76,7 +80,7 @@ def _is_categorical(values: np.ndarray) -> bool:
 class EventHistoryModel:
     """A fitted event-history model."""
 
-    def __init__(self, native: Any) -> None:
+    def __init__(self, native: _rust._EventHistoryModel) -> None:
         self._native = native
         self._subject_index = {sid: i for i, sid in enumerate(native.subject_ids())}
 
@@ -112,8 +116,9 @@ class EventHistoryModel:
 
     @property
     def reference_refinements(self) -> np.ndarray:
-        """Summed time and latent-order reference discrepancies in nats.
-        The final discrepancy must meet the reference tolerance."""
+        """For each reference grid the fit ran on, the move of any fitted
+        coefficient the next grid makes at the fitted coefficients, in
+        posterior standard deviations."""
         return np.asarray(self._native.reference_refinements())
 
     @property
@@ -124,8 +129,9 @@ class EventHistoryModel:
 
     @property
     def reference_certificate(self) -> float | None:
-        """Sum of time-refinement and latent-order discrepancies at fixed
-        coefficients, in nats. ``None`` when the
+        """The reference grid's certificate: the geometric-tail estimate of the
+        moves finer grids make the fitted coefficients take, in posterior
+        standard deviations, within the certificate's tolerance. ``None`` when the
         baselines are centred on the stationary prior."""
         return self._native.reference_certificate()
 

@@ -11,9 +11,16 @@ Composition rule (per the descriptor protocol):
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol, runtime_checkable
 
 from ._protocol import PenaltyDescriptor
+
+
+@runtime_checkable
+class _RustSerializablePenalty(Protocol):
+    """A penalty that can marshal itself into the Rust registry schema."""
+
+    def to_rust_descriptor(self) -> dict[str, Any]: ...
 
 
 class CompositePenalty(PenaltyDescriptor):
@@ -86,9 +93,17 @@ class CompositePenalty(PenaltyDescriptor):
         the count, iteration yields the originals, and the dict carries each
         child's own ``to_rust_descriptor()`` under ``"children"``.
         """
+        children: list[dict[str, Any]] = []
+        for part in self.parts:
+            if not isinstance(part, _RustSerializablePenalty):
+                raise TypeError(
+                    f"CompositePenalty part {type(part).__name__} does not "
+                    "expose to_rust_descriptor()"
+                )
+            children.append(part.to_rust_descriptor())
         return {
             "kind": "sum",
-            "children": [p.to_rust_descriptor() for p in self.parts],
+            "children": children,
         }
 
 
