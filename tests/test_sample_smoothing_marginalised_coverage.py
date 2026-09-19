@@ -11,10 +11,11 @@ over the same cubature nodes, and the two interval families must agree.
 
 Each replicate's draws must report the same smoothing treatment as that
 replicate's ``predict`` band: marginalised (or the linearised correction the
-fit published instead) whenever the band is smoothing-corrected, conditional
-with a typed reason only when the band is conditional too. A replicate whose
-fit is refused as unconverged has no posterior and is excluded from both
-interval families alike.
+fit published instead) whenever the band is smoothing-corrected. A fit that
+recorded no smoothing-parameter measure has no rho-marginal posterior to draw
+from, so ``sample`` must refuse it with a typed error rather than return draws
+conditional on rho-hat; such a replicate, like one whose fit is refused as
+unconverged, is excluded from both interval families alike.
 
 Every tolerance is a multiple of the Monte Carlo standard error across
 replicates; the multiple is the two-sided normal quantile at the declared
@@ -73,8 +74,9 @@ def _covered(truth: Any, lower: Any, upper: Any) -> float:
 
 def _replicate(family: str, rep: int, x_test: Any) -> tuple[float, float] | None:
     """Coverage of the sample() and predict() mean intervals on one replicate,
-    or ``None`` when the fit itself is refused as unconverged: that replicate
-    has no posterior for either interval to be priced off."""
+    or ``None`` when the replicate has no rho-marginal posterior: the fit is
+    refused as unconverged, or it recorded no smoothing-parameter measure and
+    sample() refuses it."""
     rng = np.random.default_rng([rep, _FAMILIES.index(family)])
     x = rng.uniform(0.0, 1.0, (_N, 3))
     y = _response(family, _truth(family, x), rng)
@@ -87,29 +89,22 @@ def _replicate(family: str, rep: int, x_test: Any) -> tuple[float, float] | None
     except gamfit.FitConvergenceError:
         return None
     band = model.predict(test, interval=_LEVEL)
-    posterior = model.sample(data, samples=_DRAWS, seed=rep)
-    drawn = posterior.predict(test, level=_LEVEL)
-
-    # sample() integrates the smoothing parameters exactly when predict()'s
-    # band does; when the fit carries no smoothing measure both condition on
-    # rho-hat, and the draws say why.
     band_source = band["covariance_source"]
     if band_source == "conditional":
-        assert posterior.covariance_source == "conditional", (
-            f"{family} rep {rep}: predict() is conditional but sample() reports "
-            f"{posterior.covariance_source}"
-        )
-        assert posterior.covariance_reason, (
-            f"{family} rep {rep}: conditional draws carry no reason"
-        )
-    else:
-        assert posterior.covariance_source in {
-            "smoothing-marginalised",
-            "smoothing-corrected",
-        }, (
-            f"{family} rep {rep}: predict() is {band_source} but sample() drew "
-            f"{posterior.covariance_source}"
-        )
+        # No smoothing measure was recorded, so there is no rho-marginal
+        # posterior: sample() refuses instead of drawing beta | rho-hat.
+        with pytest.raises(gamfit.errors.GamError, match="smoothing-parameter measure"):
+            model.sample(data, samples=_DRAWS, seed=rep)
+        return None
+    posterior = model.sample(data, samples=_DRAWS, seed=rep)
+    assert posterior.covariance_source in {
+        "smoothing-marginalised",
+        "smoothing-corrected",
+    }, (
+        f"{family} rep {rep}: predict() is {band_source} but sample() drew "
+        f"{posterior.covariance_source}"
+    )
+    drawn = posterior.predict(test, level=_LEVEL)
     return (
         _covered(mu_test, drawn["posterior_mean_lower"], drawn["posterior_mean_upper"]),
         _covered(mu_test, band["posterior_mean_lower"], band["posterior_mean_upper"]),

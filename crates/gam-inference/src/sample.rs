@@ -1141,7 +1141,7 @@ fn sample_standard(
         )
         .map_err(|e| format!("NUTS sampling failed: {e}"))
     };
-    let result = match smoothing_draw_plan(&fit) {
+    let result = match smoothing_draw_plan(&fit)? {
         SmoothingDrawPlan::Marginalised { nodes, residual } => {
             let weights: Vec<f64> = nodes.iter().map(|node| node.weight).collect();
             sample_smoothing_mixture(
@@ -1161,16 +1161,16 @@ fn sample_standard(
             cfg,
             p,
             |_, node_cfg| run_at_offset(None, node_cfg),
-            SampleCovarianceSource::SmoothingCorrected { reason },
+            SampleCovarianceSource::SmoothingCorrected {
+                reason: Some(reason),
+            },
         ),
-        SmoothingDrawPlan::Conditional { reason } => {
-            run_at_offset(None, cfg).map(|mut result| {
-                result.covariance = SampleCovarianceSource::Conditional {
-                    reason: Some(reason),
-                };
-                result
-            })
-        }
+        SmoothingDrawPlan::Unpenalised => run_at_offset(None, cfg).map(|mut result| {
+            result.covariance = SampleCovarianceSource::Conditional {
+                reason: Some(conditional_reason(&fit)),
+            };
+            result
+        }),
     };
     drop(sampler_design_copy_reservation);
     result
@@ -1190,14 +1190,24 @@ enum SmoothingDrawPlan<'a> {
     /// displace it by the linearised response of `β̂` to `ρ ~ N(ρ̂, V_ρ)`.
     Linearised {
         correction: &'a Array2<f64>,
-        reason: Option<String>,
+        reason: String,
     },
-    /// The fit retained no smoothing-parameter measure; draw `β | ρ̂` and say why.
-    Conditional { reason: String },
+    /// The fit has no smoothing parameters, so `β | ρ̂` is the whole posterior.
+    Unpenalised,
 }
 
-fn smoothing_draw_plan(fit: &gam_solve::estimate::UnifiedFitResult) -> SmoothingDrawPlan<'_> {
-    match (fit.smoothing_marginal(), fit.smoothing_correction()) {
+/// The ρ-marginal draw plan the fit's recorded measure supports, or a typed
+/// refusal. Draws conditional on `ρ̂` are not the posterior `predict()` prices
+/// for a fit with smoothing parameters, so a fit that recorded no measure to
+/// integrate over is refused with the reason it recorded, never sampled at `ρ̂`
+/// under a label.
+fn smoothing_draw_plan(
+    fit: &gam_solve::estimate::UnifiedFitResult,
+) -> Result<SmoothingDrawPlan<'_>, String> {
+    if fit.lambdas.is_empty() {
+        return Ok(SmoothingDrawPlan::Unpenalised);
+    }
+    Ok(match (fit.smoothing_marginal(), fit.smoothing_correction()) {
         (
             Some(SmoothingMarginalMeasure::Cubature {
                 nodes,
@@ -1211,19 +1221,24 @@ fn smoothing_draw_plan(fit: &gam_solve::estimate::UnifiedFitResult) -> Smoothing
         (Some(SmoothingMarginalMeasure::Linearised { reason }), Some(correction)) => {
             SmoothingDrawPlan::Linearised {
                 correction,
-                reason: Some(reason.clone()),
+                reason: reason.clone(),
             }
         }
-        // A fit saved before the measure was recorded still carries its
-        // first-order correction, which is the only measure it could have had.
-        (None, Some(correction)) => SmoothingDrawPlan::Linearised {
-            correction,
-            reason: None,
-        },
-        (_, None) => SmoothingDrawPlan::Conditional {
-            reason: conditional_reason(fit),
-        },
-    }
+        (None, Some(_)) => {
+            return Err("sample(): the fit carries a smoothing correction but no record of the \
+                        smoothing-parameter measure it integrates, so its draws cannot be \
+                        marginalised over the smoothing parameters; refit to record the measure"
+                .to_string());
+        }
+        (_, None) => {
+            return Err(format!(
+                "sample(): the fit carries no smoothing-parameter measure to marginalise the \
+                 draws over ({}), and draws conditional on the fitted smoothing parameters are \
+                 not its posterior",
+                conditional_reason(fit),
+            ));
+        }
+    })
 }
 
 /// Seed stream of the node allocation of a smoothing-marginalised draw.
