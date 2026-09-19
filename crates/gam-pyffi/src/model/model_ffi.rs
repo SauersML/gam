@@ -4484,7 +4484,7 @@ fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     }
     if fit.hasattr("_prediction_model")? {
         let compiled = fit.getattr("_prediction_model")?;
-        let compiled = compiled.downcast::<PyFittedModel>()?;
+        let compiled = compiled.cast::<PyFittedModel>()?;
         return Ok(RemlFitView::SavedSummary(
             compiled.get().summary_value()?.clone(),
         ));
