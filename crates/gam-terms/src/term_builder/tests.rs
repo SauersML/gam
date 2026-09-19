@@ -4510,3 +4510,385 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
         "try_from_dense_psd's dim·1e-10·λmax cutoff truncates a resolved eigenvalue"
     );
 }
+
+fn smooth_option_dataset() -> Dataset {
+    continuous_dataset(
+        &["y", "x", "z"],
+        (0..40)
+            .map(|i| {
+                let x = i as f64 / 39.0;
+                let z = ((i * 7) % 40) as f64 / 39.0;
+                vec![(4.0 * x).sin() + z, x, z]
+            })
+            .collect(),
+    )
+}
+
+/// The error a formula produces anywhere between parsing and the term spec.
+fn formula_error(formula: &str, ds: &Dataset) -> String {
+    let parsed = match parse_formula(formula) {
+        Ok(parsed) => parsed,
+        Err(err) => return err.to_string(),
+    };
+    match build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new()) {
+        Ok(spec) => panic!("`{formula}` must be rejected, but built {spec:?}"),
+        Err(err) => err.to_string(),
+    }
+}
+
+fn build_formula(formula: &str, ds: &Dataset) -> TermCollectionSpec {
+    let parsed = parse_formula(formula).unwrap_or_else(|err| panic!("parse `{formula}`: {err}"));
+    build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new())
+        .unwrap_or_else(|err| panic!("build `{formula}`: {err}"))
+}
+
+fn bspline_spec(spec: &TermCollectionSpec, idx: usize) -> &BSplineBasisSpec {
+    match &spec.smooth_terms[idx].basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => spec,
+        other => panic!("expected a 1-D B-spline smooth, got {other:?}"),
+    }
+}
+
+/// Every numeric smooth option is read strictly: a value that is not what the
+/// option means is an error naming the term and the option, never a silently
+/// substituted default (the old readers turned `degree=cubic` into the cubic
+/// default and `penalty_order=two` into the second-order default).
+#[test]
+fn malformed_smooth_options_are_errors_that_name_the_term_and_option() {
+    let ds = smooth_option_dataset();
+    for (term, option) in [
+        ("s(x, degree=cubic)", "degree"),
+        ("s(x, degree=3.0)", "degree"),
+        ("s(x, degree=all)", "degree"),
+        ("s(x, degree=-1)", "degree"),
+        ("s(x, penalty_order=two)", "penalty_order"),
+        ("s(x, penalty_order=-1)", "penalty_order"),
+        ("s(x, penalty_order=[1,2])", "penalty_order"),
+        ("s(x, penalty_order=all)", "penalty_order"),
+        ("s(x, k=ten)", "k"),
+        ("s(x, double_penalty=maybe)", "double_penalty"),
+    ] {
+        let err = formula_error(&format!("y ~ {term}"), &ds);
+        assert!(
+            err.contains("in term s(x"),
+            "`{term}`: the error must name the term, got: {err}"
+        );
+        assert!(
+            err.contains(option),
+            "`{term}`: the error must name `{option}`, got: {err}"
+        );
+    }
+}
+
+/// A B-spline's roughness penalty is the integrated squared `m`-th derivative,
+/// defined only for `1 <= m <= degree`. Orders outside that range used to be
+/// clamped to the degree without a word; they are now errors that say why.
+#[test]
+fn penalty_order_outside_one_to_degree_is_an_error_not_a_clamp() {
+    let ds = smooth_option_dataset();
+
+    let err = formula_error("y ~ s(x, degree=0)", &ds);
+    assert!(
+        err.contains("degree=0") && err.contains("piecewise-constant"),
+        "degree=0 must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ s(x, penalty_order=0)", &ds);
+    assert!(
+        err.contains("penalty_order=0"),
+        "penalty_order=0 must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ s(x, penalty_order=4)", &ds);
+    assert!(
+        err.contains("in term s(x")
+            && err.contains("penalty_order=4 exceeds the spline degree 3"),
+        "an order above the degree must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ s(x, degree=1, penalty_order=2)", &ds);
+    assert!(
+        err.contains("penalty_order=2 exceeds the spline degree 1"),
+        "an order above an explicit degree must be refused, got: {err}"
+    );
+    // k=3 holds at most a quadratic, so the cubic default is reduced; an order
+    // that only the requested degree could carry names that reduction.
+    let err = formula_error("y ~ s(x, k=3, penalty_order=3)", &ds);
+    assert!(
+        err.contains("degree=3 was reduced to 2") && err.contains("k=3"),
+        "the k-driven degree reduction must be named, got: {err}"
+    );
+    let err = formula_error("y ~ te(x, z, penalty_order=[2, 4])", &ds);
+    assert!(
+        err.contains("tensor margin 1") && err.contains("penalty_order=4"),
+        "a tensor margin order above its degree must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ cyclic(x, penalty_order=5)", &ds);
+    assert!(
+        err.contains("penalty_order=5"),
+        "a cyclic order above its degree must be refused, got: {err}"
+    );
+
+    // In range, the request is honoured exactly, and the default order follows
+    // a lower degree down rather than exceeding it.
+    assert_eq!(
+        bspline_spec(&build_formula("y ~ s(x, penalty_order=3)", &ds), 0).penalty_order,
+        3
+    );
+    let linear = build_formula("y ~ s(x, degree=1)", &ds);
+    assert_eq!(bspline_spec(&linear, 0).degree, 1);
+    assert_eq!(bspline_spec(&linear, 0).penalty_order, 1);
+}
+
+fn two_factor_dataset() -> Dataset {
+    let n = 36usize;
+    let rows = (0..n)
+        .map(|i| {
+            let x = i as f64 / (n - 1) as f64;
+            let f = (i % 3) as f64;
+            let g = ((i / 3) % 2) as f64;
+            vec![2.0 + x + f - g, x, f, g]
+        })
+        .collect::<Vec<_>>();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "f".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (n, 4),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular two-factor data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "f".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["f0".into(), "f1".into(), "f2".into()],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["g0".into(), "g1".into()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+/// For a built no-intercept model, the distance of the constant function from
+/// the unpenalized part of the design: the span of `X N`, with `N` the joint
+/// null space of every penalty. A zero distance means the fit is translation
+/// invariant: shifting `y` by `c` is absorbed exactly by coefficients that
+/// reproduce `c` at no penalty, so no penalty can pull the level toward zero.
+fn unpenalized_constant_residual(ds: &Dataset, spec: &TermCollectionSpec) -> f64 {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), spec)
+        .expect("design builds");
+    assert!(
+        design.intercept_range.is_empty(),
+        "a no-intercept model must not carry the all-ones column"
+    );
+    let x = design.design.to_dense();
+    let p = x.ncols();
+    let mut penalty_sum = Array2::<f64>::zeros((p, p));
+    for penalty in &design.penalties {
+        let scale = penalty.local.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if scale > 0.0 {
+            let range = penalty.col_range.clone();
+            let mut block = penalty_sum.slice_mut(ndarray::s![range.clone(), range]);
+            block.scaled_add(1.0 / scale, &penalty.local);
+        }
+    }
+    let (s_evals, s_evecs) = FaerEigh::eigh(&penalty_sum, faer::Side::Lower).expect("penalty eigh");
+    let s_max = s_evals.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+    let null_cols = (0..p)
+        .filter(|&j| s_evals[j].abs() <= 1e-10 * s_max)
+        .collect::<Vec<_>>();
+    let null_basis = s_evecs.select(ndarray::Axis(1), &null_cols);
+    let unpenalized = x.dot(&null_basis);
+    let ones = Array1::<f64>::ones(x.nrows());
+    let normal = unpenalized.t().dot(&unpenalized);
+    let (evals, evecs) = FaerEigh::eigh(&normal, faer::Side::Lower).expect("normal eigh");
+    let cutoff = evals.iter().fold(0.0_f64, |m, v| m.max(v.abs())) * 1e-10;
+    let projected = evecs.t().dot(&unpenalized.t().dot(&ones));
+    let scaled = Array1::from_iter(
+        projected
+            .iter()
+            .zip(evals.iter())
+            .map(|(p, e)| if *e > cutoff { p / e } else { 0.0 }),
+    );
+    let fitted = unpenalized.dot(&evecs.dot(&scaled));
+    (&fitted - &ones).iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+/// `0 + g` (and `- 1`, and every spelling of the fixed factor) is the
+/// cell-means model: every level keeps its column, the block is unpenalized,
+/// and the constant is spanned at no penalty. With an intercept the same
+/// factor stays the penalized full-level block it has always been.
+#[test]
+fn no_intercept_factor_is_the_unpenalized_cell_means_model() {
+    let ds = two_factor_dataset();
+    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)", "y ~ 0 + C(f)"] {
+        let spec = build_formula(formula, &ds);
+        assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
+        let re = &spec.random_effect_terms[0];
+        assert!(!re.drop_first_level, "`{formula}` keeps every level");
+        assert!(!re.penalized, "`{formula}`: the level carrier is unpenalized");
+        let residual = unpenalized_constant_residual(&ds, &spec);
+        assert!(residual < 1e-8, "`{formula}`: {residual}");
+    }
+
+    let with_intercept = build_formula("y ~ f", &ds);
+    assert_eq!(with_intercept.level, ModelLevel::Intercept);
+    assert!(with_intercept.random_effect_terms[0].penalized);
+
+    // Only the FIRST fixed factor carries the level; a second one stays the
+    // penalized block whose offsets shrink toward zero.
+    let two = build_formula("y ~ 0 + f + g", &ds);
+    assert!(!two.random_effect_terms[0].penalized);
+    assert!(two.random_effect_terms[1].penalized);
+    let residual = unpenalized_constant_residual(&ds, &two);
+    assert!(residual < 1e-8, "`0 + f + g`: {residual}");
+}
+
+/// A genuine random effect never carries the level: its levels are mean-zero
+/// deviations, so `0 + group(g) + s(x)` hands the constant to the smooth and
+/// keeps the random effect penalized.
+#[test]
+fn no_intercept_genuine_random_effect_does_not_carry_the_level() {
+    let ds = two_factor_dataset();
+    let spec = build_formula("y ~ 0 + group(f) + s(x)", &ds);
+    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
+    assert!(spec.random_effect_terms[0].penalized);
+    let residual = unpenalized_constant_residual(&ds, &spec);
+    assert!(residual < 1e-8, "{residual}");
+
+    // With nothing else able to carry it, the model has no level at all.
+    let spec = build_formula("y ~ 0 + x + group(f)", &ds);
+    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
+    assert!(spec.random_effect_terms[0].penalized);
+}
+
+/// Without a factor block, a pure-indicator interaction keeps every cell (its
+/// reference cell included): the saturated cell-means model.
+#[test]
+fn no_intercept_indicator_interaction_keeps_every_cell() {
+    let ds = two_factor_dataset();
+    let cells = |formula: &str| {
+        build_formula(formula, &ds)
+            .linear_terms
+            .iter()
+            .filter(|t| !t.categorical_levels.is_empty())
+            .count()
+    };
+    assert_eq!(cells("y ~ f:g"), 5, "with an intercept one reference cell drops");
+    assert_eq!(cells("y ~ 0 + f:g"), 6, "without one every cell stays");
+    let spec = build_formula("y ~ 0 + f:g", &ds);
+    let residual = unpenalized_constant_residual(&ds, &spec);
+    assert!(residual < 1e-8, "the saturated cells span the constant: {residual}");
+    // A factor block present elsewhere already carries the level, so the
+    // interaction keeps exactly the coding it has beside an intercept.
+    assert_eq!(cells("y ~ 0 + f + f:g"), cells("y ~ f + f:g"));
+}
+
+/// With no factor, the first plain B-spline / tensor smooth carries the level:
+/// its sum-to-zero centring is released and its null-space ridge dropped, so
+/// the constant is free. An explicit `double_penalty=true` keeps the ridge (the
+/// user asked for the whole null space to be shrunk), and a smooth whose
+/// explicit `identifiability=` keeps the constant already carries it.
+#[test]
+fn no_intercept_releases_the_first_default_smooth_to_carry_the_level() {
+    let ds = smooth_option_dataset();
+
+    let centred = build_formula("y ~ s(x)", &ds);
+    assert_eq!(centred.level, ModelLevel::Intercept);
+    assert!(matches!(
+        bspline_spec(&centred, 0).identifiability,
+        BSplineIdentifiability::WeightedSumToZero { .. }
+    ));
+    assert!(bspline_spec(&centred, 0).double_penalty);
+
+    for formula in ["y ~ 0 + s(x)", "y ~ s(x) - 1", "y ~ 0 + s(x) + s(z)"] {
+        let spec = build_formula(formula, &ds);
+        assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
+        let carrier = bspline_spec(&spec, 0);
+        assert!(matches!(carrier.identifiability, BSplineIdentifiability::None));
+        assert!(!carrier.double_penalty, "`{formula}`: the carrier's constant is unpenalized");
+        let residual = unpenalized_constant_residual(&ds, &spec);
+        assert!(residual < 1e-8, "`{formula}`: {residual}");
+    }
+    // Only the first smooth is released.
+    let two = build_formula("y ~ 0 + s(x) + s(z)", &ds);
+    assert!(matches!(
+        bspline_spec(&two, 1).identifiability,
+        BSplineIdentifiability::WeightedSumToZero { .. }
+    ));
+    assert!(bspline_spec(&two, 1).double_penalty);
+
+    let ridged = build_formula("y ~ 0 + s(x, double_penalty=true)", &ds);
+    assert_eq!(ridged.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
+    assert!(bspline_spec(&ridged, 0).double_penalty);
+
+    // An explicit gauge that keeps the constant is preferred over the default
+    // one, wherever it sits in the formula.
+    let explicit = build_formula("y ~ 0 + s(z) + s(x, identifiability=none)", &ds);
+    assert_eq!(explicit.level, ModelLevel::NoIntercept { level_smooth: Some(1) });
+    assert!(matches!(
+        bspline_spec(&explicit, 0).identifiability,
+        BSplineIdentifiability::WeightedSumToZero { .. }
+    ));
+    assert!(!bspline_spec(&explicit, 1).double_penalty);
+    let residual = unpenalized_constant_residual(&ds, &explicit);
+    assert!(residual < 1e-8, "explicit gauge: {residual}");
+
+    let tensor = build_formula("y ~ 0 + te(x, z)", &ds);
+    assert_eq!(tensor.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
+    let SmoothBasisSpec::TensorBSpline { spec, .. } = &tensor.smooth_terms[0].basis else {
+        panic!("te(x, z) lowers to a tensor B-spline");
+    };
+    assert!(matches!(spec.identifiability, TensorBSplineIdentifiability::None));
+    assert!(!spec.double_penalty);
+    let residual = unpenalized_constant_residual(&ds, &tensor);
+    assert!(residual < 1e-8, "te: {residual}");
+}
+
+/// A factor `by=` smooth's main effect is a fixed factor block, so without an
+/// intercept it is the unpenalized level carrier.
+#[test]
+fn no_intercept_factor_by_main_effect_carries_the_level() {
+    let ds = factor_dataset();
+    let spec = build_formula("y ~ 0 + s(x, by=g)", &ds);
+    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
+    assert_eq!(spec.random_effect_terms.len(), 1);
+    assert!(!spec.random_effect_terms[0].penalized);
+    let residual = unpenalized_constant_residual(&ds, &spec);
+    assert!(residual < 1e-8, "{residual}");
+}
+
+/// A parametric no-intercept model has no constant anywhere: `0 + x` is the
+/// regression through the origin.
+#[test]
+fn no_intercept_parametric_model_passes_through_the_origin() {
+    let ds = smooth_option_dataset();
+    let spec = build_formula("y ~ 0 + x", &ds);
+    assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+        .expect("design builds");
+    let dense = design.design.to_dense();
+    assert_eq!(dense.ncols(), 1, "only the slope column remains");
+    for (row, value) in dense.column(0).iter().enumerate() {
+        assert!((value - ds.values[[row, 1]]).abs() < 1e-12);
+    }
+}

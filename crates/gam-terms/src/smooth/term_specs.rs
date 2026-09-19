@@ -1440,10 +1440,11 @@ pub struct TermCollectionSpec {
 ///    full dummy coding and is made unpenalized, giving the cell-means model;
 /// 2. else the first pure-indicator interaction (`g:h`), which keeps every
 ///    cell, its reference cell included;
-/// 3. else the first B-spline / tensor smooth with the default gauge, whose
-///    sum-to-zero centring is released (`level_smooth`) and whose null-space
-///    ridge is dropped unless `double_penalty=true` was written. A smooth
-///    whose explicit `identifiability=` keeps the constant already carries it.
+/// 3. else the first B-spline / tensor smooth whose explicit
+///    `identifiability=none` already keeps the constant, or failing that the
+///    first one with the default gauge, whose sum-to-zero centring is
+///    released. Either way it becomes `level_smooth`, and its null-space
+///    ridge is dropped unless `double_penalty=true` was written.
 ///
 /// A genuine random effect (`group(g)`, `re(g)`) never carries the level: its
 /// levels are mean-zero deviations. When no term can carry it the model has
@@ -7209,22 +7210,27 @@ pub(crate) fn bspline_smooth_spans_constant(basis: &SmoothBasisSpec) -> bool {
 /// unpenalized, as for a smooth fitted alongside an intercept without a
 /// null-space penalty. An explicit `double_penalty=true` keeps it: the user
 /// asked for the whole null space, level included, to be shrunk. Only a basis
-/// for which [`bspline_smooth_is_default_centred`] holds is ever handed the
-/// level; any other basis is left untouched.
+/// for which [`bspline_smooth_is_default_centred`] or
+/// [`bspline_smooth_spans_constant`] holds is ever handed the level; any other
+/// basis is left untouched.
 pub(crate) fn release_model_centring_for_level(basis: &mut SmoothBasisSpec, keep_null_ridge: bool) {
-    if let SmoothBasisSpec::TensorBSpline { spec, .. } = basis
-        && matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero)
-    {
-        spec.identifiability = TensorBSplineIdentifiability::None;
-        spec.double_penalty &= keep_null_ridge;
-    } else if let SmoothBasisSpec::BSpline1D { spec, .. } = basis
-        && matches!(
+    if let SmoothBasisSpec::TensorBSpline { spec, .. } = basis {
+        if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) {
+            spec.identifiability = TensorBSplineIdentifiability::None;
+        }
+        if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
+            spec.double_penalty &= keep_null_ridge;
+        }
+    } else if let SmoothBasisSpec::BSpline1D { spec, .. } = basis {
+        if matches!(
             spec.identifiability,
             BSplineIdentifiability::WeightedSumToZero { .. }
-        )
-    {
-        spec.identifiability = BSplineIdentifiability::None;
-        spec.double_penalty &= keep_null_ridge;
+        ) {
+            spec.identifiability = BSplineIdentifiability::None;
+        }
+        if matches!(spec.identifiability, BSplineIdentifiability::None) {
+            spec.double_penalty &= keep_null_ridge;
+        }
     }
 }
 

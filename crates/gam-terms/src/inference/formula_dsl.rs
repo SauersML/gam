@@ -2961,7 +2961,10 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
         if t.is_empty() {
             continue;
         }
-        if intercept_token(t).is_some() {
+        if split_outside_backticks(t, ':')
+            .into_iter()
+            .any(|atom| intercept_token(atom).is_some())
+        {
             return Err(FormulaDslError::IncompatibleTerm {
                 reason: format!(
                     "intercept token `{t}` in formula `{formula}` cannot take part in an \

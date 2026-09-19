@@ -1141,6 +1141,7 @@ mod frozen_factor_level_collection_tests {
                 smooth("nested", nested),
                 smooth("numeric", numeric_wrappers),
             ],
+            level: Default::default(),
         };
 
         let levels = spec.frozen_factor_levels_by_col();

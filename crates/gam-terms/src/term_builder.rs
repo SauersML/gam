@@ -416,9 +416,10 @@ pub fn build_termspec(
     // fixed factor block already spans it with its full level set, and becomes
     // unpenalized so the level is not shrunk toward zero (the cell-means
     // model); otherwise the first pure-indicator interaction keeps its
-    // reference cell, and failing that the first plain B-spline smooth keeps
-    // its constant. A genuine random effect (`group(g)`, `re(g)`) never
-    // carries the level: its levels are deviations with mean zero.
+    // reference cell (unpenalized), and failing that the first B-spline smooth
+    // keeps its constant with its null-space ridge dropped. A genuine random
+    // effect (`group(g)`, `re(g)`) never carries the level: its levels are
+    // deviations with mean zero.
     let no_intercept = terms.iter().any(|t| matches!(t, ParsedTerm::NoIntercept));
     let is_categorical = |name: &str| {
         col_map
@@ -449,6 +450,7 @@ pub fn build_termspec(
     // Index of the first smooth eligible to carry the level, and whether an
     // explicit `double_penalty=true` asks to keep its null-space ridge.
     let mut level_smooth_candidate: Option<(usize, bool)> = None;
+    let mut explicit_level_smooth: Option<(usize, bool)> = None;
 
     for t in terms {
         match t {
@@ -757,17 +759,19 @@ pub fn build_termspec(
                         }
                     }
                 } else {
+                    // An explicit gauge is the user's choice: one that keeps the
+                    // constant is the preferred carrier, and a default-centred
+                    // smooth is the fallback.
+                    let keep_null_ridge = option_bool(options, "double_penalty")? == Some(true);
                     if options.contains_key("identifiability") {
-                        // An explicit gauge is the user's choice; one that keeps
-                        // the constant already carries the level.
-                        if crate::smooth::bspline_smooth_spans_constant(&inner_basis) {
-                            level_carried = true;
+                        if explicit_level_smooth.is_none()
+                            && crate::smooth::bspline_smooth_spans_constant(&inner_basis)
+                        {
+                            explicit_level_smooth = Some((smooth_terms.len(), keep_null_ridge));
                         }
                     } else if level_smooth_candidate.is_none()
                         && crate::smooth::bspline_smooth_is_default_centred(&inner_basis)
                     {
-                        let keep_null_ridge =
-                            option_bool(options, "double_penalty")? == Some(true);
                         level_smooth_candidate = Some((smooth_terms.len(), keep_null_ridge));
                     }
                     smooth_terms.push(SmoothTermSpec {
@@ -985,7 +989,9 @@ pub fn build_termspec(
                             feature_col,
                             feature_cols: numeric_cols.clone(),
                             categorical_levels,
-                            double_penalty: *double_penalty,
+                            // Cells that carry the level hold it unpenalized:
+                            // a ridge on them would pull the level toward zero.
+                            double_penalty: *double_penalty && !cells_carry_level,
                             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             coefficient_min: None,
                             coefficient_max: None,
@@ -1015,7 +1021,7 @@ pub fn build_termspec(
         {
             carrier.penalized = false;
         }
-        let level_smooth = match level_smooth_candidate {
+        let level_smooth = match explicit_level_smooth.or(level_smooth_candidate) {
             Some((idx, keep_null_ridge)) if !level_carried => {
                 crate::smooth::release_model_centring_for_level(
                     &mut smooth_terms[idx].basis,
