@@ -18,7 +18,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use crate::{PyObject, json_value_to_py, py_value_error};
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "EuclideanManifold",
     skip_from_py_object
 )]
@@ -58,7 +58,7 @@ impl EuclideanManifold {
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "CircleManifold",
     skip_from_py_object
 )]
@@ -86,7 +86,7 @@ impl CircleManifold {
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "SphereManifold",
     skip_from_py_object
 )]
@@ -126,7 +126,7 @@ impl SphereManifold {
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "TorusManifold",
     skip_from_py_object
 )]
@@ -199,7 +199,7 @@ fn validate_frame_domain(name: &str, k: i64, n: i64) -> PyResult<()> {
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "GrassmannManifold",
     skip_from_py_object
 )]
@@ -253,7 +253,7 @@ impl GrassmannManifold {
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "StiefelManifold",
     skip_from_py_object
 )]
@@ -306,7 +306,7 @@ impl StiefelManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SpdManifold", skip_from_py_object)]
+#[pyclass(module = "gamfit._rust", name = "SpdManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SpdManifold {
     #[pyo3(get, set)]
@@ -334,7 +334,7 @@ impl SpdManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "ProductManifold")]
+#[pyclass(module = "gamfit._rust", name = "ProductManifold")]
 pub(crate) struct ProductManifold {
     #[pyo3(get, set)]
     parts: Vec<PyObject>,

@@ -1,0 +1,36 @@
+[run] lidar n=221 gaussian :: y ~ s(range)
+   pygam_default  ok=5/5 dev=0.0068316
+   pygam_grid     ok=5/5 dev=0.0068149
+   gamfit         ok=5/5 dev=0.006779
+[run] gagurine n=314 gaussian :: y ~ s(age)
+   pygam_default  ok=5/5 dev=0.1026
+   pygam_grid     ok=5/5 dev=0.10298
+   gamfit         ok=5/5 dev=0.097923
+[run] prostate_pc n=654 binomial :: y ~ s(pc1) + s(pc2)
+   pygam_default  ok=5/5 dev=1.2381
+   pygam_grid     ok=5/5 dev=1.2277
+   gamfit         ok=5/5 dev=1.2292
+[run] haberman n=306 binomial :: y ~ s(age) + s(year) + s(nodes)
+   pygam_default  ok=5/5 dev=1.1385
+   pygam_grid     ok=5/5 dev=1.0699
+   gamfit         ok=3/5 dev=1.0767  ERR=['IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=7.516e-6 |Pg|=7.516e-6 bound=3.651e-6 (rung=solver-band derived_standard=false) hessian_psd=NO (cleared=true λ_min(H)=-1.675372e-6 λ_min(H+diag|g|)=1.285158e-7 max_k|g_k|=6.978655e-6 measured_resolution=0.000000e0 decided_at=1.490116e-8) curvature_source=terminal-analytic railed=[] → NOT STATI']
+[run] heart_failure n=299 binomial :: y ~ s(age) + s(ejection_fraction) + s(serum_creatinine) + s(serum_sodium) + s(platelets) + s(creatinine_phosphokinase)
+   pygam_default  ok=5/5 dev=1.1794
+   pygam_grid     ok=5/5 dev=1.0458
+   gamfit         ok=0/5 dev=nan  ERR=['IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=1.768e-3 |Pg|=1.768e-3 bound=5.588e-4 (rung=curvature-resolvability derived_standard=true) hessian_psd=yes curvature_source=terminal-analytic railed=[] → NOT STATIONARY (|Pg|=1.768e-3 > bound=5.588e-4); tail-snap declined: no candidate passed the curvature tie (k=4: ρ=4.61 more than 18 e-folds']
+[run] quakes n=1000 gaussian :: y ~ s(depth) + s(stations)
+   pygam_default  ok=5/5 dev=0.038518
+   pygam_grid     ok=5/5 dev=0.037918
+   gamfit         ok=5/5 dev=0.037883
+[run] quakes_space n=1000 gaussian :: y ~ te(lat, lon)
+   pygam_default  ok=5/5 dev=6136.5
+   pygam_grid     ok=5/5 dev=4382.3
+   gamfit         ok=5/5 dev=4797.7
+[run] badhealth n=1127 poisson :: y ~ s(age) + factor(badh)
+   pygam_default  ok=5/5 dev=3.1816
+   pygam_grid     ok=5/5 dev=3.1864
+   gamfit         ok=5/5 dev=3.1162
+[run] penguins_mass n=342 gaussian :: y ~ s(bl) + s(bd) + s(fl)
+   pygam_default  ok=5/5 dev=0.13626
+   pygam_grid     ok=5/5 dev=0.13149
+   gamfit         ok=5/5 dev=0.13593

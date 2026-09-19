@@ -4,6 +4,12 @@
 //! binary afresh for every thread count.  The child prints the exact IEEE-754
 //! words of the user-visible fitted coefficients, smoothing parameters, and
 //! log-likelihood; comparing text therefore compares bits, not a tolerance.
+//!
+//! The 240-row fixtures sit below every parallel threshold, so on their own
+//! they only prove the serial path is deterministic. `gaussian_wide` has enough
+//! rows that the dense row contractions (`XᵀWX`, `XᵀWy`) split into several row
+//! blocks and the Rayon row reductions fan out, which is where a fold order
+//! that followed the pool width would show up.
 
 use std::process::Command;
 
@@ -47,6 +53,32 @@ fn data(kind: &str) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode deterministic fixture")
 }
 
+/// Rows in the `gaussian_wide` fixture: several row blocks of the dense
+/// contraction kernels for its ~34-column design.
+const WIDE_ROWS: usize = 40_000;
+
+fn wide_data() -> gam::data::EncodedDataset {
+    let headers = ["y", "x1", "x2", "x3"].map(str::to_owned).to_vec();
+    let rows = (0..WIDE_ROWS)
+        .map(|i| {
+            // Three covariates on [-2.4, 2.4] visited in different orders, so
+            // the columns are not collinear and no row block is sorted.
+            let at =
+                |stride: usize| -2.4 + 4.8 * ((i * stride) % WIDE_ROWS) as f64 / WIDE_ROWS as f64;
+            let (x1, x2, x3) = (at(1), at(7919), at(104_729));
+            let mean = (2.1 * x1).sin() + 0.5 * x2 * x2 - 0.3 * (1.7 * x3).cos();
+            let noise = 0.07 * ((i * 37 % 17) as f64 - 8.0);
+            StringRecord::from(
+                [mean + noise, x1, x2, x3]
+                    .into_iter()
+                    .map(|v| format!("{v:.17e}"))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).expect("encode deterministic fixture")
+}
+
 fn words(values: impl IntoIterator<Item = f64>) -> String {
     values
         .into_iter()
@@ -66,6 +98,10 @@ fn print_child_result(kind: &str) {
             config.family = Some("gaussian".into());
             "y ~ s(x, k=10)"
         }
+        "gaussian_wide" => {
+            config.family = Some("gaussian".into());
+            "y ~ s(x1, k=12) + s(x2, k=12) + s(x3, k=12)"
+        }
         "binomial" => {
             config.family = Some("binomial".into());
             "y ~ s(x, k=10)"
@@ -78,7 +114,12 @@ fn print_child_result(kind: &str) {
         }
         _ => panic!("unknown child fixture"),
     };
-    let result = fit_from_formula(formula, &data(kind), &config).expect("fit must converge");
+    let dataset = if kind == "gaussian_wide" {
+        wide_data()
+    } else {
+        data(kind)
+    };
+    let result = fit_from_formula(formula, &dataset, &config).expect("fit must converge");
     let fit = match &result {
         FitResult::Standard(result) => &result.fit,
         FitResult::SurvivalTransformation(result) => &result.fit,
@@ -102,6 +143,11 @@ fn thread_count_fit_child_gaussian() {
 }
 
 #[test]
+fn thread_count_fit_child_gaussian_wide() {
+    print_child_result("gaussian_wide");
+}
+
+#[test]
 fn thread_count_fit_child_binomial() {
     print_child_result("binomial");
 }
@@ -114,12 +160,16 @@ fn thread_count_fit_child_survival() {
 #[test]
 fn fits_are_bit_identical_across_rayon_thread_counts_and_runs() {
     let exe = std::env::current_exe().expect("current test binary");
-    for kind in ["gaussian", "binomial", "survival"] {
+    for kind in ["gaussian", "gaussian_wide", "binomial", "survival"] {
         let mut baseline = None;
         for threads in [1, 2, 8] {
             for run in 0..2 {
                 let output = Command::new(&exe)
-                    .args(["--exact", &format!("thread_count_fit_child_{kind}"), "--nocapture"])
+                    .args([
+                        "--exact",
+                        &format!("thread_count_fit_child_{kind}"),
+                        "--nocapture",
+                    ])
                     .env("RAYON_NUM_THREADS", threads.to_string())
                     .output()
                     .expect("launch isolated fit process");
