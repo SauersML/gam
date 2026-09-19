@@ -5,7 +5,9 @@ use super::*;
 /// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
 /// `sigma = response_scale · sigma_floor + exp(X_noise @ beta_noise + offset_noise)`.
 ///
-/// `sigma_floor` is the standardized-response σ floor (`LOGB_SIGMA_FLOOR`) and
+/// `sigma_floor` is the standardized-response σ floor saved with the fit (the
+/// response's recording-grid bound `δ/√12`, see
+/// `gam_model_kernels::sigma_link::gaussian_resolution_sigma_floor`) and
 /// `response_scale` maps it back to raw response units. The `exp(η)` term is
 /// already in raw units (the persisted log-σ intercept is shifted by
 /// `+ln(response_scale)` at fit time), so only the floor is scaled here — see
@@ -62,7 +64,7 @@ impl GaussianLocationScalePredictor {
         let eta_noise = self.eta_noise(design_noise, offset_noise)?;
         let scaled_floor = self.response_scale * self.sigma_floor;
         Ok(eta_noise.mapv(|eta| {
-            gam_model_kernels::sigma_link::logb_sigma_from_eta_with_floor_scalar(scaled_floor, eta)
+            gam_model_kernels::sigma_link::logb_sigma_from_eta_scalar(scaled_floor, eta)
         }))
     }
 
@@ -100,9 +102,10 @@ impl GaussianLocationScalePredictor {
     /// With `σ = f + exp(η_s)` (`f` the scaled floor) and the per-row posterior
     /// `η_s ~ N(m, v)`, the lognormal moments give exactly
     ///   `E[σ²] = f² + 2·f·exp(m + v/2) + exp(2m + 2v)`,
-    /// which reduces to the plug-in `σ(m)²` at `v = 0` (also the no-covariance
-    /// degrade). The SD is evaluated without forming an overflowing squared
-    /// moment; `+inf` is returned only when the SD itself is outside the range.
+    /// which reduces to the plug-in `σ(m)²` only at an exact `v = 0`; a fit
+    /// without covariance is refused, never read as `v = 0`. The SD is
+    /// evaluated without forming an overflowing squared moment; `+inf` is
+    /// returned only when the SD itself is outside the range.
     fn integrated_noise_sd(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
         let (eta_noise, log_sigma_var) = self.log_sigma_posterior(input)?;
         let scaled_floor = self.response_scale * self.sigma_floor;
@@ -112,8 +115,9 @@ impl GaussianLocationScalePredictor {
     }
 
     /// Posterior mean of the noise scale, `E[σ] = f + exp(m + v/2)` under the
-    /// per-row log-σ posterior `η_s ~ N(m, v)` (`f` the scaled floor). It is
-    /// the plug-in `σ(m)` at `v = 0`, the no-covariance degrade.
+    /// per-row log-σ posterior `η_s ~ N(m, v)` (`f` the scaled floor). A fit
+    /// without covariance has no `v`, so it is refused rather than degraded to
+    /// the plug-in `σ(m)`.
     fn posterior_mean_noise_scale(
         &self,
         input: &PredictInput,
@@ -130,8 +134,9 @@ impl GaussianLocationScalePredictor {
     }
 
     /// Per-row log-σ posterior `(m, v)`: the linear predictor and its
-    /// conditional variance from the Scale block of the saved covariance
-    /// (zero variance when the fit carries no covariance).
+    /// conditional variance from the Scale block of the saved covariance. The
+    /// covariance is required: without it `v` does not exist, and reading it as
+    /// zero would silently report the plug-in σ as the posterior moment.
     fn log_sigma_posterior(
         &self,
         input: &PredictInput,
@@ -142,25 +147,26 @@ impl GaussianLocationScalePredictor {
             )
         })?;
         let eta_noise = self.eta_noise(design_noise, input.offset_noise.as_ref())?;
-        let log_sigma_var = match self.covariance.as_ref() {
-            Some(covariance) => {
-                let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-                let p_mu = self.beta_mu.len();
-                let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
-                // Coefficient layout is `[mean | scale | wiggle]`, so the log-σ
-                // block sits after the `p_mu` mean columns.
-                let se = padded_design_standard_errors_from_backend(
-                    design_noise,
-                    &backend,
-                    p_mu,
-                    p_w,
-                    "gaussian location-scale log-sigma uncertainty",
-                )?;
-                se.mapv(|s| s * s)
-            }
-            None => Array1::zeros(eta_noise.len()),
-        };
-        Ok((eta_noise, log_sigma_var))
+        let covariance = self.covariance.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Gaussian location-scale posterior σ moments integrate the log-σ posterior, \
+                 but this model carries no coefficient covariance; refit with covariance"
+                    .to_string(),
+            )
+        })?;
+        let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+        let p_mu = self.beta_mu.len();
+        let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+        // Coefficient layout is `[mean | scale | wiggle]`, so the log-σ block
+        // sits after the `p_mu` mean columns.
+        let se = padded_design_standard_errors_from_backend(
+            design_noise,
+            &backend,
+            p_mu,
+            p_w,
+            "gaussian location-scale log-sigma uncertainty",
+        )?;
+        Ok((eta_noise, se.mapv(|s| s * s)))
     }
 
     fn eta_standard_error_from_backend(

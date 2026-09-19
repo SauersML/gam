@@ -1549,7 +1549,7 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         _ => false,
     };
     let logdet_jeffreys_hphi: Option<Array2<f64>> =
-        if !include_logdet_h || options.seed_screening || !family.joint_jeffreys_term_required() {
+        if !include_logdet_h || !family.joint_jeffreys_term_required() {
             None
         } else if let Some(hphi) = cached_jeffreys_hphi {
             if hphi.dim() != (total, total) {
@@ -1564,12 +1564,8 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
             // second all-axis Jeffreys sweep at that identical coefficient point.
             Some(hphi.clone())
         } else if !outer_jeffreys_precheck_skips {
-            // Skipped during seed screening: this per-axis Jeffreys curvature
-            // (O(p · per-axis-Hdot)) augments the outer LAML logdet `½ log|H+Sλ+H_Φ|`,
-            // a refinement the screening SCORE does not need. Screening ranks seeds by
-            // the un-augmented `½ log|H+Sλ|` plus the value-only Firth penalty already
-            // in `penalty_value`; the load-bearing H_Φ is restored for the real fit
-            // (gam#729/#808).
+            // This per-axis Jeffreys curvature (O(p · per-axis-Hdot)) augments the
+            // outer LAML logdet `½ log|H+Sλ+H_Φ|` (gam#729/#808).
             match build_joint_jeffreys_subspace(family, specs, &ranges)? {
                 Some(z_joint) => {
                     custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
@@ -2029,6 +2025,7 @@ pub(crate) fn update_joint_trust_region_radius(
     objective_scale: f64,
     objective_tol: f64,
     measured_resolution: f64,
+    evaluation_roundoff_ceiling: f64,
     residual_above_tolerance: bool,
 ) -> JointTrustRegionUpdate {
     // Round-off-aware trust-region radius control, delegated to the shared
@@ -2230,11 +2227,35 @@ pub(crate) fn update_joint_trust_region_radius(
     // to be interior, `step_reached_boundary` is false and this stops. The
     // factor and the cap are the SHARED controller's own (`policy`), not a
     // second opinion about how fast a trust region should grow.
+    //
+    // "RESOLVABLE" MEANS ABOVE WHAT THE ARITHMETIC CAN CARRY, NOT ABOVE WHAT
+    // HAS BEEN SEEN (gam#2977 S2). This branch overrides a rejection, so its
+    // premise — the realized change is a fact about `β` — must hold for every
+    // rounding the evaluation could carry, and the only number that bounds
+    // that from above is the evaluation's own arithmetic ceiling
+    // `γ_m·Σ|terms| + logdet_roundoff` ([`ObjectiveAccumulation`]). `noise_floor`
+    // is a LOWER bound: before any ladder has measured, it is the `|F|·1e-14`
+    // fallback, which is exactly what a cancelling evaluation exceeds. Measured
+    // on gnomon#2370's 48-row location-scale fixture: floor `2.4e-14`, the
+    // evaluation's rounding `2.64e-11` (the witness measured it one ladder
+    // later), and a realized `+2.330e-11` accepted here as a decrease. That
+    // accept ended the ladder the witness needed, the noise-decided shrinks
+    // stood at `r = 1.160e-10`, the next cycle's exact face was declined as
+    // touching the ball, and the solve refused on a fully-rejected stall.
+    // Requiring the change to clear the ceiling keeps that attempt a
+    // rejection, so the ladder continues and the witness undoes its shrinks.
+    //
+    // The asymmetry is deliberate: the controller's own "indistinguishable ⇒
+    // `rho = 1`" test above stays on the lower bound, because treating a
+    // resolvable change as noise is the error in THAT direction. A
+    // non-finite ceiling (an evaluation this module cannot size) cannot
+    // certify any change, so the override does not fire.
     if !step.accepted
         && step.predicted_nonpositive
         && predicted_reduction.is_finite()
         && predicted_reduction >= 0.0
         && actual_reduction > noise_floor
+        && actual_reduction > evaluation_roundoff_ceiling
     {
         let region_is_the_binding_constraint = step_reached_boundary && residual_above_tolerance;
         let radius = if region_is_the_binding_constraint {
@@ -5222,6 +5243,7 @@ pub(crate) fn compute_kkt_refusal_report(
     let mut hpen_eigenvalues_sorted_desc: Vec<f64> = Vec::new();
     let mut hpen_condition_number = f64::NAN;
     let mut hpen_nullity_at_rank_tol = 0usize;
+    let mut hpen_rank_tol = joint_hessian_numerical_eigenvalue_floor(1.0, total_p);
     let mut hpen_null_direction = None;
     let mut hlik_max_abs_eigenvalue = None;
     let mut hpen_spectrum_unavailable = false;
@@ -5231,10 +5253,10 @@ pub(crate) fn compute_kkt_refusal_report(
             materialize_joint_hessian_source(source, total_p, "KKT refusal diagnostic spectrum")
     {
         // Capture the likelihood-only spectrum BEFORE the penalty is folded in.
-        // If the relative rank cutoff (`KKT_REFUSAL_RANK_TOL·λ_max`) that flags a
-        // direction "null" was inflated by a likelihood-side curvature blow-up
-        // rather than the penalty, `λ_max(H_lik) ≈ λ_max(H_pen)`; a penalty-driven
-        // inflation leaves `λ_max(H_lik)` small. Runs only on the refusal path.
+        // A flagged direction's likelihood part is what tells a gauge null from a
+        // penalty-only identification, and `λ_max(H_lik) ≈ λ_max(H_pen)` says the
+        // curvature scale is set by the likelihood rather than the penalty. Runs
+        // only on the refusal path.
         let mut h_likelihood = h_joint.clone();
         symmetrize_dense_in_place(&mut h_likelihood);
         if let Ok((lik_evals, _)) = FaerEigh::eigh(&h_likelihood, Side::Lower) {
@@ -5256,7 +5278,17 @@ pub(crate) fn compute_kkt_refusal_report(
                     .iter()
                     .map(|x: &f64| x.abs())
                     .fold(f64::INFINITY, f64::min);
-                let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+                // "Rank deficient" is a statement about RANK, so a direction
+                // counts as null only when its curvature is below H_pen's own
+                // eigensolver resolution (#2977 S6). The conditioning ratio
+                // `KKT_REFUSAL_RANK_TOL·λ_max` labelled full-rank stiff Hessians
+                // rank deficient: one −log q̇ guard row at 1/guard² = 1e12 put 48
+                // of 59 identified directions "null" (#3003), and that label is
+                // Jeffreys-arming evidence.
+                let cutoff = joint_hessian_numerical_eigenvalue_floor(max_abs, total_p);
+                if max_abs > 0.0 {
+                    hpen_rank_tol = cutoff / max_abs;
+                }
                 hpen_nullity_at_rank_tol = sorted.iter().filter(|x| x.abs() < cutoff).count();
                 hpen_condition_number = if min_abs > 0.0 && min_abs.is_finite() {
                     max_abs / min_abs
@@ -5358,7 +5390,7 @@ pub(crate) fn compute_kkt_refusal_report(
         hpen_eigenvalues_sorted_desc,
         hpen_condition_number,
         hpen_nullity_at_rank_tol,
-        hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+        hpen_rank_tol,
         hpen_null_direction,
         active_set_rows_total,
         accepted_step_inf,
@@ -5577,8 +5609,8 @@ mod kkt_refusal_spectrum_format_tests {
     fn indefinite_hpen_render_keeps_signed_extremes_and_magnitude_diagnostics_2659() {
         // The negative eigenvalue has the greatest magnitude. Algebraic
         // extrema are therefore (+5, -9), while the condition and rank cutoff
-        // must still use max|λ|=9 and min|λ|=1e-12.
-        let spectrum = vec![5.0_f64, 1.0e-12, -9.0];
+        // must still use max|λ|=9 and min|λ|=1e-16, below the √3·ε·9 resolution.
+        let spectrum = vec![5.0_f64, 1.0e-16, -9.0];
         let max_abs = spectrum
             .iter()
             .map(|value| value.abs())
@@ -5587,7 +5619,8 @@ mod kkt_refusal_spectrum_format_tests {
             .iter()
             .map(|value| value.abs())
             .fold(f64::INFINITY, f64::min);
-        let rank_cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+        let rank_tol = joint_hessian_numerical_eigenvalue_floor(1.0, spectrum.len());
+        let rank_cutoff = rank_tol * max_abs;
         let nullity = spectrum
             .iter()
             .filter(|value| value.abs() < rank_cutoff)
@@ -5604,13 +5637,13 @@ mod kkt_refusal_spectrum_format_tests {
             hpen_eigenvalues_sorted_desc: spectrum,
             hpen_condition_number: max_abs / min_abs,
             hpen_nullity_at_rank_tol: nullity,
-            hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+            hpen_rank_tol: rank_tol,
             hpen_null_direction: Some(KktNullDirectionDiagnostic {
                 projected_gradient_component_inf: 0.0,
                 vector_block_inf: vec![0.0],
                 carrying_block: Some(0),
-                penalized_curvature: 1.0e-12,
-                likelihood_curvature: 1.0e-12,
+                penalized_curvature: 1.0e-16,
+                likelihood_curvature: 1.0e-16,
                 likelihood_max_abs_eigenvalue: Some(5.0),
             }),
             active_set_rows_total: 0,
@@ -5628,7 +5661,7 @@ mod kkt_refusal_spectrum_format_tests {
             diagnosis: KktRefusalDiagnosis::RankDeficientHPen,
             constrained_fixed_point_verdict: None,
         };
-        let expected = "λ_max=5.000e0, λ_min=-9.000e0, cond=9.000e12, nullity@1e-10=1 \
+        let expected = "λ_max=5.000e0, λ_min=-9.000e0, cond=9.000e16, nullity@4e-16=1 \
              (of 3 eigenvalues)";
 
         assert_eq!(max_abs, 9.0);

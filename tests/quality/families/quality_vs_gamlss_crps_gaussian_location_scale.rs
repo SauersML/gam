@@ -40,8 +40,9 @@
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
 //!     to `FitResult::GaussianLocationScale`; the response is standardized while
 //!     fitting and coefficients are mapped back to raw units.
-//!   * raw sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale), where
-//!     LOGB_SIGMA_FLOOR = 0.01 (`families::sigma_link`); location block =
+//!   * raw sigma = response_scale * sigma_floor + exp(eta_scale), where
+//!     sigma_floor is the fit's recording-grid bound δ/√12 of the standardized
+//!     response (`families::sigma_link`); location block =
 //!     BlockRole::Location, log-sigma block = BlockRole::Scale.
 
 use gam::estimate::BlockRole;
@@ -90,10 +91,6 @@ fn crps_gaussian(y: f64, mean: f64, sd: f64) -> f64 {
     let w = (y - mean) / sd;
     sd * (w * (2.0 * norm_cdf(w) - 1.0) + 2.0 * norm_pdf(w) - 1.0 / std::f64::consts::PI.sqrt())
 }
-
-/// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
-/// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR` (and mgcv `gaulss(b=0.01)`).
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 #[test]
 fn gam_gaussian_location_scale_crps_matches_gamlss() {
@@ -177,6 +174,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,
+        sigma_floor: link_sigma_floor,
         ..
     }) = result
     else {
@@ -199,7 +197,8 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     // ---- predict gam's (mu, sigma) on the 60 held-out TEST rows ------------
     // Rebuild the frozen mean / log-sigma designs at the test (x, z) and apply
     // each block's coefficients. mu = X_mean*beta_location;
-    // sigma = response_scale*LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
+    // sigma = response_scale*link_sigma_floor + exp(X_scale*beta_scale), the
+    // fit's own noise-link floor in raw units.
     let mut test_grid = Array2::<f64>::zeros((n_test, ncols));
     for i in 0..n_test {
         test_grid[[i, x_idx]] = x_test[i];
@@ -214,7 +213,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     let gam_eta_sigma: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * link_sigma_floor + e.exp())
         .collect();
     assert_eq!(gam_mu.len(), n_test);
     assert_eq!(gam_sigma.len(), n_test);
@@ -457,6 +456,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,
+        sigma_floor,
         ..
     }) = result
     else {
@@ -490,7 +490,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
     let gam_eta_sigma: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * sigma_floor + e.exp())
         .collect();
     assert_eq!(gam_mu.len(), n_test);
     assert_eq!(gam_sigma.len(), n_test);

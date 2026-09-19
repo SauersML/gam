@@ -2,6 +2,8 @@
 
 use super::*;
 use crate::fit_orchestration::FitFailure;
+use crate::inference::predict_io::FittedLatentScoreMap;
+use std::cell::Cell;
 use crate::latent_law_compression::{CompressedLaw, DesignPoint, default_design};
 
 /// Recover the terminal hyperparameter vector from the optimizer that owned
@@ -218,12 +220,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         spec.age_entry
             .mapv(|entry| entry <= crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD),
     );
-    install_time_nullspace_shrinkage_penalty(
-        &mut spec.time_block,
-        spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
-        &entry_at_origin,
-    )
-    .map_err(FitFailure::invariant)?;
     let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
@@ -290,9 +286,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // step drops it #1082 while the certificate requires it #1449) — the
     // survival marginal-slope hang. Applied before the build so the flag is
     // frozen into `joint_specs` and honoured by every subsequent probe / frozen
-    // / kappa rebuild. Mirrors the time block's
-    // `install_time_nullspace_shrinkage_penalty`, via the ordinary builder so
-    // the layered penalty representation stays self-consistent.
+    // / kappa rebuild. Applied via the ordinary builder so the layered penalty
+    // representation stays self-consistent. The time block's affine null space
+    // is deliberately left unpenalized (gam#3003): it is the baseline's level
+    // and log-time slope, identified by `O(n_events)` curvature (gam#1076).
     for surface_spec in design_specs.iter_mut() {
         enable_surface_identifiability_double_penalty(surface_spec);
     }
@@ -340,16 +337,22 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let slope_surface_specs: Option<Vec<TermCollectionSpec>> =
         slope_topology.is_per_score().then(|| joint_specs.clone());
     if slope_topology.is_per_score() {
-        // The log σ and design-ψ terms are formed on the shared-slope row
-        // program, so a per-score slope refuses a learned frailty and a spatial
-        // marginal term rather than differentiate a likelihood other than the
-        // one it fits. Both are checked here, before the pilot solve.
+        // A Gaussian-shift frailty reaches a per-score row only through the
+        // probit scale s(σ) = 1/√(1+σ²) on every slope, so the likelihood reads
+        // σ and the slopes only through s·g: σ is not identified, and along the
+        // orbit that keeps s·g fixed only ½·log|H| moves, with no minimiser in σ
+        // (measured ∂V/∂log σ = −2σ²/(1+σ²), no data term; gam#2938). The
+        // design-ψ terms are formed on the shared-slope row program, so a
+        // spatial marginal term refuses rather than differentiate a likelihood
+        // other than the one it fits. Both are checked here, before the pilot.
         if learned_sigma_initial.is_some() {
             return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
                 reason: format!(
                     "a learned Gaussian frailty on a per-score slope over K={} scores is \
-                     refused: its log-σ derivatives are formed on the shared-slope row program, \
-                     not on the per-score likelihood this fit optimises (gam#2938)",
+                     refused: σ reaches every per-score row only through the probit scale \
+                     1/√(1+σ²) on the slopes, so the likelihood depends on σ and the slopes \
+                     only through their product and σ is not identified (the Laplace \
+                     evidence has no minimiser in σ; gam#2938)",
                     spec.z.ncols()
                 ),
             }
@@ -527,8 +530,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                              the marginal conditioning block",
                         )
                     })?;
-                    let calibrated = cal
-                        .apply(raw_scores.column(col), a_block.view())
+                    let calibrated = FittedLatentScoreMap::conditional_only(cal)
+                        .calibrate(raw_scores.column(col), Some(a_block.view()))
                         .map_err(FitFailure::invariant)?;
                     spec.z.column_mut(col).assign(&calibrated);
                 }
@@ -1154,16 +1157,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 .fold(0.0_f64, |a, v| a.max(v.abs())),
         );
     }
-    let walk_signals = crate::exact_mode_branch::OuterWalkSignals::default();
-    let exact_mode_branch = RefCell::new(crate::exact_mode_branch::ExactCoefficientModeBranch::new(
-        walk_signals.clone(),
-    ));
-    // Outer ρ-cache β-seed staging slot. The spatial-joint optimizer fires
-    // `seed_inner_beta_fn` on a cache hit before any eval has run at the
-    // restored ρ. Per-block widths are only known once `build_blocks(rho,…)`
-    // runs, so we stash the flat β here and the eval closures promote it
-    // into the deterministic coefficient-mode branch on the first invocation.
-    let pending_beta_seed = RefCell::new(None::<Array1<f64>>);
+    // Whether the member being solved is the Jeffreys/Firth-armed one. Every
+    // family `make_family` builds reads it, so the pilot, the capability
+    // probe, the outer search, the final fit and the post-fit certificates of
+    // one member all evaluate one objective (gam#2994, gam#2995).
+    let route_armed = Cell::new(false);
 
     let event = Arc::new(spec.event_target.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -1316,7 +1314,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         )?;
         slope_layout.validate_for(spec.z.ncols())?;
         let family = SurvivalMarginalSlopeFamily {
-            jeffreys_armed: true,
+            jeffreys_armed: route_armed.get(),
             latent_law: latent_law.clone(),
             n,
             event: Arc::clone(&event),
@@ -1612,630 +1610,705 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .is_some_and(|loaded| {
             gam_solve::rho_optimizer::cache_entry_would_help_outer(&loaded, setup.rho_dim())
         });
-    if outer_cache_seed_available {
+    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
+    // gam#2994, gam#2995: one objective per model, whatever route the driver
+    // takes. The route below (pilot, capability probe, outer search, final fit)
+    // runs on the unarmed member first and once more on the armed member only
+    // on the unarmed member's own typed evidence (#979 ruling (b)): the final
+    // fit's refusal, else the outer search's last evaluation's refusal, or a
+    // certified fit whose cone-truncated posterior is proved improper. On the
+    // fast path the route is one inner fit and this is the lifecycle
+    // `fit_custom_family_arming_on_evidence` runs; on the exact-joint route it
+    // is the whole length-scale and auxiliary search.
+    //
+    // Coefficient hints carry across members. The armed member runs its own
+    // pilot only when no converged solve of the unarmed member left hints.
+    let hints_from_converged_solve = Cell::new(false);
+    let outer_refusal_evidence = RefCell::new(None::<gam_problem::jeffreys_arming::JeffreysArmingEvidence>);
+    let route = |armed: bool| -> Result<
+        SpatialLengthScaleOptimizationResult<UnifiedFitResult>,
+        FitFailure,
+    > {
+        route_armed.set(armed);
+        outer_refusal_evidence.replace(None);
+        let walk_signals = crate::exact_mode_branch::OuterWalkSignals::default();
+        let exact_mode_branch = RefCell::new(
+            crate::exact_mode_branch::ExactCoefficientModeBranch::new(walk_signals.clone()),
+        );
+        // Outer ρ-cache β-seed staging slot. The spatial-joint optimizer fires
+        // `seed_inner_beta_fn` on a cache hit before any eval has run at the
+        // restored ρ. Per-block widths are only known once `build_blocks(rho,…)`
+        // runs, so we stash the flat β here and the eval closures promote it
+        // into the deterministic coefficient-mode branch on the first invocation.
+        let pending_beta_seed = RefCell::new(None::<Array1<f64>>);
+        if outer_cache_seed_available {
+            log::debug!(
+                "[survival-marginal-slope/pilot] skip reason=outer-cache-seed-present n={} rho_dim={}",
+                n,
+                setup.rho_dim(),
+            );
+        } else if hints_from_converged_solve.get() {
+            log::debug!(
+                "[survival-marginal-slope/pilot] skip reason=unarmed-member-seeded n={n}: the \
+                 coefficient hints hold the unarmed member's converged solve",
+            );
+        } else {
+            let pilot_started = std::time::Instant::now();
+            log::debug!(
+                "[survival-marginal-slope/pilot] start n={} time_p={} marginal_p={} slope_p={}",
+                n,
+                design_exit.ncols(),
+                marginal_design.design.ncols(),
+                slope_design.design.ncols(),
+            );
+            // Pilot ρ has exactly the parametric block sizes — score_warp and
+            // link_dev are excluded via FlexActivation::OffForRigidPilot below.
+            // Sizing must match build_blocks(... OffForRigidPilot) or the cursor
+            // walk inside the closure would slice past the end of the array.
+            let rigid_rho = Array1::<f64>::zeros(
+                time_penalties_len + marginal_design.penalties.len() + slope_design.penalties.len(),
+            );
+            // Blocks and families are built from the designs above (#2937).
+            let rigid_blocks = build_blocks(
+                &rigid_rho,
+                &marginal_design,
+                &slope_cov_design,
+                FlexActivation::OffForRigidPilot,
+            )
+            .map_err(FitFailure::invariant)?;
+            let rigid_family = make_family(
+                &marginal_design,
+                &slope_cov_design,
+                &initial_hyper_theta,
+                FlexActivation::OffForRigidPilot,
+            )
+            .map_err(FitFailure::invariant)?;
+            let mut pilot_options = options.clone();
+            // The pilot is only a warm start, so it skips production covariance
+            // assembly. Its inner solve runs at the family's cycle budget and stops on
+            // its own KKT certificate or the joint-Newton loop's typed stall exits,
+            // the rule every custom-family trial follows since 67fb2fd4c. A picked
+            // cycle cap is a wall-clock budget under another name.
+            pilot_options.compute_covariance = false;
+            match fit_custom_family_fixed_log_lambda_warm_start(
+                &rigid_family,
+                &rigid_blocks,
+                &pilot_options,
+            ) {
+                Ok((block_beta, converged, cycles)) => {
+                    // Only install the pilot's β as warm-start hints if the pilot
+                    // actually reached a KKT certificate. The blockwise inner
+                    // logger at custom_family.rs:12136 emits the warning
+                    //   "returning non-converged warm-start iterate and rejecting
+                    //    this outer REML/LAML evaluation"
+                    // when its cycle budget is exhausted without convergence; the
+                    // matching outer-side contract is `nonconverged_outer_eval_result`
+                    // (custom_family.rs:5993), which surfaces zero gradient and
+                    // HessianValue::Unavailable so the optimizer backs off. A
+                    // partial pilot β can still be far from the cold-start optimum
+                    // (the warning literally exists to signal that), so seeding
+                    // the real outer optimizer with it can drag the first true
+                    // inner solve to a degenerate region of (ρ, β)-space from
+                    // which the analytic envelope gradient is no longer reliable.
+                    // Discarding the partial β reverts the first real inner solve
+                    // to a clean cold start at whatever ρ the outer optimizer
+                    // picks (cached seed or initial_theta), which is the
+                    // behaviour the warning text already promises.
+                    if converged {
+                        hints_from_converged_solve.set(true);
+                        // Pilot only seeds the three parametric blocks. Flex
+                        // (score_warp / link_dev) blocks are intentionally absent
+                        // under FlexActivation::OffForRigidPilot — there is no
+                        // pilot β for them to seed.
+                        let mut hints_mut = hints.borrow_mut();
+                        if let Some(beta) = block_beta.first() {
+                            hints_mut.time_beta = Some(beta.clone());
+                        }
+                        if let Some(beta) = block_beta.get(1) {
+                            hints_mut.marginal_beta = Some(beta.clone());
+                        }
+                        if let Some(beta) = block_beta.get(2) {
+                            hints_mut.slope_beta = Some(beta.clone());
+                        }
+                    }
+                    log::debug!(
+                        "[survival-marginal-slope/pilot] end status={} cycles={} elapsed={:.3}s hints_installed={}",
+                        if converged { "converged" } else { "partial" },
+                        cycles,
+                        pilot_started.elapsed().as_secs_f64(),
+                        converged,
+                    );
+                }
+                Err(err) => {
+                    // Pilot audit policy: warn-and-proceed (exploratory).
+                    //
+                    // The pilot is a pure warm-start coefficient initialiser — it
+                    // runs at ρ=0 (no smoothing penalty) with a capped inner-cycle
+                    // budget solely to seed β hints for the first real inner solve.
+                    // Rank-deficiency at the pilot stage is a known hazard: the
+                    // zero-penalty rigid design can expose directions that become
+                    // identifiable once the outer optimizer selects a non-zero ρ.
+                    // Raising here would abort the entire fit for a transient
+                    // structural artifact of the exploration point, not a property
+                    // of the actual penalised model.
+                    //
+                    // Contrast with the outer-inner-fit audit policy (fail-fatal):
+                    // `fit_custom_family` routes through
+                    // `canonicalize_for_identifiability_with_operating_scalars`, which returns
+                    // `CustomFamilyError::IdentifiabilityFailure` on a fatal audit.
+                    // At the outer fit the full penalty is in play; rank-deficiency
+                    // there is a genuine model-specification problem that must be
+                    // surfaced to the caller rather than silently absorbed.
+                    //
+                    // In short: pilot tolerates rank-deficiency because it is
+                    // exploring ρ=0 (a singularity the outer optimizer will never
+                    // actually accept); outer-inner-fit does not because it operates
+                    // at the penalised optimum where identifiability is a hard
+                    // contract.
+                    log::debug!(
+                        "[survival-marginal-slope/pilot] end status=ignored-error elapsed={:.3}s error={}",
+                        pilot_started.elapsed().as_secs_f64(),
+                        err,
+                    );
+                }
+            }
+        }
+
+        let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
+        let slope_terms = spatial_length_scale_term_indices(&slopespec_boot);
+        let marginal_has_spatial = !marginal_terms.is_empty();
+        let slope_has_spatial = !slope_terms.is_empty();
+        if slope_has_spatial && per_score_slope_design.is_some() {
+            return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                reason: "a spatial length-scale term on a per-score slope surface is refused: the \
+                         length-scale search rebuilds the slope block from one concatenated spec, \
+                         which cannot rebuild one surface per score"
+                    .to_string(),
+            }
+            .into());
+        }
+        let analytic_joint_derivatives_available =
+            marginal_has_spatial || slope_has_spatial || setup.log_kappa_dim() == 0;
+
+        if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
+            return Err(FitFailure::invariant(
+                "exact survival marginal-slope spatial optimization requires analytic joint psi derivatives",
+            ));
+        }
+
+        let derivative_probe_started = std::time::Instant::now();
         log::debug!(
-            "[survival-marginal-slope/pilot] skip reason=outer-cache-seed-present n={} rho_dim={}",
-            n,
+            "[survival-marginal-slope] initial derivative probe start rho_dim={} log_kappa_dim={}",
             setup.rho_dim(),
+            setup.log_kappa_dim(),
         );
-    } else {
-        let pilot_started = std::time::Instant::now();
-        log::debug!(
-            "[survival-marginal-slope/pilot] start n={} time_p={} marginal_p={} slope_p={}",
-            n,
-            design_exit.ncols(),
-            marginal_design.design.ncols(),
-            slope_design.design.ncols(),
-        );
-        // Pilot ρ has exactly the parametric block sizes — score_warp and
-        // link_dev are excluded via FlexActivation::OffForRigidPilot below.
-        // Sizing must match build_blocks(... OffForRigidPilot) or the cursor
-        // walk inside the closure would slice past the end of the array.
-        let rigid_rho = Array1::<f64>::zeros(
-            time_penalties_len + marginal_design.penalties.len() + slope_design.penalties.len(),
-        );
-        // Blocks and families are built from the designs above (#2937).
-        let rigid_blocks = build_blocks(
-            &rigid_rho,
+        let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
+        let initial_blocks = build_blocks(
+            &initial_rho,
             &marginal_design,
             &slope_cov_design,
-            FlexActivation::OffForRigidPilot,
+            FlexActivation::On,
         )
         .map_err(FitFailure::invariant)?;
-        let rigid_family = make_family(
+        // Validate the assembled block specs at the construction boundary so any
+        // design/penalty width inconsistency surfaces here as a clean typed error
+        // string. Without this, the inconsistency would only be
+        // caught by the internal `assert_valid_blockspecs` invariant guards inside
+        // the capability-query hooks (`outer_hyper_hessian_dense_available`, …)
+        // reached from `custom_family_outer_derivatives` below, firing a bare
+        // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
+        // boundary" GamfitError instead of an actionable message.
+        crate::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
+            FitFailure::invariant(format!(
+                "[survival-marginal-slope] assembled block specs invalid: {reason}"
+            ))
+        })?;
+        let initial_family = make_family(
             &marginal_design,
             &slope_cov_design,
             &initial_hyper_theta,
-            FlexActivation::OffForRigidPilot,
+            FlexActivation::On,
         )
         .map_err(FitFailure::invariant)?;
-        let mut pilot_options = options.clone();
-        // The pilot is only a warm start, so it skips production covariance
-        // assembly. Its inner solve runs at the family's cycle budget and stops on
-        // its own KKT certificate or the joint-Newton loop's typed stall exits,
-        // the rule every custom-family trial follows since 67fb2fd4c. A picked
-        // cycle cap is a wall-clock budget under another name.
-        pilot_options.compute_covariance = false;
-        match fit_custom_family_fixed_log_lambda_warm_start(
-            &rigid_family,
-            &rigid_blocks,
-            &pilot_options,
-        ) {
-            Ok((block_beta, converged, cycles)) => {
-                // Only install the pilot's β as warm-start hints if the pilot
-                // actually reached a KKT certificate. The blockwise inner
-                // logger at custom_family.rs:12136 emits the warning
-                //   "returning non-converged warm-start iterate and rejecting
-                //    this outer REML/LAML evaluation"
-                // when its cycle budget is exhausted without convergence; the
-                // matching outer-side contract is `nonconverged_outer_eval_result`
-                // (custom_family.rs:5993), which surfaces zero gradient and
-                // HessianValue::Unavailable so the optimizer backs off. A
-                // partial pilot β can still be far from the cold-start optimum
-                // (the warning literally exists to signal that), so seeding
-                // the real outer optimizer with it can drag the first true
-                // inner solve to a degenerate region of (ρ, β)-space from
-                // which the analytic envelope gradient is no longer reliable.
-                // Discarding the partial β reverts the first real inner solve
-                // to a clean cold start at whatever ρ the outer optimizer
-                // picks (cached seed or initial_theta), which is the
-                // behaviour the warning text already promises.
-                if converged {
-                    // Pilot only seeds the three parametric blocks. Flex
-                    // (score_warp / link_dev) blocks are intentionally absent
-                    // under FlexActivation::OffForRigidPilot — there is no
-                    // pilot β for them to seed.
-                    let mut hints_mut = hints.borrow_mut();
-                    if let Some(beta) = block_beta.first() {
-                        hints_mut.time_beta = Some(beta.clone());
-                    }
-                    if let Some(beta) = block_beta.get(1) {
-                        hints_mut.marginal_beta = Some(beta.clone());
-                    }
-                    if let Some(beta) = block_beta.get(2) {
-                        hints_mut.slope_beta = Some(beta.clone());
-                    }
-                }
-                log::debug!(
-                    "[survival-marginal-slope/pilot] end status={} cycles={} elapsed={:.3}s hints_installed={}",
-                    if converged { "converged" } else { "partial" },
-                    cycles,
-                    pilot_started.elapsed().as_secs_f64(),
-                    converged,
-                );
-            }
-            Err(err) => {
-                // Pilot audit policy: warn-and-proceed (exploratory).
-                //
-                // The pilot is a pure warm-start coefficient initialiser — it
-                // runs at ρ=0 (no smoothing penalty) with a capped inner-cycle
-                // budget solely to seed β hints for the first real inner solve.
-                // Rank-deficiency at the pilot stage is a known hazard: the
-                // zero-penalty rigid design can expose directions that become
-                // identifiable once the outer optimizer selects a non-zero ρ.
-                // Raising here would abort the entire fit for a transient
-                // structural artifact of the exploration point, not a property
-                // of the actual penalised model.
-                //
-                // Contrast with the outer-inner-fit audit policy (fail-fatal):
-                // `fit_custom_family` routes through
-                // `canonicalize_for_identifiability_with_operating_scalars`, which returns
-                // `CustomFamilyError::IdentifiabilityFailure` on a fatal audit.
-                // At the outer fit the full penalty is in play; rank-deficiency
-                // there is a genuine model-specification problem that must be
-                // surfaced to the caller rather than silently absorbed.
-                //
-                // In short: pilot tolerates rank-deficiency because it is
-                // exploring ρ=0 (a singularity the outer optimizer will never
-                // actually accept); outer-inner-fit does not because it operates
-                // at the penalised optimum where identifiability is a hard
-                // contract.
-                log::debug!(
-                    "[survival-marginal-slope/pilot] end status=ignored-error elapsed={:.3}s error={}",
-                    pilot_started.elapsed().as_secs_f64(),
-                    err,
-                );
-            }
-        }
-    }
-
-    let marginal_terms = spatial_length_scale_term_indices(&marginalspec_boot);
-    let slope_terms = spatial_length_scale_term_indices(&slopespec_boot);
-    let marginal_has_spatial = !marginal_terms.is_empty();
-    let slope_has_spatial = !slope_terms.is_empty();
-    if slope_has_spatial && per_score_slope_design.is_some() {
-        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-            reason: "a spatial length-scale term on a per-score slope surface is refused: the \
-                     length-scale search rebuilds the slope block from one concatenated spec, \
-                     which cannot rebuild one surface per score"
-                .to_string(),
-        }
-        .into());
-    }
-    let analytic_joint_derivatives_available =
-        marginal_has_spatial || slope_has_spatial || setup.log_kappa_dim() == 0;
-
-    if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
-        return Err(FitFailure::invariant(
-            "exact survival marginal-slope spatial optimization requires analytic joint psi derivatives",
-        ));
-    }
-
-    let derivative_probe_started = std::time::Instant::now();
-    log::debug!(
-        "[survival-marginal-slope] initial derivative probe start rho_dim={} log_kappa_dim={}",
-        setup.rho_dim(),
-        setup.log_kappa_dim(),
-    );
-    let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
-    let initial_blocks = build_blocks(
-        &initial_rho,
-        &marginal_design,
-        &slope_cov_design,
-        FlexActivation::On,
-    )
-    .map_err(FitFailure::invariant)?;
-    // Validate the assembled block specs at the construction boundary so any
-    // design/penalty width inconsistency surfaces here as a clean typed error
-    // string. Without this, the inconsistency would only be
-    // caught by the internal `assert_valid_blockspecs` invariant guards inside
-    // the capability-query hooks (`outer_hyper_hessian_dense_available`, …)
-    // reached from `custom_family_outer_derivatives` below, firing a bare
-    // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
-    // boundary" GamError instead of an actionable message.
-    crate::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
-        FitFailure::invariant(format!(
-            "[survival-marginal-slope] assembled block specs invalid: {reason}"
-        ))
-    })?;
-    let initial_family = make_family(
-        &marginal_design,
-        &slope_cov_design,
-        &initial_hyper_theta,
-        FlexActivation::On,
-    )
-    .map_err(FitFailure::invariant)?;
-    let (joint_gradient, joint_hessian) =
-        custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
-    let analytic_joint_gradient_available = analytic_joint_derivatives_available
-        && matches!(joint_gradient, gam_problem::Derivative::Analytic);
-    // Survival marginal-slope now exposes exact coefficient-space and ψ-space
-    // Hessian directional derivatives as HyperOperators (see the workspace
-    // overrides below). Keep analytic curvature advertised at large scale;
-    // the unified REML/LAML planner chooses the matrix-free outer-HVP route for
-    // large `(n, p, K)` shapes instead of falling back to first-order BFGS.
-    //
-    // An exact outer Hessian over ψ reads `second_order_terms` for every ψ pair and, while the
-    // Jeffreys objective is armed, the ψ-mixed third information derivatives
-    // (`prepare_explicit_jeffreys_curvature_drifts`). The pairs are installed among design,
-    // baseline-chart and learned log-σ axes, and between a chart and a design axis only through
-    // the FLEX family program. The third derivatives have closed forms on the rigid frame for
-    // design and chart axes but not for a learned log σ (gam#2765), and through the ζ
-    // composition of `timewiggle_third` for every time-wiggle frame it serves
-    // whose ψ coordinates are all design axes (gam#2893). Any other θ keeps the analytic
-    // gradient without declared curvature: declaring it would refuse every trial point that
-    // asks for curvature.
-    //
-    // gam#2930: an armed Jeffreys objective prices its second-order completion wherever the
-    // family serves the completion's outer derivatives, and a ψ coordinate that reshapes the
-    // Jeffreys information moves that completion. The completion's explicit ψ derivative joins
-    // the gradient everywhere. Its ψψ and ρψ curvature is served where the rigid frame contracts
-    // every ψ-moved trace Hessian in one pass, which covers baseline-chart and design axes on a
-    // time-constant slope; any other such θ declares no curvature.
-    let psi_moves_priced_completion = initial_family.joint_jeffreys_term_required()
-        && initial_family.jeffreys_completion_outer_derivatives().is_some()
-        && initial_family.joint_jeffreys_information_depends_on_psi();
-    // gam#2945: a learned log σ moves the priced completion too, and the completion's explicit σ
-    // derivative `∂C/∂σ|_β` needs the σ-mixed third information derivative, which has no closed
-    // form here. Such a θ has neither an exact outer gradient nor a curvature certificate, so the
-    // fit is refused once, by name, before the smoothing search. Without this rule every
-    // value+gradient evaluation refuses at the completion's σ column action; before the completion
-    // was priced in every eval mode, the search ran and the curvature guard refused its point as
-    // unevaluated (219 s on the #2930 minimal fixture with a learned σ).
-    if psi_moves_priced_completion && learned_sigma_initial.is_some() {
-        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-            reason: "a learned Gaussian frailty σ with the armed Jeffreys completion is refused: the \
-                     completion's explicit σ derivative needs the σ-mixed third information \
-                     derivative, which is not derived, so the fit has neither an exact outer \
-                     gradient nor a curvature certificate (gam#2945)"
-                .to_string(),
-        }
-        .into());
-    }
-    let completion_psi_curvature_served = initial_family.rigid_psi_jeffreys_third_served()
-        && !initial_family.slope_is_follow_up_varying();
-    let psi_curvature_exact = setup.theta0().len() == setup.rho_dim()
-        || ((!psi_moves_priced_completion || completion_psi_curvature_served)
-            && initial_family.psi_second_order_pairs_served(setup.log_kappa_dim())
-            && (!initial_family.joint_jeffreys_term_required()
-                || initial_family.rigid_psi_jeffreys_third_served()
-                || (setup.auxiliary_dim() == 0
-                    && initial_family.timewiggle_zeta_available())));
-    let analytic_joint_hessian_available = analytic_joint_derivatives_available
-        && joint_hessian.is_analytic()
-        && psi_curvature_exact;
-    log::debug!(
-        "[survival-marginal-slope] initial derivative probe end gradient_analytic={} hessian_analytic={} elapsed={:.3}s",
-        analytic_joint_gradient_available,
-        analytic_joint_hessian_available,
-        derivative_probe_started.elapsed().as_secs_f64(),
-    );
-    let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
-    let hyper_layout_cache = RefCell::new(
-        None::<(
-            Array1<f64>,
-            crate::custom_family::SharedCustomFamilyHyperLayout,
-        )>,
-    );
-    let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
-        left.len() == right.len()
-            && left
-                .iter()
-                .zip(right.iter())
-                .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits())
-    };
-    let get_hyper_layout = |theta: &Array1<f64>,
-                            specs: &[TermCollectionSpec],
-                            designs: &[TermCollectionDesign]|
-     -> Result<
-        crate::custom_family::SharedCustomFamilyHyperLayout,
-        String,
-    > {
-        if let Some((cached_theta, cached_layout)) = hyper_layout_cache.borrow().as_ref()
-            && theta_matches(cached_theta, theta)
+        // The row-jet decision every rigid cache build reads, made once before
+        // the search: `gpu=required` for a frame the device row jet does not
+        // compute is refused here, naming the missing capability, instead of at
+        // every trial point (gam#3000). Flexible, time-wiggle and per-score fits
+        // never build a rigid row-kernel cache.
+        if !(initial_family.flex_active()
+            || initial_family.flex_timewiggle_active()
+            || initial_family.per_z_slope_active())
         {
-            return Ok(Arc::clone(cached_layout));
+            in_slope_frame!(initial_family, P, Frame, {
+                rigid_row_jet_decision::<P, Frame>(initial_family.n).map_err(FitFailure::input)?;
+            });
         }
-
-        let mut derivative_blocks = vec![
-            Vec::new(),
-            if marginal_has_spatial {
-                build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
-                    || {
-                        "survival marginal-slope: marginal block has spatial terms but spatial psi derivatives are unavailable"
-                            .to_string()
-                    },
-                )?
-            } else {
-                Vec::new()
-            },
-            if slope_has_spatial {
-                match crate::survival::time_margin_metric::TimeMarginPenaltyMetric::from_template(
-                    &slope_psi_template,
-                    &designs[1].design,
-                    designs[1].penalties.len(),
-                    "slope",
-                )? {
-                    Some(metric) => {
-                        crate::spatial_psi_bridge::build_block_spatial_psi_derivatives_with_transform(
-                            data,
-                            &specs[1],
-                            &designs[1],
-                            &metric,
-                        )?
-                    }
-                    None => build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?,
-                }
-                .ok_or_else(|| {
-                    "survival marginal-slope: slope block has spatial terms but spatial psi derivatives are unavailable"
-                        .to_string()
-                })?
-            } else {
-                Vec::new()
-            },
-        ];
-        if score_warp_runtime.is_some() {
-            derivative_blocks.push(Vec::new());
-        }
-        if link_dev_runtime.is_some() {
-            derivative_blocks.push(Vec::new());
-        }
-        let family_axis_count =
-            baseline_axis_count + usize::from(learned_sigma_initial.is_some());
-        let family_axes = (0..family_axis_count).collect();
-        let hyper_values = theta.slice(s![setup.rho_dim()..]).to_owned();
-        let layout = Arc::new(crate::custom_family::CustomFamilyHyperLayout::new(
-            derivative_blocks,
-            family_axes,
-            hyper_values,
-        )?);
-        hyper_layout_cache.replace(Some((theta.clone(), Arc::clone(&layout))));
-        Ok(layout)
-    };
-
-    log::debug!(
-        "[survival-marginal-slope/outer] solve start rho_dim={} log_kappa_dim={} aux_dim={}",
-        setup.rho_dim(),
-        setup.log_kappa_dim(),
-        setup.auxiliary_dim(),
-    );
-
-    // Survival marginal-slope is a multi-block family with β-dependent
-    // joint Hessian (hazard multipliers depend on current β); the
-    // Wood-Fasiolo PSD invariant that justifies EFS fails here, so
-    // disable fixed-point at plan time.
-    let outer_policy = initial_family.outer_derivative_policy(&initial_blocks, options);
-    let exact_spatial_outer_tol = kappa_options_ref.rel_tol;
-    // `warm_start_from` resumes the outer search that `fit_custom_family` owns on
-    // the driver's fast path. A fit that also searches length-scale or auxiliary
-    // coordinates runs the driver's own search, which a saved model's certified
-    // point does not describe, so it is refused before any fitting.
-    if options.warm_start.is_some()
-        && !(setup.auxiliary_dim() == 0
-            && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
-    {
-        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-            reason: format!(
-                "warm_start_from resumes a fit whose only outer coordinates are smoothing \
-                 parameters; this fit also searches {} length-scale and {} auxiliary coordinates",
-                setup.log_kappa_dim(),
-                setup.auxiliary_dim(),
-            ),
-        }
-        .into());
-    }
-    // The final fit's error reaches the caller typed (#2937): blocks and the
-    // family are built from the designs above, and the solver's
-    // `CustomFamilyError` is carried whole.
-    let solved = optimize_spatial_length_scale_exact_joint_typed(
-        data,
-        &[marginalspec_boot.clone(), slopespec_boot.clone()],
-        &[marginal_terms.clone(), slope_terms.clone()],
-        kappa_options_ref,
-        &setup,
-        crate::seeding::SeedRiskProfile::Survival,
-        analytic_joint_gradient_available,
-        analytic_joint_hessian_available,
-        true,
-        None,
-        Some(walk_signals),
-        outer_policy,
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
-            assert_eq!(
-                specs.len(),
-                designs.len(),
-                "survival-marginal-slope outer-inner-fit: specs/designs length mismatch",
-            );
-            let eval_started = std::time::Instant::now();
-            log::debug!(
-                "[survival-marginal-slope/outer-inner-fit] start theta_dim={}",
-                theta.len(),
-            );
-            let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let mut blocks = build_blocks(
-                &rho,
-                &designs[0],
-                &designs[1],
-                FlexActivation::On,
-            )
-            .map_err(FitFailure::invariant)?;
-            let family = make_family(
-                &designs[0],
-                &designs[1],
-                theta,
-                FlexActivation::On,
-            )
-            .map_err(FitFailure::invariant)?;
-            // A warm start carried across an outer step can sit outside the
-            // follow-up-varying likelihood domain at the NEW baseline chart
-            // (gam#2765). Restore it here, the same way the time block's seed is
-            // projected onto its own guard inside `build_blocks`; no-op on the
-            // time-constant frame and no-op when the seed is already interior.
-            family
-                .retreat_seed_into_follow_up_domain(&mut blocks)
-                .map_err(FitFailure::numerical)?;
-            let blocks = blocks;
-            let fit = match provenance {
-                SpatialFitProvenance::NoOuterOptimization => inner_fit(&family, &blocks, options)?,
-                SpatialFitProvenance::Certified { outer, mode } => {
-                    inner_fit_from_certified_outer(&family, &blocks, options, mode, theta, outer)?
-                }
-            };
-            let mut hints_mut = hints.borrow_mut();
-            if let Some(block) = fit.block_states.first() {
-                hints_mut.time_beta = Some(block.beta.clone());
+        let (joint_gradient, joint_hessian) =
+            custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
+        let analytic_joint_gradient_available = analytic_joint_derivatives_available
+            && matches!(joint_gradient, gam_problem::Derivative::Analytic);
+        // Survival marginal-slope now exposes exact coefficient-space and ψ-space
+        // Hessian directional derivatives as HyperOperators (see the workspace
+        // overrides below). Keep analytic curvature advertised at large scale;
+        // the unified REML/LAML planner chooses the matrix-free outer-HVP route for
+        // large `(n, p, K)` shapes instead of falling back to first-order BFGS.
+        //
+        // An exact outer Hessian over ψ reads `second_order_terms` for every ψ pair and, while the
+        // Jeffreys objective is armed, the ψ-mixed third information derivatives
+        // (`prepare_explicit_jeffreys_curvature_drifts`). The pairs are installed among design,
+        // baseline-chart and learned log-σ axes, and between a chart and a design axis only through
+        // the FLEX family program. The third derivatives have closed forms on the rigid frame for
+        // design and chart axes but not for a learned log σ (gam#2765), and through the ζ
+        // composition of `timewiggle_third` for every time-wiggle frame it serves
+        // whose ψ coordinates are all design axes (gam#2893). Any other θ keeps the analytic
+        // gradient without declared curvature: declaring it would refuse every trial point that
+        // asks for curvature.
+        //
+        // gam#2930: an armed Jeffreys objective prices its second-order completion wherever the
+        // family serves the completion's outer derivatives, and a ψ coordinate that reshapes the
+        // Jeffreys information moves that completion. The completion's explicit ψ derivative joins
+        // the gradient everywhere. Its ψψ and ρψ curvature is served where the rigid frame contracts
+        // every ψ-moved trace Hessian in one pass, which covers baseline-chart and design axes on a
+        // time-constant slope; any other such θ declares no curvature.
+        let completion_moves_with_psi = initial_family.jeffreys_completion_outer_derivatives().is_some()
+            && initial_family.joint_jeffreys_information_depends_on_psi();
+        let psi_moves_priced_completion =
+            initial_family.joint_jeffreys_term_required() && completion_moves_with_psi;
+        // gam#2945: a learned log σ moves the priced completion too, and the completion's explicit σ
+        // derivative `∂C/∂σ|_β` needs the σ-mixed third information derivative, which has no closed
+        // form here. An armed member with such a θ has neither an exact outer gradient nor a
+        // curvature certificate. Either member refuses it, by name, before its smoothing search: the
+        // unarmed member refits armed on typed evidence (#979), which is known only after the unarmed
+        // search, so refusing on the armed member alone would make the same configuration fit or
+        // refuse depending on the data, after a full unarmed search. Without this rule every armed value+gradient evaluation refuses at
+        // the completion's σ column action; before the completion was priced in every eval mode, the
+        // search ran and the curvature guard refused its point as unevaluated (219 s on the #2930
+        // minimal fixture with a learned σ). Where the likelihood does not identify σ at all
+        // (gam#2938) that refusal comes first.
+        if completion_moves_with_psi && learned_sigma_initial.is_some() {
+            return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                reason: "a learned Gaussian frailty σ with the armed Jeffreys completion is refused: the \
+                         fit refits armed on typed evidence (#979), and the armed completion's explicit \
+                         σ derivative needs the σ-mixed third information derivative, which is not \
+                         derived, so the armed fit would have neither an exact outer gradient nor a \
+                         curvature certificate; it is refused before the unarmed fit as well (gam#2945)"
+                    .to_string(),
             }
-            if let Some(block) = fit.block_states.get(1) {
-                hints_mut.marginal_beta = Some(block.beta.clone());
-            }
-            if let Some(block) = fit.block_states.get(2) {
-                hints_mut.slope_beta = Some(block.beta.clone());
-            }
-            if score_warp_prepared.is_some()
-                && let Some(block) = fit.block_states.get(3)
+            .into());
+        }
+        let completion_psi_curvature_served = initial_family.rigid_psi_jeffreys_third_served()
+            && !initial_family.slope_is_follow_up_varying();
+        let psi_curvature_exact = setup.theta0().len() == setup.rho_dim()
+            || ((!psi_moves_priced_completion || completion_psi_curvature_served)
+                && initial_family.psi_second_order_pairs_served(setup.log_kappa_dim())
+                && (!initial_family.joint_jeffreys_term_required()
+                    || initial_family.rigid_psi_jeffreys_third_served()
+                    || (setup.auxiliary_dim() == 0
+                        && initial_family.timewiggle_zeta_available())));
+        let analytic_joint_hessian_available = analytic_joint_derivatives_available
+            && joint_hessian.is_analytic()
+            && psi_curvature_exact;
+        log::debug!(
+            "[survival-marginal-slope] initial derivative probe end gradient_analytic={} hessian_analytic={} elapsed={:.3}s",
+            analytic_joint_gradient_available,
+            analytic_joint_hessian_available,
+            derivative_probe_started.elapsed().as_secs_f64(),
+        );
+        let hyper_layout_cache = RefCell::new(
+            None::<(
+                Array1<f64>,
+                crate::custom_family::SharedCustomFamilyHyperLayout,
+            )>,
+        );
+        let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits())
+        };
+        let get_hyper_layout = |theta: &Array1<f64>,
+                                specs: &[TermCollectionSpec],
+                                designs: &[TermCollectionDesign]|
+         -> Result<
+            crate::custom_family::SharedCustomFamilyHyperLayout,
+            String,
+        > {
+            if let Some((cached_theta, cached_layout)) = hyper_layout_cache.borrow().as_ref()
+                && theta_matches(cached_theta, theta)
             {
-                hints_mut.score_warp_beta = Some(block.beta.clone());
+                return Ok(Arc::clone(cached_layout));
             }
-            if link_dev_prepared.is_some() {
-                let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
-                if let Some(block) = fit.block_states.get(link_idx) {
-                    hints_mut.link_dev_beta = Some(block.beta.clone());
+
+            let mut derivative_blocks = vec![
+                Vec::new(),
+                if marginal_has_spatial {
+                    build_block_spatial_psi_derivatives(data, &specs[0], &designs[0])?.ok_or_else(
+                        || {
+                            "survival marginal-slope: marginal block has spatial terms but spatial psi derivatives are unavailable"
+                                .to_string()
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                },
+                if slope_has_spatial {
+                    match crate::survival::time_margin_metric::TimeMarginPenaltyMetric::from_template(
+                        &slope_psi_template,
+                        &designs[1].design,
+                        designs[1].penalties.len(),
+                        "slope",
+                    )? {
+                        Some(metric) => {
+                            crate::spatial_psi_bridge::build_block_spatial_psi_derivatives_with_transform(
+                                data,
+                                &specs[1],
+                                &designs[1],
+                                &metric,
+                            )?
+                        }
+                        None => build_block_spatial_psi_derivatives(data, &specs[1], &designs[1])?,
+                    }
+                    .ok_or_else(|| {
+                        "survival marginal-slope: slope block has spatial terms but spatial psi derivatives are unavailable"
+                            .to_string()
+                    })?
+                } else {
+                    Vec::new()
+                },
+            ];
+            if score_warp_runtime.is_some() {
+                derivative_blocks.push(Vec::new());
+            }
+            if link_dev_runtime.is_some() {
+                derivative_blocks.push(Vec::new());
+            }
+            let family_axis_count =
+                baseline_axis_count + usize::from(learned_sigma_initial.is_some());
+            let family_axes = (0..family_axis_count).collect();
+            let hyper_values = theta.slice(s![setup.rho_dim()..]).to_owned();
+            let layout = Arc::new(crate::custom_family::CustomFamilyHyperLayout::new(
+                derivative_blocks,
+                family_axes,
+                hyper_values,
+            )?);
+            hyper_layout_cache.replace(Some((theta.clone(), Arc::clone(&layout))));
+            Ok(layout)
+        };
+
+        log::debug!(
+            "[survival-marginal-slope/outer] solve start rho_dim={} log_kappa_dim={} aux_dim={}",
+            setup.rho_dim(),
+            setup.log_kappa_dim(),
+            setup.auxiliary_dim(),
+        );
+
+        // Survival marginal-slope is a multi-block family with β-dependent
+        // joint Hessian (hazard multipliers depend on current β); the
+        // Wood-Fasiolo PSD invariant that justifies EFS fails here, so
+        // disable fixed-point at plan time.
+        let outer_policy = initial_family.outer_derivative_policy(&initial_blocks, options);
+        let exact_spatial_outer_tol = kappa_options_ref.rel_tol;
+        // `warm_start_from` resumes the outer search that `fit_custom_family` owns on
+        // the driver's fast path. A fit that also searches length-scale or auxiliary
+        // coordinates runs the driver's own search, which a saved model's certified
+        // point does not describe, so it is refused before any fitting.
+        if options.warm_start.is_some()
+            && !(setup.auxiliary_dim() == 0
+                && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
+        {
+            return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                reason: format!(
+                    "warm_start_from resumes a fit whose only outer coordinates are smoothing \
+                     parameters; this fit also searches {} length-scale and {} auxiliary coordinates",
+                    setup.log_kappa_dim(),
+                    setup.auxiliary_dim(),
+                ),
+            }
+            .into());
+        }
+        // The final fit's error reaches the caller typed (#2937): blocks and the
+        // family are built from the designs above, and the solver's
+        // `CustomFamilyError` is carried whole.
+        optimize_spatial_length_scale_exact_joint_typed(
+            data,
+            &[marginalspec_boot.clone(), slopespec_boot.clone()],
+            &[marginal_terms.clone(), slope_terms.clone()],
+            kappa_options_ref,
+            &setup,
+            analytic_joint_gradient_available,
+            analytic_joint_hessian_available,
+            true,
+            Some(walk_signals.clone()),
+            outer_policy,
+            |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
+                assert_eq!(
+                    specs.len(),
+                    designs.len(),
+                    "survival-marginal-slope outer-inner-fit: specs/designs length mismatch",
+                );
+                let eval_started = std::time::Instant::now();
+                log::debug!(
+                    "[survival-marginal-slope/outer-inner-fit] start theta_dim={}",
+                    theta.len(),
+                );
+                let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
+                let mut blocks = build_blocks(
+                    &rho,
+                    &designs[0],
+                    &designs[1],
+                    FlexActivation::On,
+                )
+                .map_err(FitFailure::invariant)?;
+                let family = make_family(
+                    &designs[0],
+                    &designs[1],
+                    theta,
+                    FlexActivation::On,
+                )
+                .map_err(FitFailure::invariant)?;
+                // A warm start carried across an outer step can sit outside the
+                // follow-up-varying likelihood domain at the NEW baseline chart
+                // (gam#2765). Restore it here, the same way the time block's seed is
+                // projected onto its own guard inside `build_blocks`; no-op on the
+                // time-constant frame and no-op when the seed is already interior.
+                family
+                    .retreat_seed_into_follow_up_domain(&mut blocks)
+                    .map_err(FitFailure::numerical)?;
+                let blocks = blocks;
+                let fit = match provenance {
+                    SpatialFitProvenance::NoOuterOptimization => inner_fit(&family, &blocks, options)?,
+                    SpatialFitProvenance::Certified { outer, mode } => {
+                        inner_fit_from_certified_outer(&family, &blocks, options, mode, theta, outer)?
+                    }
+                };
+                hints_from_converged_solve.set(true);
+                let mut hints_mut = hints.borrow_mut();
+                if let Some(block) = fit.block_states.first() {
+                    hints_mut.time_beta = Some(block.beta.clone());
                 }
-            }
-            log::debug!(
-                "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?}",
-                eval_started.elapsed().as_secs_f64(),
-                fit.inner_cycles,
-                fit.convergence_evidence().inner_status(),
-            );
-            Ok(fit)
-        },
-        |theta,
-         specs: &[TermCollectionSpec],
-         designs: &[TermCollectionDesign],
-         eval_mode,
-         owned_value_mode| {
-            use gam_problem::EvalMode;
-            let eval_started = std::time::Instant::now();
-            log::debug!(
-                "[survival-marginal-slope/outer-eval] start mode={:?} theta_dim={} rows={}",
-                eval_mode,
-                theta.len(),
-                n,
-            );
-            let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let mut blocks = build_blocks(
-                &rho,
-                &designs[0],
-                &designs[1],
-                FlexActivation::On,
-            )?;
-            if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
-                let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
-                match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
-                    Ok(ws) => {
-                        if !exact_mode_branch.borrow_mut().install_seed(ws) {
-                            log::trace!(
-                                "[SMS] ignored a late outer-cache coefficient seed: an accepted outer iterate already owns the coefficient-mode anchor"
+                if let Some(block) = fit.block_states.get(1) {
+                    hints_mut.marginal_beta = Some(block.beta.clone());
+                }
+                if let Some(block) = fit.block_states.get(2) {
+                    hints_mut.slope_beta = Some(block.beta.clone());
+                }
+                if score_warp_prepared.is_some()
+                    && let Some(block) = fit.block_states.get(3)
+                {
+                    hints_mut.score_warp_beta = Some(block.beta.clone());
+                }
+                if link_dev_prepared.is_some() {
+                    let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
+                    if let Some(block) = fit.block_states.get(link_idx) {
+                        hints_mut.link_dev_beta = Some(block.beta.clone());
+                    }
+                }
+                log::debug!(
+                    "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?}",
+                    eval_started.elapsed().as_secs_f64(),
+                    fit.inner_cycles,
+                    fit.convergence_evidence().inner_status(),
+                );
+                Ok(fit)
+            },
+            |theta,
+             specs: &[TermCollectionSpec],
+             designs: &[TermCollectionDesign],
+             eval_mode,
+             owned_value_mode| {
+                use gam_problem::EvalMode;
+                let eval_started = std::time::Instant::now();
+                log::debug!(
+                    "[survival-marginal-slope/outer-eval] start mode={:?} theta_dim={} rows={}",
+                    eval_mode,
+                    theta.len(),
+                    n,
+                );
+                let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
+                let mut blocks = build_blocks(
+                    &rho,
+                    &designs[0],
+                    &designs[1],
+                    FlexActivation::On,
+                )?;
+                if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
+                    let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
+                    match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
+                        Ok(ws) => {
+                            if !exact_mode_branch.borrow_mut().install_seed(ws) {
+                                log::trace!(
+                                    "[SMS] ignored a late outer-cache coefficient seed: an accepted outer iterate already owns the coefficient-mode anchor"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "[SMS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
                             );
                         }
                     }
-                    Err(e) => {
+                }
+                // Preserve ValueOnly probes and request the Hessian exactly when
+                // this realized family advertised analytic joint second-order
+                // support.
+                let effective_mode = match eval_mode {
+                    EvalMode::ValueGradientHessian if !analytic_joint_hessian_available => {
+                        EvalMode::ValueAndGradient
+                    }
+                    other => other,
+                };
+                let family = make_family(
+                    &designs[0],
+                    &designs[1],
+                    theta,
+                    FlexActivation::On,
+                )?;
+                // Same contract as the inner-fit closure: an outer trial point must
+                // be graded from a coefficient the model admits, and restoring that
+                // is this evaluation's job. Without it the criterion refuses instead
+                // of returning a value, and a refusal carries no descent
+                // information for the outer line search (gam#2765).
+                family.retreat_seed_into_follow_up_domain(&mut blocks)?;
+                let blocks = blocks;
+                let hyper_layout = get_hyper_layout(theta, specs, designs)?;
+                let tolerance_options =
+                    joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
+                let outer_options = crate::outer_subsample::exact_outer_options(&tolerance_options);
+                let cycle_budget_evidence = || {
+                    format!(
+                        "inner cycle budget inputs: base={}",
+                        outer_options.inner_max_cycles,
+                    )
+                };
+                let selection = if let Some(value_selection) = owned_value_mode {
+                    log::debug!(
+                        "[SMS] upgrading the exact owned ValueOnly coefficient mode at identical theta; skipping coefficient re-solve"
+                    );
+                    upgrade_custom_family_joint_hyper_mode_shared(
+                        &family,
+                        &blocks,
+                        &outer_options,
+                        &rho,
+                        hyper_layout,
+                        value_selection,
+                        effective_mode,
+                    )
+                    .map_err(|error| {
+                        outer_refusal_evidence.replace(error.jeffreys_arming_evidence());
+                        format!("{error}; {}", cycle_budget_evidence())
+                    })?
+                } else {
+                    let (first_iterate, candidates) = exact_mode_branch
+                        .borrow_mut()
+                        .candidates(effective_mode, theta, &rho);
+                    if first_iterate {
                         log::debug!(
-                            "[SMS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
+                            "[SMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                         );
                     }
-                }
-            }
-            // Preserve ValueOnly probes and request the Hessian exactly when
-            // this realized family advertised analytic joint second-order
-            // support.
-            let effective_mode = match eval_mode {
-                EvalMode::ValueGradientHessian if !analytic_joint_hessian_available => {
-                    EvalMode::ValueAndGradient
-                }
-                other => other,
-            };
-            let family = make_family(
-                &designs[0],
-                &designs[1],
-                theta,
-                FlexActivation::On,
-            )?;
-            // Same contract as the inner-fit closure: an outer trial point must
-            // be graded from a coefficient the model admits, and restoring that
-            // is this evaluation's job. Without it the criterion refuses instead
-            // of returning a value, and a refusal carries no descent
-            // information for the outer line search (gam#2765).
-            family.retreat_seed_into_follow_up_domain(&mut blocks)?;
-            let blocks = blocks;
-            let hyper_layout = get_hyper_layout(theta, specs, designs)?;
-            let tolerance_options =
-                joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
-            let outer_options = crate::outer_subsample::exact_outer_options(&tolerance_options);
-            let cycle_budget_evidence = || {
-                let load_cap = |cap: &Option<Arc<AtomicUsize>>| {
-                    cap.as_ref().map(|value| value.load(std::sync::atomic::Ordering::Relaxed))
+                    evaluate_custom_family_joint_hyper_best_mode_shared(
+                        &family,
+                        &blocks,
+                        &outer_options,
+                        &rho,
+                        hyper_layout,
+                        &candidates,
+                        effective_mode,
+                    )
+                    .map_err(|error| {
+                        outer_refusal_evidence.replace(error.jeffreys_arming_evidence());
+                        format!("{error}; {}", cycle_budget_evidence())
+                    })?
                 };
-                format!(
-                    "inner cycle budget inputs: base={}, screening_cap={:?}",
-                    outer_options.inner_max_cycles,
-                    load_cap(&outer_options.screening_max_inner_iterations),
-                )
-            };
-            let selection = if let Some(value_selection) = owned_value_mode {
-                log::debug!(
-                    "[SMS] upgrading the exact owned ValueOnly coefficient mode at identical theta; skipping coefficient re-solve"
+                outer_refusal_evidence.replace(None);
+                exact_mode_branch.borrow_mut().record_value(
+                    eval_mode,
+                    theta,
+                    selection.result.warm_start.clone(),
+                    selection.result.inner_converged,
                 );
-                upgrade_custom_family_joint_hyper_mode_shared(
-                    &family,
-                    &blocks,
-                    &outer_options,
-                    &rho,
-                    hyper_layout,
-                    value_selection,
-                    effective_mode,
-                )
-                .map_err(|error| format!("{error}; {}", cycle_budget_evidence()))?
-            } else {
-                let (first_iterate, candidates) = exact_mode_branch
-                    .borrow_mut()
-                    .candidates(effective_mode, theta, &rho);
-                if first_iterate {
-                    log::debug!(
-                        "[SMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
+                if !selection.result.inner_converged {
+                    return Err(
+                        "exact survival marginal-slope inner solve did not converge".to_string()
                     );
                 }
-                evaluate_custom_family_joint_hyper_best_mode_shared(
-                    &family,
-                    &blocks,
-                    &outer_options,
-                    &rho,
-                    hyper_layout,
-                    &candidates,
-                    effective_mode,
-                )
-                .map_err(|error| format!("{error}; {}", cycle_budget_evidence()))?
-            };
-            exact_mode_branch.borrow_mut().record_value(
-                eval_mode,
-                theta,
-                selection.result.warm_start.clone(),
-                selection.result.inner_converged,
-            );
-            if !selection.result.inner_converged {
-                return Err(
-                    "exact survival marginal-slope inner solve did not converge".to_string()
-                );
-            }
-            log::debug!(
-                "[survival-marginal-slope/outer-eval] end objective={:.6e} mode={:?} elapsed={:.3}s",
-                selection.result.objective,
-                eval_mode,
-                eval_started.elapsed().as_secs_f64(),
-            );
-            if matches!(eval_mode, EvalMode::ValueGradientHessian)
-                && analytic_joint_hessian_available
-                && !selection.result.outer_hessian.is_analytic()
-            {
-                // The outer objective was requested WITH its Hessian on the STRICT
-                // analytic route (no finite-difference fallback permitted), and the
-                // family can supply one at a well-conditioned mode — but at THIS
-                // ρ/κ it could not (gam#979). The load-bearing reason is a
-                // genuinely-indefinite constrained inner mode: it is not a Laplace
-                // mode, so no SPD outer-Hessian curvature exists there. That is a
-                // property of the surface, NOT an implementation fault, so it must
-                // not abort the whole fit (the former fatal "did not return an
-                // outer Hessian" stranded the whole fit the first time an ARC
-                // re-seed probe landed on a saddle ρ — the measured survival-
-                // marginal-slope n=2500 centers=12 failure, AFTER ARC had already
-                // descended 1086.6 → 1081.5). An indefinite mode is infeasible for
-                // the Laplace approximation, so report the profiled objective as
-                // +∞: the outer optimizer's infeasible-on-non-finite-cost guard
-                // then REJECTS this ρ and steps back toward the feasible region it
-                // was descending, keeping its best-so-far incumbent — instead of
-                // aborting, and without violating the analytic-route contract
-                // (an infeasible eval owes no Hessian). A genuinely feasible mode
-                // (analytic Hessian present) is byte-identical.
                 log::debug!(
-                    "[survival-marginal-slope/outer-eval] no analytic outer Hessian at this ρ \
-                     (pseudo-objective={:.6e}, mode={:?}) — the constrained inner mode is \
-                     indefinite (not a Laplace mode); reporting the profiled objective as +∞ so \
-                     the outer solver rejects this infeasible ρ and steps back toward the feasible \
-                     region rather than aborting.",
+                    "[survival-marginal-slope/outer-eval] end objective={:.6e} mode={:?} elapsed={:.3}s",
                     selection.result.objective,
                     eval_mode,
+                    eval_started.elapsed().as_secs_f64(),
                 );
-                return Ok(ExactJointEvaluation {
-                    objective: f64::INFINITY,
+                if matches!(eval_mode, EvalMode::ValueGradientHessian)
+                    && analytic_joint_hessian_available
+                    && !selection.result.outer_hessian.is_analytic()
+                {
+                    // The outer objective was requested WITH its Hessian on the STRICT
+                    // analytic route (no finite-difference fallback permitted), and the
+                    // family can supply one at a well-conditioned mode — but at THIS
+                    // ρ/κ it could not (gam#979). The load-bearing reason is a
+                    // genuinely-indefinite constrained inner mode: it is not a Laplace
+                    // mode, so no SPD outer-Hessian curvature exists there. That is a
+                    // property of the surface, NOT an implementation fault, so it must
+                    // not abort the whole fit (the former fatal "did not return an
+                    // outer Hessian" stranded the whole fit the first time an ARC
+                    // re-seed probe landed on a saddle ρ — the measured survival-
+                    // marginal-slope n=2500 centers=12 failure, AFTER ARC had already
+                    // descended 1086.6 → 1081.5). An indefinite mode is infeasible for
+                    // the Laplace approximation, so report the profiled objective as
+                    // +∞: the outer optimizer's infeasible-on-non-finite-cost guard
+                    // then REJECTS this ρ and steps back toward the feasible region it
+                    // was descending, keeping its best-so-far incumbent — instead of
+                    // aborting, and without violating the analytic-route contract
+                    // (an infeasible eval owes no Hessian). A genuinely feasible mode
+                    // (analytic Hessian present) is byte-identical.
+                    log::debug!(
+                        "[survival-marginal-slope/outer-eval] no analytic outer Hessian at this ρ \
+                         (pseudo-objective={:.6e}, mode={:?}) — the constrained inner mode is \
+                         indefinite (not a Laplace mode); reporting the profiled objective as +∞ so \
+                         the outer solver rejects this infeasible ρ and steps back toward the feasible \
+                         region rather than aborting.",
+                        selection.result.objective,
+                        eval_mode,
+                    );
+                    return Ok(ExactJointEvaluation {
+                        objective: f64::INFINITY,
+                        gradient: selection.result.gradient.clone(),
+                        hessian: selection.result.outer_hessian.clone(),
+                        mode: selection,
+                    });
+                }
+                Ok(ExactJointEvaluation {
+                    objective: selection.result.objective,
                     gradient: selection.result.gradient.clone(),
                     hessian: selection.result.outer_hessian.clone(),
                     mode: selection,
-                });
-            }
-            Ok(ExactJointEvaluation {
-                objective: selection.result.objective,
-                gradient: selection.result.gradient.clone(),
-                hessian: selection.result.outer_hessian.clone(),
-                mode: selection,
-            })
+                })
+            },
+            |_, _, _| {
+                Err::<ExactJointEfsEvaluation<CustomFamilyJointHyperModeSelection>, String>(
+                    "survival marginal-slope EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string(),
+                )
+            },
+            crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
+        )
+    };
+    let solved = crate::custom_family::arm_on_evidence(
+        route(false),
+        |solved| &mut solved.fit,
+        |refusal| {
+            refusal
+                .jeffreys_arming_evidence()
+                .or_else(|| outer_refusal_evidence.take())
         },
-        |_, _, _| {
-            Err::<ExactJointEfsEvaluation<CustomFamilyJointHyperModeSelection>, String>(
-                "survival marginal-slope EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string(),
-            )
-        },
-        crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
+        |_, _| route(true),
+    );
+    // The post-fit families (final, certificates, correction) are the solved
+    // member's.
+    route_armed.set(
+        solved
+            .as_ref()
+            .is_ok_and(|solved| solved.fit.artifacts.jeffreys_arming_evidence.is_some()),
     );
     // Log the outer-solve outcome on BOTH paths: the inner-solve non-convergence
     // abort (#979/#1040) returns Err before the success log below, so without

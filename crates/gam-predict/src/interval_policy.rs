@@ -6,7 +6,8 @@
 //! layer that turns those quantities into confidence intervals and result
 //! structs:
 //!
-//!   1. the central normal multiplier `z = Φ⁻¹(½ + ½·level)`,
+//!   1. the central multiplier `z = F⁻¹(½ + ½·level)` of the fit's
+//!      [`IntervalReference`] (normal, or Student-t for an estimated scale),
 //!   2. the η-scale interval `η ± z·SE(η)`,
 //!   3. the response-scale interval, either by transforming the η endpoints
 //!      through the (monotone) inverse link or by the delta-method `μ ± z·SE(μ)`,
@@ -88,26 +89,101 @@ impl ResponseBounds {
     }
 }
 
-/// The central two-sided normal multiplier `z = Φ⁻¹(½ + ½·level)` for a
-/// confidence `level ∈ (0, 1)`.
+/// Reference law of the interval pivot `(θ − θ̂) / SE(θ̂)`.
 ///
-/// This is the single source of truth for the confidence-level convention used
-/// throughout the predict path; every predictor's interval construction routes
-/// its quantile through here so the convention cannot diverge.
-pub(crate) fn central_z(level: f64) -> Result<f64, EstimationError> {
-    gam_math::probability::standard_normal_quantile(0.5 + 0.5 * level)
-        .map_err(EstimationError::InvalidInput)
+/// When the covariance carries a known scale the pivot is standard normal.
+/// When it carries a scale `φ̂` estimated from the same data, `SE(θ̂)²` is
+/// `φ̂·c` and the pivot is a normal divided by `√(φ̂/φ)`. Marginalizing `φ`
+/// under its reference prior `1/φ` (in the unpenalized Gaussian linear model
+/// this is the exact sampling law `(n − p)·φ̂/φ ~ χ²_{n−p}`, with `edf` in the
+/// role of `p` for a penalized fit) turns the normal pivot into Student-t on
+/// `ν = n − edf` degrees of freedom. A normal quantile there ignores the
+/// sampling variability of `φ̂` and is too narrow at small `n`.
+///
+/// This is the same reference the fit's own Wald summary reads — the t/F
+/// tests use `wald_scale_is_estimated` and `wald_residual_degrees_of_freedom`
+/// — so a reported interval and its test stay dual: a coefficient's 95%
+/// interval excludes zero exactly when its two-sided p-value is below 0.05.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IntervalReference {
+    /// Known scale: `Φ`.
+    Normal,
+    /// Estimated scale: Student-t on the fit's residual degrees of freedom.
+    StudentT { degrees_of_freedom: f64 },
 }
 
-/// Validate that a confidence level is a usable probability in the open unit
-/// interval, returning the corresponding central multiplier.
-pub(crate) fn validated_central_z(level: f64) -> Result<f64, EstimationError> {
-    if !(level.is_finite() && level > 0.0 && level < 1.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "confidence_level must be in (0,1), got {level}"
-        )));
+impl IntervalReference {
+    /// The reference owned by a fitted model: Student-t on `n − edf` when the
+    /// fit's covariance is scaled by an estimated dispersion, normal otherwise.
+    ///
+    /// An estimated scale without positive residual degrees of freedom has no
+    /// interval reference (`edf ≥ n` leaves nothing to estimate `φ` from); that
+    /// is reported rather than silently read as a known scale.
+    ///
+    /// A fit with a modeled noise block (location-scale) has no such scalar:
+    /// `σ(x)` is a block of the joint posterior whose uncertainty is already in
+    /// the covariance, and no single residual-profiled `φ̂` multiplies that
+    /// covariance, so its pivot is normal whatever the family's scale tag.
+    pub fn of_fit(fit: &UnifiedFitResult) -> Result<Self, EstimationError> {
+        let noise_is_modeled = fit
+            .blocks
+            .iter()
+            .any(|block| block.role == gam_problem::BlockRole::Scale);
+        if noise_is_modeled || !fit.likelihood_scale.wald_scale_is_estimated() {
+            return Ok(Self::Normal);
+        }
+        let degrees_of_freedom = fit.wald_residual_degrees_of_freedom().ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "interval reference: the fitted scale is estimated ({:?}) but the fit has no \
+                 positive residual degrees of freedom n - edf (n = {}, edf = {:?}), so the \
+                 Student-t reference for its intervals is undefined",
+                fit.likelihood_scale,
+                fit.training_sample_size(),
+                fit.edf_total(),
+            ))
+        })?;
+        Ok(Self::StudentT { degrees_of_freedom })
     }
-    central_z(level)
+
+    /// Reference quantile `F⁻¹(p)` for `p ∈ (0, 1)`.
+    pub fn quantile(self, p: f64) -> Result<f64, EstimationError> {
+        match self {
+            Self::Normal => gam_math::probability::standard_normal_quantile(p),
+            Self::StudentT { degrees_of_freedom } => {
+                gam_math::probability::student_t_quantile(p, degrees_of_freedom)
+            }
+        }
+        .map_err(EstimationError::InvalidInput)
+    }
+
+    /// Reference CDF `F(x)`. Each tail is read from the function that computes
+    /// it, never as one minus the opposite tail.
+    pub fn cdf(self, x: f64) -> f64 {
+        match self {
+            Self::Normal => gam_math::probability::normal_cdf(x),
+            Self::StudentT { degrees_of_freedom } => {
+                let tail = 0.5
+                    * gam_math::probability::student_t_two_sided_probability(x, degrees_of_freedom);
+                if x <= 0.0 { tail } else { 1.0 - tail }
+            }
+        }
+    }
+
+    /// The central two-sided multiplier `F⁻¹(½ + ½·level)` for a confidence
+    /// `level ∈ (0, 1)`.
+    ///
+    /// This is the single source of truth for the confidence-level convention
+    /// used throughout the predict path; every predictor's interval
+    /// construction routes its quantile through here so the convention cannot
+    /// diverge.
+    pub fn central_multiplier(self, level: f64) -> Result<f64, EstimationError> {
+        if !(level.is_finite() && level > 0.0 && level < 1.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "confidence_level must be in (0,1), got {level}"
+            )));
+        }
+        self.quantile(0.5 + 0.5 * level)
+    }
 }
 
 /// The symmetric interval `center ± z·se`, returned as `(lower, upper)`.
@@ -327,14 +403,15 @@ pub(crate) fn symmetric_predictive_band(
 /// linear-predictor / response state.
 ///
 /// This is the shared tail every `predict_full_uncertainty` impl used to inline:
-/// validate the confidence level, form the η interval, map it onto the response
-/// scale via `method`, optionally attach an observation interval, and populate
-/// the result struct. Predictors supply only the family-specific quantities
+/// validate the confidence level, form the η interval with the multiplier of
+/// `reference`, map it onto the response scale via `method`, optionally attach
+/// an observation interval, and populate the result struct. Predictors supply only the family-specific quantities
 /// (`eta`, `mean`, the two standard errors) plus the policy choices
 /// (`eta_interval`, `method`); the engine owns everything else so interval
 /// construction cannot drift between families.
 pub(crate) fn assemble_uncertainty_result(
     confidence_level: f64,
+    reference: IntervalReference,
     eta: Array1<f64>,
     mean: Array1<f64>,
     eta_standard_error: Array1<f64>,
@@ -344,7 +421,7 @@ pub(crate) fn assemble_uncertainty_result(
     observation: Option<ObservationInterval<'_>>,
     provenance: UncertaintyProvenance,
 ) -> Result<PredictUncertaintyResult, EstimationError> {
-    let z = validated_central_z(confidence_level)?;
+    let z = reference.central_multiplier(confidence_level)?;
     let (eta_lower, eta_upper) = eta_interval.endpoints(&eta, &eta_standard_error, z);
     let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &mean, z, method)?;
     let (observation_lower, observation_upper) = match observation {
@@ -384,13 +461,14 @@ pub(crate) fn assemble_uncertainty_result(
 pub(crate) fn assemble_posterior_mean_bounds(
     result: &mut PredictPosteriorMeanResult,
     confidence_level: Option<f64>,
+    reference: IntervalReference,
     eta_interval: EtaInterval,
     method: MeanBoundMethod<'_>,
 ) -> Result<(), EstimationError> {
     let Some(level) = confidence_level else {
         return Ok(());
     };
-    let z = validated_central_z(level)?;
+    let z = reference.central_multiplier(level)?;
     let (eta_lower, eta_upper) = eta_interval.endpoints(&result.eta, &result.eta_standard_error, z);
     let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &result.mean, z, method)?;
     result.mean_lower = Some(mean_lower);
@@ -595,6 +673,25 @@ pub trait PredictionTransform {
         assert_eq!(mean.len(), z_upper.len());
         Ok(None)
     }
+
+    /// Optional response-scale posterior SD `√Var[T(η)]`, `η ~ N(eta, eta_se²)`
+    /// per row, from the same Gaussian η integral as the posterior-mean point.
+    ///
+    /// The posterior-mean driver's smoothing-corrected arm reports this, built
+    /// on the corrected η SE, as the response-scale SE whenever it is `Some`,
+    /// instead of the full-uncertainty pass's delta-method `|dT/dη̂|·SE(η)` —
+    /// which collapses to zero wherever the inverse link saturates although the
+    /// posterior of μ stays wide. The default `None` keeps the full-uncertainty
+    /// pass's `mean_se`.
+    fn posterior_response_sd(
+        &self,
+        eta: &Array1<f64>,
+        eta_se: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        // One SE per row, as every overriding impl consumes them.
+        assert_eq!(eta.len(), eta_se.len());
+        Ok(None)
+    }
 }
 
 /// Build the `MeanBoundMethod` selected by a transform's [`ResponseInterval`]
@@ -695,6 +792,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     })?;
     let policy = transform.response_jacobian_rows(PredictPass::FullUncertainty);
     let response_map = move |eta: &Array1<f64>| transform.response(eta);
+    let reference = IntervalReference::of_fit(fit)?;
     let observation = if options.includeobservation_interval {
         transform.observation_noise(input)?
     } else {
@@ -704,7 +802,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     // equal-tailed band per row from its moment-matched predictive; when present
     // it replaces the symmetric `μ ± z·σ` construction below (#817/#1193/#1194).
     let mut override_band = if options.includeobservation_interval {
-        let z = validated_central_z(options.confidence_level)?;
+        let z = reference.central_multiplier(options.confidence_level)?;
         let z_row = Array1::from_elem(state.mean.len(), z);
         transform.observation_band(input, &state.mean, &mean_se, &z_row, &z_row)?
     } else {
@@ -717,7 +815,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     // posterior-mean driver's dispatch instead of gating the family band on
     // `observation_noise` being present.
     if options.includeobservation_interval && override_band.is_none() && observation.is_none() {
-        let z = validated_central_z(options.confidence_level)?;
+        let z = reference.central_multiplier(options.confidence_level)?;
         let z_row = Array1::from_elem(state.mean.len(), z);
         let (lower, upper) = family_observation_band(
             &response_family,
@@ -725,6 +823,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
             &mean_se,
             &z_row,
             &z_row,
+            reference,
             fit,
             None,
         );
@@ -752,6 +851,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     };
     assemble_uncertainty_result(
         options.confidence_level,
+        reference,
         state.eta,
         state.mean,
         eta_se,
@@ -794,7 +894,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
     // dimensionally wrong (a logistic fit at η = 10 with SE(η) = 1 has response
     // SE ≈ 4.5e-5, not 1). Only the identity link may reuse SE(η) — there the
     // response IS the linear predictor. Every other transform must supply a
-    // genuine delta-method `mean_se`; a missing one is a producer bug, not a
+    // genuine response-scale `mean_se`; a missing one is a producer bug, not a
     // fallback opportunity. The no-covariance degrade (η SE also absent) keeps
     // its zero-SE point-only behaviour.
     let cond_mean_se = match (state.mean_se.clone(), &policy) {
@@ -853,11 +953,19 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                     "smoothing-corrected posterior-mean uncertainty requires eta SE".to_string(),
                 )
             })?;
-            let mean_se = unc.mean_se.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "smoothing-corrected posterior-mean uncertainty requires mean SE".to_string(),
-                )
-            })?;
+            // The full-uncertainty pass supplies the corrected η SE; the
+            // response-scale SE is the posterior SD over that same η posterior
+            // when the transform can integrate it, as the conditional
+            // posterior-mean pass already reports.
+            let mean_se = match transform.posterior_response_sd(&result.eta, &eta_se)? {
+                Some(sd) => sd,
+                None => unc.mean_se.ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "smoothing-corrected posterior-mean uncertainty requires mean SE"
+                            .to_string(),
+                    )
+                })?,
+            };
             if unc.covariance_source != InferenceCovarianceMode::SmoothingCorrected {
                 return Err(EstimationError::InvalidInput(
                     "smoothing-corrected posterior-mean uncertainty resolved a conditional covariance"
@@ -874,18 +982,20 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
     // (#1536).
     result.mean_standard_error = Some(mean_se.clone());
 
+    let reference = IntervalReference::of_fit(fit)?;
     {
         let response_map = |eta: &Array1<f64>| transform.response(eta);
         assemble_posterior_mean_bounds(
             &mut result,
             Some(level),
+            reference,
             eta_interval_for(&policy),
             mean_bound_method_for(transform, &policy, &response_map, &mean_se),
         )?;
     }
 
     if options.include_observation_interval {
-        let z = validated_central_z(level)?;
+        let z = reference.central_multiplier(level)?;
         let z_row = Array1::from_elem(result.mean.len(), z);
         // A skew-aware dispersion location-scale predictor builds an equal-tailed
         // band per row from its moment-matched predictive (#817/#1193/#1194). When
@@ -929,6 +1039,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                     &mean_se,
                     &z_row,
                     &z_row,
+                    reference,
                     fit,
                     // Generic transform posterior-mean band: analytic prior
                     // weights (#2077) are threaded through the dedicated
@@ -1008,6 +1119,10 @@ pub struct PredictionColumns {
     pub linear_predictor_plugin: Array1<f64>,
     pub mean_plugin: Array1<f64>,
     pub posterior_mean: Option<Array1<f64>>,
+    /// Link-scale posterior SD `SE(η) = √diag(X V Xᵀ)` under the covariance
+    /// the band was built from; the response-scale credible bounds are the
+    /// inverse link applied to the η quantiles this SD defines.
+    pub linear_predictor_standard_error: Option<Array1<f64>>,
     /// Response-scale SE — the SE the response-scale band is built from, never
     /// the link-scale `σ_η` (#1536).
     pub posterior_mean_standard_error: Option<Array1<f64>>,
@@ -1084,6 +1199,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: plugin.eta,
                 mean_plugin: plugin.mean,
                 posterior_mean: Some(prediction.mean),
+                linear_predictor_standard_error: Some(prediction.eta_standard_error),
                 posterior_mean_standard_error: Some(mean_standard_error),
                 posterior_mean_lower: Some(mean_lower),
                 posterior_mean_upper: Some(mean_upper),
@@ -1114,6 +1230,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: prediction.eta,
                 mean_plugin: mean_plugin.clone(),
                 posterior_mean: Some(mean_plugin),
+                linear_predictor_standard_error: Some(prediction.eta_standard_error),
                 posterior_mean_standard_error: Some(prediction.mean_standard_error),
                 posterior_mean_lower: Some(prediction.mean_lower),
                 posterior_mean_upper: Some(prediction.mean_upper),
@@ -1143,6 +1260,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: plugin.eta,
                 mean_plugin: plugin.mean,
                 posterior_mean: Some(prediction.mean),
+                linear_predictor_standard_error: None,
                 posterior_mean_standard_error: None,
                 posterior_mean_lower: None,
                 posterior_mean_upper: None,
@@ -1162,6 +1280,7 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: prediction.eta,
                 mean_plugin: mean_plugin.clone(),
                 posterior_mean: Some(mean_plugin),
+                linear_predictor_standard_error: None,
                 posterior_mean_standard_error: None,
                 posterior_mean_lower: None,
                 posterior_mean_upper: None,
@@ -1193,7 +1312,9 @@ mod parity_tests {
 
     /// The exact central multiplier both paths route through.
     fn z95() -> f64 {
-        central_z(LEVEL).expect("0.95 is a valid level")
+        IntervalReference::Normal
+            .central_multiplier(LEVEL)
+            .expect("0.95 is a valid level")
     }
 
     fn assert_close(a: &Array1<f64>, b: &Array1<f64>, tag: &str) {
@@ -1224,6 +1345,7 @@ mod parity_tests {
 
         let out = assemble_uncertainty_result(
             LEVEL,
+            IntervalReference::Normal,
             eta.clone(),
             mean.clone(),
             eta_se.clone(),
@@ -1275,6 +1397,7 @@ mod parity_tests {
 
         let out = assemble_uncertainty_result(
             LEVEL,
+            IntervalReference::Normal,
             eta.clone(),
             mean.clone(),
             eta_se.clone(),
@@ -1342,6 +1465,7 @@ mod parity_tests {
 
         let out = assemble_uncertainty_result(
             LEVEL,
+            IntervalReference::Normal,
             eta.clone(),
             mean.clone(),
             eta_se.clone(),
@@ -1392,6 +1516,7 @@ mod parity_tests {
 
         let out = assemble_uncertainty_result(
             LEVEL,
+            IntervalReference::Normal,
             eta.clone(),
             mean.clone(),
             mean_se.clone(),
@@ -1444,6 +1569,7 @@ mod parity_tests {
         assemble_posterior_mean_bounds(
             &mut none_result,
             None,
+            IntervalReference::Normal,
             EtaInterval::Symmetric,
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::UNIT_PROBABILITY,
@@ -1476,6 +1602,7 @@ mod parity_tests {
         assemble_posterior_mean_bounds(
             &mut some_result,
             Some(LEVEL),
+            IntervalReference::Normal,
             EtaInterval::Symmetric,
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::UNIT_PROBABILITY,
@@ -1510,6 +1637,7 @@ mod parity_tests {
 
         let out = assemble_uncertainty_result(
             LEVEL,
+            IntervalReference::Normal,
             eta.clone(),
             mean.clone(),
             eta_se.clone(),

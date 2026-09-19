@@ -1348,3 +1348,70 @@ fn time_parameterization_follows_the_log_time_collapse_not_the_smoothing_layout(
         SurvivalLocationScaleTimeParameterization::MonotoneWarp
     );
 }
+
+/// A collapsed warp reads none of the time block's offsets (#892), so the offsets
+/// a Weibull baseline target defines cannot enter a constant-scale fit: the
+/// prepared time block carries only zero offsets, and the fitted likelihood and
+/// coefficients are bitwise the same for every `(scale, shape)`. The target has
+/// no parameter in this likelihood, which is why materialize refuses one here
+/// instead of searching it.
+#[test]
+fn collapsed_warp_likelihood_is_invariant_in_the_weibull_target() {
+    use crate::survival::construction::{
+        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+        build_survival_time_offsets_for_likelihood,
+    };
+
+    let (age_exit, event, _log_t) = reduced_aft_lognormal_sample(400, 1.4, 0.5, 5);
+    let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
+    let fit_with_target = |scale: f64, shape: f64| {
+        let mut spec = reduced_aft_lognormal_spec(&age_exit, &event, 1.0);
+        let target = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(scale),
+            shape: Some(shape),
+            rate: None,
+            makeham: None,
+        };
+        let (entry, exit, derivative) = build_survival_time_offsets_for_likelihood(
+            &spec.age_entry,
+            &spec.age_exit,
+            &target,
+            SurvivalLikelihoodMode::LocationScale,
+            Some(&inverse_link),
+        )
+        .expect("Weibull target offsets");
+        assert!(
+            exit.iter().any(|&value| value != 0.0),
+            "the Weibull target must define nonzero time offsets"
+        );
+        spec.time_block.offset_entry = entry;
+        spec.time_block.offset_exit = exit;
+        spec.time_block.derivative_offset_exit =
+            derivative + DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
+
+        let prepared = prepare_survival_location_scale_model(&spec).expect("prepare");
+        assert!(prepared.family.location_log_time.is_some());
+        let time = &prepared.blockspecs[SurvivalLocationScaleFamily::BLOCK_TIME];
+        assert!(
+            time.offset.iter().all(|&value| value == 0.0)
+                && time
+                    .stacked_offset
+                    .as_ref()
+                    .is_none_or(|offset| offset.iter().all(|&value| value == 0.0)),
+            "the collapsed time block must read none of the target's offsets"
+        );
+        let (fit, _) = fit_survival_location_scale_with_geometry(spec).expect("collapsed fit");
+        (
+            fit.log_likelihood_at_mode(),
+            fit.beta_threshold(),
+            fit.beta_log_sigma(),
+        )
+    };
+
+    let (ll_a, threshold_a, log_sigma_a) = fit_with_target(3.0, 1.0);
+    let (ll_b, threshold_b, log_sigma_b) = fit_with_target(9.0, 2.5);
+    assert_eq!(ll_a.to_bits(), ll_b.to_bits(), "log-likelihood {ll_a} vs {ll_b}");
+    assert_eq!(threshold_a, threshold_b);
+    assert_eq!(log_sigma_a, log_sigma_b);
+}

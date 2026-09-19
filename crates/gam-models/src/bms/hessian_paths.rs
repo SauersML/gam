@@ -879,11 +879,6 @@ pub(super) struct BernoulliMarginalSlopeRowExactContext {
     pub(super) intercept: f64,
     pub(super) m_a: f64,
     pub(super) intercept_fast_path: bool,
-    /// Degree-9 per-row cell moments at the converged row intercept. The
-    /// top-of-cycle [`RowCellMomentsBundle`] (built at degree 9) is preferred
-    /// when present; this field remains the per-row lazy fallback for callers
-    /// without a bundle (e.g. legacy direct call sites).
-    pub(super) degree9_cells: Option<Vec<CachedDenestedCellMoments>>,
 }
 
 pub(super) struct BernoulliMarginalSlopeFlexRowScratch {
@@ -1294,6 +1289,38 @@ pub(super) fn new_cell_moment_lru_cache(
         budget,
         shard_count,
     ))
+}
+
+/// The fit's pools of runtime-sized jet workspaces for the empirical FLEX
+/// third- and fourth-order contractions and the third trace. Idle workspaces
+/// are charged to the process governor and freed with the family (gam#2989).
+pub(super) struct JetScratch {
+    /// Batched one- and two-seed workspaces for the third and fourth
+    /// contractions.
+    pub(super) batch: JetScratchPool,
+    /// Trace-jet workspaces for the third trace gradient (gam#2998).
+    pub(super) trace: gam_runtime::resource::GovernedScratchPool<gam_math::jet_trace::TraceJetWorkspace>,
+}
+
+pub(super) type JetScratchPool =
+    gam_runtime::resource::GovernedScratchPool<gam_math::jet_scalar::DynamicJetBatchWorkspace>;
+
+pub(super) fn new_jet_scratch() -> Arc<JetScratch> {
+    let governor = gam_runtime::resource::MemoryGovernor::global();
+    Arc::new(JetScratch {
+        batch: gam_runtime::resource::GovernedScratchPool::new(
+            governor.clone(),
+            "bernoulli marginal-slope empirical flex jet scratch",
+            || gam_math::jet_scalar::DynamicJetBatchWorkspace::new(1),
+            gam_math::jet_scalar::DynamicJetBatchWorkspace::allocated_bytes,
+        ),
+        trace: gam_runtime::resource::GovernedScratchPool::new(
+            governor.clone(),
+            "bernoulli marginal-slope empirical flex trace-jet scratch",
+            || gam_math::jet_trace::TraceJetWorkspace::new(1),
+            gam_math::jet_trace::TraceJetWorkspace::allocated_bytes,
+        ),
+    })
 }
 
 pub(super) fn new_cell_moment_cache_stats() -> Arc<exact_kernel::CellMomentCacheStats> {

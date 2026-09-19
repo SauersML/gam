@@ -130,7 +130,7 @@ effects. In gamfit a string column, `factor(g)` and `group(g)` also put a
 ridge penalty on them, but its strength is estimated by REML like every
 other smoothing parameter. With plenty of rows per level the penalty is
 negligible and the estimates match an unpenalized factor; with sparse
-levels they are pulled toward the overall mean. A level that was not seen in training raises `gamfit.errors.GamError` for a
+levels they are pulled toward the overall mean. A level that was not seen in training raises `gamfit.errors.PredictionError` (a `DataError`) for a
 string column or `factor(g)`, and is predicted at the population level for
 `group(g)`. The [formula reference](formulas.md#factor-terms) has the
 details.
@@ -154,13 +154,16 @@ print("P(lfp == 'yes') for the first rows:", model.predict(mroz.head()).round(3)
 If the event sorts first (for example `"case"` against `"control"`), map
 the column to `1`/`0` before fitting.
 
-### `k` is an upper bound, and gamfit tells you what it picked
+### Leave `k` unset: the data size the basis
 
-Without `k=` or `knots=`, a 1-D smooth gets `clamp(unique_values / 4, 4, 8)`
-interior knots, about a dozen basis functions, and the fit emits a
-`GamInferenceWarning` naming the rule. That is enough for most curves. A
-very wiggly truth needs a larger `k`; `model.basis_check(df)` reports when
-the basis is too small. See [Choosing `k`](formulas.md#choosing-k).
+pyGAM fixes the basis at `n_splines=20` and tunes only λ. Without `k=` or
+`knots=`, a gamfit `s(x)` starts from a lean basis of about a dozen
+functions and doubles its knot count while the fit shows the basis is too
+small, until `basis_check` passes. Only the covariate's distinct values and
+the design rank bound that growth. REML then decides how much of the basis
+to use, so a null or linear effect still shrinks to about 0 or 1 edf.
+Setting `k=` fixes the size instead. See
+[Choosing `k`](formulas.md#choosing-k).
 
 ### Formulas name columns
 

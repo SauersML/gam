@@ -11,7 +11,7 @@ pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
     BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, UnifiedFitResult, smooth_term_summary_rows,
+    ParametricTermSummary, SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -232,7 +232,8 @@ fn main() {
     // Drive the whole command on a dedicated wide-stack thread (see
     // `CLI_WORKER_STACK_SIZE`). `run` returns the same `CliResult` it would on
     // the main thread; a `join` error means `run` itself panicked, which the
-    // default panic hook has already reported, so we flush and exit non-zero.
+    // default panic hook has already reported. A panic is never the user's
+    // fault, so it exits with the internal-error code.
     let worker = std::thread::Builder::new()
         .name("gam-cli".to_string())
         .stack_size(CLI_WORKER_STACK_SIZE)
@@ -243,7 +244,7 @@ fn main() {
         Err(_) => {
             drop(std::io::Write::flush(&mut std::io::stdout()));
             drop(std::io::Write::flush(&mut std::io::stderr()));
-            HARD_EXIT(1);
+            HARD_EXIT(gam::ErrorCategory::Internal.exit_code());
         }
     };
     if let Err(e) = result {
@@ -253,7 +254,7 @@ fn main() {
         }
         drop(std::io::Write::flush(&mut std::io::stdout()));
         drop(std::io::Write::flush(&mut std::io::stderr()));
-        HARD_EXIT(1);
+        HARD_EXIT(e.error_category().exit_code());
     }
     // Every output artifact has been written and flushed by `run()`. Skip the
     // natural drop chain and exit explicitly: on Linux the cudarc + cuBLAS +
@@ -302,10 +303,11 @@ fn run() -> CliResult<()> {
         Command::ParameterDecomposition(args) => run_parameter_decomposition_cli(args),
         Command::Report(args) => run_report(args).map_err(CliError::from),
         Command::Summary(args) => run_summary(args).map_err(CliError::from),
-        Command::Predict(args) => run_predict(args).map_err(CliError::from),
+        Command::Predict(args) => run_predict(args),
         Command::TransformationScore(args) => {
             run_transformation_score(args).map_err(CliError::from)
         }
+        Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
         Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),

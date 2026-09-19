@@ -26,6 +26,7 @@ pub use posterior_predict::*;
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
 pub(crate) use crate::dispersion_location_scale::DispersionLocationScalePredictor;
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
+pub use crate::interval_policy::IntervalReference;
 use crate::interval_policy::{
     EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
@@ -47,7 +48,7 @@ use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
 use gam_linalg::utils::predict_gam_dimension_mismatch_message;
-use gam_math::probability::{normal_cdf, standard_normal_quantile};
+use gam_math::probability::normal_cdf;
 use gam_models::family_runtime::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
     strategy_from_fit,
@@ -459,6 +460,12 @@ pub trait UncertaintyCovarianceSource {
     fn constrained_fit_result(&self) -> Option<&UnifiedFitResult> {
         None
     }
+    /// Reference law of the interval pivot (see [`IntervalReference`]). A raw
+    /// covariance is taken as given — it carries no estimated scale and no
+    /// residual degrees of freedom — so its pivot is standard normal.
+    fn interval_reference(&self) -> Result<IntervalReference, EstimationError> {
+        Ok(IntervalReference::Normal)
+    }
 }
 
 impl UncertaintyCovarianceSource for UnifiedFitResult {
@@ -487,6 +494,9 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
             .as_ref()
             .and_then(|geometry| geometry.constrained_posterior.as_ref())
             .map(|_| self)
+    }
+    fn interval_reference(&self) -> Result<IntervalReference, EstimationError> {
+        IntervalReference::of_fit(self)
     }
 }
 
@@ -872,7 +882,11 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+                let sigma_floor =
+                    gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(
+                        self.payload(),
+                    )
+                    .ok()?;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
@@ -1275,10 +1289,12 @@ pub struct PredictPosteriorMeanResult {
     pub eta: Array1<f64>,
     pub eta_standard_error: Array1<f64>,
     pub mean: Array1<f64>,
-    /// Response-scale (delta-method) standard error `SE(μ̂) = |dμ/dη|·SE(η)`,
-    /// the response-scale twin of `eta_standard_error`. `Some` once confidence
-    /// bounds are assembled (it is the SE the response-scale credible band is
-    /// built from); `None` for point-only predictions. Surfaced as the
+    /// Response-scale posterior standard deviation `√Var[g⁻¹(η)]`, `η ~
+    /// N(η̂, SE(η)²)`: the response-scale twin of `eta_standard_error`, taken
+    /// from the same Gaussian η integral as the posterior-mean point (never
+    /// the delta-method `|dμ/dη̂|·SE(η)`, which collapses to zero wherever the
+    /// inverse link saturates while the posterior of μ stays wide). `Some` once
+    /// confidence bounds are assembled; `None` for point-only predictions. Surfaced as the
     /// documented response-scale `std_error` column by the FFI/CLI predict
     /// tables (#1536) so the reported SE matches the `mean`/`mean_lower`/
     /// `mean_upper` columns beside it instead of the link-scale `σ_η`.
@@ -1402,7 +1418,8 @@ impl PosteriorMeanOptions {
 ///
 /// This mirrors the bound construction in [`predict_gamwith_uncertainty`] using
 /// the `TransformEta` method: transform `eta ± z * eta_se` through the inverse
-/// link, then clamp to [0, 1] for bounded-response families.
+/// link, then clamp to [0, 1] for bounded-response families. `z` is the central
+/// multiplier of `reference`, the fit's [`IntervalReference`].
 ///
 /// Call this after [`PredictableModel::predict_posterior_mean`] whenever a
 /// confidence level is available so that `mean_lower` / `mean_upper` are
@@ -1410,22 +1427,26 @@ impl PosteriorMeanOptions {
 pub(crate) fn enrich_posterior_mean_bounds(
     result: &mut PredictPosteriorMeanResult,
     confidence_level: f64,
+    reference: IntervalReference,
     family: gam_spec::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
+    mean_standard_error: Array1<f64>,
 ) -> Result<(), EstimationError> {
     let spec = spec_from_family_link(family, link_kind);
-    // Delta-method response SE `SE(μ̂) = |dμ/dη|·SE(η)` is reported as its own
-    // uncertainty diagnostic. TransformEta bounds remain the image of the
-    // η-scale interval and never substitute this different approximation.
-    let strategy = strategy_for_spec(&spec);
-    let mut mean_se = Array1::<f64>::zeros(result.eta.len());
-    for i in 0..result.eta.len() {
-        let dmu_deta = strategy.inverse_link_jet(result.eta[i])?.d1;
-        mean_se[i] = dmu_deta.abs() * result.eta_standard_error[i];
+    if mean_standard_error.len() != result.eta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "posterior-mean response SE has {} rows but the prediction has {}",
+            mean_standard_error.len(),
+            result.eta.len()
+        )));
     }
-    // Record the response-scale SE so downstream surfaces (FFI/CLI predict
-    // tables) report it as `std_error` rather than the link-scale `σ_η` (#1536).
-    result.mean_standard_error = Some(mean_se.clone());
+    // The response-scale SE is the posterior SD `√Var[g⁻¹(η)]` from the same
+    // Gaussian η integral that produces the posterior-mean point, computed by
+    // the caller alongside `eta_standard_error`. It is recorded so downstream
+    // surfaces (FFI/CLI predict tables) report it as `std_error` rather than
+    // the link-scale `σ_η` (#1536). TransformEta bounds remain the image of the
+    // η-scale interval and never substitute this SD.
+    result.mean_standard_error = Some(mean_standard_error);
     // TransformEta bounds: transform the η endpoints through the inverse link,
     // handle non-monotone transforms, and clamp to the family support. The
     // shared engine owns this construction so it cannot drift from the
@@ -1433,6 +1454,7 @@ pub(crate) fn enrich_posterior_mean_bounds(
     assemble_posterior_mean_bounds(
         result,
         Some(confidence_level),
+        reference,
         EtaInterval::Symmetric,
         MeanBoundMethod::TransformEta {
             bounds: ResponseBounds::for_family(&spec.response),
@@ -1504,14 +1526,6 @@ pub struct PredictUncertaintyOptions {
     /// `predictor_x_for_corrections` and `training_support`. Factor is
     /// `1 + γ · Σ_k (excess_k / range_k)²`, with γ = `ood_gamma`.
     pub ood_inflation: bool,
-    /// Joint coverage adjustment over a query batch. When ON (default
-    /// OFF) the per-row z multiplier is increased so the family-wise
-    /// coverage of the returned intervals matches `confidence_level`.
-    /// Uses Bonferroni: `z_joint = standard_normal_quantile(
-    /// 0.5 + 0.5·(1 − (1 − level) / m))` where m is the joint query count
-    /// (defaults to the prediction batch size when `joint_query_count` is
-    /// None).
-    pub multi_point_joint: bool,
     /// Predictor rows aligned with the prediction batch, used by boundary
     /// and OOD corrections. Number of columns must match
     /// `training_support.axis_min.len()`. When None, both corrections
@@ -1534,9 +1548,6 @@ pub struct PredictUncertaintyOptions {
     /// None, Edgeworth correction reduces to the standard symmetric
     /// quantile (no-op).
     pub eta_skewness_for_corrections: Option<Array1<f64>>,
-    /// Joint query count m for the multi-point adjustment. When None the
-    /// prediction batch size is used.
-    pub joint_query_count: Option<usize>,
     /// Boundary correction strength α (multiplier on the squared shortfall).
     /// Default 0.25. Larger ⇒ more inflation near the edge.
     pub boundary_alpha: f64,
@@ -1583,12 +1594,10 @@ impl Default for PredictUncertaintyOptions {
             edgeworth_one_sided: true,
             boundary_correction: true,
             ood_inflation: false,
-            multi_point_joint: false,
             predictor_x_for_corrections: None,
             training_support: None,
             extrapolation_variance: None,
             eta_skewness_for_corrections: None,
-            joint_query_count: None,
             boundary_alpha: 0.25,
             boundary_band_fraction: 0.05,
             ood_gamma: 1.0,
@@ -1707,22 +1716,6 @@ pub(crate) fn ood_variance_inflation_factor(
         sq_excess += frac * frac;
     }
     (1.0 + gamma * sq_excess).max(1.0)
-}
-
-/// Bonferroni-adjusted z multiplier for joint coverage of `m` query
-/// rows at central level `level`. The per-row tail probability is
-/// `(1 − level) / m` (split equally across both tails), giving a
-/// per-row central level of `1 − (1 − level) / m`. Returns the
-/// corresponding standard-normal quantile, or the un-adjusted z if
-/// m ≤ 1 or inputs are degenerate.
-pub(crate) fn multi_point_joint_z(level: f64, m: usize) -> Result<f64, String> {
-    if m <= 1 || !(level.is_finite() && level > 0.0 && level < 1.0) {
-        return standard_normal_quantile(0.5 + 0.5 * level);
-    }
-    let alpha = 1.0 - level;
-    let per_row_alpha = alpha / (m as f64);
-    let per_row_level = 1.0 - per_row_alpha;
-    standard_normal_quantile(0.5 + 0.5 * per_row_level)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2077,8 +2070,10 @@ where
 /// `x_i^T Vb x_i + (∂f_i/∂ρ) V_ρ (∂f_i/∂ρ)^T` without recomputing or
 /// duplicating the IFT algebra at prediction time.
 ///
-/// Mean-scale SEs are delta-method approximations:
-/// Var(μ_i) ≈ (dμ/dη)^2 Var(η_i)
+/// Mean-scale SEs are the posterior SD of the response over that same
+/// Gaussian η posterior, `√Var[g⁻¹(η_i)]` with `η_i ~ N(η̂_i, Var(η_i))`, from
+/// the family's `posterior_meanvariance` integral (not the delta method
+/// `|dμ/dη|·SE(η)`, which vanishes wherever the inverse link saturates).
 ///
 /// Math note (logit family, Gaussian η posterior):
 ///
@@ -2323,6 +2318,7 @@ pub(crate) fn family_observation_band<S>(
     mean_standard_error: &Array1<f64>,
     z_lower_per_row: &Array1<f64>,
     z_upper_per_row: &Array1<f64>,
+    reference: IntervalReference,
     source: &S,
     prior_weights: Option<&Array1<f64>>,
 ) -> (Option<Array1<f64>>, Option<Array1<f64>>)
@@ -2352,7 +2348,8 @@ where
     // own family whose first two moments match the point prediction — mean `μ`
     // and total predictive variance `V = SE(μ̂)² + Var(Y|μ)` (estimation +
     // observation noise) — then read its equal-tailed quantiles at the SAME tail
-    // masses the symmetric band targeted, `Φ(−z_lower)` and `Φ(z_upper)`. When
+    // masses the symmetric band targeted, `F(−z_lower)` and `F(z_upper)` under
+    // the `reference` law the multipliers were drawn from. When
     // estimation uncertainty vanishes (`SE(μ̂) → 0`) the moment-matched
     // predictive collapses to the exact conditional law, so the band is exact;
     // with nonzero `SE(μ̂)` it is the minimal skew-correct widening. `predictive`
@@ -2370,8 +2367,8 @@ where
                 // Lower-tail probability of the lower edge and cumulative
                 // probability of the upper edge — identical tail mass to the
                 // symmetric band, routed through the correct distribution.
-                let p_lower = normal_cdf(-z_lower_per_row[i]);
-                let p_upper = normal_cdf(z_upper_per_row[i]);
+                let p_lower = reference.cdf(-z_lower_per_row[i]);
+                let p_upper = reference.cdf(z_upper_per_row[i]);
                 match predictive(mu, total_var, p_lower, p_upper) {
                     Some((q_lo, q_hi)) => {
                         lower[i] = q_lo;
@@ -2566,8 +2563,8 @@ where
             let mut upper = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let m = mean[i].clamp(0.0, 1.0);
-                let p_lo = normal_cdf(-z_lower_per_row[i]);
-                let p_hi = normal_cdf(z_upper_per_row[i]);
+                let p_lo = reference.cdf(-z_lower_per_row[i]);
+                let p_hi = reference.cdf(z_upper_per_row[i]);
                 lower[i] = bernoulli_predictive_quantile(m, p_lo);
                 upper[i] = bernoulli_predictive_quantile(m, p_hi);
             }
@@ -2888,15 +2885,12 @@ where
     }
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
-    // Per-row z multipliers. Joint adjustment widens the central level
-    // first; Edgeworth then optionally splits the lower/upper tails.
+    // Per-row multipliers: the central quantile of the fit's interval reference
+    // (Student-t on `n − edf` for an estimated scale, normal otherwise), which
+    // Edgeworth then optionally splits into lower/upper tails.
     let level = options.confidence_level;
-    let z_central = if options.multi_point_joint {
-        let m = options.joint_query_count.unwrap_or(n_rows).max(1);
-        multi_point_joint_z(level, m).map_err(EstimationError::InvalidInput)?
-    } else {
-        standard_normal_quantile(0.5 + 0.5 * level).map_err(EstimationError::InvalidInput)?
-    };
+    let reference = source.interval_reference()?;
+    let z_central = reference.central_multiplier(level)?;
     let mut z_lower_per_row = Array1::<f64>::from_elem(n_rows, z_central);
     let mut z_upper_per_row = Array1::<f64>::from_elem(n_rows, z_central);
     if options.edgeworth_one_sided
@@ -2910,13 +2904,7 @@ where
         }
     }
     let (eta_lower, eta_upper) = if let Some(fit) = constrained_fit {
-        let interval_level = if options.multi_point_joint {
-            let count = options.joint_query_count.unwrap_or(n_rows).max(1) as f64;
-            1.0 - (1.0 - level) / count
-        } else {
-            level
-        };
-        constrained_linear_predictor_intervals(fit, &x, offset, interval_level, requested_mode)?
+        constrained_linear_predictor_intervals(fit, &x, offset, level, requested_mode)?
     } else {
         (
             Array1::from_iter(
@@ -2935,13 +2923,10 @@ where
     };
     let quadctx = gam_solve::quadrature::QuadratureContext::new();
 
-    // Derivative of inverse link g^{-1}(η) used for delta-method:
-    //   Var(μ_i) ≈ [d g^{-1}(η_i)/dη]^2 Var(η_i).
+    // Response-scale posterior variance Var[g^{-1}(η_i)] with η_i ~ N(η̂_i, Var(η_i)).
     //
-    // For logit:
-    //   g^{-1}(η)=sigmoid(η), dμ/dη=μ(1-μ).
-    // If η itself is uncertain (η ~ N(m,v)), the exact predictive mean is
-    // E[sigmoid(η)] (logistic-normal integral) as documented above.
+    // For logit this is the central second moment of the logistic-normal
+    // law whose mean is the E[sigmoid(η)] integral documented above.
     //
     // For cloglog:
     //   g^{-1}(η)=1-exp(-exp(η)), dμ/dη=exp(η)exp(-exp(η)).
@@ -3088,6 +3073,7 @@ where
             &mean_standard_error,
             &z_lower_per_row,
             &z_upper_per_row,
+            reference,
             source,
             options.observation_prior_weights.as_ref(),
         )
@@ -3317,7 +3303,7 @@ where
 mod tests {
     use super::*;
     use gam_solve::constrained_posterior::constrained_projection_equal_tailed_interval;
-    use gam_math::probability::normal_pdf;
+    use gam_math::probability::{normal_pdf, standard_normal_quantile};
     use gam_models::bms::LatentMeasureKind;
     use gam_models::inference::model::SavedLatentZNormalization;
     use gam_problem::BlockRole;
@@ -3353,7 +3339,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
 
@@ -3409,7 +3394,10 @@ mod tests {
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
             likelihood_family: Some(gam_spec::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: gam_spec::LikelihoodScaleMetadata::ProfiledGaussian,
+            // A known unit scale (`σ = 1` below): this fixture carries a bare
+            // covariance and no inference, so there is no `n − edf` a
+            // profiled scale could be referred to.
+            likelihood_scale: gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
@@ -3580,7 +3568,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let result = predict_gamwith_uncertainty(
@@ -3618,7 +3605,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let result = predict_gamwith_uncertainty(
@@ -3761,42 +3747,6 @@ mod tests {
             inner_cycles: 0,
         })
         .expect("survival fit")
-    }
-
-    /// #1536 control: for the identity-link Gaussian the response and link
-    /// scales coincide, so the assembled `mean_standard_error` equals
-    /// `eta_standard_error` exactly — the property that hid the bug on Gaussian.
-    #[test]
-    fn enrich_posterior_mean_bounds_response_se_equals_link_se_for_gaussian() {
-        let eta = array![1.3, -0.2];
-        let eta_se = array![0.3, 0.45];
-        let mut result = PredictPosteriorMeanResult {
-            eta: eta.clone(),
-            eta_standard_error: eta_se.clone(),
-            mean: eta.clone(),
-            mean_standard_error: None,
-            mean_lower: None,
-            mean_upper: None,
-            observation_lower: None,
-            observation_upper: None,
-            point_covariance_source: InferenceCovarianceMode::Conditional,
-            uncertainty_covariance_source: None,
-            point_covariance_provenance: None,
-        };
-        enrich_posterior_mean_bounds(
-            &mut result,
-            0.95,
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            None,
-        )
-        .expect("enrich posterior-mean bounds");
-        let mse = result
-            .mean_standard_error
-            .as_ref()
-            .expect("response-scale SE must be populated");
-        for i in 0..eta.len() {
-            assert!((mse[i] - eta_se[i]).abs() <= 1e-12);
-        }
     }
 
     #[test]
@@ -3948,7 +3898,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
 
@@ -3993,7 +3942,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let options_fused = PredictUncertaintyOptions {
@@ -4060,7 +4008,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: None,
             link_wiggle: None,
@@ -4078,7 +4026,7 @@ mod tests {
             .predict_noise_scale(&input)
             .expect("gaussian location-scale sigma")
             .expect("sigma should be returned");
-        // σ = LOGB_SIGMA_FLOOR + exp(η + offset).
+        // σ = sigma_floor + exp(η + offset).
         assert!((sigma[0] - 3.01).abs() <= 1e-12);
         assert!((sigma[1] - 5.01).abs() <= 1e-12);
         let out = predictor
@@ -4092,8 +4040,9 @@ mod tests {
     fn gaussian_location_scale_posterior_mean_sigma_integrates_log_sigma_posterior() {
         // Scale-block variance 0.4 on the single log-σ coefficient: the
         // posterior mean of σ = f + exp(η_s) is f + exp(m + v/2), strictly
-        // above the plug-in σ(m); without covariance it is the plug-in.
-        let floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+        // above the plug-in σ(m). Without covariance the posterior moment
+        // does not exist, so it is refused, never degraded to the plug-in.
+        let floor = 0.01;
         let mut predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.3],
@@ -4117,15 +4066,12 @@ mod tests {
         let expected = 2.0 * floor + (0.3_f64 + 0.2).exp();
         assert!((integrated[0] / expected - 1.0).abs() < 1e-14);
         predictor.covariance = None;
-        let plugin = predictor
-            .predict_noise_scale(&input)
-            .expect("plug-in sigma")
-            .expect("gaussian location-scale reports sigma");
-        let degraded = predictor
-            .predict_posterior_mean_noise_scale(&input)
-            .expect("posterior-mean sigma")
-            .expect("gaussian location-scale reports sigma");
-        assert_eq!(plugin, degraded);
+        match predictor.predict_posterior_mean_noise_scale(&input) {
+            Err(EstimationError::InvalidInput(reason)) => {
+                assert!(reason.contains("no coefficient covariance"), "{reason}")
+            }
+            other => panic!("posterior-mean sigma without covariance must be refused: {other:?}"),
+        }
     }
 
     #[test]
@@ -4133,7 +4079,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
@@ -4163,7 +4109,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,
@@ -4182,7 +4128,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         };
         let corrected_fit = gaussian_location_scale_fit_with_covariance_and_corrected(
@@ -4464,7 +4409,6 @@ mod tests {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         }
     }
@@ -4486,7 +4430,12 @@ mod tests {
         )
         .expect("prediction baseline");
 
-        let z = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
+        // The uncorrected interval is `η̂ ± q·SE` with `q` the fit's own
+        // reference quantile (Student-t on n − edf for this profiled-scale
+        // fixture; pinned numerically in the test below).
+        let z = IntervalReference::of_fit(&fit)
+            .and_then(|reference| reference.central_multiplier(0.95))
+            .unwrap();
         let expected_se = (0.25_f64).sqrt();
         assert!((pred.eta_standard_error[0] - expected_se).abs() <= 1e-12);
         let expected_lower = 1.0 - z * expected_se;
@@ -4502,6 +4451,97 @@ mod tests {
             "baseline upper drifted: got {}, expected {}",
             pred.eta_upper[0],
             expected_upper
+        );
+    }
+
+    #[test]
+    fn estimated_scale_interval_multiplier_is_student_t_on_residual_df() {
+        // The fixture profiles the Gaussian scale σ̂² from n = 16 rows with
+        // edf = 1, so the interval pivot is Student-t on ν = n − edf = 15, not
+        // standard normal. A known scale on the same fit keeps Φ.
+        let (fit, x, beta, offset) = coverage_correction_fixture();
+        assert_eq!(fit.wald_residual_degrees_of_freedom(), Some(15.0));
+        let reference = IntervalReference::of_fit(&fit).expect("estimated-scale reference");
+        assert_eq!(
+            reference,
+            IntervalReference::StudentT {
+                degrees_of_freedom: 15.0
+            }
+        );
+        // t_{15}(0.975), independent high-precision reference.
+        let t15 = 2.131449545559776_f64;
+        let multiplier = reference.central_multiplier(0.95).expect("multiplier");
+        assert!(
+            (multiplier - t15).abs() <= 1e-13 * t15,
+            "multiplier {multiplier} != t_15(0.975) = {t15}"
+        );
+        let se = 0.25_f64.sqrt();
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
+            &fit,
+            &corrections_baseline_options(),
+        )
+        .expect("estimated-scale prediction");
+        for (tag, half_width) in [
+            ("lower", 1.0 - pred.eta_lower[0]),
+            ("upper", pred.eta_upper[0] - 1.0),
+        ] {
+            assert!(
+                (half_width - t15 * se).abs() <= 1e-12,
+                "{tag} half-width {half_width} != t_15·SE = {}",
+                t15 * se
+            );
+        }
+
+        let mut known = fit.clone();
+        known.likelihood_scale = gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 };
+        assert_eq!(
+            IntervalReference::of_fit(&known).expect("known-scale reference"),
+            IntervalReference::Normal
+        );
+        let z = standard_normal_quantile(0.975).unwrap();
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
+            &known,
+            &corrections_baseline_options(),
+        )
+        .expect("known-scale prediction");
+        assert!((pred.eta_upper[0] - 1.0 - z * se).abs() <= 1e-12);
+        assert!((1.0 - pred.eta_lower[0] - z * se).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn estimated_scale_without_residual_df_has_no_interval_reference() {
+        // edf = n leaves no residual degrees of freedom to estimate φ from: the
+        // t reference is undefined and must be reported, never read as Φ.
+        let mut fit = posterior_band_fixture(array![1.0], array![[0.25]]);
+        fit.inference.as_mut().expect("fixture inference").edf_total = 16.0;
+        assert_eq!(fit.wald_residual_degrees_of_freedom(), None);
+        expect_estimation_error(
+            IntervalReference::of_fit(&fit),
+            "estimated scale without residual df must be an error",
+        );
+    }
+
+    #[test]
+    fn modeled_noise_block_keeps_normal_interval_reference() {
+        // Gaussian location-scale: σ(x) is a posterior block, not a profiled
+        // scalar φ̂, so even under the Gaussian scale tag the pivot is Φ.
+        let fit = gaussian_location_scale_fit_with_covariance(
+            array![0.0],
+            array![0.0],
+            array![[1.0, 0.0], [0.0, 1.0]],
+        );
+        assert!(fit.likelihood_scale.wald_scale_is_estimated());
+        assert_eq!(
+            IntervalReference::of_fit(&fit).expect("location-scale reference"),
+            IntervalReference::Normal
         );
     }
 
@@ -4647,47 +4687,6 @@ mod tests {
     }
 
     #[test]
-    fn multi_point_joint_widens_interval_relative_to_per_row() {
-        let beta = array![1.0_f64];
-        let cov = array![[0.25_f64]];
-        let fit = posterior_band_fixture(beta.clone(), cov);
-        // Five identical query rows; joint over m=5 must widen each
-        // interval relative to the per-row baseline, by the Bonferroni z.
-        let x = Array2::<f64>::from_elem((5, 1), 1.0_f64);
-        let offset = Array1::zeros(5);
-        let mut opts = corrections_baseline_options();
-        opts.multi_point_joint = true;
-        // Don't set joint_query_count so the helper uses batch size = 5.
-
-        let pred = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            &fit,
-            &opts,
-        )
-        .expect("joint-adjusted prediction");
-
-        let z_per_row = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
-        let z_joint = standard_normal_quantile(0.5 + 0.5 * (1.0 - 0.05_f64 / 5.0)).unwrap();
-        assert!(
-            z_joint > z_per_row + 1e-6,
-            "Bonferroni z must exceed per-row z: joint={z_joint}, per-row={z_per_row}"
-        );
-        let baseline_se = (0.25_f64).sqrt();
-        // Width per row should be 2·z_joint·se.
-        for i in 0..5 {
-            let width = pred.eta_upper[i] - pred.eta_lower[i];
-            let expected = 2.0 * z_joint * baseline_se;
-            assert!(
-                (width - expected).abs() <= 1e-12,
-                "joint row {i} width mismatch: got {width}, expected {expected}"
-            );
-        }
-    }
-
-    #[test]
     fn edgeworth_helper_zero_skew_returns_central_z() {
         let z = 1.96_f64;
         let adj = edgeworth_one_sided_quantile(z, 0.0);
@@ -4716,13 +4715,6 @@ mod tests {
             1.0,
         );
         assert!((f - 1.0).abs() <= 1e-12);
-    }
-
-    #[test]
-    fn multi_point_joint_z_passthrough_at_m_one() {
-        let z1 = multi_point_joint_z(0.95, 1).unwrap();
-        let z_baseline = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
-        assert!((z1 - z_baseline).abs() <= 1e-12);
     }
 
     #[test]
@@ -5231,6 +5223,7 @@ mod tests {
             &Array1::from_elem(n, 0.01),
             &z_per_row,
             &z_per_row,
+            IntervalReference::Normal,
             &fit,
             None,
         );

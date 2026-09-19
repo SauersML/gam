@@ -78,7 +78,7 @@ pub mod types;
 pub use riemannian_retraction::LatentRetractionRegistry;
 pub use row_measure::RowSubsampleMask;
 
-pub use basis_error::BasisError;
+pub use basis_error::{BasisError, CovariateSpan};
 pub use block_count_error::BlockCountMismatch;
 pub use block_role::BlockRole;
 pub use block_spec::{
@@ -137,6 +137,7 @@ pub use estimation_error::{
 pub use estimation_error::FitStationarityEvidence;
 pub use execution_path::ExecutionPath;
 pub use failure_category::FailureCategory;
+pub use gam_spec::ErrorCategory;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use finite_validation::{
     bail_if_cached_beta_non_finite,
@@ -207,7 +208,7 @@ pub use row_metric::{
     WeightField,
 };
 pub use schedule::{GumbelTemperatureSchedule, ScheduleKind};
-pub use seeding::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
+pub use seeding::OrderedRhoBounds;
 pub use solver_contract::{
     DeclaredHessianForm,
     Derivative,

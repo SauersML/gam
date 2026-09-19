@@ -337,12 +337,7 @@ fn certified_survival_fit_quadratic() -> gam_solve::rho_optimizer::CertifiedOute
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_tolerance(1.0e-8)
         .with_max_iter(40)
-        .with_initial_rho(array![0.5])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.5]);
     let mut objective = problem.build_objective(
         (),
         |_: &mut (), theta: &Array1<f64>| Ok(0.5 * (theta[0] - 0.25).powi(2)),
@@ -1249,6 +1244,50 @@ fn survival_ls_joint_oracle_states(primaries: &[[f64; SLS_ROW_K]]) -> Vec<Parame
             eta: stacked(6, 7, 8),
         },
     ]
+}
+
+/// gam#3035: the all-axes dense overrides agree with the generic per-row
+/// reductions on the full data and on a Horvitz–Thompson-weighted subsample.
+#[test]
+fn survival_ls_dense_overrides_match_generic_on_every_row_set_3035() {
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+                [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+                [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+                [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
+                [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+            ];
+            let event = [1.0, 1.0, 1.0, 0.35];
+            let weight = [1.0, 1.2, 1.1, 1.3];
+            for distribution in [
+                ResidualDistribution::Gaussian,
+                ResidualDistribution::Gumbel,
+                ResidualDistribution::Logistic,
+            ] {
+                let inverse_link = residual_distribution_inverse_link(distribution);
+                let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+                let states = survival_ls_joint_oracle_states(&primaries);
+                let dynamic = family.build_dynamic_geometry(&states).expect("dynamic geometry");
+                let kernel = SurvivalLsRowKernel {
+                    family: &family,
+                    dynamic: &dynamic,
+                    deriv_log_scale: 0.0,
+                    offsets: family.joint_block_offsets(),
+                };
+                crate::test_support::row_set_overrides::assert_dense_overrides_match_generic(
+                    &format!("survival location-scale {distribution:?}"),
+                    &kernel,
+                    &[0.7, -0.5, 0.9],
+                    &[-1.1, 0.8, 0.3],
+                    1e-13,
+                );
+            }
+        })
+        .expect("spawn wide-stack override thread")
+        .join();
+    assert!(join_result.is_ok(), "survival LS override pinning thread must complete");
 }
 
 /// The hand-derived analytic joint-Hessian directional derivative
@@ -7637,3 +7676,9 @@ fn the_explicit_psi_terms_are_the_psi_derivatives_of_the_nll_2695() {
 
 /// gam#2695 degree ladder (child module so this file stays under the line gate).
 mod knot_ladder_2695;
+
+/// #3090: the direct parametric-AFT step on an indefinite Hessian.
+mod absolute_newton_3090;
+
+/// #3185: the direct parametric-AFT backtracking floor and stall.
+mod line_search_3185;

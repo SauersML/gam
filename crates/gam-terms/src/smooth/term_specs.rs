@@ -66,6 +66,58 @@ pub(crate) fn rewrite_thin_plate_knots_error(
     }
 }
 
+/// Put the unresolvable-bulk thin-plate refusal in the term's own units: name
+/// the smooth and, for each covariate, the full range the centres had to span
+/// next to the interquartile range where the bulk of the rows sit, so the
+/// outlying span is visible and the remedy is actionable.
+pub(crate) fn name_thin_plate_outlier_span(
+    err: BasisError,
+    termname: &str,
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+) -> BasisError {
+    let BasisError::ThinPlateBulkUnresolvable {
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        ..
+    } = err
+    else {
+        return err;
+    };
+    let spans = feature_cols
+        .iter()
+        .filter(|&&col| col < data.ncols() && data.nrows() > 0)
+        .map(|&col| {
+            let mut values: Vec<f64> = data.column(col).iter().copied().collect();
+            values.sort_by(f64::total_cmp);
+            let quantile = |p: f64| {
+                let pos = p * (values.len() - 1) as f64;
+                let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+                values[lo] + (pos - lo as f64) * (values[hi] - values[lo])
+            };
+            crate::basis::CovariateSpan {
+                column: col,
+                min: values[0],
+                lower_quartile: quantile(0.25),
+                upper_quartile: quantile(0.75),
+                max: values[values.len() - 1],
+            }
+        })
+        .collect();
+    BasisError::ThinPlateBulkUnresolvable {
+        term: Some(termname.to_string()),
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        spans,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeConstraint {
     None,
@@ -1182,20 +1234,13 @@ pub(crate) const fn default_pca_chunk_size() -> usize {
 /// Random-effects term specification.
 ///
 /// The selected feature column is interpreted as a categorical grouping variable.
-/// The term contributes a one-hot dummy block with an identity penalty on group
-/// coefficients, equivalent to i.i.d. Gaussian random effects.
+/// The term contributes a full one-hot dummy block, one column per level, with
+/// a REML-estimated identity ridge on the group coefficients (i.i.d. Gaussian
+/// random effects).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RandomEffectTermSpec {
     pub name: String,
     pub feature_col: usize,
-    /// If true, drop the lexicographically first group level to use treatment coding.
-    /// If false, keep all levels (full one-hot block, still identifiable under ridge).
-    pub drop_first_level: bool,
-    /// If true, add a ridge penalty and estimate this block as a random effect.
-    /// If false, leave the one-hot/treatment-coded block unpenalized so it is a
-    /// fixed categorical main effect.  The default preserves older saved models.
-    #[serde(default = "default_random_effect_penalized")]
-    pub penalized: bool,
     /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
     /// When present, prediction uses exactly these columns to avoid design drift.
     #[serde(default)]
@@ -1209,23 +1254,11 @@ pub struct RandomEffectTermSpec {
     /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
     /// materialized as a penalized one-hot block, must raise on an
     /// out-of-vocabulary level at predict rather than being silently mapped to
-    /// the factor's centering point (#2102/#2137). `factor(g)` originally shared
-    /// the `group()`/`re()` parse arm and so wrongly inherited the lenient policy
-    /// (#2137). For a string factor the typed schema encode rejects the unseen
-    /// level upstream; for a numeric-coded `factor(year)` the reject is enforced
-    /// by `build_random_effect_block`, which owns the frozen vocabulary. The
-    /// `true` default preserves the pre-#2102 (uniformly lenient) behavior for
-    /// models serialized before this field existed.
-    #[serde(default = "default_random_effect_lenient_unseen")]
+    /// the factor's centering point (#2102/#2137). For a string factor the typed
+    /// schema encode rejects the unseen level upstream; for a numeric-coded
+    /// `factor(year)` the reject is enforced by `build_random_effect_block`,
+    /// which owns the frozen vocabulary.
     pub lenient_unseen: bool,
-}
-
-pub(crate) fn default_random_effect_penalized() -> bool {
-    true
-}
-
-pub(crate) fn default_random_effect_lenient_unseen() -> bool {
-    true
 }
 
 pub(crate) fn validate_measure_jet_positive_vec_len(
@@ -1268,36 +1301,27 @@ pub struct TermCollectionSpec {
 /// Where a model's constant level lives.
 ///
 /// The constant is carried at most once, and always in an unpenalized
-/// direction, so a shift of the response shifts the fit and nothing else. With
-/// the default global intercept it is the unpenalized all-ones column and
-/// every other term is centred against it. A formula that removes the
-/// intercept (`0 + …`, `… - 1`) hands the level to one term, in this order:
+/// direction, so a shift of the response shifts the fit and nothing else: it
+/// is the unpenalized all-ones column, and every other term is centred against
+/// it. A formula that removes the intercept (`0 + …`, `… - 1`) still keeps it
+/// when some term spans the constant: a fixed factor block (`+ g`,
+/// `factor(g)`, or the main effect of a factor `by=`), a
+/// pure-indicator interaction over the full level cross (`g:h`), or a
+/// B-spline / tensor smooth whose gauge would keep the constant (the default
+/// sum-to-zero centring, or `identifiability=none`). Such a model has the
+/// column space the formula asked for, with only the constant free; every
+/// other direction keeps its default penalty (a full-level ridge beside the
+/// intercept is the ridge on the level contrasts).
 ///
-/// 1. the first fixed factor block (`+ g`, `factor(g)`, `C(g)`, or the main
-///    effect of a factor `by=`), which already spans the constant with its
-///    full dummy coding and is made unpenalized, giving the cell-means model;
-/// 2. else the first pure-indicator interaction (`g:h`), which keeps every
-///    cell, its reference cell included;
-/// 3. else the first B-spline / tensor smooth whose explicit
-///    `identifiability=none` already keeps the constant, or failing that the
-///    first one with the default gauge, whose sum-to-zero centring is
-///    released. Either way it becomes `level_smooth`, and its null-space
-///    ridge is dropped unless `double_penalty=true` was written.
-///
-/// A genuine random effect (`group(g)`, `re(g)`) never carries the level: its
-/// levels are mean-zero deviations. When no term can carry it the model has
-/// no level: every surviving effect passes through the origin, as a
-/// parametric no-intercept fit does.
+/// Only when no term spans the constant is it removed (`NoIntercept`): every
+/// effect then passes through the origin, as a parametric no-intercept fit
+/// does. A genuine random effect (`group(g)`, `re(g)`) never spans it: its
+/// levels are mean-zero deviations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ModelLevel {
     #[default]
     Intercept,
-    NoIntercept {
-        /// Index into `smooth_terms` of the smooth whose centring was released
-        /// to carry the level. Its parametric constraint block omits the
-        /// constant column so the identifiability pass does not re-centre it.
-        level_smooth: Option<usize>,
-    },
+    NoIntercept,
 }
 
 pub(crate) fn validate_smooth_basis_frozen(
@@ -5493,11 +5517,63 @@ fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
 /// first, while their coordinates stay independent on the chart's null space.
 /// That reproduces both cases and needs no record of which chart produced a
 /// frozen transform.
+/// Orthonormal basis of `{γ : Zγ ∈ span(F)}` for an injective chart `Z` and an
+/// orthonormal frame `F`.
+///
+/// `Z = UΣVᵀ` moves the question onto the orthonormal `U`, where the singular
+/// values of `(I − FFᵀ)U` are sines of principal angles between two subspaces.
+/// A direction the chart keeps inside `span(F)` has angle zero up to roundoff,
+/// so a machine-precision rank cutoff decides it however the chart scales its
+/// coordinates. `γ = VΣ⁻¹u` maps each such `u` back to the chart.
+fn chart_preimage_of_span(
+    chart: &Array2<f64>,
+    frame: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    use gam_linalg::faer_ndarray::{FaerSvd, rrqr_nullspace_basis};
+    if chart.nrows() != frame.nrows() {
+        crate::bail_dim_basis!(
+            "tensor chart has {} rows but the null frame has {}",
+            chart.nrows(),
+            frame.nrows()
+        );
+    }
+    let width = chart.ncols();
+    if frame.ncols() == 0 || width == 0 {
+        return Ok(Array2::zeros((width, 0)));
+    }
+    let (left, singular, right_t) = chart.svd(true, true).map_err(BasisError::LinalgError)?;
+    let (Some(left), Some(right_t)) = (left, right_t) else {
+        crate::bail_invalid_basis!("tensor chart SVD returned no singular vectors");
+    };
+    if singular.len() < width || singular.iter().take(width).any(|&s| !(s > 0.0)) {
+        crate::bail_invalid_basis!(
+            "tensor identifiability chart is not injective ({} columns)",
+            width
+        );
+    }
+    let left = left.slice(s![.., ..width]).to_owned();
+    let projected = &left - &frame.dot(&frame.t().dot(&left));
+    // `rrqr_nullspace_basis(a)` spans `null(aᵀ)`.
+    let (angle_null, _) =
+        rrqr_nullspace_basis(&projected.t().to_owned(), 1.0).map_err(BasisError::LinalgError)?;
+    if angle_null.ncols() == 0 {
+        return Ok(Array2::zeros((width, 0)));
+    }
+    let scaled = Array2::from_shape_fn(angle_null.dim(), |(row, col)| {
+        angle_null[[row, col]] / singular[row]
+    });
+    let preimage = right_t.slice(s![..width, ..]).t().dot(&scaled);
+    let (basis, _, _) = preimage.svd(true, false).map_err(BasisError::LinalgError)?;
+    let Some(basis) = basis else {
+        crate::bail_invalid_basis!("tensor chart null SVD returned no singular vectors");
+    };
+    Ok(basis.slice(s![.., ..preimage.ncols()]).to_owned())
+}
+
 fn tensor_null_function_block_ridges(
     normalized_marginal_penalties: &[(Array2<f64>, f64)],
     marginal_function_grams: &[Array2<f64>],
     chart: Option<&Array2<f64>>,
-    chart_primary: &ConstructiveQuadratic,
 ) -> Result<Vec<ConstructiveQuadratic>, BasisError> {
     use gam_linalg::faer_ndarray::FaerEigh;
     let margins = normalized_marginal_penalties.len();
@@ -5507,12 +5583,9 @@ fn tensor_null_function_block_ridges(
             marginal_function_grams.len()
         );
     }
-    let Some(chart_null) = crate::basis::constructive_nullspace_basis(chart_primary)? else {
-        return Ok(Vec::new());
-    };
-
     // Per margin: the constant frame and the trend frame, each orthonormal.
     let mut margin_frames = Vec::<[Array2<f64>; 2]>::with_capacity(margins);
+    let mut joint_null = Array2::<f64>::eye(1);
     for ((penalty, _), gram) in normalized_marginal_penalties
         .iter()
         .zip(marginal_function_grams)
@@ -5526,6 +5599,7 @@ fn tensor_null_function_block_ridges(
             .map(|(idx, _)| idx)
             .collect();
         let null = analysis.eigenvectors.select(Axis(1), &null_idx);
+        joint_null = kronecker_product(&joint_null, &null);
         let width = penalty.nrows();
         let ones = Array1::<f64>::from_elem(width, 1.0);
         let constant_energy = ones.dot(&penalty.dot(&ones)) / width as f64;
@@ -5554,6 +5628,20 @@ fn tensor_null_function_block_ridges(
             null.dot(&constant_coords).insert_axis(Axis(1)),
             null.dot(&trend_coords),
         ]);
+    }
+    // Both decompositions penalize every tensor direction with a penalized
+    // factor, so the joint null is `⊗_j null(S_j)` by construction, and in the
+    // chart it is the preimage of that span. Reading it off the chart
+    // primary's spectrum instead fails once the chart is not orthonormal: the
+    // collection gauge whitens against the design Gram, which spreads the
+    // primary's eigenvalues until a spectral cutoff counts penalized
+    // directions as null.
+    let chart_null = match chart {
+        Some(z) => chart_preimage_of_span(z, &joint_null)?,
+        None => joint_null,
+    };
+    if chart_null.ncols() == 0 {
+        return Ok(Vec::new());
     }
 
     // Blocks `⊗_j frames[j][bit j]`, with their Gram images `⊗_j G_j frames[j][bit j]`.
@@ -6162,21 +6250,10 @@ pub(crate) fn build_tensor_bspline_basis(
         // The null-function ridges are built in the coefficient chart the fit
         // uses, after identifiability, because the chart decides which null
         // blocks remain free (see `tensor_null_function_block_ridges`).
-        let physical_primary_terms = candidates
-            .iter()
-            .map(|candidate| {
-                candidate
-                    .matrix
-                    .scaled(candidate.normalization_scale, "physical tensor primary penalty")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let chart_primary =
-            ConstructiveQuadratic::sum(&physical_primary_terms, "joint tensor primary penalty")?;
         for ridge in tensor_null_function_block_ridges(
             &normalized_marginal_penalties,
             &marginal_function_grams,
             z_opt.as_ref(),
-            &chart_primary,
         )? {
             let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense());
             candidates.push(PenaltyCandidate {
@@ -6382,20 +6459,8 @@ pub fn build_random_effect_block(
         if levels.is_empty() {
             crate::bail_invalid_basis!("random-effect term '{}' has no observed levels", spec.name);
         }
-        let start_idx = if spec.drop_first_level && levels.len() > 1 {
-            1usize
-        } else {
-            0usize
-        };
-        levels[start_idx..].to_vec()
+        levels
     };
-
-    if kept_levels.is_empty() {
-        crate::bail_invalid_basis!(
-            "random-effect term '{}' drops all levels; keep at least one level",
-            spec.name
-        );
-    }
 
     let q = kept_levels.len();
     let mut level_to_col = BTreeMap::<u64, usize>::new();
@@ -6414,14 +6479,11 @@ pub fn build_random_effect_block(
     // encode rejects the unseen level before we get here; a *numeric-coded*
     // `factor(year)` column, however, reaches Rust as a plain numeric column
     // with no categorical schema, so the operator that owns the frozen level
-    // vocabulary is the enforcement point that closes the same gap. Only when
-    // the full one-hot block is kept (`!drop_first_level`) does an absent level
-    // unambiguously mean "unseen" — with treatment coding the dropped baseline
-    // is a legitimate absent column, so we do not gate that path. `frozen_levels`
-    // presence marks the predict/frozen context; at fit the vocabulary is
-    // derived from this very data, so no row is unseen.
-    let strict_unseen =
-        !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
+    // vocabulary is the enforcement point that closes the same gap. The block
+    // keeps every level, so a level absent from the frozen set is unseen.
+    // `frozen_levels` presence marks the predict/frozen context; at fit the
+    // vocabulary is derived from this very data, so no row is unseen.
+    let strict_unseen = !spec.lenient_unseen && spec.frozen_levels.is_some();
     let mut group_ids = Vec::with_capacity(n);
     for (row, &v) in col.iter().enumerate() {
         let bits = gam_data::canonical_level_bits(v);
@@ -7010,7 +7072,7 @@ pub(crate) fn defer_inner_model_centering_to_factor_level_wrapper(basis: &mut Sm
 /// Whether a B-spline smooth (1-D or tensor) carries its default model-space
 /// centring, the gauge that removes the constant so the smooth cannot compete
 /// with a global intercept. Other bases report `false`: they keep their own
-/// gauge and never take part in the level-carrier rule (see [`ModelLevel`]).
+/// gauge and never count as spanning the constant (see [`ModelLevel`]).
 pub(crate) fn bspline_smooth_is_default_centred(basis: &SmoothBasisSpec) -> bool {
     match basis {
         SmoothBasisSpec::BSpline1D { spec, .. } => matches!(
@@ -7035,43 +7097,6 @@ pub(crate) fn bspline_smooth_spans_constant(basis: &SmoothBasisSpec) -> bool {
             matches!(spec.identifiability, TensorBSplineIdentifiability::None)
         }
         _ => false,
-    }
-}
-
-/// Hand the model's constant level to this smooth when the formula removed
-/// the intercept (the level-carrier rule of [`ModelLevel`]): release the
-/// default model-space centring so the constant stays in the smooth's span.
-///
-/// The level must sit in an unpenalized direction, or the fit would shrink the
-/// whole curve toward zero and change under a shift of the response. The
-/// wiggliness penalty already leaves the constant free (it lies in its null
-/// space); the double-penalty null-space ridge would not, so when
-/// `keep_null_ridge` is false the ridge is dropped and the smooth's null space
-/// (the constant and the polynomials the penalty annihilates) is left
-/// unpenalized, as for a smooth fitted alongside an intercept without a
-/// null-space penalty. An explicit `double_penalty=true` keeps it: the user
-/// asked for the whole null space, level included, to be shrunk. Only a basis
-/// for which [`bspline_smooth_is_default_centred`] or
-/// [`bspline_smooth_spans_constant`] holds is ever handed the level; any other
-/// basis is left untouched.
-pub(crate) fn release_model_centring_for_level(basis: &mut SmoothBasisSpec, keep_null_ridge: bool) {
-    if let SmoothBasisSpec::TensorBSpline { spec, .. } = basis {
-        if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) {
-            spec.identifiability = TensorBSplineIdentifiability::None;
-        }
-        if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
-            spec.double_penalty &= keep_null_ridge;
-        }
-    } else if let SmoothBasisSpec::BSpline1D { spec, .. } = basis {
-        if matches!(
-            spec.identifiability,
-            BSplineIdentifiability::WeightedSumToZero { .. }
-        ) {
-            spec.identifiability = BSplineIdentifiability::None;
-        }
-        if matches!(spec.identifiability, BSplineIdentifiability::None) {
-            spec.double_penalty &= keep_null_ridge;
-        }
     }
 }
 
@@ -8324,7 +8349,8 @@ pub fn build_single_local_smooth_term(
                 spec_local.identifiability = SpatialIdentifiability::None;
             }
             let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
-                rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
+                let err = rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec);
+                name_thin_plate_outlier_span(err, &term.name, data, feature_cols)
             })?;
             // Inject the input scale into metadata; also restore the user's
             // original length_scale (not the σ_geom-compensated one) so a

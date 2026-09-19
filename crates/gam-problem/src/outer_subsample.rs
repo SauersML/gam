@@ -192,6 +192,31 @@ pub enum RowSet {
 }
 
 impl RowSet {
+    /// Number of positions the row set walks: `n_total` for `All`, the stored
+    /// row count for `Subsample`.
+    #[inline]
+    pub fn walk_len(&self, n_total: usize) -> usize {
+        match self {
+            Self::All => n_total,
+            Self::Subsample { rows, .. } => rows.len(),
+        }
+    }
+
+    /// The row index and Horvitz–Thompson weight at walk position `position`:
+    /// `(position, 1.0)` for `All`, the stored row's `(index, weight)` for
+    /// `Subsample`. Walking positions `0..walk_len` in order visits the rows in
+    /// the order, and with the tiling, of [`Self::par_reduce_fold`].
+    #[inline]
+    pub fn row_at(&self, position: usize) -> (usize, f64) {
+        match self {
+            Self::All => (position, 1.0),
+            Self::Subsample { rows, .. } => {
+                let row = &rows[position];
+                (row.index, row.weight)
+            }
+        }
+    }
+
     /// Parallel fold-reduce over the row set. `init` produces a fresh
     /// accumulator, `fold` is the per-row update, `reduce` combines two
     /// accumulators.

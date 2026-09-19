@@ -92,7 +92,7 @@ pub(crate) use super::*;
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
-    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
+    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, unit_measure_deviance_and_log_kernel_from_eta, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
     use crate::estimate::EstimationError;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use approx::assert_relative_eq;
@@ -369,8 +369,8 @@ mod tests {
             | LinkFunction::Sas
             | LinkFunction::BetaLogistic
             | LinkFunction::Log => 1.0,
-            LinkFunction::Inverse | LinkFunction::InverseSquared => {
-                panic!("calculate_scale has no residual scale for the reciprocal links")
+            LinkFunction::Inverse | LinkFunction::InverseSquared | LinkFunction::Sqrt => {
+                panic!("calculate_scale has no residual scale for the reciprocal and sqrt links")
             }
             LinkFunction::Identity => {
                 let mut fitted = x.dot(beta);
@@ -940,7 +940,7 @@ mod tests {
         };
         let beta = array![1.0, 2.0];
         let grad = array![0.0, 0.0];
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
         assert!(diag.primal_feasibility <= 1e-12);
         assert!(diag.dual_feasibility <= 1e-12);
         assert!(diag.complementarity <= 1e-12);
@@ -955,7 +955,7 @@ mod tests {
         };
         let beta = array![0.0, 1.5];
         let grad = array![2.0, 0.0];
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
         assert_eq!(diag.n_constraints, 2);
         assert_eq!(diag.n_active, 1);
         assert!(diag.primal_feasibility <= 1e-12);
@@ -1004,7 +1004,7 @@ mod tests {
         let lambda_true = array![1.0, 0.5, 2.0];
         let grad = constraints.a.t().dot(&lambda_true);
 
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
 
         assert_eq!(diag.n_constraints, 3);
         assert_eq!(
@@ -1108,7 +1108,7 @@ mod tests {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
         let beta =
-            default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view(), None, None);
+            default_beta_guess_external(3, &ResponseFamily::Binomial, LinkFunction::Logit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
         let expected = (prevalence / (1.0 - prevalence)).ln();
         assert!((beta[0] - expected).abs() < 1e-12);
@@ -1121,7 +1121,7 @@ mod tests {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
         let beta =
-            default_beta_guess_external(3, LinkFunction::Probit, y.view(), w.view(), None, None);
+            default_beta_guess_external(3, &ResponseFamily::Binomial, LinkFunction::Probit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
         let log_odds = (prevalence / (1.0 - prevalence)).ln();
         let expected =
@@ -1143,6 +1143,9 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
+        // The dense route never counts the design's nonzeros, and says so.
+        assert_eq!(decision.nnz_x, None);
+        assert!(decision.format_fields(decision.path_str()).contains("nnz_x=na"));
     }
 
     #[test]
@@ -1166,7 +1169,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 300);
+        assert_eq!(decision.nnz_x, Some(300));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(300));
         assert_eq!(decision.nnz_h_est, Some(300));
         assert!(decision.density_h_est.expect("density") < 0.01);
@@ -1183,7 +1186,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 64);
+        assert_eq!(decision.nnz_x, Some(64));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(64));
         assert_eq!(decision.nnz_h_est, Some(64));
         assert!(decision.density_h_est.expect("density") < 0.05);
@@ -2253,6 +2256,74 @@ mod tests {
         assert_eq!(data_kernel, -0.5 * raw_weighted_rss / phi);
     }
 
+    #[test]
+    fn unit_measure_single_pass_objective_is_bit_identical_to_the_two_pass_objective() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(2_026_091_9);
+        let n = 4096usize;
+        let eta = Array1::from_iter((0..n).map(|_| -6.0 + 8.0 * rng.random::<f64>()));
+        let bernoulli_y = eta.mapv(|e| {
+            let p = 1.0 / (1.0 + (-e).exp());
+            if rng.random::<f64>() < p { 1.0 } else { 0.0 }
+        });
+        let bernoulli_w = Array1::from_iter((0..n).map(|i| if i % 97 == 0 { 0.0 } else { 1.0 }));
+        let trials = Array1::from_iter((0..n).map(|i| (1 + i % 9) as f64));
+        let trials_y = Array1::from_iter(
+            (0..n).map(|i| (rng.random::<f64>() * (trials[i] + 1.0)).floor().min(trials[i]) / trials[i]),
+        );
+        let poisson_eta = eta.mapv(|e| 0.25 * e);
+        let poisson_y = poisson_eta.mapv(|e| (rng.random::<f64>() * 2.0 * e.exp()).floor());
+        let poisson_w = Array1::from_iter((0..n).map(|_| 0.5 + rng.random::<f64>()));
+
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        let log = InverseLink::Standard(StandardLink::Log);
+        let binomial = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            logit.clone(),
+        ));
+        let poisson = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            log.clone(),
+        ));
+        let cases = [
+            ("bernoulli", &binomial, &logit, &bernoulli_y, &eta, &bernoulli_w),
+            ("binomial trials", &binomial, &logit, &trials_y, &eta, &trials),
+            ("poisson", &poisson, &log, &poisson_y, &poisson_eta, &poisson_w),
+        ];
+        for (label, likelihood, link, y, eta, w) in cases {
+            let deviance =
+                calculate_deviance_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("two-pass deviance");
+            let log_kernel =
+                pirls_data_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view(), deviance)
+                    .expect("two-pass data log-kernel");
+            let (fused_deviance, fused_log_kernel) =
+                unit_measure_deviance_and_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("single-pass objective")
+                    .expect("unit-measure family takes the single pass");
+            assert_eq!(fused_deviance.to_bits(), deviance.to_bits(), "{label} deviance");
+            assert_eq!(fused_log_kernel.to_bits(), log_kernel.to_bits(), "{label} log-kernel");
+        }
+
+        let profiled_gaussian = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ));
+        assert!(
+            unit_measure_deviance_and_log_kernel_from_eta(
+                poisson_y.view(),
+                &poisson_eta,
+                &profiled_gaussian,
+                &profiled_gaussian.spec.link,
+                poisson_w.view(),
+            )
+            .expect("profiled Gaussian is declined, not rejected")
+            .is_none()
+        );
+    }
+
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must
     /// report the conventional **unscaled** deviance `D = 2·Σ wᵢ·d(yᵢ, μᵢ)` —
     /// exactly like Poisson/Binomial/NB/Beta and R/mgcv/statsmodels — and must
@@ -2571,10 +2642,10 @@ mod tests {
         );
     }
 
-    #[test]
-    pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
-        let x = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
-        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+    /// Intercept-only Gamma PIRLS fit under `link`: returns the fitted shape,
+    /// the shape re-profiled at the converged η, and the fitted mean.
+    fn intercept_only_gamma_fit(link: StandardLink, y: &Array1<f64>) -> (f64, f64, f64) {
+        let x = Array2::<f64>::ones((y.len(), 1));
         let w = Array1::ones(y.len());
         let offset = Array1::zeros(y.len());
         let rho = array![0.0];
@@ -2598,9 +2669,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(StandardLink::Log),
+                InverseLink::Standard(link),
             )),
-            link_kind: InverseLink::Standard(StandardLink::Log),
+            link_kind: InverseLink::Standard(link),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -2635,10 +2706,26 @@ mod tests {
             .likelihood
             .gamma_shape()
             .expect("gamma fit should expose fitted shape");
-        let profiled_shape =
-            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta.to_owned(), w.view())
-                .expect("converged Gamma shape must be representable");
+        let profiled_shape = super::estimate_gamma_shape_from_eta(
+            &result.likelihood.spec.link,
+            y.view(),
+            &result.final_eta.to_owned(),
+            w.view(),
+        )
+        .expect("converged Gamma shape must be representable");
+        let eta = result.final_eta[0];
+        let mean = match link {
+            StandardLink::Log => eta.exp(),
+            StandardLink::Inverse => eta.recip(),
+            other => panic!("not a Gamma link: {other:?}"),
+        };
+        (fitted_shape, profiled_shape, mean)
+    }
 
+    #[test]
+    pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
+        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+        let (fitted_shape, profiled_shape, _) = intercept_only_gamma_fit(StandardLink::Log, &y);
         assert!(fitted_shape > 1.0, "shape should not stay fixed at one");
         assert_relative_eq!(
             fitted_shape,
@@ -2646,6 +2733,106 @@ mod tests {
             epsilon = 1e-10,
             max_relative = 1e-10
         );
+    }
+
+    /// The shape MLE reads μ through the fit's own link. An intercept-only fit
+    /// has μ̂ = ȳ under every link, so the inverse-link shape must equal the
+    /// log-link one; reading μ = exp(η) at the inverse-link η = 1/ȳ instead
+    /// profiled the shape against the wrong mean (the fuzzer's gamma(inverse)
+    /// cells reported φ ≈ 1.5 on data drawn at φ = 1/3).
+    #[test]
+    pub(crate) fn gamma_inverse_fit_profiles_shape_on_its_own_link() {
+        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+        let ybar = y.mean().expect("nonempty response");
+        let (log_shape, _, log_mean) = intercept_only_gamma_fit(StandardLink::Log, &y);
+        let (inv_shape, inv_profiled, inv_mean) =
+            intercept_only_gamma_fit(StandardLink::Inverse, &y);
+        assert_relative_eq!(log_mean, ybar, max_relative = 1e-8);
+        assert_relative_eq!(inv_mean, ybar, max_relative = 1e-8);
+        assert_relative_eq!(inv_shape, inv_profiled, epsilon = 1e-10, max_relative = 1e-10);
+        assert_relative_eq!(inv_shape, log_shape, max_relative = 1e-6);
+    }
+
+    /// Identity-Poisson with a group whose counts are all zero: the likelihood
+    /// increases without bound as that group's mean falls to zero, so the
+    /// maximum sits on the boundary `eta = 0` of the identity link's
+    /// feasibility set. Fisher curvature `1/mu` diverges there, so the Newton
+    /// decrement collapses while the gradient does not; P-IRLS must return the
+    /// typed boundary error instead of certifying the edge as converged.
+    #[test]
+    fn identity_poisson_boundary_optimum_is_a_typed_error() {
+        let n = 40;
+        let mut x = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            x[[i, 0]] = 1.0;
+            if i >= n / 2 {
+                x[[i, 1]] = 1.0;
+                y[i] = [3.0, 5.0, 6.0, 4.0, 7.0][i % 5];
+            }
+        }
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0];
+        let root = array![[0.0, 0.0]];
+        let canonical = vec![gam_terms::construction::CanonicalPenalty {
+            local: root.t().dot(&root).into_shared(),
+            root: root.into_shared(),
+            col_range: 0..2,
+            total_dim: 2,
+            nullity: 2,
+            prior_mean: Array1::zeros(2),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }];
+        let link = InverseLink::Standard(StandardLink::Identity);
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                link.clone(),
+            )),
+            link_kind: link,
+            max_iterations: 200,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+        };
+
+        let err = fit_model_for_fixed_rho(
+            LogSmoothingParamsView::new(rho.view())
+                .expect("test rho lies in exact strength domain"),
+            PirlsProblem {
+                x: x.view(),
+                offset: offset.view(),
+                y: y.view(),
+                priorweights: w.view(),
+                covariate_se: None,
+                gaussian_fixed_cache: None,
+                glm_first_step_gram: None,
+            },
+            PenaltyConfig {
+                canonical_penalties: &canonical,
+                reparam_invariant: None,
+                p: 2,
+                coefficient_lower_bounds: None,
+                linear_constraints_original: None,
+            },
+            &config,
+            None,
+        )
+        .map(|_| ())
+        .expect_err("a boundary optimum has no interior fit to report");
+        assert!(
+            matches!(
+                err,
+                EstimationError::LinkFeasibilityBoundaryOptimum {
+                    link: "identity",
+                    ..
+                }
+            ),
+            "expected the typed boundary error, got {err:?}"
+        );
+        assert!(err.is_trial_point_infeasible());
     }
 
     #[test]
@@ -3551,19 +3738,8 @@ mod root_cause_tests {
         assert!(kkt.stationarity <= 1e-12);
     }
 
-    /// The user's large-scale pathological case: a fit with `n=320000`,
-    /// `p=20`, projected stationarity residual `‖g‖ = 1.465e-5`. The old
-    /// absolute test `‖g‖ < 1e-6` rejects this as non-converged, even
-    /// though the normalized residual is ~2.6e-8. After the fix, the
-    /// scale-invariant certificate accepts it under EITHER bound.
-    #[test]
-    pub(crate) fn certifies_kkt_accepts_large_scale_pathological_case() {
-        let n = 320_000usize;
-        let p = 20usize;
-        let g_norm = 1.465e-5;
-        let tol = 1e-6;
-
-        let state = WorkingState {
+    fn certificate_state(n: usize, p: usize, natural_scale: f64) -> WorkingState {
+        WorkingState {
             eta: LinearPredictor::new(Array1::zeros(n)),
             gradient: Array1::zeros(p),
             hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
@@ -3573,19 +3749,20 @@ mod root_cause_tests {
             penalty_term: 0.0,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            // At convergence the score and penalty gradient nearly cancel;
-            // both are O(√n) for standardized columns. Use a representative
-            // magnitude so the natural-scale bound has something to chew on.
-            gradient_natural_scale: 1.0e3,
-        };
+            gradient_natural_scale: natural_scale,
+        }
+    }
 
-        // Dimension-based bound: tol * sqrt(n) * sqrt(p) ≈ 1e-6 * 565.7 * 4.47 ≈ 2.5e-3
-        // Natural-scale bound: 1.465e-5 / (1 + 1e3) ≈ 1.5e-8
-        // Both pass; old absolute test 1.465e-5 < 1e-6 fails.
-        assert!(
-            state.certifies_kkt(g_norm, tol),
-            "scale-invariant certificate should accept large-scale pathological case"
-        );
+    /// The large-scale case: `n=320000`, `p=20`, projected stationarity
+    /// residual `‖g‖ = 1.465e-5` on a natural scale of `1e3`. An absolute
+    /// test `‖g‖ < 1e-6` rejects it, though its dimensionless residual is
+    /// `1.5e-8`; the certificate accepts it.
+    #[test]
+    pub(crate) fn certifies_kkt_accepts_large_scale_pathological_case() {
+        let g_norm = 1.465e-5;
+        let tol = 1e-6;
+        let state = certificate_state(320_000, 20, 1.0e3);
+        assert!(state.certifies_kkt(g_norm, tol));
         assert!(
             !(g_norm < tol),
             "this test must witness the failure of the old absolute test; \
@@ -3593,113 +3770,67 @@ mod root_cause_tests {
         );
     }
 
-    /// The strict KKT certificate must be invariant under uniform rescaling
-    /// of the objective `F → c·F` (which scales `‖g‖`, `‖score‖`, and
-    /// `‖S·β‖` all by the same `c`). The additive `1` floor in the
-    /// natural-scale denominator makes the test approximately invariant
-    /// at small natural scale and exactly invariant in the limit.
+    /// The certificate is exactly invariant under a uniform rescaling of the
+    /// gradient (`F → c·F`, or `β → β/c`), which scales `‖g‖`, `‖score‖` and
+    /// `‖S·β‖` together, at EVERY natural scale — not only once the natural
+    /// scale dominates an additive floor.
     #[test]
     pub(crate) fn certifies_kkt_is_scale_invariant() {
-        let n = 1000usize;
-        let p = 10usize;
-        let tol = 1e-6;
-        let g_norm = 1.0;
-        let natural_scale = 5.0e6; // dominates the +1 floor
-
-        let mk_state = |g: Array1<f64>, ns: f64| WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: g,
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: ns,
-        };
-
-        let base = mk_state(Array1::zeros(p), natural_scale);
-        let scaled = mk_state(Array1::zeros(p), natural_scale * 1000.0);
-
-        // Numerator scales by c; denominator scales by c when the natural
-        // scale dominates. So r_g is invariant.
-        assert_eq!(
-            base.certifies_kkt(g_norm, tol),
-            scaled.certifies_kkt(g_norm * 1000.0, tol),
-            "KKT classification must be invariant under uniform F → c·F"
-        );
+        let tol = 1e-8;
+        for natural_scale in [1.0e-5, 1.0, 5.0e6] {
+            for residual in [1.0e-10, 1.0e-6] {
+                let g_norm = residual * natural_scale;
+                let verdict = certificate_state(1000, 10, natural_scale).certifies_kkt(g_norm, tol);
+                assert_eq!(verdict, residual < tol);
+                for c in [1.0e-6, 1.0e6] {
+                    assert_eq!(
+                        certificate_state(1000, 10, natural_scale * c).certifies_kkt(g_norm * c, tol),
+                        verdict,
+                        "KKT classification must be invariant under g → c·g (scale {natural_scale:e}, c {c:e})"
+                    );
+                }
+            }
+        }
     }
 
-    /// The two scale-invariant certificates must each be sufficient on its
-    /// own (acceptance under EITHER suffices). One is data-driven (natural
-    /// scale), the other purely structural (sqrt(n)·sqrt(p)). Both should
-    /// accept obviously-converged states; failures of one should not block
-    /// the other.
+    /// The canonical inverse-Gaussian inner solve at a small-unit response:
+    /// P-IRLS stopped at `‖g‖ = 4.72e-12` on a natural scale of order `1e-5`,
+    /// two steps into a solve whose mode (the same data at ten times the
+    /// units) sits nine steps away. The dimension bound `τ·√n·√p` and the
+    /// additive `1 +` floor both read that residual in the gradient's own
+    /// units and certified it; its dimensionless residual `4.7e-7` is far
+    /// above `τ` and must not certify.
     #[test]
-    pub(crate) fn certifies_kkt_accepts_under_either_bound() {
-        let n = 100usize;
-        let p = 5usize;
-        let tol = 1e-6;
-
-        let state_well_scaled = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 1.0e6,
-        };
-        // Natural-scale bound: 1.0 / (1+1e6) ≈ 1e-6 → at threshold; pass.
-        // Dimension bound: 1.0 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.2e-5 → fail.
-        // Acceptance under EITHER: pass (via natural-scale).
-        assert!(state_well_scaled.certifies_kkt(0.99e-6 * (1.0 + 1.0e6), tol));
-
-        let state_unscaled = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 0.0,
-        };
-        // Natural-scale bound: 2e-6 / 1 = 2e-6 → fail (above tol=1e-6).
-        // Dimension bound: 2e-6 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.236e-5 → pass.
-        // Acceptance under EITHER: pass (via dimension).
-        assert!(state_unscaled.certifies_kkt(2.0e-6, tol));
+    pub(crate) fn certifies_kkt_refuses_small_unit_residual_far_from_mode() {
+        let tol = 1e-10;
+        let state = certificate_state(500, 23, 1.0e-5);
+        assert!(!state.certifies_kkt(4.72e-12, tol));
+        assert!(!state.near_stationary_kkt(4.72e-12, tol));
+        assert!(state.certifies_kkt(4.72e-12 * 1.0e-4, tol));
     }
 
-    /// The near-stationary band is exactly 10× the strict KKT tolerance,
-    /// applied under either bound. It classifies a usable but non-strictly
+    /// An exactly zero residual is stationary on any natural scale, zero
+    /// included; a nonzero residual on a zero natural scale is not resolved by
+    /// the ratio and is left to the exact Newton decrement.
+    #[test]
+    pub(crate) fn certifies_kkt_on_zero_natural_scale() {
+        let tol = 1e-6;
+        let state = certificate_state(100, 5, 0.0);
+        assert!(state.certifies_kkt(0.0, tol));
+        assert!(state.near_stationary_kkt(0.0, tol));
+        assert!(!state.certifies_kkt(2.0e-6, tol));
+        assert!(!state.near_stationary_kkt(2.0e-6, tol));
+    }
+
+    /// The near-stationary band is exactly 10× the strict KKT tolerance on the
+    /// same dimensionless residual. It classifies a usable but non-strictly
     /// converged minimum as `StalledAtValidMinimum` rather than as a hard
     /// non-convergence.
     #[test]
     pub(crate) fn near_stationary_kkt_uses_ten_times_band() {
-        let n = 100usize;
-        let p = 4usize;
         let tol = 1e-6;
-        let state = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 99.0,
-        };
-        // Natural-scale band: relative ‖g‖ = g/(1+99) = g/100 ≤ 10·tol = 1e-5
-        // ⇒ accept when g ≤ 1e-3.
+        let state = certificate_state(100, 4, 100.0);
+        // Relative ‖g‖ = g/100 ≤ 10·tol = 1e-5 ⇒ accept when g ≤ 1e-3.
         assert!(state.near_stationary_kkt(9.9e-4, tol));
         assert!(!state.near_stationary_kkt(2.0e-3, tol));
         // Strict KKT at the same point should be ~10× tighter.
@@ -4336,6 +4467,143 @@ mod root_cause_tests {
             });
             assert_deviance_monotone(&trace, &format!("Logistic(seed={})", seed));
         }
+    }
+
+    pub(crate) fn capture_pirls_lm_attempts<F, R>(run: F) -> (R, usize)
+    where
+        F: FnOnce() -> R,
+    {
+        super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT.with(|count| count.set(Some(0)));
+        let result = run();
+        let attempts = super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT
+            .with(|count| count.take())
+            .unwrap();
+        (result, attempts)
+    }
+
+    /// Rare-event logistic cold start (pyGAM audit F18). A ~3%-prevalence
+    /// response whose log-odds rise steeply with a skewed covariate (the
+    /// credit-default shape: logit p = −10.65 + 0.0055·balance) makes the
+    /// undamped Newton step from the prevalence-intercept seed overshoot by
+    /// orders of magnitude: it drives η to ≈ +11 on the high-balance rows.
+    /// The Levenberg–Marquardt damping must climb from `u ≈ 1e-16` to O(1)
+    /// before a trial is accepted. The geometric reject schedule alone
+    /// (×2, ×4, ×8, …) needs ~11 trials to cross those 16 decades, each
+    /// re-solving a step the tiny damping leaves unchanged. Moré's
+    /// interpolated rejection update takes the damping to the radius the
+    /// rejected trial indicates in one or two trials. This pins the cost in
+    /// LM attempts (damped solves plus trial evaluations), not wall clock.
+    #[test]
+    pub(crate) fn rare_event_logistic_cold_start_reaches_damping_in_few_trials() {
+        let n = 4000;
+        let n_basis = 10;
+        let mut rng_state: u64 = 0x5EED_F18_0000_0001;
+        let mut uniform = || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((rng_state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
+        };
+        let mut balance = Vec::with_capacity(n);
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            // Box–Muller N(835, 480), truncated at zero like a card balance.
+            let (u1, u2) = (uniform(), uniform());
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let b = (835.0 + 480.0 * z).max(0.0);
+            let p = 1.0 / (1.0 + (10.65 - 0.0055 * b).exp());
+            y[i] = if uniform() < p { 1.0 } else { 0.0 };
+            balance.push(b);
+        }
+        let positives: f64 = y.sum();
+        assert!(
+            positives > 0.01 * n as f64 && positives < 0.08 * n as f64,
+            "fixture must be rare-event, got {positives} positives of {n}"
+        );
+        // Intercept plus a hat-function (linear B-spline) basis on the
+        // covariate range, with a second-difference penalty on the hats.
+        let (lo, hi) = balance
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &b| {
+                (lo.min(b), hi.max(b))
+            });
+        let h = (hi - lo) / (n_basis - 1) as f64;
+        let p = n_basis + 1;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for (i, &b) in balance.iter().enumerate() {
+            x[[i, 0]] = 1.0;
+            for k in 0..n_basis {
+                let knot = lo + k as f64 * h;
+                x[[i, k + 1]] = (1.0 - ((b - knot) / h).abs()).max(0.0);
+            }
+        }
+        let mut root = Array2::<f64>::zeros((n_basis - 2, p));
+        for r in 0..n_basis - 2 {
+            root[[r, r + 1]] = 1.0;
+            root[[r, r + 2]] = -2.0;
+            root[[r, r + 3]] = 1.0;
+        }
+        let canonical = vec![gam_terms::construction::CanonicalPenalty {
+            local: root.t().dot(&root).into_shared(),
+            root: root.into_shared(),
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 0,
+            prior_mean: Array1::zeros(p),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }];
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+        };
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0];
+        let (result, attempts) = capture_pirls_lm_attempts(|| {
+            fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(rho.view())
+                    .expect("test rho lies in exact strength domain"),
+                PirlsProblem {
+                    x: x.view(),
+                    offset: offset.view(),
+                    y: y.view(),
+                    priorweights: w.view(),
+                    covariate_se: None,
+                    gaussian_fixed_cache: None,
+                    glm_first_step_gram: None,
+                },
+                PenaltyConfig {
+                    canonical_penalties: &canonical,
+                    reparam_invariant: None,
+                    p,
+                    coefficient_lower_bounds: None,
+                    linear_constraints_original: None,
+                },
+                &config,
+                None,
+            )
+        });
+        let (_, working) = result.expect("rare-event logistic P-IRLS fit should succeed");
+        assert_eq!(working.status, PirlsStatus::Converged);
+        // Every attempt beyond one per iteration is a rejected trial. The
+        // geometric schedule alone spent 10 rejections (21 attempts over 11
+        // iterations) climbing from `u` to the accepted damping; the
+        // interpolated update needs 2.
+        let rejected = attempts.saturating_sub(working.iterations);
+        assert!(
+            rejected <= 3,
+            "rare-event cold start spent {rejected} rejected LM trials \
+             ({attempts} attempts over {} iterations)",
+            working.iterations
+        );
     }
 
     #[test]

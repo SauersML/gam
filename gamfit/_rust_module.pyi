@@ -20,8 +20,6 @@ from . import _rust
 
 class RustModule(Protocol):
     ARDPenalty: type[_rust.ARDPenalty]
-    AloError: type[_rust.AloError]
-    ArrowSchurError: type[_rust.ArrowSchurError]
     AtomBirthGate: type[_rust.AtomBirthGate]
     AtomCore: type[_rust.AtomCore]
     AuxConditionalPriorPenalty: type[_rust.AuxConditionalPriorPenalty]
@@ -29,65 +27,49 @@ class RustModule(Protocol):
     BlockOrthogonalityPenalty: type[_rust.BlockOrthogonalityPenalty]
     BlockSparseDictStream: type[_rust.BlockSparseDictStream]
     BlockSparsityPenalty: type[_rust.BlockSparsityPenalty]
-    CacheStoreError: type[_rust.CacheStoreError]
     CalibratorError: type[_rust.CalibratorError]
     CircleManifold: type[_rust.CircleManifold]
     ColumnNotFoundError: type[_rust.ColumnNotFoundError]
-    CorrectedCovarianceError: type[_rust.CorrectedCovarianceError]
-    CubicCellKernelError: type[_rust.CubicCellKernelError]
-    CustomFamilyError: type[_rust.CustomFamilyError]
+    ConvergenceError: type[_rust.ConvergenceError]
     DataError: type[_rust.DataError]
-    DeviationRuntimeError: type[_rust.DeviationRuntimeError]
     DictionaryConvergenceError: type[_rust.DictionaryConvergenceError]
     EigendecompositionError: type[_rust.EigendecompositionError]
     EuclideanManifold: type[_rust.EuclideanManifold]
     FitConvergenceError: type[_rust.FitConvergenceError]
-    FitError: type[_rust.FitError]
     FitInputError: type[_rust.FitInputError]
     FitInvariantError: type[_rust.FitInvariantError]
     FitNumericalError: type[_rust.FitNumericalError]
     FitSeedError: type[_rust.FitSeedError]
-    FittedModelError: type[_rust.FittedModelError]
     FittedTransport: type[_rust.FittedTransport]
     FormulaError: type[_rust.FormulaError]
-    GamError: type[_rust.GamError]
-    GamlssError: type[_rust.GamlssError]
+    GamfitError: type[_rust.GamfitError]
     GeometryError: type[_rust.GeometryError]
-    GpuError: type[_rust.GpuError]
     GradientUnavailableError: type[_rust.GradientUnavailableError]
     GrassmannManifold: type[_rust.GrassmannManifold]
     HessianNotPositiveDefiniteError: type[_rust.HessianNotPositiveDefiniteError]
-    HmcError: type[_rust.HmcError]
-    IdentifiabilityCompilerError: type[_rust.IdentifiabilityCompilerError]
     IllConditionedError: type[_rust.IllConditionedError]
     InnerModeConvergenceError: type[_rust.InnerModeConvergenceError]
     IntegrationError: type[_rust.IntegrationError]
+    InternalError: type[_rust.InternalError]
     InvalidConfigurationError: type[_rust.InvalidConfigurationError]
     InvalidInputError: type[_rust.InvalidInputError]
     InvalidSpecificationError: type[_rust.InvalidSpecificationError]
     IsometryPenalty: type[_rust.IsometryPenalty]
     IvaeRidgeMeanGauge: type[_rust.IvaeRidgeMeanGauge]
-    JointPenaltyError: type[_rust.JointPenaltyError]
-    LatentSurvivalError: type[_rust.LatentSurvivalError]
     LayoutError: type[_rust.LayoutError]
-    LinearAlgebraError: type[_rust.LinearAlgebraError]
     LinearSystemSolveError: type[_rust.LinearSystemSolveError]
-    LognormalKernelError: type[_rust.LognormalKernelError]
     ManifoldBehaviorCore: type[_rust.ManifoldBehaviorCore]
     ManifoldCrosscoderCore: type[_rust.ManifoldCrosscoderCore]
     ManifoldSAE: type[_rust.ManifoldSAE]
     ManifoldSAESupport: type[_rust.ManifoldSAESupport]
-    MapUniquenessError: type[_rust.MapUniquenessError]
-    MatrixError: type[_rust.MatrixError]
-    MatrixMaterializationError: type[_rust.MatrixMaterializationError]
     MechanismSparsityPenalty: type[_rust.MechanismSparsityPenalty]
     MissingDependencyError: type[_rust.MissingDependencyError]
     ModelOverparameterizedError: type[_rust.ModelOverparameterizedError]
     MonotoneRootError: type[_rust.MonotoneRootError]
+    NotFittedError: type[_rust.NotFittedError]
     NuclearNormPenalty: type[_rust.NuclearNormPenalty]
     OrderedBetaBernoulliPenalty: type[_rust.OrderedBetaBernoulliPenalty]
     OrthogonalityPenalty: type[_rust.OrthogonalityPenalty]
-    OuterStrategyError: type[_rust.OuterStrategyError]
     ParameterConstraintError: type[_rust.ParameterConstraintError]
     ParametricAuxConditionalPriorPenalty: type[_rust.ParametricAuxConditionalPriorPenalty]
     PenaltySpectrumError: type[_rust.PenaltySpectrumError]
@@ -99,10 +81,8 @@ class RustModule(Protocol):
     RESPONSE_GEOMETRY_SCHEMA: str
     RemlConvergenceError: type[_rust.RemlConvergenceError]
     ScadMcpPenalty: type[_rust.ScadMcpPenalty]
-    ScaleDesignError: type[_rust.ScaleDesignError]
     SchemaMismatchError: type[_rust.SchemaMismatchError]
     SheafConsistencyPenalty: type[_rust.SheafConsistencyPenalty]
-    SmoothError: type[_rust.SmoothError]
     SmoothThresholdPenalty: type[_rust.SmoothThresholdPenalty]
     SoftmaxAssignmentSparsityPenalty: type[_rust.SoftmaxAssignmentSparsityPenalty]
     SparseDictStream: type[_rust.SparseDictStream]
@@ -110,18 +90,10 @@ class RustModule(Protocol):
     SpdManifold: type[_rust.SpdManifold]
     SphereManifold: type[_rust.SphereManifold]
     StiefelManifold: type[_rust.StiefelManifold]
-    SurvivalConstructionError: type[_rust.SurvivalConstructionError]
-    SurvivalError: type[_rust.SurvivalError]
-    SurvivalLocationScaleError: type[_rust.SurvivalLocationScaleError]
-    SurvivalMarginalSlopeError: type[_rust.SurvivalMarginalSlopeError]
-    SurvivalPredictError: type[_rust.SurvivalPredictError]
-    TermBuilderError: type[_rust.TermBuilderError]
     Tier0SAE: type[_rust.Tier0SAE]
     TopKActivationPenalty: type[_rust.TopKActivationPenalty]
     TorusManifold: type[_rust.TorusManifold]
     TotalVariationPenalty: type[_rust.TotalVariationPenalty]
-    TransformationNormalError: type[_rust.TransformationNormalError]
-    UnsupportedLinkError: type[_rust.UnsupportedLinkError]
     _EncodedTable: type[_rust._EncodedTable]
     _EventHistoryModel: type[_rust._EventHistoryModel]
     _FittedModel: type[_rust._FittedModel]
@@ -416,6 +388,8 @@ class RustModule(Protocol):
     def is_multinomial_family_name(family: str) -> bool: ...
     @staticmethod
     def label_shuffle_permutation(n_rows: int, seed: int, draw: int) -> NDArray[np.uint64]: ...
+    @staticmethod
+    def latent_conditional_residual_table(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable) -> NDArray[np.float64] | None: ...
     @staticmethod
     def lawley_bartlett_factor(design: NDArray[np.float64], family: str, eta: NDArray[np.float64], tested_start: int, tested_end: int, ref_df: float, penalty: NDArray[np.float64] | None = ..., dispersion: float = ..., prior_weights: NDArray[np.float64] | None = ..., lr_statistic: float | None = ...) -> dict[Any, Any]: ...
     @staticmethod
@@ -822,10 +796,6 @@ class RustModule(Protocol):
     def transformation_score_table(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable) -> NDArray[np.float64]: ...
     @staticmethod
     def validate_formula_json(headers: Sequence[str], rows: _rust._EncodedTable, formula: str, config_json: str | None) -> str: ...
-    @staticmethod
-    def vec_to_array1_f64(values: Sequence[float]) -> NDArray[np.float64]: ...
-    @staticmethod
-    def weighted_auc_from_predictions(observed: Sequence[float], predicted_mean: Sequence[float], weights: Sequence[float]) -> float: ...
     @staticmethod
     def weighted_sum_to_zero_transform(basis: NDArray[np.float64], weights: NDArray[np.float64] | None = ...) -> NDArray[np.float64]: ...
     @staticmethod

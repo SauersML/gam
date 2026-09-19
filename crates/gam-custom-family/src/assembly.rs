@@ -430,7 +430,6 @@ pub(crate) fn unified_joint_cost_gradient(
         gam_problem::HessianValue,
         [f64; 4],
         Option<Array2<f64>>,
-        Option<Array2<f64>>,
     ),
     CustomFamilyError,
 > {
@@ -517,7 +516,6 @@ pub(crate) fn unified_joint_cost_gradient(
 
     let hessian = result.hessian;
     let ext_mode_response_cols = result.ext_mode_response_cols;
-    let rho_mode_response_cols = result.rho_mode_response_cols;
 
     Ok((
         cost,
@@ -525,7 +523,6 @@ pub(crate) fn unified_joint_cost_gradient(
         hessian,
         criterion_components,
         ext_mode_response_cols,
-        rho_mode_response_cols,
     ))
 }
 
@@ -1573,14 +1570,8 @@ pub(crate) fn joint_outer_evaluate(
     } else {
         None
     };
-    let (
-        objective,
-        grad,
-        outer_hessian,
-        criterion_components,
-        ext_mode_response_cols,
-        rho_mode_response_cols,
-    ) = unified_joint_cost_gradient(
+    let (objective, grad, outer_hessian, criterion_components, ext_mode_response_cols) =
+        unified_joint_cost_gradient(
             inner,
             specs,
             per_block,
@@ -1681,10 +1672,7 @@ pub(crate) fn joint_outer_evaluate(
             .map(|st| st.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
-        cached_inner: Some(CachedInnerMode {
-            rho_mode_responses: rho_mode_response_cols.map(Arc::new),
-            ..cached_inner_mode_from_result(inner)
-        }),
+        cached_inner: Some(cached_inner_mode_from_result(inner)),
     };
 
     Ok(OuterObjectiveEvalResult {
@@ -2907,15 +2895,14 @@ pub(crate) struct CachedInnerMode {
     pub(crate) converged: bool,
     pub(crate) block_logdet_h: Option<f64>,
     pub(crate) block_logdet_s: Option<f64>,
-    pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    // No joint Hessian workspace (#2996): a warm start keeps only arrays. The
+    // reuse path re-certifies the cached mode and takes the certificate's
+    // fresh workspace, so a filed workspace was never read, but it pinned an
+    // n-row cache per warm-start carrier past the exact-cache store's bound.
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
     pub(crate) terminal_working_sets: Option<Vec<BlockWorkingSet>>,
     pub(crate) terminal_likelihood_score: Option<TerminalLikelihoodScore>,
-    /// The mode's IFT tangent, `v_k = H⁻¹ a_k` per penalty coordinate (the per-block
-    /// log-λ's, then the joint penalties), when the evaluation that filed it formed them:
-    /// `dβ̂/dρ_k = −v_k`. A branch continuation predicts from it (gam#2973).
-    pub(crate) rho_mode_responses: Option<Arc<Array2<f64>>>,
     /// The smoothing state this cached mode was solved at (#2615). A lookup
     /// compares against this, not against a key rebuilt from the caller's
     /// coordinates.
