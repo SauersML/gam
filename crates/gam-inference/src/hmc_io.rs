@@ -26,7 +26,7 @@
 use crate::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerEigh, fast_ab, fast_ata_into, fast_atv, fast_av, fast_av_into,
+    FaerCholesky, fast_ab, fast_ata_into, fast_atv, fast_av, fast_av_into,
 };
 use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
@@ -1125,7 +1125,7 @@ mod tests {
         }
     }
 
-    use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
+    use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
     use gam_problem::types::{GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization, ResponseFamily, StandardLink};
@@ -1138,6 +1138,27 @@ mod tests {
     use gam_solve::model_types::InferenceCovarianceMode;
     use ndarray::{Array1, Array2, Axis, array};
     use std::sync::Arc;
+
+    /// The diagnostic along the eigenpairs of an assembled Hessian.
+    fn laplace_directional_cubic_diagnostic(
+        hessian: &Array2<f64>,
+        design: &DesignMatrix,
+        c_weights: &Array1<f64>,
+        refine_supremum: bool,
+    ) -> Result<(f64, Array1<f64>), String> {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let sym_h = (hessian + &hessian.t()) * 0.5;
+        let (evals, evecs) = sym_h
+            .eigh(faer::Side::Lower)
+            .map_err(|e| format!("directional cubic diagnostic eigendecomposition failed: {e}"))?;
+        laplace_directional_cubic_diagnostic_on_eigenpairs(
+            &evals,
+            &evecs,
+            design,
+            c_weights,
+            refine_supremum,
+        )
+    }
 
     #[test]
     fn posterior_interval_uses_shared_linear_quantiles() {
@@ -3267,12 +3288,19 @@ mod tests {
     impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector for RecordingCorrector {
         fn directional_cubic_diagnostic(
             &self,
-            hessian: &Array2<f64>,
+            eigenvalues: &Array1<f64>,
+            eigenvectors: &Array2<f64>,
             design: &DesignMatrix,
             c_weights: &Array1<f64>,
             refine_supremum: bool,
         ) -> Result<(f64, Array1<f64>), String> {
-            laplace_directional_cubic_diagnostic(hessian, design, c_weights, refine_supremum)
+            super::laplace_directional_cubic_diagnostic_on_eigenpairs(
+                eigenvalues,
+                eigenvectors,
+                design,
+                c_weights,
+                refine_supremum,
+            )
         }
         fn block_quadrature_marginal_correction(
             &self,
@@ -3356,16 +3384,18 @@ mod tests {
     impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector for ScriptedCorrector {
         fn directional_cubic_diagnostic(
             &self,
-            hessian: &Array2<f64>,
+            eigenvalues: &Array1<f64>,
+            eigenvectors: &Array2<f64>,
             design: &DesignMatrix,
             c_weights: &Array1<f64>,
             refine_supremum: bool,
         ) -> Result<(f64, Array1<f64>), String> {
             Err(format!(
-                "the scripted corrector has no diagnostic ({}x{} Hessian, {} rows, {} weights, \
-                 refine={refine_supremum})",
-                hessian.nrows(),
-                hessian.ncols(),
+                "the scripted corrector has no diagnostic ({} eigenvalues, {}x{} eigenvectors, \
+                 {} rows, {} weights, refine={refine_supremum})",
+                eigenvalues.len(),
+                eigenvectors.nrows(),
+                eigenvectors.ncols(),
                 design.nrows(),
                 c_weights.len()
             ))
@@ -5873,21 +5903,30 @@ pub fn run_nuts_sampling_flattened_family(
 /// passes `false` and skips Phase 2's multi-probe O(probes·iters·np) refinement
 /// on every inner evaluation. Diagnostic callers that report the true supremum
 /// pass `true`.
-pub(crate) fn laplace_directional_cubic_diagnostic(
-    hessian: &Array2<f64>,
+///
+/// The diagnostic runs along caller-supplied eigenpairs
+/// `(eigenvalues[r], eigenvectors[:, r])`, in any order, so the #784
+/// correction prices it on the criterion's own eigensystem. `γ[r]` is aligned
+/// to pair `r`; a pair without resolved positive curvature carries `γ[r] = 0`.
+pub(crate) fn laplace_directional_cubic_diagnostic_on_eigenpairs(
+    evals: &Array1<f64>,
+    evecs: &Array2<f64>,
     design: &DesignMatrix,
     c_weights: &Array1<f64>,
     refine_supremum: bool,
 ) -> Result<(f64, Array1<f64>), String> {
-    let p = hessian.nrows();
-    if p == 0 || hessian.ncols() != p {
+    let p = evals.len();
+    if p == 0 {
         return Ok((0.0, Array1::zeros(0)));
     }
-
-    let sym_h = (hessian + &hessian.t()) * 0.5;
-    let (evals, evecs) = sym_h
-        .eigh(Side::Lower)
-        .map_err(|e| format!("directional cubic diagnostic eigendecomposition failed: {e}"))?;
+    if evecs.dim() != (p, p) {
+        return Err(format!(
+            "directional cubic diagnostic: {} eigenvalues against a {}x{} eigenvector matrix",
+            p,
+            evecs.nrows(),
+            evecs.ncols()
+        ));
+    }
     let max_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
     // An eigenvalue inside the eigensolver band `p·ε·max|λ|` carries no curvature to
     // standardize by.
@@ -6345,12 +6384,19 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
 {
     fn directional_cubic_diagnostic(
         &self,
-        hessian: &Array2<f64>,
+        eigenvalues: &Array1<f64>,
+        eigenvectors: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
         refine_supremum: bool,
     ) -> Result<(f64, Array1<f64>), String> {
-        laplace_directional_cubic_diagnostic(hessian, design, c_weights, refine_supremum)
+        laplace_directional_cubic_diagnostic_on_eigenpairs(
+            eigenvalues,
+            eigenvectors,
+            design,
+            c_weights,
+            refine_supremum,
+        )
     }
 
     fn block_quadrature_marginal_correction(
