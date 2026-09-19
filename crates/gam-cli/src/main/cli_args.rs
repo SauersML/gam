@@ -106,6 +106,9 @@ pub(crate) enum Command {
     Summary(SummaryArgs),
     /// Print a fitted model's per-row residuals on a labeled dataset as JSON.
     Residuals(ResidualsArgs),
+    /// Rank fitted models on their smoothing-corrected AIC and print the
+    /// comparison as JSON.
+    Compare(CompareArgs),
     /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
@@ -550,6 +553,24 @@ pub(crate) struct ResidualsArgs {
         help = "Residual type: response, working, deviance or pearson"
     )]
     pub(crate) kind: gam::solver::pirls::ResidualKind,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CompareArgs {
+    #[arg(
+        value_name = "MODEL",
+        required = true,
+        num_args = 1..,
+        help = "Fitted model files produced by `gam fit`, all on the same data and family"
+    )]
+    pub(crate) models: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        num_args = 1..,
+        help = "One label per model, in order (default: the model paths)"
+    )]
+    pub(crate) names: Option<Vec<String>>,
 }
 
 #[derive(Args, Debug)]

@@ -69,6 +69,78 @@ pub enum LatentConditioningSpan {
     PrimaryDesignTail { ncols: usize },
 }
 
+/// The maps a fit applied to its latent score before any kernel read it: the
+/// saved normalisation, then either the rank-INT calibration an older model
+/// replays or the conditional location-scale calibration
+/// `ζ = (z − m(a))/√v(a)` (#905, gam#2926). A fit mints at most one of the two.
+///
+/// This is the one owner of that composition. The saved marginal-slope predictor
+/// reads its kernel score through it, and so does
+/// `FittedModel::latent_conditional_residual`, which returns ζ for new rows
+/// (gam#3016).
+#[derive(Clone, Copy)]
+pub(crate) struct FittedLatentScoreMap<'a> {
+    pub(crate) normalization: &'a SavedLatentZNormalization,
+    pub(crate) rank_int: Option<&'a LatentZRankIntCalibration>,
+    pub(crate) conditional: Option<&'a LatentZConditionalCalibration>,
+    /// Where `primary_design` carries the conditioning span `a`.
+    pub(crate) span: LatentConditioningSpan,
+}
+
+impl FittedLatentScoreMap<'_> {
+    /// The fitted latent score of each row: `z_raw` normalised, then calibrated.
+    pub(crate) fn apply(
+        &self,
+        z_raw: &Array1<f64>,
+        primary_design: &DesignMatrix,
+        context: &str,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let normalized = self
+            .normalization
+            .apply(z_raw, context)
+            .map_err(EstimationError::from)?;
+        self.conditional_step(&self.rank_int_step(&normalized), primary_design)
+    }
+
+    /// The rank-INT step on normalised scores, or the identity when the fit
+    /// minted none.
+    fn rank_int_step(&self, z: &Array1<f64>) -> Array1<f64> {
+        match self.rank_int {
+            Some(cal) => z.mapv(|zi| cal.apply_at_predict(zi)),
+            None => z.clone(),
+        }
+    }
+
+    /// The conditional location-scale step, reading `a` from `primary_design` at
+    /// `self.span`, or the identity when the fit minted none.
+    fn conditional_step(
+        &self,
+        z: &Array1<f64>,
+        primary_design: &DesignMatrix,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let Some(cal) = self.conditional else {
+            return Ok(z.clone());
+        };
+        let design = primary_design.to_dense();
+        let a_block = match self.span {
+            LatentConditioningSpan::PrimaryDesign => design.view(),
+            LatentConditioningSpan::PrimaryDesignTail { ncols } => {
+                let width = design.ncols();
+                if ncols > width {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "conditional latent calibration names the trailing {ncols} columns of the \
+                         primary design as its conditioning span, but that design has only \
+                         {width} columns"
+                    )));
+                }
+                design.slice(ndarray::s![.., width - ncols..])
+            }
+        };
+        cal.apply(z.view(), a_block)
+            .map_err(EstimationError::InvalidInput)
+    }
+}
+
 /// One prediction row's anchored marginal-slope kernel: everything the rigid
 /// (standard-normal) or declared-law (empirical) intercept calibration needs
 /// besides the two primaries `(q, b)` it is anchored on.
@@ -709,10 +781,7 @@ impl BernoulliMarginalSlopePredictor {
     /// having passed the strict normality check, so no transform was
     /// applied at fit time either.
     fn apply_latent_z_calibration(&self, z: &Array1<f64>) -> Array1<f64> {
-        match &self.latent_z_calibration {
-            Some(cal) => Array1::from_iter(z.iter().map(|&zi| cal.apply_at_predict(zi))),
-            None => z.clone(),
-        }
+        self.latent_score_map().rank_int_step(z)
     }
 
     /// Apply the (optional) conditional location-scale latent-z calibration
@@ -730,26 +799,17 @@ impl BernoulliMarginalSlopePredictor {
         z: &Array1<f64>,
         input: &PredictInput,
     ) -> Result<Array1<f64>, EstimationError> {
-        let Some(cal) = self.latent_z_conditional_calibration.as_ref() else {
-            return Ok(z.clone());
-        };
-        let design = input.design.to_dense();
-        let a_block = match self.latent_conditioning_span {
-            LatentConditioningSpan::PrimaryDesign => design.view(),
-            LatentConditioningSpan::PrimaryDesignTail { ncols } => {
-                let width = design.ncols();
-                if ncols > width {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "conditional latent calibration names the trailing {ncols} columns of the \
-                         primary design as its conditioning span, but that design has only \
-                         {width} columns"
-                    )));
-                }
-                design.slice(ndarray::s![.., width - ncols..])
-            }
-        };
-        cal.apply(z.view(), a_block)
-            .map_err(EstimationError::InvalidInput)
+        self.latent_score_map().conditional_step(z, &input.design)
+    }
+
+    /// This predictor's fitted latent-score maps, borrowed.
+    fn latent_score_map(&self) -> FittedLatentScoreMap<'_> {
+        FittedLatentScoreMap {
+            normalization: &self.latent_z_normalization,
+            rank_int: self.latent_z_calibration.as_ref(),
+            conditional: self.latent_z_conditional_calibration.as_ref(),
+            span: self.latent_conditioning_span,
+        }
     }
 
     fn rigid_intercept_from_marginal(&self, marginal_eta: f64, slope: f64) -> f64 {
@@ -2425,12 +2485,8 @@ impl BernoulliMarginalSlopePredictor {
                 self.z_column
             ))
         })?;
-        let z_normalized = self
-            .latent_z_normalization
-            .apply(z_raw, "bernoulli marginal-slope prediction")
-            .map_err(EstimationError::from)?;
-        let z = self.apply_latent_z_calibration(&z_normalized);
-        self.apply_latent_z_conditional_calibration(&z, input)
+        self.latent_score_map()
+            .apply(z_raw, &input.design, "bernoulli marginal-slope prediction")
     }
 
     /// The two primaries the anchored kernel is a function of, at `theta`:

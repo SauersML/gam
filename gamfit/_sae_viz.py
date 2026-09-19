@@ -157,9 +157,13 @@ def _as_2d(value: Any, name: str) -> np.ndarray:
 def _geometry_plan_for(fit: Any, k: int) -> Mapping[str, Any]:
     plans = fit.geometry_plans
     idx = int(k)
-    if idx < 0 or idx >= len(plans) or not isinstance(plans[idx], Mapping):
-        raise ValueError(f"geometry_plans must contain a mapping for atom {idx}")
-    return plans[idx]
+    missing = f"geometry_plans must contain a mapping for atom {idx}"
+    if idx < 0 or idx >= len(plans):
+        raise ValueError(missing)
+    plan = plans[idx]
+    if not isinstance(plan, Mapping):
+        raise ValueError(missing)
+    return plan
 
 
 def _basis_for(fit: Any, k: int) -> str:
@@ -258,7 +262,8 @@ def _project(points: np.ndarray, projector: np.ndarray) -> np.ndarray:
         aligned = np.zeros((points.shape[0], projector.shape[0]), dtype=float)
         aligned[:, :width] = points[:, :width]
         points = aligned
-    return points @ projector
+    projected: np.ndarray = points @ projector
+    return projected
 
 
 def _active_weights(fit: Any, atom: Any, k: int, n: int) -> np.ndarray | None:

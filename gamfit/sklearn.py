@@ -10,6 +10,7 @@ from sklearn.utils.validation import check_is_fitted
 
 from ._binding import rust_module
 from ._api import fit as fit_model
+from ._api import is_multinomial_family
 from ._model import Model
 from ._tables import attach_target, detect_table_kind, table_columns
 
@@ -25,7 +26,9 @@ _BaseT = TypeVar("_BaseT", bound="_BaseGAMEstimator")
 # the SurvivalPrediction object returned by Model.predict.
 
 
-def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str]]:
+def _prepare_fit_input(
+    X: Any, y: Any, formula: str | None
+) -> tuple[Any, str, list[str]]:
     rust = rust_module()
     if isinstance(y, str):
         columns, _kind = table_columns(X)
@@ -57,23 +60,26 @@ def _prepare_fit_input(X: Any, y: Any, formula: str) -> tuple[Any, str, list[str
 
 @dataclass
 class _BaseGAMEstimator(BaseEstimator):
-    formula: str
+    formula: str | None = None
     family: str = "auto"
     offset: str | None = None
     weights: str | None = None
     config: dict[str, Any] | None = None
 
-    def _fit_model(self: _BaseT, X: Any, y: Any = None) -> _BaseT:
+    def _fit_model(
+        self: _BaseT, X: Any, y: Any = None, *, family: str | None = None
+    ) -> _BaseT:
         training_data, fit_formula, feature_names = _prepare_fit_input(X, y, self.formula)
         self.model_ = fit_model(
             training_data,
             fit_formula,
-            family=self.family,
+            family=self.family if family is None else family,
             offset=self.offset,
             weights=self.weights,
             config=self.config,
         )
-        self.formula_ = fit_formula
+        # The fitted formula, with an automatic `.` expanded by the engine.
+        self.formula_ = getattr(self.model_, "formula", fit_formula)
         self.feature_names_in_ = np.asarray(feature_names, dtype=object)
         self.n_features_in_ = len(feature_names)
         if isinstance(self.model_, Model):
@@ -109,7 +115,7 @@ class _BaseGAMEstimator(BaseEstimator):
 class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
     """scikit-learn-compatible regressor wrapping :func:`gamfit.fit`.
 
-    Construct with a formula string and (optionally) pipeline kwargs such as
+    Construct with an optional formula string and pipeline kwargs such as
     ``family``, ``offset``, ``weights``, or a free-form ``config`` dict, then
     call :meth:`fit` with either a fully-formed table (``X``) or a feature
     table plus a target column / vector (``y``). After fitting, the estimator
@@ -119,9 +125,16 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
 
     Parameters
     ----------
-    formula : str
+    formula : str or None, default ``None``
         Wilkinson-style formula. May or may not include the response on the
         left-hand side; the response is resolved from ``y`` if missing.
+        ``None`` fits the automatic formula ``y ~ .``: the engine builds one
+        term per feature column from its schema (``s(x)`` for numeric
+        columns with at least three distinct values, a linear term for
+        two-valued numeric and boolean columns, ``factor(g)`` for
+        categorical and string columns, constant columns dropped with a
+        warning). Every such term is penalized and can shrink to zero; the
+        formula actually fitted is ``formula_`` after :meth:`fit`.
     family : str, default ``"auto"``
         Likelihood family forwarded to :func:`gamfit.fit`.
     offset : str or None, optional
@@ -135,6 +148,8 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
     --------
     >>> from gamfit.sklearn import GAMRegressor
     >>> reg = GAMRegressor(formula="y ~ s(x1) + s(x2)").fit(X_train, y_train)
+    >>> GAMRegressor().fit(X_train, y_train).formula_
+    'y ~ s(x1) + s(x2)'
     >>> preds = reg.predict(X_test)
     >>> reg.score(X_test, y_test)
     0.87
@@ -153,7 +168,7 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
             Target. ``str`` names a column already in ``X``; an array-like is
             bound to ``X`` under the response name implied by ``formula``;
             ``None`` means ``X`` already contains the response named by
-            ``formula``.
+            ``formula`` (which then must be given).
 
         Returns
         -------
@@ -191,15 +206,25 @@ class GAMRegressor(RegressorMixin, _BaseGAMEstimator):
 
 
 class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
-    """scikit-learn-compatible binary classifier wrapping :func:`gamfit.fit`.
+    """scikit-learn-compatible classifier wrapping :func:`gamfit.fit`.
 
     Same construction and ``fit`` semantics as :class:`GAMRegressor` (see that
-    class for parameter documentation). The supplied ``y`` may be any binary
-    label vector (strings, ``{-1, +1}``, ``{1, 2}``, integer ``{0, 1}``, …);
-    the wrapper records the observed classes in ``classes_`` (sorted, as
-    sklearn requires) and label-encodes the positive class — i.e.
-    ``classes_[1]`` — to ``1`` before fitting the binomial GAM. ``predict``
-    returns labels drawn from ``classes_``.
+    class for parameter documentation). The supplied ``y`` may be any label
+    vector (strings, ``{-1, +1}``, ``{1, 2}``, integer codes, …); the wrapper
+    records the observed classes in ``classes_`` (sorted, as sklearn requires)
+    and ``predict`` returns labels drawn from ``classes_``.
+
+    * **Two classes** fit the binomial-logit GAM, with the positive class
+      ``classes_[1]`` label-encoded to ``1``.
+    * **Three or more classes** (or ``family="multinomial"`` at any class
+      count) fit one joint multinomial-logit GAM: ``K − 1`` linear predictors,
+      each with its own smooths and REML/LAML-selected smoothing parameters,
+      estimated together by penalized likelihood. It is a single model, not
+      ``K`` one-vs-rest binary fits, so its class probabilities are coherent
+      by construction.
+
+    ``predict_proba`` returns the ``(n, K)`` posterior-mean class
+    probabilities with column ``j`` aligned to ``classes_[j]``; rows sum to 1.
 
     Examples
     --------
@@ -208,23 +233,26 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
     >>> clf.fit(X_train, y_train)
     >>> clf.predict_proba(X_test)[:1]
     array([[0.34, 0.66]])
+    >>> clf3 = GAMClassifier(formula="y ~ s(x1) + s(x2)").fit(X_train, species)
+    >>> clf3.predict_proba(X_test).shape
+    (100, 3)
     """
 
     def fit(self, X: Any, y: Any = None) -> "GAMClassifier":
-        """Fit the binary GAM classifier and return ``self``.
+        """Fit the GAM classifier and return ``self``.
 
         Parameters
         ----------
         X : Any
             Training table. See :meth:`GAMRegressor.fit` for accepted forms.
         y : str, array-like, or None, optional
-            Binary target. See :meth:`GAMRegressor.fit` for accepted forms.
+            Class labels. See :meth:`GAMRegressor.fit` for accepted forms.
 
         Returns
         -------
         GAMClassifier
-            Fitted estimator (``self``) with ``classes_`` reflecting the
-            observed labels (sorted ascending; the positive class is
+            Fitted estimator (``self``) with ``classes_`` holding the observed
+            labels sorted ascending (for two classes the positive class is
             ``classes_[1]``).
 
         Examples
@@ -232,18 +260,35 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         >>> GAMClassifier(formula="y ~ s(x)", family="binomial").fit(df, y="y")
         """
         labels = self._resolve_target_labels(X, y)
-        classes = np.unique(labels)
-        if classes.size != 2:
+        classes, class_index = np.unique(labels, return_inverse=True)
+        if classes.size < 2:
             raise ValueError(
-                "GAMClassifier requires exactly two observed classes; "
+                "GAMClassifier requires at least two observed classes; "
                 f"got {classes.size}: {classes!r}"
             )
-        # Positive class is the second sorted label, matching the convention
-        # used by sklearn's LabelEncoder and LogisticRegression.
-        positive = classes[1]
-        encoded = np.where(labels == positive, 1, 0).astype(int)
+        if classes.size == 2 and not is_multinomial_family(self.family):
+            # Positive class is the second sorted label, matching the
+            # convention used by sklearn's LabelEncoder and LogisticRegression.
+            encoded_X, encoded_y = self._inject_encoded_target(X, y, class_index)
+            fitted = self._fit_model(encoded_X, encoded_y)
+            self._multinomial_columns_ = None
+            self.classes_ = classes
+            return fitted
+        if self.family != "auto" and not is_multinomial_family(self.family):
+            raise ValueError(
+                f"GAMClassifier: family={self.family!r} is a binary likelihood but "
+                f"y has {classes.size} classes; use family='auto' or "
+                "family='multinomial' for a joint multinomial-logit GAM"
+            )
+        # The multinomial response is categorical and the engine orders its
+        # levels by label text. Each row carries its class INDEX as the label,
+        # and the engine's level order is mapped back to index order, so column
+        # j of `predict_proba` is `classes_[j]` whatever the label dtype.
+        encoded = np.asarray([str(index) for index in class_index], dtype=object)
         encoded_X, encoded_y = self._inject_encoded_target(X, y, encoded)
-        fitted = self._fit_model(encoded_X, encoded_y)
+        fitted = self._fit_model(encoded_X, encoded_y, family="multinomial")
+        engine_levels = np.asarray([int(level) for level in self.model_.classes_])
+        self._multinomial_columns_ = np.argsort(engine_levels)
         self.classes_ = classes
         return fitted
 
@@ -343,8 +388,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         Returns
         -------
         numpy.ndarray
-            Two-column float array ``[[P(y=0), P(y=1)], ...]``, clipped to
-            ``[0, 1]``.
+            ``(n, K)`` float array of posterior-mean class probabilities;
+            column ``j`` is ``P(y = classes_[j])`` and every row sums to 1.
 
         Examples
         --------
@@ -353,6 +398,9 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         """
         check_is_fitted(self, "model_")
         serving = self._strip_response_column(X)
+        if self._multinomial_columns_ is not None:
+            probabilities = np.asarray(self.model_.predict(serving), dtype=float)
+            return probabilities[:, self._multinomial_columns_]
         predicted = self.model_.predict(serving, return_type="dict")
         positive = np.clip(
             np.asarray(predicted["posterior_mean"], dtype=float), 0.0, 1.0
@@ -419,7 +467,10 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         >>> clf.predict(X_test)[:5]
         array([1, 0, 1, 1, 0])
         """
-        return self.classes_.take(np.argmax(self.predict_proba(X), axis=1))
+        labels: np.ndarray = self.classes_.take(
+            np.argmax(self.predict_proba(X), axis=1)
+        )
+        return labels
 
     def metrics(self, X: Any, y: Any) -> dict[str, float]:
         """Classification-metric panel for ``X`` against true labels ``y``.
@@ -449,6 +500,11 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         0.91
         """
         check_is_fitted(self, "model_")
+        if self._multinomial_columns_ is not None:
+            raise ValueError(
+                "GAMClassifier.metrics() is the binary classification panel; "
+                f"this model has {self.classes_.size} classes"
+            )
         observed = self._encode_labels(y)
         positive = self.predict_proba(X)[:, 1].astype(float)
         train_prev = float(np.mean(observed)) if observed.size else 0.0
@@ -461,7 +517,10 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         )
 
     def score(self, X: Any, y: Any, sample_weight: Any | None = None) -> float:
-        """Area under the ROC curve (AUC) of the model on ``(X, y)``.
+        """Area under the ROC curve (AUC) of a binary model on ``(X, y)``.
+
+        A model with more than two classes has no single ROC curve; its score
+        is scikit-learn's classifier accuracy.
 
         Overrides scikit-learn's default accuracy score with AUC, the natural
         threshold-free discrimination metric for the probabilistic output of
@@ -494,6 +553,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         0.91
         """
         check_is_fitted(self, "model_")
+        if self._multinomial_columns_ is not None:
+            return float(super().score(X, y, sample_weight=sample_weight))
         observed = self._encode_labels(y)
         positive = self.predict_proba(X)[:, 1].astype(float)
         if sample_weight is None:
@@ -523,8 +584,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         arr = np.asarray(y).reshape(-1)
         positive = self.classes_[1]
         negative = self.classes_[0]
-        is_positive = arr == positive
-        is_negative = arr == negative
+        is_positive: np.ndarray = arr == positive
+        is_negative: np.ndarray = arr == negative
         unknown = ~(is_positive | is_negative)
         if np.any(unknown):
             raise ValueError(
