@@ -162,6 +162,25 @@ def test_timeout_is_a_listed_loss_not_a_skip() -> None:
     assert "status vs pygam " in losses and "status vs pygam_gs" in losses
 
 
+def test_n_predict_cells_are_reported_apart() -> None:
+    # Two cells that differ only in n_predict are separate report rows, and a
+    # post-fit metric gets its own table only once some rep measured it.
+    records = [
+        dict(_rec(lib, 0, pred_cpu_s=t), n_predict=m)
+        for m, t in ((100, 0.01), (1_000_000, 1.0))
+        for lib in ("gamfit", "pygam_gs")
+    ]
+    text = render(records)
+    assert "gaussian n=100 p1 n_predict=100" in text
+    assert "gaussian n=100 p1 n_predict=1e+06" in text
+    assert "## partial dependence CPU" not in text
+    records[0]["pd_cpu_s"] = 0.5
+    records[1]["pd_cpu_s"] = 0.25
+    assert "## partial dependence CPU" in render(records)
+    assert PLANS["postfit"].postfit
+    assert all(cell.n_predict is not None for cell in PLANS["postfit"].cells)
+
+
 def test_thread_settings_reach_every_pool_variable() -> None:
     assert thread_env(1) == THREAD_ENV
     assert thread_env(4) == {k: "4" for k in THREAD_ENV}

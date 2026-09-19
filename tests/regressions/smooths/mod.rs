@@ -14,6 +14,7 @@ mod duchon_replay_penalty_topology_2433;
 mod factor_smooth_degree_shrink_predict_replay;
 mod gaulss_by_group_both_blocks_joint_hessian_shape_1504;
 mod gaussian_location_scale_sinusoidal_scale_recovery;
+mod glm_duchon_operator_penalties_recover_truth;
 mod group_random_effect_sparse_exact_smoothing_correction;
 mod input_loc_matern;
 mod margslope_duchon_slowdown;
