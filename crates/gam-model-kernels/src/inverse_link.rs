@@ -118,8 +118,29 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 out.push(e.powf(-exponent));
             }
         }
+        Some(LinkFunction::Sqrt) => {
+            // μ = η², the inverse of g(μ) = √μ, is a bijection only on η > 0; a
+            // non-positive η is outside the link's feasibility set.
+            for &e in eta {
+                if !(e > 0.0) {
+                    return Err(format!(
+                        "the sqrt link maps only eta > 0 to a positive mean; got eta={e}"
+                    ));
+                }
+                out.push(e * e);
+            }
+        }
         None => {
-            return Err(gam_problem::UnknownLinkName(kind.to_string()).to_string());
+            // The tag names no closed-form link. It may be a family name, or a
+            // parameterized link (mixture, latent-cloglog) whose per-fit state
+            // the bare tag cannot carry.
+            return Err(format!(
+                "family_kind={kind:?} names no closed-form inverse link ({}); a \
+                 parameterized link (sas, mixture, latent-cloglog, beta-logistic) carries \
+                 per-fit state and must be routed through the serialized `link_spec` (see \
+                 `apply_inverse_link_spec_vec`).",
+                gam_problem::UnknownLinkName(kind.to_string())
+            ));
         }
         Some(other @ (LinkFunction::Sas | LinkFunction::BetaLogistic)) => {
             let other = other.name();

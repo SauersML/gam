@@ -15,13 +15,23 @@ configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Required
 Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"required"`:
 
 ```python
-gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
+gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})   # CPU when no CUDA device is present
 ```
 
 Manifold-SAE fits own the policy per fit, including every nested arrow-Schur
 solve and evidence evaluation:
 
 ```python
+import numpy as np
+import gamfit
+
 rng = np.random.default_rng(0)
 angle = rng.uniform(0.0, 2.0 * np.pi, 200)
 X = np.column_stack([np.cos(angle), np.sin(angle)]) + 0.05 * rng.standard_normal((200, 2))

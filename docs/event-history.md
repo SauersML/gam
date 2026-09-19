@@ -173,6 +173,7 @@ events before termination.
 ```python
 import numpy as np
 import pandas as pd
+import gamfit
 
 rng = np.random.default_rng(0)
 n = 200

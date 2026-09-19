@@ -341,9 +341,85 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         };
 
-        // Step 1: per-direction skewness diagnostic γ_r.
+        // The eigensystem every step below reads: the block's directions `v_r`,
+        // their curvatures `λ_r`, and the resolvent the mode and gap terms are
+        // built from. It is the criterion's own spectral operator for this ρ
+        // whenever the criterion priced one on the full frame. An `eigh` of the
+        // assembled `H` resolves each eigenvalue only to `O(ε·‖H‖)`; with one λ
+        // railed, `‖H‖` is many orders above the soft modes this block lives
+        // on, so that error is a visible fraction of `λ_r` and of `v_r`, and it
+        // changes with the last bits of `H` from one inner solve to the next.
+        // `Δ_b` then differs between two evaluations at the same ρ by far more
+        // than the outer line search can resolve, and the BFGS continuation
+        // stalls on noise. The criterion's operator is priced from the root
+        // `B` with `H = BᵀB` when the assembled spectrum cannot resolve
+        // `log|H|` (#2644), which prices each soft mode to its own scale — the
+        // same eigenpairs the Laplace term was priced on.
+        //
+        // The decision is published by the spectral assembly. A value-only
+        // probe on the transformed route prices a Cholesky factor and publishes
+        // none, so the assembly is run once at a derivative order to obtain it,
+        // exactly as `criterion_rank_decision_at` does: `Δ_b` must be one
+        // function of ρ whether the evaluation carries a gradient or not.
+        // Only a sparse-exact backend, or a spectral operator priced on an
+        // active-constraint face's free basis, leaves no full-frame decision;
+        // the criterion priced no spectrum of this frame's `H` there, so the
+        // assembled matrix's own is the only one.
+        if bundle.criterion_rank_decision().is_none()
+            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
+        {
+            self.build_auto_assembly(
+                rho,
+                bundle,
+                super::reml_outer_engine::EvalMode::ValueAndGradient,
+                false,
+                false,
+            )?;
+        }
+        let sym_h = (h_total + &h_total.t()) * 0.5;
+        let (evals, evecs) = match bundle.criterion_rank_decision() {
+            Some(decision) => {
+                let evals = Array1::from(decision.operator.raw_eigenvalues.clone());
+                let evecs = match decision.frame {
+                    CriterionFrame::Transformed => decision.operator.eigenvectors.clone(),
+                    // `H_orig = Qs·H·Qsᵀ` with `Qs` orthogonal, so the transformed
+                    // frame's eigenvectors are `Qsᵀ·V_orig` with the same eigenvalues.
+                    CriterionFrame::Original => match pirls_result.coordinate_frame {
+                        pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
+                            .reparam_result
+                            .qs
+                            .t()
+                            .dot(&decision.operator.eigenvectors),
+                        pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                            decision.operator.eigenvectors.clone()
+                        }
+                    },
+                };
+                log::trace!(
+                    "[#784] block eigensystem from the criterion's {:?} operator ({:?} frame)",
+                    decision.predicate,
+                    decision.frame,
+                );
+                (evals, evecs)
+            }
+            None => sym_h.eigh(Side::Lower).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "#784 block-local fallback eigendecomposition failed: {e}"
+                ))
+            })?,
+        };
+        if evals.len() != p || evecs.dim() != (p, p) {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 block eigensystem has {} eigenvalues and {}x{} eigenvectors for p={p}",
+                evals.len(),
+                evecs.nrows(),
+                evecs.ncols()
+            )));
+        }
+
+        // Step 1: per-direction skewness diagnostic γ_r, aligned to those pairs.
         let (max_abs, directional) = corrector
-            .directional_cubic_diagnostic(h_total, x_design, c_weights, false)
+            .directional_cubic_diagnostic(&evals, &evecs, x_design, c_weights, false)
             .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
             return Ok(zero());
@@ -397,12 +473,14 @@ impl<'a> RemlState<'a> {
         // away from an eigenvalue coincidence, which a path through ρ avoids
         // generically, so the latched block is too, and the frame-rotation
         // channel (c) below differentiates exactly that motion.
-        let sym_h = (h_total + &h_total.t()) * 0.5;
-        let (evals, evecs) = sym_h.eigh(Side::Lower).map_err(|e| {
-            EstimationError::InvalidInput(format!(
-                "#784 block-local fallback eigendecomposition failed: {e}"
-            ))
-        })?;
+        //
+        // A position is a rank in ASCENDING eigenvalue order, not an index into
+        // `evals`: the criterion's operator above is an `eigh` of the assembled
+        // `H` (ascending) where that resolves `log|H|` and the root SVD
+        // (descending) where it does not (#2644), and the route can change
+        // between two ρ of one search.
+        let mut ascending: Vec<usize> = (0..evals.len()).collect();
+        ascending.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
         let latched_quadrature = self
             .block_correction_axis_orders
             .lock()
@@ -411,19 +489,23 @@ impl<'a> RemlState<'a> {
             .filter(|latch| Some(latch.block_positions.len()) == latched_block_dim);
         let block_cols: Vec<usize> = match (&latched_quadrature, latched_block_dim) {
             (Some(latch), _) => {
-                if let Some(&r) = latch
+                if let Some(&k) = latch
                     .block_positions
                     .iter()
-                    .find(|&&r| r >= evals.len() || evals[r] <= 0.0)
+                    .find(|&&k| k >= ascending.len() || evals[ascending[k]] <= 0.0)
                 {
                     return Err(EstimationError::InvalidInput(format!(
-                        "#784 latched block direction at spectral position {r} has no positive \
+                        "#784 latched block direction at spectral position {k} has no positive \
                          curvature at this rho (eigenvalue {:?}); the block the admission \
                          integrated does not exist here",
-                        evals.get(r)
+                        ascending.get(k).map(|&r| evals[r])
                     )));
                 }
-                latch.block_positions.clone()
+                latch
+                    .block_positions
+                    .iter()
+                    .map(|&k| ascending[k])
+                    .collect()
             }
             // The admission and its block are latched together below, so an
             // admission without its block is a broken latch, not a model.
@@ -774,13 +856,18 @@ impl<'a> RemlState<'a> {
         // every gate cleared. Everything below this point splices, so this is
         // the exact boundary of "the correction is part of this model".
         if latched_block_dim.is_none() {
+            let mut rank_of = vec![0; ascending.len()];
+            for (k, &r) in ascending.iter().enumerate() {
+                rank_of[r] = k;
+            }
+            let block_positions: Vec<usize> = block_cols.iter().map(|&r| rank_of[r]).collect();
             self.block_correction_admission
                 .store(m + 1, std::sync::atomic::Ordering::Relaxed);
             *self
                 .block_correction_axis_orders
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BlockQuadratureLatch {
-                block_positions: block_cols.clone(),
+                block_positions: block_positions.clone(),
                 axis_orders: axis_orders.clone(),
                 axis_quadrature_errors: axis_quadrature_errors.clone(),
                 axis_split,
@@ -792,7 +879,7 @@ impl<'a> RemlState<'a> {
             drop(decision);
             log::debug!(
                 "[#784] block-local correction ADMITTED for this fit: block dimension m={m}, \
-                 spectral positions {block_cols:?}, axis split={axis_split} and axis orders \
+                 spectral positions {block_positions:?}, axis split={axis_split} and axis orders \
                  {:?} are now the model's, and the tau={:.3} activation no longer switches \
                  the criterion on and off along the outer search (#2748, #2623)",
                 axis_orders,

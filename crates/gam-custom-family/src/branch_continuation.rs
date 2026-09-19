@@ -25,8 +25,8 @@
 //! criterion's own accuracy ([`criterion_inner_solve_options`]), and only the endpoint is priced,
 //! in the caller's evaluation mode, from the corrected mode as it is. Taking the tangent from the
 //! evaluator's mode responses instead cost two derivative-bearing pricings per value probe on the
-//! tilted double well: one to re-derive a seed's tangent (a value-only or screening seed files
-//! none) and one per interior sub-step.
+//! tilted double well: one to re-derive a seed's tangent (a value-only seed files none) and one
+//! per interior sub-step.
 //!
 //! The test's corrections are Deuflhard's: the Newton correction at the predictor, then the
 //! simplified correction at its image with the curvature frozen at the predictor. This slice
@@ -517,8 +517,7 @@ fn certified_exact_newton_mode(seed: &ConstrainedWarmStart) -> bool {
 }
 
 /// Whether an evaluation at `rho` from `seed` continues the seed's branch: the continuation
-/// covers the family's solve, the seed is a certified mode at another θ, and no screening cap
-/// truncates the inner solve (a capped probe certifies no mode, so it continues none).
+/// covers the family's solve and the seed is a certified mode at another θ.
 fn continues_its_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -527,13 +526,8 @@ fn continues_its_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
     seed: &ConstrainedWarmStart,
     rho: &Array1<f64>,
 ) -> bool {
-    let screening_capped = options
-        .screening_max_inner_iterations
-        .as_ref()
-        .is_some_and(|cap| cap.load(Ordering::Relaxed) > 0);
     continuation_covers(family, specs, options, layout)
         && certified_exact_newton_mode(seed)
-        && !screening_capped
         && seed.rho.len() == rho.len()
         && !same_point(&seed.rho, rho)
 }
@@ -542,8 +536,8 @@ fn continues_its_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// (gam#2973). A seed that is a certified mode at another θ is continued along its branch
 /// ([`continue_branch`]). Any other seed is evaluated as the seed rules chose it: no seed, the
 /// same θ (a same-ρ reuse), a seed that is no certified mode, a family whose inner objective
-/// declares one mode, a solve the Newton-region test does not cover yet (the joint Newton path),
-/// or a capped screening probe. A branch that ends before `rho` refuses the trial point.
+/// declares one mode, or a solve the Newton-region test does not cover yet (the joint Newton
+/// path). A branch that ends before `rho` refuses the trial point.
 pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
