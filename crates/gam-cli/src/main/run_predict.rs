@@ -1475,7 +1475,7 @@ fn run_predict_conformal(
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",
-        "frozen_rho_certified",
+        "conformal_certificate",
     ]
     .into_iter()
     .filter_map(|name| columns.get(name).map(|values| (name, values.as_slice())))
