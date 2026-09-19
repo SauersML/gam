@@ -4483,5 +4483,16 @@
     },
     "reason": "gam#2999: the pub(super) marginal-slope base-link resolver read only the formula's link(...). It is replaced, in the same file, by resolve_marginal_slope_link, which also reads the request's link and flexible_link arguments, so no link spelling goes unread. Its two callers, the bernoulli marginal-slope and the survival marginal-slope materializers, call the replacement.",
     "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
+  },
+  {
+    "base": "c981848bcb2ddbde8a46383c9c065105a19e4525",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::consumed": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::from_model": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::required": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::session": 1
+    },
+    "reason": "gam#3002: OuterWarmStart's four methods staged a saved model's point as a one-entry outer cache session. They are replaced by resolve_warm_start, which builds a gam_model_api::WarmStart (the point, its certified value, and whether the inputs are the parent's), and every outer search takes it through OuterProblem::with_warm_start. See docs/source-removal-changes.json at the same base.",
+    "evidence": "At the landing tree git grep finds no call of OuterWarmStart::from_model, .session(), .required() or .consumed() on a warm start; gam-pyffi's geometry_ffi.rs, the only production caller of from_model, calls resolve_warm_start. public_api_census.py at 5bd6913b9b on 55212405d7 refused exactly these four identities without this entry, and verified 13342 -> 13345 public function declarations with it."
   }
 ]

@@ -1960,7 +1960,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // the driver's fast path. A fit that also searches length-scale or auxiliary
     // coordinates runs the driver's own search, which a saved model's certified
     // point does not describe, so it is refused before any fitting.
-    if options.required_warm_start.is_some()
+    if options.warm_start.is_some()
         && !(setup.auxiliary_dim() == 0
             && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
     {
