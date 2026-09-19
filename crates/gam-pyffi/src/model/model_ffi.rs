@@ -1372,8 +1372,7 @@ fn default_survival_time_grid_from_model(
     formula,
     config_json = None,
     fisher_rao_w = None,
-    warm_start_model = None,
-    warm_start_dir = None
+    warm_start_model = None
 ))]
 fn fit_table(
     py: Python<'_>,
@@ -1383,7 +1382,6 @@ fn fit_table(
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
     warm_start_model: Option<Vec<u8>>,
-    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
@@ -1397,7 +1395,7 @@ fn fit_table(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
-            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
+            warm_start_model.as_deref(),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
@@ -1409,8 +1407,7 @@ fn fit_table(
     formula,
     config_json = None,
     fisher_rao_w = None,
-    warm_start_model = None,
-    warm_start_dir = None
+    warm_start_model = None
 ))]
 fn fit_array(
     py: Python<'_>,
@@ -1420,7 +1417,6 @@ fn fit_array(
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
     warm_start_model: Option<Vec<u8>>,
-    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
@@ -1432,7 +1428,7 @@ fn fit_array(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
-            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
+            warm_start_model.as_deref(),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())

@@ -1454,5 +1454,21 @@
     ],
     "reason": "#2822/#2976: GradientAccumulation moves unchanged (the same two pub fields, accumulation_depth and absolute_sums) into gam_linalg::roundoff beside accumulation_growth and accumulation_band, which own the gamma_m it is read with, so the SAE arrow assembly, which does not depend on gam-model-api, carries the same record for its gradient. family_trait.rs re-exports it at its old path (pub use gam_linalg::roundoff::GradientAccumulation), so every existing path resolves to the one definition.",
     "evidence": "Direct gate dy7 sf-a1v2-p4 at 9ba55dfa34 (patch md5 c72cd8f1, tree 57fa8adf, this move plus the #2822 unit that reuses the type) without this entry: source_removal_guard.py names exactly this one item, kind struct, public, production_occurrences 0 (direct-dy7-sf-a1v2-p4.log.guard). In the same gate the workspace --all-targets check and the gam-pyffi check exit 0 with every existing user of the old path compiling through the re-export, and the public-API census exits 0."
+  },
+  {
+    "base": "c981848bcb2ddbde8a46383c9c065105a19e4525",
+    "items": [
+      "crates/gam-model-api/src/families/custom_family/options.rs:struct:RequiredWarmStart",
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs:fn:consumed",
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs:fn:fmt",
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs:fn:from_model",
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs:fn:required",
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs:fn:session",
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs:struct:OuterWarmStart",
+      "crates/gam-models/tests/suite/warm_start_from.rs:fn:a_warm_refit_resumes_at_the_cold_point_and_a_model_it_cannot_resume_is_refused",
+      "crates/gam-models/tests/suite/warm_start_from.rs:fn:certified_point"
+    ],
+    "reason": "gam#3002: warm_start_from carried a saved model's point to one route through the outer cache seam. OuterWarmStart staged the point as a one-entry cache session in a scratch directory (from_model, session, required, consumed, and its Debug fmt), and RequiredWarmStart was the flag the consuming route set. That made the point the sole seed of every search that read the options, including searches whose criterion the point is not certified for (an unarmed evidence fit, a pilot). One mechanism replaces them. gam_model_api::WarmStart carries the point, its certified value and whether the inputs are the parent's; resolve_warm_start builds it; OuterProblem::with_warm_start offers it to every search, which accepts it only where it is certified for its own criterion (resume_prior_certificate), or joins it to an independent multistart on other inputs. The suite test and its certified_point helper are replaced by four tests of the new contract (resume with no outer iteration and the parent's bits, join on other data with V at most cold, another dimension bit-cold, the three refusals).",
+    "evidence": "git grep -w OuterWarmStart and RequiredWarmStart at the landing tree find nothing under crates, src, tests or gamfit, and none of .consumed(), warm_start.required() or OuterWarmStart:: remains; gam-pyffi's geometry_ffi.rs, the only caller of from_model, calls resolve_warm_start. The fmt removed is OuterWarmStart's own Debug impl (the 1269 production occurrences are other fmt fns). Gate on acn112 (strike-wall lane, 6 cores) at 5bd6913b9b on 55212405d7: without this entry source_removal_guard.py refused exactly these 9 items, and with it verified 1714 -> 1738 Rust items with 9 guarded removals; test_census 12085 -> 12093 tests; cargo check --workspace --all-targets and cargo build --workspace --lib RC 0; gam-solve rho_optimizer:: 440 of 440 with the four gam#3002 multistart pins; gam-models suite warm_start_from 4 of 4; gam-custom-family lib 347 of 347; the gam-models materialize and payload tests 106 of 108, whose two failures are the Gaussian location-scale tests that fail identically on unpatched main (gam#2959 comment)."
   }
 ]

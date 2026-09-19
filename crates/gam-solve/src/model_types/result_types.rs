@@ -2599,10 +2599,11 @@ pub struct FitArtifacts {
     /// so it will not catch a new producer on its own.
     #[serde(default)]
     pub covariance_declined: Option<CovarianceDeclined>,
-    /// The certified outer point in the outer optimizer's own coordinates, when
-    /// the route that fitted the model records one: `gamfit.fit(...,
-    /// warm_start_from=model)` resumes a new fit from it through the outer cache
-    /// seam, which recertifies it rather than trusting it. `None` on a route that
+    /// The certified outer point of the published search, in the outer
+    /// optimizer's own coordinates, when the route that fitted the model records
+    /// one: `gamfit.fit(..., warm_start_from=model)` offers it to a new fit
+    /// (gam#3002, `OuterProblem::with_warm_start`), whose searches accept it only
+    /// where it is certified for their own criterion. `None` on a route that
     /// records none and on a model saved before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_warm_start: Option<OuterWarmStartRecord>,
@@ -2613,13 +2614,23 @@ pub struct FitArtifacts {
     pub coefficient_mode_selection: CoefficientModeSelection,
 }
 
-/// A certified outer point: `rho` in the outer optimizer's coordinates and
-/// `beta`, the inner coefficient mode flattened across blocks in the order the
-/// outer objective's coefficient seed reads it.
+/// A certified outer point (gam#3002): `theta`, the outer coordinates in the order
+/// the fit's outer problem holds them (ρ, then the log length scales, then the
+/// auxiliary coordinates), `beta`, the inner coefficient mode there flattened
+/// across blocks, `value`, the criterion the search certified there, and the
+/// fingerprint of the inputs the point is certified for.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OuterWarmStartRecord {
-    pub rho: Vec<f64>,
+    /// v25 wrote the ρ-only point as `rho`.
+    #[serde(alias = "rho")]
+    pub theta: Vec<f64>,
     pub beta: Vec<f64>,
+    /// `value` and `input_fingerprint` are `None` in a v25 record, which predates
+    /// them; such a point can only join a search, never resume as a certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fingerprint: Option<String>,
 }
 
 /// Which rule selected a fit's coefficient mode (#2366, #2661).
@@ -2752,7 +2763,7 @@ impl std::fmt::Debug for FitArtifacts {
                 &self
                     .outer_warm_start
                     .as_ref()
-                    .map(|seed| (seed.rho.len(), seed.beta.len())),
+                    .map(|seed| (seed.theta.len(), seed.beta.len())),
             )
             .finish()
     }
