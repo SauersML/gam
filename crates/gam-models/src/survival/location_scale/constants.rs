@@ -42,43 +42,6 @@ pub(crate) const CONSTRAINT_NONNEGATIVITY_REL_TOL: f64 = 1e-10;
 pub(crate) const MONOTONE_CONE_FEASIBILITY_GATE_TOL: f64 =
     gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
 
-/// Maximum number of Dykstra alternating-projection sweeps when projecting an
-/// initial coefficient guess onto the represented linear inequality
-/// constraints. The projection converges geometrically; this caps the rare
-/// near-degenerate constraint set and keeps the warm-start best-effort.
-pub(crate) const DYKSTRA_PROJECTION_MAX_SWEEPS: usize = 100;
-
-/// Relative floor for the coupled-survival SCALE-COUPLED block trust-region
-/// metric (issue #1569). The free scale predictor `η_σ` enters the likelihood
-/// through the standardized index `u = inv_sigma·(h − η_t)` with
-/// `inv_sigma = exp(−η_σ)`, so `∂u/∂h = inv_sigma` and `∂u/∂η_t = −inv_sigma`:
-/// the TIME, LOCATION (threshold) and LOG-σ channels all carry an `exp(−η_σ)`
-/// factor in their gradient and an `exp(−2 η_σ)` factor in their
-/// likelihood-Hessian diagonal `Σ_r exp(−2 η_σ,r) X_{rj}²` (the scale divides the
-/// whole residual, #2695). When `exp(−η_σ)` is large on a few rows the metric
-/// is dominated by them for the coefficients they load on, while a coefficient
-/// loading mostly on large-σ rows is metric-STARVED. The affine-covariant
-/// Moré–Sorensen step then over-reaches on the starved coordinates and the inner
-/// trust loop grinds. We floor every location and log-σ metric entry at this fraction
-/// of the block's MAXIMUM metric entry, capping the `exp(−η_σ)`-induced condition
-/// number so no coordinate is starved. The floor is derived ENTIRELY from the
-/// scale-coupled diagonal (no knob, no flag): it scales with `exp(−2 η_σ)`
-/// automatically and self-vanishes at the KKT fixed point (it shapes the step
-/// norm only, never the converged β). `1e-6` keeps the floor six orders below the
-/// block's dominant curvature so a well-conditioned block (constant or mild
-/// scale) sees a byte-identical metric, while a sharply heteroscedastic block has
-/// its metric dynamic range capped at `1e6`. The time block carries the same
-/// factor but is left unfloored (`joint_trust_metric_block_floor` says why).
-pub(crate) const SCALE_COUPLED_TRUST_METRIC_FLOOR_REL: f64 = 1e-6;
-
-/// Outer (smoothing-parameter) loop budget for the blockwise location-scale
-/// fit: at most this many outer iterations, stopping once the outer relative
-/// change falls below the tolerance. The dead-flat time-smoothing ridge of the
-/// constant-scale case is what makes a finite cap necessary.
-pub(crate) const BLOCKWISE_OUTER_MAX_ITER: usize = 60;
-
-pub(crate) const BLOCKWISE_OUTER_TOL: f64 = 1e-5;
-
 /// Target byte budget for one row-chunk when streaming a design matrix's
 /// trailing columns into a dense buffer. The per-chunk row count is derived as
 /// `BUDGET / (p · sizeof(f64))`, so wide designs use proportionally fewer rows

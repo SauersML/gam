@@ -581,8 +581,8 @@ pub fn project_onto_linear_constraints(
     // nearest point whose every row clears the `1e-6` scaled interior margin,
     // so the seed clears the downstream raw `1e-8` gate with ~100× room. If the
     // margin-shifted system has empty interior, fall back to the exact boundary
-    // projection (`H = I`). Only if BOTH exact solves refuse AND a Dykstra
-    // safety net cannot reach tolerance do we return a HARD ERROR with the
+    // projection (`H = I`). If BOTH exact solves refuse, the constraint system
+    // has no certified feasible point and we return a HARD ERROR with the
     // residual — never a silently-accepted infeasible seed.
     let n_rows = constraints.a.nrows();
     // Accept a candidate projection iff it clears the downstream feasibility
@@ -612,82 +612,33 @@ pub fn project_onto_linear_constraints(
         return Ok(interior);
     }
     let identity = Array2::<f64>::eye(dim);
-    if let Ok((boundary, _active)) = gam_solve::active_set::solve_quadratic_with_linear_constraints(
+    let boundary_refusal = match gam_solve::active_set::solve_quadratic_with_linear_constraints(
         &identity,
         &beta0_vec,
         &beta0_vec,
         constraints,
         None,
-    ) && worst_raw_violation(&boundary).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
-    {
-        return Ok(boundary);
-    }
-
-    // Dykstra safety net (alternating projection is guaranteed to converge to
-    // the exact projection onto a convex intersection of halfspaces). Collapse
-    // bit-identical rows first (tied-time duplicates that DO coincide), run until
-    // the violation clears the downstream gate the result is certified against,
-    // then HARD-CHECK feasibility against it — no silent infeasible return. A row
-    // whose normal is exactly zero states no halfspace and is skipped.
-    let mut seen: std::collections::HashSet<Box<[u64]>> =
-        std::collections::HashSet::with_capacity(n_rows);
-    let mut unique_rows: Vec<usize> = Vec::with_capacity(n_rows);
-    for i in 0..n_rows {
-        let row_i = constraints.a.row(i);
-        if row_i.dot(&row_i) == 0.0 {
-            continue;
-        }
-        let mut key: Vec<u64> = Vec::with_capacity(dim + 1);
-        key.extend(row_i.iter().map(|v| v.to_bits()));
-        key.push(constraints.b[i].to_bits());
-        if seen.insert(key.into_boxed_slice()) {
-            unique_rows.push(i);
-        }
-    }
-    let mut beta = beta0_vec;
-    let mut corrections = Array2::<f64>::zeros((unique_rows.len(), dim));
-    let max_sweeps = DYKSTRA_PROJECTION_MAX_SWEEPS;
-    for _ in 0..max_sweeps {
-        let mut max_violation = 0.0_f64;
-        for (slot, &i) in unique_rows.iter().enumerate() {
-            let row = constraints.a.row(i);
-            let row_norm_sq = row.dot(&row);
-            if row_norm_sq == 0.0 {
-                continue;
+    ) {
+        Ok((boundary, _active)) => {
+            let (worst, worst_row) = worst_raw_violation(&boundary);
+            if worst <= DOWNSTREAM_FEASIBILITY_GATE_TOL {
+                return Ok(boundary);
             }
-            let y = &beta + &corrections.row(slot);
-            let slack = row.dot(&y) - constraints.b[i];
-            max_violation = max_violation.max((-slack).max(0.0));
-            if slack >= 0.0 {
-                corrections.row_mut(slot).assign(&(&y - &beta));
-                continue;
-            }
-            let step = (constraints.b[i] - row.dot(&y)) / row_norm_sq;
-            let projected = &y + &(row.to_owned() * step);
-            corrections.row_mut(slot).assign(&(&y - &projected));
-            beta.assign(&projected);
+            format!("its solution violates row {worst_row} by {worst:.3e}")
         }
-        if max_violation <= DOWNSTREAM_FEASIBILITY_GATE_TOL {
-            break;
-        }
+        Err(error) => format!("it refused: {error}"),
+    };
+    Err(SurvivalLocationScaleError::ConstraintViolation {
+        reason: format!(
+            "project_onto_linear_constraints could not certify a feasible projection of the \
+             seed onto the monotone time-derivative cone ({n_rows} guard rows): the \
+             strict-interior projection found no interior point clearing the downstream gate \
+             tol={DOWNSTREAM_FEASIBILITY_GATE_TOL:.1e}, and the exact boundary projection \
+             {boundary_refusal}. This is a genuine feasibility failure of the constraint \
+             system, surfaced rather than silently returning an infeasible seed."
+        ),
     }
-    let (worst, worst_row) = worst_raw_violation(&beta);
-    if worst > DOWNSTREAM_FEASIBILITY_GATE_TOL {
-        return Err(SurvivalLocationScaleError::ConstraintViolation {
-            reason: format!(
-                "project_onto_linear_constraints could not certify a feasible projection of the \
-                 seed onto the monotone time-derivative cone: worst raw violation {worst:.3e} at \
-                 row {worst_row} ({} unique of {n_rows} guard rows). Both exact active-set \
-                 projections (strict-interior and boundary) refused and the Dykstra safety net \
-                 did not reach the downstream gate tol={DOWNSTREAM_FEASIBILITY_GATE_TOL:.1e}. This \
-                 is a genuine feasibility failure of the constraint system, surfaced rather than \
-                 silently returning an infeasible seed.",
-                unique_rows.len(),
-            ),
-        }
-        .into());
-    }
-    Ok(beta)
+    .into())
 }
 
 /// The ONE round-off allowance every post-update feasibility check in this
