@@ -93,7 +93,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
-    let p_intercept = usize::from(!term_collection_has_anchored_bspline(spec));
+    let p_intercept = usize::from(term_collection_has_global_intercept(spec));
     let p_lin = spec.linear_terms.len();
 
     // Smooth construction, random-effect construction, and linear-column
@@ -184,6 +184,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         data,
         &spec.linear_terms,
         &spec.smooth_terms,
+        level_carrier_smooth(spec),
     )?;
 
     let p_rand: usize = random_blocks.iter().map(|b| b.num_groups).sum();
@@ -456,6 +457,21 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         random_effect_levels,
         smooth,
     })
+}
+
+/// Whether the design leads with the global all-ones intercept column: the
+/// formula kept its intercept and no anchored B-spline pins the level.
+pub fn term_collection_has_global_intercept(spec: &TermCollectionSpec) -> bool {
+    matches!(spec.level, ModelLevel::Intercept) && !term_collection_has_anchored_bspline(spec)
+}
+
+/// The smooth that carries the constant level of a no-intercept model, if one
+/// was chosen (see [`ModelLevel`]).
+fn level_carrier_smooth(spec: &TermCollectionSpec) -> Option<usize> {
+    match spec.level {
+        ModelLevel::NoIntercept { level_smooth } => level_smooth,
+        ModelLevel::Intercept => None,
+    }
 }
 
 /// Whether any smooth term carries an anchored B-spline endpoint (one *or* two
@@ -1542,6 +1558,7 @@ fn apply_global_smooth_identifiability(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
+    level_smooth: Option<usize>,
 ) -> Result<(SmoothDesign, Array1<f64>), BasisError> {
     // Global smooth identifiability policy:
     //
@@ -1701,6 +1718,9 @@ fn apply_global_smooth_identifiability(
                         || factor_by_level_gate(termspec).is_some())
             }
         };
+        // The level-carrying smooth of a no-intercept model keeps its
+        // constant, so the constant column stays out of its block; a block
+        // left with no column is no block at all.
         let parametric_block = if !needs_parametric_block {
             None
         } else {
@@ -1708,7 +1728,9 @@ fn apply_global_smooth_identifiability(
                 data,
                 linear_terms,
                 termspec,
+                level_smooth != Some(idx),
             )?)
+            .filter(|block| block.ncols() > 0)
         };
         // The replay's own owner blocks, named by the chart rather than
         // re-derived: which owners bound is decided by a cross-residual on the
@@ -2141,6 +2163,7 @@ fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     termspec: &SmoothTermSpec,
+    include_constant: bool,
 ) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
@@ -2192,10 +2215,13 @@ fn build_parametric_constraint_block_for_term(
         }
     }
 
-    let mut c = Array2::<f64>::zeros((n, 1 + parametric_cols.len()));
-    c.column_mut(0).fill(1.0);
+    let lead = usize::from(include_constant);
+    let mut c = Array2::<f64>::zeros((n, lead + parametric_cols.len()));
+    if include_constant {
+        c.column_mut(0).fill(1.0);
+    }
     for (j, &feature_col) in parametric_cols.iter().enumerate() {
-        c.column_mut(j + 1).assign(&data.column(feature_col));
+        c.column_mut(j + lead).assign(&data.column(feature_col));
     }
     Ok(c)
 }
@@ -3159,6 +3185,7 @@ mod frozen_linear_term_mass_rebuild_tests {
                     coefficient_min: None, coefficient_max: None, frozen_function_mass: None,
                 }).collect(),
                 random_effect_terms: vec![], smooth_terms: vec![],
+                level: Default::default(),
             };
             let before = hwm();
             let built = build_term_collection_design(data.view(), &spec).expect("million-row design");
@@ -3206,6 +3233,7 @@ mod frozen_linear_term_mass_rebuild_tests {
             }],
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
+            level: Default::default(),
         }
     }
 

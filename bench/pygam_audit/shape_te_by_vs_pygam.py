@@ -82,7 +82,7 @@ def _timed_gamfit(fit: Callable[[], T]) -> tuple[T | None, float]:
     t0 = time.perf_counter()
     try:
         values = fit()
-    except gamfit.RemlConvergenceError as err:
+    except gamfit.errors.RemlConvergenceError as err:
         print(f"  gamfit refused: {str(err).splitlines()[0][:160]}")
         values = None
     return values, time.perf_counter() - t0

@@ -3,7 +3,7 @@
 numpy is gamfit's only dependency, so a pandas frame must fit without pyarrow;
 polars frames cross through their own Arrow C stream; and every untyped input
 (dict, records, rows, object columns) shares one inference rule and one error
-type, ``gamfit.DataError``, naming the column and row of a bad value.
+type, ``gamfit.errors.DataError``, naming the column and row of a bad value.
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ def test_pandas_missing_cells_are_preserved_until_a_term_consumes_them() -> None
     )
     model = gamfit.fit(frame, "y ~ x")
     assert np.all(np.isfinite(model.predict(frame)))
-    with pytest.raises(gamfit.DataError, match="row 2"):
+    with pytest.raises(gamfit.errors.DataError, match="row 2"):
         gamfit.fit(frame, "y ~ x + unused_int")
 
 
@@ -167,7 +167,7 @@ def test_polars_numeric_string_labels_stay_categorical() -> None:
 def test_unsupported_values_raise_data_error_naming_column_and_row(
     label: str, table, type_name: str, row: int
 ) -> None:
-    with pytest.raises(gamfit.DataError) as caught:
+    with pytest.raises(gamfit.errors.DataError) as caught:
         normalize_table(table)
     message = str(caught.value)
     assert f"at row {row}, column 'g'" in message, message
@@ -188,7 +188,7 @@ def test_unsupported_values_raise_data_error_naming_column_and_row(
     ids=["numpy-ns", "numpy-day", "numpy-timedelta", "numpy-complex", "pandas-datetime", "pandas-timedelta"],
 )
 def test_a_declared_dtype_that_is_not_numbers_or_labels_is_a_data_error(table) -> None:
-    with pytest.raises(gamfit.DataError, match="unsupported column dtype .* for column 'g'"):
+    with pytest.raises(gamfit.errors.DataError, match="unsupported column dtype .* for column 'g'"):
         normalize_table(table)
 
 
@@ -203,7 +203,7 @@ def test_a_declared_dtype_that_is_not_numbers_or_labels_is_a_data_error(table) -
     ids=["dict", "pandas", "pandas-categorical", "polars"],
 )
 def test_a_whitespace_label_is_the_same_data_error_from_every_library(table) -> None:
-    with pytest.raises(gamfit.DataError, match="row 2, column 'g'"):
+    with pytest.raises(gamfit.errors.DataError, match="row 2, column 'g'"):
         normalize_table(table)
 
 
@@ -222,7 +222,7 @@ def test_padded_labels_are_the_same_levels_from_every_library() -> None:
 
 def test_unsupported_arrow_column_type_is_a_data_error() -> None:
     frame = pl.DataFrame({"g": [datetime.date(2020, 1, 1)] * 2})
-    with pytest.raises(gamfit.DataError, match="column 'g'"):
+    with pytest.raises(gamfit.errors.DataError, match="column 'g'"):
         normalize_table(frame)
 
 

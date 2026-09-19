@@ -132,11 +132,13 @@ fn build_clean_cohort(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec)
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![make_bspline("f_marginal", 6)],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![make_bspline("f_slope", 5)],
+        level: Default::default(),
     };
 
     let spec = BernoulliMarginalSlopeTermSpec {

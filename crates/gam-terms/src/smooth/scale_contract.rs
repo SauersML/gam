@@ -1695,6 +1695,7 @@ mod tests {
                 shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
 
         let error = frozen

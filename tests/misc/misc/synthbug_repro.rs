@@ -174,6 +174,7 @@ fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
         ],
         random_effect_terms: vec![],
         smooth_terms: vec![duchon_term],
+        level: Default::default(),
     };
 
     let err = build_term_collection_design(data.view(), &spec)

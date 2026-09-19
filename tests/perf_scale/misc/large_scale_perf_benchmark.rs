@@ -370,6 +370,7 @@ fn te_xh_design_spec(
             shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

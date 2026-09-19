@@ -70,7 +70,7 @@ def certify(gamfit, X, t, B, lam=0.0, assignment="softmax", order=1):
         kw["top_k"] = 1
     t0 = time.perf_counter()
     try:
-        rep = gamfit.sae_manifold_certify_external(np.ascontiguousarray(X), **kw)
+        rep = gamfit.sae.sae_manifold_certify_external(np.ascontiguousarray(X), **kw)
         ik = rep.get("inner_kkt") or {}
         return {
             "status": rep.get("status"),

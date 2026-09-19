@@ -102,6 +102,7 @@ fn survival_static_spatial_psi_blocks_match_shared_engine() {
             shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let base_design =

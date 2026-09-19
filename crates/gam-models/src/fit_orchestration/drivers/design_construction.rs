@@ -4488,6 +4488,7 @@ mod refit_seed_2902_tests {
                 shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let family = LikelihoodSpec::new(
             ResponseFamily::Poisson,

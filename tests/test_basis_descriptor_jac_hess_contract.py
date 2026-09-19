@@ -83,13 +83,13 @@ def _check_hessian(spec: Any, coords: list[torch.Tensor]) -> None:
 
 def _bspline_1d() -> tuple[Any, list[torch.Tensor]]:
     knots = np.linspace(0.0, 1.0, 8 + 2 * 3)
-    spec = gamfit.BSpline(knots=knots, degree=3, periodic=False)
+    spec = gamfit.smooth.BSpline(knots=knots, degree=3, periodic=False)
     x = torch.linspace(0.1, 0.9, 11, dtype=torch.float64)
     return spec, [x]
 
 
 def _periodic_bspline_1d() -> tuple[Any, list[torch.Tensor]]:
-    spec = gamfit.BSpline(knots=10, degree=3, periodic=True)
+    spec = gamfit.smooth.BSpline(knots=10, degree=3, periodic=True)
     x = torch.linspace(0.05, 0.95, 11, dtype=torch.float64)
     spec.evaluate(x)  # let auto-knots resolve, if needed
     return spec, [x]
@@ -98,7 +98,7 @@ def _periodic_bspline_1d() -> tuple[Any, list[torch.Tensor]]:
 def _matern_2d() -> tuple[Any, list[torch.Tensor]]:
     rng = np.random.default_rng(0)
     centers = rng.standard_normal((6, 2))
-    spec = gamfit.Matern(centers=centers, nu=1.5, length_scale=0.5)
+    spec = gamfit.smooth.Matern(centers=centers, nu=1.5, length_scale=0.5)
     pts = rng.standard_normal((7, 2))
     x = torch.tensor(pts[:, 0], dtype=torch.float64)
     y = torch.tensor(pts[:, 1], dtype=torch.float64)
@@ -107,7 +107,7 @@ def _matern_2d() -> tuple[Any, list[torch.Tensor]]:
 
 def _duchon_1d() -> tuple[Any, list[torch.Tensor]]:
     centers = np.linspace(0.0, 1.0, 6).reshape(-1, 1)
-    spec = gamfit.Duchon(centers=centers, m=2)
+    spec = gamfit.smooth.Duchon(centers=centers, m=2)
     x = torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
     return spec, [x]
 
@@ -119,7 +119,7 @@ def _sphere() -> tuple[Any, list[torch.Tensor]]:
     centers = np.array(
         [[0.5, 0.1], [-0.4, 1.2], [1.2, 2.9], [0.05, -1.3], [-1.0, 2.2], [0.8, -2.6]]
     )
-    spec = gamfit.Sphere(centers=centers, penalty_order=2, kernel="sobolev", radians=True)
+    spec = gamfit.smooth.Sphere(centers=centers, penalty_order=2, kernel="sobolev", radians=True)
     # Stay away from poles and the seam.
     lat = torch.linspace(0.2, 1.0, 8, dtype=torch.float64)
     lon = torch.linspace(0.3, 2.5, 8, dtype=torch.float64)
@@ -127,16 +127,16 @@ def _sphere() -> tuple[Any, list[torch.Tensor]]:
 
 
 def _periodic_curve() -> tuple[Any, list[torch.Tensor]]:
-    spec = gamfit.PeriodicSplineCurve(n_knots=10, degree=3, output_dim=1)
+    spec = gamfit.smooth.PeriodicSplineCurve(n_knots=10, degree=3, output_dim=1)
     t = torch.linspace(0.05, 0.95, 11, dtype=torch.float64)
     return spec, [t]
 
 
 def _tensor_bspline_open() -> tuple[Any, list[torch.Tensor]]:
-    spec = gamfit.TensorBSpline(
+    spec = gamfit.smooth.TensorBSpline(
         marginals=[
-            gamfit.BSpline(knots=8, degree=3, periodic=False),
-            gamfit.BSpline(knots=6, degree=3, periodic=False),
+            gamfit.smooth.BSpline(knots=8, degree=3, periodic=False),
+            gamfit.smooth.BSpline(knots=6, degree=3, periodic=False),
         ]
     )
     x = torch.linspace(0.1, 0.9, 9, dtype=torch.float64)
@@ -161,7 +161,7 @@ def _torus() -> tuple[Any, list[torch.Tensor]]:
 def _pca() -> tuple[Any, list[torch.Tensor]]:
     rng = np.random.default_rng(0)
     basis = rng.standard_normal((5, 3))
-    spec = gamfit.Pca(basis=basis)
+    spec = gamfit.smooth.Pca(basis=basis)
     coords = [
         torch.tensor(rng.standard_normal(6), dtype=torch.float64) for _ in range(5)
     ]

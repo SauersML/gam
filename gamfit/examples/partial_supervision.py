@@ -8,7 +8,7 @@ the Rust checks, and result wrapping into the :class:`PartialSupervisionFit`
 dataclass.
 
 Color-specific auxiliaries (HSV/RGB/LCh) reuse the existing
-:class:`gamfit.GaugeCompanion` scorer; its loss is also a Rust pyfunction
+:class:`gamfit.sae.GaugeCompanion` scorer; its loss is also a Rust pyfunction
 (``equivariant_gauge_companion_loss``).
 """
 
@@ -57,7 +57,7 @@ class PartialSupervisionFit:
     map_b : ndarray | None
         Anchor affine intercept. ``None`` for the other methods.
     aux_score : float | None
-        Optional :class:`gamfit.GaugeCompanion` loss when a color
+        Optional :class:`gamfit.sae.GaugeCompanion` loss when a color
         auxiliary was supplied; ``None`` otherwise.
     warnings : list[str]
         Identifiability-theorem precondition issues from

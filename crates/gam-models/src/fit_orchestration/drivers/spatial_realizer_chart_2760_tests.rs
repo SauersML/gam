@@ -76,6 +76,7 @@ mod spatial_realizer_chart_2760_tests {
                 shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 
@@ -103,6 +104,7 @@ mod spatial_realizer_chart_2760_tests {
                 shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 

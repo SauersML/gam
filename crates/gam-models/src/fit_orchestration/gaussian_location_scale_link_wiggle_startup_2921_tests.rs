@@ -112,6 +112,7 @@ fn termspec(request: Request) -> TermCollectionSpec {
             joint_null_rotation: None,
             frozen_parametric_residualization: None,
         }],
+        level: Default::default(),
     }
 }
 

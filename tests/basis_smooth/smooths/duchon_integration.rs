@@ -93,6 +93,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
             shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let weights = Array1::ones(n);
@@ -223,6 +224,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
             shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let weights = Array1::ones(n);
@@ -374,6 +376,7 @@ fn duchon_2d_scale_dimensions_does_not_abort_on_clean_data_issue_382() {
             shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     // This is the Rust core behind gamfit's `scale_dimensions=True` kwarg.

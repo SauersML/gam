@@ -109,6 +109,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let design = build_term_collection_design(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));

@@ -35,7 +35,7 @@
 //! `d ∈ {2, 4, 8}`.
 //!
 //! No data-driven fitting is involved; this checks the manifold primitives that
-//! back `gamfit.PoincareAtoms` against their defining geometric axioms.
+//! back `gamfit.torch.PoincareAtoms` against their defining geometric axioms.
 
 use gam::geometry::poincare::{exp_origin, log_origin, poincare_distance};
 use gam::test_support::reference::{Column, QualityPair, max_abs_diff, relative_l2, run_python};
