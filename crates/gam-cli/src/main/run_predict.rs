@@ -1502,7 +1502,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
         return run_predict_multinomial(&args).map_err(CliError::from);
     }
     let phase_start = std::time::Instant::now();
-    let model = SavedModel::load_from_path(&args.model)?;
+    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
     log::debug!(
         "[PHASE] predict load-model done elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
