@@ -73,8 +73,6 @@ def _payload(**overrides: typing.Any) -> dict[str, typing.Any]:
         ("noise_offset", "logvar"),
         ("flexible_link", True),
         ("survival_time_anchor", 25.0),
-        ("outer_tol", 1e-8),
-        ("inner_tol", 1e-9),
     ],
 )
 def test_model_spec_kwarg_sets_its_request_key(kwarg: str, value: typing.Any) -> None:
@@ -86,8 +84,6 @@ def test_model_spec_kwarg_sets_its_request_key(kwarg: str, value: typing.Any) ->
     [
         ("noise_formula", "noise_formula"),
         ("flexible_link", "flexible_link"),
-        ("outer_tol", "outer_tol"),
-        ("inner_tol", "inner_tol"),
         ("family", "family"),
         ("offset", "offset"),
         ("weights", "weights"),
@@ -132,8 +128,6 @@ def test_unset_model_spec_kwargs_emit_no_config_keys() -> None:
         "noise_offset",
         "flexible_link",
         "survival_time_anchor",
-        "outer_tol",
-        "inner_tol",
     ):
         assert key not in payload
 
@@ -144,22 +138,18 @@ def test_fit_refuses_config_spelling_before_fitting() -> None:
         gamfit.fit(data, "y ~ x", family="gaussian", config={"noise_formula": "x"})
 
 
-def test_solver_tolerances_reach_the_rust_request() -> None:
-    """``outer_tol`` / ``inner_tol`` travel the wire to the route that runs.
+def test_solver_tolerances_are_not_request_options() -> None:
+    """Solver tolerances are derived (gam SPEC 18-23), never requested.
 
-    A standard Gaussian fit takes ``outer_tol`` as its REML tolerance. Its PIRLS
-    has no inner tolerance, so ``inner_tol`` is refused by name there. That
-    refusal can only come from the Rust materializer, so it proves the key
-    crossed the wire.
+    The request document refuses the keys by name, so ``config`` cannot carry
+    one either.
     """
 
     pytest.importorskip("gamfit._rust")
     data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
-    gamfit.fit(data, "y ~ x", family="gaussian", outer_tol=1e-8)
-    with pytest.raises(Exception, match=r"inner_tol"):
-        gamfit.fit(data, "y ~ x", family="gaussian", inner_tol=1e-9)
-    with pytest.raises(Exception, match=r"outer_tol must be finite and > 0"):
-        gamfit.fit(data, "y ~ x", family="gaussian", outer_tol=0.0)
+    for key in ("outer_tol", "inner_tol"):
+        with pytest.raises(Exception, match=rf"unknown field `{key}`"):
+            gamfit.fit(data, "y ~ x", family="gaussian", config={key: 1e-8})
 
 
 def test_warm_start_from_takes_a_fitted_model() -> None:

@@ -153,8 +153,6 @@ def _fully_populated_payload() -> dict[str, typing.Any]:
             "noise_formula": "s(x)",
             "noise_offset": "logvar",
             "flexible_link": True,
-            "outer_tol": 1e-8,
-            "inner_tol": 1e-9,
             "precision_hyperpriors": {"block": {"shape": 2.0, "rate": 1.0}},
             "latents": {"u": _Latent()},
             "penalties": [{"kind": "ard", "target": "u"}],
