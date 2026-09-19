@@ -2070,8 +2070,8 @@ fn a_shared_constant_is_certified_on_its_slice_2576() {
         moved.penalized_objective(target.view(), &lambda, &ard).expect("moved objective");
     let resolution = term.objective_descent_resolution(objective);
     println!(
-        "[#2576 shared constant] ‖A ξ̂‖ {residual:.3e}, band {band:.3e}, spectrum {:.3e} .. {:.3e}; \
-         objective change under a 0.3 move {:.3e} (band {resolution:.3e})",
+        "[#2576 shared constant] ‖A ξ̂‖ {residual:.3e}, band {band:.3e}, spectrum {:.3e} .. \
+         {:.3e}; objective change under a 0.3 move {:.3e} (band {resolution:.3e})",
         values[0],
         values[1],
         moved_objective - objective
@@ -2103,4 +2103,67 @@ fn a_shared_constant_is_certified_on_its_slice_2576() {
         .support_exact_symmetry_generators(&odd_ard, &odd_offsets, odd_beta_dim)
         .expect("generators");
     assert!(odd_generators.is_empty(), "an odd co-selection cycle admits no shared constant");
+}
+
+/// #2576 — a symmetry the certificate is not given is refused, never certified over. At
+/// the converged states of the two symmetric fixtures, the certificate on the slice of
+/// their declared generators certifies, and the same certificate given no generators
+/// refuses on its factorization: the rotation (`support_outer_fixture_2933`) and the
+/// shared constant (`constant_redistribution_fixture_2576`) leave `A` singular, so no
+/// `A − μ·I ≻ 0` exists without their quotient.
+#[test]
+fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
+    let rotation = support_outer_fixture_2933();
+    let shared = constant_redistribution_fixture_2576(2, &[[0, 1]; 8]);
+    for (name, (mut term, target, lambda, ard), tolerance) in [
+        ("rotation", rotation, 1.0e-9),
+        ("shared constant", shared, f64::NAN),
+    ] {
+        let tolerance = if tolerance.is_nan() { term.fixed_point_tolerance() } else { tolerance };
+        term.solve_fixed_point(target.view(), &lambda, &ard, tolerance, 1.0)
+            .expect("the symmetric fixture certifies on the slice of its declared symmetry");
+        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
+        let bound = tolerance * parameter_scale;
+        let (newton, _) = term
+            .exact_newton_solve(target.view(), &lambda, &ard)
+            .expect("exact Newton displacement");
+        let (offsets, beta_dim) = term.beta_layout().expect("beta layout");
+        let generators = term
+            .support_exact_symmetry_generators(&ard, &offsets, beta_dim)
+            .expect("generators");
+        assert!(!generators.is_empty(), "{name}: the fixture declares its symmetry");
+        let admitted = term
+            .support_kantorovich_certificate_on_slice(
+                target.view(),
+                &lambda,
+                &ard,
+                &newton,
+                bound,
+                &generators,
+            )
+            .expect("certificate on the declared slice");
+        assert!(
+            matches!(admitted, SupportKantorovichVerdict::Certified { .. }),
+            "{name}: the declared quotient certifies: {admitted:?}"
+        );
+        match term
+            .support_kantorovich_certificate_on_slice(
+                target.view(),
+                &lambda,
+                &ard,
+                &newton,
+                bound,
+                &[],
+            )
+            .expect("certificate without the quotient")
+        {
+            SupportKantorovichVerdict::NotCertified(reason) => assert!(
+                reason.contains("not certified at μ"),
+                "{name}: the refusal must come from the factorization of the singular A: {reason}"
+            ),
+            verdict => {
+                panic!("{name}: a symmetry the certificate is not given must refuse: {verdict:?}")
+            }
+        }
+    }
 }

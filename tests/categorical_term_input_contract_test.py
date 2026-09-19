@@ -1,7 +1,7 @@
 """Input contracts for categorical columns (pyGAM audit F2, F3).
 
-Every categorical spelling (a bare ``+ g``, ``factor(g)``, ``C(g)``,
-``group(g)``, ``re(g)``) builds one coefficient per level under a ridge whose
+Every categorical spelling (a bare ``+ g``, ``factor(g)``, ``group(g)``,
+``re(g)``) builds one coefficient per level under a ridge whose
 strength REML estimates, so the model can recover the null of no level effect.
 Two input contracts keep categorical columns out of the wrong terms:
 
@@ -10,7 +10,9 @@ Two input contracts keep categorical columns out of the wrong terms:
   ``factor()``/``group()`` instead of fitting the level codes as positions on
   a line (F2);
 * the categorical wrappers take no options, so a typo such as
-  ``factor(g, foo=1)`` is an error instead of being silently ignored (F3).
+  ``factor(g, foo=1)`` is an error instead of being silently ignored (F3);
+* ``factor(g)`` is the one level-effect spelling: ``C(g)`` is refused with a
+  pointer to it rather than kept as a second name.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ def _g_block(model: Any) -> Any:
     return blocks[0]
 
 
-@pytest.mark.parametrize("formula", ["y ~ g", "y ~ factor(g)", "y ~ C(g)", "y ~ group(g)", "y ~ re(g)"])
+@pytest.mark.parametrize("formula", ["y ~ g", "y ~ factor(g)", "y ~ group(g)", "y ~ re(g)"])
 def test_every_categorical_spelling_is_a_reml_penalized_level_block(formula: str) -> None:
     model = gamfit.fit(_gaussian_frame(seed=1), formula)
     block = _g_block(model)
@@ -87,3 +89,8 @@ def test_categorical_column_in_a_numeric_axis_term_is_refused(formula: str) -> N
 def test_categorical_wrappers_reject_unknown_options(formula: str) -> None:
     with pytest.raises(gamfit.errors.FormulaError, match="does not accept option"):
         gamfit.fit(_gaussian_frame(seed=3), formula)
+
+
+def test_capital_c_is_refused_with_a_pointer_to_factor() -> None:
+    with pytest.raises(gamfit.errors.FormulaError, match=r"`C\(\)` is not a term function.*factor\(g\)"):
+        gamfit.fit(_gaussian_frame(seed=4), "y ~ C(g)")

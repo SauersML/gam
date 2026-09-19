@@ -634,8 +634,6 @@ pub fn build_termspec(
                             random_terms.push(RandomEffectTermSpec {
                                 name: name.clone(),
                                 feature_col: col,
-                                drop_first_level: false,
-                                penalized: true,
                                 frozen_levels: None,
                                 // A BARE categorical main effect (`+ g`) is a FIXED
                                 // parametric factor. Although it is auto-promoted to
@@ -690,8 +688,6 @@ pub fn build_termspec(
                 random_terms.push(RandomEffectTermSpec {
                     name: name.clone(),
                     feature_col: col,
-                    drop_first_level: false,
-                    penalized: true,
                     frozen_levels: None,
                     // Unseen-level policy is fixed by the wrapper the user wrote
                     // (`formula_dsl`): a genuine random effect
@@ -803,12 +799,11 @@ pub fn build_termspec(
                             // `+ factor` does — the latter is auto-promoted to a
                             // penalized random-effect block (see the
                             // `ParsedTerm::Linear` / `ColumnKindTag::Categorical`
-                            // arm above, `penalized: true`). Both representations
-                            // carry the same per-level offsets, so #1457: the
-                            // `by=` branch must NOT additionally add its own
-                            // unpenalized treatment-coded main effect, which would
-                            // double-represent the factor (two `g` design blocks +
-                            // a spurious extra smoothing parameter).
+                            // arm above). Both representations carry the same
+                            // per-level offsets, so #1457: the `by=` branch must
+                            // NOT additionally add its own main effect, which
+                            // would double-represent the factor (two `g` design
+                            // blocks + a spurious extra smoothing parameter).
                             let penalized_group_owner_present =
                                 terms.iter().any(|other| match other {
                                     ParsedTerm::RandomEffect { name, .. } => name == &by_name,
@@ -839,12 +834,10 @@ pub fn build_termspec(
                                 random_terms.push(RandomEffectTermSpec {
                                     name: by_name.clone(),
                                     feature_col: by_col,
-                                    drop_first_level: false,
-                                    penalized: true,
                                     frozen_levels: None,
-                                    // A FIXED factor main effect, like a bare `+ g`:
-                                    // an unseen level is out of contract and must
-                                    // raise, not center (#2102).
+                                    // Strict like a bare `+ g`: an unseen level is
+                                    // out of contract and must raise, not center
+                                    // (#2102).
                                     lenient_unseen: false,
                                 });
                             }
