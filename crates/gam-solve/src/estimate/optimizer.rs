@@ -1143,17 +1143,24 @@ where
     // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
     // from the conditioned design's Gram on that penalty's columns and the
     // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20).
+    let rho_resolvability =
+        crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
+            w_o.view(),
+            &x_fit,
+            canonical_shared.as_slice(),
+        )
+        .map_err(EstimationError::LayoutError)?;
+    // The domain is a numerical device, not the prior: the ρ-posterior
+    // integrates over all of ℝ^K and continues the criterion past each
+    // saturated face (#2812).
+    let rho_continuation = rho_resolvability.continuation();
     let crate::estimate::rho_domain::ResolvabilityDomain {
         lower: rho_domain_lower,
         upper: rho_domain_upper,
         lower_is_limit: rho_lower_is_limit,
         upper_is_limit: rho_upper_is_limit,
-    } = crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
-        w_o.view(),
-        &x_fit,
-        canonical_shared.as_slice(),
-    )
-    .map_err(EstimationError::LayoutError)?;
+        ..
+    } = rho_resolvability;
     let mut reml_state = RemlState::newwith_offset_shared(
         reml_y_view,
         x_fit,
@@ -3575,8 +3582,11 @@ where
         // K≤16, honest Unavailable beyond) at this same live seam.
         (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
             &final_rho,
-            // The searched and certified box is the posterior's support.
-            &rho_model_domain,
+            // The box is where λ is numerically resolvable, not the
+            // posterior's support: a draw past a saturated face is valued by
+            // the criterion's exact affine limit from that face, so no
+            // posterior mass is dropped when the box edge moves.
+            &rho_continuation,
             !opts.skip_rho_posterior_inference,
             None,
         );

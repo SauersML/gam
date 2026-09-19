@@ -139,22 +139,25 @@ pub struct ConstraintKktDiagnostics {
     /// refusal says nothing was measured at all.
     #[serde(default)]
     pub cone_projection_refused: bool,
-    /// Inf-norm of the (raw, unprojected) gradient at `beta`, `‖gradient‖∞` —
-    /// the natural scale of the stationarity residual. A converged constrained
-    /// optimum drives `stationarity = ‖grad − Aᵀλ‖∞` to zero *relative to* this
-    /// scale, not to a fixed absolute floor: the profiled REML latent objective
-    /// carries an O(n) gradient magnitude even at a genuine stationary point
-    /// (issue #879), so a bare absolute stationarity gate is unreachable there
-    /// by construction. The inner active-set solver already certifies
-    /// convergence on the scale-invariant ratio
-    /// `stationarity / max(gradient_scale, 1)` (its `stationarity_rel` path
-    /// against `ACTIVE_SET_KKT_STATIONARITY_TOL`); the outer validation gate
-    /// [`crate::estimate::reml::outer_eval`]`::enforce_constraint_kkt` consults this
-    /// field to apply the identical relative test, so the two stop on the same
-    /// contract instead of the gate spuriously aborting a constrained optimum
-    /// the solver legitimately reached (issue #989). Defaults to `0.0` when
-    /// deserialized from a model saved before this field existed, which makes
-    /// `max(gradient_scale, 1) = 1` and recovers the bare absolute test.
+    /// The natural scale of the gradient at `beta`: the magnitude of the
+    /// operands whose cancellation forms it (for a P-IRLS gradient
+    /// `g = S_λβ − score`, `‖score‖₂ + ‖S_λβ‖₂`), supplied by the caller that
+    /// formed `g`. Every gradient-unit channel (stationarity, a negative
+    /// multiplier, `|λ·slack|`) is certified relative to this scale and only
+    /// relative to it ([`exceeds_at_gradient_scale`]).
+    ///
+    /// The scale is the OPERANDS', not `‖g‖∞` itself: rescaling the objective
+    /// by `c` scales the operands, `g` and `λ` by `c` and leaves the minimizer
+    /// unchanged, so the ratio is invariant, and it stays small at a genuine
+    /// optimum where `g` cancels. `‖g‖∞` would read the ratio of an interior
+    /// optimum's own gradient to itself, `1`. A converged constrained optimum
+    /// of the profiled REML latent objective carries an O(n) residual (issue
+    /// #879), so no absolute bar is reachable there; the inner solver and the
+    /// outer validation gate
+    /// [`crate::estimate::reml::outer_eval`]`::enforce_constraint_kkt` read this
+    /// one field, so the two stop on the same contract (issue #989). Defaults
+    /// to `0.0` when deserialized from a model saved before this field existed,
+    /// which certifies only an exactly zero residual.
     #[serde(default)]
     pub gradient_scale: f64,
 }
@@ -188,9 +191,7 @@ impl ConstraintKktDiagnostics {
     }
 }
 
-/// Inf-norm `‖g‖∞` used as the scale of the stationarity residual in the
-/// relative KKT criterion shared by the inner active-set solver and the outer
-/// validation gate (see [`ConstraintKktDiagnostics::gradient_scale`]).
+/// Inf-norm `‖v‖∞`, the norm every KKT residual is measured in.
 fn gradient_inf_norm(gradient: &Array1<f64>) -> f64 {
     gradient.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
 }
@@ -539,9 +540,23 @@ pub(crate) fn active_face(
     })
 }
 
+/// Primal feasibility `max_i max(−s_i, 0)` of `beta` on unit-normalized rows,
+/// the one KKT channel that needs no gradient. Infinite when `beta` does not
+/// match the constraint width, so a mismatch is never feasible.
+pub(crate) fn constraint_primal_feasibility(
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+) -> f64 {
+    active_face(beta, constraints).map_or(f64::INFINITY, |face| face.primal_feasibility)
+}
+
+/// KKT diagnostics of `(beta, gradient)` on `constraints`. `gradient_scale` is
+/// the natural scale of `gradient`, the magnitude of the operands that formed
+/// it; see [`ConstraintKktDiagnostics::gradient_scale`].
 pub(crate) fn compute_constraint_kkt_diagnostics(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
+    gradient_scale: f64,
     constraints: &LinearInequalityConstraints,
 ) -> ConstraintKktDiagnostics {
     let m = constraints.a.nrows();
@@ -562,7 +577,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     else {
         // `beta` does not match the constraint system's coefficient width. No
         // face can be formed, so no KKT claim can be made: report the raw
-        // gradient scale and an empty active set rather than inventing one.
+        // gradient and an empty active set rather than inventing one.
         return ConstraintKktDiagnostics {
             n_constraints: m,
             n_active: 0,
@@ -573,7 +588,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
             active_tolerance,
             working_set_rank_deficient: false,
             cone_projection_refused: false,
-            gradient_scale: gradient_inf_norm(gradient),
+            gradient_scale,
         };
     };
 
@@ -650,7 +665,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
         active_tolerance,
         working_set_rank_deficient,
         cone_projection_refused,
-        gradient_scale: gradient_inf_norm(gradient),
+        gradient_scale,
     }
 }
 
@@ -3085,13 +3100,12 @@ fn scan_operator_violations(
 /// the returned minimizer is a function of `(H, rhs, A, b)` alone, so warm-start
 /// history can change how fast this solve runs but never what it returns.
 /// The two dual KKT channels of the metric projection, judged in the same
-/// units as its stationarity channel: a channel is violated only when it
-/// exceeds its tolerance both absolutely AND relative to `gradient_scale`
-/// (`max(1, ‖g‖∞)`). The multipliers solve `g − A_Aᵀμ = 0` on unit rows, so
-/// they carry the gradient's scale and so does `|μ·slack|`; an absolute bar
-/// alone refused every high-λ seed of the survival location-scale fits at
-/// `|μ·slack| ≈ 1e-6` from a `1e-15` roundoff slack under `‖g‖∞ ≈ 2e9`
-/// (gam#2695, gam#2714).
+/// units as its stationarity channel: relative to `gradient_scale`, the
+/// natural scale of the gradient ([`exceeds_at_gradient_scale`]). The
+/// multipliers solve `g − A_Aᵀμ = 0` on unit rows, so they carry the
+/// gradient's scale and so does `|μ·slack|`; an absolute bar refused every
+/// high-λ seed of the survival location-scale fits at `|μ·slack| ≈ 1e-6` from
+/// a `1e-15` roundoff slack under `‖g‖∞ ≈ 2e9` (gam#2695, gam#2714).
 pub(crate) fn kkt_dual_channel_violations(
     dual_violation: f64,
     complementarity: f64,
@@ -3104,20 +3118,22 @@ pub(crate) fn kkt_dual_channel_violations(
 }
 
 /// Whether a gradient-unit KKT residual (stationarity `‖g − Aᵀλ‖∞`, a negative
-/// multiplier, or `|λ·slack|`) exceeds `tolerance` both absolutely AND relative
-/// to the gradient scale `max(1, ‖g‖∞)`.
+/// multiplier, or `|λ·slack|`) exceeds `tolerance` relative to `gradient_scale`,
+/// the natural scale of the gradient: the magnitude of the operands whose
+/// cancellation forms it ([`ConstraintKktDiagnostics::gradient_scale`]).
 ///
-/// All three channels carry the gradient's units: rescaling the response
-/// `y → c·y` scales `g`, `λ` and therefore every one of these residuals by `c`
-/// (or `c²` for a Gaussian deviance) while leaving the constrained minimizer's
-/// geometry unchanged. The relative branch is what makes the verdict invariant
-/// under that rescale; the `max(1, ·)` floor keeps a vanishing gradient from
-/// turning roundoff into a violation. This is the one contract the inner
-/// active-set solver and the outer REML startup gate both judge by, so a point
-/// the solver certifies is never one the gate then refuses. A non-finite
-/// residual is never within tolerance.
+/// All three channels carry the gradient's units: rescaling the objective by
+/// `c` (a response rescale `y → c·y` does, by `c` or `c²`) scales the operands,
+/// `g`, `λ` and therefore every one of these residuals by `c` while leaving the
+/// constrained minimizer unchanged. The verdict is the ratio alone, so it is
+/// the same at every such `c`; an absolute branch or a floor on the scale
+/// would give a unit-dependent verdict for any objective whose scale crosses
+/// it. This is the one contract the inner active-set solver and the outer REML
+/// startup gate both judge by, so a point the solver certifies is never one
+/// the gate then refuses. A non-finite residual or scale is never within
+/// tolerance.
 pub(crate) fn exceeds_at_gradient_scale(residual: f64, tolerance: f64, gradient_scale: f64) -> bool {
-    !(residual <= tolerance || residual / gradient_scale.max(1.0) <= tolerance)
+    !(gradient_scale.is_finite() && residual <= tolerance * gradient_scale)
 }
 
 /// The part of the metric projection's stationarity residual above what its
@@ -3566,12 +3582,19 @@ fn solve_operator_metric_projection_dual_active_set(
         (residual, complementarity, dual_violation)
     };
     let stationarity = gradient_inf_norm(&residual);
-    let gradient_scale = gradient_inf_norm(&gradient).max(1.0);
+    // The gradient `Hβ − rhs` is a cancellation of its two operands, and their
+    // magnitude is its natural scale: scaling the objective by `c` scales `H`,
+    // `rhs`, `g` and `μ` by `c` and leaves `β` alone, so every residual below is
+    // judged by a ratio that `c` does not move. `‖g‖∞` itself is no such scale,
+    // since it vanishes at the very optimum this certifies.
+    let gradient_scale = gradient_inf_norm(&hessian.dot(&candidate)) + gradient_inf_norm(rhs);
     // A residual that no evaluation of its own operands can resolve is not
     // evidence against the face (#1561): only the part above that floor counts.
-    let roundoff = if stationarity > ACTIVE_SET_KKT_STATIONARITY_TOL
-        && stationarity / gradient_scale > ACTIVE_SET_KKT_STATIONARITY_TOL
-    {
+    let roundoff = if exceeds_at_gradient_scale(
+        stationarity,
+        ACTIVE_SET_KKT_STATIONARITY_TOL,
+        gradient_scale,
+    ) {
         let rows = if active_ids.is_empty() {
             None
         } else {
@@ -3598,8 +3621,7 @@ fn solve_operator_metric_projection_dual_active_set(
         None
     };
     if let Some(roundoff) = roundoff
-        && roundoff.excess > ACTIVE_SET_KKT_STATIONARITY_TOL
-        && roundoff.excess / gradient_scale > ACTIVE_SET_KKT_STATIONARITY_TOL
+        && exceeds_at_gradient_scale(roundoff.excess, ACTIVE_SET_KKT_STATIONARITY_TOL, gradient_scale)
     {
         // WHICH of the two things failed is not recoverable from `residual`
         // alone, and they need opposite repairs (#2592).
@@ -3665,7 +3687,7 @@ fn solve_operator_metric_projection_dual_active_set(
     // seed, `β ≈ 1`) has `μ ≈ 1e9` and a roundoff slack of `1e-15` on a
     // certified-active row reads as `|μ·slack| ≈ 1e-6` — the absolute bar,
     // met by exact arithmetic on that very face. Stationarity above is
-    // already judged absolute-OR-relative to `gradient_scale`; the two dual
+    // already judged relative to `gradient_scale`; the two dual
     // channels are certified in the same units so the three KKT residuals
     // share one scale (gam#2695, gam#2714: every seed of the survival
     // location-scale fits was refused here with `dual = 0`, `complementarity
@@ -3940,34 +3962,139 @@ mod tests {
     /// against `‖g‖∞ = 1.52e6`, a relative residual of `6e-11`, and the
     /// absolute `1e-7` gate refused it. The same geometry at every response
     /// scale must get the same verdict, and a residual that is a genuine
-    /// violation relative to the gradient must stay one at every scale whose
-    /// gradient is above the unit floor.
+    /// violation relative to the gradient must stay one at EVERY scale — there
+    /// is no unit floor below which a violation is forgiven.
     #[test]
     fn gradient_unit_kkt_residual_verdict_is_invariant_to_response_scale() {
         use super::exceeds_at_gradient_scale;
         let tolerance = 1.0e-7;
         let (roundoff, gradient) = (9.650e-5_f64, 1.519e6_f64);
-        for scale in [1.0e-6, 1.0e-3, 1.0, 1.0e3, 1.0e6] {
+        let violation = 1.0e-3 * gradient;
+        for scale in [1.0e-12, 1.0e-6, 1.0e-3, 1.0, 1.0e3, 1.0e6, 1.0e12] {
             assert!(
                 !exceeds_at_gradient_scale(roundoff * scale, tolerance, gradient * scale),
                 "scale {scale}: a residual at 6e-11 of the gradient is roundoff, not a violation"
             );
-            let violation = 1.0e-3 * gradient;
-            if gradient * scale >= 1.0 {
-                assert!(
-                    exceeds_at_gradient_scale(violation * scale, tolerance, gradient * scale),
-                    "scale {scale}: a residual at 1e-3 of the gradient is a violation"
-                );
-            }
+            assert!(
+                exceeds_at_gradient_scale(violation * scale, tolerance, gradient * scale),
+                "scale {scale}: a residual at 1e-3 of the gradient is a violation"
+            );
         }
         assert!(
             exceeds_at_gradient_scale(f64::NAN, tolerance, gradient),
             "a non-finite residual is never within tolerance"
         );
         assert!(
-            exceeds_at_gradient_scale(1.0e-6, tolerance, 0.0),
-            "a vanishing gradient does not relax the absolute tolerance"
+            exceeds_at_gradient_scale(1.0e-6, tolerance, f64::NAN),
+            "an unknown scale certifies nothing"
         );
+        assert!(
+            exceeds_at_gradient_scale(1.0e-6, tolerance, f64::INFINITY),
+            "an overflowed scale certifies nothing"
+        );
+        assert!(
+            exceeds_at_gradient_scale(1.0e-300, tolerance, 0.0),
+            "a vanishing scale certifies only an exactly zero residual"
+        );
+        assert!(!exceeds_at_gradient_scale(0.0, tolerance, 0.0));
+    }
+
+    /// Rescaling the objective `½βᵀHβ − rhsᵀβ` by `c` leaves its constrained
+    /// minimizer, its active face and every KKT verdict unchanged, so the
+    /// solver and the diagnostics must decide identically at every `c`. A unit
+    /// floor under the gradient scale broke that: at `c = 1e-6` a genuinely
+    /// non-stationary point whose residual had shrunk below the absolute
+    /// tolerance was certified, and at `c = 1e6` the same point was refused.
+    #[test]
+    fn kkt_decisions_do_not_move_when_the_objective_is_rescaled() {
+        use super::{exceeds_at_gradient_scale, gradient_inf_norm};
+        let hessian = array![
+            [4.0, 1.0, 0.5, 0.0],
+            [1.0, 3.0, 0.25, 0.5],
+            [0.5, 0.25, 2.0, 0.75],
+            [0.0, 0.5, 0.75, 5.0],
+        ];
+        let rhs = array![-2.0, 1.0, -1.5, 3.0];
+        // β₀ ≥ 0, β₀ + β₂ ≥ 0.25, β₃ ≤ 0.4: the free minimizer violates the
+        // first two, so the solved face is non-empty.
+        let constraints = LinearInequalityConstraints::new(
+            array![
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, -1.0],
+            ],
+            array![0.0, 0.25, -0.4],
+        )
+        .expect("constraints");
+        let start = array![1.0, 0.0, 1.0, 0.0];
+
+        let (reference_beta, reference_active) =
+            solve_quadratic_with_linear_constraints(&hessian, &rhs, &start, &constraints, None)
+                .expect("unit-scale solve");
+        assert!(!reference_active.is_empty(), "the fixture must bind a face");
+        let reference_gradient = hessian.dot(&reference_beta) - &rhs;
+        let reference_scale =
+            gradient_inf_norm(&hessian.dot(&reference_beta)) + gradient_inf_norm(&rhs);
+
+        // A point off the optimum, stepped along a free tangent direction of
+        // the reference face: a real stationarity violation at every scale.
+        let off_optimum = &reference_beta + &array![0.0, 1.0e-3, 0.0, 0.0];
+        let off_gradient = hessian.dot(&off_optimum) - &rhs;
+        let off_scale = gradient_inf_norm(&hessian.dot(&off_optimum)) + gradient_inf_norm(&rhs);
+
+        for c in [1.0e-6, 1.0, 1.0e6] {
+            let scaled_hessian = hessian.mapv(|v| v * c);
+            let scaled_rhs = rhs.mapv(|v| v * c);
+            let (beta, mut active) = solve_quadratic_with_linear_constraints(
+                &scaled_hessian,
+                &scaled_rhs,
+                &start,
+                &constraints,
+                None,
+            )
+            .unwrap_or_else(|error| panic!("c = {c}: solve refused: {error}"));
+            let mut expected_active = reference_active.clone();
+            active.sort_unstable();
+            expected_active.sort_unstable();
+            assert_eq!(active, expected_active, "c = {c}: the active face moved");
+            for (got, want) in beta.iter().zip(reference_beta.iter()) {
+                assert_relative_eq!(*got, *want, epsilon = 1e-12, max_relative = 1e-10);
+            }
+
+            let certified = compute_constraint_kkt_diagnostics(
+                &reference_beta,
+                &reference_gradient.mapv(|v| v * c),
+                reference_scale * c,
+                &constraints,
+            );
+            assert!(
+                !exceeds_at_gradient_scale(
+                    certified.stationarity,
+                    super::ACTIVE_SET_KKT_STATIONARITY_TOL,
+                    certified.gradient_scale,
+                ),
+                "c = {c}: the optimum must be certified (stat={:.3e}, scale={:.3e})",
+                certified.stationarity,
+                certified.gradient_scale,
+            );
+
+            let refused = compute_constraint_kkt_diagnostics(
+                &off_optimum,
+                &off_gradient.mapv(|v| v * c),
+                off_scale * c,
+                &constraints,
+            );
+            assert!(
+                exceeds_at_gradient_scale(
+                    refused.stationarity,
+                    super::ACTIVE_SET_KKT_STATIONARITY_TOL,
+                    refused.gradient_scale,
+                ),
+                "c = {c}: a point off the optimum must be refused (stat={:.3e}, scale={:.3e})",
+                refused.stationarity,
+                refused.gradient_scale,
+            );
+        }
     }
 
     /// #2469: a direction joins the active set's Gram–Schmidt bases when
@@ -4342,8 +4469,7 @@ mod tests {
                 least_squares_min_norm_any_shape(&design, &(residual + &tangent_direction))?;
             let scale = residual
                 .iter()
-                .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
-                .max(1.0);
+                .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
             let tol = 100.0 * f64::EPSILON * (p.max(m) as f64) * scale;
             for (position, &row) in tangent_active.iter().enumerate() {
                 let value = solved[position];
@@ -4360,10 +4486,11 @@ mod tests {
             .fold(0.0_f64, |acc, (&left, &right)| {
                 acc.max((left - right).abs())
             });
+        // Relative to the residual being projected, so the oracle's verdict
+        // does not move when the residual is rescaled.
         let scale = residual
             .iter()
-            .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
-            .max(1.0);
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
         if reconstruction_error > 1e-8 * scale || !array_is_finite(&lambda_canonical) {
             return None;
         }
@@ -4991,7 +5118,7 @@ mod tests {
             b: array![0.0, 0.0],
         };
 
-        let finite = compute_constraint_kkt_diagnostics(&beta, &array![1.0, 2.0], &constraints);
+        let finite = compute_constraint_kkt_diagnostics(&beta, &array![1.0, 2.0], 2.0, &constraints);
         assert!(
             !finite.cone_projection_refused,
             "a finite gradient on a full-rank active face must be projected, not refused"
@@ -5003,7 +5130,7 @@ mod tests {
         );
 
         let refused =
-            compute_constraint_kkt_diagnostics(&beta, &array![f64::NAN, 2.0], &constraints);
+            compute_constraint_kkt_diagnostics(&beta, &array![f64::NAN, 2.0], f64::NAN, &constraints);
         assert_eq!(
             refused.n_active, 2,
             "the fixture must reach the projector: an empty active face skips it entirely"
@@ -5043,7 +5170,7 @@ mod tests {
             a: array![[1.0, 0.0]],
             b: array![0.0],
         };
-        let diag_unit = compute_constraint_kkt_diagnostics(&beta_unit, &gradient, &unit);
+        let diag_unit = compute_constraint_kkt_diagnostics(&beta_unit, &gradient, 0.0, &unit);
 
         // Same hyperplane, row scaled ×1000: raw slack would be 2.071e-5, but
         // the *scaled* primal must still equal the geometric distance.
@@ -5052,7 +5179,7 @@ mod tests {
             a: array![[1000.0, 0.0]],
             b: array![0.0],
         };
-        let diag_big = compute_constraint_kkt_diagnostics(&beta_big, &gradient, &big);
+        let diag_big = compute_constraint_kkt_diagnostics(&beta_big, &gradient, 0.0, &big);
 
         assert_relative_eq!(
             diag_unit.primal_feasibility,
@@ -5792,7 +5919,12 @@ mod tests {
             multipliers.iter().all(|&value| value > 0.0),
             "the returned face must carry nonnegative KKT multipliers"
         );
-        let certified = compute_constraint_kkt_diagnostics(&cold, &gradient, &constraints);
+        let certified = compute_constraint_kkt_diagnostics(
+            &cold,
+            &gradient,
+            super::gradient_inf_norm(&gradient),
+            &constraints,
+        );
         assert!(certified.primal_feasibility <= 1e-14);
         assert!(certified.dual_feasibility <= 1e-14);
         assert!(certified.complementarity <= 1e-14);
@@ -6279,13 +6411,18 @@ mod tests {
         assert_eq!(lambda_true.len(), m);
 
         let aligned = a_scaled.t().dot(&lambda_true);
-        let diag = compute_constraint_kkt_diagnostics(&beta, &aligned, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(
+            &beta,
+            &aligned,
+            super::gradient_inf_norm(&aligned),
+            &constraints,
+        );
         assert_eq!(
             diag.n_active, m,
             "an affine β must make every second-difference row tight"
         );
         assert!(
-            diag.stationarity <= 1e-12 * diag.gradient_scale.max(1.0),
+            diag.stationarity <= 1e-12 * diag.gradient_scale,
             "∇f = Aᵀλ with λ ≥ 0 IS the stationarity condition for A β ≥ b; the cone \
              projector must absorb it entirely (stat={:.6e}, ‖g‖∞={:.6e}, active={}/{})",
             diag.stationarity,
@@ -6320,7 +6457,12 @@ mod tests {
         // is what makes the sign hypothesis untenable, and if it ever moves,
         // the reasoning above needs redoing.
         let opposed = aligned.mapv(|v| -v);
-        let flipped = compute_constraint_kkt_diagnostics(&beta, &opposed, &constraints);
+        let flipped = compute_constraint_kkt_diagnostics(
+            &beta,
+            &opposed,
+            super::gradient_inf_norm(&opposed),
+            &constraints,
+        );
         let opposed_scale = opposed.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(
             !flipped.cone_projection_refused,

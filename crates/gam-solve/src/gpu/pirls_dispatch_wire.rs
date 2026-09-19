@@ -538,6 +538,7 @@ mod linux_impl {
             Some(compute_constraint_kkt_diagnostics(
                 &beta,
                 &gradient_total,
+                gradient_natural_scale,
                 lin,
             ))
         } else {
@@ -935,7 +936,12 @@ mod linux_impl {
         };
 
         let constraint_kkt_val = if let Some(lin) = input.linear_constraints.as_ref() {
-            Some(compute_constraint_kkt_diagnostics(&beta, &gradient, lin))
+            Some(compute_constraint_kkt_diagnostics(
+                &beta,
+                &gradient,
+                score_norm + s_beta_norm,
+                lin,
+            ))
         } else {
             None
         };

@@ -3611,7 +3611,7 @@ impl FitConvergenceEvidence {
             evidence.push_str(&format!(
                 "; constrained residual={residual:.6e} decided by {deciding} \
                  (primal={:.6e} dual={:.6e} complementarity={:.6e} stationarity={:.6e}) \
-                 active={}/{} rank_deficient={} gradient_inf={:.6e} \
+                 active={}/{} rank_deficient={} gradient_scale={:.6e} \
                  relative={:.6e} vs tol={tolerance_text}",
                 kkt.primal_feasibility,
                 kkt.dual_feasibility,
