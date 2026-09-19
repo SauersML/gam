@@ -16,6 +16,12 @@ designs `p1`, `p5` and `p20` (additive, `eta = sum_j sin(2 pi x_j + j)/sqrt(p)`)
 plus `te` (`sin(2 pi x0) cos(2 pi x1)` fitted with `te(x0, x1)`). The data
 generators are the audit's own, so the numbers stay comparable with speed.md.
 
+The binomial sweep adds three binomial variants. `binomial_p10` and
+`binomial_p01` shift the intercept so the prevalence is 0.1 and 0.01 (slope 1.5
+on the same `eta`). `binomial_trials` draws 1 to 20 trials per row and fits the
+observed proportion with the trial counts as prior weights, through `weights=`
+in both libraries; its deviance and log score are trial-weighted.
+
 ## Setup
 
 pyGAM is a **bench-only** dependency. It is never a runtime dependency of
@@ -52,6 +58,9 @@ These are the plans (see `plans.py`):
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
+| `binomial_small` | n ∈ {1e2, 1e3}, {`binomial`, `binomial_p10`, `binomial_p01`, `binomial_trials`} × all designs | 3 |
+| `binomial_1e4` | n=1e4, the four binomial variants × all designs | 2 |
+| `binomial_1e5` | n=1e5, the four binomial variants × all designs | 1 |
 | `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
 | `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
 | `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
