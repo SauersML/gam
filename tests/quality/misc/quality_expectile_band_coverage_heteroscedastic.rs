@@ -176,7 +176,6 @@ fn expectile_bands_cover_true_expectile_under_heteroscedastic_noise() {
         edgeworth_one_sided: false,
         boundary_correction: false,
         ood_inflation: false,
-        multi_point_joint: false,
         ..PredictUncertaintyOptions::default()
     };
 

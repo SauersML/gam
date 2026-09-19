@@ -1233,8 +1233,8 @@ mod tests {
             .map(|root| {
                 let rank = root.nrows();
                 CanonicalPenalty {
-                    local: root.t().dot(&root),
-                    root,
+                    local: root.t().dot(&root).into_shared(),
+                    root: root.into_shared(),
                     col_range: 0..p,
                     total_dim: p,
                     nullity: p - rank,
@@ -1296,7 +1296,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p,
                 coefficient_lower_bounds: None,
@@ -1317,7 +1316,7 @@ mod tests {
     #[test]
     pub(crate) fn sparse_native_reparam_preserves_declared_penalty() {
         use gam_terms::construction::{
-            CanonicalPenalty, EngineDims, stable_reparameterization_engine_canonical,
+            CanonicalPenalty, EngineDims, stable_reparameterization_original_frame,
         };
         use ndarray::array;
 
@@ -1325,16 +1324,13 @@ mod tests {
         let root = array![[1.0, 0.0]];
         let canonical = vec![CanonicalPenalty::from_dense_root(root, p)];
         let lambdas = [3.0f64];
-        let base = stable_reparameterization_engine_canonical(
+        let result = stable_reparameterization_original_frame(
             &canonical,
             &lambdas,
             EngineDims::new(p, canonical.len()),
             None,
         )
         .expect("declared penalty must reparameterize");
-        let result = super::loop_driver::build_sparse_native_reparam_result(
-            base, &canonical, &lambdas, p,
-        );
 
         let gram = result.e_transformed.t().dot(&result.e_transformed);
         for (actual, expected) in gram.iter().zip(result.s_transformed.iter()) {
@@ -1397,11 +1393,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -1434,7 +1430,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -1535,11 +1530,11 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let r = array![[1.0]];
         let canonical = vec![gam_terms::construction::CanonicalPenalty {
-            root: r.clone(),
+            root: r.clone().into_shared(),
             col_range: 0..r.ncols(),
             total_dim: r.ncols(),
             nullity: 0,
-            local: r.t().dot(&r),
+            local: r.t().dot(&r).into_shared(),
             prior_mean: Array1::zeros(r.ncols()),
             positive_eigenvalues: Vec::new(),
             op: None,
@@ -1574,7 +1569,6 @@ mod tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 1,
                     coefficient_lower_bounds: None,
@@ -2590,11 +2584,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2627,7 +2621,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -2668,11 +2661,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2705,7 +2698,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -4190,11 +4182,11 @@ mod root_cause_tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -4228,7 +4220,6 @@ mod root_cause_tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 2,
                     coefficient_lower_bounds: None,
@@ -4293,11 +4284,11 @@ mod root_cause_tests {
                 .map(|r| {
                     let local = r.t().dot(r);
                     gam_terms::construction::CanonicalPenalty {
-                        root: r.clone(),
+                        root: r.clone().into_shared(),
                         col_range: 0..r.ncols(),
                         total_dim: r.ncols(),
                         nullity: 0,
-                        local,
+                        local: local.into_shared(),
                         prior_mean: Array1::zeros(r.ncols()),
                         positive_eigenvalues: Vec::new(),
                         op: None,
@@ -4331,7 +4322,6 @@ mod root_cause_tests {
                     },
                     PenaltyConfig {
                         canonical_penalties: &canonical,
-                        balanced_penalty_root: None,
                         reparam_invariant: None,
                         p: 3,
                         coefficient_lower_bounds: None,

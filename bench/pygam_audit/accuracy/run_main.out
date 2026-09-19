@@ -1,0 +1,29 @@
+[run] wage n=3000 gaussian :: y ~ s(year) + s(age) + factor(edu)
+   pygam_default  ok=5/5 dev=1257
+   pygam_grid     ok=5/5 dev=1251
+   gamfit         ok=3/5 dev=1273.2  ERR=['IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain']
+[run] coal n=150 poisson :: y ~ s(year)
+   pygam_default  ok=5/5 dev=1.159
+   pygam_grid     ok=5/5 dev=1.1309
+   gamfit         ok=5/5 dev=1.1754
+[run] faithful n=200 poisson :: y ~ s(erupt)
+   pygam_default  ok=5/5 dev=1.2972
+   pygam_grid     ok=5/5 dev=1.3039
+   gamfit         ok=5/5 dev=1.2792
+[run] trees n=31 gamma :: y ~ s(girth) + s(height)
+   pygam_default  ok=5/5 dev=0.44561
+   pygam_grid     ok=5/5 dev=0.70664
+   gamfit         ok=5/5 dev=0.0073316
+[run] default n=10000 binomial :: y ~ factor(student) + s(balance) + s(income)
+   pygam_default  ok=5/5 dev=0.1597
+   pygam_grid     ok=5/5 dev=0.15832
+   gamfit         ok=5/5 dev=0.15794
+[run] cake n=270 gaussian :: y ~ factor(recipe) + factor(replicate) + s(temp)
+   pygam_default  ok=5/5 dev=26.058
+   pygam_grid     ok=5/5 dev=26.084
+   gamfit         ok=3/5 dev=25.535  ERR=['IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain']
+[run] hepatitis n=83 gaussian :: y ~ s(age)
+   pygam_default  ok=5/5 dev=0.012402
+   pygam_grid     ok=5/5 dev=0.013206
+   gamfit         ok=5/5 dev=0.013108
+[run] toy_classification n=5000 binomial :: y ~ s(c0) + s(c1) + s(i0) + s(i1) + s(i2) + factor(cat)
