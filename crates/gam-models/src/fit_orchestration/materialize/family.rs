@@ -7,7 +7,7 @@ binomial-cloglog/bernoulli-cloglog/cloglog, latent-cloglog-binomial, \
 poisson, poisson-log, gamma, gamma-log, beta/beta-regression, \
 beta-logit/beta-regression-logit, tweedie/tw, tweedie-log, \
 negative-binomial/negbin/nb, negative-binomial-log/negbin-log, \
-royston-parmar, transformation-normal";
+student-t/t, royston-parmar, transformation-normal";
 
 /// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
 /// onto the [`ResponseColumnKind`] consumed by the family layer.
@@ -55,7 +55,9 @@ pub fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind 
 /// it accepts no link override here.
 fn link_legal_for_family(response: &ResponseFamily, link: LinkFunction) -> bool {
     match response {
-        ResponseFamily::Gaussian => matches!(link, LinkFunction::Identity),
+        ResponseFamily::Gaussian | ResponseFamily::StudentT { .. } => {
+            matches!(link, LinkFunction::Identity)
+        }
         ResponseFamily::Poisson
         | ResponseFamily::Gamma
         | ResponseFamily::Tweedie { .. }
@@ -443,6 +445,20 @@ pub fn scalar_family_from_name(
                 InverseLink::Standard(StandardLink::Logit),
             ),
             true,
+        ),
+        // The Student-t scale σ and degrees of freedom ν are LAML
+        // hyperparameters: the optimizer replaces this placeholder with its
+        // data-derived seed (σ = weighted MAD of y, ν = 1) before the first
+        // evaluation, so the values written here never reach a fit.
+        "student-t" | "t" => (
+            LikelihoodSpec::new(
+                ResponseFamily::StudentT {
+                    sigma: 1.0,
+                    nu: 1.0,
+                },
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            false,
         ),
         "gamma" => (
             LikelihoodSpec::new(

@@ -138,6 +138,8 @@ mod estimate_policy_tests;
 #[cfg(test)]
 mod link_ext_hessian_2665_tests;
 #[cfg(test)]
+mod student_t_laml_tests;
+#[cfg(test)]
 mod gaussian_high_edf_scale_tests;
 #[cfg(test)]
 mod gaussian_observation_interval_calibration_tests;
