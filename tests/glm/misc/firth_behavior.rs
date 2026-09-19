@@ -102,7 +102,6 @@ fn fit_beta_norm(
         },
         PenaltyConfig {
             canonical_penalties: penalties,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -398,7 +397,6 @@ fn fit_deviance(
         },
         PenaltyConfig {
             canonical_penalties: penalties,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,

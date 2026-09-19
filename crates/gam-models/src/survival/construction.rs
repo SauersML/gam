@@ -1494,6 +1494,7 @@ pub fn build_survival_time_basis(
                         knotspec: BSplineKnotSpec::Automatic {
                             num_internal_knots: Some(num_internal_knots),
                             placement,
+                            adaptive: false,
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
@@ -4742,6 +4743,7 @@ pub fn build_time_varying_survival_covariate_template(
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(num_internal_knots),
             placement: gam_terms::basis::BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
