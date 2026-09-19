@@ -363,6 +363,7 @@ fn summary_smooth_terms(
             ref_df: row.ref_df,
             chi_sq: row.chi_sq,
             p_value: row.pvalue,
+            p_value_unavailable: row.pvalue_unavailable.map(|reason| reason.label()),
         })
         .collect())
 }
@@ -496,6 +497,7 @@ fn scan_summary_payload(
         // as `summary.gam` does for terms whose Wald test is unavailable.
         chi_sq: None,
         p_value: None,
+        p_value_unavailable: None,
     }];
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
@@ -883,6 +885,11 @@ pub struct SummarySmoothTermRow {
     pub chi_sq: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value: Option<f64>,
+    /// Why `p_value` is absent when the term has no valid reference law
+    /// (`"shape_constrained"`); see
+    /// [`gam_solve::estimate::SmoothPValueUnavailable`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_value_unavailable: Option<&'static str>,
 }
 
 /// The fitted curvature estimate for one `curv(...)` constant-curvature smooth
