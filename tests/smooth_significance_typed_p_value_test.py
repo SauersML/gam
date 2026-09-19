@@ -1,20 +1,21 @@
 """Every smooth-significance row publishes a p-value, a bound, or a reason.
 
 `Model.smooth_significance` scores the per-term likelihood-ratio statistic
-against its null law by Imhof inversion, which is accurate in *absolute* terms
-only (to `p_value_bound`, ~1e-13). A strong term's tail lies below that, and
-the row used to publish the inversion's rounding residue as the p-value:
-`p_value_corrected = 0.0` for the audit's Poisson replicate 5 (W = 90.8) and
-`5.55e-16` for its Gaussian replicate 34, next to `p_value_bound ~ 1e-13`.
-Neither is the tail; both are noise.
+against its null law. The tail used to come from Imhof inversion, accurate in
+*absolute* terms only (~1e-13), and a strong term's row published the
+inversion's rounding residue as its p-value: `p_value_corrected = 0.0` for the
+audit's Poisson replicate 5 and `5.55e-16` for its Gaussian replicate 34, next
+to `p_value_bound ~ 1e-13`. Neither was the tail; both were noise. The tail is
+now evaluated with relative accuracy, so those rows resolve to a finite, tiny
+p-value that clears its own accuracy.
 
 The contract pinned here:
 
 * every row carries exactly one of `p_value`, `p_value_upper_bound`,
   `unavailable_reason`, and always the same keys;
-* a tail the reference cannot resolve is published as `p < p_value_upper_bound`
-  — a finite, positive number no larger than the evaluation accuracy — never
-  as a point value;
+* a published point value is never below its own evaluation accuracy
+  `p_value_bound` (a tail that cannot be resolved is `p < p_value_upper_bound`);
+* a strong term's tail is finite, positive and tiny, never zero or rounding;
 * a null term's tail is resolved, and equals the evaluated corrected tail;
 * a term shrunk to its null is not significant. An estimated-scale statistic
   is scored on its own support, which starts below zero, rather than clamped
@@ -56,21 +57,18 @@ def _rows(family: str, rep: int) -> dict[str, dict]:
     return {r["name"]: r for r in rows}
 
 
-def _assert_bounded_strong_term(row: dict) -> None:
-    assert row["p_value"] is None, (
-        f"{row['name']}: W={row['statistic_lr']:.1f} published the point value "
-        f"{row['p_value']!r}, below the evaluation accuracy {row['p_value_bound']:.3g}"
-    )
-    bound = row["p_value_upper_bound"]
-    assert bound is not None and np.isfinite(bound)
-    # The ceiling is never looser than "evaluated residue + its accuracy".
-    ceiling = max(row["p_value_corrected"], 0.0) + row["p_value_bound"]
-    assert 0.0 < bound <= ceiling, (bound, ceiling)
+def _assert_resolved_strong_term(row: dict) -> None:
+    p, accuracy = row["p_value"], row["p_value_bound"]
+    assert p is not None, (row["statistic_lr"], row["p_value_upper_bound"], row["unavailable_reason"])
+    assert np.isfinite(p) and 0.0 < p < 1e-10, (row["statistic_lr"], p)
+    # A point value is published only where its accuracy resolves it.
+    assert accuracy < p, (p, accuracy)
+    assert p == row["p_value_corrected"]
 
 
-def test_poisson_tail_below_the_imhof_accuracy_is_a_bound_not_zero() -> None:
+def test_poisson_strong_term_tail_is_finite_and_resolved_not_zero() -> None:
     rows = _rows("poisson", 5)
-    _assert_bounded_strong_term(rows["s(x1)"])
+    _assert_resolved_strong_term(rows["s(x1)"])
     null = rows["s(x2)"]
     assert null["p_value"] is not None and 0.0 < null["p_value"] <= 1.0
     assert null["p_value"] == null["p_value_corrected"]
@@ -91,9 +89,9 @@ def test_gaussian_term_shrunk_to_its_null_is_not_significant() -> None:
     assert row["p_value"] == row["p_value_corrected"]
 
 
-def test_gaussian_tail_below_the_imhof_accuracy_is_a_bound_not_rounding() -> None:
+def test_gaussian_strong_term_tail_is_finite_and_resolved_not_rounding() -> None:
     rows = _rows("gaussian", 34)
-    _assert_bounded_strong_term(rows["s(x1)"])
+    _assert_resolved_strong_term(rows["s(x1)"])
     null = rows["s(x2)"]
     assert null["p_value"] is not None and 0.0 < null["p_value"] <= 1.0
     assert null["p_value"] == null["p_value_corrected"]
