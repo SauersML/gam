@@ -7,7 +7,8 @@ use crate::estimate::evaluation::{
 use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
 use crate::estimate::penalty::{REML_SEED_SCREENING_RHO_CAP, scaled_covariance};
 use crate::estimate::prefit::{
-    reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
+    reject_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
+    reject_prefit_unpenalized_rank_deficiency,
 };
 use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
@@ -396,7 +397,7 @@ fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::Me
     ) {
         Ok(reservation) => Some(reservation),
         Err(error) => {
-            log::info!(
+            log::debug!(
                 "Dense covariance/influence bundle not reserved; using factorized inference: {error}"
             );
             None
@@ -495,7 +496,7 @@ fn reserve_factorized_inference_state(
     ) {
         Ok(reservation) => Some(reservation),
         Err(error) => {
-            log::info!("Factorized inference state could not be fully reserved: {error}");
+            log::debug!("Factorized inference state could not be fully reserved: {error}");
             None
         }
     }
@@ -585,22 +586,6 @@ pub(crate) fn external_reml_seed_config(k: usize, gaussian_identity: bool) -> Se
         num_auxiliary_trailing: 0,
         over_smoothing_probe_rho: None,
     }
-}
-
-pub(crate) fn standard_reml_search_prefers_gradient_only(gaussian_identity: bool) -> bool {
-    // The optimize-3 / certify-4 split exists to keep the generic
-    // non-Gaussian family derivative tower through order four out of the
-    // smoothing-parameter search (#2359).  A profiled Gaussian identity
-    // likelihood is quadratic in eta: its family derivatives above order two
-    // vanish, so reserving the already-available exact outer Hessian for mint
-    // buys nothing.  Worse, it routes a small exact-curvature problem through
-    // first-order BFGS: the saturated wine_gamair fold took 86 accepted
-    // iterations, then failed the first analytic stationarity audit.
-    //
-    // Let the capability planner choose analytic-Hessian ARC for that exact
-    // quadratic objective.  Every non-identity family retains the order-three
-    // search ceiling and pays order four only at mint.
-    !gaussian_identity
 }
 
 /// The resolution the outer certificate's curvature verdict was decided at,
@@ -1037,12 +1022,12 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         if let Err(error) =
             reml_state.compute_cost_with_ext_count(anchor, external_hyper_count)
         {
-            log::debug!("[OUTER] nuisance anchor candidate rejected: {error:?}");
+            log::trace!("[OUTER] nuisance anchor candidate rejected: {error:?}");
             continue;
         }
         let bits = frozen.load(Ordering::Relaxed);
         if bits != 0 {
-            log::info!(
+            log::debug!(
                 "[OUTER] {family} λ-search freeze anchored at ρ=[{}] before any warm start (#2363): \
                  value {:.6e}; the outer criterion is now a function of the data and the model spec alone",
                 anchor
@@ -1061,7 +1046,7 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         // is about to try the same points and will report its own refusal;
         // leaving the freeze unset keeps the pre-existing capture path rather
         // than converting a seed-cascade failure into a different error here.
-        log::warn!(
+        log::debug!(
             "[OUTER] no deterministic anchor converged for the {family} λ-search freeze; \
              the outer criterion cannot be pinned before the seed cascade"
         );
@@ -1118,6 +1103,7 @@ where
         );
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
+    reject_prefit_unidentifiable_unpenalized_space(w, p, &canonical)?;
     // Student-t `(σ, ν)` are outer LAML hyperparameters searched jointly with
     // ρ in the coordinates `(ln(σ/s₀), ln ν)` (see `student_t_outer_point`).
     // Install the zero seed before any evaluation reads the family.
@@ -1137,7 +1123,7 @@ where
         DesignMatrix::Dense(_) => "dense",
         DesignMatrix::Sparse(_) => "sparse",
     };
-    log::info!(
+    log::debug!(
         "[GAM fit] n={} p={} k={} fam={:?} link={:?} X={} reml_iter={} firth={}",
         y.len(),
         p,
@@ -1355,6 +1341,9 @@ where
     // later run of the standard arm is the corrected search continued from that
     // optimum, alone (#1082).
     let mut corrected_continuation = false;
+    // The Laplace optimum's exact analytic outer Hessian, bound to that
+    // optimum: the corrected continuation's BFGS starts from its inverse.
+    let mut continuation_curvature: Option<Array2<f64>> = None;
     let mut negbin_best_checkpoint: Option<NegbinJointCheckpoint> = None;
     // The box every outer arm searches the ρ block in, and so the box its
     // certificate judges rails against: the #2812 resolvability domain (#2902
@@ -1383,12 +1372,13 @@ where
                 .and_then(|rho| rho.as_slice())
                 .or(heuristic_log_lambdas);
             let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
-            // #2359: non-Gaussian search consumes the analytic outer gradient
-            // (the family derivative ladder through order three), reserving
-            // exact curvature for the terminal mint audit.  Profiled Gaussian
-            // identity is quadratic in eta and has no expensive order-four
-            // family tower, so it uses the declared exact outer Hessian during
-            // search instead of approximating it with first-order BFGS.
+            // Every family's search consumes the declared exact outer Hessian
+            // (ARC), as profiled Gaussian identity always has. The #2359 split
+            // that held non-Gaussian links to gradient-only BFGS, paying the
+            // order-four family tower only at the mint audit, made binomial and
+            // Poisson fits 6-10x slower than the Gaussian path: BFGS rebuilds
+            // from secant pairs the curvature the evaluator already has exactly
+            // (48-61 outer iterations on a one-smooth n=1000 logistic fit).
             let n_obs = y_o.len();
             let problem = OuterProblem::new(k)
                 .with_gradient(Derivative::Analytic)
@@ -1397,9 +1387,6 @@ where
                 } else {
                     DeclaredHessianForm::Unavailable
                 })
-                .with_prefer_gradient_only(standard_reml_search_prefers_gradient_only(
-                    cfg.likelihood.spec.is_gaussian_identity(),
-                ))
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                         fit_linear_constraints.as_ref(),
@@ -1464,6 +1451,12 @@ where
                 problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
             } else {
                 problem
+            };
+            let problem = match (corrected_continuation, negbin_rho_seed.as_ref(), continuation_curvature.as_ref()) {
+                (true, Some(seed), Some(hessian)) => {
+                    problem.with_initial_curvature(seed.clone(), hessian.clone())
+                }
+                _ => problem,
             };
 
             // Geometric-mean log prior-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ`
@@ -1696,7 +1689,7 @@ where
                     // cheapest point with the eventual fit: Gaussian sends every
                     // unique finite analytic candidate through a certified full
                     // solve below and keeps the best converged REML value.
-                    log::info!(
+                    log::debug!(
                         "[OUTER] standard REML analytic-start ranking: {:?} -> {:?} \
                          (scored: {scored_report}; bounds {:.3}..{:.3})",
                         base.as_slice().unwrap_or(&[]),
@@ -1771,7 +1764,13 @@ where
                 Some(|state: &mut &mut crate::estimate::reml::RemlState<'_>| {
                     state.reset_outer_seed_state()
                 }),
-                Some(
+                // The EFS map is the fixed point of the Laplace trace identity
+                // alone. Once the #784 block correction is latched the criterion
+                // also carries Delta_b(rho), whose rho-gradient that map never
+                // sees, so its fixed point is not a stationary point of the
+                // corrected criterion: the corrected continuation has no
+                // fixed-point map and walks on the criterion's own derivatives.
+                (!corrected_continuation).then_some(
                     |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                         state.compute_efs_steps(rho)
                     },
@@ -2114,7 +2113,7 @@ where
 
                 let cost_sec = tcost.elapsed().as_secs_f64();
                 let aux_dim = mixture_dim + sas_dim + student_t_dim;
-                log::debug!(
+                log::trace!(
                     "[outer-eval {eval_idx}] theta_dim={} aux_dim={} unified_link_ext time_sec={:.3}",
                     theta_dim,
                     aux_dim,
@@ -2364,7 +2363,7 @@ where
                         rho_gradient,
                     ));
                 outer_result.final_grad_norm = Some(rho_residual);
-                log::debug!(
+                log::trace!(
                     "[OUTER] negative-binomial joint optimum certified after {} round(s): \
                      rho KKT residual {:.3e} <= {:.3e}, theta residual {:.3e} <= {:.3e}",
                     negbin_alternation_round + 1,
@@ -2382,6 +2381,7 @@ where
                 {
                     negbin_rho_seed = Some(final_rho.clone());
                     corrected_continuation = true;
+                    continuation_curvature = outer_result.final_hessian.clone();
                     continue;
                 }
                 break;
@@ -2407,7 +2407,7 @@ where
             // fixed. No secant/grid extrapolation and no unreported answer cap.
             let theta_next =
                 pirls::estimate_negbin_theta_from_eta(y_o.view(), &final_eta, w_o.view())?;
-            log::info!(
+            log::debug!(
                 "[OUTER] negative-binomial joint round {} not yet certified: \
                  rho residual {:.3e}/{:.3e}, theta residual {:.3e}/{:.3e}; \
                  updating theta {:.6e} -> {:.6e} and resuming from rho checkpoint",
@@ -2445,6 +2445,7 @@ where
         {
             negbin_rho_seed = Some(final_rho.clone());
             corrected_continuation = true;
+            continuation_curvature = outer_result.final_hessian.clone();
             continue;
         }
 
@@ -2695,7 +2696,7 @@ where
                         dense,
                         penalty_rank_total,
                     )?;
-                    log::info!(
+                    log::debug!(
                         "[#2901 V22] the penalized Hessian is singular on {} of {p_dim} \
                          coefficient directions (strict factorization: {reason}); inference is \
                          taken on its identified {}-dimensional subspace",
@@ -3335,7 +3336,7 @@ where
                         },
                     ) {
                         Ok((certificate, step_radius)) => {
-                            log::info!(
+                            log::debug!(
                                 "[#2901 V22] identified rank {} of {} is certified constant over \
                                  the certificate's Newton step {step_radius:.3e}: smallest \
                                  identified eigenvalue {:.3e}, rounding band {:.3e}",
@@ -3361,7 +3362,7 @@ where
                         {
                             let reason =
                                 crate::model_types::RankConstancyNotEvaluated::RootScalePricedRank;
-                            log::info!(
+                            log::debug!(
                                 "[#2959 D1] root-priced rank {} of {}; its constancy over the \
                                  certificate's step was not evaluated: {}",
                                 spectrum.rank(),
@@ -3376,7 +3377,7 @@ where
                 (reason, ..) => {
                     let reason = reason
                         .unwrap_or(crate::model_types::RankConstancyNotEvaluated::NoOuterHessian);
-                    log::info!(
+                    log::debug!(
                         "[#2901 V22] identified rank {} of {}; its constancy over the \
                          certificate's step was not evaluated: {}",
                         spectrum.rank(),
@@ -3559,7 +3560,7 @@ where
             // out `H`: `max|H − Hᵀ| = 0.000e0` there). Report both asymmetries
             // at the one place that holds `s_mat`. `debug!` so it costs nothing
             // without a backend installed, and O(p²) beside the O(p³) work above.
-            if log::log_enabled!(log::Level::Debug) {
+            if log::log_enabled!(log::Level::Trace) {
                 let asym = |m: &ndarray::Array2<f64>| {
                     let mut worst = 0.0_f64;
                     for i in 0..m.nrows() {
@@ -3570,7 +3571,7 @@ where
                     worst
                 };
                 let scale = xwx.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-                log::debug!(
+                log::trace!(
                     "[WPS-GRAM #2668] max|H-H^T|={:.3e} max|S-S^T|={:.3e} \
                      max|H-S|={:.3e} (the stored gram is symmetrize(H-S); a \
                      non-zero S asymmetry is absorbed here and surfaces as \
@@ -3823,7 +3824,7 @@ where
                             "exact smoothing-corrected covariance unavailable: {reason:?}"
                         )));
                     }
-                    log::info!(
+                    log::debug!(
                         "[SMOOTHING-CORRECTION] typed-unavailable on a {} fit ({reason:?}); \
                          shipping the plug-in covariance without a smoothing correction",
                         if rail_certified { "rail-certified" } else { "non-analytic-outer-Hessian" }
@@ -4061,7 +4062,7 @@ where
                         Some(corrected)
                     }
                     Err(reason) => {
-                        log::warn!(
+                        log::debug!(
                             "[CONSTRAINED-Vp] the smoothing-corrected covariance could not be \
                              truncated to the feasible set ({reason}); publishing the typed \
                              absence rather than an untruncated marginal, which would over-state \

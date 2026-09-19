@@ -2246,7 +2246,7 @@ fn integrated_mixture_component_jet(
     match component {
         LinkComponent::Logit => integrated_inverse_link_jet(ctx, LinkFunction::Logit, mu, sigma)
             .unwrap_or_else(|error| {
-                log::debug!(
+                log::trace!(
                     "integrated logit jet at (mu={mu}, sigma={sigma}) fell back to GHQ: {error}"
                 );
                 integrated_logit_jet_ghq(ctx, mu, sigma)

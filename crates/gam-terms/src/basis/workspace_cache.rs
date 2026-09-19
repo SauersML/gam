@@ -1040,7 +1040,7 @@ pub fn select_spherical_farthest_point_centers(
     radians: bool,
 ) -> Result<Array2<f64>, BasisError> {
     let chosen = select_spherical_farthest_point_center_rows(data, num_centers, radians)?;
-    log::debug!(
+    log::trace!(
         "spherical farthest-point centers: {} of {} rows, {} sorted dot profile(s) built",
         chosen.rows.len(),
         data.nrows(),

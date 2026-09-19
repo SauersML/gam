@@ -697,7 +697,7 @@ pub fn harvest_move_proposals(
                         // Binding proven (or interaction non-negligible): the
                         // atom is irreducible. Do NOT propose a fission.
                         fission_carve_blocked_count += 1;
-                        log::debug!(
+                        log::trace!(
                             "[structure-harvest] #993 carve KEEPS atom {atom}: binding proven \
                              (edge_p={edge_p:?}, interaction_fraction={interaction:.3e}); no fission proposed",
                         );
@@ -712,7 +712,7 @@ pub fn harvest_move_proposals(
             }
             Some(Err(err)) => {
                 fission_carve_unavailable_count += 1;
-                log::debug!(
+                log::trace!(
                     "[structure-harvest] #993 carve could not run on atom {atom}: {err}; \
                      fission audit rides on co-activation significance, e-gate owns acceptance",
                 );
@@ -881,7 +881,7 @@ pub fn harvest_move_proposals(
                     deferred_predicted_bits += priority.bits().unwrap_or(0.0);
                 }
                 if births_deferred > 0 {
-                    log::debug!(
+                    log::trace!(
                         "[structure-harvest] #2233 deferred {births_deferred} birth(s) (zero \
                          residual energy or past the max_births budget; total priority \
                          {deferred_predicted_bits:.1} bits) of {r} residual factors; proposed \
@@ -4440,7 +4440,7 @@ fn birth_atlas(
         // that owns `HarvestReport`, so the debug log — the channel the #2233
         // birth pre-screen already reports through — is the additive diagnostic
         // surface here; each `RejectedCenter` is `Display`-legible.
-        log::debug!(
+        log::trace!(
             "#2280 atlas dropped {} uncertifiable center(s) on a birth residual: {}",
             dropped.len(),
             dropped
@@ -4456,7 +4456,7 @@ fn birth_atlas(
 /// The atlas's topology readout, logged, or `None` when it cannot be computed.
 fn atlas_readout(atlas: &crate::manifold::LocalAtlas) -> Option<AtlasTopologyReadout> {
     let readout = crate::manifold::observe_atlas_topology(atlas).ok()?;
-    log::debug!("#2280 {readout}");
+    log::trace!("#2280 {readout}");
     Some(readout)
 }
 
@@ -4532,7 +4532,7 @@ fn atlas_reorder_specs(
     let named = observed.and_then(observed_kind_to_auto_topology);
     if let Some(named) = named {
         if specs.iter().any(|spec| spec.kind == named) {
-            log::debug!(
+            log::trace!(
                 "#2280 atlas topology prior: the charts and their transition holonomy measure \
                  {named:?}; floating it ahead of the menu so the REML race breaks an exact tie \
                  toward the measured manifold"
@@ -4554,13 +4554,13 @@ fn atlas_reorder_specs(
         return specs;
     }
     if !specs.iter().any(|spec| kind_is_non_orientable(spec.kind)) {
-        log::debug!(
+        log::trace!(
             "#2280 atlas topology prior: measured a non-orientable manifold, but this menu \
              realizes no twisted candidate; menu unchanged"
         );
         return specs;
     }
-    log::debug!(
+    log::trace!(
         "#2280 atlas topology prior: measured a non-orientable manifold the menu cannot realize \
          exactly; floating the twisted candidate(s) ahead of the orientable menu"
     );
@@ -5189,7 +5189,7 @@ fn log_atlas_evidence_agreement(atlas: Option<&AtlasTopologyReadout>, ranking: &
         && measured_entry.kind != winner_kind
         && !winner.is_resolvably_better_than(&measured_entry)
     {
-        log::info!(
+        log::debug!(
             "#2729 atlas/evidence TIE: the charts measured {measured:?} (tk \
              {:.17e}, resolution {:?}) and the race ranked {winner_kind:?} first (tk \
              {winner_score:.17e}, resolution {:?}); the {:.6e} gap is INSIDE the combined \
@@ -5207,14 +5207,14 @@ fn log_atlas_evidence_agreement(atlas: Option<&AtlasTopologyReadout>, ranking: &
         // resolved it against the field; `log_unresolved_topology_race` has
         // already reported the unresolved case, and a tie between OTHER
         // candidates does not weaken this datum, so the AGREE branch stands.
-        log::debug!(
+        log::trace!(
             "#2280 atlas/evidence AGREE: the charts measured {measured:?} and the REML race \
              independently ranked it first (tk {winner_score:.6})"
         );
         return;
     }
     match measured_entry {
-        Some(measured_entry) => log::info!(
+        Some(measured_entry) => log::debug!(
             "#2280 atlas/evidence DISAGREE: the charts measured {measured:?} (tk \
              {:.6}) but the REML race ranked {winner_kind:?} first (tk \
              {winner_score:.6}); evidence margin {:.6} against the measured manifold, \
@@ -5224,7 +5224,7 @@ fn log_atlas_evidence_agreement(atlas: Option<&AtlasTopologyReadout>, ranking: &
             measured_entry.tk_score_resolution.unwrap_or(f64::NAN)
                 + winner.tk_score_resolution.unwrap_or(f64::NAN)
         ),
-        None => log::info!(
+        None => log::debug!(
             "#2280 atlas/evidence DISAGREE: the charts measured {measured:?}, which this race \
              did not realize as a candidate at all; the race ranked {winner_kind:?} first (tk \
              {winner_score:.6})"
@@ -5251,7 +5251,7 @@ fn log_unresolved_topology_race(ranking: &[RankedTopology]) {
     if tied.is_empty() {
         return;
     }
-    log::info!(
+    log::debug!(
         "#2729 topology race UNRESOLVED: {:?} (tk {:.17e}, resolution {:?}) is not resolvably \
          better than {:?}; every listed gap is inside the combined resolution of the two scores, \
          so the ordering among them is set by floating-point roundoff, not by the data. The \

@@ -473,7 +473,7 @@ impl SaeManifoldTerm {
         //    at the first coarse-KKT-band hit: the value and its implicit
         //    derivative must describe the same differentiable root (#2253).
         let mut rho_fixed = rho.clone();
-        log::info!(
+        log::debug!(
             "[SAE-ENTRY] initial joint fit starts {:.2}s after criterion entry",
             criterion_entered.elapsed().as_secs_f64(),
         );
@@ -486,7 +486,7 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
-        log::info!(
+        log::debug!(
             "[SAE-ENTRY] initial joint fit done {:.2}s after criterion entry",
             criterion_entered.elapsed().as_secs_f64(),
         );
@@ -714,7 +714,7 @@ impl SaeManifoldTerm {
             let value = loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam;
             // #2228 — the criterion's terms at the cache the `[SAE-ACCEPT]` line named, so
             // a split between two lanes at one ρ says which term moved.
-            log::info!(
+            log::debug!(
                 "[SAE-CRITERION] V={value:.10e}: loss={:.10e} \
                  extra_penalty={extra_penalty_energy:.6e} ½log|A|={:.6e} rank_charge={:.6e} \
                  occam={occam:.6e}",
@@ -1466,7 +1466,7 @@ impl SaeManifoldTerm {
             let assemble_seconds = step_started.elapsed().as_secs_f64();
             let grad_norm_sq = Self::system_grad_norm_sq(&sys);
             if !grad_norm_sq.is_finite() {
-                log::debug!("terminal Newton bail: non-finite ‖g‖² at entry");
+                log::trace!("terminal Newton bail: non-finite ‖g‖² at entry");
                 break;
             }
             let grad_norm = grad_norm_sq.sqrt();
@@ -1489,7 +1489,7 @@ impl SaeManifoldTerm {
             ) {
                 Ok(factor) => factor,
                 Err(err) => {
-                    log::debug!(
+                    log::trace!(
                         "terminal Newton bail: deflated criterion factor at ‖g‖={grad_norm:.6e}: {err}"
                     );
                     break;
@@ -1511,7 +1511,7 @@ impl SaeManifoldTerm {
             // #2472 — one line per Newton step, so a criterion evaluation that
             // has not returned can be read as "still contracting" or "grinding
             // at a fixed ‖g‖" from the log alone. Bounded by `max_steps`.
-            log::info!(
+            log::debug!(
                 "[SAE-NEWTON] polish step {}/{max_steps}: ‖g‖={grad_norm:.6e} \
                  (quotient {quotient_grad_norm:.6e}, tol {grad_tolerance:.3e}) \
                  λ²={decrement_sq:.6e} cert={cert:.6e}",
@@ -1543,7 +1543,7 @@ impl SaeManifoldTerm {
                 AssignmentMode::OrderedBetaBernoulli { .. }
             ) && dense_admitted;
             if !dense_geometry_route {
-                log::info!(
+                log::debug!(
                     "[SAE-NEWTON] step {}/{max_steps} steps on the arrow exact-A system (the \
                      dense geometry at dim={exact_dim} would hold {} resident bytes; admitted \
                      by the carried host reading of {} bytes: {dense_admitted})",
@@ -1556,7 +1556,7 @@ impl SaeManifoldTerm {
                     target, rho_fixed, registry, options, &sys, shift,
                 )?
                 else {
-                    log::debug!(
+                    log::trace!(
                         "terminal Newton bail: no shift on the arrow exact-A ladder bought \
                          sufficient Armijo decrease of the penalized objective at \
                          ‖g‖={grad_norm:.6e}"
@@ -1573,7 +1573,7 @@ impl SaeManifoldTerm {
                         after_gate,
                         grad_tolerance,
                     ) {
-                        log::debug!(
+                        log::trace!(
                             "SAE terminal Newton reached the KKT band at arrow exact-A step {}: \
                              gate norm {quotient_grad_norm:.6e} → {after_gate:.6e} against tol \
                              {grad_tolerance:.6e}",
@@ -1633,7 +1633,7 @@ impl SaeManifoldTerm {
                         committed.curvature_along_step
                     }
                 };
-                log::info!(
+                log::debug!(
                     "[SAE-NEWTON] step {} arrow exact-A phases: assemble={assemble_seconds:.2}s \
                      trials={} in {:.2}s (σ={:.6e}, ridge escalations {}, ‖Δ‖={:.6e}, model \
                      agreement {model_agreement:.3e}) total={:.2}s \
@@ -1671,7 +1671,7 @@ impl SaeManifoldTerm {
                 match self.materialize_exact_stationarity_geometry(rho_fixed, target, &cache) {
                     Ok(geometry) => geometry,
                     Err(err) => {
-                        log::debug!(
+                        log::trace!(
                             "terminal Newton bail: dense exact-stationarity geometry at \
                              ‖g‖={grad_norm:.6e}: {err}"
                         );
@@ -1680,7 +1680,7 @@ impl SaeManifoldTerm {
                 };
             let Some((curvature_min, curvature_max)) = geometry.retained_curvature_extremes()
             else {
-                log::debug!(
+                log::trace!(
                     "terminal Newton bail: every direction of A is inside its own null band at \
                      ‖g‖={grad_norm:.6e} — no step of this operator can move the residual",
                 );
@@ -1717,7 +1717,7 @@ impl SaeManifoldTerm {
                 let damped = match geometry.damped_objective_step(&residual, nu) {
                     Ok(damped) => damped,
                     Err(err) => {
-                        log::debug!(
+                        log::trace!(
                             "terminal Newton bail: damped residual step at ν={nu:.6e}: {err}"
                         );
                         break;
@@ -1732,7 +1732,7 @@ impl SaeManifoldTerm {
                     // ν, so no larger damping on this ladder can clear the floor
                     // either: the ladder is exhausted, and it is exhausted for a
                     // stated reason rather than at a trial count.
-                    log::debug!(
+                    log::trace!(
                         "terminal Newton: damping ladder exhausted at ν={nu:.6e} — predicted \
                          objective decrease {predicted_objective_decrease:.6e} is under the \
                          round-off floor {predicted_floor:.6e}",
@@ -1804,7 +1804,7 @@ impl SaeManifoldTerm {
                     smallest_damping
                 };
                 if next > largest_damping {
-                    log::debug!(
+                    log::trace!(
                         "terminal Newton: damping ladder exhausted at ν={next:.6e} — past \
                          λ_max²={largest_damping:.6e}, where every direction is already damped"
                     );
@@ -1818,7 +1818,7 @@ impl SaeManifoldTerm {
                 // delivering none. Termination is a property of the ladder, so
                 // it is enforced on the ladder.
                 if !(next > nu) {
-                    log::debug!(
+                    log::trace!(
                         "terminal Newton: damping ladder cannot advance past ν={nu:.6e} \
                          (λ_min²={smallest_damping:.6e} is not representable above it)"
                     );
@@ -1827,7 +1827,7 @@ impl SaeManifoldTerm {
                 nu = next;
             }
             let Some(accepted) = accepted else {
-                log::debug!(
+                log::trace!(
                     "terminal Newton bail: no damping on [{smallest_damping:.6e}, \
                      {largest_damping:.6e}] bought sufficient Armijo decrease of the \
                      penalized objective at ‖g‖={grad_norm:.6e} ({trials} trial(s))"
@@ -1854,7 +1854,7 @@ impl SaeManifoldTerm {
                 if Self::quasi_laplace_kkt_stationary(after_sq.sqrt(), after_gate, grad_tolerance) {
                     // The step landed in the band. Say so without paying for the
                     // next loop top's assembly to rediscover it.
-                    log::debug!(
+                    log::trace!(
                         "SAE terminal Newton reached the KKT band at step {}: gate norm \
                          {gate_norm:.6e} → {after_gate:.6e} against tol {grad_tolerance:.6e}",
                         step + 1,
@@ -1935,7 +1935,7 @@ impl SaeManifoldTerm {
                     smallest_damping
                 }
             };
-            log::info!(
+            log::debug!(
                 "[SAE-NEWTON] step {} phases: assemble={assemble_seconds:.2}s \
                  trials={trials} in {:.2}s (ν={:.6e}, ‖Δ‖={:.6e}, damped rank {}/{}, \
                  ‖g_null‖={:.6e} of ‖g‖={grad_norm:.6e}, model agreement \
@@ -1950,7 +1950,7 @@ impl SaeManifoldTerm {
                 accepted.step.excluded_gradient_norm_sq.sqrt(),
                 step_started.elapsed().as_secs_f64(),
             );
-            log::debug!(
+            log::trace!(
                 "SAE terminal Newton step committed: quotient merit {:.6e} → {:.6e} \
                  (predicted quotient reduction {:.6e}, measured {:.6e}, ratio {:.4e}); \
                  ambient merit {:.6e} → {:.6e}; ‖g‖ {grad_norm:.6e} → {:.6e}, tol \
@@ -2013,7 +2013,7 @@ impl SaeManifoldTerm {
         let exact = match self.exact_a_evidence_system(target, rho_fixed, majorizer, 1.0) {
             Ok(exact) => exact,
             Err(err) => {
-                log::debug!("terminal Newton bail: arrow exact-A system: {err}");
+                log::trace!("terminal Newton bail: arrow exact-A system: {err}");
                 return Ok(None);
             }
         };
@@ -2041,7 +2041,7 @@ impl SaeManifoldTerm {
                 ) {
                     Ok(solution) => solution,
                     Err(err) => {
-                        log::debug!(
+                        log::trace!(
                             "terminal Newton bail: arrow exact-A solve at σ={shift:.6e}: {err}"
                         );
                         return Ok(None);
@@ -2066,7 +2066,7 @@ impl SaeManifoldTerm {
             if !(predicted_objective_decrease.is_finite()
                 && predicted_objective_decrease > predicted_floor)
             {
-                log::debug!(
+                log::trace!(
                     "terminal Newton: arrow exact-A ladder exhausted at σ={shift:.6e} — \
                      predicted objective decrease {predicted_objective_decrease:.6e} is under \
                      the verifiable floor {predicted_floor:.6e}",
@@ -2080,7 +2080,7 @@ impl SaeManifoldTerm {
                     Ok(()) => match self.assemble_arrow_schur(target, rho_fixed, registry) {
                         Ok(trial_sys) => Some(trial_sys),
                         Err(err) => {
-                            log::debug!(
+                            log::trace!(
                                 "terminal Newton: arrow exact-A trial assembly at σ={shift:.6e}: \
                                  {err}"
                             );
@@ -2088,7 +2088,7 @@ impl SaeManifoldTerm {
                         }
                     },
                     Err(err) => {
-                        log::debug!(
+                        log::trace!(
                             "terminal Newton: arrow exact-A trial step at σ={shift:.6e}: {err}"
                         );
                         None
@@ -2124,7 +2124,7 @@ impl SaeManifoldTerm {
                 predicted_objective_decrease / step_norm_sq
             };
             if !(next.is_finite() && next > shift) {
-                log::debug!(
+                log::trace!(
                     "terminal Newton: arrow exact-A ladder cannot advance past σ={shift:.6e} \
                      (next rung {next:.6e})"
                 );
@@ -3075,7 +3075,7 @@ impl SaeManifoldTerm {
             let value = loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam;
             // #2515 — the dense lane's `[SAE-CRITERION]` terms, on this lane, so a split
             // between the two routes at one ρ says which term moved.
-            log::info!(
+            log::debug!(
                 "[SAE-CRITERION streaming] V={value:.10e}: loss={:.10e} \
                  extra_penalty={extra_penalty_energy:.6e} ½log|A|={:.6e} rank_charge={:.6e} \
                  occam={occam:.6e}",

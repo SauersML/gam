@@ -903,7 +903,7 @@ impl<'a> GamWorkingModel<'a> {
                 .take()
                 .expect("frozen first-step Gram present by the guard above");
             self.glm_first_step_gram_consumed = true;
-            log::debug!(
+            log::trace!(
                 "[frozen-glm-gram] serving first Fisher-step XᵀWX n-free (p={})",
                 xtwx.nrows()
             );

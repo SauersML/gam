@@ -536,7 +536,7 @@ pub(crate) fn reduced_blockwise_edf(
     ) {
         Ok(triple) => Some(triple),
         Err(err) => {
-            log::warn!(
+            log::debug!(
                 "[custom-family inference] reduced-space effective degrees of freedom unavailable: {err}"
             );
             None
