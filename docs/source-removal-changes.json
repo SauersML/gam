@@ -1498,7 +1498,7 @@
     "evidence": "Direct gate dy7 sf-a1v2-p4 at 9ba55dfa34 (patch md5 c72cd8f1, tree 57fa8adf, this move plus the #2822 unit that reuses the type) without this entry: source_removal_guard.py names exactly this one item, kind struct, public, production_occurrences 0 (direct-dy7-sf-a1v2-p4.log.guard). In the same gate the workspace --all-targets check and the gam-pyffi check exit 0 with every existing user of the old path compiling through the re-export, and the public-API census exits 0."
   },
   {
-    "base": "a353a4f02b0e843ac25790d187166b7b3a428ee3",
+    "base": "12d4f8d71d84c11f6f7e4c6937efdf0d54688d7b",
     "items": [
       "crates/gam-solve/src/estimate/optimizer.rs:const:CUBATURE_SIGMA_POINTS",
       "crates/gam-solve/src/estimate/optimizer.rs:const:IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE",
