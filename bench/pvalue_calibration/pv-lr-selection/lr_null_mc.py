@@ -8,15 +8,9 @@ Truth: eta = b0 + a1 sin(2 pi x1) + 0 * x2 + a3 cos(2 pi x3), x ~ U(0,1)^3.
 Model: y ~ s(x1) + s(x2) + s(x3). s(x2) is null (size), s(x3) is weak (power).
 Replicate r draws its data from numpy's default_rng(50000 + r), so every run of
 a cell sees the same datasets. Reports rejection at .10/.05/.01 with the
-binomial Monte-Carlo standard error, the KS distance of the null p-values from
-U(0,1) and its asymptotic p-value, and the weak-term power.
-
-Why a second, truncated KS: under the null a double-penalty smooth is shrunk to
-nothing on about half the datasets, so W has an ATOM at zero of mass m and a
-calibrated p-value is uniform on (0, 1 - m) with an atom at 1 - m. The
-full-range KS rejects that by construction. Given p < 1/2 (below the atom
-whenever m < 1/2) a calibrated p is U(0, 1/2), so `KS | p < .5` tests 2p on
-that event against U(0,1).
+binomial Monte-Carlo standard error, the two-sided KS distance of every null
+p-value from U(0,1) and its asymptotic p-value, the number of replicates that
+published no p-value, and the weak-term power.
 
 LR_MC_FORMULA overrides the model formula and LR_MC_SIGNAL scales a1 and a3
 (diagnostics only).
@@ -109,23 +103,19 @@ def report(cell, results, key="p_value_corrected"):
     null = np.array(
         [r["terms"]["s(x2)"][key] for r in ok if r["terms"]["s(x2)"][key] is not None]
     )
+    lines.append(f"  null p-value unavailable on {len(ok) - len(null)} fits")
     weak = np.array(
         [r["terms"]["s(x3)"][key] for r in ok if r["terms"]["s(x3)"][key] is not None]
     )
     for alpha in (0.10, 0.05, 0.01):
-        rate = np.mean(null < alpha)
+        rate = np.mean(null <= alpha)
         mcse = np.sqrt(alpha * (1 - alpha) / len(null))
         lines.append(
             f"  size@{alpha:.2f} = {rate:.4f}  (MCSE {mcse:.4f}, z = {(rate - alpha) / mcse:+.2f})"
         )
     d, pks = ks(null)
     lines.append(f"  KS D = {d:.4f}, p = {pks:.3f}")
-    below = null[null < 0.5]
-    d_below, p_below = ks(2 * below)
-    lines.append(
-        f"  P(p < .5) = {len(below) / len(null):.4f}; KS | p < .5: D = {d_below:.4f}, p = {p_below:.3f}"
-    )
-    lines.append(f"  power@.05 on s(x3) = {np.mean(weak < 0.05):.4f}")
+    lines.append(f"  power@.05 on s(x3) = {np.mean(weak <= 0.05):.4f}")
     return "\n".join(lines)
 
 
