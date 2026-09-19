@@ -4094,9 +4094,10 @@ fn model_deployment_extensions(py: Python<'_>, model: PyRef<'_, PyFittedModel>) 
 
 /// The saved-model summary as a JSON value, built from the typed model, with its
 /// rendered text under `"text"`: the one Rust renderer `gam summary` prints, so
-/// `str(model.summary())` is that same string.
+/// `str(model.summary())` is that same string. The summary rebuilds the term
+/// designs in parallel, so it runs on the process pool like every fit.
 fn summary_payload_value(model: &FittedModel) -> Result<serde_json::Value, String> {
-    let summary = saved_model_summary(model)?;
+    let summary = gam_runtime::parallel::install(|| saved_model_summary(model))?;
     let text = render_summary_text(&summary);
     let mut value = serde_json::to_value(&summary)
         .map_err(|err| format!("failed to serialize summary: {err}"))?;

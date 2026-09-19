@@ -8,10 +8,10 @@ hung once gamfit was imported. The fit now runs on a pool that belongs to the
 current process, so a forked child builds its own.
 
 The scenario runs in a subprocess so that a regression is a bounded failure
-instead of a hung test run. Every process also reports the threads that
-appeared while it fitted: all of them must be gam's own named workers, so no
-computation reached rayon's global pool or a library's private thread pool
-(neither of which a forked child can use).
+instead of a hung test run. Every process also reports the unnamed threads
+that appeared while it fitted: there must be none, so no computation reached
+rayon's global pool or a library's private thread pool (neither of which a
+forked child can use) instead of gam's own named workers.
 """
 
 from __future__ import annotations
@@ -40,6 +40,9 @@ import gamfit
 # split them over threads of its own (matrixmultiply's thread tree did).
 ROWS = 2000
 
+with open("/proc/self/comm") as handle:
+    INTERPRETER_THREAD = handle.read().strip()
+
 
 def frame():
     out = {"x": [], "y": []}
@@ -67,25 +70,28 @@ def fit_once(_=None):
     model = gamfit.fit(data, "y ~ s(x, k=10)")
     coef = model.summary().coefficients_frame()["estimate"].tolist()
     prediction = [float(v) for v in model.predict(data)]
-    # Threads that the fit started. The process pool gives each worker its own
-    # name; an unnamed thread (rayon's global pool, a library's private pool)
-    # inherits the name of the thread that started it, so it shows up either
-    # under a foreign name or as a second copy of a gam worker's name.
+    # Threads that the fit started without naming them. The process pool
+    # names each of its workers; a thread nobody names (rayon's global pool, a
+    # library's private pool) keeps the name of the thread that started it, so
+    # it shows up under the interpreter's name or as a second copy of a gam
+    # worker's name. Threads that a library names itself (an allocator's
+    # background thread) are that library's to manage across fork.
     after = thread_names()
     counts = {}
     for name in after.values():
         counts[name] = counts.get(name, 0) + 1
-    started = sorted(
-        name if counts[name] == 1 else f"{name} (duplicate)"
+    unnamed = sorted(
+        name
         for tid, name in after.items()
         if tid not in before
+        and (name == INTERPRETER_THREAD or (name.startswith("gam-") and counts[name] > 1))
     )
     return {
         "fit": {
             "coefficients": [v.hex() for v in coef],
             "prediction": [v.hex() for v in prediction],
         },
-        "started_threads": started,
+        "unnamed_threads": unnamed,
     }
 
 
@@ -164,9 +170,5 @@ def test_fits_in_forked_children_match_the_parent(tmp_path: Path) -> None:
     expected = report["parent"]["fit"]
     for name, run in runs.items():
         assert run["fit"] == expected, f"{name} fit differs from the parent's"
-        foreign = [
-            thread
-            for thread in run["started_threads"]
-            if not thread.startswith("gam-") or thread.endswith("(duplicate)")
-        ]
-        assert not foreign, f"{name} started threads outside gam's pool: {foreign}"
+        unnamed = run["unnamed_threads"]
+        assert not unnamed, f"{name} started threads outside gam's pool: {unnamed}"
