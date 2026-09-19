@@ -581,22 +581,25 @@ pub(crate) fn reject_prefit_binomial_separation(
             positive_above_threshold: diagnostic.positive_above_threshold,
         });
     }
+    // The realized-design columns each projected column is read from, in the
+    // order `project_onto_penalty_free_directions` lays them out.
+    let supports: Vec<&[usize]> = direct_columns
+        .iter()
+        .map(std::slice::from_ref)
+        .chain(frames.iter().flat_map(|frame| {
+            std::iter::repeat_n(frame.columns.as_slice(), frame.frame.ncols())
+        }))
+        .collect();
     reject_linear_separation_along_columns(
         y,
         w,
         &projected,
         &vec![true; projected.ncols()],
         |projected_columns| {
-            let mut global = Vec::new();
-            for &column in projected_columns {
-                match direct_columns.get(column) {
-                    Some(&direct) => global.push(direct),
-                    None => {
-                        let frame = frame_of_projected_column(&frames, column - direct_columns.len());
-                        global.extend_from_slice(&frames[frame].columns);
-                    }
-                }
-            }
+            let mut global: Vec<usize> = projected_columns
+                .iter()
+                .flat_map(|&column| supports[column].iter().copied())
+                .collect();
             global.sort_unstable();
             global.dedup();
             global
@@ -756,17 +759,6 @@ fn penalty_free_block_frames(penalties: &[CanonicalPenalty], p: usize) -> Vec<Pe
         }));
     }
     frames
-}
-
-/// The frame a projected column past the direct columns belongs to.
-fn frame_of_projected_column(frames: &[PenaltyFreeFrame], mut offset: usize) -> usize {
-    for (index, frame) in frames.iter().enumerate() {
-        if offset < frame.frame.ncols() {
-            return index;
-        }
-        offset -= frame.frame.ncols();
-    }
-    unreachable!("projected column past every frame")
 }
 
 /// `[X_direct, X_B1·F1, X_B2·F2, …]`: the design read along the directions the
