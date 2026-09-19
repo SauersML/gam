@@ -354,6 +354,7 @@ fn fit_ceiling_region(
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)?;
     let seed = init_rho.to_flat(&term.assignment)?;
     let n_params = seed.len();
+    let p_beta = term.beta_dim();
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         target.to_owned(),
@@ -365,6 +366,7 @@ fn fit_ceiling_region(
         1.0e-6,
     );
     let result = OuterProblem::new(n_params)
+        .with_problem_size(target.len(), p_beta)
         .with_initial_rho(seed)
         .with_max_iter(outer_iters)
         .run(&mut objective, "Qwen3-8B L18 K=1 ceiling")

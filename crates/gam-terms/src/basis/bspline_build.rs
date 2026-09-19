@@ -16,19 +16,8 @@ pub fn initializewiggle_knots_from_seed(
     degree: usize,
     num_internal_knots: usize,
 ) -> Result<Array1<f64>, String> {
-    const MIN_WIGGLE_SEED_SPAN: f64 = 1e-8;
-    const DEFAULT_WIGGLE_HALF_RANGE: f64 = 3.0;
-
-    let mut seed_min = seed.iter().copied().fold(f64::INFINITY, f64::min);
-    let mut seed_max = seed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !seed_min.is_finite() || !seed_max.is_finite() {
-        return Err("non-finite seed for wiggle knot initialization".to_string());
-    }
-    if (seed_max - seed_min).abs() < MIN_WIGGLE_SEED_SPAN {
-        let center = 0.5 * (seed_min + seed_max);
-        seed_min = center - DEFAULT_WIGGLE_HALF_RANGE;
-        seed_max = center + DEFAULT_WIGGLE_HALF_RANGE;
-    }
+    let (seed_min, seed_max) = seed_knot_range(seed)
+        .ok_or_else(|| "non-finite seed for wiggle knot initialization".to_string())?;
     let (_, knots) = create_basis::<Dense>(
         seed,
         KnotSource::Generate {
@@ -40,6 +29,33 @@ pub fn initializewiggle_knots_from_seed(
     )
     .map_err(|e| e.to_string())?;
     Ok(knots)
+}
+
+/// The knot domain a 1-D seed sample spans: `[min, max]`, widened to a fixed
+/// half-range about its midpoint when the sample is (nearly) constant so the
+/// generated spans stay well-conditioned. `None` when the sample holds a
+/// non-finite value or is empty.
+///
+/// Shared by the clamped wiggle generator
+/// ([`initializewiggle_knots_from_seed`]) and the monotone warp generator
+/// ([`monotone_warp_knots_from_seed`]) so both place knots over one domain.
+pub fn seed_knot_range(seed: ArrayView1<'_, f64>) -> Option<(f64, f64)> {
+    const MIN_SEED_SPAN: f64 = 1e-8;
+    const DEGENERATE_SEED_HALF_RANGE: f64 = 3.0;
+
+    let low = seed.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = seed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !low.is_finite() || !high.is_finite() {
+        return None;
+    }
+    if (high - low).abs() < MIN_SEED_SPAN {
+        let center = 0.5 * (low + high);
+        return Some((
+            center - DEGENERATE_SEED_HALF_RANGE,
+            center + DEGENERATE_SEED_HALF_RANGE,
+        ));
+    }
+    Some((low, high))
 }
 
 pub fn select_centers_by_strategy(
@@ -136,11 +152,10 @@ pub fn build_bspline_basis_1d(
             .map(|(start, end, _)| (start, end, num_internal_knots + spec.degree + 1)),
         BSplineKnotSpec::Automatic {
             num_internal_knots, ..
-        } => spec.boundary.period().map(|(start, end, _)| {
-            let internal = num_internal_knots
-                .unwrap_or_else(|| default_internal_knot_count_for_data(data.len(), spec.degree));
-            (start, end, internal + spec.degree + 1)
-        }),
+        } => spec
+            .boundary
+            .period()
+            .map(|(start, end, _)| (start, end, num_internal_knots + spec.degree + 1)),
         BSplineKnotSpec::Provided(knots) => spec
             .boundary
             .period()
@@ -362,9 +377,7 @@ pub fn build_bspline_basis_1d(
                 placement,
                 ..
             } => {
-                let inferred = num_internal_knots.unwrap_or_else(|| {
-                    default_internal_knot_count_for_data(data.len(), spec.degree)
-                });
+                let inferred = *num_internal_knots;
                 Some(match placement {
                     BSplineKnotPlacement::Uniform => {
                         let range = finite_data_range(data)?;
@@ -501,9 +514,7 @@ pub fn build_bspline_basis_1d(
                 placement,
                 ..
             } => {
-                let inferred = num_internal_knots.unwrap_or_else(|| {
-                    default_internal_knot_count_for_data(data.len(), spec.degree)
-                });
+                let inferred = *num_internal_knots;
                 let knots = match placement {
                     BSplineKnotPlacement::Uniform => {
                         let range = finite_data_range(data)?;
@@ -565,9 +576,7 @@ pub fn build_bspline_basis_1d(
                 placement,
                 ..
             } => {
-                let inferred = num_internal_knots.unwrap_or_else(|| {
-                    default_internal_knot_count_for_data(data.len(), spec.degree)
-                });
+                let inferred = *num_internal_knots;
                 let knots = match placement {
                     BSplineKnotPlacement::Uniform => {
                         let range = finite_data_range(data)?;
@@ -3444,15 +3453,6 @@ pub(crate) fn rebuild_metric_consistent_ridge(
     )?))
 }
 
-pub(crate) fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
-    if n < 8 {
-        return 0;
-    }
-    let heuristic = if n < 16 { 3 } else { (n / 4).max(3) };
-    let max_reasonable = n.saturating_sub(degree + 2);
-    heuristic.min(40).min(max_reasonable)
-}
-
 /// Auto-shrink a requested B-spline configuration to the largest feasible
 /// `(num_internal_knots, degree)` that the available data can support.
 ///
@@ -3552,8 +3552,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
             placement,
             adaptive,
         } => {
-            let requested_interior = num_internal_knots
-                .unwrap_or_else(|| default_internal_knot_count_for_data(n, spec.degree));
+            let requested_interior = *num_internal_knots;
             let Some((eff_interior, eff_degree, shrunk)) =
                 auto_shrink_bspline_config(n, requested_interior, spec.degree)
             else {
@@ -3575,7 +3574,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(eff_interior),
+                num_internal_knots: eff_interior,
                 placement: *placement,
                 adaptive: *adaptive,
             };

@@ -288,6 +288,15 @@ fn screen_measure_jet_range(
     let refuse = |error: EstimationError| EstimationError::TrialPointRefused {
         reason: error.to_string(),
     };
+    // The screen's REML is over `[1 | X(ℓ)]`, and the Gaussian kernel keeps
+    // `X(ℓ)` at one column per center for every ℓ > 0, so the coefficient
+    // count the engine sizes its resolution by is fixed across the window.
+    let p_coefficients = {
+        let mut sizing = spec.clone();
+        sizing.length_scale = bracket.nodes.iter().copied().find(|node| node.is_finite() && *node > 0.0)?;
+        sizing.double_penalty = false;
+        gam_terms::basis::build_measure_jet_basis(data, &sizing).ok()?.design.ncols() + 1
+    };
     let mut best: Option<(f64, f64)> = None;
     for &node in &bracket.nodes {
         let start = node.ln();
@@ -295,6 +304,7 @@ fn screen_measure_jet_range(
             continue;
         }
         let problem = OuterProblem::new(1)
+            .with_problem_size(y.len(), p_coefficients)
             .with_gradient(Derivative::Analytic)
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_vec(vec![lower]), Array1::from_vec(vec![upper]))
