@@ -2832,6 +2832,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
+        decrement_verdict_config: None,
     };
     let grad_sample = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
     assert_eq!(grad_sample.value, 1.0);
@@ -2896,6 +2897,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
+        decrement_verdict_config: None,
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a candidate whose row geometry refuses must not produce a cost");
@@ -2969,6 +2971,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
+        decrement_verdict_config: None,
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a structural refusal must not produce a cost");
@@ -3026,6 +3029,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
+        decrement_verdict_config: None,
     };
     let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
         .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
@@ -3278,6 +3282,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
+        decrement_verdict_config: None,
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
     // Every finite sample, including the one that fills the stall window, must
@@ -3346,6 +3351,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
+        decrement_verdict_config: None,
     };
 
     for iter in 0..5 {
@@ -3425,6 +3431,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
+        decrement_verdict_config: None,
     };
     for iter in 0..(COST_STALL_WINDOW + 2) {
         let sample = eval_accepted_hessian_3017(&mut bridge, &ledger, &lo, iter)
@@ -3507,6 +3514,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
+        decrement_verdict_config: None,
     };
     // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
     // evals fill the infeasible-streak window and trip the sentinel.
@@ -3613,6 +3621,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
+        decrement_verdict_config: None,
     };
     // ARC accepts it; the next evaluation folds it as the incumbent (#3017).
     SecondOrderObjective::eval_hessian(&mut bridge, &feasible_rho)

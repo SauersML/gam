@@ -1,0 +1,14 @@
+g1d_sin3_n2000         truth_mse | default: 0.0024383 (edf 11.9) | k20: 0.0014439 (edf 18.6) | k20-default d=-0.000994+-0.00011
+g1d_sin6_n500          truth_mse | default: 0.40598 (edf 11.0) | k20: 0.0077662 (edf 19.5) | k20-default d=-0.398+-0.013
+g1d_doppler_n500       truth_mse | default: 0.23584 (edf 11.2) | k20: 0.15536 (edf 18.2) | k20-default d=-0.0805+-0.0073
+null3_n200             truth_mse | default: 0.044947 (edf 3.7) | k20: 0.045266 (edf 3.8) | pygam_default: 0.28757 | pygam_grid: 0.054715 | k20-default d=+0.000318+-0.00056
+null3_n2000            truth_mse | default: 0.00064514 (edf 1.5) | k20: 0.000644 (edf 1.5) | pygam_default: 0.022846 | pygam_grid: 0.0033163 | k20-default d=-1.14e-06+-1.1e-06
+add4_n200              truth_mse | default: 0.49004 (edf 13.4) | k20: 0.49426 (edf 14.6) | pygam_default: 1.0084 | pygam_grid: 0.72009 | k20-default d=+0.00422+-0.022
+add4_n1000             truth_mse | default: 0.10495 (edf 16.5) | k20: 0.099439 (edf 19.0) | pygam_default: 0.20257 | pygam_grid: 0.20558 | k20-default d=-0.00551+-0.0029
+hetero_n500            truth_mse | default: 0.0116 (edf 9.0) | k20: 0.0138 (edf 11.4) | pygam_default: 0.012943 | pygam_grid: 0.013964 | k20-default d=+0.0022+-0.00064
+binom_add4_n1000       truth_mse | default: 0.0043404 (edf 14.1) | k20: 0.004209 (edf 15.4) | pygam_default: 0.0092024 | pygam_grid: 0.007874 | k20-default d=-0.000131+-5.7e-05
+   pois_add2_n300 default fail: IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain
+   pois_add2_n300 k20 fail: IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain
+   pois_add2_n300 k20 fail: IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain
+pois_add2_n300         truth_mse | default: 0.18145 (edf 13.2) | k20: 0.21168 (edf 15.1) | pygam_default: 0.56488 | pygam_grid: 0.16799 | k20-default d=+0.0874+-0.046
+gamma_add2_n300        truth_mse | default: 0.2611 (edf 9.3) | k20: 0.27277 (edf 9.9) | pygam_default: 0.63708 | pygam_grid: 0.42244 | k20-default d=+0.0117+-0.0072

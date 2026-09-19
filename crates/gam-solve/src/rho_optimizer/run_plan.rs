@@ -1918,6 +1918,13 @@ pub(crate) fn run_outer_with_plan(
                         // dense route's half of the same repair.
                         curvature_stationary_floor: Some(outer_rel_cost_floor(config)),
                         accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
+                        // #2954 — and on the rung it judges on. Where the route
+                        // declares its size the certificate decides on the
+                        // Newton-decrement verdict on rounding bands, not on
+                        // `floor·(1 + |V|)`; without the config the loop kept
+                        // stopping on the older rung at points the certificate
+                        // then refused.
+                        decrement_verdict_config: Some(config),
                         },
                         Arc::clone(&last_objective_error),
                     );

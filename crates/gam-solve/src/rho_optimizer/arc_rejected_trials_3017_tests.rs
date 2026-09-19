@@ -188,6 +188,7 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
         cost_stall_bounds: Some((array![-30.0], array![30.0])),
         curvature_stationary_floor: Some(outer_rel_cost_floor(&config)),
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
+        decrement_verdict_config: Some(&config),
     };
     let mut outcomes = Vec::new();
     for (iter, &trial) in trials.iter().enumerate() {
