@@ -5222,8 +5222,8 @@ impl FittedModel {
                     .iter()
                     .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
                     .collect();
-                let Some((row, value)) = values
-                    .column(index)
+                let column = values.column(index);
+                let Some((row, value)) = column
                     .iter()
                     .enumerate()
                     .find(|(_, value)| !vocab.contains(&gam_data::canonical_level_bits(**value)))
