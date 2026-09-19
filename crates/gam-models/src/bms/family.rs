@@ -71,8 +71,8 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// double-bump.
     pub(super) auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
     /// Whether this member's Jeffreys/Firth prior is armed. A fit arms it only
-    /// on the unarmed fit's own evidence, through
-    /// `fit_custom_family_arming_on_evidence` (#979).
+    /// on the unarmed route's own evidence: `fit_bernoulli_marginal_slope_terms`
+    /// runs the whole route through `arm_on_evidence` (#979, #3164).
     pub(super) jeffreys_armed: bool,
     /// The residual genetic repair block (gam#2924): `K` conditionally centred
     /// features with constant coefficients entering the genetic drive beside
