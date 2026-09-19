@@ -5284,13 +5284,6 @@ fn run_conjugate_gaussian_sampling(
     })
 }
 
-/// Penalty subtracted from the log-density when the `ρ`-criterion closure
-/// reports an infeasible / non-finite point during Tier-2 `ρ`-posterior NUTS
-/// (#938). The fallback density is the whitened standard normal shifted down by
-/// this constant, so the sampler sees a smooth, coercive pull back toward the
-/// feasible region around `ρ̂` instead of a `-inf` cliff.
-const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
-
 /// Tier-2 of the marginal-smoothing inference stack (#938): the whitened
 /// `ρ`-criterion Hamiltonian target.
 ///
@@ -5306,9 +5299,16 @@ const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
 /// solve with interior caches), so it is serialized behind a `Mutex`; chains
 /// take turns evaluating, which also keeps the inner warm-start trajectory
 /// coherent.
+///
+/// The criterion is `π(ρ|y)` on all of `ρ`-space, so a position it cannot value
+/// is not a zero-density region: the first such failure is recorded in
+/// `evaluation_failure`, the position is rejected, and the run is failed with
+/// that reason rather than sampled from a density invented for it.
 struct WhitenedRhoCriterionTarget<F> {
-    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`; `None` marks an infeasible point.
+    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, or why it cannot be valued.
     criterion_and_grad: Mutex<F>,
+    /// The first position the criterion could not value, and why.
+    evaluation_failure: Arc<Mutex<Option<String>>>,
     /// `ρ̂`, the converged smoothing parameters (the whitening center).
     mode: Array1<f64>,
     /// `L` with `L Lᵀ = H_ρ⁻¹`: maps whitened `z` to `ρ = ρ̂ + L z`.
@@ -5321,7 +5321,7 @@ struct WhitenedRhoCriterionTarget<F> {
 
 impl<F> HamiltonianTarget<Array1<f64>> for WhitenedRhoCriterionTarget<F>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
         let rho = &self.mode + &self.chol.dot(position);
@@ -5332,8 +5332,8 @@ where
                 .expect("rho-criterion mutex poisoned");
             (*criterion)(&rho)
         };
-        match eval {
-            Some((cost, g))
+        let failure = match eval {
+            Ok((cost, g))
                 if cost.is_finite()
                     && g.len() == position.len()
                     && g.iter().all(|v| v.is_finite()) =>
@@ -5342,18 +5342,20 @@ where
                 for (gi, &v) in grad.iter_mut().zip(grad_z.iter()) {
                     *gi = -v;
                 }
-                -(cost - self.cost_hat)
+                return -(cost - self.cost_hat);
             }
-            _ => {
-                // Infeasible criterion: smooth coercive fallback toward ρ̂.
-                let mut quad = 0.0;
-                for (gi, &zi) in grad.iter_mut().zip(position.iter()) {
-                    *gi = -zi;
-                    quad += zi * zi;
-                }
-                -0.5 * quad - RHO_NUTS_INFEASIBLE_LOGP_PENALTY
-            }
-        }
+            Ok((cost, g)) => format!(
+                "criterion at rho {rho:?} is {cost} with a {}-entry gradient {g:?}",
+                g.len()
+            ),
+            Err(detail) => format!("criterion unavailable at rho {rho:?}: {detail}"),
+        };
+        self.evaluation_failure
+            .lock()
+            .expect("rho-criterion failure mutex poisoned")
+            .get_or_insert(failure);
+        grad.fill(0.0);
+        f64::NEG_INFINITY
     }
 }
 
@@ -5363,8 +5365,9 @@ where
 /// * `rho_hat` — converged `ρ̂` (the whitening center and chain seed).
 /// * `outer_hessian` — exact finite symmetric positive-definite outer Hessian
 ///   `H_ρ` at `ρ̂`, factored without perturbation for whitening.
-/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact; `None`
-///   for infeasible `ρ`. Each call is one warm inner profile solve.
+/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact, or the
+///   reason it cannot value `ρ`; any such position fails the run with that
+///   reason. Each call is one warm inner profile solve.
 /// * `config` — sampler configuration; determinism comes from `config.seed`
 ///   through the same splitmix64 chain/transition streams as every other NUTS
 ///   entry point (no clock, no global RNG).
@@ -5378,7 +5381,7 @@ pub(crate) fn run_rho_criterion_nuts<F>(
     config: &NutsConfig,
 ) -> Result<NutsResult, String>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     validate_nuts_config(config).map_err(String::from)?;
     let dim = rho_hat.len();
@@ -5401,17 +5404,22 @@ where
     )?;
 
     let cost_hat = match criterion_and_grad(&mode) {
-        Some((cost, _)) if cost.is_finite() => cost,
-        _ => {
-            return Err(
-                "rho-posterior NUTS: criterion is infeasible at rho_hat itself".to_string(),
-            );
+        Ok((cost, _)) if cost.is_finite() => cost,
+        Ok((cost, _)) => {
+            return Err(format!("rho-posterior NUTS: criterion at rho_hat is {cost}"));
+        }
+        Err(detail) => {
+            return Err(format!(
+                "rho-posterior NUTS: criterion is unavailable at rho_hat itself: {detail}"
+            ));
         }
     };
 
     let chol = whitening.chol;
+    let evaluation_failure = Arc::new(Mutex::new(None));
     let target = WhitenedRhoCriterionTarget {
         criterion_and_grad: Mutex::new(criterion_and_grad),
+        evaluation_failure: Arc::clone(&evaluation_failure),
         mode: mode.clone(),
         chol: chol.clone(),
         chol_t: whitening.chol_t,
@@ -5423,7 +5431,7 @@ where
     // dense metric during warmup would spend expensive profile solves estimating
     // curvature we have already supplied analytically.
     let mass_cfg = NUTSMassMatrixConfig::disabled();
-    let (result, run_stats) = run_whitened_nuts_result(
+    let run = run_whitened_nuts_result(
         target,
         &mode,
         &chol,
@@ -5434,7 +5442,17 @@ where
         0x6B42_E9A1_05D7_C83F,
         "rho-posterior NUTS sampling failed",
         mode.clone(),
-    )?;
+    );
+    // A position the criterion could not value is the run's failure, whether or
+    // not the sampler itself then stopped.
+    if let Some(failure) = evaluation_failure
+        .lock()
+        .expect("rho-criterion failure mutex poisoned")
+        .take()
+    {
+        return Err(format!("rho-posterior NUTS: {failure}"));
+    }
+    let (result, run_stats) = run?;
     log::debug!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
     Ok(result)
 }
