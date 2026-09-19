@@ -5103,9 +5103,11 @@ impl SparseRemlDecision {
 /// Eviction is byte-budgeted rather than entry-count-budgeted: each entry
 /// records its own estimated footprint (the surviving n-length vectors plus
 /// the two p×p Hessians plus per-entry overhead) and the cache evicts in
-/// LRU order until the running total fits under the budget. An entry that
-/// individually exceeds the budget is rejected silently rather than poisoning
-/// the cache.
+/// LRU order until the running total fits under the budget. The newest entry
+/// is always kept, alone if it alone exceeds the budget, so the next
+/// evaluation at its ρ (a gradient after a value) reuses the solve: the cache
+/// holds at most the larger of its budget and one solve, which the evaluation
+/// that produced it held anyway.
 pub(crate) struct PirlsLruCache {
     // Stored tuple: (compacted result, last-touched clock, estimated bytes).
     pub(crate) map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
@@ -5137,19 +5139,10 @@ impl PirlsLruCache {
     pub(crate) fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
         self.clock += 1;
         let bytes = pirls_result_cache_bytes(&value);
-        // Refuse entries that on their own already exceed the entire budget;
-        // caching one would force eviction of every other entry without
-        // leaving room for the new one anyway.
-        if bytes > self.byte_budget {
-            if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
-                self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
-            }
-            return;
-        }
         if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
             self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
         }
-        while self.current_bytes + bytes > self.byte_budget {
+        while !self.map.is_empty() && self.current_bytes + bytes > self.byte_budget {
             let evict_key = self
                 .map
                 .iter()
@@ -5234,9 +5227,9 @@ impl PenaltySubspaceCacheKey {
 ///
 /// A cache hit saves one P-IRLS solve, and a solve costs passes over the
 /// design, so the memo may hold as many bytes as the dense design it
-/// memoizes and no more: it is at most one further design-sized store, at any
-/// `n` and any number of outer evaluations, and an entry that alone exceeds
-/// it is recomputed instead of cached (see [`PirlsLruCache::insert`]). The
+/// memoizes and no more: at any `n` and any number of outer evaluations it is
+/// one further design-sized store, or the newest solve alone where one solve
+/// outgrows the design (see [`PirlsLruCache::insert`]). The
 /// host bound is the governor's stationary per-operation ceiling rather than
 /// live availability, so which evaluations hit the cache never depends on
 /// what else the machine is doing (SPEC-20).
