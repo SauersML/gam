@@ -1,0 +1,16 @@
+# conformal-honest-rho
+
+TITLE: Full conformal with a proven finite-sample guarantee on every row (replace the probe-grid frozen-rho certificate; implement Layer 3)
+WORK ITEM: crates/gam-models/src/inference/full_conformal.rs (about 3.5k lines, issue #942). Layers 1 (exact Gaussian at fixed rho) and 2 (certified GLM homotopy) exist. The weak link is the frozen-rho certificate. Its module doc (~line 161) and certified_full_conformal (~1385) say it "checks the rho-excursion on a fixed probe grid" and accepts "under a grid-checked Lipschitz assumption. This is a conditional check, not a continuous supremum proof." gamfit/_model.py predict docs say the finite-sample coverage theorem applies only where frozen_rho_certified == 1.0; other rows "carry no finite-sample guarantee". SPEC forbids grid search, and a guarantee that holds only on some rows is not a guarantee.
+Goal: every row of interval="conformal" either (a) carries a real finite-sample coverage guarantee for the honest fitting map, which re-selects rho by REML on the augmented data, or (b) returns a typed, loud reason why not. Never a silent conditional.
+Fix (principled, no grid, no hand box, no wall-clock budget):
+1. Replace the probe grid with a sound bound on sup_{z in Z} |rho_hat(z) - rho_hat_0|. Use the outer IFT (d rho/dz = -[Hess_rho V]^{-1} dG/dz) together with an analytic bound on how dG/dz and Hess_rho V vary in z over the deciding range. For Gaussian at fixed basis these are rational in z (the augmented fit is affine in z), so bound them in closed form. Alternatively, locate the roots of G(rho; z) as z varies by exact interval/rational arithmetic. If a certified bound is impossible, implement item 2 and do not keep the grid.
+2. Implement Layer 3 as the module contract describes: bound plus local refit. Where the certificate cannot pin membership, run cold deterministic augmented REML refits only at the breakpoint-localized z regions (a finite, data-determined set of candidates, not a grid). Use the same seed-path optimizer the fit uses, so the fitting map stays symmetric.
+3. Delete the "grid-checked Lipschitz" wording and the probe-count diagnostics once they are gone. The frozen_rho_certified column becomes a certificate kind: exact_frozen, honest_refit, or refused:<reason>.
+Coordinate: conformal-families (wires this core into predict for more families; agree on the result type first and keep route wiring out of this lane), pv-instruments (owns conformal p-value validity tests), model-payload (the n-sized substrate; do not re-add eager persistence).
+Acceptance:
+- A seeded Monte Carlo (>= 2000 reps, MCSE reported; n in {20, 50, 200}; misspecified mean, heavy tails, heteroscedastic noise) shows marginal coverage >= 1 - alpha - 2*MCSE at alpha in {0.1, 0.05} for EVERY row class, with no rows excluded.
+- An independent oracle test brute-forces the honest set on small n (explicit augmented REML refits on a fine z grid; tests may grid) and asserts the returned set equals it up to breakpoint tolerance.
+- A grep test asserts no probe-grid certificate remains in full_conformal.rs.
+- Cost is reported: the median extra refits per test row. The typical Gaussian case must still be one factorization.
+- These tests fail at HEAD (grid wording present; rows without a guarantee exist).
