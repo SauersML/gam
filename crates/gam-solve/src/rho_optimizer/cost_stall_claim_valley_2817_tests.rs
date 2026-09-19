@@ -40,13 +40,7 @@ fn run_valley(start: &Array1<f64>) -> Result<OuterResult, EstimationError> {
         .with_hessian(DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(true)
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
-        .with_initial_rho(start.clone())
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(start.clone());
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| Ok(valley_eval(rho).cost),
