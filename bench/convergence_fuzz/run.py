@@ -51,8 +51,9 @@ N_GRID: tuple[int, ...] = (30, 100, 1_000, 10_000)
 FULL_CASES = 180
 QUICK_CASES = 6
 QUICK_N: tuple[int, ...] = (30, 100)
-# Safety net only (see module docstring). The slowest certified rep of the
-# full plan takes well under a minute single-threaded.
+# Safety net only (see module docstring). The slowest certified reps of the
+# full plan (binomial, n = 10 000, both fits) take about five minutes
+# single-threaded under full-host load.
 TIMEOUT_S = 900.0
 
 
