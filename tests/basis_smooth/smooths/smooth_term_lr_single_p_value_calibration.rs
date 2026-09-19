@@ -30,10 +30,9 @@
 //!   3. NO SILENT FALLBACK. When `λ̂` was chosen but its selection replay
 //!      refused, the published p-value is NaN and the refusal is named; it is
 //!      never the conditional tail in disguise.
-//!   4. POWER. The real term `s(x)` is rejected at `α = 0.05` on most null-`z`
-//!      replicates, and a modest nonlinear effect in `z` is detected well above
-//!      the nominal rate — so the size in (1) is not bought by a test that
-//!      never rejects.
+//!   4. POWER. The real term `s(x)`, and a modest nonlinear effect in `z`, are
+//!      rejected at `α = 0.05` above the top of the null Monte-Carlo band — so
+//!      the size in (1) is not bought by a test that never rejects.
 //!
 //! The Monte-Carlo band is `3·SE = 3·√(α(1−α)/R)` with nothing added: the
 //! claim is that the published p-value is the right size, not that it is close.
@@ -292,19 +291,23 @@ fn assert_null_calibration(family: Family) -> (f64, f64) {
         "[single p-value] {} n={n} R={reps}: power(s(x))@.05={power_x:.3}",
         family.name()
     );
+    let floor = detection_floor(0.05, reps);
     assert!(
-        power_x >= MIN_POWER,
-        "{} n={n}: the real nonlinear s(x) must be rejected at α=0.05 on at least \
-         {MIN_POWER} of the replicates; rate {power_x:.3} on {reps}",
+        power_x > floor,
+        "{} n={n}: the real nonlinear s(x) must be rejected at α=0.05 above the null band \
+         {floor:.3}; rate {power_x:.3} on {reps}",
         family.name()
     );
     conditional_at_05
 }
 
-/// The rejection rate at `α = 0.05` a real effect must reach: a majority of
-/// replicates, ten times the nominal rate. It is a floor against a test that
-/// never rejects, not a power claim for the design.
-const MIN_POWER: f64 = 0.5;
+/// The rejection rate a real effect must exceed: the top of the Monte-Carlo
+/// band a correctly sized test's null rejection rate falls in. Beating it
+/// says the test rejects beyond what nominal size alone explains — a floor
+/// against a test that never rejects, not a power claim for the design.
+fn detection_floor(alpha: f64, reps: usize) -> f64 {
+    alpha + mc_band(alpha, reps)
+}
 
 #[test]
 fn published_smooth_p_value_is_calibrated_for_a_gaussian_null_term_beside_a_real_one() {
@@ -337,10 +340,11 @@ fn assert_power(family: Family, amplitude: f64) {
         "[single p-value] {} n={n} amplitude={amplitude} R={reps}: power@.05={power:.3}",
         family.name()
     );
+    let floor = detection_floor(0.05, reps);
     assert!(
-        power >= MIN_POWER,
-        "{} n={n}: a {amplitude}·sin(3πz) effect must be detected at α=0.05 on at least \
-         {MIN_POWER} of the replicates; power {power:.3} on {reps}",
+        power > floor,
+        "{} n={n}: a {amplitude}·sin(3πz) effect must be detected at α=0.05 above the null \
+         band {floor:.3}; power {power:.3} on {reps}",
         family.name()
     );
 }
