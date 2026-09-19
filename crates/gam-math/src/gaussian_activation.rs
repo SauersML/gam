@@ -128,7 +128,7 @@ use crate::bivariate_normal::{
 };
 use crate::double_double::BoundedDoubleDouble;
 use crate::probability::{normal_cdf, normal_left_tail_ratios, normal_pdf_bounded};
-use crate::roundoff::{UNIT_ROUNDOFF, inflated};
+use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth, inflated};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
 use std::sync::LazyLock;
@@ -884,8 +884,31 @@ fn underflowed_hermite_function_bound() -> f64 {
 ///
 /// A step rounds two products, the root `√k`, the subtraction, the root `√(k+1)`
 /// and the division. That is at most `3u (|x h_k| + √k |h_{k−1}|)` on the numerator
-/// and `2u |h_{k+1}|` on the quotient, on top of the propagated
-/// `(|x| e_k + √k e_{k−1})/√(k+1)`.
+/// and `2u |h_{k+1}|` on the quotient: the step's local error `δ_{k+1}`. The error
+/// `ε_k = ĥ_k − h_k` then obeys the recurrence itself, `ε_{k+1} = a_k ε_k − c_k ε_{k−1}
+/// + δ_{k+1}` with `a_k = x/√(k+1)` and `c_k = √(k/(k+1))`, and two bounds on it hold.
+///
+/// - The absolute bound `e_{k+1} = |a_k| e_k + c_k e_{k−1} + δ_{k+1}` takes every
+///   propagated term at its magnitude. It is tight while the recurrence grows
+///   monotonically, but past the oscillatory onset it ignores the recurrence's
+///   cancellation and grows like `e^{|x|√k}`, while `|h_k(x)|` stays below Cramér's
+///   `K e^{x²/4}`.
+/// - The form bound follows the error vector `v_k = (ε_k, ε_{k−1})` in the quadratic
+///   form each step preserves: `T_k = [[a_k, −c_k], [1, 0]]` maps `v_k` to `v_{k+1} − δ e₁`,
+///   and `F_k(u, v) = u² − a_k u v + c_k v²` has `F_k(T_k w) = c_k F_k(w)` exactly. `F_k` is
+///   positive definite once `a_k² < 4 c_k`, the oscillatory region. With
+///   `G_k ≥ √F_k(v_k)`, `√F_k(v_{k+1}) ≤ √c_k G_k + |δ_{k+1}|`, and moving to the next
+///   step's form costs `κ_k = √(1 + ‖M_{k+1} − M_k‖₂/λ_min(M_k))`, with `M_k` the matrix of
+///   `F_k`. `Δa_k ≈ x/(2 k^{3/2})` and `Δc_k ≈ 1/(2k²)`, so `Π κ_k` converges and the bound
+///   grows polynomially. Minimizing `F_k` over the second coordinate gives
+///   `|ε_k| ≤ G_k/√(1 − a_k²/(4 c_k))`.
+///
+/// Both are bounds on the same error, so each step keeps the smaller, and each feeds the
+/// other: the form bound starts from the absolute one at the onset, `F_k(v_k) ≤
+/// e_k² + |a_k| e_k e_{k−1} + c_k e_{k−1}²`. Every factor the form bound reads is taken
+/// as an upper (or, for a determinant or an eigenvalue it divides by, a lower) bound of
+/// its exact value; a step whose determinant is not resolved positive keeps the
+/// absolute bound alone.
 #[derive(Clone, Copy, Debug)]
 struct HermiteRecurrence {
     argument: f64,
@@ -895,6 +918,83 @@ struct HermiteRecurrence {
     previous_error: f64,
     current: f64,
     current_error: f64,
+    /// `G_k ≥ √F_k(ε_k, ε_{k−1})`, or `+∞` before the oscillatory onset.
+    form_error: f64,
+    /// The step form at `degree`, carried from the previous step.
+    form: Option<StepForm>,
+}
+
+/// The step form `F_k(u, v) = u² − a_k u v + c_k v²` of the Hermite recurrence at order `k`,
+/// with upper bounds on `|a_k|` and `c_k` and lower bounds on `det M_k = c_k − a_k²/4` and
+/// `λ_min(M_k)`, all first order in the unit roundoff; `None` while the determinant is not
+/// resolved positive.
+#[derive(Clone, Copy, Debug)]
+struct StepForm {
+    slope: f64,
+    slope_upper: f64,
+    contraction: f64,
+    contraction_upper: f64,
+    determinant_lower: f64,
+    smallest_eigenvalue_lower: f64,
+}
+
+impl StepForm {
+    fn at(argument: f64, degree: usize) -> Option<Self> {
+        let order = degree as f64;
+        // `a = x/√(k+1)`: a root and a quotient; `c = √k/√(k+1)`: two roots and a quotient.
+        let slope = argument / (order + 1.0).sqrt();
+        let contraction = order.sqrt() / (order + 1.0).sqrt();
+        let slope_upper = slope.abs() * (1.0 + accumulation_growth(2));
+        let contraction_upper = contraction * (1.0 + accumulation_growth(3));
+        let contraction_lower = contraction * (1.0 - accumulation_growth(3));
+        let quarter_square = 0.25 * slope_upper * slope_upper;
+        // Forming `c − a²/4` rounds the square, the quarter and the difference.
+        let determinant_lower =
+            contraction_lower - quarter_square - accumulation_growth(3) * (contraction_lower + quarter_square);
+        if !(determinant_lower > 0.0) {
+            return None;
+        }
+        let spread = (1.0 - contraction_lower).abs();
+        let largest_eigenvalue_upper = 0.5
+            * ((1.0 + contraction_upper) + (spread * spread + slope_upper * slope_upper).sqrt())
+            * (1.0 + accumulation_growth(6));
+        // `λ_min λ_max = det`, so the smaller eigenvalue is formed without the cancellation of
+        // `(1 + c) − √((1 − c)² + a²)` near the onset.
+        let smallest_eigenvalue_lower =
+            determinant_lower / largest_eigenvalue_upper * (1.0 - accumulation_growth(1));
+        Some(Self {
+            slope,
+            slope_upper,
+            contraction,
+            contraction_upper,
+            determinant_lower,
+            smallest_eigenvalue_lower,
+        })
+    }
+
+    /// An upper bound on `√F(u, v)` for `|u| ≤ first`, `|v| ≤ second`.
+    fn norm_upper(&self, first: f64, second: f64) -> f64 {
+        (first * first + self.slope_upper * first * second + self.contraction_upper * second * second).sqrt()
+            * (1.0 + accumulation_growth(6))
+    }
+
+    /// An upper bound on `|u|` for `√F(u, v) ≤ norm`: the minimum of `F` over `v` is
+    /// `u² (1 − a²/(4c)) = u² det/c`.
+    fn first_upper(&self, norm: f64) -> f64 {
+        norm * (self.contraction_upper / self.determinant_lower).sqrt() * (1.0 + accumulation_growth(4))
+    }
+
+    /// An upper bound on `sup_w √(F_next(w)/F(w))`: `F_next = F + (M_next − M)`, and
+    /// `‖M_next − M‖₂ ≤ ‖M_next − M‖_F = √(Δa²/2 + Δc²)`.
+    fn transition_upper(&self, next: &Self) -> f64 {
+        let slope_change = (next.slope - self.slope).abs()
+            + accumulation_growth(3) * (next.slope.abs() + self.slope.abs());
+        let contraction_change = (next.contraction - self.contraction).abs()
+            + accumulation_growth(4) * (next.contraction + self.contraction);
+        let change = (0.5 * slope_change * slope_change + contraction_change * contraction_change).sqrt();
+        (1.0 + change / self.smallest_eigenvalue_lower * (1.0 + accumulation_growth(4))).sqrt()
+            * (1.0 + accumulation_growth(4))
+    }
 }
 
 impl HermiteRecurrence {
@@ -906,6 +1006,8 @@ impl HermiteRecurrence {
             previous_error: 0.0,
             current: 1.0,
             current_error: 0.0,
+            form_error: f64::INFINITY,
+            form: StepForm::at(argument, 0),
         }
     }
 
@@ -916,15 +1018,27 @@ impl HermiteRecurrence {
         let next = (self.argument * self.current - root * self.previous) / next_root;
         let numerator_magnitude =
             self.argument.abs() * self.current.abs() + root * self.previous.abs();
-        let next_error = (self.argument.abs() * self.current_error
-            + root * self.previous_error
-            + 3.0 * UNIT_ROUNDOFF * numerator_magnitude)
-            / next_root
-            + 2.0 * UNIT_ROUNDOFF * next.abs();
+        let local = 3.0 * UNIT_ROUNDOFF * numerator_magnitude / next_root + 2.0 * UNIT_ROUNDOFF * next.abs();
+        let absolute = (self.argument.abs() * self.current_error + root * self.previous_error) / next_root + local;
+        let upcoming = StepForm::at(self.argument, self.degree + 1);
+        let (next_error, next_form_error) = match (self.form, upcoming) {
+            (Some(form), Some(next_form)) => {
+                let now = self
+                    .form_error
+                    .min(form.norm_upper(self.current_error, self.previous_error));
+                let carried = form.transition_upper(&next_form)
+                    * (form.contraction_upper.sqrt() * (1.0 + accumulation_growth(1)) * now + local)
+                    * (1.0 + accumulation_growth(2));
+                (absolute.min(next_form.first_upper(carried)), carried)
+            }
+            _ => (absolute, f64::INFINITY),
+        };
         self.previous = self.current;
         self.previous_error = self.current_error;
         self.current = next;
         self.current_error = next_error;
+        self.form_error = next_form_error;
+        self.form = upcoming;
         self.degree += 1;
     }
 }
@@ -3381,6 +3495,74 @@ mod tests {
             largest_discrepancy > 0.0,
             "the recurrence never rounded, so the running bound was not exercised"
         );
+    }
+
+    #[test]
+    fn hermite_recurrence_error_bound_stays_polynomial_past_the_oscillatory_onset() {
+        // #2946: the chaos pair table carries units to their own orders, 13511 for Pythia-70m
+        // layer 2's rarely active unit, at x = b/√(1 + s²) = −3.21. The production bound must
+        // hold against the double-double recurrence at every order there, and must certify
+        // digits: below Cramér's envelope K e^{x²/4} of the values themselves. The absolute
+        // bound alone, e_{k+1} = |a_k| e_k + c_k e_{k−1} + δ_{k+1}, grows like e^{|x|√k} and at
+        // that order certifies none: the positive control that the form bound is what holds.
+        let orders = 13_600;
+        for argument in [-3.21_f64, 0.5, 6.0, -11.5] {
+            let envelope = CRAMER_BOUND * (0.25 * argument * argument).exp();
+            let mut recurrence = HermiteRecurrence::start(argument);
+            let x = DoubleDouble::from(argument);
+            let mut previous = DoubleDouble::from(0.0);
+            let mut current = DoubleDouble::from(1.0);
+            let (mut absolute_previous, mut absolute_current) = (0.0_f64, 0.0_f64);
+            let mut tightest = f64::INFINITY;
+            for degree in 0..orders {
+                let discrepancy = ((recurrence.current - current.high) - current.low).abs();
+                assert!(
+                    discrepancy <= recurrence.current_error,
+                    "h_{degree}({argument}): discrepancy {discrepancy:e} beyond its bound {:e}",
+                    recurrence.current_error
+                );
+                if discrepancy > 0.0 {
+                    tightest = tightest.min(recurrence.current_error / discrepancy);
+                }
+                let root = DoubleDouble::root_of(degree as f64);
+                let next_root = DoubleDouble::root_of((degree + 1) as f64);
+                let next = x
+                    .mul(current)
+                    .add(root.mul(previous).negated())
+                    .div(next_root);
+                previous = current;
+                current = next;
+                // The absolute bound alone, from the same local rounding model.
+                let order = degree as f64;
+                let (root_f, next_root_f) = (order.sqrt(), (order + 1.0).sqrt());
+                let computed_next = (argument * recurrence.current - root_f * recurrence.previous) / next_root_f;
+                let local = 3.0 * UNIT_ROUNDOFF * (argument.abs() * recurrence.current.abs() + root_f * recurrence.previous.abs())
+                    / next_root_f
+                    + 2.0 * UNIT_ROUNDOFF * computed_next.abs();
+                let absolute_next = (argument.abs() * absolute_current + root_f * absolute_previous) / next_root_f + local;
+                absolute_previous = absolute_current;
+                absolute_current = absolute_next;
+                recurrence.advance();
+            }
+            eprintln!(
+                "#2946 Hermite recurrence at x = {argument}, order {orders}: form bound {:e}, absolute bound {:e}, \
+                 envelope {envelope:e}, tightest bound/discrepancy {tightest:.3e}",
+                recurrence.current_error, absolute_current
+            );
+            assert!(
+                recurrence.current_error < UNIT_ROUNDOFF.sqrt() * envelope,
+                "x = {argument}: the bound {:e} at order {orders} certifies under half the digits of the \
+                 envelope {envelope:e}",
+                recurrence.current_error
+            );
+            if argument == -3.21 {
+                assert!(
+                    !(absolute_current < envelope),
+                    "x = {argument}: the absolute bound {absolute_current:e} certified a digit at order \
+                     {orders}, so the control does not show the form bound is what holds"
+                );
+            }
+        }
     }
 
     #[test]
