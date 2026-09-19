@@ -526,8 +526,9 @@ impl BernoulliMarginalSlopeFamily {
     /// The intercept value channel never moves under the lift (the constraint's
     /// value channel is the certified root residual `= 0`), so each grid node's
     /// normal-CDF derivative stack at the fixed base index `η_k0 = a0 + s·g·x_k`
-    /// is built ONCE — one transcendental pass — and the cheap polynomial
-    /// composition repeats per lift grade.
+    /// is built ONCE — one transcendental pass — and folded into fifteen grid
+    /// moments; each lift grade then composes a degree-four polynomial in the
+    /// intercept and slope jets whose cost does not grow with the grid.
     fn empirical_rigid_intercept_jet<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
@@ -543,16 +544,28 @@ impl BernoulliMarginalSlopeFamily {
         let observed_slope = s * slope;
 
         // One transcendental pass: per node the fixed normal-CDF derivative
-        // stack at η_k0 = a0 + s·slope·x_k, the g-jet coefficient s·x_k, and the
-        // primal calibration Jacobian F_a = Σ_k π_k φ(η_k0) = Σ_k π_k Φ'(η_k0).
-        let mut f_a = 0.0f64;
-        let mut node_stacks: Vec<([f64; 5], f64, f64)> = Vec::with_capacity(nodes.len());
+        // stack at η_k0 = a0 + s·slope·x_k, folded into the grid moments
+        //   M[j][i] = Σ_k π_k (s·x_k)^i Φ^{(j)}(η_k0),   i ≤ j ≤ 4.
+        // Node k's index jet is η_k0 + α + (s·x_k)·γ, with α and γ the
+        // derivative parts of the intercept and slope jets, so the grid sum
+        // composes to the polynomial
+        //   Σ_k π_k Φ(η_k) = Σ_{p+q ≤ 4} M[p+q][q] / (p!·q!) · α^p γ^q
+        // and every lift reads these fifteen moments instead of composing the
+        // grid again. The primal calibration Jacobian is F_a = M[1][0].
+        let mut moments = [[0.0f64; 5]; 5];
         for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
             let eta0 = a0 + observed_slope * node;
             let cdf_stack = unary_derivatives_normal_cdf(eta0);
-            f_a += weight * cdf_stack[1];
-            node_stacks.push((cdf_stack, s * node, weight));
+            let g_coef = s * node;
+            let mut coefficient = weight;
+            for q in 0..5 {
+                for j in q..5 {
+                    moments[j][q] += coefficient * cdf_stack[j];
+                }
+                coefficient *= g_coef;
+            }
         }
+        let f_a = moments[1][0];
         if !f_a.is_finite() || f_a <= 0.0 {
             return Err(format!(
                 "empirical rigid jet: non-positive calibration Jacobian F_a={f_a} at row {row}"
@@ -575,12 +588,36 @@ impl BernoulliMarginalSlopeFamily {
             ])
             .neg();
 
-        // Constraint F(a, θ) = −μ(m) + Σ_k π_k Φ(a + s·g·x_k), evaluated in S.
+        // Constraint F(a, θ) = −μ(m) + Σ_k π_k Φ(a + s·g·x_k), evaluated in S
+        // from the moments. The slope's powers γ^q do not move under the lift.
+        const INVERSE_FACTORIAL: [f64; 5] = [1.0, 1.0, 0.5, 1.0 / 6.0, 1.0 / 24.0];
+        let gamma = g_jet.with_value(0.0);
+        let mut gamma_powers = [S::constant(1.0); 5];
+        for q in 1..5 {
+            gamma_powers[q] = gamma_powers[q - 1].mul(&gamma);
+        }
+        let neg_mu_at_grid = neg_mu.add_constant(moments[0][0]);
         let constraint = |a: &S| -> S {
-            let mut acc = neg_mu;
-            for &(cdf_stack, g_coef, weight) in node_stacks.iter() {
-                let eta_k = a.add(&g_jet.scale(g_coef));
-                acc = acc.add(&eta_k.compose_unary(cdf_stack).scale(weight));
+            let alpha = a.with_value(0.0);
+            let mut acc = neg_mu_at_grid;
+            let mut alpha_power = S::constant(1.0);
+            for p in 0..5 {
+                for q in 0..(5 - p) {
+                    if p + q == 0 {
+                        continue;
+                    }
+                    let coefficient =
+                        moments[p + q][q] * INVERSE_FACTORIAL[p] * INVERSE_FACTORIAL[q];
+                    let monomial = match (p, q) {
+                        (0, _) => gamma_powers[q],
+                        (_, 0) => alpha_power,
+                        _ => alpha_power.mul(&gamma_powers[q]),
+                    };
+                    acc = acc.add(&monomial.scale(coefficient));
+                }
+                if p < 4 {
+                    alpha_power = alpha_power.mul(&alpha);
+                }
             }
             acc
         };
