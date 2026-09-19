@@ -4179,6 +4179,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
             for index in 0..reactive_upper.len() {
                 reactive_upper[index] = reactive_upper[index].min(log_strength_upper[index]);
             }
+            // #2822 — an output-scale coordinate (global dispersion, crosscoder block
+            // relevance) is not a prior strength: the reactive entry has no heavy-entry
+            // value for it and hands back its literal target, which is not a claim about
+            // the domain. Left there, the noise precision was boxed at its seed and every
+            // planted-circle fit railed on it. It keeps the objective-domain face.
+            let block_start = self.baseline_rho.block_flat_start();
+            for index in block_start..block_start + self.baseline_rho.log_lambda_block.len() {
+                reactive_upper[index] = log_strength_upper[index];
+            }
         }
         // #2691 — the same chart-resolution face on the reactive exit. The
         // reactive construction leaves a periodic ARD coordinate at its literal
