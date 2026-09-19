@@ -243,7 +243,8 @@ class GamfitAdapter(Adapter):
         return {
             "edf": None if summ.edf_total is None else float(summ.edf_total),
             "ncoef": None if summ.coefficients is None else len(summ.coefficients),
-            "iterations": summ.iterations,
+            "iterations": self.model.outer_iterations,
+            "inner_iterations": self.model.inner_iterations,
             "convergence": json.loads(json.dumps(conv, default=str)),
         }
 
