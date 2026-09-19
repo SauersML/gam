@@ -2,7 +2,7 @@
 
 There is deliberately no second, gradient-trained SAE in this module.  Model
 construction, latent inference, assignment, smoothing selection, and
-out-of-sample projection all belong to :func:`gamfit.sae_manifold_fit` and its
+out-of-sample projection all belong to :func:`gamfit.sae.sae_manifold_fit` and its
 Rust implementation.  :class:`ManifoldSAE` only converts tensors at that fitted
 model boundary and serializes the immutable fit inside an ``nn.Module`` state.
 """
@@ -176,7 +176,7 @@ def circular_concordance(
 class ManifoldSAE(nn.Module):
     """Frozen ``nn.Module`` adapter around a converged native SAE fit.
 
-    Construct the model with :func:`gamfit.sae_manifold_fit`, then wrap that
+    Construct the model with :func:`gamfit.sae.sae_manifold_fit`, then wrap that
     returned native object.  ``forward`` runs the native converged-latent path
     for both training rows and unseen rows.  It is intentionally
     non-differentiable: fitting or differentiating a second torch objective
@@ -188,7 +188,7 @@ class ManifoldSAE(nn.Module):
         if not isinstance(fitted, _FittedManifoldSAE):
             raise TypeError(
                 "gamfit.torch.ManifoldSAE expects the converged object returned "
-                "by gamfit.sae_manifold_fit"
+                "by gamfit.sae.sae_manifold_fit"
             )
         self._fitted = fitted
         self.register_buffer(

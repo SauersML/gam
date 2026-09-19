@@ -268,6 +268,15 @@ pub fn logb_sigma_from_eta_with_floor_scalar(floor: f64, eta: f64) -> f64 {
     floor + safe_exp(eta)
 }
 
+/// Posterior mean `E[σ]` of `σ = floor + exp(η)` when the log-σ predictor has
+/// the Gaussian posterior `η ~ N(mean, variance)`: the lognormal first moment
+/// gives exactly `floor + exp(mean + variance/2)`. At `variance = 0` this is
+/// the plug-in [`logb_sigma_from_eta_with_floor_scalar`].
+#[inline]
+pub fn logb_sigma_posterior_mean_with_floor_scalar(floor: f64, mean: f64, variance: f64) -> f64 {
+    floor + safe_exp(mean + 0.5 * variance)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

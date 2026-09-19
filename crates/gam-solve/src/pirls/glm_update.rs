@@ -410,6 +410,7 @@ pub(crate) fn update_glmvectors_integrated_by_family(
 pub(crate) fn computeworkingweight_derivatives_from_eta(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
+    y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
 ) -> Result<
@@ -470,6 +471,29 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                     d2mu_deta2: &mut d2mu_deta2,
                     d3mu_deta3: &mut d3mu_deta3,
                 },
+            )?;
+        }
+        ResponseFamily::StudentT { .. } => {
+            // The EM weight `(ν+1)/(A + r²)` depends on the response, so this
+            // is the one family whose working-weight jet needs `y`.
+            let scale = StudentTScale::from_likelihood(likelihood)?;
+            let (mut mu, mut weights, mut z) =
+                (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n));
+            write_student_t_working_state(
+                y,
+                eta,
+                priorweights,
+                &scale,
+                &mut mu,
+                &mut weights,
+                &mut z,
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut dmu_deta,
+                    d2mu_deta2: &mut d2mu_deta2,
+                    d3mu_deta3: &mut d3mu_deta3,
+                }),
             )?;
         }
         ResponseFamily::Poisson => {

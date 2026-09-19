@@ -237,6 +237,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         se_eta: f64,
     ) -> Result<f64, EstimationError> {
         match (&self.spec.response, &self.spec.link) {
+            (ResponseFamily::StudentT { .. }, _) => Ok(eta),
             (
                 ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
                 InverseLink::Standard(StandardLink::Log),
@@ -323,6 +324,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         se_eta: f64,
     ) -> Result<(f64, f64), EstimationError> {
         match (&self.spec.response, &self.spec.link) {
+            (ResponseFamily::StudentT { .. }, _) => Ok((eta, se_eta * se_eta)),
             (
                 ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
                 InverseLink::Standard(StandardLink::Identity),

@@ -172,6 +172,9 @@ pub enum NoiseModel {
         /// `Tweedie::phi`.
         phi: Array1<f64>,
     },
+    /// Location-scale Student-t: `y = mean + sigma * T_nu`. Both `sigma` and
+    /// `nu` are the fitted values stored on the Student-t response spec.
+    StudentT { sigma: f64, nu: f64 },
     Bernoulli,
     /// Row-specific categorical response law.
     ///
@@ -404,6 +407,19 @@ impl NoiseModel {
                 Ok(NoiseModel::InverseGaussian {
                     phi: Array1::from_elem(nobs, phi),
                 })
+            }
+            ResponseFamily::StudentT { sigma, nu } => {
+                let sigma = Self::require_positive_noise_parameter(
+                    likelihood,
+                    "Student-t scale sigma",
+                    Some(*sigma),
+                )?;
+                let nu = Self::require_positive_noise_parameter(
+                    likelihood,
+                    "Student-t degrees of freedom nu",
+                    Some(*nu),
+                )?;
+                Ok(NoiseModel::StudentT { sigma, nu })
             }
             ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic generation"
@@ -817,6 +833,14 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 y[i] = rand_distr::Distribution::sample(&dist, rng);
             }
             Ok(y)
+        }
+        NoiseModel::StudentT { sigma, nu } => {
+            let dist = rand_distr::StudentT::new(*nu).map_err(|e| {
+                EstimationError::InvalidInput(format!("invalid Student-t degrees of freedom {nu}: {e}"))
+            })?;
+            Ok(spec
+                .mean
+                .mapv(|mu| mu + sigma * rand_distr::Distribution::sample(&dist, rng)))
         }
         NoiseModel::Bernoulli => {
             let mut y = Array1::<f64>::zeros(spec.mean.len());

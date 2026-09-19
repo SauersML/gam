@@ -159,15 +159,15 @@ def manifold_fit(gamfit, z, *, K, atom_topology, atom_basis, d_atom, assignment,
     if intrinsic_rank is not None:
         kwargs["intrinsic_rank"] = intrinsic_rank
     t0 = time.time()
-    fit = gamfit.sae_manifold_fit(**kwargs)
+    fit = gamfit.sae.sae_manifold_fit(**kwargs)
     dt = time.time() - t0
     return fit, dt
 
 
 def adjudicate(gamfit, coords, seed, mean_l0):
     """Cross-class shape race through the Rust FFI (single evidence impl)."""
-    if hasattr(gamfit, "adjudicate_atom_shape") and coords.shape[1] == 2:
-        return gamfit.adjudicate_atom_shape(
+    if hasattr(gamfit.sae, "adjudicate_atom_shape") and coords.shape[1] == 2:
+        return gamfit.sae.adjudicate_atom_shape(
             np.ascontiguousarray(coords), folds=5, seed=seed, mean_l0=mean_l0
         )
     return {
@@ -203,7 +203,7 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
             "data": str(data),
             "seed": seed,
             "n_iter": n_iter,
-            "gamfit_has_adjudicator": hasattr(gamfit, "adjudicate_atom_shape"),
+            "gamfit_has_adjudicator": hasattr(gamfit.sae, "adjudicate_atom_shape"),
         },
         "layers": {},
         "variant_sweep": [],

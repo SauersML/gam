@@ -980,10 +980,15 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         return result;
     }
 
-    if matches!(link_function, LinkFunction::Identity) && linear_constraints.is_none() {
+    if matches!(link_function, LinkFunction::Identity)
+        && likelihood.spec.is_gaussian_identity()
+        && linear_constraints.is_none()
+    {
         // Gaussian-Identity zero-iteration exact solve. The unconstrained
-        // penalized least-squares system is linear, so for an identity link a
-        // single solve is the exact minimizer and no PIRLS iteration is needed.
+        // penalized least-squares system is linear, so for a Gaussian identity
+        // model a single solve is the exact minimizer and no PIRLS iteration is
+        // needed. Other identity-link families (Student-t) have a non-quadratic
+        // likelihood and take the iterative loop below.
         //
         // This shortcut is only valid in the *unconstrained* convex program.
         // When shape/box/linear inequality constraints are present (e.g. a
@@ -1148,6 +1153,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     computeworkingweight_derivatives_from_eta(
                         &config.likelihood,
                         &config.link_kind,
+                        y,
                         &final_eta,
                         priorweights_owned.view(),
                     )?;
@@ -1217,6 +1223,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 computeworkingweight_derivatives_from_eta(
                     &config.likelihood,
                     &config.link_kind,
+                    y,
                     &final_eta,
                     priorweights_owned.view(),
                 )?;

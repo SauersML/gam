@@ -2594,6 +2594,23 @@ pub fn integrated_family_moments_jet(
                 mode: jet.mode,
             })
         }
+        ResponseFamily::StudentT { sigma, nu } => {
+            // Identity link: the mean is exact; the response variance
+            // `σ²ν/(ν−2)` exists only for `ν > 2`.
+            if !(*nu > 2.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Student-t response variance does not exist at nu={nu} (requires nu > 2)"
+                )));
+            }
+            Ok(IntegratedMomentsJet {
+                mean: e,
+                variance: sigma * sigma * nu / (nu - 2.0),
+                d1: 1.0,
+                d2: 0.0,
+                d3: 0.0,
+                mode: IntegratedExpectationMode::ExactClosedForm,
+            })
+        }
         ResponseFamily::RoystonParmar => {
             let jet = integrated_inverse_link_jetwith_state(
                 quadctx,

@@ -10,7 +10,7 @@ pytest.importorskip("torch")
 
 
 def test_gated_sae_decoder_atoms_match_rust() -> None:
-    from gamfit import GatedSAEDecoder
+    from gamfit.penalties import GatedSAEDecoder
     from gamfit._binding import rust_module
 
     rng = np.random.default_rng(202)

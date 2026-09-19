@@ -1164,6 +1164,7 @@ impl FittedModelPayload {
                 linear_terms: Vec::new(),
                 smooth_terms: Vec::new(),
                 random_effect_terms: Vec::new(),
+                level: Default::default(),
             });
     }
 
@@ -1277,16 +1278,34 @@ pub enum ModelKind {
     TransformationNormal,
 }
 
+/// Saved-family tag of a joint multi-level expectile location-scale fit.
+pub const JOINT_EXPECTILE_FAMILY_TAG: &str = "expectile-location-scale";
+
+/// Prediction column carrying the level-`tau` curve of a joint expectile fit.
+pub fn expectile_curve_column_name(tau: f64) -> String {
+    format!("expectile_{tau}")
+}
+
 /// Statistical criterion represented by a saved fitted surface.
 ///
 /// `Likelihood` means the persisted [`LikelihoodSpec`] is also the fitted
 /// observation law. `Expectile` records the asymmetric least-squares target;
 /// it intentionally defines no observation sampler on its own.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+/// `ExpectileLocationScale` records a joint multi-level expectile fit on a
+/// Gaussian location-scale surface: level `levels[k]` is the curve
+/// `μ(x) + standardized_expectiles[k]·E[σ(x)]`. The standardized expectiles
+/// are strictly increasing, which is what makes the curves non-crossing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "estimator_kind", rename_all = "kebab-case")]
 pub enum FittedEstimator {
     Likelihood,
-    Expectile { tau: f64 },
+    Expectile {
+        tau: f64,
+    },
+    ExpectileLocationScale {
+        levels: Vec<f64>,
+        standardized_expectiles: Vec<f64>,
+    },
 }
 
 /// The family name every surface (summary, CLI fit line, Python
@@ -3678,8 +3697,34 @@ impl FittedModel {
     }
 
     #[inline]
-    pub fn estimator(&self) -> FittedEstimator {
-        self.payload().estimator
+    pub fn estimator(&self) -> &FittedEstimator {
+        &self.payload().estimator
+    }
+
+    /// Point-payload shape this model's prediction publishes. A joint expectile
+    /// fit publishes one curve per level (`expectile_curves`); every other
+    /// model publishes its class shape (`PredictModelClass::point_shape`).
+    pub fn prediction_point_shape(&self) -> &'static str {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { .. } => "expectile_curves",
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => {
+                self.predict_model_class().point_shape()
+            }
+        }
+    }
+
+    /// Point columns of a joint expectile fit, one per level in increasing
+    /// level order; `None` for every other estimator.
+    pub fn expectile_curve_columns(&self) -> Option<Vec<String>> {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { levels, .. } => Some(
+                levels
+                    .iter()
+                    .map(|&tau| expectile_curve_column_name(tau))
+                    .collect(),
+            ),
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => None,
+        }
     }
 
     /// Columns this model consumes from a prediction frame — its *input
@@ -4145,7 +4190,8 @@ impl FittedModel {
         let curved_family = match &family.response {
             // Identity-link Gaussian: inverse link is linear, so the posterior
             // mean equals the plug-in and the cheaper exact path is taken. The
-            // inverse link `1/η` is curved.
+            // inverse link `1/η` is curved. Student-t is identity-only.
+            ResponseFamily::StudentT { .. } => false,
             ResponseFamily::Gaussian => {
                 !matches!(&family.link, InverseLink::Standard(StandardLink::Identity))
             }
@@ -5192,12 +5238,15 @@ impl FittedModel {
                 ),
             });
         }
-        let expectile_family_tag = {
+        let (expectile_family_tag, joint_expectile_family_tag) = {
             let family = self.family.trim().to_ascii_lowercase();
-            family == "expectile" || family.starts_with("expectile(")
+            (
+                family == "expectile" || family.starts_with("expectile("),
+                family == JOINT_EXPECTILE_FAMILY_TAG,
+            )
         };
-        match self.estimator {
-            FittedEstimator::Likelihood if expectile_family_tag => {
+        match &self.estimator {
+            FittedEstimator::Likelihood if expectile_family_tag || joint_expectile_family_tag => {
                 return Err(FittedModelError::SchemaMismatch {
                     reason:
                         "saved family is tagged expectile but estimator metadata says likelihood"
@@ -5206,6 +5255,7 @@ impl FittedModel {
             }
             FittedEstimator::Likelihood => {}
             FittedEstimator::Expectile { tau } => {
+                let tau = *tau;
                 if !tau.is_finite() || tau <= 0.0 || tau >= 1.0 {
                     return Err(FittedModelError::SchemaMismatch {
                         reason: format!(
@@ -5227,6 +5277,62 @@ impl FittedModel {
                             self.model_kind,
                             self.family,
                             self.family_state.likelihood(),
+                        ),
+                    });
+                }
+            }
+            FittedEstimator::ExpectileLocationScale {
+                levels,
+                standardized_expectiles,
+            } => {
+                let gaussian_identity_location_scale = self.model_kind == ModelKind::LocationScale
+                    && matches!(
+                        &self.family_state,
+                        FittedFamily::LocationScale { likelihood, .. }
+                            if likelihood == &LikelihoodSpec::gaussian_identity()
+                    );
+                if !gaussian_identity_location_scale || !joint_expectile_family_tag {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator requires a \
+                             `{JOINT_EXPECTILE_FAMILY_TAG}`-tagged Gaussian location-scale fit; \
+                             got model_kind={:?}, family={:?}, likelihood={:?}",
+                            self.model_kind,
+                            self.family,
+                            self.family_state.likelihood(),
+                        ),
+                    });
+                }
+                if levels.len() < 2 || levels.len() != standardized_expectiles.len() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator needs at least two levels, each with \
+                             one standardized expectile; got {} levels and {} expectiles",
+                            levels.len(),
+                            standardized_expectiles.len()
+                        ),
+                    });
+                }
+                if levels.iter().any(|tau| !tau.is_finite() || *tau <= 0.0 || *tau >= 1.0)
+                    || levels.windows(2).any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile levels must be strictly increasing and \
+                             strictly inside (0, 1), got {levels:?}"
+                        ),
+                    });
+                }
+                if standardized_expectiles.iter().any(|c| !c.is_finite())
+                    || standardized_expectiles
+                        .windows(2)
+                        .any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile standardized expectiles must be finite and \
+                             strictly increasing (the non-crossing guarantee), got \
+                             {standardized_expectiles:?}"
                         ),
                     });
                 }
@@ -6304,6 +6410,7 @@ mod tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     }
 
@@ -7936,6 +8043,7 @@ mod tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 

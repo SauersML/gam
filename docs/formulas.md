@@ -23,6 +23,30 @@ This page lists each right-hand-side term, its options, and the
 formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
 `timewiggle(...)`, `survmodel(...)`).
 
+### Column names that are not identifiers
+
+A column whose name is not a plain identifier — it has a space, a dot, a
+hyphen, a leading digit, or non-ASCII letters — is written in backticks,
+anywhere a column name is accepted, the response included:
+
+```
+`body mass` ~ s(`flipper.length`) + `2nd dose` + C(`site id`)
+```
+
+Everything between the backticks is the column name, verbatim. Plain
+identifiers need no quoting (`s(x)` and ``s(`x`)`` are the same term).
+
+### Option values are checked
+
+Every option a term accepts is parsed strictly. An unknown option name, a
+value of the wrong type (`k=ten`, `double_penalty=maybe`), and an
+out-of-range value (`k=0`, `degree=-1`) are errors that name the term and
+the option, e.g. ``in term s(x, k=ten): option `k=ten` is not a
+non-negative integer``. Nothing is silently clamped or ignored; in
+particular `penalty_order` must satisfy `1 <= penalty_order <= degree`,
+because the `m`-th derivative of a degree-`d` spline is identically zero
+for `m > d` and such a penalty would penalize nothing.
+
 ## Response (left of `~`)
 
 | Response | Default behaviour |
@@ -123,12 +147,55 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
 `prior=`, `target`/`strength`, and the (legacy) `pull=` shorthand are
 mutually exclusive.
 
+## Removing the intercept {#removing-the-intercept}
+
+```
+y ~ 0 + x                 # regression through the origin (penalized slope)
+y ~ x - 1                 # the same model
+y ~ 0 + linear(x, double_penalty=false)   # unpenalized: OLS through the origin
+y ~ 0 + g                 # cell means: one unpenalized coefficient per level of g
+y ~ 0 + s(x) + s(z)       # s(x) carries the level; s(z) stays centred
+```
+
+`0 + …`, `… + 0` and `… - 1` remove the global intercept; `1 + …` (or
+`+ 1`) keeps it, which is the default. The constant level of the model is
+always carried at most once, and always in an unpenalized direction, so
+shifting the response shifts the fit and nothing else. With the intercept
+it is the all-ones column and every other term is centred against it.
+Without it the level moves to one term, chosen by this rule:
+
+1. **The first fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main
+   effect of a factor `by=` smooth. It is dummy-coded with every level kept
+   (no reference level) and made unpenalized, so `0 + g` is exactly the
+   cell-means model. A second factor keeps its usual coding.
+2. **Else the first pure-indicator interaction** (`g:h`), which keeps every
+   cell, its reference cell included.
+3. **Else the first B-spline or tensor smooth** (`s(x)`, `te(x, z)`, …). A
+   smooth with an explicit `identifiability=none` is preferred; otherwise
+   the first default-centred one has its sum-to-zero centring released.
+   Either way its null-space ridge is dropped so the constant it now spans
+   is unpenalized — unless `double_penalty=true` was written, in which case
+   the whole null space, the level included, stays shrunk as asked. Every
+   other smooth stays centred.
+
+A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never carries the
+level: its levels are mean-zero deviations. When no term can carry it, the
+model has no constant at all and every effect passes through the origin,
+exactly as a parametric no-intercept fit does. `y ~ 0 + linear(x,
+double_penalty=false)` is ordinary least squares through the origin, to
+rounding. The default `y ~ 0 + x` also passes through the origin, but its
+slope carries the same REML-selected shrinkage ridge as `x` in `y ~ x`
+(see [Linear and constrained coefficients](#linear-and-constrained-coefficients)),
+so it sits slightly toward zero from the least-squares slope when the data
+support shrinkage.
+
 ## Random effects and factor smooths
 
 ```
 y ~ x + group(site)                      # random intercept per level
 y ~ x + re(site)                         # random-intercept alias of group()
 y ~ x + factor(site)                     # FIXED categorical factor (like bare `+ site`)
+y ~ x + C(site)                          # alias of factor(), as in patsy/formulaic
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -187,11 +254,44 @@ difference-penalized P-spline of the same dimension.
 | `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value and zero first derivative). Combine with `side=left`/`right` for half-open smooths. |
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
 | `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
+| `domain` | data range | `[lower, upper]` interval the spline is built on. See [Fixing the spline's interval](#spline-domain). |
+| `shape` | `none` | Shape constraint: `monotone_increasing`, `monotone_decreasing`, `convex`, `concave`. See [Shape-constrained smooths](#shape-constrained-smooths). |
 
 Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes the left endpoint value and slope while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
 
 The 1-D B-spline path accepts these options plus `periodic`, `period`,
 `periods`, `period_start`, `period_end`, `origin`, `identifiability`.
+
+### Fixing the spline's interval (`domain=`) {#spline-domain}
+
+```
+y ~ s(age, domain=[0, 100])             # basis spans [0, 100], not min..max(age)
+y ~ s(x, bs=cr, k=8, domain=[0, 1])     # cr end knots at 0 and 1
+y ~ te(x, z, domain=[[0, 1], none])     # per margin: fix x, z keeps its data range
+```
+
+By default an open (non-periodic) spline's boundary knots sit at the minimum
+and maximum of the fitted column, so the basis — and therefore the fit —
+depends on which rows happened to be sampled. `domain=[lower, upper]`
+declares the interval instead: the clamped boundary knots are placed at
+`lower` and `upper`, generated interior knots are spread over it, and a
+`bs=cr`/`cs` basis puts its end value-knots there. Quantile knot placement
+keeps its interior knots at data quantiles and moves only the boundary knots
+to the domain. Explicit interior `knots=[...]` must lie inside it. Two
+samples of different extent inside the same domain therefore build exactly
+the same basis. Bounds accept numeric expressions (`domain=[0, 2*pi]`).
+
+On `te()`/`ti()` the option takes one entry per margin, each an interval or
+`none` (keep that margin's data range): `domain=[[0, 1], [-5, 5]]`.
+
+Fitted data must lie inside the domain: a row outside it is an error that
+names the column and its observed span, rather than a silent widening.
+At **prediction** time a point outside the domain is evaluated by linear
+extrapolation from the boundary, as for any clamped B-spline. `domain=` is
+for open splines only; a periodic axis takes its interval from
+`period=`/`period_start=`/`period_end=` (or `origins=` on a tensor margin),
+and combining the two is an error. (`boundary=` is unrelated: it sets the
+endpoint condition, e.g. `boundary=periodic` or `bc=clamped`.)
 
 `identifiability=` selects the smooth's own gauge. On the 1-D B-spline path —
 `s()` and `cyclic()` — and on `matern()`, the vocabulary is:
@@ -235,6 +335,45 @@ then `k = internal_knots + degree + 1`, and an explicit `k` is honoured
 exactly down to `k = degree + 1` (zero interior knots). Passing both `k`
 and `knots` is an error. The fit's inference note prints the rule it
 applied.
+
+### Shape-constrained smooths {#shape-constrained-smooths}
+
+```
+y ~ s(x, shape=monotone_increasing)   # f'(x) >= 0 on the knot range
+y ~ s(x, shape=monotone_decreasing)   # f'(x) <= 0
+y ~ s(x, shape=convex)                # f''(x) >= 0
+y ~ s(x, shape=concave, k=12)         # f''(x) <= 0
+```
+
+Accepted spellings (case and hyphens are ignored): `none`;
+`monotone_increasing` (`monotonic_increasing`, `increasing`, `mono_inc`,
+`mpi`); `monotone_decreasing` (`monotonic_decreasing`, `decreasing`,
+`mono_dec`, `mpd`); `convex` (`cvx`); `concave` (`ccv`). From Python,
+`gamfit.fit(..., constraints={"s(x)": "monotone_increasing"})` rewrites the
+formula into the same `shape=` option.
+
+The constraint is exact, not a penalty and not a check on a grid of points.
+The B-spline coefficients are written as `β = C·δ`, where `δ` holds
+successive coefficient differences (monotone) or knot-scaled slope
+differences (convex/concave), and the solver enforces `δ ≥ 0`. A
+non-negative control-polygon difference makes the spline itself monotone
+(or convex) everywhere on the knot range. The roughness penalty stays the
+function penalty `βᵀSβ`, carried into `δ` coordinates by congruence.
+
+A shape-constrained smooth is centred like an unconstrained one. The chart
+drops the constant ("level") direction, which the B-spline partition of
+unity would otherwise make identical to the intercept. It also subtracts
+each increment column's weighted training mean, which leaves every
+coefficient difference, and so the cone, unchanged. The fitted term then
+sums to zero over the training rows and the intercept carries the level.
+`identifiability=` takes `sum_tozero` (the default) or `none`. With `none`,
+the constant stays in the chart as an unbounded level coordinate. `linear`
+is refused because removing a linear trend is not compatible with the cone.
+
+Only open 1-D B-spline `s(x)` smooths accept `shape=`. Periodic
+(`cyclic()`), cubic-regression (`bs='cr'`/`'cs'`) and boundary-conditioned
+bases, thin-plate/Duchon/Matérn/sphere smooths, and tensor products reject a
+non-`none` shape with an error.
 
 ### Boundary-conditioned 1-D smooths {#boundary-conditioned-1d-smooths}
 
@@ -448,6 +587,8 @@ takes the same options as `te(...)`.
 | `double_penalty` | `true` | Ridge alongside per-margin penalties. |
 | `bc` | none | Per-margin margin kind. A `periodic` / `cyclic` / `cc` token makes that margin wrap; `clamped` / `open` / `natural` / `free` / `none` all mark an ordinary non-periodic margin (`clamped` here is the *clamped knot vector* of an open spline, not a zero-derivative endpoint pin — for that, use a 1-D `s(x, bc=clamped)` term). `anchored` is rejected. A single token applies to every margin; any other length is an error. |
 | `periodic`, `period`, `periods`, `origin`, `origins` | — | Per-margin periodicity (see below). |
+| `bs` (`type`) | `cr` per margin | Margin basis: `tp`/`tps`, `ps`, `bs`, `cr`, `cs`, `cc`. A scalar `bs=ps` applies to every margin; `bs=c('cc', 'ps')` sets them per margin. `te()` is always a tensor product — `bs=` never turns it into a different smooth. |
+| `domain` | data range, per margin | One `[lower, upper]` interval (or `none`) per margin: `domain=[[0, 1], none]`. See [Fixing the spline's interval](#spline-domain). |
 | `by` | — | See [univariate smooths](#univariate-smooths). |
 | `identifiability` | `sum_tozero` (`te`), `marginal_sum_tozero` (`ti`) | `none`, `sum_tozero`, or `marginal_sum_tozero`. |
 

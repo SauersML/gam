@@ -75,6 +75,7 @@ fn aniso_matern_recovers_signal_axis() {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let weights = Array1::ones(n);
