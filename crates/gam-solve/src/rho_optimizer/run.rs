@@ -7206,7 +7206,6 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
     let rho_hat = result.rho.slice(ndarray::s![..rho_dim]).to_owned();
     let theta_hat = result.rho.clone();
     let cost_hat = result.final_value;
-    let (domain_lower, domain_upper) = outer_model_domain_bounds_template(config, rho_dim);
     let diagnostic = {
         let mut served_hat_cost = false;
         let mut criterion = |rho: &Array1<f64>| -> Option<f64> {
@@ -7218,16 +7217,6 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
             if is_hat && !served_hat_cost {
                 served_hat_cost = true;
                 return Some(cost_hat);
-            }
-            // The criterion's support is the model's canonical outer domain: a
-            // draw outside it is not a model, so its importance weight is zero
-            // and there is nothing to evaluate. A railed coordinate carries a
-            // near-flat Laplace proposal whose draws land far outside the box,
-            // where the inner solve has no valid minimum to report.
-            let outside = (0..rho_dim)
-                .any(|idx| !(rho[idx] >= domain_lower[idx] && rho[idx] <= domain_upper[idx]));
-            if outside {
-                return None;
             }
             let mut theta = theta_hat.clone();
             for idx in 0..rho_dim {

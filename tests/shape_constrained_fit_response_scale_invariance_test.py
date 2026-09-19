@@ -32,6 +32,23 @@ def _monotone_data(n: int = 300) -> tuple[np.ndarray, np.ndarray]:
     return x, y
 
 
+def test_monotone_fit_does_not_probe_rho_outside_its_domain(capfd) -> None:
+    """The post-fit rho-posterior diagnostic stays inside the certified box (B3).
+
+    The monotone fit rails one smoothing parameter on its derived lower face.
+    Its Laplace proposal along that coordinate is near-flat, so the PSIS
+    adequacy draws landed hundreds of log-units below the face, and every one
+    of them printed a ``P-IRLS could not certify a valid minimum`` error on
+    stderr for a fit that had converged and certified. Such a draw is outside
+    the posterior's support and now gets zero weight without an inner solve.
+    """
+    x, y = _monotone_data()
+    capfd.readouterr()
+    gamfit.fit({"x": x, "y": y}, "y ~ s(x, shape=monotone_increasing)")
+    err = capfd.readouterr().err
+    assert "P-IRLS could not certify" not in err, err
+
+
 def test_monotone_fit_is_equivariant_under_response_rescaling() -> None:
     x, y = _monotone_data()
     grid = np.linspace(0.0, 10.0, 60)

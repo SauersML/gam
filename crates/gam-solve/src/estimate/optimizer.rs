@@ -3787,6 +3787,8 @@ where
         // K≤16, honest Unavailable beyond) at this same live seam.
         (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
             &final_rho,
+            // The searched and certified box is the posterior's support.
+            &rho_model_domain,
             !opts.skip_rho_posterior_inference,
             None,
         );
