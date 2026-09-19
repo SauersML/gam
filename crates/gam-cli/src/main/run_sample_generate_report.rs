@@ -829,7 +829,9 @@ fn report_family_residuals(
     edf_total: f64,
 ) -> Result<FamilyResiduals, String> {
     use rand::RngExt;
-    use statrs::distribution::{Beta, Discrete, DiscreteCDF, Gamma, NegativeBinomial, Poisson};
+    use statrs::distribution::{
+        Beta, Discrete, DiscreteCDF, Gamma, NegativeBinomial, Poisson, StudentsT,
+    };
 
     let n = y.len().min(mu.len());
     if n == 0 {
@@ -946,6 +948,21 @@ fn report_family_residuals(
             Ok(FamilyResiduals {
                 values,
                 label: "Randomized Quantile Residual",
+            })
+        }
+        ResponseFamily::StudentT { sigma, nu } => {
+            // σ and ν are the fitted LAML estimates, so the residual is the exact
+            // quantile residual Φ⁻¹(F_t((y−μ)/σ; ν)).
+            let values = (0..n)
+                .map(|i| {
+                    let dist = StudentsT::new(mu[i], *sigma, *nu)
+                        .map_err(|e| format!("Student-t residual at μ={}: {e}", mu[i]))?;
+                    to_normal(dist.cdf(y[i]))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Quantile Residual",
             })
         }
         ResponseFamily::Gamma => {

@@ -43,6 +43,37 @@ transformation-normal, and Bernoulli
 marginal-slope families are selected through `Surv(...)` or dedicated
 fit options rather than `family=`.
 
+## Every remaining column (`.`)
+
+```
+y ~ .                                # one term per column, chosen from the data
+y ~ s(x, k=12) + .                   # explicit terms first, `.` covers the rest
+```
+
+`.` stands for every column no other part of the fit reads: not the
+response, a column an explicit term names, or a weights, offset or
+auxiliary-formula column. Each column gets a penalized term whose null
+space is penalized too, so a column that carries no signal shrinks to
+about zero effective degrees of freedom:
+
+| Column | Term |
+| --- | --- |
+| numeric, at least 3 distinct values | `s(col)` |
+| numeric with 2 distinct values (including bool) | `col` (penalized linear) |
+| categorical or string with repeated levels | `factor(col)` (random effect) |
+| categorical in which every level occurs once (a row id) | dropped, with a note |
+| a single value | dropped, with a note (the intercept already fits it) |
+
+Three distinct values is the smallest number a second-order
+difference-penalized smooth can separate from its linear null space.
+With two values the column can only enter linearly.
+
+`gam fit data.csv "y ~ ."`, `gamfit.fit(df, "y ~ .")` and
+`GAMRegressor().fit(X, y)` all use the same Rust rule. The expanded
+formula is printed to stderr by the CLI and reported as a
+`GamInferenceWarning`. It is also stored as `model.formula` (and
+`formula_` on the estimators).
+
 ## Linear and constrained coefficients
 
 ```
@@ -157,6 +188,7 @@ difference-penalized P-spline of the same dimension.
 | `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value and zero first derivative). Combine with `side=left`/`right` for half-open smooths. |
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
 | `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
+| `shape` | `none` | Shape constraint: `monotone_increasing`, `monotone_decreasing`, `convex`, `concave`. See [Shape-constrained smooths](#shape-constrained-smooths). |
 
 Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes the left endpoint value and slope while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
 
@@ -205,6 +237,45 @@ then `k = internal_knots + degree + 1`, and an explicit `k` is honoured
 exactly down to `k = degree + 1` (zero interior knots). Passing both `k`
 and `knots` is an error. The fit's inference note prints the rule it
 applied.
+
+### Shape-constrained smooths {#shape-constrained-smooths}
+
+```
+y ~ s(x, shape=monotone_increasing)   # f'(x) >= 0 on the knot range
+y ~ s(x, shape=monotone_decreasing)   # f'(x) <= 0
+y ~ s(x, shape=convex)                # f''(x) >= 0
+y ~ s(x, shape=concave, k=12)         # f''(x) <= 0
+```
+
+Accepted spellings (case and hyphens are ignored): `none`;
+`monotone_increasing` (`monotonic_increasing`, `increasing`, `mono_inc`,
+`mpi`); `monotone_decreasing` (`monotonic_decreasing`, `decreasing`,
+`mono_dec`, `mpd`); `convex` (`cvx`); `concave` (`ccv`). From Python,
+`gamfit.fit(..., constraints={"s(x)": "monotone_increasing"})` rewrites the
+formula into the same `shape=` option.
+
+The constraint is exact, not a penalty and not a check on a grid of points.
+The B-spline coefficients are written as `β = C·δ`, where `δ` holds
+successive coefficient differences (monotone) or knot-scaled slope
+differences (convex/concave), and the solver enforces `δ ≥ 0`. A
+non-negative control-polygon difference makes the spline itself monotone
+(or convex) everywhere on the knot range. The roughness penalty stays the
+function penalty `βᵀSβ`, carried into `δ` coordinates by congruence.
+
+A shape-constrained smooth is centred like an unconstrained one. The chart
+drops the constant ("level") direction, which the B-spline partition of
+unity would otherwise make identical to the intercept. It also subtracts
+each increment column's weighted training mean, which leaves every
+coefficient difference, and so the cone, unchanged. The fitted term then
+sums to zero over the training rows and the intercept carries the level.
+`identifiability=` takes `sum_tozero` (the default) or `none`. With `none`,
+the constant stays in the chart as an unbounded level coordinate. `linear`
+is refused because removing a linear trend is not compatible with the cone.
+
+Only open 1-D B-spline `s(x)` smooths accept `shape=`. Periodic
+(`cyclic()`), cubic-regression (`bs='cr'`/`'cs'`) and boundary-conditioned
+bases, thin-plate/Duchon/Matérn/sphere smooths, and tensor products reject a
+non-`none` shape with an error.
 
 ### Boundary-conditioned 1-D smooths {#boundary-conditioned-1d-smooths}
 

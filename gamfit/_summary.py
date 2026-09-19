@@ -46,10 +46,6 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "deviance_explained_unavailable",
     "scale",
     "log_likelihood",
-    "conditional_aic",
-    "conditional_aic_unavailable",
-    "corrected_aic",
-    "corrected_aic_unavailable",
     "reml_score",
     "raw_reml_score",
     "reml_score_unavailable",
@@ -58,6 +54,11 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "iterations",
     "edf_total",
     "edf_rank_bound",
+    "aic_conditional",
+    "edf_corrected",
+    "aic_corrected",
+    "scale_dof",
+    "aic_corrected_unavailable",
     "lambdas",
     "coefficients",
     "parametric_statistic",
@@ -182,7 +183,8 @@ class Summary:
     formula : str
         The Wilkinson formula string the model was fitted with.
     family_name : str
-        Human-readable family + link label, e.g. ``"Gaussian Identity"``.
+        Human-readable family + link label, e.g. ``"Gaussian Identity"``;
+        an expectile fit reports its estimator, e.g. ``"Expectile(tau=0.9)"``.
     link : str
         The link function's name, e.g. ``"identity"`` or ``"logit"``.
     model_class : str
@@ -213,16 +215,6 @@ class Summary:
         Ordinary reported log-likelihood at the converged fit. Every rankable
         model carries a finite value; ``None`` is reserved for the exact
         zero-dispersion boundary where no normalized Gaussian density exists.
-    conditional_aic : float or None
-        :math:`-2\\ell + 2(\\mathrm{edf} + \\text{scale dof})`, conditional on the
-        fitted smoothing parameters.
-    conditional_aic_unavailable : str or None
-        Why :attr:`conditional_aic` is ``None``. Present exactly when it is.
-    corrected_aic : float or None
-        The Wood-Pya-Säfken (2016) AIC, which also charges for estimating the
-        smoothing parameters.
-    corrected_aic_unavailable : str or None
-        Why :attr:`corrected_aic` is ``None``. Present exactly when it is.
     reml_score : float or None
         Comparable REML / LAML cost at convergence, including the
         rank-aware Tierney-Kadane null-space normalizer. ``None`` in two cases,
@@ -263,6 +255,22 @@ class Summary:
         certificate's workspace. A block that is not certified publishes its
         trace, its EDF and ``edf_total`` unclamped. Empty when the fit recorded
         none.
+    aic_conditional : float or None
+        Conditional AIC ``-2*log_likelihood + 2*(edf_total + scale_dof)``. It
+        treats the smoothing parameters as known and so favours over-flexible
+        models; reported for reference, never ranked on.
+    edf_corrected : float or None
+        Effective degrees of freedom with the Wood-Pya-Saefken correction for
+        the smoothing-parameter uncertainty added to ``edf_total``.
+    aic_corrected : float or None
+        Smoothing-corrected AIC ``-2*log_likelihood + 2*(edf_corrected +
+        scale_dof)``, the criterion ``gamfit.compare_models`` and
+        ``gam compare`` rank on.
+    scale_dof : float or None
+        Parameters counted for the dispersion: 1 when the scale was estimated,
+        0 when the family fixes it.
+    aic_corrected_unavailable : str or None
+        Why ``aic_corrected`` is ``None``; absent when it is available.
     lambdas : list of float
         Fitted smoothing / precision parameters in penalty-block order.
     coefficients : sequence of mappings
@@ -384,10 +392,6 @@ class Summary:
     deviance_explained_unavailable: str | None = None
     scale: float | None = None
     log_likelihood: float | None = None
-    conditional_aic: float | None = None
-    conditional_aic_unavailable: str | None = None
-    corrected_aic: float | None = None
-    corrected_aic_unavailable: str | None = None
     reml_score: float | None = None
     raw_reml_score: float | None = None
     reml_score_unavailable: str | None = None
@@ -397,6 +401,11 @@ class Summary:
     edf_total: float | None = None
     #: Per-block rank-bound status beside the EDF fields (#2901).
     edf_rank_bound: list[Any] = field(default_factory=list)
+    aic_conditional: float | None = None
+    edf_corrected: float | None = None
+    aic_corrected: float | None = None
+    scale_dof: float | None = None
+    aic_corrected_unavailable: str | None = None
     lambdas: list[float] = field(default_factory=list)
     coefficients: Sequence[Mapping[str, Any]] = field(default_factory=list)
     parametric_statistic: str | None = None

@@ -31,6 +31,18 @@ fn factorized_covariance_fallback(fit: &UnifiedFitResult) -> Option<Result<Predi
     if let Err(error) = fit.require_posterior_mean("coefficient covariance summary") {
         return Some(Err(error.to_string()));
     }
+    // An expectile fit's Hessian rebuilds the Gaussian working-model `Vb`, the
+    // covariance its declined sandwich replaces; its identity-link point never
+    // needs it, so the only thing this reconstruction could feed is a band
+    // the fit declared inadmissible.
+    if let Some(
+        declined @ gam::estimate::CovarianceDeclined::ExpectileSandwichRequiresDenseCovariance {
+            ..
+        },
+    ) = fit.artifacts.covariance_declined.as_ref()
+    {
+        return Some(Err(declined.explain()));
+    }
     let hessian = fit.penalized_hessian()?;
     let scale = match fit.coefficient_covariance_scale() {
         Ok(scale) => scale,

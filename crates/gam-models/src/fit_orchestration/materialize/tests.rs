@@ -380,7 +380,7 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
 #[test]
 fn an_absent_warm_start_attaches_no_cache_session() {
     let absent = blockwise_fit_options(&FitConfig::default());
-    assert!(absent.cache_session.is_none() && absent.required_warm_start.is_none());
+    assert!(absent.cache_session.is_none() && absent.warm_start.is_none());
 }
 
 /// The carrier is survival-only: a standard fit has no survival time basis to

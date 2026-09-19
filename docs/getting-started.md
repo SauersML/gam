@@ -21,7 +21,7 @@ uv pip install gamfit
 ### Optional extras
 
 ```bash
-uv add "gamfit[pandas]"     # pandas + pyarrow input/output
+uv add "gamfit[pandas]"     # pandas input/output (pyarrow not required)
 uv add "gamfit[plot]"       # matplotlib-based plotting
 uv add "gamfit[sklearn]"    # scikit-learn integration
 uv add "gamfit[cuda]"       # NVIDIA CUDA 12 wheel libraries on Linux x86_64

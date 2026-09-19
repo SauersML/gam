@@ -97,10 +97,13 @@ def sae_trust_diagnostics(
 
 def atom_trust_scores(diagnostics: Mapping[str, Any]) -> np.ndarray:
     """Return the validated per-atom trust score vector from diagnostics."""
-    trust = np.asarray(diagnostics["atom_trust"], dtype=float)
+    trust: np.ndarray = np.asarray(diagnostics["atom_trust"], dtype=float)
     if trust.ndim != 1:
         raise ValueError(f"atom_trust must be 1D; got shape {trust.shape}")
-    return trust.copy()
+    # ``ndarray.copy`` is declared ``-> Self`` but numpy's stubs resolve it to
+    # ``Any`` under mypy; bind the copy to its real type.
+    scores: np.ndarray = trust.copy()
+    return scores
 
 
 __all__ = [

@@ -63,7 +63,6 @@ mod evaluation;
 mod external_options;
 mod fit;
 mod identified_hessian;
-mod information_criteria;
 mod joint_hyper;
 mod null_space_normalizer;
 mod optimizer;
@@ -96,7 +95,6 @@ pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
 };
-pub use information_criteria::{AkaikeCriteria, CorrectedEdf, CorrectedEdfUnavailable, akaike_criterion};
 pub use fit::{fit_gam_with_penalty_specs, fit_gamwith_heuristic_log_lambdas};
 pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub use joint_hyper::{
@@ -140,6 +138,8 @@ mod continuous_order_tests;
 mod estimate_policy_tests;
 #[cfg(test)]
 mod link_ext_hessian_2665_tests;
+#[cfg(test)]
+mod student_t_laml_tests;
 #[cfg(test)]
 mod gaussian_high_edf_scale_tests;
 #[cfg(test)]

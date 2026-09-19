@@ -18,6 +18,7 @@ gam --help
 | `gam sample MODEL DATA [--out posterior.csv]` | Draw posterior coefficients. |
 | `gam generate MODEL DATA [--out generated.csv]` | Draw synthetic responses from a fitted model. |
 | `gam summary MODEL` | Print the model's text summary (the same text as `print(model.summary())`). |
+| `gam compare MODEL... [--names NAME...]` | Rank saved models on the smoothing-corrected AIC and print the comparison as JSON (the document `gamfit.compare_models` returns). |
 | `gam report MODEL [DATA] [OUT]` | Write a self-contained HTML report. |
 | `gam crosscoder --anchor L=F --block L=F --atoms N --harmonics N --out REPORT.json` | Fit a row-aligned manifold crosscoder across activation matrices and write a GAM-SAE report. |
 | `gam transformation-score MODEL DATA [--out scores.csv]` | Evaluate a fitted conditional transformation model at observed responses. |

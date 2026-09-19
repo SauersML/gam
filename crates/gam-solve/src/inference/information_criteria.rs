@@ -1,14 +1,34 @@
-//! Information criteria at the fit optimum: the conditional AIC, which treats
-//! the smoothing parameters as known, and the Wood–Pya–Säfken (2016, JASA)
-//! corrected AIC, which charges for their estimation (issue #946).
+//! Conditional and smoothing-corrected AIC of a converged fit.
 //!
-//! Both are owned by the fit, so every surface that prints them — the model
-//! summary, `gam diagnose`, the model-comparison payload — reads the same
-//! degrees of freedom instead of each counting its own.
+//! This is the one place the information criteria reported by the fitted
+//! summary, `gam diagnose`, and the `compare_models` ranking are formed. Every
+//! input is data-free: the fit-retained conditional EDF `tr(F)`, the weighted
+//! Gram `X'WX`, the first-order smoothing-parameter covariance correction `C`,
+//! the coefficient-covariance scale, and the reported log-likelihood.
+//!
+//! * `aic_conditional = −2ℓ + 2·(tr(F) + p_scale)` treats `λ̂` as known and is
+//!   biased toward complexity exactly where model choice matters (a
+//!   finite-`λ̂` null smooth still spends a few EDF fitting noise).
+//! * `aic_corrected = −2ℓ + 2·(τ + p_scale)` with the Wood–Pya–Säfken (2016,
+//!   JASA) `τ = tr(F) + tr(X'WX · C)/s`, where `C = J V_ρ Jᵀ` propagates the
+//!   REML/LAML smoothing-parameter posterior covariance `V_ρ` (inverse outer
+//!   Hessian on its identified subspace) through the IFT Jacobian
+//!   `J = dβ̂/dρ`, and `s` is the coefficient-covariance ownership scale
+//!   (`V_β = s·H⁻¹`; `s = φ̂` for a profiled Gaussian, 1 for fixed-scale
+//!   families). The formula is family-generic: `X'WX` is the PIRLS working
+//!   Gram at the mode and `C` is computed from the same outer Hessian for any
+//!   number of smoothing parameters.
+//!
+//! `p_scale` counts an estimated dispersion parameter (one for a profiled
+//! Gaussian σ², an estimated Gamma shape, Beta φ, Tweedie φ or negative-binomial
+//! θ; zero for Poisson, binomial, and any user-fixed scale), matching mgcv's
+//! `2·(edf + 1)` for scale-estimated families.
 
 use crate::estimate::{EstimationError, UnifiedFitResult};
 use crate::model_types::SmoothingCorrectionMethod;
-use gam_problem::types::{GlmLikelihoodSpec, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
+use gam_problem::types::{
+    GlmLikelihoodSpec, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
+};
 use ndarray::ArrayView2;
 
 /// Effective-degrees-of-freedom pair: the conditional `tr(F)` and the
@@ -18,7 +38,7 @@ use ndarray::ArrayView2;
 pub struct CorrectedEdf {
     /// `tr(F)` with `F = H⁻¹X'WX`, conditional on `λ̂`.
     pub conditional: f64,
-    /// `τ = tr(F) + tr(X'WX · Σ_ρ)`, when its exact inputs were retained.
+    /// `τ = tr(F) + tr(X'WX · C)/s`, when its exact inputs were retained.
     pub corrected: Option<f64>,
     /// Typed provenance for an unavailable correction. `None` means either the
     /// correction is available or `K=0` proved it is exactly zero.
@@ -34,27 +54,52 @@ pub enum CorrectedEdfUnavailable {
 }
 
 impl CorrectedEdfUnavailable {
-    /// Why the corrected EDF is absent, in the words a summary prints.
-    pub const fn reason(self) -> &'static str {
+    /// Human-readable statement of which retained fit artifact is missing.
+    pub const fn describe(self) -> &'static str {
         match self {
-            Self::MissingWeightedGram => "the fit retained no weighted Gram X'WX",
-            Self::MissingSmoothingCorrection => {
-                "the fit retained no first-order smoothing-parameter correction"
+            Self::MissingWeightedGram => {
+                "the fit retained no weighted Gram X'WX, so the smoothing-parameter \
+                 uncertainty correction tr(X'WX·C) cannot be formed"
             }
-            Self::MissingCovarianceScale => "the fit has no coefficient covariance scale",
+            Self::MissingSmoothingCorrection => {
+                "the fit retained no first-order smoothing-parameter covariance \
+                 correction C = J·V_rho·J'"
+            }
+            Self::MissingCovarianceScale => {
+                "the fit has no engine-level likelihood family, so the \
+                 coefficient-covariance scale of the correction is undefined"
+            }
             Self::MissingMethodProvenance => {
-                "the retained smoothing correction is not the exact first-order one"
+                "the retained smoothing correction is not the first-order \
+                 identified-subspace correction the corrected AIC is defined from"
             }
         }
     }
 }
 
 impl CorrectedEdf {
-    /// The per-fit measurement the issue calls out: how much λ-uncertainty is
-    /// inflating the user's model-choice complexity penalty, `τ − tr(F)`.
+    /// How much λ-uncertainty inflates the model-choice complexity penalty,
+    /// `τ − tr(F)`.
     pub fn rho_uncertainty_df(&self) -> Option<f64> {
         self.corrected.map(|value| value - self.conditional)
     }
+}
+
+/// Conditional and corrected AIC of one fit, with the pieces they are built
+/// from.
+#[derive(Debug, Clone, Copy)]
+pub struct InformationCriteria {
+    /// The normalized log-likelihood both criteria are formed from.
+    pub log_likelihood: f64,
+    /// Conditional and WPS-corrected effective degrees of freedom.
+    pub edf: CorrectedEdf,
+    /// Estimated dispersion parameters added to both complexity terms.
+    pub scale_dof: f64,
+    /// `−2ℓ + 2·(edf_conditional + scale_dof)`.
+    pub aic_conditional: f64,
+    /// `−2ℓ + 2·(edf_corrected + scale_dof)`; `None` exactly when
+    /// `edf.unavailable_reason` is `Some`.
+    pub aic_corrected: Option<f64>,
 }
 
 /// Exact Wood–Pya–Säfken corrected effective degrees of freedom.
@@ -72,7 +117,7 @@ impl CorrectedEdf {
 ///
 /// Missing artifacts or method provenance produce `corrected=None` with a
 /// typed reason; malformed present inputs are errors.
-fn corrected_edf(
+pub fn corrected_edf(
     edf_conditional: f64,
     weighted_gram: Option<ArrayView2<'_, f64>>,
     smoothing_correction: Option<ArrayView2<'_, f64>>,
@@ -92,33 +137,24 @@ fn corrected_edf(
             unavailable_reason: None,
         });
     }
-    if !method_certified_exact {
-        return Ok(CorrectedEdf {
+    let unavailable = |reason| {
+        Ok(CorrectedEdf {
             conditional: edf_conditional,
             corrected: None,
-            unavailable_reason: Some(CorrectedEdfUnavailable::MissingMethodProvenance),
-        });
+            unavailable_reason: Some(reason),
+        })
+    };
+    if !method_certified_exact {
+        return unavailable(CorrectedEdfUnavailable::MissingMethodProvenance);
     }
     let Some(xwx) = weighted_gram else {
-        return Ok(CorrectedEdf {
-            conditional: edf_conditional,
-            corrected: None,
-            unavailable_reason: Some(CorrectedEdfUnavailable::MissingWeightedGram),
-        });
+        return unavailable(CorrectedEdfUnavailable::MissingWeightedGram);
     };
     let Some(correction) = smoothing_correction else {
-        return Ok(CorrectedEdf {
-            conditional: edf_conditional,
-            corrected: None,
-            unavailable_reason: Some(CorrectedEdfUnavailable::MissingSmoothingCorrection),
-        });
+        return unavailable(CorrectedEdfUnavailable::MissingSmoothingCorrection);
     };
     let Some(scale) = covariance_scale else {
-        return Ok(CorrectedEdf {
-            conditional: edf_conditional,
-            corrected: None,
-            unavailable_reason: Some(CorrectedEdfUnavailable::MissingCovarianceScale),
-        });
+        return unavailable(CorrectedEdfUnavailable::MissingCovarianceScale);
     };
     let extra = wps_correction_term(xwx, correction, scale)?;
     let corrected = edf_conditional + extra;
@@ -209,13 +245,15 @@ fn wps_correction_term(
 }
 
 /// Number of estimated dispersion / scale parameters a family contributes to the
-/// conditional-AIC degrees of freedom (`2·(edf + scale_dof)`, #1583).
+/// AIC degrees of freedom (`2·(edf + scale_dof)`, #1583).
 ///
 /// Gaussian profiles σ̂² (one extra dof) unless φ was user-fixed; Gamma / Beta /
 /// Tweedie / Negative-Binomial add one only when their dispersion is *estimated*
-/// from data; Poisson and Binomial carry φ ≡ 1 and add none.
-fn scale_parameter_count(spec: &LikelihoodSpec, scale: &LikelihoodScaleMetadata) -> f64 {
+/// from data; Poisson and Binomial carry φ ≡ 1 and add none. Student-t always
+/// estimates both its scale σ and its degrees of freedom ν, so it adds two.
+pub fn scale_parameter_count(spec: &LikelihoodSpec, scale: &LikelihoodScaleMetadata) -> f64 {
     let estimated = match spec.response {
+        ResponseFamily::StudentT { .. } => return 2.0,
         ResponseFamily::Gaussian => {
             !matches!(scale, LikelihoodScaleMetadata::FixedDispersion { .. })
         }
@@ -236,112 +274,92 @@ fn scale_parameter_count(spec: &LikelihoodSpec, scale: &LikelihoodScaleMetadata)
     if estimated { 1.0 } else { 0.0 }
 }
 
-/// `−2·ℓ + 2·dof`: the one Akaike form both the conditional and the corrected
-/// criterion take, differing only in the degrees of freedom charged.
-pub fn akaike_criterion(log_likelihood: f64, degrees_of_freedom: f64) -> f64 {
-    -2.0 * log_likelihood + 2.0 * degrees_of_freedom
+/// Form both AICs from the scalar pieces. Shared by [`information_criteria`]
+/// and fits whose correction is computed outside the dense coefficient path.
+pub fn information_criteria_from_parts(
+    log_likelihood: f64,
+    edf: CorrectedEdf,
+    scale_dof: f64,
+) -> Result<InformationCriteria, EstimationError> {
+    if !log_likelihood.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "information criteria require a finite log-likelihood; got {log_likelihood}"
+        )));
+    }
+    let aic = |edf: f64| {
+        let value = -2.0 * log_likelihood + 2.0 * (edf + scale_dof);
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(EstimationError::InvalidInput(
+                "AIC is outside f64 range".into(),
+            ))
+        }
+    };
+    Ok(InformationCriteria {
+        log_likelihood,
+        edf,
+        scale_dof,
+        aic_conditional: aic(edf.conditional)?,
+        aic_corrected: edf.corrected.map(aic).transpose()?,
+    })
 }
 
-impl UnifiedFitResult {
-    /// Conditional and Wood–Pya–Säfken corrected EDF of this fit.
-    ///
-    /// The WPS correction is reported as exact only under the typed provenance
-    /// the optimizer retained with the correction itself: first-order IFT on the
-    /// identified outer-Hessian subspace. SigmaPointCubature is a named
-    /// approximation and must stay out of the exact channel.
-    ///
-    /// Read the RETAINED first-order pair, not the fit's primary
-    /// `smoothing_correction()`/`smoothing_correction_method()`: the optimizer's
-    /// auto-selector escalates the primary pair to a cubature upgrade exactly
-    /// when smoothing-parameter uncertainty is large enough to matter (rho
-    /// posterior variance over threshold, near-boundary, or high outer
-    /// gradient) — precisely the regime this correction exists to report on.
-    /// Gating on the primary pair made this channel `None` whenever the
-    /// correction would have been large enough to be interesting and `Some`
-    /// only when it was small enough that first-order alone was already
-    /// deemed adequate (#946). `compute_smoothing_correction_auto` always
-    /// computes the exact first-order correction before deciding whether to
-    /// escalate, and the optimizer now retains it alongside the cubature
-    /// upgrade rather than discarding it, so this channel is populated
-    /// whenever the first-order geometry was computable at all, independent
-    /// of whether cubature also ran for some other consumer's benefit.
-    pub fn corrected_edf(&self) -> Result<CorrectedEdf, EstimationError> {
-        let phi = self.dispersion_phi()?;
-        let edf_conditional = self.edf_total().ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "information criteria require a retained conditional EDF".into(),
-            )
-        })?;
-        let covariance_scale = self
-            .likelihood_family
-            .as_ref()
-            .map(|spec| {
-                GlmLikelihoodSpec {
-                    spec: spec.clone(),
-                    scale: self.likelihood_scale,
-                }
-                .coefficient_covariance_scale(phi)
-                .map_err(|error| {
-                    EstimationError::InvalidInput(format!(
-                        "corrected-EDF coefficient covariance scale: {error}"
-                    ))
-                })
-            })
-            .transpose()?;
-        let method_certified_exact = matches!(
-            self.smoothing_correction_method_first_order(),
-            Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
-        );
-        corrected_edf(
-            edf_conditional,
-            self.weighted_gram().map(|g| g.view()),
-            self.smoothing_correction_first_order().map(|c| c.view()),
-            covariance_scale,
-            self.log_lambdas.len(),
-            method_certified_exact,
+/// Conditional and WPS-corrected AIC of a converged fit at the supplied
+/// normalized log-likelihood.
+///
+/// The correction is read from the RETAINED first-order pair
+/// ([`UnifiedFitResult::smoothing_correction_first_order`]), not the fit's
+/// primary `smoothing_correction()`: the optimizer's auto-selector escalates the
+/// primary pair to a cubature upgrade exactly when smoothing-parameter
+/// uncertainty is large enough to matter, and a cubature correction is a named
+/// approximation outside the exact channel. The first-order IFT correction on
+/// the identified outer-Hessian subspace is always computed before that decision
+/// and retained alongside any upgrade (#946).
+pub fn information_criteria(
+    fit: &UnifiedFitResult,
+    log_likelihood: f64,
+) -> Result<InformationCriteria, EstimationError> {
+    let phi = fit.dispersion_phi()?;
+    let edf_conditional = fit.edf_total().ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "information criteria require a retained conditional EDF".into(),
         )
-    }
-
-    /// Estimated dispersion parameters the conditional AIC charges beside the
-    /// EDF. An estimated / profiled dispersion is a fitted parameter and adds
-    /// one degree of freedom — mgcv's `2·(edf + 1)` for a scale-estimated
-    /// family (#1583). Fixed-scale families (Poisson, Binomial, user-fixed φ/θ)
-    /// and fits without an engine-level family add none.
-    pub fn scale_parameter_count(&self) -> f64 {
-        self.likelihood_family
-            .as_ref()
-            .map(|spec| scale_parameter_count(spec, &self.likelihood_scale))
-            .unwrap_or(0.0)
-    }
-
-    /// The conditional and corrected AIC at `log_likelihood`, each charging
-    /// its EDF plus [`Self::scale_parameter_count`].
-    pub fn akaike_criteria(
-        &self,
-        log_likelihood: f64,
-    ) -> Result<AkaikeCriteria, EstimationError> {
-        let edf = self.corrected_edf()?;
-        let scale_dof = self.scale_parameter_count();
-        Ok(AkaikeCriteria {
-            conditional: akaike_criterion(log_likelihood, edf.conditional + scale_dof),
-            corrected: edf
-                .corrected
-                .map(|corrected| akaike_criterion(log_likelihood, corrected + scale_dof)),
-            edf,
+    })?;
+    let covariance_scale = fit
+        .likelihood_family
+        .as_ref()
+        .map(|spec| {
+            GlmLikelihoodSpec {
+                spec: spec.clone(),
+                scale: fit.likelihood_scale,
+            }
+            .coefficient_covariance_scale(phi)
+            .map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "information-criteria coefficient covariance scale: {error}"
+                ))
+            })
         })
-    }
-}
-
-/// The two Akaike criteria of one fit at one log-likelihood.
-#[derive(Debug, Clone, Copy)]
-pub struct AkaikeCriteria {
-    /// `−2ℓ + 2(tr(F) + scale dof)`, conditional on `λ̂`.
-    pub conditional: f64,
-    /// `−2ℓ + 2(τ + scale dof)`; `None` exactly when `edf.corrected` is.
-    pub corrected: Option<f64>,
-    /// The degrees of freedom both were charged, with the reason the corrected
-    /// one is absent.
-    pub edf: CorrectedEdf,
+        .transpose()?;
+    let method_certified_exact = matches!(
+        fit.smoothing_correction_method_first_order(),
+        Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
+    );
+    let edf = corrected_edf(
+        edf_conditional,
+        fit.weighted_gram().map(|g| g.view()),
+        fit.smoothing_correction_first_order().map(|c| c.view()),
+        covariance_scale,
+        fit.log_lambdas.len(),
+        method_certified_exact,
+    )?;
+    let scale_dof = fit
+        .likelihood_family
+        .as_ref()
+        .map(|spec| scale_parameter_count(spec, &fit.likelihood_scale))
+        .unwrap_or(0.0);
+    information_criteria_from_parts(log_likelihood, edf, scale_dof)
 }
 
 #[cfg(test)]
@@ -350,13 +368,13 @@ mod tests {
     use ndarray::{Array2, array};
 
     #[test]
-    fn wps_correction_is_trace_of_h_f_sigma_over_phi() {
-        // X'WX = I, φ = 2 → correction is tr(X'WX·corr)/φ = tr(corr)/φ.
+    fn wps_correction_is_trace_of_xwx_correction_over_scale() {
+        // X'WX = I, s = 2 → correction is tr(corr)/s.
         let xwx = Array2::<f64>::eye(3);
         let corr = array![[2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 6.0]];
         let edf = corrected_edf(3.0, Some(xwx.view()), Some(corr.view()), Some(2.0), 1, true)
             .expect("corrected EDF");
-        // tr(corr)/φ = (2+4+6)/2 = 6, so corrected = 3 + 6 = 9, ρ-df = 6.
+        // tr(corr)/s = (2+4+6)/2 = 6, so corrected = 3 + 6 = 9, ρ-df = 6.
         assert_eq!(edf.corrected, Some(9.0));
         assert_eq!(edf.rho_uncertainty_df(), Some(6.0));
         assert!((edf.conditional - 3.0).abs() < 1e-12);
@@ -372,5 +390,17 @@ mod tests {
             edf.unavailable_reason,
             Some(CorrectedEdfUnavailable::MissingWeightedGram)
         );
+    }
+
+    #[test]
+    fn aics_share_the_log_likelihood_and_scale_dof() {
+        let edf = CorrectedEdf {
+            conditional: 4.0,
+            corrected: Some(5.5),
+            unavailable_reason: None,
+        };
+        let ic = information_criteria_from_parts(-100.0, edf, 1.0).expect("criteria");
+        assert_eq!(ic.aic_conditional, 200.0 + 2.0 * 5.0);
+        assert_eq!(ic.aic_corrected, Some(200.0 + 2.0 * 6.5));
     }
 }

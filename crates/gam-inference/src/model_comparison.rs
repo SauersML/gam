@@ -27,8 +27,8 @@
 //! a race already produces, never replacing it.
 
 use gam_problem::types::{GlmLikelihoodSpec, LikelihoodSpec};
-pub use gam_solve::estimate::{CorrectedEdf, CorrectedEdfUnavailable};
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
+use gam_solve::inference::information_criteria::information_criteria;
 use gam_solve::psis::pareto_smooth_weights;
 use ndarray::{Array1, ArrayView1};
 
@@ -49,6 +49,8 @@ pub struct AloElpd {
     /// the `0.7` heavy-tail cutoff.
     pub n_k_bad: usize,
 }
+
+pub use gam_solve::inference::information_criteria::{CorrectedEdf, CorrectedEdfUnavailable};
 
 /// The full comparison payload reported alongside a fit's evidence headline.
 #[derive(Debug, Clone)]
@@ -183,26 +185,19 @@ pub fn model_comparison_from_unified(
     alo_eta_tilde: Option<ArrayView1<'_, f64>>,
 ) -> Result<ModelComparison, EstimationError> {
     let phi = fit.dispersion_phi()?;
-
     // The user-facing `log_likelihood` (and the AIC / elpd derived from it) must
-    // be the *fully normalized, scale-aware* absolute log-likelihood — not the
-    // REML building block stored on the fit, which deliberately drops every
-    // family- and saturated-likelihood normalizing constant and the Gaussian
-    // scale (#1581/#1582/#1583). Recompute it here at the fitted means with the
-    // profiled Gaussian scale concretized into σ̂². For custom / GAMLSS fits with
-    // no engine-level family there is no per-row kernel to call, so we fall back
-    // to the stored value (those paths supply their own normalized log-lik).
+    // be the *fully normalized, scale-aware* absolute log-likelihood. Recompute
+    // it here at the fitted means with the profiled Gaussian scale concretized
+    // into σ̂² (#1581/#1582/#1583). For custom / GAMLSS fits with no
+    // engine-level family there is no per-row kernel to call; those engines own
+    // their normalized likelihood, so the stored value is authoritative.
     let log_lik = if let Some(spec) = fit.likelihood_family.as_ref() {
         let scale = reporting_scale(spec, &fit.likelihood_scale, phi);
         full_loglikelihood_at_eta(y, eta_hat, prior_weights, spec, scale)?
     } else {
-        // Custom/GAMLSS engines own their normalized likelihood and do not
-        // advertise an engine-level GLM family. Their stored value is therefore
-        // authoritative, not a fallback from a failed GLM evaluation.
         fit.log_likelihood
     };
-
-    let aic = fit.akaike_criteria(log_lik)?;
+    let criteria = information_criteria(fit, log_lik)?;
 
     let loo = match (alo_eta_tilde, fit.likelihood_family.as_ref()) {
         (Some(eta_tilde), Some(spec)) => {
@@ -221,9 +216,9 @@ pub fn model_comparison_from_unified(
 
     Ok(ModelComparison {
         log_lik,
-        edf: aic.edf,
-        aic_conditional: aic.conditional,
-        aic_corrected: aic.corrected,
+        edf: criteria.edf,
+        aic_conditional: criteria.aic_conditional,
+        aic_corrected: criteria.aic_corrected,
         loo,
     })
 }

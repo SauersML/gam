@@ -64,8 +64,34 @@
 //!   is mapped into the new coordinates and re-evaluated by the new oracle. A mask
 //!   with no representative is dropped, and a mask that is no longer bad is
 //!   discarded, never kept on trust.
+//!
+//! # Separation over mask boxes
+//!
+//! [`BoxSeparationOracle`] decides `R(S) <= eps` over the binary endpoint masks that keep
+//! `S` on, for a program that encloses its divergence over any box of masks
+//! ([`BoxDivergence`]): every control fixed at 0 or at 1, or free over `[0, 1]`
+//! ([`MaskBox`]). It refines the box with `S` on and every other control free, depth first
+//! and off before on:
+//! * a box whose enclosure is at most `eps` is decided, since every mask it holds is;
+//! * a vertex whose divergence exceeds `eps` by more than its numerical error refutes `S`;
+//! * any other box splits one free control into its two fixed values, in the order the
+//!   program names, widest first.
+//!
+//! Each split fixes one more control, so refinement ends after at most `2^{C-|S|}` vertices
+//! with no cap: every leaf is decided, or it is an exactly evaluated vertex. An enclosure
+//! over a box bounds its interior masks too, so a box can stay undecided because of an
+//! interior effect that no binary mask has (P12's `4 m (1 - m)`); its split then decides it at
+//! the vertices. For the same reason a box's lower bound never refutes. The outcome is:
+//! * certified: a uniform bound over the family, or `Exact` when every leaf was an exactly
+//!   evaluated vertex, so the refinement was exhaustive;
+//! * refuted: a counterexample at a shrunk vertex. Its off components are switched back on
+//!   while it still refutes, so its edge `A(m)` is minimal: a refuting mask that perturbs
+//!   fewer components cuts more supports;
+//! * otherwise unresolved, between the best vertex lower bound and the largest leaf upper
+//!   bound.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt;
 
@@ -1286,13 +1312,486 @@ where
     Ok(replay)
 }
 
+/// One component's control inside a [`MaskBox`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MaskSide {
+    /// Fixed at 0: the component is off.
+    Off,
+    /// Fixed at 1: the component is on.
+    On,
+    /// Free over `[0, 1]`.
+    Free,
+}
+
+/// A box of masks over `C` components: every control fixed at 0 or at 1, or free over
+/// `[0, 1]`. A box with no free control is a vertex, one binary endpoint mask.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MaskBox {
+    sides: Vec<MaskSide>,
+}
+
+impl MaskBox {
+    /// The box that keeps `support` on and leaves every other component free.
+    pub fn clamped(support: &ComponentSet) -> Self {
+        let mut sides = vec![MaskSide::Free; support.components()];
+        for &component in support.members() {
+            sides[component] = MaskSide::On;
+        }
+        Self { sides }
+    }
+
+    /// The vertex that keeps `on` on and every other component off.
+    pub fn vertex(on: &ComponentSet) -> Self {
+        let mut sides = vec![MaskSide::Off; on.components()];
+        for &component in on.members() {
+            sides[component] = MaskSide::On;
+        }
+        Self { sides }
+    }
+
+    /// The number of components `C`.
+    pub fn components(&self) -> usize {
+        self.sides.len()
+    }
+
+    /// Each component's control, in component order.
+    pub fn sides(&self) -> &[MaskSide] {
+        &self.sides
+    }
+
+    /// The components whose control is free.
+    pub fn free(&self) -> Vec<usize> {
+        self.of(MaskSide::Free)
+    }
+
+    /// True when no control is free.
+    pub fn is_vertex(&self) -> bool {
+        !self.sides.contains(&MaskSide::Free)
+    }
+
+    /// The components some mask of the box does not keep on: `A(m) = {c : m_c != 1}` at a
+    /// vertex, and every control not fixed on for a box.
+    pub fn perturbed(&self) -> Vec<usize> {
+        (0..self.sides.len()).filter(|&component| self.sides[component] != MaskSide::On).collect()
+    }
+
+    /// The two boxes that fix a free `component` off and on, or `None` when its control is
+    /// not free.
+    pub fn split(&self, component: usize) -> Option<(Self, Self)> {
+        (self.sides.get(component) == Some(&MaskSide::Free))
+            .then(|| (self.with(component, MaskSide::Off), self.with(component, MaskSide::On)))
+    }
+
+    fn of(&self, side: MaskSide) -> Vec<usize> {
+        (0..self.sides.len()).filter(|&component| self.sides[component] == side).collect()
+    }
+
+    fn with(&self, component: usize, side: MaskSide) -> Self {
+        let mut sides = self.sides.clone();
+        sides[component] = side;
+        Self { sides }
+    }
+}
+
+/// What a program states about its divergence over one mask box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxEnclosure<D> {
+    /// Evidence about `sup { d(m) : m in the box }`. At a vertex it is the divergence at
+    /// that mask; over a box with free controls it is a uniform bound over the whole box
+    /// (interior masks included), or unresolved.
+    pub evidence: EvidenceStatus<MaskBox, D>,
+    /// The box's free components, the widest first: the order refinement splits them in.
+    /// It decides how fast refinement closes, never what it concludes.
+    pub split_order: Vec<usize>,
+}
+
+/// A program whose divergence from its all-on setting is enclosed over any mask box.
+pub trait BoxDivergence {
+    /// The program and inputs its evidence is stated over.
+    type Domain: Clone;
+    /// Why an enclosure failed.
+    type Error;
+
+    /// The number of components `C`.
+    fn components(&self) -> usize;
+
+    /// The program's own domain, which every family its oracle reports over names.
+    fn domain(&self) -> Self::Domain;
+
+    /// Evidence about the divergence over `mask_box`, with the order to split its free
+    /// components in.
+    fn enclose(&mut self, mask_box: &MaskBox) -> Result<BoxEnclosure<Self::Domain>, Self::Error>;
+}
+
+/// The family a box oracle's evidence is stated over: the binary endpoint masks of the
+/// program's `components`, at the declared `tolerance`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxFamily<D> {
+    pub components: usize,
+    pub tolerance: f64,
+    pub program: D,
+}
+
+/// Why a box oracle was refused.
+#[derive(Debug)]
+pub enum BoxOracleError<E> {
+    /// The program failed.
+    Program(E),
+    /// A status could not be built.
+    Evidence(EvidenceStatusError),
+    /// The declared tolerance is negative or not finite.
+    InvalidTolerance { tolerance: f64 },
+    /// The program's component count differs from a box's.
+    Hypergraph(HypergraphError),
+    /// An undecided box whose split order names none of its free components.
+    NoSplit { free: Vec<usize> },
+    /// A statistical estimate, which bounds no supremum, where a box needs an enclosure.
+    StatisticalEvidence,
+    /// A single-mask evaluation of a box with free controls.
+    NotAVertex { free: Vec<usize> },
+}
+
+impl<E: fmt::Display> fmt::Display for BoxOracleError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Program(error) => write!(f, "the box program failed: {error}"),
+            Self::Evidence(error) => write!(f, "{error}"),
+            Self::InvalidTolerance { tolerance } => {
+                write!(f, "the declared tolerance must be finite and nonnegative, got {tolerance}")
+            }
+            Self::Hypergraph(error) => write!(f, "{error}"),
+            Self::NoSplit { free } => write!(
+                f,
+                "an undecided box's split order names none of its free components {free:?}"
+            ),
+            Self::StatisticalEvidence => {
+                write!(f, "a statistical estimate bounds no supremum over a mask box")
+            }
+            Self::NotAVertex { free } => {
+                write!(f, "a single mask was asked for, but components {free:?} are free")
+            }
+        }
+    }
+}
+
+impl<E: fmt::Debug + fmt::Display> std::error::Error for BoxOracleError<E> {}
+
+impl<E> From<EvidenceStatusError> for BoxOracleError<E> {
+    fn from(error: EvidenceStatusError) -> Self {
+        Self::Evidence(error)
+    }
+}
+
+/// The binary-endpoint separation oracle of a [`BoxDivergence`] program at a declared
+/// tolerance, by refinement of mask boxes (see the module documentation). `separate`
+/// never returns a status stronger than its leaves prove.
+pub struct BoxSeparationOracle<P: BoxDivergence> {
+    program: P,
+    tolerance: f64,
+    enclosed: BTreeMap<MaskBox, BoxEnclosure<P::Domain>>,
+}
+
+/// A refuting vertex's divergence and its numerical error: the value when the status states
+/// one, else the proven lower bound with no error. `None` when the status does not refute.
+fn refuting_value<D>(evidence: &EvidenceStatus<MaskBox, D>, tolerance: f64) -> Option<(f64, f64)> {
+    if !evidence.refutes_at_most(tolerance) {
+        return None;
+    }
+    match evidence {
+        EvidenceStatus::Exact {
+            value, numerical_error, ..
+        }
+        | EvidenceStatus::Counterexample {
+            value, numerical_error, ..
+        } => Some((*value, *numerical_error)),
+        EvidenceStatus::UniformBound { .. }
+        | EvidenceStatus::StatisticalEstimate { .. }
+        | EvidenceStatus::Unresolved { .. } => evidence.lower_bound().map(|lower| (lower, 0.0)),
+    }
+}
+
+/// The outcome of refining one support's box.
+enum Refined {
+    /// Every leaf is decided at the tolerance or is a vertex that does not refute it.
+    Leaves(Refinement),
+    /// A vertex that refutes the tolerance, with its divergence and numerical error.
+    Refuted(MaskBox, (f64, f64)),
+}
+
+/// What refinement found over the leaves of one support's box.
+struct Refinement {
+    /// The largest proven upper bound over the leaves, and the largest numerical error.
+    upper: f64,
+    numerical_error: f64,
+    /// Every leaf was a vertex with an exact value: the largest value and its vertex.
+    exhaustive: Option<(f64, MaskBox)>,
+    vertices: u64,
+    /// The largest proven lower bound at a vertex, and the vertex.
+    lower: Option<(f64, MaskBox)>,
+    /// A leaf neither decided nor refuted, and whether one proved no upper bound.
+    undecided: bool,
+    unbounded: bool,
+}
+
+impl<P: BoxDivergence> BoxSeparationOracle<P> {
+    /// Refuses a tolerance that is negative or not finite.
+    pub fn new(program: P, tolerance: f64) -> Result<Self, BoxOracleError<P::Error>> {
+        if !(tolerance.is_finite() && tolerance >= 0.0) {
+            return Err(BoxOracleError::InvalidTolerance { tolerance });
+        }
+        Ok(Self {
+            program,
+            tolerance,
+            enclosed: BTreeMap::new(),
+        })
+    }
+
+    pub fn program(&self) -> &P {
+        &self.program
+    }
+
+    pub fn tolerance(&self) -> f64 {
+        self.tolerance
+    }
+
+    /// The boxes and vertices the program has enclosed, each once.
+    pub fn enclosures(&self) -> usize {
+        self.enclosed.len()
+    }
+
+    fn family(&self) -> BoxFamily<P::Domain> {
+        BoxFamily {
+            components: self.program.components(),
+            tolerance: self.tolerance,
+            program: self.program.domain(),
+        }
+    }
+
+    fn enclose(&mut self, mask_box: &MaskBox) -> Result<BoxEnclosure<P::Domain>, BoxOracleError<P::Error>> {
+        if mask_box.components() != self.program.components() {
+            return Err(BoxOracleError::Hypergraph(HypergraphError::ComponentCountMismatch {
+                expected: self.program.components(),
+                found: mask_box.components(),
+            }));
+        }
+        if let Some(found) = self.enclosed.get(mask_box) {
+            return Ok(found.clone());
+        }
+        let enclosure = self.program.enclose(mask_box).map_err(BoxOracleError::Program)?;
+        if matches!(enclosure.evidence, EvidenceStatus::StatisticalEstimate { .. }) {
+            return Err(BoxOracleError::StatisticalEvidence);
+        }
+        self.enclosed.insert(mask_box.clone(), enclosure.clone());
+        Ok(enclosure)
+    }
+
+    /// Re-enables the off components of a refuting vertex, in ascending order and pass after
+    /// pass, while the vertex still refutes the tolerance. The result refutes, and turning any
+    /// one of its off components back on no longer does, so its failure edge is minimal.
+    fn shrink(
+        &mut self,
+        mut vertex: MaskBox,
+        mut divergence: (f64, f64),
+    ) -> Result<(MaskBox, (f64, f64)), BoxOracleError<P::Error>> {
+        loop {
+            let mut changed = false;
+            for component in vertex.of(MaskSide::Off) {
+                let candidate = vertex.with(component, MaskSide::On);
+                let found = self.enclose(&candidate)?;
+                if let Some(refuting) = refuting_value(&found.evidence, self.tolerance) {
+                    (vertex, divergence) = (candidate, refuting);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok((vertex, divergence));
+            }
+        }
+    }
+
+    /// Refines `root` depth first, off before on, until every leaf is decided at the
+    /// tolerance or is a vertex. A refuting vertex ends the refinement with that vertex.
+    fn refine(&mut self, root: MaskBox) -> Result<Refined, BoxOracleError<P::Error>> {
+        let mut found = Refinement {
+            upper: 0.0,
+            numerical_error: 0.0,
+            exhaustive: None,
+            vertices: 0,
+            lower: None,
+            undecided: false,
+            unbounded: false,
+        };
+        let mut all_vertices = true;
+        let mut stack = vec![root];
+        while let Some(mask_box) = stack.pop() {
+            let enclosure = self.enclose(&mask_box)?;
+            let evidence = &enclosure.evidence;
+            let own_error = match evidence {
+                EvidenceStatus::Exact { numerical_error, .. }
+                | EvidenceStatus::UniformBound { numerical_error, .. } => *numerical_error,
+                EvidenceStatus::StatisticalEstimate { .. }
+                | EvidenceStatus::Counterexample { .. }
+                | EvidenceStatus::Unresolved { .. } => 0.0,
+            };
+            if mask_box.is_vertex() {
+                if let Some(refuting) = refuting_value(evidence, self.tolerance) {
+                    return Ok(Refined::Refuted(mask_box, refuting));
+                }
+                found.vertices += 1;
+                if let Some(lower) = evidence.lower_bound()
+                    && found.lower.as_ref().is_none_or(|(best, _)| lower > *best)
+                {
+                    found.lower = Some((lower, mask_box.clone()));
+                }
+                if let EvidenceStatus::Exact { value, .. } = evidence {
+                    if found.exhaustive.as_ref().is_none_or(|(best, _)| *value > *best) {
+                        found.exhaustive = Some((*value, mask_box.clone()));
+                    }
+                } else {
+                    all_vertices = false;
+                }
+                match evidence.upper_bound() {
+                    Some(upper) => {
+                        found.upper = found.upper.max(upper);
+                        found.numerical_error = found.numerical_error.max(own_error);
+                        found.undecided |= upper > self.tolerance;
+                    }
+                    None => {
+                        found.undecided = true;
+                        found.unbounded = true;
+                    }
+                }
+                continue;
+            }
+            if evidence.certifies_at_most(self.tolerance) {
+                all_vertices = false;
+                if let Some(upper) = evidence.upper_bound() {
+                    found.upper = found.upper.max(upper);
+                }
+                found.numerical_error = found.numerical_error.max(own_error);
+                continue;
+            }
+            let free = mask_box.free();
+            let Some((off, on)) = enclosure
+                .split_order
+                .iter()
+                .find_map(|&component| mask_box.split(component))
+            else {
+                return Err(BoxOracleError::NoSplit { free });
+            };
+            stack.push(on);
+            stack.push(off);
+        }
+        if !all_vertices {
+            found.exhaustive = None;
+        }
+        Ok(Refined::Leaves(found))
+    }
+
+    /// A program status at one vertex, restated over the oracle's family.
+    fn vertex_status(
+        &self,
+        vertex: &MaskBox,
+        evidence: &EvidenceStatus<MaskBox, P::Domain>,
+    ) -> Result<EvidenceStatus<MaskBox, BoxFamily<P::Domain>>, BoxOracleError<P::Error>> {
+        let family = self.family();
+        Ok(match evidence {
+            EvidenceStatus::Exact {
+                value, numerical_error, ..
+            } => EvidenceStatus::exact(
+                *value,
+                *numerical_error,
+                ExactBasis::Exhaustive { cardinality: 1 },
+                Some(vertex.clone()),
+                family,
+            )?,
+            EvidenceStatus::UniformBound {
+                upper, numerical_error, ..
+            } => EvidenceStatus::uniform_bound(*upper, *numerical_error, family)?,
+            EvidenceStatus::Counterexample {
+                value,
+                numerical_error,
+                threshold,
+                ..
+            } => EvidenceStatus::counterexample(*value, *numerical_error, *threshold, vertex.clone())?,
+            EvidenceStatus::Unresolved { lower, upper, .. } => EvidenceStatus::unresolved(
+                *lower,
+                *upper,
+                Extremum::Supremum,
+                lower.is_finite().then(|| vertex.clone()),
+                family,
+            )?,
+            EvidenceStatus::StatisticalEstimate { .. } => return Err(BoxOracleError::StatisticalEvidence),
+        })
+    }
+}
+
+impl<P: BoxDivergence> SeparationOracle for BoxSeparationOracle<P> {
+    type Mask = MaskBox;
+    type Domain = BoxFamily<P::Domain>;
+    type Error = BoxOracleError<P::Error>;
+
+    fn components(&self) -> usize {
+        self.program.components()
+    }
+
+    fn perturbed_components(&self, mask: &MaskBox) -> Vec<usize> {
+        mask.perturbed()
+    }
+
+    fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
+        let root = MaskBox::clamped(support);
+        let free = root.free().len();
+        let refinement = match self.refine(root)? {
+            Refined::Leaves(refinement) => refinement,
+            Refined::Refuted(vertex, divergence) => {
+                let (witness, (value, numerical_error)) = self.shrink(vertex, divergence)?;
+                return Ok(EvidenceStatus::counterexample(value, numerical_error, self.tolerance, witness)?);
+            }
+        };
+        let family = self.family();
+        if refinement.undecided {
+            let (lower, witness) = match refinement.lower {
+                Some((lower, vertex)) => (lower, Some(vertex)),
+                None => (f64::NEG_INFINITY, None),
+            };
+            let upper = if refinement.unbounded { f64::INFINITY } else { refinement.upper };
+            return Ok(EvidenceStatus::unresolved(lower, upper, Extremum::Supremum, witness, family)?);
+        }
+        if let Some((value, vertex)) = refinement.exhaustive {
+            // Every leaf was an exactly evaluated vertex: 2^free of them, one per mask of the family.
+            if let Some(cardinality) = u32::try_from(free).ok().and_then(|free| 1u64.checked_shl(free))
+                && cardinality == refinement.vertices
+            {
+                return Ok(EvidenceStatus::exact(
+                    value,
+                    refinement.numerical_error,
+                    ExactBasis::Exhaustive { cardinality },
+                    Some(vertex),
+                    family,
+                )?);
+            }
+        }
+        Ok(EvidenceStatus::uniform_bound(refinement.upper, refinement.numerical_error, family)?)
+    }
+
+    fn evaluate(&mut self, mask: &MaskBox) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
+        if !mask.is_vertex() {
+            return Err(BoxOracleError::NotAVertex { free: mask.free() });
+        }
+        let enclosure = self.enclose(mask)?;
+        self.vertex_status(mask, &enclosure.evidence)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        BoxDivergence, BoxEnclosure, BoxFamily, BoxOracleError, BoxSeparationOracle,
         CardinalityCode, ComponentSet, ConflictReplay, EvidenceStatus, EvidenceStatusError,
-        ExactBasis, Extremum, FailureEdge, FailureHypergraph, InputSupport, SeparationOracle,
-        SupportSearchError, greedy_hitting_set, minimum_code_support, replay_conflicts,
-        sufficient_union,
+        ExactBasis, Extremum, FailureEdge, FailureHypergraph, HypergraphError, InputSupport,
+        MaskBox, MaskSide, SeparationOracle, SupportSearchError, greedy_hitting_set,
+        minimum_code_support, replay_conflicts, sufficient_union,
     };
     use std::cmp::Ordering;
     use std::convert::Infallible;
@@ -1946,5 +2445,358 @@ mod tests {
             .expect("the replay evaluates");
         assert_eq!(replay.no_longer_bad, 1);
         assert!(replay.hypergraph.edges().is_empty());
+    }
+
+    /// `f(m) = OR(m0, m1) + 2 m2 + 4 m3 (1 - m3) + m4 / 4` with `OR(a, b) = 1 - (1 - a)(1 - b)`,
+    /// and `d(m) = |f(m) - f(1)|`. Components 0 and 1 are redundant, an OR constraint, and
+    /// component 3 acts only at interior masks (P12's `4 m (1 - m)`). Every value is dyadic, so
+    /// the interval enclosure over a box is exact in f64 and its numerical error is zero.
+    struct OrProgram;
+
+    const OR_COMPONENTS: usize = 5;
+
+    fn or_response(mask: &[f64]) -> f64 {
+        (1.0 - (1.0 - mask[0]) * (1.0 - mask[1]))
+            + 2.0 * mask[2]
+            + 4.0 * mask[3] * (1.0 - mask[3])
+            + mask[4] / 4.0
+    }
+
+    impl BoxDivergence for OrProgram {
+        type Domain = &'static str;
+        type Error = EvidenceStatusError;
+
+        fn components(&self) -> usize {
+            OR_COMPONENTS
+        }
+
+        fn domain(&self) -> &'static str {
+            "or fixture"
+        }
+
+        fn enclose(&mut self, mask_box: &MaskBox) -> Result<BoxEnclosure<&'static str>, EvidenceStatusError> {
+            let reference = or_response(&[1.0; OR_COMPONENTS]);
+            let bounds: Vec<(f64, f64)> = mask_box
+                .sides()
+                .iter()
+                .map(|side| match side {
+                    MaskSide::Off => (0.0, 0.0),
+                    MaskSide::On => (1.0, 1.0),
+                    MaskSide::Free => (0.0, 1.0),
+                })
+                .collect();
+            // `OR` rises in both arguments, and `4 m (1 - m)` spans `[0, 1]` over `[0, 1]`.
+            let or = |a: f64, b: f64| 1.0 - (1.0 - a) * (1.0 - b);
+            let interior = if mask_box.sides()[3] == MaskSide::Free { 1.0 } else { 0.0 };
+            let low = or(bounds[0].0, bounds[1].0) + 2.0 * bounds[2].0 + bounds[4].0 / 4.0;
+            let high = or(bounds[0].1, bounds[1].1) + 2.0 * bounds[2].1 + interior + bounds[4].1 / 4.0;
+            let widths = [1.0, 1.0, 2.0, 1.0, 0.25];
+            let mut split_order = mask_box.free();
+            split_order.sort_by(|a, b| f64::total_cmp(&widths[*b], &widths[*a]));
+            let evidence = if mask_box.is_vertex() {
+                let mask: Vec<f64> = bounds.iter().map(|bound| bound.0).collect();
+                EvidenceStatus::exact(
+                    (or_response(&mask) - reference).abs(),
+                    0.0,
+                    ExactBasis::Exhaustive { cardinality: 1 },
+                    Some(mask_box.clone()),
+                    "or fixture",
+                )?
+            } else {
+                EvidenceStatus::uniform_bound((reference - low).max(high - reference).max(0.0), 0.0, "or fixture")?
+            };
+            Ok(BoxEnclosure { evidence, split_order })
+        }
+    }
+
+    /// [`OrProgram`] with every box's bound understated fourfold: a planted false enclosure.
+    struct Understated;
+
+    impl BoxDivergence for Understated {
+        type Domain = &'static str;
+        type Error = EvidenceStatusError;
+
+        fn components(&self) -> usize {
+            OR_COMPONENTS
+        }
+
+        fn domain(&self) -> &'static str {
+            "understated fixture"
+        }
+
+        fn enclose(&mut self, mask_box: &MaskBox) -> Result<BoxEnclosure<&'static str>, EvidenceStatusError> {
+            let mut enclosure = OrProgram.enclose(mask_box)?;
+            if let (false, Some(upper)) = (mask_box.is_vertex(), enclosure.evidence.upper_bound()) {
+                enclosure.evidence = EvidenceStatus::uniform_bound(upper / 4.0, 0.0, "understated fixture")?;
+            }
+            Ok(enclosure)
+        }
+    }
+
+    /// [`OrProgram`] whose boxes are unresolved and name no component to split.
+    struct Unordered;
+
+    impl BoxDivergence for Unordered {
+        type Domain = &'static str;
+        type Error = EvidenceStatusError;
+
+        fn components(&self) -> usize {
+            OR_COMPONENTS
+        }
+
+        fn domain(&self) -> &'static str {
+            "unordered fixture"
+        }
+
+        fn enclose(&mut self, mask_box: &MaskBox) -> Result<BoxEnclosure<&'static str>, EvidenceStatusError> {
+            if mask_box.is_vertex() {
+                return OrProgram.enclose(mask_box);
+            }
+            Ok(BoxEnclosure {
+                evidence: EvidenceStatus::unresolved(0.0, f64::INFINITY, Extremum::Supremum, None, "unordered fixture")?,
+                split_order: Vec::new(),
+            })
+        }
+    }
+
+    /// An oracle that records every support it is asked to separate.
+    struct Recording<O> {
+        oracle: O,
+        queried: Vec<ComponentSet>,
+    }
+
+    impl<O: SeparationOracle> SeparationOracle for Recording<O> {
+        type Mask = O::Mask;
+        type Domain = O::Domain;
+        type Error = O::Error;
+
+        fn components(&self) -> usize {
+            self.oracle.components()
+        }
+
+        fn perturbed_components(&self, mask: &O::Mask) -> Vec<usize> {
+            self.oracle.perturbed_components(mask)
+        }
+
+        fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<O::Mask, O::Domain>, O::Error> {
+            self.queried.push(support.clone());
+            self.oracle.separate(support)
+        }
+
+        fn evaluate(&mut self, mask: &O::Mask) -> Result<EvidenceStatus<O::Mask, O::Domain>, O::Error> {
+            self.oracle.evaluate(mask)
+        }
+    }
+
+    /// The no-shrink mutant: every refutation comes back without its vertex, so the search can
+    /// cut only the complement of the refuted support.
+    struct WithoutWitness(BoxSeparationOracle<OrProgram>);
+
+    impl SeparationOracle for WithoutWitness {
+        type Mask = MaskBox;
+        type Domain = BoxFamily<&'static str>;
+        type Error = BoxOracleError<EvidenceStatusError>;
+
+        fn components(&self) -> usize {
+            self.0.components()
+        }
+
+        fn perturbed_components(&self, mask: &MaskBox) -> Vec<usize> {
+            self.0.perturbed_components(mask)
+        }
+
+        fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
+            let found = self.0.separate(support)?;
+            let refuted = matches!(found, EvidenceStatus::Counterexample { .. });
+            match (refuted, found.lower_bound()) {
+                (true, Some(lower)) => Ok(EvidenceStatus::unresolved(
+                    lower,
+                    f64::INFINITY,
+                    Extremum::Supremum,
+                    None,
+                    self.0.family(),
+                )?),
+                _ => Ok(found),
+            }
+        }
+
+        fn evaluate(&mut self, mask: &MaskBox) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
+            self.0.evaluate(mask)
+        }
+    }
+
+    fn largest_edge<M>(hypergraph: &FailureHypergraph<M>) -> usize {
+        hypergraph.edges().iter().map(|edge| edge.perturbed.len()).max().unwrap_or(0)
+    }
+
+    /// Whether each box's enclosure bounds every vertex it holds from above, the soundness a
+    /// `BoxDivergence` owes its oracle, over all `3^C` boxes of `C` components.
+    fn covers_its_vertices<P: BoxDivergence>(program: &mut P) -> bool
+    where
+        P::Error: std::fmt::Debug,
+    {
+        let components = program.components();
+        let sides = [MaskSide::Off, MaskSide::On, MaskSide::Free];
+        for code in 0..3_usize.pow(components as u32) {
+            let mask_box = MaskBox {
+                sides: (0..components).map(|component| sides[code / 3_usize.pow(component as u32) % 3]).collect(),
+            };
+            let Some(upper) = program.enclose(&mask_box).expect("an enclosure").evidence.upper_bound() else {
+                continue;
+            };
+            let free = mask_box.free();
+            for bits in 0..1_usize << free.len() {
+                let mut vertex = mask_box.clone();
+                for (slot, &component) in free.iter().enumerate() {
+                    vertex.sides[component] = if bits >> slot & 1 == 1 { MaskSide::On } else { MaskSide::Off };
+                }
+                let lower = program.enclose(&vertex).expect("a vertex").evidence.lower_bound();
+                if lower.is_some_and(|lower| lower > upper) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Refinement over mask boxes decides every support the way exhaustive evaluation of the
+    /// binary masks does, on a fixture with an OR constraint and an interior-mask effect: equal
+    /// minimum codes at every tolerance, and the same certify/refute decision for every
+    /// support either search queried. The box with `{0, 2}` on is not decided at `1/2` as a whole,
+    /// since `m3 = 1/2` moves `f` by 1, but refinement certifies it at its vertices.
+    #[test]
+    fn the_box_oracle_decides_every_support_as_exhaustive_evaluation_does() {
+        for tolerance in [0.0, 0.25, 0.5, 1.0, 2.0, 2.25, 3.25] {
+            let mut boxes = Recording {
+                oracle: BoxSeparationOracle::new(OrProgram, tolerance).expect("a declared tolerance"),
+                queried: Vec::new(),
+            };
+            let mut grid = Recording {
+                oracle: GridOracle { components: OR_COMPONENTS, levels: vec![0.0, 1.0], response: or_response },
+                queried: Vec::new(),
+            };
+            let by_boxes = minimum_code_support(&mut boxes, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
+                .expect("the box search closes");
+            let by_grid = minimum_code_support(&mut grid, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
+                .expect("the exhaustive search closes");
+            assert_eq!(
+                (by_boxes.code.lower_bound(), by_boxes.code.upper_bound()),
+                (by_grid.code.lower_bound(), by_grid.code.upper_bound()),
+                "tolerance {tolerance}: both searches must find one minimum code"
+            );
+            let queried: Vec<ComponentSet> = boxes.queried.iter().chain(grid.queried.iter()).cloned().collect();
+            for support in &queried {
+                let from_boxes = boxes.oracle.separate(support).expect("box separation");
+                let from_grid = grid.oracle.separate(support).expect("exhaustive separation");
+                assert_eq!(
+                    (from_boxes.certifies_at_most(tolerance), from_boxes.refutes_at_most(tolerance)),
+                    (from_grid.certifies_at_most(tolerance), from_grid.refutes_at_most(tolerance)),
+                    "tolerance {tolerance}, support {:?}: both oracles must decide it alike",
+                    support.members()
+                );
+            }
+        }
+        let kept = set(OR_COMPONENTS, &[0, 2]);
+        let whole = OrProgram.enclose(&MaskBox::clamped(&kept)).expect("an enclosure");
+        assert!(
+            !whole.evidence.certifies_at_most(0.5),
+            "the whole box holds the interior mask m3 = 1/2, which moves f by 1"
+        );
+        let mut oracle = BoxSeparationOracle::new(OrProgram, 0.5).expect("a declared tolerance");
+        assert!(
+            oracle.separate(&kept).expect("box separation").certifies_at_most(0.5),
+            "every binary mask with 0 and 2 on is within 1/4, so refinement certifies the support"
+        );
+    }
+
+    /// The oracle trusts each box enclosure, so a program's enclosures must bound every vertex they
+    /// hold. The cross-check passes for the fixture and catches an enclosure planted four times too
+    /// small, which would certify `{0, 4}` at `1/2` although the mask with 2 off is 2 away.
+    #[test]
+    fn an_understated_box_enclosure_fails_the_vertex_cross_check() {
+        assert!(covers_its_vertices(&mut OrProgram), "the fixture's enclosures bound their vertices");
+        assert!(!covers_its_vertices(&mut Understated), "the cross-check must catch the understated enclosure");
+        let support = set(OR_COMPONENTS, &[0, 4]);
+        let mut planted = BoxSeparationOracle::new(Understated, 0.5).expect("a declared tolerance");
+        let mut grid = GridOracle { components: OR_COMPONENTS, levels: vec![0.0, 1.0], response: or_response };
+        assert!(
+            planted.separate(&support).expect("box separation").certifies_at_most(0.5),
+            "control: the understated enclosure certifies {{0, 4}}"
+        );
+        assert!(
+            grid.separate(&support).expect("exhaustive separation").refutes_at_most(0.5),
+            "exhaustive evaluation refutes {{0, 4}}"
+        );
+    }
+
+    /// A refuting vertex is shrunk: refinement of the empty support reaches the all-off vertex
+    /// first, and switching components back on while it still refutes leaves only component 2
+    /// off, which no other component replaces. Each of its off components switched back on no
+    /// longer refutes. The mutant that hands back no vertex cuts only complements, so its largest
+    /// edge is larger.
+    #[test]
+    fn a_refuting_vertex_is_shrunk_to_a_minimal_edge() {
+        let tolerance = 0.5;
+        let mut oracle = BoxSeparationOracle::new(OrProgram, tolerance).expect("a declared tolerance");
+        let refuted = oracle.separate(&set(OR_COMPONENTS, &[])).expect("box separation");
+        assert!(refuted.refutes_at_most(tolerance));
+        let witness = refuted.witness().cloned().expect("a refutation carries its vertex");
+        assert!(witness.is_vertex());
+        assert_eq!(witness.perturbed(), vec![2], "the all-off vertex shrinks to the one irreplaceable component");
+        for component in witness.perturbed() {
+            let mut restored = witness.clone();
+            restored.sides[component] = MaskSide::On;
+            assert!(
+                !OrProgram.enclose(&restored).expect("a vertex").evidence.refutes_at_most(tolerance),
+                "switching {component} back on no longer refutes"
+            );
+        }
+
+        let mut shrinking = BoxSeparationOracle::new(OrProgram, tolerance).expect("a declared tolerance");
+        let shrunk = minimum_code_support(&mut shrinking, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
+            .expect("the shrinking search closes");
+        let mut mutant = WithoutWitness(BoxSeparationOracle::new(OrProgram, tolerance).expect("a declared tolerance"));
+        let cut = minimum_code_support(&mut mutant, &SizeCode, tolerance, FailureHypergraph::new(OR_COMPONENTS))
+            .expect("the complement-cut search closes");
+        assert_eq!(shrunk.code.upper_bound(), cut.code.upper_bound(), "both searches find one minimum code");
+        assert_eq!(largest_edge(&shrunk.hypergraph), 2, "the shrunk edges are {{2}} and the OR pair {{0, 1}}");
+        assert!(
+            largest_edge(&cut.hypergraph) > largest_edge(&shrunk.hypergraph),
+            "positive control: without shrunk vertices the edges are larger"
+        );
+    }
+
+    /// Refusals: a tolerance that is not finite and nonnegative, a single-mask evaluation of a box
+    /// with free controls, a box of another component count, and an undecided box whose split order
+    /// names none of its free components.
+    #[test]
+    fn the_box_oracle_refuses_what_it_cannot_decide() {
+        for tolerance in [f64::NAN, -1.0, f64::INFINITY] {
+            assert!(matches!(
+                BoxSeparationOracle::new(OrProgram, tolerance),
+                Err(BoxOracleError::InvalidTolerance { .. })
+            ));
+        }
+        let mut oracle = BoxSeparationOracle::new(OrProgram, 0.5).expect("a declared tolerance");
+        assert!(
+            oracle
+                .evaluate(&MaskBox::vertex(&set(OR_COMPONENTS, &[0, 2, 4])))
+                .expect("a vertex")
+                .certifies_at_most(0.5),
+            "positive control: a vertex evaluates"
+        );
+        assert!(matches!(
+            oracle.evaluate(&MaskBox::clamped(&set(OR_COMPONENTS, &[0]))),
+            Err(BoxOracleError::NotAVertex { .. })
+        ));
+        assert!(matches!(
+            oracle.evaluate(&MaskBox::vertex(&set(3, &[0]))),
+            Err(BoxOracleError::Hypergraph(HypergraphError::ComponentCountMismatch { .. }))
+        ));
+        let mut unordered = BoxSeparationOracle::new(Unordered, 0.5).expect("a declared tolerance");
+        assert!(matches!(
+            unordered.separate(&set(OR_COMPONENTS, &[0])),
+            Err(BoxOracleError::NoSplit { .. })
+        ));
     }
 }

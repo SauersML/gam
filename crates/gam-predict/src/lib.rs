@@ -58,8 +58,8 @@ use gam_models::inference::model::{
 use gam_problem::{BlockRole, EstimationError};
 use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::constrained_posterior::{
-    ConstrainedPosteriorGeometry, constrained_posterior_correction_from_covariance,
-    constrained_projection_equal_tailed_interval,
+    ConstrainedPosteriorGeometry, ConstrainedProjectionLaw,
+    constrained_posterior_correction_from_covariance,
 };
 use gam_solve::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
@@ -1311,9 +1311,20 @@ impl PointCovarianceProvenance {
     /// The provenance of a posterior-mean point integrated from `fit`'s own
     /// posterior.
     pub fn of_fit(fit: &UnifiedFitResult) -> Option<Self> {
+        // An expectile fit is identity-link: its posterior-mean point is the
+        // mode Xβ̂ and integrates no covariance, so its declined sandwich
+        // qualifies only the intervals, which `refuse_declined_covariance`
+        // refuses.
         fit.artifacts
             .covariance_declined
             .clone()
+            .filter(|declined| {
+                !matches!(
+                    declined,
+                    gam_solve::model_types::CovarianceDeclined::
+                        ExpectileSandwichRequiresDenseCovariance { .. }
+                )
+            })
             .map(|declined| Self::ConditionalOnFittedLatentLaw { declined })
     }
 
@@ -1953,6 +1964,12 @@ fn constrained_linear_predictor_intervals(
         )));
     }
     let law = constrained_law(fit, geometry, covariance_mode)?;
+    // The projection law — including its certified orthant cubature — is a
+    // property of the fit, not of the row, so it is prepared once and every row
+    // reads it. Peak cubature storage is one node set, independent of the
+    // prediction batch, chunk size and worker count.
+    let projection_law = ConstrainedProjectionLaw::new(&law.ambient, &law.geometry)
+        .map_err(EstimationError::InvalidInput)?;
     let n_rows = design.nrows();
     let mut lower = Array1::<f64>::zeros(n_rows);
     let mut upper = Array1::<f64>::zeros(n_rows);
@@ -1960,28 +1977,14 @@ fn constrained_linear_predictor_intervals(
     for start in (0..n_rows).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n_rows);
         let rows = design_row_chunk(design, start..end).map_err(EstimationError::InvalidInput)?;
-        // One projection can retain up to ORTHANT_MOMENT_MAXIMUM_POINTS scalar
-        // node/weight pairs. Evaluate rows serially so peak cubature storage is
-        // O(nodes), independent of prediction batch and chunk size. Parallel
-        // rows would multiply that allocation by the Rayon worker count and
-        // violate the library's bounded-memory contract on hard faces.
-        for local_row in 0..rows.nrows() {
-            let contrast = geometry
-                .coefficient_gauge
-                .t_full
-                .t()
-                .dot(&rows.row(local_row));
-            let (row_lower, row_upper) = constrained_projection_equal_tailed_interval(
-                &law.ambient,
-                &law.geometry,
-                &contrast,
-                level,
-            )
+        // Row r's contrast is `Tᵀx_r`, so the chunk's contrasts are the rows of `X·T`.
+        let contrasts = rows.dot(&geometry.coefficient_gauge.t_full);
+        let intervals = projection_law
+            .equal_tailed_intervals(contrasts.view(), level)
             .map_err(EstimationError::InvalidInput)?;
-            let shift = offset[start + local_row]
-                + rows
-                    .row(local_row)
-                    .dot(&geometry.coefficient_gauge.affine_shift);
+        let shifts = rows.dot(&geometry.coefficient_gauge.affine_shift);
+        for (local_row, (row_lower, row_upper)) in intervals.into_iter().enumerate() {
+            let shift = offset[start + local_row] + shifts[local_row];
             lower[start + local_row] = row_lower + shift;
             upper[start + local_row] = row_upper + shift;
         }
@@ -2258,6 +2261,10 @@ where
         // the Bernoulli indicator 1{T > t} with conditional variance S(1−S) —
         // the Binomial law of total variance below with μ = S: E[S(1−S)] =
         // m(1−m) − v, and total predictive variance exactly m(1−m).
+        // Location-scale t: Var(Y|μ) = σ²ν/(ν−2), finite only for ν > 2.
+        ResponseFamily::StudentT { sigma, nu } => {
+            (*nu > 2.0).then(|| Array1::from_elem(mean.len(), sigma * sigma * nu / (nu - 2.0)))
+        }
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => Some(Array1::from_iter(
             mean.iter().enumerate().map(|(i, &mu)| {
                 let p = mu.clamp(0.0, 1.0);
@@ -2487,6 +2494,11 @@ where
                 beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
         }
+        // The predictive law of a fresh Student-t observation is a Gaussian
+        // (posterior of η) convolved with a scaled t, which has no closed-form
+        // quantile; no observation band is reported rather than a Gaussian
+        // surrogate that would under-cover the heavy tails.
+        ResponseFamily::StudentT { .. } => (None, None),
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
             // Royston–Parmar reports the survival probability S(t) at the
             // requested horizon, so its fresh observation is the Bernoulli
@@ -3259,6 +3271,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_solve::constrained_posterior::constrained_projection_equal_tailed_interval;
     use gam_math::probability::normal_pdf;
     use gam_models::bms::LatentMeasureKind;
     use gam_models::inference::model::SavedLatentZNormalization;

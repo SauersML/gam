@@ -82,17 +82,20 @@ pub fn render_summary_text(summary: &SummaryPayload) -> String {
             .log_likelihood
             .map_or_else(|| unavailable(Some(NO_LIKELIHOOD_AT_EXACT_FIT)), format_significant),
     );
+    // The conditional AIC is absent only when the fit has no normalized
+    // likelihood, and the corrected one then carries that same reason.
+    let criteria = &summary.information_criteria;
     line(
         "Conditional AIC",
-        summary.conditional_aic.map_or_else(
-            || unavailable(summary.conditional_aic_unavailable.as_deref()),
+        criteria.aic_conditional.map_or_else(
+            || unavailable(criteria.aic_corrected_unavailable),
             format_significant,
         ),
     );
     line(
         "Corrected AIC",
-        summary.corrected_aic.map_or_else(
-            || unavailable(summary.corrected_aic_unavailable.as_deref()),
+        criteria.aic_corrected.map_or_else(
+            || unavailable(criteria.aic_corrected_unavailable),
             format_significant,
         ),
     );
@@ -314,7 +317,8 @@ fn convergence_text(convergence: &SummaryConvergence) -> String {
 mod tests {
     use super::*;
     use crate::inference::saved_summary::{
-        SummaryOuterCertificate, SummaryParametricTermRow, SummarySmoothTermRow,
+        SummaryInformationCriteria, SummaryOuterCertificate, SummaryParametricTermRow,
+        SummarySmoothTermRow,
     };
 
     fn smooth_row(name: &str, edf: f64, label: Option<&str>) -> SummarySmoothTermRow {
@@ -346,10 +350,6 @@ mod tests {
             deviance_explained_unavailable: None,
             scale: Some(0.2525),
             log_likelihood: Some(-70.125),
-            conditional_aic: Some(155.5),
-            conditional_aic_unavailable: None,
-            corrected_aic: Some(157.25),
-            corrected_aic_unavailable: None,
             n_obs: Some(100),
             reml_score: Some(81.75),
             raw_reml_score: Some(80.5),
@@ -359,6 +359,13 @@ mod tests {
             iterations: 7,
             edf_total: Some(6.875),
             edf_rank_bound: Vec::new(),
+            information_criteria: SummaryInformationCriteria {
+                aic_conditional: Some(155.5),
+                edf_corrected: Some(7.75),
+                aic_corrected: Some(157.25),
+                scale_dof: Some(1.0),
+                aic_corrected_unavailable: None,
+            },
             lambdas: vec![0.0125],
             coefficients: Vec::new(),
             parametric_statistic: Some("t"),
@@ -468,8 +475,8 @@ Convergence: certified; inner P-IRLS: Converged; 7 outer iterations; analytic_gr
         summary.deviance_explained = None;
         summary.adjusted_r_squared = None;
         summary.deviance_explained_unavailable = Some("no intercept-only deviance");
-        summary.corrected_aic = None;
-        summary.corrected_aic_unavailable = Some("no smoothing-parameter covariance".to_string());
+        summary.information_criteria.aic_corrected = None;
+        summary.information_criteria.aic_corrected_unavailable = Some("no smoothing-parameter covariance");
         summary.smooth_terms = Vec::new();
         summary.smooth_terms_unavailable = Some("no frozen term spec".to_string());
         let text = render_summary_text(&summary);

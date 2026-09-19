@@ -7,7 +7,7 @@
 //! estimator wrapper. The response column comes from the formula DSL's own
 //! `formula_response_column`, the same authority the CLI fit uses.
 
-use gam::terms::inference::formula_dsl::formula_response_column;
+use gam::terms::inference::formula_dsl::{AUTOMATIC_REST_TERM, formula_response_column};
 use pyo3::prelude::*;
 
 use crate::py_value_error;
@@ -22,10 +22,15 @@ pub(crate) fn sklearn_resolved_formula(formula: &str, target_name: &str) -> Stri
 #[pyfunction(signature = (columns, formula, target_column = None, has_external_target = false))]
 pub(crate) fn sklearn_fit_metadata(
     columns: Vec<String>,
-    formula: &str,
+    formula: Option<&str>,
     target_column: Option<String>,
     has_external_target: bool,
 ) -> PyResult<(String, Vec<String>, String)> {
+    // No formula is the automatic formula `target ~ .`: the fit expands `.`
+    // against the training table's schema in Rust
+    // (`gam_terms::inference::automatic_formula`), the same expansion the CLI
+    // and the library apply to `y ~ .`.
+    let formula = formula.unwrap_or(AUTOMATIC_REST_TERM);
     let has_target_column = target_column.is_some();
     if has_target_column && has_external_target {
         return Err(py_value_error(
@@ -44,7 +49,11 @@ pub(crate) fn sklearn_fit_metadata(
         formula_response_column(formula).unwrap_or_else(|| "y".to_string())
     } else {
         let target_name = formula_response_column(formula).ok_or_else(|| {
-            py_value_error("formula must include a response when y is not provided".to_string())
+            py_value_error(
+                "formula must include a response when y is not provided; without a formula, \
+                 pass y (an array or the name of the target column)"
+                    .to_string(),
+            )
         })?;
         if !columns.iter().any(|column| column == &target_name) {
             return Err(py_value_error(format!(
