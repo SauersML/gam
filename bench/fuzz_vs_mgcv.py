@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import secrets
 import statistics
@@ -1052,26 +1053,29 @@ def main() -> None:
     parser.add_argument("--max-total-seconds", type=int, default=None)
     parser.add_argument("--max-scenario-cost", type=float, default=200_000.0)
     parser.add_argument("--baseline-json", type=str, default=None)
-    # #2584: the nightly stream runs below `info`, so a run that eats its whole
-    # budget cannot say WHICH scenario ate it -- nothing is attributable. The
-    # level is opt-in rather than always-on because the extension installs its
-    # logger at a deliberately quiet `warn` default (#1688) and that stream
-    # carries real per-evaluation compute (eigendecompositions), not just I/O:
-    # turning it on nightly would slow the very budget this is meant to explain.
+    # #2584: without the solver stream, a run that eats its whole budget cannot
+    # say WHICH scenario ate it -- nothing is attributable. The stream is
+    # opt-in because it carries real per-evaluation compute (eigendecompositions,
+    # #1688), not just I/O: turning it on nightly would slow the very budget
+    # this is meant to explain.
     parser.add_argument(
-        "--log-level",
-        type=str,
-        default=None,
-        choices=["off", "error", "warn", "info", "debug", "trace"],
-        help="gamfit solver log level (default: leave the quiet warn default alone)",
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="write gamfit's solver records to stderr (-v debug, -vv trace)",
     )
     args = parser.parse_args()
 
-    if args.log_level is not None:
-        # `RUST_LOG` alone does nothing here: the extension installs its own
-        # stderr logger at import, so the level must be set through the shim.
-        rust_module().set_log_level(args.log_level)
-        print(f"gamfit solver log level set to {args.log_level!r}", flush=True)
+    if args.verbose:
+        # The engine logs through the `gamfit` Python logger, silent by default;
+        # its trace records arrive at half of `logging.DEBUG`.
+        solver_log = logging.getLogger("gamfit")
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(relativeCreated)d ms %(message)s"))
+        solver_log.addHandler(handler)
+        solver_log.setLevel(logging.DEBUG if args.verbose == 1 else logging.DEBUG // 2)
+        print(f"gamfit solver log enabled (verbosity {args.verbose})", flush=True)
 
     try:
         _check_mgcv_available()

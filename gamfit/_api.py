@@ -812,7 +812,7 @@ def fit(
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
-        ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
+        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
         ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
         ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
         estimated by LAML jointly with the smoothing parameters; the fitted
@@ -993,15 +993,20 @@ def fit(
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
         ``"s(x)"`` or ``"s(x, k=12)"``; whitespace differences are ignored).
-        Values are one of ``"monotone_increasing"``,
-        ``"monotone_decreasing"``, ``"convex"``, ``"concave"``, or
-        ``"none"`` / ``None`` for the default unconstrained fit. The mapping
-        is rewritten into the formula option ``s(x, shape=...)``. The
-        constraint is exact on the B-spline control polygon (``β = C·δ``
-        with ``δ ≥ 0``), so it holds everywhere on the knot range, and the
-        term stays centred like an unconstrained smooth. Only open 1-D
-        B-spline ``s(x)`` smooths accept it; see ``docs/formulas.md``
-        (Shape-constrained smooths).
+        Values take the same forms as ``shape=`` in the formula: one of
+        ``"monotone_increasing"``, ``"monotone_decreasing"``, ``"convex"``,
+        ``"concave"``, or ``"none"`` / ``None`` for the default
+        unconstrained fit; a list of atoms that must all hold
+        (``["monotone_increasing", "concave"]``); or, for a ``te()`` term,
+        one entry per margin (``["monotone_increasing", None]``). The
+        mapping is rewritten into the formula option ``shape=...``. The
+        constraint is exact on the B-spline control polygon (``β = C·γ``
+        with ``γ ≥ 0`` for one shape, inequality rows ``A·β ≥ 0`` for a list
+        or a tensor margin), so it holds everywhere on the knot range, and
+        the term stays centred like an unconstrained smooth. Supported on
+        open 1-D B-spline ``s(x)`` smooths, ``te()`` tensor products of
+        them, and either of those with ``by=``; see ``docs/formulas.md``
+        (Shape-constrained smooths) and ``Smooth.shape_constraint``.
 
         Example::
 
@@ -1081,9 +1086,12 @@ def fit(
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
         # Python only marshals the mapping across the FFI.
+        from .smooth import shape_constraint_text
+
         try:
             formula = rust_module().apply_shape_constraints_to_formula(
-                formula, [(str(k), str(v)) for k, v in constraints.items()]
+                formula,
+                [(str(k), shape_constraint_text(v)) for k, v in constraints.items()],
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -1208,7 +1216,7 @@ def fit(
     # Surface any materialization advisories (e.g. an mgcv-style "k reduced to
     # the data support" note when a cr/cs/sz basis is capped) as warnings, so a
     # basis the fit silently adjusted is never silent to the caller (#1543).
-    emit_inference_warnings(model.notes)
+    emit_inference_warnings(model._fit_notes()[0])
     return model
 
 
@@ -1325,7 +1333,7 @@ def fit_array(
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
-    emit_inference_warnings(model.notes)  # see fit(): never silently adjust a basis (#1543)
+    emit_inference_warnings(model._fit_notes()[0])  # see fit(): never silently adjust a basis (#1543)
     return model
 
 

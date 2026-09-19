@@ -80,7 +80,7 @@ pub fn dispersion_from_likelihood(
                 known(phi.value())
             }
         }
-        Scale::Tweedie { phi, estimated } => {
+        Scale::Tweedie { phi, estimated } | Scale::Dispersion { phi, estimated } => {
             if estimated {
                 estimated_dispersion(phi.value())
             } else {
@@ -4535,7 +4535,8 @@ fn validate_likelihood_scale_estimation(
         LikelihoodScaleMetadata::FixedDispersion { phi }
         | LikelihoodScaleMetadata::EstimatedBetaPhi { phi }
         | LikelihoodScaleMetadata::FixedBetaPhi { phi }
-        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi } => {
+        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi }
+        | LikelihoodScaleMetadata::EstimatedDispersion { phi } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
             if phi > 0.0 {
                 Ok(())
@@ -6158,7 +6159,8 @@ impl UnifiedFitResult {
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => Ok(FittedLinkState::Standard(None)),
+            | (ResponseFamily::Gamma, _)
+            | (ResponseFamily::InverseGaussian, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::Beta { .. }, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::RoystonParmar, _) => Ok(FittedLinkState::Standard(None)),
         }

@@ -581,7 +581,7 @@ impl CompressedLaw {
         for ((point, root, certificate), ratio) in
             audited.iter().zip(&measured_over_bound).skip(sample.len())
         {
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope latent-z] compression audit tail anchor q={} b={:e}: root {:e}, \
                  certified error {:e} ({}), measured / certified {:e} (gam#2928)",
                 point.q,

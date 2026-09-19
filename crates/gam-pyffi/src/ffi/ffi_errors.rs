@@ -227,7 +227,9 @@ create_exception!(
     _rust,
     ModelOverparameterizedError,
     DataError,
-    "Model is over-parameterized: more coefficients than samples."
+    "Model is over-parameterized: its unpenalized coefficient directions \
+     (intercept, unpenalized terms, penalty null spaces) are not fewer than the \
+     observations, or the design is rank deficient."
 );
 
 create_exception!(
@@ -532,7 +534,8 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         }
         EstimationError::GradientUnavailable { .. } => GradientUnavailableError::new_err(message),
         EstimationError::LayoutError(_) => LayoutError::new_err(message),
-        EstimationError::PrefitRankDeficientDesignDetected { .. } => {
+        EstimationError::PrefitRankDeficientDesignDetected { .. }
+        | EstimationError::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
         EstimationError::PrefitNearDegenerateDesignDetected { .. } => {

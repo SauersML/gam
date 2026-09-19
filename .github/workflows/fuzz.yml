@@ -5,8 +5,8 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
-      log_level:
-        description: "gamfit solver log level for this run (empty = quiet default). Use 'info' to make budget spend attributable per scenario; the stream is uploaded as an artifact and is NOT committed."
+      verbose:
+        description: "gamfit solver log verbosity for this run (empty = quiet default, '-v' = debug, '-vv' = trace). Use '-v' to make budget spend attributable per scenario; the stream is uploaded as an artifact and is NOT committed."
         default: ""
         required: false
       n_trials:
@@ -123,7 +123,7 @@ jobs:
 
       - name: Run fuzzer
         env:
-          LOG_LEVEL: ${{ github.event.inputs.log_level }}
+          VERBOSE: ${{ github.event.inputs.verbose }}
         run: |
           set -o pipefail
           # #2584: stdout is the in-tree ledger (`fuzz_output.txt` is COMMITTED by
@@ -131,9 +131,11 @@ jobs:
           # stream and goes to an artifact-only file. Raising the level globally
           # into the committed file would check in a six-figure-line log nightly.
           level_args=()
-          if [[ -n "${LOG_LEVEL:-}" ]]; then
-            level_args=(--log-level "$LOG_LEVEL")
-          fi
+          case "${VERBOSE:-}" in
+            "") ;;
+            -v|-vv) level_args=("$VERBOSE") ;;
+            *) echo "::error::verbose must be empty, -v or -vv (got '$VERBOSE')"; exit 1 ;;
+          esac
           # The step shell is `bash -e`, so the pipeline must be un-guarded for
           # its exit code to be CAPTURED rather than abort the step: a failing
           # run is exactly when the stderr tail below is worth having in-tree.

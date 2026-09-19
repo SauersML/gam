@@ -611,7 +611,7 @@ impl FirthDenseOperator {
                 // The eigensolver resolves eigenvalues to `r·ε·λ_max`; a smallest one
                 // inside that band leaves I_r singular to working precision.
                 if rel <= eigvals_ir.len() as f64 * f64::EPSILON {
-                    log::warn!(
+                    log::debug!(
                         "[REML/Firth] reduced Fisher I_r is near-singular (min/max={:.3e}/{:.3e}, rel={:.3e}); exact derivatives may be ill-conditioned near active-subspace boundaries.",
                         min_ev,
                         max_ev,

@@ -184,6 +184,7 @@ __all__ = [
     "fit_array",
     "fit_event_history",
     "fit_joint_event_model",
+    "fit_notes_from_model",
     "fit_penalized_multinomial_pyfunc",
     "fit_table",
     "fit_transport",
@@ -226,7 +227,6 @@ __all__ = [
     "identifiability_check_json",
     "identifiable_factor_profile_log_likelihood",
     "identifiable_factor_weights",
-    "inference_notes_from_model",
     "interchange_decode_backward",
     "interchange_decode_forward",
     "interchange_swap_backward",
@@ -378,7 +378,6 @@ __all__ = [
     "select_probe_by_expected_evidence",
     "select_topology_candidate_lifecycle",
     "separation_limit",
-    "set_log_level",
     "shape_matched_control",
     "shape_matched_control_f32",
     "sinkhorn_barycenter_forward",
@@ -432,6 +431,7 @@ __all__ = [
     "survival_prediction_payload_from_json",
     "survival_score_grid_from_times",
     "survival_should_chunk",
+    "sync_log_level_from_python",
     "term_blocks_for_model",
     "thin_plate_penalty",
     "thin_svd_scores",
@@ -1746,6 +1746,8 @@ def fit_event_history(declared_marks: Sequence[tuple[str, str]] | None, covariat
 
 def fit_joint_event_model(declared_marks: Sequence[tuple[str, str]] | None, subject_ids: Sequence[str], entry: Sequence[float], exit: Sequence[float], event_subject: Sequence[str], event_time: Sequence[float], event_marks: Sequence[str]) -> _JointEventModel: ...
 
+def fit_notes_from_model(model_bytes: Sequence[int]) -> tuple[list[str], list[str]]: ...
+
 def fit_penalized_multinomial_pyfunc(design: NDArray[np.float64], y_one_hot: NDArray[np.float64], penalty: NDArray[np.float64], lambdas: NDArray[np.float64], row_weights: NDArray[np.float64] | None = ..., max_iter: int = ..., tol: float = ...) -> dict[Any, Any]: ...
 
 def fit_table(headers: Sequence[str], rows: _EncodedTable, formula: str, config_json: str | None = ..., fisher_rao_w: NDArray[np.float64] | None = ..., warm_start_model: Sequence[int] | None = ...) -> bytes: ...
@@ -1829,8 +1831,6 @@ def identifiability_check_json(input: str) -> str: ...
 def identifiable_factor_profile_log_likelihood(residual_sum_squares: float, penalty: float, n_obs: int) -> float: ...
 
 def identifiable_factor_weights(aux_prior_weight: float | None, mech_sparsity_weight: float | None) -> tuple[float, float]: ...
-
-def inference_notes_from_model(model_bytes: Sequence[int]) -> list[str]: ...
 
 def interchange_decode_backward(z: NDArray[np.float64], weights: NDArray[np.float64], gate: NDArray[np.float64], grad_out: NDArray[np.float64], with_bias: bool) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64] | None]: ...
 
@@ -2134,8 +2134,6 @@ def select_topology_candidate_lifecycle(request_json: str) -> str: ...
 
 def separation_limit(n_harmonics: int) -> float: ...
 
-def set_log_level(level: str) -> None: ...
-
 def shape_matched_control(data: NDArray[np.float64], kind: str, seed: int = ...) -> NDArray[np.float64]: ...
 
 def shape_matched_control_f32(data: NDArray[np.float32], kind: str, seed: int = ...) -> NDArray[np.float32]: ...
@@ -2241,6 +2239,8 @@ def survival_prediction_payload_from_json(raw: str) -> Any: ...
 def survival_score_grid_from_times(train_times: Sequence[float]) -> NDArray[np.float64]: ...
 
 def survival_should_chunk(n_rows: int, n_times: int) -> bool: ...
+
+def sync_log_level_from_python(effective_level: int) -> None: ...
 
 def term_blocks_for_model(model_bytes: Sequence[int]) -> list[tuple[str, str, int, int]]: ...
 

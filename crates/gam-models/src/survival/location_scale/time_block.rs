@@ -440,7 +440,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
         // float-scale entries from the upstream basis builder. We log
         // warn-level only in the surprising regime.
         if total_subtol_nonzeros > 0 {
-            log::warn!(
+            log::debug!(
                 "structural time coefficient bounds: no value-varying shape column on this candidate's time design ({} rows × {} cols, sub-tolerance derivative nonzero entries (0 < |v| ≤ {:.0e}): {}, max(|.|) of the columns carrying them: {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
                 nrows,
                 p,

@@ -1257,7 +1257,7 @@ impl<'a> RemlState<'a> {
             let grad = result
                 .gradient_for_mode(eval_mode, theta.len())
                 .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
-            log::info!(
+            log::debug!(
                 "[outer-timing] compute_joint_hyper_eval (unified, rho_dim={}, psi_dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 hyper_dirs.len(),
@@ -1283,7 +1283,7 @@ impl<'a> RemlState<'a> {
             // and silently degraded large-K joint-hyper outers to the dense
             // path even when the eval-side had elected Operator.
             let eval = self.compute_outer_eval_with_order(&rho, order)?;
-            log::debug!(
+            log::trace!(
                 "[outer-timing] compute_joint_hyper_eval (rho-only, dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 t_outer_start.elapsed().as_secs_f64(),
@@ -1324,7 +1324,7 @@ impl<'a> RemlState<'a> {
         if n_x.saturating_mul(p_x) > HYPER_MAX_DENSE_WORK
             && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
         {
-            log::warn!(
+            log::debug!(
                 "skipping tau hyper-coordinate construction (n={n_x}, p={p_x}): \
                  dense design materialization too large; falling back to rho-only REML"
             );
@@ -1386,7 +1386,7 @@ impl<'a> RemlState<'a> {
             };
             Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv))
         };
-        log::debug!(
+        log::trace!(
             "[outer-timing] build_tau_unified_objects_from_bundle ({}, n={}, p={}, psi_dim={}): {:.1}ms",
             backend_label,
             n_x,
@@ -3041,7 +3041,7 @@ impl<'a> RemlState<'a> {
         let p_x = pirls_result.x_transformed.ncols();
         const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::warn!(
+            log::debug!(
                 "skipping SAS link ext coordinate construction (n={n_x}, p={p_x}): \
                  dense design materialization too large"
             );
@@ -3245,7 +3245,7 @@ impl<'a> RemlState<'a> {
         let p_x = pirls_result.x_transformed.ncols();
         const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::warn!(
+            log::debug!(
                 "skipping mixture link ext coordinate construction (n={n_x}, p={p_x}): \
                  dense design materialization too large"
             );
