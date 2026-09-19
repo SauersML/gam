@@ -1448,7 +1448,7 @@
     "evidence": "source_removal_guard.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly these two identities: resolve_marginal_slope_base_link (public, 0 production occurrences) and the test (test_scoped). git grep -c -w resolve_marginal_slope_base_link and MarginalSlopeLinkRefusal::Flexible find 0 files under crates, src, tests and gamfit at the landing tree. test_census.py: 12036 -> 12038 tests. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
   },
   {
-    "base": "9ba55dfa343f27b1a78f3c9dde7c71dfbeb7889f",
+    "base": "7fd13fb17125294510097a5851478811b57ca39a",
     "items": [
       "crates/gam-cli/src/main/model_summary.rs:fn:build_model_summary",
       "crates/gam-inference/src/model_comparison.rs:enum:CorrectedEdfUnavailable",
