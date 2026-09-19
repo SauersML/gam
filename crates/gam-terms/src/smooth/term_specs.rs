@@ -5465,7 +5465,73 @@ fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
 /// first, while their coordinates stay independent on the chart's null space.
 /// That reproduces both cases and needs no record of which chart produced a
 /// frozen transform.
+///
+/// The blocks are built on an orthonormal frame of the chart's range, not on
+/// the chart's own coordinates. A frozen chart saved before the collection
+/// gauge became orthonormal composes the identifiability basis with a spectral
+/// whitener, whose column scales span as many decades as the penalty spectrum,
+/// so a relative rank cutoff on the primary in those coordinates reports
+/// spurious null directions and the blocks can never cover them. With `Z = U Σ Vᵀ` the frame `U` spans the same functions,
+/// coordinates map by `c_U = Σ Vᵀ c_Z`, and each ridge factor `E` in `U` is `E Σ
+/// Vᵀ` in `Z`. For an orthonormal chart (every chart the fit builds itself)
+/// this is an identity, because the ridges depend on the null space only
+/// through its projector.
 fn tensor_null_function_block_ridges(
+    normalized_marginal_penalties: &[(Array2<f64>, f64)],
+    marginal_function_grams: &[Array2<f64>],
+    chart: Option<&Array2<f64>>,
+    chart_primary: &ConstructiveQuadratic,
+) -> Result<Vec<ConstructiveQuadratic>, BasisError> {
+    use gam_linalg::faer_ndarray::FaerSvd;
+    let Some(z) = chart else {
+        return tensor_null_function_block_ridges_in_frame(
+            normalized_marginal_penalties,
+            marginal_function_grams,
+            None,
+            chart_primary,
+        );
+    };
+    let (frame, singular, right_t) = z.svd(true, true).map_err(BasisError::LinalgError)?;
+    let (Some(frame), Some(right_t)) = (frame, right_t) else {
+        return Err(BasisError::LinalgError(
+            gam_linalg::faer_ndarray::FaerLinalgError::SvdNoConvergence {
+                context: "tensor null blocks: chart singular vectors were not returned",
+            },
+        ));
+    };
+    if numerical_rank(z)? != z.ncols() {
+        crate::bail_invalid_basis!(
+            "tensor null blocks: the {}x{} coefficient chart is rank deficient",
+            z.nrows(),
+            z.ncols()
+        );
+    }
+    // `c_U = Σ Vᵀ c_Z` and its inverse `c_Z = V Σ⁻¹ c_U`.
+    let to_frame = Array2::from_diag(&singular).dot(&right_t);
+    let from_frame = right_t
+        .t()
+        .dot(&Array2::from_diag(&singular.mapv(f64::recip)));
+    let frame_primary = ConstructiveQuadratic::from_energy_factor(
+        fast_ab(chart_primary.factor(), &from_frame),
+        "tensor primary penalty on the chart frame",
+    )?;
+    tensor_null_function_block_ridges_in_frame(
+        normalized_marginal_penalties,
+        marginal_function_grams,
+        Some(&frame),
+        &frame_primary,
+    )?
+    .into_iter()
+    .map(|ridge| {
+        ConstructiveQuadratic::from_energy_factor(
+            fast_ab(ridge.factor(), &to_frame),
+            "tensor null-function block ridge",
+        )
+    })
+    .collect()
+}
+
+fn tensor_null_function_block_ridges_in_frame(
     normalized_marginal_penalties: &[(Array2<f64>, f64)],
     marginal_function_grams: &[Array2<f64>],
     chart: Option<&Array2<f64>>,
