@@ -3,7 +3,7 @@
 // Crate-root shared imports, re-exported so each `src/main/` submodule
 // inherits them via `use super::*;`. Real submodules below replace the
 // former textually-pasted source fragments.
-pub(crate) use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+pub(crate) use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 

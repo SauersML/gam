@@ -297,7 +297,6 @@ pub(crate) struct FitArgs {
             "sigma_time_k",
             "slope_time_k",
             "scale_dimensions",
-            "precompute_conformal"
         ]
     )]
     pub(crate) request: Option<PathBuf>,
@@ -433,24 +432,6 @@ pub(crate) struct FitArgs {
     /// `scale_dims=true` / `scale_dims=false`, which overrides this global flag.
     #[arg(long = "scale-dimensions", default_value_t = false)]
     pub(crate) scale_dimensions: bool,
-    /// Whether to precompute the distribution-free conformal substrates (#942
-    /// jackknife+, #1098 exact full-conformal) at fit time and persist them on
-    /// the saved model. Omit to keep the default of precomputing whenever the
-    /// fit is eligible; `false` skips both.
-    ///
-    /// Measured on `y ~ s(x1,k=6) + s(x2,k=6)` (#2633): the two substrates are
-    /// 94% of a saved Gaussian model at n=20,000 (10.2 MB of 10.85 MB) and grow
-    /// linearly with the training rows. Rebuilding both costs ~5.6 ms, 0.3% of
-    /// the fit, and stays under half a second out to p=253. So turning this off
-    /// yields a ~16x smaller model (10.85 MB -> ~0.65 MB at n=20,000).
-    ///
-    /// It is opt-OUT because rebuilding needs the training design AND response
-    /// back, which a saved model deliberately does not carry: a model shipped to
-    /// a host that never sees the training data must keep them or it cannot
-    /// produce a conformal interval at all. Turn it off when the caller retains
-    /// its training data, fits in batch, or never asks for conformal intervals.
-    #[arg(long = "precompute-conformal", action = ArgAction::Set, default_value_t = true)]
-    pub(crate) precompute_conformal: bool,
     #[arg(long = "out", required = true)]
     pub(crate) out: Option<PathBuf>,
 }
@@ -483,15 +464,21 @@ pub(crate) struct PredictArgs {
     #[arg(long = "covariance-mode", value_parser = parse_covariance_mode_arg)]
     pub(crate) covariance_mode: Option<InferenceCovarianceMode>,
     /// Replace the posterior band with a distribution-free conformal band at
-    /// `--level`: the exact full-conformal set of a Gaussian-identity fit that
-    /// precomputed its substrate, or with `--calibration` the split-conformal
-    /// band calibrated on a held-out labeled table.
+    /// `--level`: with `--training-data` the exact full-conformal set of a
+    /// Gaussian-identity fit, or with `--calibration` the split-conformal band
+    /// calibrated on a held-out labeled table.
     #[arg(long = "conformal", default_value_t = false, conflicts_with = "uncertainty")]
     pub(crate) conformal: bool,
     /// Held-out labeled table (CSV or parquet, including the response column)
     /// that calibrates the split-conformal band.
     #[arg(long = "calibration", requires = "conformal")]
     pub(crate) calibration: Option<PathBuf>,
+    /// The labeled table the model was fit on (CSV or parquet, including the
+    /// response column). The saved model keeps only the p x p frozen penalty,
+    /// never per-row training data, so the exact full-conformal set re-reads
+    /// its labeled rows from here.
+    #[arg(long = "training-data", requires = "conformal", conflicts_with = "calibration")]
+    pub(crate) training_data: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
