@@ -4530,5 +4530,14 @@
     },
     "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
     "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
+  },
+  {
+    "base": "1e82fb0eb466f64fc310e9e4a3951a6d1591c31d",
+    "removed": {
+      "crates/gam-sae/src/assignment.rs::set_ordered_beta_bernoulli_alpha_override": 1,
+      "crates/gam-sae/src/manifold/tests.rs::per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha": 1
+    },
+    "reason": "#2933 F06 / #1777: the ordered-beta-Bernoulli alpha override is deleted. SaeFitConfig and SaeAssignment carried ordered_beta_bernoulli_alpha_override, a second path to a state that AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable) already declares; set_ordered_beta_bernoulli_alpha_override was its setter. A fixed concentration is now declared only through the mode (learnable_alpha: false), so the override-specific tests (the overridden_* finalization and reactive-box twins, the OVERRIDE_ALPHA fixtures, and the per_fit_config barrier-and-alpha isolation test) go with it; the surviving fixed/learnable finalization, layout-refusal and zero-trace tests move to tests_alpha_persistence_2933.rs and cover the single remaining path.",
+    "evidence": "source_removal_guard.py and public_api_census.py against this base report exactly these identities. At the head tree git grep -w alpha_override finds no occurrence under crates, src or tests. cargo check -p gam-sae --tests and cargo check -p gam-pyffi pass; tests_alpha_persistence_2933 keeps fixed_alpha_finalizes_without_changing_the_objective_2933, learnable_alpha_finalizes_and_reloads_its_fitted_concentration_2933, a_layout_contradicting_the_concentration_is_refused_2933 and fixed_alpha_reactive_box_has_no_sparse_face_2933."
   }
 ]
