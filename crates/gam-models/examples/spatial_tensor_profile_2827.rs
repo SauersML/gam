@@ -41,7 +41,7 @@ fn run() -> Result<(), String> {
     }
     let log_level = args.get(4).map(|level| level.parse::<log::LevelFilter>())
         .transpose().map_err(|error| error.to_string())?
-        .unwrap_or(log::LevelFilter::Info);
+        .unwrap_or(log::LevelFilter::Debug);
     log::set_max_level(log_level);
     let rows = args[2].parse::<usize>().map_err(|error| error.to_string())?;
     if rows == 0 {
@@ -77,7 +77,7 @@ fn run() -> Result<(), String> {
 fn main() -> Result<(), String> {
     START.set(Instant::now()).expect("initialize logger clock once");
     log::set_logger(&LOGGER).map_err(|error| error.to_string())?;
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Debug);
     std::thread::Builder::new().name("spatial-profile-2827".into())
         .stack_size(64 << 20).spawn(run).map_err(|error| error.to_string())?
         .join().map_err(|_| "fit worker panicked".to_string())?

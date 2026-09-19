@@ -9,17 +9,11 @@ pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 
-    /// Solver log verbosity: `off|error|warn|info|debug|trace`. Defaults to the
-    /// quiet `warn` level (#1688) — pass `--log-level info` to opt back into the
-    /// full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`, etc.).
-    /// Unrecognized levels are rejected by the argument parser.
-    #[arg(
-        long,
-        global = true,
-        value_name = "LEVEL",
-        value_parser = parse_log_level_cli
-    )]
-    pub(crate) log_level: Option<log::LevelFilter>,
+    /// Show solver diagnostics on stderr: `-v` for the per-iteration solver
+    /// trace (`[OUTER …]`, `[PIRLS …]`, …), `-vv` for the finer trace-level
+    /// records as well. Without it a run writes only its results and errors.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
 }
 
 #[derive(Args, Debug)]
@@ -95,12 +89,18 @@ pub(crate) enum Command {
     ParameterDecomposition(ParameterDecompositionArgs),
     /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
+    /// Print the text summary of a fitted model (the text gamfit's
+    /// `Model.summary()` prints).
+    Summary(SummaryArgs),
     /// Predict on a new dataset using a fitted model.
     Predict(PredictArgs),
     /// Evaluate a fitted conditional transformation model at observed responses.
     TransformationScore(TransformationScoreArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Rank fitted models on their smoothing-corrected AIC and print the
+    /// comparison as JSON.
+    Compare(CompareArgs),
     /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
@@ -241,7 +241,7 @@ pub(crate) struct CrosscoderArgs {
 #[derive(Args, Debug)]
 pub(crate) struct ParameterDecompositionArgs {
     /// Versioned `gam.mpd-request` JSON document: the same bytes
-    /// `gamfit.run_parameter_decomposition` sends.
+    /// `gamfit.sae.run_parameter_decomposition` sends.
     #[arg(long, value_name = "REQUEST.json")]
     pub(crate) request: PathBuf,
 
@@ -297,8 +297,7 @@ pub(crate) struct FitArgs {
             "sigma_time_k",
             "slope_time_k",
             "scale_dimensions",
-            "precompute_conformal",
-            "persistent_warm_start_root"
+            "precompute_conformal"
         ]
     )]
     pub(crate) request: Option<PathBuf>,
@@ -371,11 +370,17 @@ pub(crate) struct FitArgs {
     /// Fixed size/overdispersion parameter for `--family negative-binomial`.
     #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     pub(crate) negative_binomial_theta: Option<f64>,
-    /// Expectile asymmetry `τ ∈ (0, 1)` for `--family expectile` (default 0.5,
+    /// Expectile level(s) `τ ∈ (0, 1)` for `--family expectile` (default 0.5,
     /// the ordinary mean). `τ > 0.5` fits an upper expectile, `τ < 0.5` a lower
-    /// one — the smooth analogue of a quantile.
-    #[arg(long = "expectile-tau", value_parser = parse_probability_open_cli)]
-    pub(crate) expectile_tau: Option<f64>,
+    /// one — the smooth analogue of a quantile. A comma-separated, strictly
+    /// increasing list (`0.1,0.5,0.9`) fits all levels jointly as one
+    /// location-scale model whose curves never cross.
+    #[arg(
+        long = "expectile-tau",
+        value_parser = parse_probability_open_cli,
+        value_delimiter = ','
+    )]
+    pub(crate) expectile_tau: Option<Vec<f64>>,
     /// Survival likelihood mode for Surv(...) formulas; defaults to
     /// transformation for Surv() formulas.
     #[arg(long = "survival-likelihood", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
@@ -446,10 +451,6 @@ pub(crate) struct FitArgs {
     /// its training data, fits in batch, or never asks for conformal intervals.
     #[arg(long = "precompute-conformal", action = ArgAction::Set, default_value_t = true)]
     pub(crate) precompute_conformal: bool,
-    /// Opt in to cross-process warm starts at this exact root. Omit to keep the
-    /// fit disk-silent; no ambient temp/cache path is used.
-    #[arg(long = "persistent-warm-start-root", value_name = "DIR")]
-    pub(crate) persistent_warm_start_root: Option<PathBuf>,
     #[arg(long = "out", required = true)]
     pub(crate) out: Option<PathBuf>,
 }
@@ -525,6 +526,24 @@ pub(crate) struct DiagnoseArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct CompareArgs {
+    #[arg(
+        value_name = "MODEL",
+        required = true,
+        num_args = 1..,
+        help = "Fitted model files produced by `gam fit`, all on the same data and family"
+    )]
+    pub(crate) models: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        num_args = 1..,
+        help = "One label per model, in order (default: the model paths)"
+    )]
+    pub(crate) names: Option<Vec<String>>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct SampleArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     pub(crate) model: PathBuf,
@@ -580,6 +599,12 @@ pub(crate) struct GenerateArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct SummaryArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct ReportArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     pub(crate) model: PathBuf,
@@ -606,8 +631,15 @@ pub(crate) enum FamilyArg {
     PoissonLog,
     NegativeBinomial,
     GammaLog,
+    /// Inverse-Gaussian (`V(μ) = φμ³`) with its canonical `1/μ²` link; the
+    /// log link is selected in the formula with `link(type=log)`.
+    InverseGaussian,
     Tweedie,
     Beta,
+    /// Robust scaled Student-t response on the identity link; its scale and
+    /// degrees of freedom are estimated jointly with the smoothing parameters.
+    #[value(alias = "student_t", alias = "t")]
+    StudentT,
     RoystonParmar,
     Expectile,
     /// Penalized multinomial-logit GAM: a categorical response with K classes
@@ -707,17 +739,13 @@ pub(crate) fn parse_finite_f64_cli(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-pub(crate) fn parse_log_level_cli(raw: &str) -> Result<log::LevelFilter, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "off" => Ok(log::LevelFilter::Off),
-        "error" => Ok(log::LevelFilter::Error),
-        "warn" => Ok(log::LevelFilter::Warn),
-        "info" => Ok(log::LevelFilter::Info),
-        "debug" => Ok(log::LevelFilter::Debug),
-        "trace" => Ok(log::LevelFilter::Trace),
-        other => Err(format!(
-            "unsupported --log-level '{other}'; accepted values: off, error, warn, info, debug, trace"
-        )),
+/// The stderr log filter a `-v` count asks for. Library diagnostics are all
+/// `debug`/`trace` records, so the unflagged level shows none of them.
+pub(crate) fn log_level_for_verbosity(verbose: u8) -> log::LevelFilter {
+    match verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
     }
 }
 

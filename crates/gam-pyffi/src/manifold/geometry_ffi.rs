@@ -4463,37 +4463,13 @@ fn identifiability_check_json(input: &str) -> PyResult<String> {
     gam::identifiability::precondition::identifiability_check_json(input).map_err(py_value_error)
 }
 
-/// Set the solver's stderr log verbosity at runtime from Python.
-///
-/// The extension installs the logger at the quiet `warn` default on import
-/// (#1688), so the per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`,
-/// the `[#1271-diag]` REML logdet dump, etc.) is suppressed — that stream also
-/// carries real per-evaluation compute (eigendecompositions), not just I/O, so
-/// quieting it speeds fits as well as silencing them. Call
-/// `gam._rust.set_log_level("info")` (or `debug`/`trace`) to opt back into the
-/// full trace; `off`/`error`/`warn` quiet it further. The accepted spellings
-/// are the standard `log` level names (case-insensitive); an unrecognized value
-/// raises `ValueError`.
-#[pyfunction]
-fn set_log_level(level: &str) -> PyResult<()> {
-    match gam::solver::progress_log::parse_level_directive(level) {
-        Some(filter) => {
-            gam::solver::progress_log::init_logging_at(filter);
-            Ok(())
-        }
-        None => Err(py_value_error(format!(
-            "unrecognized log level {level:?}; expected one of off|error|warn|info|debug|trace"
-        ))),
-    }
-}
-
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
-    // Install the same stderr logger used by the CLI so long-running Rust
-    // solver phases (including survival marginal-slope joint-Newton cycles)
-    // are visible from Python without requiring a separate shell.
-    gam::solver::progress_log::init_logging();
+    // Engine diagnostics go to Python `logging` (the `gamfit` logger), never
+    // straight to stderr: silent by default, shown by
+    // `logging.getLogger("gamfit").setLevel(logging.DEBUG)`.
+    crate::ffi::python_log::install();
     // Background process monitor: emits a `[process-monitor] elapsed=… rss=…`
     // line every 60s for the life of the process, so silent stretches
     // inside long PIRLS line-searches still surface a process-alive
@@ -4507,7 +4483,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // the classes here makes them addressable as `gam._rust.GamError`,
     // `gam._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
     // re-exports each one under its public `gamfit.*` name so the class
-    // identity caught by `pytest.raises(gamfit.RemlConvergenceError)`
+    // identity caught by `pytest.raises(gamfit.errors.RemlConvergenceError)`
     // and constructed by `RemlConvergenceError::new_err(...)` on the
     // Rust side is exactly the same object.
     module.add("GamError", module.py().get_type::<GamError>())?;
@@ -4749,7 +4725,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyEncodedTable>()?;
     module.add_function(wrap_pyfunction!(sae_observe_atlas_topology, module)?)?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
-    module.add_function(wrap_pyfunction!(fit_multinomial_formula_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(
         predict_multinomial_formula_pyfunc,
         module
@@ -4772,7 +4747,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_column_name, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
-    module.add_function(wrap_pyfunction!(set_log_level, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::ffi::python_log::sync_log_level_from_python,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_defaults, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_ranges, module)?)?;
@@ -4809,12 +4787,14 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compile_model, module)?)?;
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
-    module.add_function(wrap_pyfunction!(inference_notes_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(fit_notes_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(
         required_saved_model_payload_string,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
+    module.add_function(wrap_pyfunction!(is_multinomial_family_name, module)?)?;
     module.add("RESPONSE_GEOMETRY_SCHEMA", RESPONSE_GEOMETRY_SCHEMA)?;
     module.add_function(wrap_pyfunction!(saved_model_predict_class_name, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_class_traits, module)?)?;
@@ -4902,8 +4882,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sphere_basis_jet_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_hessian, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve_basis_locations_1d, module)?)?;
     module.add_function(wrap_pyfunction!(_block_diag, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
@@ -4924,7 +4903,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(stacked_predictive_mean, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
-    module.add_function(wrap_pyfunction!(compare_reml_fits, module)?)?;
+    module.add_function(wrap_pyfunction!(compare_models, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
@@ -5114,9 +5093,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(model_deployment_extensions, module)?)?;
-    module.add_function(wrap_pyfunction!(model_conditional_aic, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
-    module.add_function(wrap_pyfunction!(summary_criterion_row, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
@@ -6915,26 +6892,24 @@ fn fit_dataset_impl(
     formula: String,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-    warm_start: Option<(&[u8], &str)>,
+    warm_start_model: Option<&[u8]>,
 ) -> Result<Vec<u8>, WorkflowError> {
-    // The stderr `[OUTER step]` log stream (installed by `progress_log::
-    // init_logging` at module import) carries solver progress for the Python
-    // bindings; the former always-on TUI session lane has been removed.
+    // Solver progress (`[OUTER step]`, …) reaches Python as `debug` records on
+    // the `gamfit` logger (`ffi::python_log`).
     let mut fit_config = parse_fit_config(config_json)?;
-    // `warm_start_from`: the saved model's certified outer point, staged under the
-    // caller's scratch directory for this one fit.
-    if let Some((model_bytes, scratch_dir)) = warm_start {
-        let prior = load_model_impl(model_bytes)?;
-        fit_config.outer_warm_start = Some(
-            gam::families::fit_orchestration::OuterWarmStart::from_model(
-                prior.payload(),
-                &formula,
-                std::path::PathBuf::from(scratch_dir),
-            )?,
-        );
-    }
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
+    }
+    // `warm_start_from` (gam#3002): the saved model's certified outer point,
+    // resolved against exactly the data and request this fit runs on.
+    if let Some(model_bytes) = warm_start_model {
+        let prior = load_model_impl(model_bytes)?;
+        fit_config.warm_start = Some(gam::families::fit_orchestration::resolve_warm_start(
+            prior.payload(),
+            &formula,
+            &dataset,
+            &fit_config,
+        )?);
     }
     let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
         formula,
@@ -7188,6 +7163,21 @@ fn predict_array_impl(
     // `posterior_mean` (#2785); the remaining classes retain their
     // class-specific point column. `PredictModelClass::point_column` owns
     // that choice, together with `predict_columns` below.
+    if let Some(curve_columns) = model.expectile_curve_columns() {
+        // A joint expectile fit's point is one curve per level: `(n, K)` in
+        // increasing level order, with or without an interval request.
+        let n = columns
+            .get(model_class.point_column())
+            .map_or(0, Vec::len);
+        let mut out = Array2::<f64>::zeros((n, curve_columns.len()));
+        for (k, name) in curve_columns.iter().enumerate() {
+            let curve = columns
+                .get(name)
+                .ok_or_else(|| format!("predict_array: expectile curve `{name}` missing"))?;
+            out.column_mut(k).assign(&ndarray::ArrayView1::from(curve.as_slice()));
+        }
+        return Ok(out);
+    }
     if options.interval.is_none() {
         let point_column = model_class.point_column();
         let mean = columns
@@ -7213,7 +7203,8 @@ fn predict_dataset_with_options_impl(
         columns,
         model_class: prediction_model_class_label(model),
         point_column: model_class.point_column(),
-        point_shape: model_class.point_shape(),
+        point_shape: model.prediction_point_shape(),
+        point_columns: model.expectile_curve_columns(),
         family: family_link_kind(&model_likelihood_spec(model)).to_string(),
         // The plain dataset predict path returns the model-based credible /
         // predictive band (or no interval at all); a conformal provenance tag
@@ -7530,6 +7521,15 @@ fn predict_columns(
     {
         columns.insert("noise_scale".to_string(), noise_scale.to_vec());
     }
+    // A joint expectile fit publishes its level curves `E[μ] + c_k·E[σ]`.
+    if let Some(curves) =
+        gam_predict::joint_expectile_curves(model, &*predictor, &predict_input, &posterior_mean)
+            .map_err(|err| format!("expectile curve prediction failed: {err}"))?
+    {
+        for (name, curve) in curves {
+            columns.insert(name, curve.to_vec());
+        }
+    }
 
     Ok((columns, provenance))
 }
@@ -7580,6 +7580,7 @@ fn predict_encoded_table_conformal_impl(
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
+        point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(
             "split-conformal (distribution-free, finite-sample marginal coverage)".to_string(),
@@ -7614,6 +7615,7 @@ fn predict_encoded_table_full_conformal_impl(
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
+        point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(format!(
             "full-conformal at frozen smoothing parameters (exact set given Sλ; the \

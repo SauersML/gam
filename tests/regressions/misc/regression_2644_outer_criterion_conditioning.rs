@@ -76,7 +76,7 @@ fn subset_rows(ds: &EncodedDataset, rows: &[usize]) -> EncodedDataset {
 
 #[test]
 fn prostate_binomial_logit_fit_certifies_2644() {
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     let ds = load_csvwith_inferred_schema(Path::new(PROSTATE_CSV)).expect("load prostate.csv");
     let n = ds.values.nrows();
     let train_rows: Vec<usize> = (0..n).filter(|i| i % 4 != 0).collect();
@@ -145,7 +145,7 @@ fn build_dataset(n: usize, sigma: f64, seed: u64) -> EncodedDataset {
 
 #[test]
 fn matern_three_axis_k16_fit_certifies_2644() {
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     let ds = build_dataset(N_TRAIN, SIGMA, TRAIN_SEED);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -190,7 +190,7 @@ fn mk_2d(
 
 #[test]
 fn te_with_disparate_scales_certifies() {
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     let ds = mk_2d(300, |a, b| a + b, (0.0, 1.0), (0.0, 1000.0), 0.05, 7);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -299,7 +299,7 @@ fn mk_1d(n: usize, f: impl Fn(f64) -> f64, sigma: f64, seed: u64) -> EncodedData
 
 #[test]
 fn matern_low_n_fit_certifies_2644() {
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     let ds = mk_1d(15, |t| t.powi(2), 0.05, 7);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -390,7 +390,7 @@ fn matern_low_n_fit_certifies_2644() {
 
 #[test]
 fn joint_route_outer_criterion_is_invariant_to_the_origin_of_y() {
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()

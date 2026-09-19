@@ -163,7 +163,7 @@ impl ProcessMonitorState {
             None => " active=<idle>".to_string(),
         };
 
-        log::info!(
+        log::debug!(
             "[process-monitor] pid={pid} elapsed={} {} {} instrumented_threads={}{}",
             format_duration(self.started.elapsed()),
             resource.format(),
@@ -178,7 +178,7 @@ impl ProcessMonitorState {
             .iter()
             .filter(|p| p.deepest_age >= PROCESS_MONITOR_STALL_THRESHOLD)
         {
-            log::warn!(
+            log::debug!(
                 "[process-monitor][STALL] pid={pid} thread={} phase={:?} stuck={}",
                 phase.thread_label,
                 phase.deepest_label,
@@ -188,7 +188,7 @@ impl ProcessMonitorState {
 
         // Compact per-thread phase summary: deepest frame label + age, capped.
         for phase in phases.iter().take(PROCESS_MONITOR_MAX_PHASE_LINES) {
-            log::info!(
+            log::debug!(
                 "[process-monitor] pid={pid} phase thread={} depth={} deepest={:?} in_frame={} updated_ago={}",
                 phase.thread_label,
                 phase.depth,
@@ -198,7 +198,7 @@ impl ProcessMonitorState {
             );
         }
         if phases.len() > PROCESS_MONITOR_MAX_PHASE_LINES {
-            log::info!(
+            log::debug!(
                 "[process-monitor] pid={pid} phase ... and {} more active thread(s) omitted",
                 phases.len() - PROCESS_MONITOR_MAX_PHASE_LINES,
             );
@@ -262,7 +262,7 @@ fn start_process_monitor_thread(state: Arc<ProcessMonitorState>) {
         }
     }) {
         Ok(handle) => drop(handle),
-        Err(err) => log::warn!("failed to start process monitor thread: {err}"),
+        Err(err) => log::debug!("failed to start process monitor thread: {err}"),
     }
 }
 

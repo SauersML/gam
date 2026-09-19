@@ -380,7 +380,7 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
 #[test]
 fn an_absent_warm_start_attaches_no_cache_session() {
     let absent = blockwise_fit_options(&FitConfig::default());
-    assert!(absent.cache_session.is_none() && absent.required_warm_start.is_none());
+    assert!(absent.cache_session.is_none() && absent.warm_start.is_none());
 }
 
 /// The carrier is survival-only: a standard fit has no survival time basis to
@@ -2160,8 +2160,9 @@ fn bernoulli_marginal_slope_prune_drops_penalized_redundant_scalar_term() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
-    let mut notes = Vec::new();
+    let mut notes = crate::fit_orchestration::FitNotes::default();
     let removed = prune_unidentified_linear_terms_for_marginal_slope(
         &mut spec,
         &data,
@@ -4373,5 +4374,28 @@ fn survival_marginal_slope_and_latent_refusals_raise_their_category_2937() {
             "{mode}: {err}"
         );
         assert_eq!(err.variant_name(), "FitFailure::Input", "{mode}: {err}");
+    }
+}
+
+/// PKG-10: one predicate names the multinomial-logit family for the CLI, the
+/// Python `fit_table` entry and the latent fitters, and the scalar resolver
+/// refuses exactly those names.
+#[test]
+fn multinomial_family_names_are_one_predicate() {
+    for name in [
+        "multinomial",
+        "Multinomial_Logit",
+        "categorical",
+        "categorical-logit",
+        "SOFTMAX",
+    ] {
+        assert!(is_multinomial_family_name(name), "{name}");
+        assert!(
+            scalar_family_from_name(name, FamilyNuisanceOverrides::default()).is_err(),
+            "{name}"
+        );
+    }
+    for name in ["binomial", "gaussian", "poisson", "ordinal", "auto"] {
+        assert!(!is_multinomial_family_name(name), "{name}");
     }
 }

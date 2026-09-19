@@ -635,6 +635,24 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
         axis_orders: &[usize],
     ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal>;
 
+    /// [`Self::block_quadrature_marginal_correction`] at orders an admission has
+    /// already certified, returning `certified_axis_errors` (the paired-rule
+    /// errors measured at that admission) as the result's certificate.
+    ///
+    /// Once the admission is latched the orders are the model's and the paired
+    /// error switches nothing (#2748), so an implementation may integrate the fine
+    /// rule alone. The paired lower rules are then never evaluated; on a
+    /// three-axis block they are five times the fine rule's nodes. The default
+    /// measures them again.
+    fn block_quadrature_marginal_correction_at_certified_orders(
+        &self,
+        target: &dyn BlockExcessTarget,
+        axis_orders: &[usize],
+        _certified_axis_errors: &[f64],
+    ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
+        self.block_quadrature_marginal_correction(target, axis_orders)
+    }
+
     /// Publish one step of [`select_block_quadrature_orders`]: the rule it evaluated,
     /// the unresolved axis it raises next, and the node count projected at the
     /// resolving orders. The standard corrector logs it at info, so a search that

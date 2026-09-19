@@ -30,7 +30,7 @@ fn next_gauss(state: &mut u64) -> f64 {
 struct StderrInfoLogger;
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-        m.level() <= log::Level::Info
+        m.level() <= log::Level::Debug
     }
     fn log(&self, r: &log::Record<'_>) {
         if self.enabled(r.metadata()) {
@@ -89,7 +89,7 @@ fn main() {
     // Raise the level only if this call is the one that installed LOGGER;
     // losing the race means someone else owns the level too.
     if log::set_logger(&LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
 
     // Positional CLI args: `repro979_survival_margslope [n] [centers]`. Absent

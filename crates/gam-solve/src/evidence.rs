@@ -2776,285 +2776,235 @@ impl UnionStructure {
     }
 }
 
-/// One fitted model in a REML/LAML evidence comparison.
+/// Criterion `compare_models` ranks on. It is the one ranking estimand; the
+/// REML/LAML `score_table` is a diagnostic beside it.
+pub const COMPARISON_CRITERION: &str = "aic_corrected";
+
+/// One fitted model in a model comparison, read from its fitted summary.
+///
+/// Every field is required: a model that cannot publish its corrected AIC is
+/// refused before it becomes a candidate, with the summary's own reason.
 #[derive(Clone, Debug)]
-pub struct RemlCandidate {
-    pub index: usize,
+pub struct ComparisonCandidate {
     pub name: String,
-    /// Comparable REML/LAML criterion, kept verbatim in the diagnostic score
-    /// table, or `None` for a fit without one (no criterion at all, or no
-    /// null-space metadata for the Tierney-Kadane normalizer). This is not the
-    /// conditional-AIC cost that ranks candidates, so its absence never blocks a
-    /// ranking.
-    pub score: Option<f64>,
-    /// Effective degrees of freedom consumed by the fitted mean. Required
-    /// because conditional AIC has no definition without its complexity term.
-    pub edf: f64,
-    /// Ordinary log-likelihood at the converged mode. Required because a raw
-    /// REML/LAML objective is a different estimand, not a ranking fallback.
-    pub log_lik: f64,
-    /// Response-family tag (e.g. "gaussian", "gamma", "binomial"). Carried so
-    /// `compare_reml_fits` can REFUSE to rank fits whose REML/LAML scores are on
-    /// incomparable base measures (a cross-family comparison is meaningless;
-    /// #1384). `None` for legacy payloads that did not record it — those are not
-    /// guarded (back-compatible), but every current FFI candidate carries it.
-    pub family: Option<String>,
-    /// Number of observations the fit was trained on. Carried so
-    /// `compare_reml_fits` can REFUSE to rank fits made on a different number of
-    /// observations (hence different data): `−2·loglik` and the REML/LAML
-    /// evidence grow with `n`, so a score difference between two fits with
-    /// different `n` is not a Bayes factor — the same incomparability the family
-    /// guard already rejects. `None` for payloads that do not record it (legacy /
-    /// O(n) scan smoothers), which the guard treats as unconstrained.
-    pub n_obs: Option<usize>,
+    /// Response-family label. Candidates of different families are refused:
+    /// their log-likelihoods live on different base measures (#1384).
+    pub family: String,
+    /// Training observations. Candidates fit on different `n` are refused:
+    /// `−2ℓ` grows with `n`, so their AIC gap is not an evidence ratio.
+    pub n_obs: usize,
+    /// Wood–Pya–Säfken smoothing-corrected AIC `−2ℓ + 2·(τ + p_scale)`, the
+    /// ranking criterion.
+    pub aic_corrected: f64,
+    /// AIC conditional on `λ̂`, `−2ℓ + 2·(tr(F) + p_scale)`, reported beside
+    /// the ranking for reference only.
+    pub aic_conditional: f64,
+    /// Corrected EDF `τ = tr(F) + tr(X'WX·C)/s`.
+    pub edf_corrected: f64,
+    /// Conditional EDF `tr(F)`.
+    pub edf_conditional: f64,
+    /// Comparable (Tierney-Kadane normalized) REML/LAML criterion, or `None`
+    /// for a fit without one. Diagnostic only; never ranks.
+    pub reml_score: Option<f64>,
 }
 
-impl RemlCandidate {
-    /// Cost used to RANK candidates and pick the winner.
-    ///
-    /// The REML/LAML marginal-likelihood evidence headline (`score`) does NOT
-    /// reliably Occam-penalise an added pure-noise smooth: on `y ~ s(x)` vs
-    /// `y ~ s(x) + s(z)` with `z ⟂ y`, the augmented model's evidence is
-    /// *lower* (apparently better) by a few nats on essentially every dataset,
-    /// because the Gaussian REML Occam pair `½(log|H| − log|S|₊)` collapses
-    /// toward zero for a finite-`λ̂` null term while that term still spends a
-    /// few effective degrees of freedom fitting noise (issue #1362).
-    ///
-    /// The conditional AIC `−2ℓ + 2·edf` prices exactly those spent degrees of
-    /// freedom and discriminates correctly: it penalises the noise smooth
-    /// (Δ ≈ +15 nats) yet rewards a genuinely relevant smooth (Δ ≈ −650),
-    /// preserving power. Ranking therefore requires both quantities and refuses
-    /// an invalid candidate rather than switching to the incomparable raw
-    /// evidence headline. The reported `score_table` still carries that raw
-    /// diagnostic unchanged.
-    pub(crate) fn ranking_score(&self) -> Result<f64, String> {
-        if let Some(score) = self.score
-            && !score.is_finite()
-        {
-            return Err(format!(
-                "compare_models: candidate '{}' has non-finite raw REML/LAML score {score}",
-                self.name
-            ));
-        }
-        if !(self.edf.is_finite() && self.edf >= 0.0) {
-            return Err(format!(
-                "compare_models: candidate '{}' requires finite non-negative edf_total, got {}",
-                self.name, self.edf
-            ));
-        }
-        if !self.log_lik.is_finite() {
-            return Err(format!(
-                "compare_models: candidate '{}' requires finite log_likelihood; \
-                 raw REML/LAML is not a substitute ranking estimand",
-                self.name
-            ));
-        }
-        let score = -2.0 * self.log_lik + 2.0 * self.edf;
-        if !score.is_finite() {
-            return Err(format!(
-                "compare_models: candidate '{}' conditional AIC is outside f64 range",
-                self.name
-            ));
-        }
-        Ok(score)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RemlComparison {
+/// Result of [`compare_models`], serialized verbatim by every frontend.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelComparison {
+    /// Always [`COMPARISON_CRITERION`].
+    pub criterion: &'static str,
+    /// Rows ordered by ascending `aic_corrected`; the first row is the winner.
     pub ranking: Vec<RankedRow>,
     pub winner: String,
     pub evidence_summary: String,
+    /// REML/LAML criterion per model, in ranking order. See [`ScoreRow`] for
+    /// when its gaps are meaningful.
     pub score_table: Vec<ScoreRow>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RankedRow {
     pub name: String,
-    pub score: Option<f64>,
-    /// Cost gap from the winning model on the SAME scale used to order the
-    /// ranking (`ranking_score`, the Occam-penalised conditional AIC,
-    /// issue #1362). The winner is `argmin ranking_score`, so this
-    /// is `>= 0` for every row by construction — it never contradicts the
-    /// declared winner (issue #1465). `score` still carries the raw REML/LAML
-    /// diagnostic on its own explicitly labelled scale.
-    pub delta: f64,
-    /// Akaike evidence ratio of the winner over this row on the ranking scale.
-    /// `delta` is a conditional-AIC gap (a −2·log / deviance-scale quantity), so
-    /// the evidence ratio is `exp(½·delta) >= 1` (Burnham & Anderson), NOT
-    /// `exp(delta)` — the latter squares the intended ratio (issues #1465, #2124).
-    ///
-    /// This is NOT a Bayes factor and was renamed away from that word: a Bayes
-    /// factor is a ratio of prior-integrated marginal likelihoods, whereas this
-    /// is the relative likelihood `exp(−ΔAIC/2)`, which integrates over no
-    /// prior and must not be read against Jeffreys / Kass–Raftery thresholds.
-    /// The raw REML/LAML `score_table` keeps the Laplace-approximate
-    /// marginal-likelihood diagnostic on its own labelled scale.
-    pub evidence_ratio: f64,
-    pub edf: f64,
+    pub aic_corrected: f64,
+    /// `aic_corrected − min aic_corrected`, `>= 0` by construction, so it
+    /// never contradicts the declared winner (#1465).
+    pub delta_aic: f64,
+    /// Akaike evidence ratio of the winner over this row, `exp(½·delta_aic)`
+    /// (Burnham & Anderson; #2124). A relative likelihood, not a Bayes factor:
+    /// it integrates over no prior. `None` when it exceeds `f64` range; the
+    /// gap itself is `delta_aic`.
+    pub evidence_ratio: Option<f64>,
+    pub aic_conditional: f64,
+    pub edf_corrected: f64,
+    pub edf_conditional: f64,
 }
 
-#[derive(Clone, Debug)]
-/// One row of the diagnostic REML/LAML score table. The criterion and its
-/// factors are `None` for a candidate without a comparable criterion, and the
-/// factors are referenced to the minimum over the candidates that have one.
+/// One row of the diagnostic REML/LAML score table.
+///
+/// A REML/LAML gap between two fits is a log restricted-evidence ratio only
+/// when the fits share the family, the data, and the unpenalized fixed-effect
+/// space (identical parametric terms and penalty null spaces): REML integrates
+/// the penalized coefficients but conditions on that space, so fits with
+/// different fixed effects have restricted likelihoods on different
+/// error contrasts. Nested smooths added to a common parametric part qualify;
+/// a parametric term added or removed does not. The table is reported for that
+/// case and never decides the winner.
+#[derive(Clone, Debug, Serialize)]
 pub struct ScoreRow {
     pub name: String,
     pub reml_score: Option<f64>,
+    /// `reml_score − min reml_score` over the candidates that have one.
     pub delta_reml: Option<f64>,
-    /// `exp(delta_reml)`, the exp of this row's raw criterion gap to the
-    /// minimum. It is a restricted-evidence ratio only at plug-in λ, with
-    /// normalized evidence over a fixed-effect space the candidates share, and
-    /// never a prior-integrated Bayes factor.
+    /// `exp(delta_reml)`: the restricted-evidence ratio of the best-scoring fit
+    /// over this one, at plug-in `λ̂`, under the shared fixed-effect condition
+    /// above. `None` without a `delta_reml` or when the ratio exceeds `f64`
+    /// range.
     pub reml_criterion_ratio_best_over_model: Option<f64>,
     pub effective_dof: f64,
 }
 
-/// Gap `cost_b − cost_a` between two minimised criterion costs (lower is
-/// better), positive when `a` is better. The raw REML/LAML score table and the
-/// conditional-AIC ranking both use it. It is a Bayes factor on neither, and an
-/// AIC gap must be halved before it is a log evidence ratio.
-#[inline]
-pub fn criterion_gap(cost_a: f64, cost_b: f64) -> f64 {
-    cost_b - cost_a
+/// Refuse candidates that no information criterion can compare: different
+/// response families or different observation counts.
+fn check_comparable(candidates: &[&ComparisonCandidate]) -> Result<(), String> {
+    let Some(first) = candidates.first() else {
+        return Err("compare_models requires at least one fit".to_string());
+    };
+    for cand in candidates {
+        if cand.family != first.family {
+            return Err(format!(
+                "compare_models: cannot compare fits of different response families \
+                 ('{}' vs '{}'); their log-likelihoods are on incomparable base measures. \
+                 Compare models fit to the same response under the same family.",
+                first.family, cand.family
+            ));
+        }
+        if cand.n_obs != first.n_obs {
+            return Err(format!(
+                "compare_models: cannot compare fits made on a different number of \
+                 observations (n={} vs n={}); AIC scales with the sample size, so their \
+                 difference is not an evidence ratio. Compare models fit to the same \
+                 response on the same data.",
+                first.n_obs, cand.n_obs
+            ));
+        }
+        for (label, value) in [
+            ("aic_corrected", cand.aic_corrected),
+            ("aic_conditional", cand.aic_conditional),
+            ("edf_corrected", cand.edf_corrected),
+            ("edf_conditional", cand.edf_conditional),
+        ] {
+            if !value.is_finite() {
+                return Err(format!(
+                    "compare_models: candidate '{}' has non-finite {label} {value}",
+                    cand.name
+                ));
+            }
+        }
+        if let Some(score) = cand.reml_score
+            && !score.is_finite()
+        {
+            return Err(format!(
+                "compare_models: candidate '{}' has non-finite REML/LAML score {score}",
+                cand.name
+            ));
+        }
+    }
+    Ok(())
 }
 
-/// Compare fitted models by the single evidence ordering contract used by
-/// topology ranking and seed screening: lower finite cost wins, with stable
-/// original-order tie handling.
-pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlComparison, String> {
-    if candidates.is_empty() {
-        return Err("compare_models requires at least one fit".to_string());
-    }
-    // Fail-loud comparability guard (#1384): REML/LAML evidence scores are only
-    // comparable across fits of the SAME response family — a Gaussian score and
-    // a Gamma score live on different log-density base measures, so their
-    // difference is not a Bayes factor. Ranking them anyway returns a confident
-    // but meaningless winner. Refuse when two candidates carry DIFFERENT family
-    // tags. Candidates with no family tag (`None`, legacy payloads) are not
-    // constrained, so this never spuriously rejects an older saved model.
-    {
-        let mut seen_family: Option<&str> = None;
-        for cand in &candidates {
-            if let Some(fam) = cand.family.as_deref() {
-                match seen_family {
-                    None => seen_family = Some(fam),
-                    Some(prev) if prev != fam => {
-                        return Err(format!(
-                            "compare_models: cannot compare fits of different response families                              ('{prev}' vs '{fam}'); their REML/LAML evidence scores are on                              incomparable base measures. Compare models fit to the same response                              under the same family."
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-    }
-    // Fail-loud comparability guard (#1384 sibling): AIC / REML-LAML evidence are
-    // only comparable across fits of the SAME response on the SAME observations.
-    // `−2·loglik` (and the marginal-likelihood headline) grow with the number of
-    // observations `n`, so two fits with different `n` live on incomparable
-    // scales and their score gap is not a Bayes factor — comparing an n=500 and
-    // an n=100 fit of the same DGP otherwise declares the n=100 model the winner
-    // purely because fewer points give a less-negative total log-likelihood.
-    // Refuse when two candidates carry DIFFERENT observation counts. Candidates
-    // with no count (`None`, legacy / O(n) scan payloads) are unconstrained, so
-    // this never spuriously rejects a fit that simply did not record `n`.
-    {
-        let mut seen_n: Option<usize> = None;
-        for cand in &candidates {
-            if let Some(n) = cand.n_obs {
-                match seen_n {
-                    None => seen_n = Some(n),
-                    Some(prev) if prev != n => {
-                        return Err(format!(
-                            "compare_models: cannot compare fits made on a different number of \
-                             observations (n={prev} vs n={n}); AIC / REML-LAML evidence scales \
-                             with the sample size, so their score difference is not a Bayes \
-                             factor. Compare models fit to the same response on the same data."
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-    }
+/// `exp(log_ratio)` when it is a finite `f64`. A ratio past `f64::MAX` is
+/// reported as absent rather than `inf`, which JSON cannot carry; the finite
+/// log-scale gap beside it remains the exact comparison.
+fn representable_exp(log_ratio: f64) -> Option<f64> {
+    Some(log_ratio.exp()).filter(|ratio| ratio.is_finite())
+}
+
+/// Log Akaike evidence ratio of `a` over `b`, `½·(AIC_c(b) − AIC_c(a))`, on
+/// the same corrected AIC and under the same comparability guards as
+/// [`compare_models`].
+pub fn log_evidence_ratio(
+    a: &ComparisonCandidate,
+    b: &ComparisonCandidate,
+) -> Result<f64, String> {
+    check_comparable(&[a, b])?;
+    Ok(0.5 * (b.aic_corrected - a.aic_corrected))
+}
+
+/// Rank fitted models on their smoothing-corrected AIC: lower wins, with
+/// stable original-order tie handling.
+///
+/// The corrected AIC (Wood, Pya & Säfken 2016) prices the effective degrees
+/// of freedom a smooth spends *including* those spent by estimating its
+/// smoothing parameter. The conditional AIC `−2ℓ + 2·tr(F)` treats `λ̂` as
+/// known and so under-penalises a null smooth whose `λ̂` is finite, and the
+/// REML/LAML score collapses its Occam term for the same smooth (#1362).
+pub fn compare_models(
+    candidates: Vec<ComparisonCandidate>,
+) -> Result<ModelComparison, String> {
+    check_comparable(&candidates.iter().collect::<Vec<_>>())?;
     let priority_candidates = candidates
         .into_iter()
         .enumerate()
         .map(|(idx, row)| {
-            let ranking = row.ranking_score()?;
-            Ok(PriorityCandidate::new(row, idx, ranking, 0))
+            let cost = row.aic_corrected;
+            PriorityCandidate::new(row, idx, cost, 0)
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    candidates = rank_priority_candidates(priority_candidates)
+        .collect::<Vec<_>>();
+    let candidates: Vec<ComparisonCandidate> = rank_priority_candidates(priority_candidates)
         .into_iter()
         .map(|row| row.item)
         .collect();
 
     let winner = candidates[0].name.clone();
-    // The ranking `delta` / `evidence_ratio` must be measured on the SAME scale
-    // that orders the table — the `ranking_score` (Occam-penalised conditional
-    // AIC, issue #1362). `candidates[0]` is the winner =
-    // `argmin ranking_score`, so its ranking score IS the minimum; every row's
-    // ranking-scale gap is then `>= 0` and its evidence ratio `>= 1`, never
-    // contradicting the declared winner (issue #1465). Computing these against
-    // the AIC winner's *raw REML* — which is not the minimum raw REML once AIC
-    // and REML disagree — produced negative deltas and evidence ratios < 1 for
-    // non-winner rows.
-    let best_ranking_score = candidates[0].ranking_score()?;
-    // The raw-REML `score_table` stays on its explicitly labelled diagnostic
-    // scale, but is referenced to the genuine minimum raw REML so its factors are
-    // coherent (`>= 1`), rather than to whichever row happens to sit at index 0.
-    let best_raw_score = candidates.iter().filter_map(|c| c.score).reduce(f64::min);
-    let mut ranking = Vec::with_capacity(candidates.len());
-    let mut score_table = Vec::with_capacity(candidates.len());
-    for row in &candidates {
-        let delta = criterion_gap(best_ranking_score, row.ranking_score()?);
-        // `ranking_score` is the conditional AIC (`−2·loglik + 2·edf`), a −2·log /
-        // deviance-scale cost, so `delta` is a full ΔAIC gap. The Akaike evidence
-        // ratio for an AIC gap Δ is `exp(−½Δ)` (Burnham & Anderson evidence ratio),
-        // hence the winner-over-row evidence ratio is `exp(½·delta)`. Reporting
-        // `delta.exp()` squared the intended ratio (issue #2124). `delta` itself is
-        // left on the AIC scale on purpose — only its exp() conversion is halved.
-        let evidence_ratio = (0.5 * delta).exp();
-        let delta_reml = best_raw_score
-            .zip(row.score)
-            .map(|(best, score)| criterion_gap(best, score));
-        ranking.push(RankedRow {
-            name: row.name.clone(),
-            score: row.score,
-            delta,
-            evidence_ratio,
-            edf: row.edf,
-        });
-        score_table.push(ScoreRow {
-            name: row.name.clone(),
-            reml_score: row.score,
-            delta_reml,
-            reml_criterion_ratio_best_over_model: delta_reml.map(f64::exp),
-            effective_dof: row.edf,
-        });
-    }
-    // The winner is decided by `ranking_score` (the Occam-penalised conditional
-    // AIC, issue #1362), which can disagree in sign with the raw
-    // REML/LAML criterion gap for a noise-augmented model. Summarise the actual
-    // decision margin so the headline never contradicts the chosen winner.
-    let evidence_summary = if let Some(runner_up) = candidates.get(1) {
-        let margin = runner_up.ranking_score()? - candidates[0].ranking_score()?;
-        // `margin` is a conditional-AIC gap (−2·log scale), so the Akaike evidence
-        // ratio is `exp(−½·margin)`; `format_exp_ratio` formats `exp()` of its
-        // argument, so pass the halved margin to headline `exp(½·margin)` rather
-        // than the squared `exp(margin)` (issue #2124).
-        format!(
-            "{} wins by evidence ratio {} over {}",
-            winner,
-            format_exp_ratio(0.5 * margin),
+    let best_aic = candidates[0].aic_corrected;
+    // Referenced to the genuine minimum REML score so its factors are `>= 1`,
+    // not to whichever row the AIC ordering puts first.
+    let best_reml = candidates
+        .iter()
+        .filter_map(|c| c.reml_score)
+        .reduce(f64::min);
+    let ranking = candidates
+        .iter()
+        .map(|row| {
+            let delta_aic = row.aic_corrected - best_aic;
+            RankedRow {
+                name: row.name.clone(),
+                aic_corrected: row.aic_corrected,
+                delta_aic,
+                evidence_ratio: representable_exp(0.5 * delta_aic),
+                aic_conditional: row.aic_conditional,
+                edf_corrected: row.edf_corrected,
+                edf_conditional: row.edf_conditional,
+            }
+        })
+        .collect();
+    let score_table = candidates
+        .iter()
+        .map(|row| {
+            let delta_reml = best_reml
+                .zip(row.reml_score)
+                .map(|(best, score)| score - best);
+            ScoreRow {
+                name: row.name.clone(),
+                reml_score: row.reml_score,
+                delta_reml,
+                reml_criterion_ratio_best_over_model: delta_reml.and_then(representable_exp),
+                effective_dof: row.edf_conditional,
+            }
+        })
+        .collect();
+    let evidence_summary = match candidates.get(1) {
+        // The AIC gap is on the −2·log scale; `format_exp_ratio` exponentiates
+        // its argument, so pass the halved gap (#2124).
+        Some(runner_up) => format!(
+            "{winner} wins by evidence ratio {} over {} (aic_corrected)",
+            format_exp_ratio(0.5 * (runner_up.aic_corrected - best_aic)),
             runner_up.name
-        )
-    } else {
-        format!("{winner} (single fit; no comparison)")
+        ),
+        None => format!("{winner} (single fit; no comparison)"),
     };
-    Ok(RemlComparison {
+    Ok(ModelComparison {
+        criterion: COMPARISON_CRITERION,
         ranking,
         winner,
         evidence_summary,
@@ -3680,26 +3630,27 @@ mod tests {
     }
 
     #[test]
-    fn compare_reml_fits_delta_and_evidence_ratio_never_contradict_winner_gh1465() {
-        // Regression for #1465: the ranking `delta` / `evidence_ratio` must be
-        // measured on the SAME scale that orders the table (the Occam-penalised
-        // conditional AIC `ranking_score`), so every row's delta is >= 0 and its
+    fn compare_models_delta_and_evidence_ratio_never_contradict_winner_gh1465() {
+        // Regression for #1465: the ranking `delta_aic` / `evidence_ratio` must be
+        // measured on the SAME scale that orders the table (`aic_corrected`), so
+        // every row's delta is >= 0 and its
         // evidence ratio >= 1 — the table must never claim a non-winner beats the
         // declared winner. The scenario is exactly the case the comparison
         // exists to handle: AIC and raw REML DISAGREE. `m1` is the AIC winner
         // but does NOT carry the minimum raw REML (`m2` does) — the noise
         // extra-term case from the issue.
         //
-        // `ranking_score` = -2*log_lik + 2*edf; with log_lik = 0 it is `2*edf`,
-        // so the AIC order is m1 < m2 < m3 while the raw-REML order has m2 lowest.
-        let cand = |name: &str, score: f64, edf: f64| RemlCandidate {
-            index: 0,
+        // `aic_corrected` is set to 2*edf, so the AIC order is m1 < m2 < m3
+        // while the REML order has m2 lowest.
+        let cand = |name: &str, score: f64, edf: f64| ComparisonCandidate {
             name: name.to_string(),
-            score: Some(score),
-            edf,
-            log_lik: 0.0,
-            family: Some("gaussian".to_string()),
-            n_obs: Some(100),
+            family: "gaussian".to_string(),
+            n_obs: 100,
+            aic_corrected: 2.0 * edf,
+            aic_conditional: 2.0 * edf,
+            edf_corrected: edf,
+            edf_conditional: edf,
+            reml_score: Some(score),
         };
         // raw REML : m2 (41.605) < m1 (53.748) < m3 (120.011)
         // AIC=2*edf: m1 (100)    < m2 (102)    < m3 (130)
@@ -3708,28 +3659,28 @@ mod tests {
             cand("m2", 41.605, 51.0),
             cand("m3", 120.011, 65.0),
         ];
-        let cmp = compare_reml_fits(candidates).expect("comparison");
+        let cmp = compare_models(candidates).expect("comparison");
 
         assert_eq!(cmp.winner, "m1", "AIC winner");
         // No ranking row may contradict the declared winner.
         for row in &cmp.ranking {
             assert!(
-                row.delta >= 0.0,
+                row.delta_aic >= 0.0,
                 "ranking delta for {} must be >= 0, got {}",
                 row.name,
-                row.delta
+                row.delta_aic
             );
             assert!(
-                row.evidence_ratio >= 1.0 - 1e-12,
-                "ranking evidence_ratio for {} must be >= 1, got {}",
+                row.evidence_ratio.is_some_and(|ratio| ratio >= 1.0 - 1e-12),
+                "ranking evidence_ratio for {} must be >= 1, got {:?}",
                 row.name,
                 row.evidence_ratio
             );
         }
         let winner_row = cmp.ranking.iter().find(|r| r.name == "m1").unwrap();
-        assert!(winner_row.delta.abs() < 1e-12, "winner delta == 0");
+        assert!(winner_row.delta_aic.abs() < 1e-12, "winner delta == 0");
         assert!(
-            (winner_row.evidence_ratio - 1.0).abs() < 1e-9,
+            winner_row.evidence_ratio == Some(1.0),
             "winner evidence_ratio == 1"
         );
 
@@ -4602,239 +4553,149 @@ mod tests {
         assert!(select_hybrid_split(&slots).is_err());
     }
 
-    // ── #1362: compare_models must Occam-penalise a pure-noise smooth ────────
+    // ── compare_models ranks on the smoothing-corrected AIC (#1362, slop G2) ──
     //
-    // These tests pin the ranking contract directly on `compare_reml_fits` with
-    // controlled (score, edf, log_lik) inputs taken from the actual #1362
-    // reproduction (Rust `reml_score` of `y ~ s(x)` vs `y ~ s(x) + s(z)` at
-    // n=700). They do not need a fitted GAM or a Python wheel.
+    // These tests pin the ranking contract on `compare_models` with controlled
+    // inputs. They need no fitted GAM or Python wheel.
 
-    fn cand(name: &str, score: f64, edf: f64, log_lik: f64) -> RemlCandidate {
-        RemlCandidate {
-            index: 0,
+    fn cand(name: &str, reml: f64, aic_conditional: f64, aic_corrected: f64) -> ComparisonCandidate {
+        ComparisonCandidate {
             name: name.to_string(),
-            score: Some(score),
-            edf,
-            log_lik,
-            family: None,
-            n_obs: None,
+            family: "Gaussian Identity".to_string(),
+            n_obs: 200,
+            aic_corrected,
+            aic_conditional,
+            edf_corrected: 6.0,
+            edf_conditional: 5.0,
+            reml_score: Some(reml),
         }
     }
 
     #[test]
-    fn ranking_score_is_conditional_aic_when_loglik_and_edf_present() {
-        // AIC = -2ℓ + 2·edf.
-        let c = cand("m", /*score (ignored)*/ 999.0, 6.748, -32.0866);
-        let expected = -2.0 * -32.0866 + 2.0 * 6.748;
-        assert!((c.ranking_score().expect("finite AIC") - expected).abs() < 1e-9);
+    fn compare_models_ranks_on_corrected_not_conditional_aic() {
+        // The noise-augmented `big` has the lower REML score AND the lower
+        // conditional AIC — the two criteria that treat λ̂ as known. Its
+        // corrected AIC, which prices the EDF its smoothing-parameter
+        // uncertainty spends, is higher, so the winner must be `small`.
+        let small = cand("small", 180.5, 100.0, 101.0);
+        let big = cand("big", 177.4, 99.0, 103.0);
+        let cmp = compare_models(vec![big, small]).expect("compare");
+        assert_eq!(cmp.criterion, "aic_corrected");
+        assert_eq!(cmp.winner, "small");
+        assert_eq!(cmp.ranking[0].name, "small");
+        assert!((cmp.ranking[1].delta_aic - 2.0).abs() < 1e-12);
+        assert!((cmp.ranking[1].aic_conditional - 99.0).abs() < 1e-12);
+        // The REML table keeps its own ordering on its own labelled scale.
+        let big_row = cmp.score_table.iter().find(|r| r.name == "big").unwrap();
+        assert_eq!(big_row.delta_reml, Some(0.0));
     }
 
     #[test]
-    fn ranking_score_refuses_non_finite_log_likelihood_instead_of_using_reml() {
-        let c = RemlCandidate {
-            index: 0,
-            name: "m".to_string(),
-            score: Some(151.28),
-            edf: 6.0,
-            log_lik: f64::NAN,
-            family: None,
-            n_obs: None,
-        };
-        let error = c
-            .ranking_score()
-            .expect_err("raw REML must not replace a missing likelihood");
-        assert!(error.contains("requires finite log_likelihood"));
-        assert!(error.contains("not a substitute ranking estimand"));
+    fn ranking_evidence_ratio_is_akaike_evidence_ratio_not_its_square() {
+        // #2124: for an AIC gap Δ the winner-over-loser evidence ratio is
+        // `exp(½Δ)`, not `exp(Δ)`. The REML table stays `exp(Δreml)`.
+        let delta_aic = 27.68_f64;
+        let winner = cand("winner", 100.0, 0.0, 0.0);
+        let loser = cand("loser", 110.0, delta_aic, delta_aic);
+        let cmp = compare_models(vec![winner, loser]).expect("compare");
+        assert_eq!(cmp.winner, "winner");
+        let loser_row = cmp.ranking.iter().find(|r| r.name == "loser").unwrap();
+        assert!((loser_row.delta_aic - delta_aic).abs() < 1e-9);
+        let expected = (0.5 * delta_aic).exp();
+        assert!(loser_row
+            .evidence_ratio
+            .is_some_and(|ratio| (ratio / expected - 1.0).abs() < 1e-9));
+        let loser_score_row = cmp.score_table.iter().find(|r| r.name == "loser").unwrap();
+        assert!(
+            loser_score_row
+                .reml_criterion_ratio_best_over_model
+                .is_some_and(|factor| (factor / 10.0_f64.exp() - 1.0).abs() < 1e-9)
+        );
+        assert!(cmp.evidence_summary.contains("winner wins by evidence ratio 1e+6.0 over loser"));
+    }
+
+    #[test]
+    fn log_evidence_ratio_agrees_with_compare_models_and_is_antisymmetric() {
+        let a = cand("a", 100.0, 90.0, 92.0);
+        let b = cand("b", 101.0, 91.0, 97.0);
+        let cmp = compare_models(vec![a.clone(), b.clone()]).expect("compare");
+        let b_row = cmp.ranking.iter().find(|r| r.name == "b").unwrap();
+        let log_ratio = log_evidence_ratio(&a, &b).expect("comparable");
+        assert!((log_ratio - 0.5 * b_row.delta_aic).abs() < 1e-12);
+        assert!((log_evidence_ratio(&b, &a).unwrap() + log_ratio).abs() < 1e-12);
+        assert_eq!(log_evidence_ratio(&a, &a).unwrap(), 0.0);
     }
 
     #[test]
     fn compare_models_rejects_pure_noise_smooth_despite_lower_evidence() {
-        // Seed-3000 numbers from the #1362 Rust reproduction:
-        //   small (y ~ s(x)):      reml=180.526, edf=6.748,  loglik=-32.0866
-        //   big   (y ~ s(x)+s(z)): reml=177.404, edf=14.250, loglik=-32.1212
-        // The big (noise-augmented) model has the LOWER (apparently better) raw
-        // REML evidence, yet it spends ~7.5 extra EDF fitting noise without
-        // improving the likelihood. The winner must be the SMALL model.
-        let small = cand("small", 180.526, 6.748, -32.0866);
-        let big = cand("big", 177.404, 14.250, -32.1212);
-
-        // Sanity: raw evidence (the broken headline) prefers big.
-        assert!(big.score < small.score);
-
-        let cmp = compare_reml_fits(vec![small, big]).expect("compare");
-        assert_eq!(
-            cmp.winner, "small",
-            "compare_models must Occam-penalise the pure-noise smooth and pick the smaller model"
-        );
-        // The score table still reports the raw evidence headline unchanged, so
-        // Model.evidence / evidence_ratio_vs stay consistent with the table.
-        let small_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "small")
-            .expect("small row");
-        let big_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "big")
-            .expect("big row");
-        assert!(small_row
-            .reml_score
-            .is_some_and(|score| (score - 180.526).abs() < 1e-9));
+        // Seed-3000 numbers from the #1362 reproduction. The noise-augmented
+        // `big` has the lower raw REML score but spends ~7.5 extra EDF without
+        // improving the likelihood; on the Gaussian scale-counted AICs
+        // (`−2ℓ + 2(edf + 1)`) the small model wins.
+        let small = cand("small", 180.526, 79.669, 81.2);
+        let big = cand("big", 177.404, 94.742, 97.9);
+        assert!(big.reml_score < small.reml_score);
+        let cmp = compare_models(vec![small, big]).expect("compare");
+        assert_eq!(cmp.winner, "small");
+        let big_row = cmp.score_table.iter().find(|r| r.name == "big").unwrap();
         assert!(big_row
             .reml_score
             .is_some_and(|score| (score - 177.404).abs() < 1e-9));
     }
 
     #[test]
-    fn ranking_evidence_ratio_is_akaike_evidence_ratio_not_its_square() {
-        // Issue #2124: `ranking_score` is the conditional AIC (`−2ℓ + 2·edf`), a
-        // −2·log / deviance-scale cost. For an AIC gap Δ the Akaike evidence ratio
-        // (Burnham & Anderson) is `exp(−½Δ)`, so the winner-over-loser
-        // `evidence_ratio` must be `exp(½Δ)` — NOT `exp(Δ)`, which squares it.
-        //
-        // Winner: AIC 0 (loglik 0, edf 0). Loser: AIC = 27.68 (loglik −13.84,
-        // edf 0), matching the ΔAIC in the issue repro. Raw REML scores are set
-        // distinct (100 vs 110) to lock the scoping: the raw score_table path
-        // must stay `exp(Δreml)` with NO halving.
-        let delta_aic = 27.68_f64;
-        let winner = cand("winner", 100.0, 0.0, 0.0);
-        let loser = cand("loser", 110.0, 0.0, -delta_aic / 2.0);
-
-        let cmp = compare_reml_fits(vec![winner, loser]).expect("compare");
-        assert_eq!(cmp.winner, "winner");
-
-        let loser_row = cmp
-            .ranking
-            .iter()
-            .find(|r| r.name == "loser")
-            .expect("loser ranking row");
-
-        // The AIC gap FIELD stays on the AIC scale, unchanged (issue #2124).
-        assert!((loser_row.delta - delta_aic).abs() < 1e-9);
-
-        // The evidence ratio is the Akaike ratio exp(½·ΔAIC) = exp(13.84)
-        // ≈ 1.03e6 — NOT the squared exp(27.68) ≈ 1.05e12 the bug reported.
-        let expected = (0.5 * delta_aic).exp();
-        assert!(
-            (loser_row.evidence_ratio / expected - 1.0).abs() < 1e-9,
-            "ranking evidence_ratio {} should be exp(½ΔAIC)={}, not exp(ΔAIC)={}",
-            loser_row.evidence_ratio,
-            expected,
-            delta_aic.exp()
-        );
-        // Explicit anti-regression: it must not be the squared ratio.
-        assert!(loser_row.evidence_ratio < delta_aic.exp() * 0.5);
-
-        // Scoping lock (issue #2124): the RAW-REML score_table path is untouched —
-        // its best-over-model Bayes factor is `exp(Δreml)` with NO halving. Raw
-        // scores 100 (winner) vs 110 (loser) give Δreml = 10, so the loser's raw
-        // Bayes factor is exp(10), not exp(5).
-        let loser_score_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "loser")
-            .expect("loser score row");
-        let expected_reml_ratio = 10.0_f64.exp();
-        assert!(
-            loser_score_row
-                .reml_criterion_ratio_best_over_model
-                .is_some_and(|factor| (factor / expected_reml_ratio - 1.0).abs() < 1e-9),
-            "raw-REML reml_criterion_ratio_best_over_model must stay exp(Δreml)=exp(10), got {:?}",
-            loser_score_row.reml_criterion_ratio_best_over_model
-        );
-    }
-
-    #[test]
     fn compare_models_keeps_power_for_a_relevant_smooth() {
-        // Seed-3000 relevant-z numbers from the same reproduction:
-        //   small: reml=1025.067, edf≈6.75,  loglik≈-368.99 (aic≈751.5)
-        //   big:   reml=199.509,  edf≈14.25, loglik≈-33.16  (aic≈94.8)
-        // A genuinely relevant smooth lowers BOTH the evidence and the AIC, so
-        // the bigger model must still win — a fix cannot just always pick small.
-        let small = cand("small", 1025.067, 6.75, -368.985);
-        let big = cand("big", 199.509, 14.25, -33.165);
-        let cmp = compare_reml_fits(vec![small, big]).expect("compare");
-        assert_eq!(
-            cmp.winner, "big",
-            "compare_models must retain power: the relevant smooth's model must win"
-        );
+        // Seed-3000 relevant-z numbers: a genuinely relevant smooth lowers the
+        // REML score and the AICs, so the bigger model must still win.
+        let small = cand("small", 1025.067, 753.47, 755.0);
+        let big = cand("big", 199.509, 96.83, 99.9);
+        let cmp = compare_models(vec![small, big]).expect("compare");
+        assert_eq!(cmp.winner, "big");
     }
 
     #[test]
     fn compare_models_rejects_mismatched_observation_counts() {
-        // Two same-family fits on different-sized data are not comparable by
-        // AIC / evidence; the comparison must fail loud, mirroring the family
-        // guard, rather than declare a sample-size-driven winner.
-        let with_n = |name: &str, n: usize| RemlCandidate {
-            index: 0,
-            name: name.to_string(),
-            score: Some(100.0),
-            edf: 5.0,
-            log_lik: -40.0,
-            family: Some("gaussian".to_string()),
-            n_obs: Some(n),
-        };
-        let err = compare_reml_fits(vec![with_n("big", 500), with_n("small", 100)])
+        let mut other_n = cand("big_n", 100.0, 50.0, 51.0);
+        other_n.n_obs = 500;
+        let err = compare_models(vec![cand("a", 100.0, 50.0, 51.0), other_n.clone()])
             .expect_err("cross-n comparison must be rejected");
-        assert!(
-            err.contains("number of observations") && err.contains("500") && err.contains("100"),
-            "n-guard error should name the incomparable counts, got: {err}"
-        );
+        assert!(err.contains("number of observations") && err.contains("500"));
+        assert!(log_evidence_ratio(&cand("a", 1.0, 1.0, 1.0), &other_n).is_err());
+    }
 
-        // Same n is comparable.
-        compare_reml_fits(vec![with_n("a", 250), with_n("b", 250)])
-            .expect("same-n comparison must succeed");
+    #[test]
+    fn compare_models_rejects_mismatched_family() {
+        let mut other_family = cand("pois", 100.0, 50.0, 51.0);
+        other_family.family = "Poisson Log".to_string();
+        let err = compare_models(vec![cand("a", 100.0, 50.0, 51.0), other_family])
+            .expect_err("cross-family comparison must be rejected");
+        assert!(err.contains("different response families"));
+    }
 
-        // A missing count (`None`) is unconstrained: it must not block a
-        // comparison against a fit that does carry one (legacy / scan payloads).
-        let without_n = RemlCandidate {
-            index: 0,
-            name: "legacy".to_string(),
-            score: Some(90.0),
-            edf: 4.0,
-            log_lik: -35.0,
-            family: Some("gaussian".to_string()),
-            n_obs: None,
-        };
-        compare_reml_fits(vec![with_n("counted", 500), without_n])
-            .expect("an unconstrained (None) count must not trip the guard");
+    #[test]
+    fn compare_models_refuses_non_finite_criterion() {
+        let err = compare_models(vec![cand("a", 100.0, 50.0, f64::NAN)])
+            .expect_err("a NaN corrected AIC cannot rank");
+        assert!(err.contains("non-finite aic_corrected"));
     }
 
     #[test]
     fn a_candidate_without_a_comparable_criterion_ranks_and_reports_none_2627() {
         // #2627: a fit without null-space metadata has no comparable REML/LAML
-        // criterion. It still ranks on conditional AIC, and its score-table row
-        // reports the absence instead of a raw number under the comparable name.
-        // The other rows keep their factors, referenced among themselves.
-        let mut scan = cand("scan", 0.0, 4.0, -40.0);
-        scan.score = None;
-        let standard = cand("standard", 120.0, 5.0, -38.0);
-        let other = cand("other", 125.0, 5.0, -39.0);
-        // Conditional AIC: scan 88, standard 86, other 88.
-        let cmp = compare_reml_fits(vec![scan, standard, other]).expect("compare");
+        // criterion. It still ranks on the corrected AIC, and its score-table
+        // row reports the absence. The other rows keep their factors,
+        // referenced among themselves.
+        let mut no_reml = cand("no_reml", 0.0, 86.0, 88.0);
+        no_reml.reml_score = None;
+        let standard = cand("standard", 120.0, 84.0, 86.0);
+        let other = cand("other", 125.0, 86.0, 88.0);
+        let cmp = compare_models(vec![no_reml, standard, other]).expect("compare");
         assert_eq!(cmp.winner, "standard");
-
-        let scan_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "scan")
-            .expect("scan row");
-        assert_eq!(scan_row.reml_score, None);
-        assert_eq!(scan_row.delta_reml, None);
-        assert_eq!(scan_row.reml_criterion_ratio_best_over_model, None);
-        let scan_ranked = cmp
-            .ranking
-            .iter()
-            .find(|r| r.name == "scan")
-            .expect("scan ranking row");
-        assert_eq!(scan_ranked.score, None);
-
-        let other_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "other")
-            .expect("other row");
+        let no_reml_row = cmp.score_table.iter().find(|r| r.name == "no_reml").unwrap();
+        assert_eq!(no_reml_row.reml_score, None);
+        assert_eq!(no_reml_row.delta_reml, None);
+        assert_eq!(no_reml_row.reml_criterion_ratio_best_over_model, None);
+        let other_row = cmp.score_table.iter().find(|r| r.name == "other").unwrap();
         assert!(other_row
             .delta_reml
             .is_some_and(|delta| (delta - 5.0).abs() < 1e-12));

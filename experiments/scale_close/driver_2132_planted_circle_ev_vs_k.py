@@ -19,7 +19,7 @@ Ground truth (no reference tool required, this is an objective truth-recovery ba
   must not lose EV as spare atoms are added through K=2M. This is the exact
   comparison #2132 reported; the driver measures it end to end.
 
-Uses gamfit's PUBLIC API only: gamfit.sae_manifold_fit(..., assignment='topk',
+Uses gamfit's PUBLIC API only: gamfit.sae.sae_manifold_fit(..., assignment='topk',
 d_atom=1, atom_topology='circle', top_k=...) for the curved fit and
 model.reconstruct(X_test) for the exact out-of-sample reconstruction. The affine
 bar is plain PCA (numpy eigh) at fixed rank M on the identical train/test split.
@@ -92,7 +92,7 @@ def curved_ev(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, assignment,
               n_iter, seed):
     import gamfit
 
-    model = gamfit.sae_manifold_fit(
+    model = gamfit.sae.sae_manifold_fit(
         x_tr, K=K, d_atom=d_atom, atom_topology=topology,
         assignment=assignment, top_k=top_k, n_iter=n_iter, random_state=seed)
     recon = np.asarray(model.reconstruct(x_te), dtype=np.float64)
@@ -111,12 +111,12 @@ def preflight(assignment, top_k, d_atom, topology):
 
     ver = getattr(gamfit, "__version__", "?")
     where = os.path.dirname(getattr(gamfit, "__file__", "?"))
-    if not hasattr(gamfit, "sae_manifold_fit"):
+    if not hasattr(gamfit.sae, "sae_manifold_fit"):
         raise SystemExit(f"[preflight] gamfit {ver} at {where} has no sae_manifold_fit")
     rng = np.random.default_rng(0)
     x = np.ascontiguousarray(rng.standard_normal((240, 16)), dtype=np.float32)
     try:
-        m = gamfit.sae_manifold_fit(
+        m = gamfit.sae.sae_manifold_fit(
             x, K=4, d_atom=d_atom, atom_topology=topology,
             assignment=assignment, top_k=top_k, n_iter=3, random_state=0)
         r = np.asarray(m.reconstruct(x[:8]))

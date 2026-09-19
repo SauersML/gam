@@ -51,7 +51,7 @@ def _resolve_knots_tensor(
     explicit knot tensor passes the requested degree straight through.
     ``periodic`` selects the uniform cyclic grid (``K + degree + 1`` controls
     over ``[min(t), max(t)]``) instead of the clamped open vector, matching
-    :func:`gamfit.bspline_basis`.
+    :func:`gamfit.basis.bspline_basis`.
     """
     if isinstance(knots, torch.Tensor):
         return knots, degree

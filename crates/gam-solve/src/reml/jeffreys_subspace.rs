@@ -1290,7 +1290,7 @@ where
     {
         Ok(reservation) => reservation,
         Err(refusal) => {
-            log::debug!("[Jeffreys pre-check] exact spectrum not formed: {refusal}");
+            log::trace!("[Jeffreys pre-check] exact spectrum not formed: {refusal}");
             return Ok(false);
         }
     };

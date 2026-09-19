@@ -44,7 +44,7 @@ fn matern_smooth(name: &str, centers: usize, kappa_auto: bool) -> SmoothTermSpec
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -103,11 +103,13 @@ fn build(
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![matern_smooth("f_pc", centers, kappa_auto)],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![matern_smooth("ls_pc", centers, kappa_auto)],
+        level: Default::default(),
     };
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
@@ -132,7 +134,7 @@ fn build(
 struct StderrInfoLogger;
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
@@ -156,7 +158,7 @@ fn arg_usize(idx: usize, default: usize) -> usize {
 fn main() {
     gam::init_parallelism();
     match log::set_logger(&LOGGER) {
-        Ok(()) => log::set_max_level(log::LevelFilter::Info),
+        Ok(()) => log::set_max_level(log::LevelFilter::Debug),
         Err(err) => eprintln!("keeping the already-installed logger: {err}"),
     }
     let n: usize = arg_usize(1, 1500);

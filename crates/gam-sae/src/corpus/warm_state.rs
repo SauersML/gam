@@ -309,7 +309,7 @@ impl RowWarmCache for DiskRowWarmCache {
                 // Non-fatal by design (the LRU still holds the seed for this run),
                 // but a disk-side failure has to be observable or a silently
                 // never-persisting store looks identical to a working one.
-                log::debug!("warm-start write-through failed for row {row_id}: {err}");
+                log::trace!("warm-start write-through failed for row {row_id}: {err}");
             }
         }
     }

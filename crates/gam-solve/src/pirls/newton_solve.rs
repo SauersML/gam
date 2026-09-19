@@ -231,7 +231,7 @@ impl DenseOuterState {
             min_parallel_work,
         ) else {
             accumulate_outer_upper(&mut self.xtwx_dense, x_t, weights, 0..n);
-            log::info!(
+            log::debug!(
                 "[STAGE] PIRLS dense XᵀWX assembly (serial) n={} p={} flops~{} elapsed={:.3}s",
                 n,
                 p,
@@ -262,7 +262,7 @@ impl DenseOuterState {
             // The assign preserves `xtwx_dense`'s storage; it is never reallocated.
             self.xtwx_dense.assign(&sum);
         }
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS dense XᵀWX assembly (parallel, chunks={}) n={} p={} flops~{} elapsed={:.3}s",
             n_chunks,
             n,
@@ -549,7 +549,7 @@ pub(super) fn descent_curvature(
             }
         }
     }
-    log::debug!(
+    log::trace!(
         "[PIRLS] Newton curvature not positive definite (λ_min={:.3e}, ‖H‖₂={spectral_radius:.3e}): \
          descent direction taken on the Gill–Murray modification floored at {floor:.3e}",
         eigenvalues.iter().copied().fold(f64::INFINITY, f64::min)
@@ -634,7 +634,7 @@ pub(super) fn solve_newton_direction_dense(
         direction_out.assign(&solved.column(0));
         direction_out.mapv_inplace(|v| -v);
         if array_is_finite(direction_out) {
-            log::info!(
+            log::debug!(
                 "[STAGE] PIRLS dense newton solve backend=CUDA p={} flops~{} elapsed={:.3}s route=\"cuSOLVER potrf/potrs\"",
                 p,
                 (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
@@ -673,7 +673,7 @@ pub(super) fn solve_newton_direction_dense(
         )));
     }
     if array_is_finite(direction_out) {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
             p,
             (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
@@ -791,7 +791,7 @@ pub(super) fn solve_newton_direction_from_root_with_firth_hessian(
             direction_out,
         )?;
     }
-    log::info!(
+    log::debug!(
         "[STAGE] PIRLS dense newton solve backend=CPU p={} rows={} route=\"Householder QR of PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
         p,
         root.nrows(),
@@ -992,7 +992,7 @@ impl TallSkinnyQrLeastSquares {
                 direction_out,
             )?;
         }
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS tall-skinny newton solve backend=CPU p={} rows={} route=\"blocked Householder QR of sparse PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
             self.p,
             self.total_rows,
@@ -1350,7 +1350,7 @@ where
             },
         ));
     }
-    log::info!(
+    log::debug!(
         "[STAGE] PIRLS implicit (PCG) newton solve p={} dense_pens={} op_pens={} elapsed={:.3}s",
         p,
         dense_penalties.len(),
@@ -1606,19 +1606,14 @@ pub(super) fn constrained_stationarity_norm(
 ///   tighter than the outer startup gate's `KKT_TOL_PRIMAL = 1e-7`, so
 ///   certifying against it can never hand the outer gate something it rejects.
 /// * Complementarity is `|λ_i·s_i|` — a gradient times a distance — and is held
-///   to `KKT_TOL_COMP`, the OUTER startup gate's own bound.
-///
-/// # Why complementarity's bound is inherited rather than derived
-///
-/// The dimensionally natural bound for `|λ_i·s_i|` scales with the gradient
-/// magnitude its multipliers live at; a fixed absolute number makes the same fit
-/// pass or fail under a response rescale `y → c·y`, since `λ ∝ c`. But the
-/// binding requirement HERE is lockstep: `enforce_constraint_kkt` refuses any
-/// iterate whose complementarity exceeds `KKT_TOL_COMP` absolutely, so an inner
-/// certificate that admitted the scaled form would certify geometries the outer
-/// gate then rejects — and a fit's success would again depend on which ρ the
-/// seed loop started from, which is #873. Adopting the natural form is a change
-/// to BOTH gates or to neither. This one is recorded as inherited, not endorsed.
+///   to `KKT_TOL_COMP`, the OUTER startup gate's own bound, in the gate's own
+///   frame: absolutely AND relative to `max(1, ‖g‖∞)`
+///   ([`crate::active_set::exceeds_at_gradient_scale`]). The multipliers carry
+///   the gradient's scale, so a bare absolute bar made the same fit pass or
+///   fail under a response rescale `y → c·y`. The requirement here is
+///   lockstep with `enforce_constraint_kkt` — an inner certificate the outer
+///   gate then rejects makes a fit's success depend on which ρ the seed loop
+///   started from (#873) — and both gates judge through the one predicate.
 ///
 /// Returns `true` for an unconstrained fit and for a constrained one whose
 /// bounds yield no representable constraint rows: there is no geometry to
@@ -1633,7 +1628,11 @@ pub(super) fn constraint_geometry_is_certified(
     };
     let kkt = compute_constraint_kkt_diagnostics(beta, gradient, constraints);
     kkt.primal_feasibility <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-        && kkt.complementarity <= crate::estimate::reml::outer_eval::KKT_TOL_COMP
+        && !crate::active_set::exceeds_at_gradient_scale(
+            kkt.complementarity,
+            crate::estimate::reml::outer_eval::KKT_TOL_COMP,
+            kkt.gradient_scale,
+        )
 }
 
 /// Structural nonzeros of a dense matrix's upper triangle: every entry that is
@@ -1727,7 +1726,7 @@ pub(crate) fn estimate_sparse_native_decision(
                 start = end;
             }
         }
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS row-chunk generation chunks={} n={} p={} nnz={} elapsed={:.3}s",
             chunks_processed,
             n,

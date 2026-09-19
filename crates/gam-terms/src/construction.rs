@@ -720,6 +720,24 @@ impl ReparamResult {
             .map(|penalty| split.project_canonical(penalty, PenaltyFrame::Transformed))
             .collect()
     }
+
+    /// Bytes this reparameterization owns on the heap. Every rotated penalty in
+    /// `canonical_transformed` is dense in the transformed frame, so with `K`
+    /// smoothing coordinates this is about `(K + 3) p²` doubles: forty
+    /// coordinates at `p = 221` hold 16 MB here, far more than `S̃`, `Qs` and `E`.
+    pub fn resident_bytes(&self) -> usize {
+        let owned = self.s_transformed.len()
+            + self.det1.len()
+            + self.qs.len()
+            + self.e_transformed.len()
+            + self.u_truncated.len();
+        owned * std::mem::size_of::<f64>()
+            + self
+                .canonical_transformed
+                .iter()
+                .map(CanonicalPenalty::resident_bytes)
+                .sum::<usize>()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -916,6 +934,17 @@ impl CanonicalPenalty {
     /// `&[CanonicalPenalty]`.
     pub fn from_dense_root(root: Array2<f64>, p: usize) -> Self {
         Self::from_dense_root_with_mean(root, p, Array1::zeros(p))
+    }
+
+    /// Bytes this penalty owns on the heap: its root, its cached `local` Gram,
+    /// its prior mean and eigenvalues. A shared `op` handle is not owned here.
+    /// A dense (reparam-rotated) penalty's `local` is a full `p × p` matrix.
+    pub fn resident_bytes(&self) -> usize {
+        (self.root.len()
+            + self.local.len()
+            + self.prior_mean.len()
+            + self.positive_eigenvalues.len())
+            * std::mem::size_of::<f64>()
     }
 
     pub fn from_dense_root_with_mean(root: Array2<f64>, p: usize, prior_mean: Array1<f64>) -> Self {
@@ -1234,9 +1263,9 @@ impl CanonicalPenalty {
 /// `block_dim = 10`), so nothing rides on where in that gap the bar falls.
 ///
 /// Logging policy, `delta`-denominated throughout:
-/// - `delta <= sqrt(m) * EPSILON` → `log::warn!` with `[PENALTY-REDUNDANCY]`.
+/// - `delta <= sqrt(m) * EPSILON` → `log::debug!` with `[PENALTY-REDUNDANCY]`.
 ///   Only their combination `lambda_i + c*lambda_j` is identified.
-/// - `sqrt(m) * EPSILON < delta <= 1e-1` → `log::info!` with
+/// - `sqrt(m) * EPSILON < delta <= 1e-1` → `log::debug!` with
 ///   `[PENALTY-SIMILARITY]`, carrying `delta`. At large scale (`k > 64`) only
 ///   the three smallest-`delta` such pairs are logged to bound log volume.
 ///
@@ -1317,7 +1346,7 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
 
     // Always emit every exact redundancy — these are structural model errors.
     for &(i, j, defect) in &redundant {
-        log::warn!(
+        log::debug!(
             "[PENALTY-REDUNDANCY] penalties i={i} j={j} are proportional to the arithmetic \
              that formed them (relative defect min_c ||S_{j} - c S_{i}||_F / ||S_{i}||_F = \
              {defect:.6e}) — only their COMBINATION is identified, so the criterion is exactly \
@@ -1336,7 +1365,7 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
         similar.truncate(TOP_SIMILARITY_PAIRS);
     }
     for (i, j, defect, scale) in similar {
-        log::info!(
+        log::debug!(
             "[PENALTY-SIMILARITY] penalties i={i} j={j} are close but MEASURABLY distinct \
              (relative defect {defect:.6e} at the best scale c={scale:.6e}) — the outer Hessian \
              may be ill-conditioned along their antisymmetric direction, and the criterion \
@@ -1456,7 +1485,7 @@ pub fn canonicalize_penalty_spec(
     })?;
 
     if analysis.rank == 0 {
-        log::debug!(
+        log::trace!(
             "Dropped inactive penalty block idx={idx} reason={}",
             if analysis.iszero {
                 "ZeroMatrix"
@@ -1507,7 +1536,7 @@ pub fn canonicalize_penalty_spec(
     // is a real geometric fact (e.g. high-d Duchon kernels) the operator
     // should be able to see.
     if classes.is_indefinite() {
-        log::debug!(
+        log::trace!(
             "{context}: penalty block idx={idx} carries {} negative-curvature \
              eigendirection(s) below -tol={tolerance:e}; dropped from the canonical \
              root and NOT counted as null space (rank={rank_k}, nullity={})",
@@ -2676,7 +2705,7 @@ pub fn stable_reparameterizationwith_invariant(
         }
         if let Some(reason) = svd_refusal.as_deref() {
             if rescued_by_r_svd {
-                log::warn!(
+                log::debug!(
                     "penalized-block rotation: stacked-root SVD {reason}. Recovered the SAME \
                      right-singular basis from the Householder QR of `E` followed by the SVD \
                      of its triangular factor `R`: `EᵀE = RᵀR`, so no accuracy is given up."
@@ -2685,7 +2714,7 @@ pub fn stable_reparameterizationwith_invariant(
                 // The accuracy downgrade is observable rather than silent: the
                 // Gram route resolves a recessive penalized eigenvalue only down
                 // to `O(ε·d_max)`, where the SVD of `E` reaches `O(ε²·d_max)`.
-                log::warn!(
+                log::debug!(
                     "penalized-block rotation: stacked-root SVD {reason}, and so did the R-SVD \
                      of its Householder QR factor. Recomputing it from the Gram `Σₖ λₖ Sₖ`, \
                      which squares the condition number: recessive eigenvalues are resolved to \
@@ -3011,6 +3040,45 @@ mod tests {
             "the split's penalized subspace has the balanced structural rank"
         );
         assert_eq!(invariant.split.q_null.ncols(), 0);
+    }
+
+    /// pyGAM audit speed F1: the PIRLS cache budgets its entries by
+    /// `resident_bytes`, so it must count the rotated penalties. Each of `K`
+    /// block-local penalties becomes dense in the transformed frame and carries
+    /// its own `p × p` Gram, so the reparameterization holds at least `K p²`
+    /// doubles beyond `S̃`, `Qs` and `E`, not the few `p²` those three alone hold.
+    #[test]
+    fn reparam_resident_bytes_counts_every_rotated_penalty_gram() {
+        let blocks = 6usize;
+        let width = 4usize;
+        let p = blocks * width;
+        let penalties: Vec<super::CanonicalPenalty> = (0..blocks)
+            .map(|block| {
+                let mut root = Array2::<f64>::zeros((width - 1, p));
+                for row in 0..width - 1 {
+                    root[[row, block * width + row]] = 1.0;
+                    root[[row, block * width + row + 1]] = -1.0;
+                }
+                super::CanonicalPenalty::from_dense_root(root, p)
+            })
+            .collect();
+        let lambdas = vec![1.0; blocks];
+        let invariant =
+            precompute_reparam_invariant_from_canonical(&penalties, p).expect("reparam invariant");
+        let reparam = stable_reparameterizationwith_invariant(&penalties, &lambdas, p, &invariant)
+            .expect("reparameterization");
+        assert_eq!(reparam.canonical_transformed.len(), blocks);
+        let f64_bytes = std::mem::size_of::<f64>();
+        let rotated_grams = blocks * p * p * f64_bytes;
+        let frame_matrices =
+            (reparam.s_transformed.len() + reparam.qs.len() + reparam.e_transformed.len())
+                * f64_bytes;
+        assert!(
+            reparam.resident_bytes() >= frame_matrices + rotated_grams,
+            "resident {} must cover the frame matrices {frame_matrices} and the {blocks} rotated \
+             p x p Grams {rotated_grams}",
+            reparam.resident_bytes()
+        );
     }
 
     use super::{

@@ -357,7 +357,7 @@ fn zz_2691_euclidean_line_refusal_sweep() {
     }
 }
 
-/// The FULL production entry, the way `gamfit.sae_manifold_fit` reaches it:
+/// The FULL production entry, the way `gamfit.sae.sae_manifold_fit` reaches it:
 /// minimal seed → fit seed → `run_sae_manifold_fit` with
 /// `run_outer_rho_search: true`. This is the only structural difference from
 /// [`fit_and_measure_chart`], which drives the inner joint fit alone at a FIXED
@@ -616,7 +616,7 @@ fn zz_2691_ard_precision_ladder_collapses_the_chart() {
 /// certified fit whose coordinate is a constant.
 ///
 /// The fixture is the ARD ladder's terminal rung driven through the REAL entry
-/// (`run_sae_manifold_fit`, the same function `gamfit.sae_manifold_fit` calls),
+/// (`run_sae_manifold_fit`, the same function `gamfit.sae.sae_manifold_fit` calls),
 /// at a FIXED ρ so the collapse is placed by construction rather than waited
 /// for: `α = 1e9` on the periodic chart axis. At the parent commit this call
 /// returns `Ok` with `coord_std = 5.000e-1`, one distinct chart point over 70
