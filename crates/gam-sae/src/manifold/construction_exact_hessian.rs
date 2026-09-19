@@ -862,6 +862,8 @@ pub(crate) struct EvidenceRootCounters {
     negative_curvature_no_steps: std::sync::atomic::AtomicUsize,
     unfactorable_no_steps: std::sync::atomic::AtomicUsize,
     uncertified_refinements: std::sync::atomic::AtomicUsize,
+    rounding_floor_stops: std::sync::atomic::AtomicUsize,
+    band_refused_commits: std::sync::atomic::AtomicUsize,
 }
 
 /// A snapshot of [`EvidenceRootTelemetry`].
@@ -881,6 +883,11 @@ pub(crate) struct EvidenceRootCounts {
     /// A refinement moved the state and recurred, but the refined root did not certify, so
     /// the accepted state was priced.
     pub(crate) uncertified_refinements: usize,
+    /// #2822 — the gate sat inside its formation band, so no root step was solved for.
+    pub(crate) rounding_floor_stops: usize,
+    /// #2822 — a trial the strict contraction would have committed, refused because the two
+    /// gates' formation bands overlap.
+    pub(crate) band_refused_commits: usize,
 }
 
 impl EvidenceRootTelemetry {
@@ -896,6 +903,8 @@ impl EvidenceRootTelemetry {
                 .load(Ordering::Relaxed),
             unfactorable_no_steps: self.0.unfactorable_no_steps.load(Ordering::Relaxed),
             uncertified_refinements: self.0.uncertified_refinements.load(Ordering::Relaxed),
+            rounding_floor_stops: self.0.rounding_floor_stops.load(Ordering::Relaxed),
+            band_refused_commits: self.0.band_refused_commits.load(Ordering::Relaxed),
         }
     }
 }
@@ -2532,7 +2541,7 @@ impl SaeManifoldTerm {
             Ok(solve) => solve,
             Err(err) => {
                 counters.solve_failures.fetch_add(1, Ordering::Relaxed);
-                log::info!("[SAE-ROOT] no root step: dense exact-A pseudoinverse: {err}");
+                log::debug!("[SAE-ROOT] no root step: dense exact-A pseudoinverse: {err}");
                 return None;
             }
         };
@@ -2540,7 +2549,7 @@ impl SaeManifoldTerm {
         // step toward the saddle along it. The root this phase refines is a mode.
         if let Some(negative) = solve.negative_curvature {
             counters.negative_curvature_no_steps.fetch_add(1, Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[SAE-ROOT] no root step: the pencil resolves {} negative curvature direction(s) \
                  (min μ={:.6e} below −{:.6e})",
                 negative.directions,
@@ -2557,7 +2566,7 @@ impl SaeManifoldTerm {
         if let Some(nearest) = nearest_edge {
             if solve.retained_rank == 0 {
                 counters.band_skips.fetch_add(1, Ordering::Relaxed);
-                log::info!(
+                log::debug!(
                     "[SAE-ROOT] no root step: pencil band holds a direction (|μ|={:.6e}, \
                      band={:.6e}); all {} directions are in the band",
                     nearest.magnitude,
@@ -2567,7 +2576,7 @@ impl SaeManifoldTerm {
                 return None;
             }
             counters.band_holds.fetch_add(1, Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[SAE-ROOT] pencil band holds {} direction(s) (nearest its edge |μ|={:.6e}, \
                  band={:.6e}); stepping on the resolvable complement of rank {}",
                 solve.band.len(),
@@ -4881,7 +4890,7 @@ impl SaeManifoldTerm {
                 min_retained_over_floor = min_retained_over_floor.min(magnitude / edge);
             }
         }
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] priced: dim={} retained={retained} in_band={in_band} \
              substituted={substituted} resolution_limited={resolution_limited} negative={} \
              ½log|A|={:.6e} ½log|Φ|={:.6e} min retained μ/floor={:.3e} \
@@ -4901,7 +4910,7 @@ impl SaeManifoldTerm {
         } else {
             let values = Self::price_compact_orbits(&geometry.orbit_generators, &geometry.block)?;
             for (generator, value) in geometry.orbit_generators.iter().zip(values.orbits.iter()) {
-                log::info!(
+                log::debug!(
                     "[SAE-EXACT-ORBIT] atom={} priced: nodes={} log I={:.6e} log det N={:.6e} \
                      coupling=[{:.3e}, {:.3e}, {:.3e}] correction={:.6e}",
                     generator.atom,
@@ -4936,7 +4945,7 @@ impl SaeManifoldTerm {
                         }
                     }
                 }
-                log::info!(
+                log::debug!(
                     "[SAE-EXACT-ORBIT] {} separated orbits: largest cross/diagonal complement form {largest:.3e}",
                     values.orbits.len()
                 );
@@ -4997,7 +5006,7 @@ impl SaeManifoldTerm {
         let mut eigenvectors = metric.lower_transpose_solve(rotation.view())?;
         drop(rotation);
         EXACT_A_PENCIL_DECOMPOSITIONS.with(|count| count.set(count.get() + 1));
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] pencil eigendecomposition DONE: dim={dimension}, {:.3} s, \
              decomposition {} on this thread",
             eigh_started.elapsed().as_secs_f64(),
@@ -5075,7 +5084,7 @@ impl SaeManifoldTerm {
             // Report when the working coordinates, rather than the pencil, determine the
             // shared spectral rank.
             let widest = block.resolution.iter().copied().fold(0.0_f64, f64::max);
-            log::warn!(
+            log::debug!(
                 "[SAE-EXACT-DENSE] numerical resolution limit: {crossings} of {dimension} \
                  pencil directions clear √ε but not their own numerical resolution (widest \
                  {widest:.6e}); value and adjoint discard these directions",
@@ -5210,7 +5219,7 @@ impl SaeManifoldTerm {
             );
             let floor = sae_exact_a_band_edge(kappa, resolution, 0.0);
             if kappa < -floor {
-                log::warn!(
+                log::debug!(
                     "SAE exact-A basin refusal: block={label}, mode={i}, curvature={kappa:e}, floor={floor:e}"
                 );
                 let Some(directions) = refused_directions.as_mut() else {
@@ -5448,7 +5457,7 @@ impl SaeManifoldTerm {
         for pricing in self.separated_compact_orbit_pricing(rho, target, cache)? {
             match pricing {
                 CompactOrbitPricing::ExactCircle(generator) => {
-                    log::info!(
+                    log::debug!(
                         "[SAE-EXACT-ORBIT] atom={} exact circle orbit: period={:e} eta={:e} \
                          closure residual={:.3e} band={:.3e} prior rows={}",
                         generator.atom,
@@ -5462,7 +5471,7 @@ impl SaeManifoldTerm {
                 }
                 CompactOrbitPricing::Laplace { atom, reason } => {
                     if reason != CompactOrbitLaplaceReason::NotAPeriodicChart {
-                        log::info!("[SAE-EXACT-ORBIT] atom={atom} keeps Laplace pricing: {reason:?}");
+                        log::debug!("[SAE-EXACT-ORBIT] atom={atom} keeps Laplace pricing: {reason:?}");
                     }
                 }
             }
@@ -5585,7 +5594,7 @@ impl SaeManifoldTerm {
             .map(|row| offsets[row + 1] - offsets[row])
             .max()
             .unwrap_or(0);
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] materializing the exact stationarity Hessian: dim={dim} \
              (coords={total_t} + border={k}) from {} arrow probes ({slots} coordinate \
              slots + {k} border columns), {:.1} MiB per dim x dim f64 block",
@@ -5723,7 +5732,7 @@ impl SaeManifoldTerm {
             }
         };
         let build_elapsed = build_started.elapsed();
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {} arrow probes on {pool_threads} pool \
              threads + symmetrization in {:.3} s ({:.3} ms wall per probe), with the \
              decoder-prior majorizer gap border from the same {k} border probes; the \
@@ -8219,7 +8228,7 @@ mod column_loop_oracle_tests {
             // hundred and finishes in ~1.6 s, while a 508-row K=8 dense-softmax rung
             // is ~5.3e3 and one step measured >=25 min at 4.7 GiB peak RSS. One line,
             // once per materialization, states the size of the bill before it is paid.
-            log::info!(
+            log::debug!(
                 "[SAE-EXACT-DENSE] materializing the exact stationarity Hessian: dim={dim} \
                  (coords={total_t} + border={k}), {:.1} MiB per dim x dim f64 block, \
                  {:.1} MiB resident across {} live blocks, \
@@ -8279,7 +8288,7 @@ mod column_loop_oracle_tests {
                 }
             }
             let build_elapsed = build_started.elapsed();
-            log::info!(
+            log::debug!(
                 "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {dim} Hessian-vector applies \
                  + symmetrization in {:.3} s ({:.3} ms per apply); \
                  the O(dim^3) symmetric eigendecomposition has NOT started yet",

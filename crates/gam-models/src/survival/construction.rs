@@ -179,8 +179,9 @@ pub enum SurvivalTimeBasisConfig {
     ///   `q'(t) ≥ 0` pointwise. The `derivative_guard` constant is added
     ///   externally by [`add_survival_time_derivative_guard_offset`],
     ///   leaving the derivative guarantee `q'(t) ≥ guard` exact.
-    /// * 2nd-difference penalty on the underlying degree-`(k+1)` B-spline
-    ///   coefficients, filtered through `keep_cols` for identifiability.
+    /// * the exact `∫(f'')²` roughness Gram of the underlying degree-`(k+1)`
+    ///   B-spline, carried to the I-spline increments by the value-space
+    ///   congruence and filtered through `keep_cols` for identifiability.
     ///
     /// `TimeBlockInput::time_monotonicity` declares to the consuming
     /// family how monotonicity is enforced. The marginal-slope
@@ -1493,6 +1494,7 @@ pub fn build_survival_time_basis(
                         knotspec: BSplineKnotSpec::Automatic {
                             num_internal_knots: Some(num_internal_knots),
                             placement,
+                            adaptive: false,
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
@@ -1975,18 +1977,20 @@ pub fn build_survival_time_basis(
             // The I-spline coefficient γ is the consecutive increment of the B-spline
             // value coefficients `c`: `c_0 = 0`, `c_k = Σ_{j<k} γ_j = (L γ)_k`, where
             // `L` is the `p_time × p_time` lower-triangular cumsum matrix. The
-            // second-difference penalty on the B-spline values is `S_B = D₂ᵀD₂`
-            // (the active `penalty_basis` matrix block). The correct curvature penalty
-            // on γ is the **value-space congruence transform**
+            // curvature penalty on the B-spline values is the exact function-space
+            // Gram `S_B = ∫ B''B''ᵀ` (the active `penalty_basis` matrix block), not a
+            // coefficient-difference operator. The correct curvature penalty on γ is
+            // the **value-space congruence transform**
             //
             //   `S_I = Lᵀ S_B[1:,1:] L`,
             //
             // which satisfies `γᵀ S_I γ = (Lγ)ᵀ S_B[1:,1:] (Lγ)`.
             //
-            // A constant γ (γ_k = γ₀ ∀k) maps to the linear value sequence
-            // `c_k = k·γ₀`, which is annihilated by D₂: `D₂c = 0`. Therefore
-            // `γᵀ S_I γ = 0` for constant γ, i.e. the **affine trend lies in the
-            // penalty null space**. REML does not penalize the baseline slope
+            // `S_B` annihilates exactly the value coefficients of an affine function,
+            // `c_k = a + b·ξ_k` (ξ the Greville abscissae), so the increments
+            // `γ_k = b·(ξ_{k+1} − ξ_k)` of that affine trend satisfy `γᵀ S_I γ = 0`
+            // (constant γ when the knots are uniform), i.e. the **affine trend lies
+            // in the penalty null space**. REML does not penalize the baseline slope
             // `d(log Λ)/d(log t)` or the overall level, so it correctly lets the
             // data determine these quantities without bias. The previous increment-
             // space form `S_B[1:,1:]` (applied directly to γ instead of Lγ) did NOT
@@ -4739,6 +4743,7 @@ pub fn build_time_varying_survival_covariate_template(
         knotspec: BSplineKnotSpec::Automatic {
             num_internal_knots: Some(num_internal_knots),
             placement: gam_terms::basis::BSplineKnotPlacement::Quantile,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,

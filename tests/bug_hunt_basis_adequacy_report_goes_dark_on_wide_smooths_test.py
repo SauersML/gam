@@ -47,7 +47,7 @@ directions as the enrichment widens: ``energy_scale`` grows with the center coun
 while the residual spectrum of a smooth 1-D radial kernel decays geometrically
 once the design already spans its coarse directions. Reproducing the same linear
 algebra outside the engine on the ladder above (design from
-``Model.design_matrix``, enrichment from ``gamfit.duchon_basis`` at
+``Model.design_matrix``, enrichment from ``gamfit.basis.duchon_basis`` at
 ``enrichment_width`` equal-mass centers) recovers the shipped ranks exactly and
 shows the crossing:
 

@@ -135,7 +135,6 @@ fn fit_survival_marginal_slope_model(n: usize, seed: u64) -> FittedModel {
         slope_time_degree: SURVIVAL_SLOPE_TIME_DEGREE,
         baseline_target: "weibull".to_string(),
         time_num_internal_knots: 3,
-        precompute_conformal: Some(false),
         ..FitConfig::default()
     };
     let payload = fit_formula_to_payload("Surv(time, event) ~ 1".to_string(), &ds, &cfg)

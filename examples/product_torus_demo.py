@@ -16,17 +16,17 @@ def main() -> None:
         + 0.5 * np.cos(theta[:, 1] - theta[:, 2])
         + 0.05 * rng.normal(size=n)
     )
-    manifold = gamfit.ProductManifold(
-        gamfit.CircleManifold(),
-        gamfit.CircleManifold(),
-        gamfit.CircleManifold(),
+    manifold = gamfit.geometry.ProductManifold(
+        gamfit.geometry.CircleManifold(),
+        gamfit.geometry.CircleManifold(),
+        gamfit.geometry.CircleManifold(),
     )
     model = gamfit.fit(
         {"y": y},
         "y ~ s(t, type='duchon', centers=24)",
         family="gaussian",
         latents={
-            "t": gamfit.LatentCoord(
+            "t": gamfit.smooth.LatentCoord(
                 n=n,
                 d=3,
                 init=theta,

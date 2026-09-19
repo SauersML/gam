@@ -597,9 +597,10 @@ mod tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let base_design =
             build_term_collection_design(data.view(), &spec).expect("build base spatial design");

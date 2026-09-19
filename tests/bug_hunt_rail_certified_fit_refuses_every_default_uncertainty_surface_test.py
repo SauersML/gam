@@ -42,13 +42,16 @@ below its own sampling noise.
 Observed: a certified, summarisable fit refuses every default uncertainty
 surface, and ``diagnose()`` cannot be asked for a weaker one.
 
-Expected: a certified fit reports uncertainty through its default surfaces.
+Expected: a certified fit reports uncertainty through its default surfaces. The
+conditional covariance it already publishes through ``summary()`` (and returns
+on request through ``predict``) is available; the correction that is missing is
+an enhancement, exactly as the solver comment says.
 
-Resolution: the outer certificate judges definiteness only off its railed
-coordinates, and the smoothing correction now excludes the same coordinates.
-At a rail ``d beta_hat / d rho_k -> 0``, so a railed coordinate contributes
-exactly nothing to ``J V_rho J^T``: the fit carries the smoothing-corrected
-covariance, and on this all-railed fit it equals the conditional one.
+Resolution: the correction was never missing in principle. A railed coordinate
+carries zero ρ-variance exactly (``∂β̂/∂ρ_k = 0`` on the rail face), so the
+correction now judges the ρ-Hessian off the railed axes, as the outer
+certificate does, and a fit whose every smoothing parameter is railed
+publishes the exact zero correction instead of none.
 """
 
 from __future__ import annotations
@@ -90,6 +93,8 @@ def railed() -> tuple[Any, dict[str, Any]]:
     # assertions below would be testing nothing.
     assert summary.convergence["certified"] is True
     assert summary.convergence["outer"]["lambdas_railed"] == [0]
+    # The only smoothing parameter sits on its rail, where ∂β̂/∂ρ = 0 exactly:
+    # the correction is published, and it is the exact zero, not an absence.
     assert summary.covariance_kind == "smoothing-corrected"
     assert all(np.isfinite(c["std_error"]) for c in summary.coefficients)
     return model, data

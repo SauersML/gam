@@ -72,7 +72,7 @@ def test_sphere_atom_stable_at_poles():
         n_pole=50, n_interior=150, p=48, noise=0.03, seed=0
     )
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis="sphere",

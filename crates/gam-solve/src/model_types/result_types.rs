@@ -80,7 +80,7 @@ pub fn dispersion_from_likelihood(
                 known(phi.value())
             }
         }
-        Scale::Tweedie { phi, estimated } => {
+        Scale::Tweedie { phi, estimated } | Scale::Dispersion { phi, estimated } => {
             if estimated {
                 estimated_dispersion(phi.value())
             } else {
@@ -2350,6 +2350,19 @@ pub enum CovarianceDeclined {
         /// serde tag.
         unavailable_channel: String,
     },
+    /// Expectile (LAWS) fit whose inner solve published no dense covariance —
+    /// the memory governor refused it and only a factorized diagonal of the
+    /// Gaussian working-model `Vb` exists, or inference was not computed.
+    ///
+    /// The expectile's covariance is the penalized Newey–Powell sandwich
+    /// `H⁻¹(c·Xᵀdiag(w²r²)X + φ̂S_λ)H⁻¹`, a correction of the FULL `Vb`; a
+    /// diagonal alone cannot carry it, and publishing the working-model
+    /// diagonal under the expectile's name is the under-coverage the sandwich
+    /// exists to remove. Point estimation is unaffected and IS published.
+    ExpectileSandwichRequiresDenseCovariance {
+        /// Coefficient count whose dense covariance was not admitted.
+        coefficients: usize,
+    },
 }
 
 impl CovarianceDeclined {
@@ -2410,6 +2423,19 @@ impl CovarianceDeclined {
                      correction exists to add, so the intervals would be too narrow and, on the \
                      wire, indistinguishable from corrected ones. The point estimates are \
                      unaffected and are published. See gam#2985."
+                )
+            }
+            Self::ExpectileSandwichRequiresDenseCovariance { coefficients } => {
+                format!(
+                    "no coefficient covariance was published for this expectile fit: its inner \
+                     solve published no dense {coefficients}-coefficient covariance (the memory \
+                     governor did not admit it, or inference was not computed), and the \
+                     expectile's Newey-Powell sandwich covariance is a correction of that full \
+                     matrix which a factorized diagonal or a bare Hessian cannot carry. \
+                     Publishing the Gaussian working-model standard errors instead is not \
+                     admissible: the asymmetric weights are not inverse variances, so those \
+                     intervals under-cover wherever the noise is large. The point estimates are \
+                     unaffected and are published."
                 )
             }
         }
@@ -2591,18 +2617,22 @@ pub struct FitArtifacts {
     /// git grep -n 'covariance_declined' -- crates/ src/ | grep -E 'covariance_declined\s*='
     /// ```
     ///
-    /// **Today that returns exactly 1** — `bms/block_specs.rs`, the BMS
-    /// Murphy-Topel seam. **If a second producer ever appears, check whether it
+    /// **Outside tests, today that returns** `bms/block_specs.rs` (the BMS
+    /// Murphy-Topel seam), `survival/marginal_slope/generated_regressor.rs`,
+    /// and `fit_orchestration/entry.rs` (the expectile sandwich on a fit whose
+    /// dense covariance was not admitted, persisted whole-fit through
+    /// `assemble_standard_payload`). **If a second producer ever appears, check whether it
     /// persists through a compact constructor; if it does, the parameter must be
     /// threaded and `tests/bms_covariance_declined_2718.rs` extended to cover
     /// that route.** The round-trip test there pins the wire, not the routing,
     /// so it will not catch a new producer on its own.
     #[serde(default)]
     pub covariance_declined: Option<CovarianceDeclined>,
-    /// The certified outer point in the outer optimizer's own coordinates, when
-    /// the route that fitted the model records one: `gamfit.fit(...,
-    /// warm_start_from=model)` resumes a new fit from it through the outer cache
-    /// seam, which recertifies it rather than trusting it. `None` on a route that
+    /// The certified outer point of the published search, in the outer
+    /// optimizer's own coordinates, when the route that fitted the model records
+    /// one: `gamfit.fit(..., warm_start_from=model)` offers it to a new fit
+    /// (gam#3002, `OuterProblem::with_warm_start`), whose searches accept it only
+    /// where it is certified for their own criterion. `None` on a route that
     /// records none and on a model saved before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_warm_start: Option<OuterWarmStartRecord>,
@@ -2613,13 +2643,23 @@ pub struct FitArtifacts {
     pub coefficient_mode_selection: CoefficientModeSelection,
 }
 
-/// A certified outer point: `rho` in the outer optimizer's coordinates and
-/// `beta`, the inner coefficient mode flattened across blocks in the order the
-/// outer objective's coefficient seed reads it.
+/// A certified outer point (gam#3002): `theta`, the outer coordinates in the order
+/// the fit's outer problem holds them (ρ, then the log length scales, then the
+/// auxiliary coordinates), `beta`, the inner coefficient mode there flattened
+/// across blocks, `value`, the criterion the search certified there, and the
+/// fingerprint of the inputs the point is certified for.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OuterWarmStartRecord {
-    pub rho: Vec<f64>,
+    /// v25 wrote the ρ-only point as `rho`.
+    #[serde(alias = "rho")]
+    pub theta: Vec<f64>,
     pub beta: Vec<f64>,
+    /// `value` and `input_fingerprint` are `None` in a v25 record, which predates
+    /// them; such a point can only join a search, never resume as a certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fingerprint: Option<String>,
 }
 
 /// Which rule selected a fit's coefficient mode (#2366, #2661).
@@ -2752,7 +2792,7 @@ impl std::fmt::Debug for FitArtifacts {
                 &self
                     .outer_warm_start
                     .as_ref()
-                    .map(|seed| (seed.rho.len(), seed.beta.len())),
+                    .map(|seed| (seed.theta.len(), seed.beta.len())),
             )
             .finish()
     }
@@ -3366,6 +3406,13 @@ pub struct FitGeometry {
     /// statement that the terminal solver geometry has no single diagonal
     /// row representation; it is never represented by empty or zero-filled
     /// placeholder vectors.
+    ///
+    /// It is in-memory fit evidence only and is never serialized: both vectors
+    /// have one entry per training row, and a saved model carries no per-row
+    /// training data (speed F6). A loaded fit therefore reads `None`, and a
+    /// payload written at payload version 28 or earlier, which serialized it, has its
+    /// `working` key read past.
+    #[serde(skip)]
     pub working: Option<WorkingGeometry>,
 }
 
@@ -4459,7 +4506,9 @@ pub struct UnifiedFitResult {
     /// Solver artifacts (e.g. cached PIRLS result for ALO).
     #[serde(default)]
     pub artifacts: FitArtifacts,
-    /// Inner cycle count (blockwise path).
+    /// Inner iterations of the final certified inner solve at the reported
+    /// smoothing parameters: P-IRLS iterations on the standard path, blockwise
+    /// cycles on the custom-family path.
     #[serde(default)]
     pub inner_cycles: usize,
     /// Number of outer REML cost-only evaluations the fit executed (each
@@ -4490,7 +4539,8 @@ fn validate_likelihood_scale_estimation(
         LikelihoodScaleMetadata::FixedDispersion { phi }
         | LikelihoodScaleMetadata::EstimatedBetaPhi { phi }
         | LikelihoodScaleMetadata::FixedBetaPhi { phi }
-        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi } => {
+        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi }
+        | LikelihoodScaleMetadata::EstimatedDispersion { phi } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
             if phi > 0.0 {
                 Ok(())
@@ -6041,7 +6091,9 @@ impl UnifiedFitResult {
         family: &gam_problem::LikelihoodSpec,
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
-            (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
+            (ResponseFamily::Gaussian, _) | (ResponseFamily::StudentT { .. }, _) => {
+                Ok(FittedLinkState::Standard(None))
+            }
             // Every state-less binomial probability link decodes to the bare
             // `Standard(None)` payload — the concrete `StandardLink` lives on the
             // family/spec, not in the fitted-link record. LogLog and Cauchit
@@ -6106,7 +6158,8 @@ impl UnifiedFitResult {
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => Ok(FittedLinkState::Standard(None)),
+            | (ResponseFamily::Gamma, _)
+            | (ResponseFamily::InverseGaussian, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::Beta { .. }, _) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::RoystonParmar, _) => Ok(FittedLinkState::Standard(None)),
         }

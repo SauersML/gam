@@ -613,7 +613,7 @@ impl IsometryPenalty {
     /// Log an evaluation that returns zero because the decoder metric is
     /// degenerate or a Duchon radial jet failed to materialize.
     fn log_zero_default(&self, method: &str, detail: &str) {
-        log::warn!("IsometryPenalty::{method} {detail}; returning the zero default");
+        log::debug!("IsometryPenalty::{method} {detail}; returning the zero default");
     }
 
     /// Build `M_n = U_n^T J_n ∈ ℝ^{r_n × d}` for row `n`. For

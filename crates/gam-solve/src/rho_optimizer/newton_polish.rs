@@ -181,7 +181,7 @@ pub(super) fn polish_the_mint(
                     Ok((rail_cost, judged))
                         if rail_cost.is_finite() && cost - rail_cost > evidence.band_f =>
                     {
-                        log::info!(
+                        log::debug!(
                             "[CERTIFICATE] {context}: Newton-decrement polish rails coordinate(s) \
                              {natives:?} at their limit-model bounds ({stopped}); the criterion \
                              there is {rail_cost:.9e} against {cost:.9e}, and the railed point is \
@@ -261,7 +261,7 @@ pub(super) fn polish_the_mint(
         trial_ran = true;
         match damped_newton_step(obj, config, &result.rho, step, bounds, cost, evidence) {
             Ok(taken) => {
-                log::info!(
+                log::debug!(
                     "[CERTIFICATE] {context}: Newton-decrement polish continues past its \
                      {}-step budget ({stopped}): λ̂² contracted from {:.3e} to {:.3e} on this \
                      face (#3012)",
@@ -487,7 +487,7 @@ fn take_polish_step(
         judged,
         t,
     } = taken;
-    log::info!(
+    log::debug!(
         "[CERTIFICATE] {context}: Newton-decrement polish step {}: ½λ̂²={:.3e} is \
          resolvable against band_f={:.3e}; the Newton step at t={t:.3e} lowers the \
          criterion from {cost:.9e} to {trial_cost:.9e}, and the point it reaches is judged \

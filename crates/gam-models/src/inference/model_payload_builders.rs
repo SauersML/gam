@@ -22,16 +22,17 @@ use crate::bms::{
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
-    DispersionLocationScaleFitResult, FitConfig, FitRequest, FitResult, StandardFitResult,
-    WorkflowError, expectile_tau_for_config, fit_expectile_if_requested,
+    DispersionLocationScaleFitResult, ExpectileFit, ExpectileLocationScaleFitResult, FitConfig,
+    FitNoteSink, FitNotes, FitRequest, FitResult, StandardFitResult, WorkflowError,
+    expectile_levels_for_config, fit_expectile_if_requested,
     fit_materialized_standard_with_notes, fit_model, materialize,
 };
 use crate::gamlss::{
     BinomialLocationScaleFitResult, DispersionFamilyKind, GaussianLocationScaleFitResult,
 };
 use crate::inference::model::{
-    FittedEstimator, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
+    FittedEstimator, FittedFamily, FittedModelPayload, JOINT_EXPECTILE_FAMILY_TAG,
+    MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
     SavedResidualCascade, SavedSplineScan, SavedSurvivalLocationScaleStructure,
     SavedTransformationNormalGeometry, TransformationNormalParameterization,
     TransformationScoreCalibration,
@@ -50,6 +51,7 @@ use crate::transformation_normal::{TransformationNormalFamily, TransformationNor
 use crate::wiggle::{WigglePenaltyMetadata, canonical_wiggle_function_penalties};
 use gam_data::{DataSchema, EncodedDataset};
 use gam_linalg::faer_ndarray::array2_to_nested_vec;
+use gam_linalg::matrix::LinearOperator;
 use gam_problem::BlockRole;
 use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
@@ -274,29 +276,16 @@ impl RealizedRawPenaltyTopology {
     }
 }
 
-fn response_for_standard_payload(formula: &str, dataset: &EncodedDataset) -> Option<Array1<f64>> {
-    let response = gam_terms::inference::formula_dsl::parse_formula(formula)
-        .ok()?
-        .response;
-    let column = *dataset.column_map().get(&response)?;
-    Some(dataset.values.column(column).to_owned())
-}
-
-fn standard_conformal_substrates(
-    formula: &str,
-    dataset: &EncodedDataset,
+/// The frozen penalty the exact full-conformal set of an eligible standard fit
+/// needs, recovered as `Sλ = M₀ − XᵀX` from the unit-weight training Gram. Only
+/// the p × p penalty is persisted: the labeled rows the set is built on are
+/// supplied again at prediction time, so the saved model never grows with `n`.
+fn standard_conformal_penalty(
     fit_config: &FitConfig,
     family: &LikelihoodSpec,
     fit: &UnifiedFitResult,
     design: &TermCollectionDesign,
-) -> Option<crate::inference::full_conformal::ExactFullConformalSubstrate> {
-    // #2633: the substrate grows with the training rows. A caller that keeps
-    // its training data, or never asks for a conformal interval, can decline it;
-    // see `FitConfig::precompute_conformal` for the measured trade-off and why
-    // the default is to keep it.
-    if fit_config.precompute_conformal == Some(false) {
-        return None;
-    }
+) -> Option<crate::inference::full_conformal::ExactFullConformalPenalty> {
     let expectile = fit_config.family.as_deref().is_some_and(|family| {
         let family = family.trim().to_ascii_lowercase();
         family == "expectile" || family.starts_with("expectile(")
@@ -310,28 +299,21 @@ fn standard_conformal_substrates(
     {
         return None;
     }
-    let y = response_for_standard_payload(formula, dataset)?;
-    let x = design.design.try_to_dense_arc("standard conformal design").ok()?;
     let normal_matrix = fit.penalized_hessian()?;
-    if x.nrows() != y.len()
-        || normal_matrix.nrows() != x.ncols()
-        || normal_matrix.ncols() != x.ncols()
-    {
-        return None;
-    }
-    let weights = Array1::<f64>::ones(y.len());
-    // The substrate may legitimately decline this design (rank, shape, or a
-    // non-invertible normal matrix). `None` is the contract, but the reason is
-    // what explains a fit that silently ships without conformal intervals.
-    match crate::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
-        x.as_ref(),
-        &y,
-        &weights,
-        normal_matrix,
-    ) {
-        Ok(substrate) => Some(substrate),
+    let unit_weights = Array1::<f64>::ones(design.design.nrows());
+    // The penalty may legitimately be unavailable (the Gram cannot be formed
+    // for this design). `None` is the contract, but the reason is what explains
+    // a fit that ships without exact full-conformal intervals.
+    let penalty = design.design.diag_xtw_x(&unit_weights).and_then(|gram| {
+        crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
+            &gram,
+            normal_matrix,
+        )
+    });
+    match penalty {
+        Ok(penalty) => Some(penalty),
         Err(reason) => {
-            log::debug!("exact full-conformal substrate unavailable: {reason}");
+            log::trace!("exact full-conformal penalty unavailable: {reason}");
             None
         }
     }
@@ -384,17 +366,24 @@ pub fn assemble_standard_payload(
             "standard fit reached payload assembly without its resolved likelihood family"
                 .to_string()
         })?;
-    let estimator = expectile_tau_for_config(fit_config)
+    let estimator = match expectile_levels_for_config(fit_config)
         .map_err(|error| format!("failed to persist estimator metadata: {error}"))?
-        .map_or(FittedEstimator::Likelihood, |tau| {
-            FittedEstimator::Expectile { tau }
-        });
-    let family_label = match estimator {
-        FittedEstimator::Likelihood => family.name().to_string(),
-        FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
+        .as_deref()
+    {
+        None => FittedEstimator::Likelihood,
+        Some([tau]) => FittedEstimator::Expectile { tau: *tau },
+        Some(levels) => {
+            return Err(format!(
+                "a standard fit cannot persist the joint expectile levels {levels:?}; they are \
+                 fitted as one location-scale model"
+            ));
+        }
     };
-    let full_conformal =
-        standard_conformal_substrates(&formula, dataset, fit_config, &family, &fit, &design);
+    let family_label = match &estimator {
+        FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
+        _ => family.name().to_string(),
+    };
+    let full_conformal = standard_conformal_penalty(fit_config, &family, &fit, &design);
     let latent_cloglog_state = if family.is_latent_cloglog() {
         Some(saved_latent_cloglog_state_from_fit(&fit).ok_or_else(|| {
             "latent-cloglog-binomial fit did not produce a fitted latent-cloglog state".to_string()
@@ -1131,7 +1120,7 @@ fn new_royston_parmar_survival_payload(
     frailty: crate::survival::lognormal_kernel::FrailtySpec,
 ) -> Result<FittedModelPayload, String> {
     if let Some(decline) = fit_result.posterior_moment_decline() {
-        log::warn!(
+        log::debug!(
             "[survival saved-model assembly] saving the converged constrained mode; posterior \
              moments are unavailable at the boundary: {}",
             decline.summary()
@@ -1498,11 +1487,26 @@ pub fn assemble_latent_window_payload(
 pub fn apply_request_metadata(
     payload: &mut FittedModelPayload,
     fit_config: &FitConfig,
-    inference_notes: Vec<String>,
+    notes: FitNotes,
 ) {
     payload.group_metadata = fit_config.group_metadata.clone();
     payload.training_table_kind = fit_config.training_table_kind.clone();
-    payload.inference_notes = inference_notes;
+    payload.inference_notes = notes.advisories;
+    payload.informational_notes = notes.informational;
+}
+
+/// Record, on every certified outer point the payload carries, the fingerprint of
+/// the inputs it is certified for, so a later warm start can tell a resume from a
+/// new fit (gam#3002). `None` leaves the point able only to join a later search.
+fn record_input_fingerprint(payload: &mut FittedModelPayload, input_fingerprint: Option<String>) {
+    for fit in [payload.fit_result.as_mut(), payload.unified.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(record) = fit.artifacts.outer_warm_start.as_mut() {
+            record.input_fingerprint = input_fingerprint.clone();
+        }
+    }
 }
 
 /// One authoritative "formula fit → saved payload" service: materialize once,
@@ -1518,6 +1522,7 @@ pub fn fit_formula_to_payload(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
+    let dataset = &*crate::fit_orchestration::drop_zero_weight_rows(dataset, fit_config)?;
     let automatic = crate::fit_orchestration::expand_automatic_fit_formula(
         &formula, dataset, fit_config,
     )?;
@@ -1535,15 +1540,26 @@ fn fit_expanded_formula_to_payload(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
-    if fit_config.outer_warm_start.is_some()
-        && (fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some())
+    let warm_start_route_refused = |route: &'static str| WorkflowError::WarmStartRefused {
+        refusal: crate::fit_orchestration::WarmStartRefusal::NoSearchTakesIt { route },
+    };
+    if fit_config.warm_start.is_some()
+        && crate::fit_orchestration::expectile_levels_for_config(fit_config)?.is_some()
     {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "warm_start_from resumes one fit; a CTN chain fits several".to_string(),
-        });
+        return Err(warm_start_route_refused("an expectile fit"));
     }
+    // A CTN chain's certified point is its outcome fit's, and that fit is a
+    // function of the chain's own inputs (the stage-1 transform is fitted or
+    // frozen from them), so the point is recorded against the chain's inputs.
+    // The outcome fit takes the warm start through its configuration and says
+    // what its searches did with it; the stage-1 fits never receive it.
     if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
-        return crate::inference::ctn::fit_chain(formula, dataset, fit_config);
+        let mut payload = crate::inference::ctn::fit_chain(formula.clone(), dataset, fit_config)?;
+        record_input_fingerprint(
+            &mut payload,
+            crate::fit_orchestration::fit_input_fingerprint(&formula, dataset, fit_config),
+        );
+        return Ok(payload);
     }
     // Expectile (Newey–Powell LAWS) family (#1777): the expectile estimator is an
     // OUTER driver that wraps the standard Gaussian-identity GAM with iterative
@@ -1555,22 +1571,18 @@ fn fit_expanded_formula_to_payload(
     // `StandardFitResult`, so the persistence payload is built by the same
     // `assemble_standard_payload` used for every other standard fit.
     if let Some(expectile_result) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
-        if fit_config.outer_warm_start.is_some() {
-            return Err(WorkflowError::InvalidConfig {
-                reason: "warm_start_from resumes custom-family fits; the expectile driver does \
-                         not read it"
-                    .to_string(),
-            });
-        }
-        let mut payload = assemble_standard_payload(StandardPayloadInputs {
-            formula,
-            dataset,
-            fit_config,
-            result: expectile_result,
-        })?;
+        let mut payload = match expectile_result {
+            ExpectileFit::Single(result) => assemble_standard_payload(StandardPayloadInputs {
+                formula,
+                dataset,
+                fit_config,
+                result,
+            })?,
+            ExpectileFit::Joint(joint) => payload_for_joint_expectile(formula, dataset, fit_config, joint)?,
+        };
         // The LAWS driver materializes its inner Gaussian design itself; there are
         // no outer materialize advisories to carry (matches `fit_from_formula`).
-        apply_request_metadata(&mut payload, fit_config, Vec::new());
+        apply_request_metadata(&mut payload, fit_config, FitNotes::default());
         return Ok(payload);
     }
     // Standard-fit dispatch must materialize at the adaptive structural start:
@@ -1578,6 +1590,7 @@ fn fit_expanded_formula_to_payload(
     // materializers do not consume this standard-only orchestration field.
     let mut dispatch_config = fit_config.clone();
     dispatch_config.spatial_center_counts = Some(Vec::new());
+    let formula_for_fingerprint = formula.clone();
     let materialized = materialize(&formula, dataset, &dispatch_config)?;
     let request = materialized.request;
     // The time basis THIS materialization built, carried to the save path so a
@@ -1910,19 +1923,36 @@ fn fit_expanded_formula_to_payload(
             payload_for_dispersion_location_scale(formula, dataset, fit_config, kind, ls_result)?
         }
     };
-    // A route that never attached the model's point fitted cold; that is not the
-    // warm start the caller asked for.
-    if fit_config
-        .outer_warm_start
-        .as_ref()
-        .is_some_and(|warm_start| !warm_start.consumed())
-    {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "warm_start_from: this fit's route runs no outer search that the model's \
-                     certified point describes, so it could not resume from it"
-                .to_string(),
-        });
+    // A route whose outer driver never received the model's point fitted cold;
+    // that is not the warm start the caller asked for. One that received it says
+    // what it did in the model's notes, so a point it did not use is never silent.
+    if let Some(warm_start) = fit_config.warm_start.as_ref() {
+        match warm_start.recorded() {
+            None => return Err(warm_start_route_refused("this fit's route")),
+            // A point that was used is what the caller asked for; one that was
+            // not is a fit that differs from the request.
+            Some(gam_model_api::WarmStartOutcome::Resumed) => inference_notes.inform(
+                "warm_start_from: resumed from the model's certified point (same inputs)"
+                    .to_string(),
+            ),
+            Some(gam_model_api::WarmStartOutcome::JoinedMultistart) => inference_notes.inform(
+                "warm_start_from: the model's certified point joined the multistart as one \
+                 more seed (other inputs)"
+                    .to_string(),
+            ),
+            Some(gam_model_api::WarmStartOutcome::NotUsed(reason)) => inference_notes.advise(
+                format!("warm_start_from: the model's certified point was not used: {reason}"),
+            ),
+        }
     }
+    record_input_fingerprint(
+        &mut payload,
+        crate::fit_orchestration::fit_input_fingerprint(
+            &formula_for_fingerprint,
+            dataset,
+            fit_config,
+        ),
+    );
     payload.unidentified_scalar_terms = unidentified_scalar_terms;
     apply_request_metadata(&mut payload, fit_config, inference_notes);
     Ok(payload)
@@ -2466,6 +2496,37 @@ fn payload_for_gaussian_location_scale(
             noise_offset_column: fit_config.noise_offset_column.clone(),
         },
     )
+}
+
+/// Saved payload of a joint multi-level expectile fit: the Gaussian
+/// location-scale payload of its `μ`/`σ` surfaces, tagged with the joint
+/// estimator that turns them into one non-crossing curve per level.
+fn payload_for_joint_expectile(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    joint: ExpectileLocationScaleFitResult,
+) -> Result<FittedModelPayload, String> {
+    let noise_formula = crate::fit_orchestration::expectile_noise_formula(&formula, fit_config)
+        .map_err(|error| error.to_string())?;
+    let location_scale_config = FitConfig {
+        noise_formula: Some(noise_formula),
+        ..fit_config.clone()
+    };
+    let response_scale = joint.location_scale.response_scale;
+    let mut payload = payload_for_gaussian_location_scale(
+        formula,
+        dataset,
+        &location_scale_config,
+        joint.location_scale,
+        response_scale,
+    )?;
+    payload.family = JOINT_EXPECTILE_FAMILY_TAG.to_string();
+    payload.estimator = FittedEstimator::ExpectileLocationScale {
+        levels: joint.levels,
+        standardized_expectiles: joint.standardized_expectiles,
+    };
+    Ok(payload)
 }
 
 /// Map the optional `(knots, degree, beta)` link-wiggle parts a location-scale

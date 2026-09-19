@@ -25,12 +25,50 @@ pub(crate) struct BoundInnerSeed {
     pub(crate) beta: Array1<f64>,
 }
 
+/// Exact outer curvature bound to the one outer coordinate it was measured at.
+///
+/// It seeds the BFGS iter-0 metric only at a start bitwise equal to `theta`,
+/// so a reseed or a resumed checkpoint elsewhere never inherits it.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundOuterCurvature {
+    pub(crate) theta: Array1<f64>,
+    pub(crate) hessian: Array2<f64>,
+}
+
 pub(crate) fn outer_theta_bitwise_eq(left: &Array1<f64>, right: &Array1<f64>) -> bool {
     left.len() == right.len()
         && left
             .iter()
             .zip(right.iter())
             .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+/// Why a search on the parent's own inputs did not take the parent's point.
+pub(crate) const RESUME_DECLINED: &str = "the parent's certified point is not certified for this search's criterion (a pilot, an \
+     evidence fit or an alternation round, or a criterion this version computes differently), \
+     so this search ran as it runs cold";
+
+/// `config` as the resume attempt for a warm start on the parent's own inputs
+/// (gam#3002): the parent's point as the one seed, its inner mode installed
+/// there, and its recorded criterion value, so the search accepts the point
+/// where it stands or declines (`resume_prior_certificate`).
+pub(crate) fn resume_config(
+    config: &OuterConfig,
+    warm_start: &gam_model_api::WarmStart,
+) -> OuterConfig {
+    let mut resume = config.clone();
+    resume.initial_rho = Some(warm_start.theta.clone());
+    resume.initial_rho_candidates.clear();
+    resume.sole_seed = true;
+    resume.screen_initial_rho = false;
+    resume.screening_cap = None;
+    resume.initial_inner_seed = Some(BoundInnerSeed {
+        theta: warm_start.theta.clone(),
+        beta: warm_start.beta.clone(),
+    });
+    resume.initial_rho_is_prior_terminal_certificate = true;
+    resume.resume_value = Some(warm_start.value);
+    resume
 }
 
 /// Install cached inner state only at the exact outer coordinate that owns it.
@@ -51,20 +89,20 @@ pub(crate) fn install_matching_initial_inner_seed(
         return Ok(());
     }
     match obj.seed_inner_state(&bound.beta)? {
-        SeedOutcome::Installed => log::info!(
+        SeedOutcome::Installed => log::debug!(
             "[CACHE] beta-warm context={} theta_dim={} beta_dim={} action=installed",
             context,
             bound.theta.len(),
             bound.beta.len(),
         ),
-        SeedOutcome::NoSlot => log::warn!(
+        SeedOutcome::NoSlot => log::debug!(
             "[CACHE] beta-warm context={} theta_dim={} beta_dim={} action=skip \
              reason=objective_has_no_inner_beta_slot",
             context,
             bound.theta.len(),
             bound.beta.len(),
         ),
-        SeedOutcome::Incompatible => log::info!(
+        SeedOutcome::Incompatible => log::debug!(
             "[CACHE] beta-warm context={} theta_dim={} beta_dim={} action=rho-only \
              reason=seed_beta_incompatible_with_inner_state",
             context,
@@ -73,13 +111,6 @@ pub(crate) fn install_matching_initial_inner_seed(
         ),
     }
     Ok(())
-}
-
-/// Observation and coefficient counts of the problem an outer run fits.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OuterProblemSize {
-    pub n_obs: Option<usize>,
-    pub p_coefficients: Option<usize>,
 }
 
 /// Temporarily require a complete inner solve.
@@ -107,6 +138,17 @@ impl Drop for FullFidelityInnerCapGuard<'_> {
     fn drop(&mut self) {
         self.cap.store(self.previous, Ordering::Relaxed);
     }
+}
+
+/// Declared size of the problem behind an outer objective: the number of
+/// observations and of inner coefficients. The decrement-band certificate
+/// charges its floating-point formation error against these counts
+/// (`outer_decrement_bands`); a route that declares no size takes no band
+/// verdict.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OuterProblemSize {
+    pub(crate) n_obs: Option<usize>,
+    pub(crate) p_coefficients: Option<usize>,
 }
 
 /// Configuration for the outer optimization runner.
@@ -176,6 +218,16 @@ pub(crate) struct OuterConfig {
     /// the canonical frame. `None` on the first attempt and on every path outside the plan loop.
     pub(crate) carried_checkpoint: Option<OuterResult>,
     pub(crate) initial_inner_seed: Option<BoundInnerSeed>,
+    /// The exact analytic Hessian of the criterion a continuation search
+    /// resumes, at the start it resumes from. The #784 corrected continuation
+    /// starts at the certified Laplace optimum, where the Laplace criterion's
+    /// analytic Hessian is exact and the correction's own curvature is a small
+    /// perturbation of it; BFGS takes its inverse as the iter-0 metric, so the
+    /// first step is a Newton step instead of a unit-length gradient step that
+    /// the line search halves back down one full corrected evaluation at a time.
+    /// The metric shapes the path only: BFGS reaches the same stationary point
+    /// under any SPD initial metric.
+    pub(crate) initial_curvature: Option<BoundOuterCurvature>,
     pub(crate) fallback_policy: FallbackPolicy,
     pub(crate) screening_cap: Option<Arc<AtomicUsize>>,
     pub(crate) screen_initial_rho: bool,
@@ -186,6 +238,13 @@ pub(crate) struct OuterConfig {
     /// about it: a terminal certificate is a rho a previous outer run already
     /// certified as stationary, so re-deriving it can only move it.
     pub(crate) initial_rho_is_prior_terminal_certificate: bool,
+    /// A resume attempt (gam#3002): the criterion value a prior fit certified at
+    /// `initial_rho`. The search then accepts `initial_rho` where it stands when
+    /// it is certified for THIS search's criterion (its value agrees within the
+    /// rounding envelope and its projected gradient is inside the band), and
+    /// otherwise declines with an error. It never searches
+    /// (`resume_prior_certificate`).
+    pub(crate) resume_value: Option<f64>,
     /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
     /// When set, the BFGS bridge drives this atomic on every accepted
     /// gradient eval to coarsen the inner Newton solve at early outer iters
@@ -229,8 +288,6 @@ pub(crate) struct OuterConfig {
     /// seed-prefix key so the next fit with related structure can warm-start
     /// from this one, even after an interrupted run.
     pub(crate) cache_mirror_sessions: Vec<Arc<CacheSession>>,
-    /// Observation and coefficient counts of the fitted problem; they size the
-    /// floating-point accumulation band of the Newton-decrement certificate.
     pub(crate) problem_size: OuterProblemSize,
     /// Converged exact outer Hessian `H(θ̂)` transferred from a prior
     /// structurally-matching fit via the persistent cache (a warm-start *hit*),
@@ -384,6 +441,7 @@ impl Default for OuterConfig {
             screening_cap: None,
             screen_initial_rho: false,
             initial_rho_is_prior_terminal_certificate: false,
+            resume_value: None,
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
@@ -394,6 +452,7 @@ impl Default for OuterConfig {
             cache_mirror_sessions: Vec::new(),
             problem_size: OuterProblemSize::default(),
             warm_start_outer_hessian: None,
+            initial_curvature: None,
             rho_canonical_keys: None,
             native_coordinate_order: None,
             curvature_search_latched: false,
@@ -434,6 +493,7 @@ pub struct OuterProblem {
     heuristic_log_lambdas: Option<Vec<f64>>,
     initial_rho: Option<Array1<f64>>,
     initial_rho_candidates: Vec<Array1<f64>>,
+    initial_curvature: Option<BoundOuterCurvature>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
     screen_initial_rho: bool,
@@ -448,6 +508,15 @@ pub struct OuterProblem {
     problem_size: OuterProblemSize,
     rho_canonical_keys: Option<Vec<u64>>,
     sole_seed: bool,
+    /// The inner mode at one joined multistart seed: installed only at that
+    /// exact point (`install_matching_initial_inner_seed`).
+    warm_start: Option<BoundInnerSeed>,
+    /// A prior fit's certified point (`with_warm_start`, gam#3002).
+    warm_start_source: Option<gam_model_api::WarmStart>,
+    /// This problem is a multistart's resume attempt: a declined prior
+    /// certificate is returned as the error, and the multistart runs the cold
+    /// seeds itself.
+    resume_only: bool,
 }
 
 impl OuterProblem {
@@ -475,6 +544,7 @@ impl OuterProblem {
             heuristic_log_lambdas: None,
             initial_rho: None,
             initial_rho_candidates: Vec::new(),
+            initial_curvature: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             screen_initial_rho: false,
@@ -489,6 +559,9 @@ impl OuterProblem {
             problem_size: OuterProblemSize::default(),
             rho_canonical_keys: None,
             sole_seed: false,
+            warm_start: None,
+            warm_start_source: None,
+            resume_only: false,
         }
     }
 
@@ -586,6 +659,12 @@ impl OuterProblem {
         self.initial_rho = Some(rho);
         self
     }
+    /// Bind the exact outer Hessian measured at `theta` to this search; see
+    /// [`OuterConfig::initial_curvature`].
+    pub(crate) fn with_initial_curvature(mut self, theta: Array1<f64>, hessian: Array2<f64>) -> Self {
+        self.initial_curvature = Some(BoundOuterCurvature { theta, hessian });
+        self
+    }
     pub(crate) fn with_initial_rho_candidates(mut self, candidates: Vec<Array1<f64>>) -> Self {
         self.initial_rho_candidates = candidates;
         self
@@ -615,6 +694,44 @@ impl OuterProblem {
         self.initial_rho_candidates.clear();
         self.sole_seed = true;
         self
+    }
+    /// Offer this search a prior fit's certified outer point (gam#3002). Every
+    /// warm-start source reaches every outer search through this one rule, and
+    /// [`Self::run`] and [`Self::run_certified_multistart`] derive from it what
+    /// the point may do without changing the point the search reports for its
+    /// own criterion (see [`gam_model_api::WarmStart`]):
+    /// - on the parent's own inputs the point is offered as a prior certificate
+    ///   first. The search accepts it with no outer iteration where it is
+    ///   certified for this search's criterion (`resume_prior_certificate`), and
+    ///   otherwise runs exactly as it runs cold, from a reset objective;
+    /// - on other inputs the independent multistart adds it as one more seed, so
+    ///   its argmin is taken over a superset of the cold seeds; the cascade,
+    ///   which certifies its first certifiable seed, runs cold and records why.
+    /// A point of another outer dimension belongs to another search: this one
+    /// runs cold.
+    pub fn with_warm_start(mut self, warm_start: &gam_model_api::WarmStart) -> Self {
+        self.warm_start_source = Some(warm_start.clone());
+        self
+    }
+    /// This problem with no warm start: the search a cold fit runs.
+    fn without_warm_start(&self) -> Self {
+        let mut cold = self.clone();
+        cold.warm_start = None;
+        cold.warm_start_source = None;
+        cold.resume_only = false;
+        cold
+    }
+    /// The warm start this search can take, if its point has this search's outer
+    /// dimension. A point of another dimension is recorded as not used here.
+    fn warm_start_for_this_search(&self) -> Option<&gam_model_api::WarmStart> {
+        let warm_start = self.warm_start_source.as_ref()?;
+        if warm_start.theta.len() != self.n_params {
+            warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
+                "the parent's certified point has another outer dimension than this search",
+            ));
+            return None;
+        }
+        Some(warm_start)
     }
     /// Wire the bidirectional inner-PIRLS feedback channel.
     ///
@@ -845,13 +962,15 @@ impl OuterProblem {
             initial_rho_candidates: self.initial_rho_candidates.clone(),
             previously_refused_seed_points: Vec::new(),
             carried_checkpoint: None,
-            initial_inner_seed: None,
+            initial_inner_seed: self.warm_start.clone(),
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
             screen_initial_rho: self.screen_initial_rho,
-            // Only the cache's final-hit path can establish this, and it says
-            // so where it sets `initial_rho`.
+            // Only a prior fit's certified point can establish these: the resume
+            // attempt `Self::run` derives from a warm start, and the cache's final
+            // hit, which says so where it sets `initial_rho`.
             initial_rho_is_prior_terminal_certificate: false,
+            resume_value: None,
             outer_inner_cap: self.outer_inner_cap.clone(),
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
@@ -864,6 +983,7 @@ impl OuterProblem {
             // Populated only by the persistent-cache resume path in `run` after
             // a warm-start hit decodes a converged outer Hessian.
             warm_start_outer_hessian: None,
+            initial_curvature: self.initial_curvature.clone(),
             rho_canonical_keys: self.rho_canonical_keys.clone(),
             // Set only on the recursive canonical run's config (#2817).
             native_coordinate_order: None,
@@ -1013,6 +1133,40 @@ impl OuterProblem {
         if objective_lower.is_some() || objective_upper.is_some() {
             install_objective_domain(&mut config, self.n_params, objective_lower, objective_upper)?;
         }
+        // A warm start (`with_warm_start`): on the parent's inputs the point is
+        // offered as a prior certificate, and a decline leaves this search to run
+        // exactly as it runs cold; on other inputs this cascade, which certifies
+        // its first certifiable seed, runs cold. One warm-start source per
+        // search, so the cold run takes no cache session either.
+        if self.warm_start_source.is_some() {
+            if let Some(warm_start) = self.warm_start_for_this_search() {
+                if warm_start.same_inputs {
+                    match run_outer(obj, &resume_config(&config, warm_start), context) {
+                        Ok(result) => {
+                            warm_start.record(gam_model_api::WarmStartOutcome::Resumed);
+                            return Ok(result);
+                        }
+                        Err(decline) if self.resume_only => return Err(decline),
+                        Err(decline) => {
+                            log::debug!(
+                                "[OUTER] {context}: the parent's certified point is not certified \
+                                 for this search's criterion ({decline}); running the cold search"
+                            );
+                            warm_start
+                                .record(gam_model_api::WarmStartOutcome::NotUsed(RESUME_DECLINED));
+                            obj.reset();
+                        }
+                    }
+                } else {
+                    warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
+                        "the fit's inputs differ from the parent's, and this search certifies its \
+                         first certifiable seed, so a new first seed would change the point it \
+                         reports",
+                    ));
+                }
+            }
+            return run_outer(obj, &config, context);
+        }
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);
         };
@@ -1028,7 +1182,7 @@ impl OuterProblem {
                     iterations,
                     prior_obj_display,
                 } => {
-                    log::info!(
+                    log::debug!(
                         "[CACHE] final-hit key={}.. context={} rho_dim={} prior_obj={:.6e} iter={} action=resume-and-recertify",
                         short_key,
                         context,
@@ -1080,7 +1234,7 @@ impl OuterProblem {
                         .as_ref()
                         .is_none_or(|initial| initial != rho)
                     {
-                        log::info!(
+                        log::debug!(
                             "[CACHE] hit  key={}.. context={} rho_dim={} beta_dim={} prior_obj={:.6e} iter={}",
                             short_key,
                             context,
@@ -1093,7 +1247,7 @@ impl OuterProblem {
                         config.screen_initial_rho = false;
                         had_hit = true;
                     } else {
-                        log::info!(
+                        log::debug!(
                             "[CACHE] hit  key={}.. context={} rho_dim={} beta_dim={} already-aligned prior_obj={:.6e}",
                             short_key,
                             context,
@@ -1111,7 +1265,7 @@ impl OuterProblem {
                     reason: "payload-shape-mismatch",
                     ..
                 } => {
-                    log::info!(
+                    log::debug!(
                         "[CACHE] skip key={}.. context={} reason=payload-shape-mismatch n_params={}",
                         short_key,
                         context,
@@ -1123,7 +1277,7 @@ impl OuterProblem {
                     prior_obj_display,
                     all_rho_finite,
                 } => {
-                    log::info!(
+                    log::debug!(
                         "[CACHE] skip key={}.. context={} reason={} prior_obj={:.6e} all_rho_finite={}",
                         short_key,
                         context,
@@ -1134,7 +1288,7 @@ impl OuterProblem {
                 }
             }
         } else {
-            log::info!(
+            log::debug!(
                 "[CACHE] miss key={}.. context={} reason=fresh-fingerprint n_params={}",
                 short_key,
                 context,
@@ -1182,7 +1336,7 @@ impl OuterProblem {
                 Some(result.iterations as u64),
             );
             if saved {
-                log::info!(
+                log::debug!(
                     "[CACHE] save key={}.. context={} final_obj={:.6e} iter={} resumed={}",
                     short_key,
                     context,
@@ -1203,7 +1357,7 @@ impl OuterProblem {
                 );
                 if mirror_saved {
                     let mirror_hex = mirror.key().to_hex();
-                    log::info!(
+                    log::debug!(
                         "[CACHE] save key={}.. context={} mirror final_obj={:.6e} iter={}",
                         &mirror_hex[..8.min(mirror_hex.len())],
                         context,
@@ -2727,7 +2881,7 @@ pub(crate) fn adjudicate_negative_curvature(
     // Restore the profiled inner state to the checkpoint ρ so the refusal path
     // that follows measures the checkpoint, not the last probe.
     if let Err(err) = obj.eval_cost(rho) {
-        log::warn!(
+        log::debug!(
             "[CERTIFICATE] {context}: failed to restore the objective to the checkpoint \
              after saddle-escape probing: {err}"
         );
@@ -2746,7 +2900,7 @@ pub(crate) fn adjudicate_negative_curvature(
             bounds,
             context,
         );
-        log::info!(
+        log::debug!(
             "[CERTIFICATE] {context}: the criterion CONFIRMS the interior strict saddle \
              (λ_min={lambda_min:.3e} < 0, |Pg| within band): a feasible step along its \
              eigenvector lowers the objective {:.6e} → {:.6e}; the caller decides whether that \
@@ -2772,7 +2926,7 @@ pub(crate) fn adjudicate_negative_curvature(
             escape_step_scales.len(),
         ));
     }
-    log::warn!(
+    log::debug!(
         "[CERTIFICATE] {context}: the criterion CONTRADICTS the reported negative curvature. \
          lambda_min={lambda_min:.6e} on the judged sub-block, and {probed} evaluated trial(s) \
          along its eigenvector — both signs, steps {:.3e} down to {smallest_step:.3e} — lowered \
@@ -2992,7 +3146,7 @@ fn expand_confirmed_descent(
         }
     }
     if best.expansions > 0 || truncated {
-        log::info!(
+        log::debug!(
             "[CERTIFICATE] {context}: the confirmed negative-curvature descent was extended past \
              the falsifiability ladder's step alpha={alpha:.6e} to alpha={:.6e} over {} \
              doubling(s) ({} evaluated), objective {:.9e} -> {:.9e}; box intersection along the \
@@ -3013,7 +3167,7 @@ fn expand_confirmed_descent(
     // Same contract as the adjudication's own checkpoint restore: leave the
     // profiled inner state at ρ, not at the last probe.
     if let Err(err) = obj.eval_cost(rho) {
-        log::warn!(
+        log::debug!(
             "[CERTIFICATE] {context}: failed to restore the objective to the checkpoint after \
              extending the negative-curvature descent: {err}"
         );
@@ -3658,7 +3812,7 @@ fn certify_fixed_point_optimality(
         },
     };
     result.termination.certify(via);
-    log::info!("[CERTIFICATE] {context}: {}", native_certificate_summary(&certificate, config));
+    log::debug!("[CERTIFICATE] {context}: {}", native_certificate_summary(&certificate, config));
     Ok(certificate)
 }
 
@@ -4028,7 +4182,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // screening and mint may otherwise print identical rho/raw gradients while
     // silently projecting against different faces. Record every detector-active
     // or actually projected coordinate, capped only in the log payload.
-    if log::log_enabled!(log::Level::Info) {
+    if log::log_enabled!(log::Level::Debug) {
         const PROJECTION_RECORD_LIMIT: usize = 32;
         let mut active_or_projected = 0usize;
         let mut projection_records = Vec::new();
@@ -4054,7 +4208,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             }
         }
         if active_or_projected > 0 {
-            log::info!(
+            log::debug!(
                 "[CERTIFICATE-PROJECTION] {context}: fidelity={fidelity:?},                  active_or_projected={active_or_projected},                  records(index,rho,model_lo,model_hi,projection_lo,projection_hi,raw_g,projected_g,detector_railed)={projection_records:?}{}",
                 if active_or_projected > projection_records.len() {
                     " (truncated)"
@@ -4079,7 +4233,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         // #2568's audit line, which until #2688 could not print on this path:
         // the cap it announces had already been applied silently in the band
         // helper, so the guard below that emits it was false by construction.
-        log::info!(
+        log::debug!(
             "[2568-REQUIREMENT] {context}: caller requires |Pg| <= {:.6e}; \
              engine bound was {:.6e} (rung {}); measured |Pg| = \
              {projected_grad_norm:.6e}",
@@ -4191,7 +4345,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && capability.hessian.is_analytic()
         && projected_grad_norm > stationarity_bound
     {
-        log::info!(
+        log::debug!(
             "[CERTIFICATE] {context}: screening's first-order band would refuse \
              (|Pg|={projected_grad_norm:.3e} > bound={stationarity_bound:.3e}, rung={}); \
              spending the order-four ladder so this refusal is judged by the SAME \
@@ -4212,7 +4366,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     Some(hessian)
                 }
                 _ => {
-                    log::info!(
+                    log::debug!(
                         "[CERTIFICATE] {context}: the escalated order-four evaluation \
                          supplied no usable curvature; keeping the first-order bound"
                     );
@@ -4220,7 +4374,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 }
             },
             Err(error) => {
-                log::info!(
+                log::debug!(
                     "[CERTIFICATE] {context}: the escalated order-four evaluation failed \
                      ({error}); keeping the first-order bound"
                 );
@@ -4376,7 +4530,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             ) {
                 Ok(decision) => Some(decision),
                 Err(reason) => {
-                    log::info!(
+                    log::debug!(
                         "[CERTIFICATE] {context}: Newton-decrement verdict not taken: {reason}; \
                          the first-order ladder decides (#2954)"
                     );
@@ -4390,7 +4544,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         });
     if let Some((decision, (bound, source))) = decrement_decided.as_ref() {
         let verdict = &decision.verdict;
-        log::info!(
+        log::debug!(
             "[CERTIFICATE] {context}: Newton-decrement verdict {verdict:?} (band_f = channels \
              {:.3e} + factor {:.3e} + inner residual {:.3e}); face {:?}, released {:?}; bound \
              {bound:.3e} (rung {}) replaces {stationarity_bound:.3e} (rung {}) at \
@@ -4433,7 +4587,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             // comparison this point actually satisfies: the historical line always
             // printed `≤`, including on refusals where the decrement was 360× over.
             let relation = if predicted_decrease <= objective_tol { "≤" } else { ">" };
-            log::info!(
+            log::debug!(
                 "[CERTIFICATE] {context}: curvature-scaled flat-valley bound {curvature_grad_bound:.3e} \
                  (|Pg|={projected_grad_norm:.3e}, Newton ½gᵀH⁻¹g={predicted_decrease:.3e} {relation} tol {objective_tol:.3e}) \
                  widened from gradient-band {stationarity_bound:.3e}"
@@ -4503,7 +4657,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && let Some(prior) = run_recorded.as_ref()
         && !prior.is_at(&result.rho)
     {
-        log::info!(
+        log::debug!(
             "[CERTIFICATE] {context}: gradient-reproducibility floor not applied: the \
              run-recorded measurement was taken at rho={:?}, not at the certified rho={:?} \
              (#2953)",
@@ -4544,7 +4698,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             && repro_bound > stationarity_bound
             && projected_grad_norm <= repro_bound
         {
-            log::info!(
+            log::debug!(
                 "[CERTIFICATE] {context}: gradient-reproducibility floor widened the \
                  stationarity bound to {repro_bound:.3e} (|Pg|={projected_grad_norm:.3e}, \
                  same-ρ spread between the run-recorded and certificate-time gradients \
@@ -4564,7 +4718,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // `derived_standard=false` is the actionable bit: it says this verdict rests
     // on a gradient-magnitude substitute because the resolvability form was
     // unavailable on this route, not because the problem called for it.
-    log::info!(
+    log::debug!(
         "[CERTIFICATE-BOUND] {context}: fidelity={fidelity:?}, rho={:?}, \
          bound {stationarity_bound:.6e} set by {} (derived_standard={}, \
          |Pg|={projected_grad_norm:.6e}, |g|={grad_norm:.6e}, \
@@ -4605,7 +4759,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // behaviour bit for bit.
     let criterion_invariance = obj.criterion_invariant_directions(&result.rho);
     if let Some(basis) = criterion_invariance.as_ref() {
-        log::info!(
+        log::debug!(
             "[CERTIFICATE] {context}: deflating {} criterion-invariant direction(s) of {} \
              before the curvature verdict -- their rho-curvature is the chain-rule term \
              `sum_k g_k t_k^2` identically, so its sign measures the gradient code against \
@@ -4741,7 +4895,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     .certify(OuterConvergedVia::AsymptoteStationary {
                         rails: certificate.stationarity.rails().len(),
                     });
-                log::info!("[CERTIFICATE] {context}: {}", native_certificate_summary(&certificate, config));
+                log::debug!("[CERTIFICATE] {context}: {}", native_certificate_summary(&certificate, config));
                 return Ok(certificate);
             }
         }
@@ -4835,7 +4989,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 .collect::<Vec<_>>()
                 .join(", ");
             let probe_summary = probe_reports.join("; ");
-            log::info!(
+            log::debug!(
                 "[CERTIFICATE] {context}: large-step flatness certificate classified \
                  coordinate(s) [{flat_list}] saturated-flat (curvature row ≤ \
                  {null_curvature_threshold:.3e}, probed Δ=±{LARGE_STEP_DELTA} with \
@@ -4863,7 +5017,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     decrement_stationarity_bound(certified_projected_grad_norm, &decision.verdict)
                 {
                     let verdict = &decision.verdict;
-                    log::info!(
+                    log::debug!(
                         "[CERTIFICATE] {context}: Newton-decrement verdict {verdict:?} with the \
                          saturated-flat coordinate(s) on the face; bound {bound:.3e} (rung {}) at \
                          |Pg|={certified_projected_grad_norm:.3e} (#2954)",
@@ -4876,9 +5030,9 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         }
         // `eval_cost` warm-starts the inner solve, so the probes moved the objective
         // off the certified point. Restore it to ρ̂ once iff we actually probed, so
-        // the downstream state sees the fitted
-        // point. A failure to re-evaluate the same ρ that certified moments ago is a
-        // genuinely broken objective and refuses conservatively.
+        // the downstream state sees the fitted point. A failure to re-evaluate the
+        // same ρ that certified moments ago is a genuinely broken objective and
+        // refuses conservatively.
         if probed_any {
             obj.eval_cost(&result.rho).map_err(|err| {
                 outer_nonconvergence_error(
@@ -5063,7 +5217,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     .certify(OuterConvergedVia::AsymptoteStationary {
                         rails: certificate.stationarity.rails().len(),
                     });
-                log::info!(
+                log::debug!(
                     "[CERTIFICATE] {context}: tail-stationary at the checkpoint \
                      (#2348 Inc 2c): {}",
                     native_certificate_summary(&certificate, config)
@@ -5071,7 +5225,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 return Ok(certificate);
             }
             TailSnapOutcome::ConfirmedNeedsReseed(snapped) => {
-                log::info!(
+                log::debug!(
                     "[CERTIFICATE] {context}: confirmed exponential tail on un-railed \
                      coordinate(s); publishing the snapped point {snapped} as a waypoint \
                      for one re-optimization retry (#2348 Inc 2b / #2358)"
@@ -5168,7 +5322,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 if allow_tail_snap {
                     result.saddle_escape_reseed = Some(point);
                 } else {
-                    log::info!(
+                    log::debug!(
                         "[CERTIFICATE] {context}: the criterion CONFIRMS the reported negative \
                          curvature (a feasible trial along its eigenvector lowers the objective \
                          by more than the criterion's resolution), and the one-shot escape \
@@ -5184,7 +5338,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 objective_resolution,
                 best_seen_cost,
             } => {
-                log::info!(
+                log::debug!(
                     "[CERTIFICATE] {context}: WITHDRAWING the curvature verdict — {probed} \
                      evaluated trial(s) down to step {smallest_step:.3e}, where the claim's own \
                      predicted decrease {predicted_at_smallest:.3e} reaches the criterion's \
@@ -5209,7 +5363,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 );
             }
             SaddleAdjudication::Declined(reason) => {
-                log::info!("[CERTIFICATE] {context}: saddle escape declined -- {reason}");
+                log::debug!("[CERTIFICATE] {context}: saddle escape declined -- {reason}");
             }
         }
     }
@@ -5251,7 +5405,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 None
             };
             if let Some(reason) = escape_blocker {
-                log::warn!(
+                log::debug!(
                     "[CERTIFICATE] {context}: negative-curvature saddle escape NOT ATTEMPTED at a \
                      first-order-stationary point that is being refused for curvature \
                      (hessian_psd={:?}, require_measured_psd={}); blocked by {reason}. The \
@@ -5390,7 +5544,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                             .get(k)
                             .is_some_and(|component| *component != 0.0)
                         {
-                            log::info!(
+                            log::debug!(
                                 "[ACTIVE-SET] {context}: coordinate {} is within the rail \
                                  margin of its bound but its projected gradient is \
                                  {:.6e} (feasible descent remains), so it is INTERIOR and \
@@ -5579,7 +5733,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         },
     };
     result.termination.certify(via);
-    log::info!("[CERTIFICATE] {context}: {}", native_certificate_summary(&certificate, config));
+    log::debug!("[CERTIFICATE] {context}: {}", native_certificate_summary(&certificate, config));
     Ok(certificate)
 }
 
@@ -5756,7 +5910,7 @@ fn try_certify_asymptote_rail(
         )));
     }
     if !box_railed.is_empty() {
-        log::info!(
+        log::debug!(
             "[CERTIFICATE] {}: {} bound-active ψ coordinate(s) {:?} held out of the tail law \
              (their box endpoints are attainable, so complementarity certifies them); tail law \
              runs on log-λ coordinate(s) {:?}",
@@ -5779,7 +5933,7 @@ fn try_certify_asymptote_rail(
     // hold, the measured-tail path below is unchanged.
     match try_certify_face_analytically(obj, inputs, &tail_railed, estimand_tol)? {
         Ok((rails, proof)) => {
-            log::info!(
+            log::debug!(
                 "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s): λ_min(C)={:.6e} \
                  > margin {:.3e}, joint pencil ĉ={:.6e}, remaining value gap {:.3e}, estimand \
                  travel {:.3e}",
@@ -5797,7 +5951,7 @@ fn try_certify_asymptote_rail(
                 rails,
             )));
         }
-        Err(reason) => log::info!(
+        Err(reason) => log::debug!(
             "[CERTIFICATE] {}: analytic λ=∞ face proof declined ({reason}); measuring the tail \
              instead",
             inputs.context,
@@ -5841,8 +5995,8 @@ fn try_certify_asymptote_rail(
     }
 
     // The probes warm-started the inner solve away from ρ̂; restore it so the
-    // shipped fitted state sees the certified
-    // point. A failure here is a genuinely broken objective, not a refusal.
+    // shipped fitted state sees the certified point. A failure here is a
+    // genuinely broken objective, not a refusal.
     if probed_any {
         obj.eval_cost(rho).map_err(|err| {
             EstimationError::RemlOptimizationFailed(format!(
@@ -6517,7 +6671,7 @@ fn try_tail_snap_to_rail(
                 // `OnTailNotYetEquivalent`: the law says WHERE the optimum is;
                 // the snap below reoptimizes from the face, granting nothing
                 // by itself.
-                log::info!(
+                log::debug!(
                     "[CERTIFICATE] joint {}-coordinate face: pencil-constant run \
                      confirmed but estimand not settled at the checkpoint \
                      ({reason}); snapping the face for re-optimization",
@@ -7306,7 +7460,7 @@ fn with_reseed_failure(
             rho_checkpoint,
         },
         other => {
-            log::warn!(
+            log::debug!(
                 "[OUTER] {context}: the certificate's {kind:?} reseed could not run \
                  ({reseed_error}); the refusal from the point it started at stands: {other}"
             );
@@ -7375,7 +7529,7 @@ pub(crate) fn run_outer(
     // Permutation-invariant outer search (#1538/#1539). When the caller has
     // supplied per-coordinate structural keys that induce a non-identity
     // canonical order, run the ENTIRE outer pipeline (seeding, multistart,
-    // optimization, and the #934 certificate / uncertainty audits) in that
+    // optimization, and the #934 certificate) in that
     // canonical layout against a permuting wrapper, then map the result back to
     // the native layout. Seeding/tie-breaking then see byte-identical
     // coordinates for every term order, so both orders select the same λ̂.
@@ -7387,7 +7541,7 @@ pub(crate) fn run_outer(
         // The runner's trail below prints ρ in canonical order; this line is what
         // lets a reader map it back. Only the returned result and refusal are
         // mapped to native order, both here.
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: searching in canonical coordinate order; canonical slot c \
              holds native coordinate perm[c], perm={perm:?}"
         );
@@ -7414,7 +7568,7 @@ pub(crate) fn run_outer(
         exact_config.screen_initial_rho = false;
         exact_config.operator_initial_trust_radius = result.operator_trust_radius;
         exact_config.warm_start_outer_hessian = result.final_hessian.clone();
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: sampled derivative pilot completed after {} iteration(s); \
              continuing from its checkpoint on the exact full-data measure",
             pilot_iterations,
@@ -7473,17 +7627,17 @@ pub(crate) fn run_outer(
     // 9.1671e2, because the two paths prime the inner solve under different
     // eval orders). Running the terminal installation FIRST and certifying
     // LAST makes the certificate's own evaluation the final objective-state
-    // installer, so the sealed terminal identity fit assembly binds against
-    // IS the certified evidence — bitwise, by construction, independent of
-    // basin multiplicity.
+    // installer, so the sealed terminal identity fit assembly binds against IS
+    // the certified evidence — bitwise, by construction, independent of basin
+    // multiplicity.
     let certify_and_install = |obj: &mut dyn OuterObjective,
                                result: &mut OuterResult|
      -> Result<OuterCriterionCertificate, EstimationError> {
         // Reinstall the selected point under cap=0 so the certificate below
         // measures the full-fidelity state belonging to `result.rho`, not
-        // the search's last (possibly capped) evaluation (seeding beta alone
-        // does not restore weights, factors, or link state). Reset forces a
-        // real installation instead of an LRU value hit.
+        // whatever capped search evaluation last touched the objective
+        // (seeding beta alone does not restore weights, factors, or link
+        // state). Reset forces a real installation instead of an LRU value hit.
         let terminal_cap_guard = config
             .outer_inner_cap
             .as_ref()
@@ -7571,7 +7725,7 @@ pub(crate) fn run_outer(
                 }
                 last_refused_certified_value = Some(certified_value);
                 let prior_iterations = result.iterations;
-                log::info!(
+                log::debug!(
                     "[OUTER] {context}: analytic certification refused after \
                      {prior_iterations} iteration(s) (final_value={certified_value:.6e}); re-running \
                      from the certificate's reseed {} (#2357/#2348/#2392)",
@@ -7770,6 +7924,17 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
         }
         canonical.warm_start_outer_hessian = Some(hc);
     }
+    if let Some(bound) = config.initial_curvature.as_ref()
+        && bound.hessian.nrows() == perm.len()
+        && bound.hessian.ncols() == perm.len()
+    {
+        canonical.initial_curvature = Some(BoundOuterCurvature {
+            theta: permute_arr(&bound.theta),
+            hessian: Array2::from_shape_fn((perm.len(), perm.len()), |(a, b)| {
+                bound.hessian[[perm[a], perm[b]]]
+            }),
+        });
+    }
     canonical
 }
 
@@ -7868,6 +8033,11 @@ pub(crate) fn run_outer_uncertified(
                 )
             })?;
     }
+    // A resume attempt (gam#3002) accepts the prior certificate where it stands
+    // or declines; it runs no plan, so no fallback can search from the point.
+    if config.resume_value.is_some() {
+        return resume_prior_certificate(obj, config, &cap, context);
+    }
     // Frontier ρ-scaling auto-switch (#986): at per-atom-EFS-eligible frontier
     // rho dimension the decoupled per-atom fixed point is the primary outer
     // iteration; everything else falls through to the dense / standard path
@@ -7935,7 +8105,7 @@ pub(crate) fn run_outer_uncertified(
     'plan_attempts: for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
         let the_plan = plan(attempt_cap);
         if attempt_idx > 0 {
-            log::debug!("[OUTER] {context}: primary plan failed; falling back to {the_plan}");
+            log::trace!("[OUTER] {context}: primary plan failed; falling back to {the_plan}");
         }
         log_plan(context, attempt_cap, &the_plan);
 
@@ -7977,7 +8147,7 @@ pub(crate) fn run_outer_uncertified(
             // authority exactly when the incumbent lay outside the criterion's
             // finite observed-information domain (#2653).
             attempt_config.seed_config.seed_budget = 1;
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: resuming {the_plan} first from the last finite {:?} \
                  incumbent after {} iteration(s) of its plan attempt: cost={:.6e}, \
                  |step|={:.3e}, inner_beta={}",
@@ -8008,7 +8178,7 @@ pub(crate) fn run_outer_uncertified(
             // refuses, `should_start_next_seed` may advance until a candidate
             // certifies, exactly as for a rho-local EFS trial refusal.
             attempt_config.seed_config.seed_budget = 1;
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: analytic screening refuted the {:?} fixed point; \
                  resuming {the_plan} first from its best finite checkpoint after {} \
                  iteration(s): cost={:.6e}",
@@ -8033,7 +8203,7 @@ pub(crate) fn run_outer_uncertified(
         ) {
             Ok(PlanRunOutcome::Converged(result)) => Ok(result),
             Ok(PlanRunOutcome::FirstOrderFallbackRequested(request)) => {
-                log::debug!(
+                log::trace!(
                     "[OUTER] {context}: attempt {} (plan={the_plan}) requested a joint \
                      first-order fallback: {}",
                     attempt_idx + 1,
@@ -8071,7 +8241,7 @@ pub(crate) fn run_outer_uncertified(
                 continue 'plan_attempts;
             }
             Ok(PlanRunOutcome::DominatedPlateau(dominated)) => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: attempt {} (plan={the_plan}) declined a certified \
                      winner at cost {:.6e}, dominated by an evaluated state at cost {:.6e} \
                      (gap {:.3e} > rounding envelope {:.3e}); that state is the resume \
@@ -8110,7 +8280,7 @@ pub(crate) fn run_outer_uncertified(
                     && matches!(the_plan.solver, Solver::Efs | Solver::HybridEfs)
                     && has_bfgs_fallback
                 {
-                    log::info!(
+                    log::debug!(
                         "[OUTER] {context}: {:?} stopped at a fixed point, but no \
                          candidate passed analytic screening; continuing the best finite \
                          checkpoint with analytic-gradient BFGS",
@@ -8152,14 +8322,14 @@ pub(crate) fn run_outer_uncertified(
                     "{context}: attempt {} (plan={the_plan}) exhausted without convergence",
                     attempt_idx + 1
                 );
-                log::debug!("[OUTER] {message}; trying degraded fallback plan");
+                log::trace!("[OUTER] {message}; trying degraded fallback plan");
                 last_error = Some(EstimationError::RemlOptimizationFailed(message));
             }
             Err(e) => {
                 if e.is_fatal_outer_evaluation() {
                     return Err(e);
                 }
-                log::debug!(
+                log::trace!(
                     "[OUTER] {context}: attempt {} (plan={the_plan}) failed: {e}",
                     attempt_idx + 1
                 );
@@ -8282,7 +8452,7 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         }
     };
 
-    log::info!(
+    log::debug!(
         "[OUTER] {context}: frontier ρ-scaling (rho_dim={rho_dim}) → per-atom decoupled EFS primary"
     );
 
@@ -8944,6 +9114,35 @@ pub(crate) fn run_fixed_point_outer_solver(
     label: &str,
     failure_prefix: &str,
 ) -> Result<OuterResult, FixedPointOuterRunError> {
+    // Judge the seed before walking from it. The walk's own stop is a step-norm
+    // test, never stationarity (see the certificate after the walk), so a seed
+    // that is already stationary is walked anyway: a smoothing parameter on its
+    // rail keeps proposing an outward EFS step, and nothing short of the
+    // unprogressing-walk window ends it. On the ISLR `Default` logistic fit the
+    // #784 corrected continuation starts from the certified Laplace optimum, which
+    // is stationary under the correction too (the BFGS continuation later
+    // certified it at zero iterations, |g| = 5.9e-6), yet the walk spent ~60
+    // corrected evaluations there. The screening certificate is the one the walk's
+    // stop is judged by, so passing it here is the same claim with zero steps.
+    // A refusal is no verdict on the walk; it proceeds from the same seed.
+    if obj.capability().gradient == Derivative::Analytic {
+        let mut seed_result = OuterResult::new(seed.clone(), f64::NAN, 0, true, the_plan);
+        if let Ok(certificate) = certify_outer_optimality_with_fidelity(
+            obj,
+            config,
+            context,
+            &mut seed_result,
+            CertificationFidelity::Screening,
+        ) {
+            log::info!(
+                "[OUTER] {context}: {label} seed is already stationary at cost={:.6e}; \
+                 no fixed-point step taken",
+                seed_result.final_value,
+            );
+            seed_result.criterion_certificate = Some(certificate);
+            return Ok(seed_result);
+        }
+    }
     // Shared publication slot for the recurrent-restored-incumbent stop
     // (#2235 verdict 2): the bridge is moved into the driver, so the streak
     // count comes back through this cell and is stamped onto the returned
@@ -9117,7 +9316,7 @@ pub(crate) fn run_fixed_point_outer_solver(
                     if config.fallback_policy == FallbackPolicy::Automatic
                         && obj.capability().gradient == Derivative::Analytic =>
                 {
-                    log::info!(
+                    log::debug!(
                         "[OUTER] {context}: {label} step-norm stop after {} iteration(s) at \
                          cost={:.6e} is not stationary; continuing the incumbent with the \
                          analytic-gradient plan: {refusal}",
@@ -9147,7 +9346,7 @@ pub(crate) fn run_fixed_point_outer_solver(
             let step_norm = last_solution.final_step_norm.expect(
                 "a fixed-point max-iteration solution must carry its final accepted step norm",
             );
-            log::warn!(
+            log::debug!(
                 "[OUTER warning] {context}: {label} hit max_iter={} at final_value={:.6e} step_norm={:.3e}",
                 config.max_iter,
                 last_solution.final_value,
@@ -9161,7 +9360,7 @@ pub(crate) fn run_fixed_point_outer_solver(
                 && (!last_solution.final_value.is_finite()
                     || best.sample.value < last_solution.final_value)
             {
-                log::warn!(
+                log::debug!(
                     "[OUTER] {context}: {label} budget-exhaustion last iterate (value={:.6e}) \
                      is worse than the best iterate it evaluated (value={:.6e}, iteration {}); \
                      substituting the best iterate (#2817)",

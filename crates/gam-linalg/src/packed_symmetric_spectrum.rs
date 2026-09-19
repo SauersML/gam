@@ -34,7 +34,7 @@
 //! Time is `O(n³)` (the tridiagonalization; `4n³/3` flops) plus `O(n²)` for the
 //! QL sweep — the same order a dense eigendecomposition pays. Memory is the
 //! caller's packed triangle, destroyed in place, plus `O(n)` working vectors
-//! and `O(threads · n)` reduction buffers.
+//! and `O(threads · log(n) · n)` reduction buffers.
 
 use rayon::prelude::*;
 
@@ -297,36 +297,39 @@ fn tridiagonalize_packed_with_probe(
 /// `p := S v` for the symmetric `m × m` `S` held as a row-major packed upper
 /// triangle. `p` is fully overwritten.
 fn packed_symmetric_matvec(m: usize, packed: &[f64], v: &[f64], p: &mut [f64]) {
-    if m < PARALLEL_MIN_ROWS || rayon::current_num_threads() < 2 {
+    if m < PARALLEL_MIN_ROWS {
         p.fill(0.0);
         serial_packed_symmetric_matvec(m, packed, v, p, 0, m);
         return;
     }
     // Every row scatters into columns to its right, so the partial products do
-    // not partition by output index; each task accumulates a full-width partial
-    // and the reduction adds them. `threads × m` doubles, against the `m²/2`
-    // triangle the kernel is reading — accounted for in the caller's budget as
-    // an `O(m)` term.
-    let tasks = rayon::current_num_threads().min(m.div_ceil(PARALLEL_MIN_ROWS)).max(1);
-    let chunk = m.div_ceil(tasks);
-    let partials: Vec<Vec<f64>> = (0..tasks)
-        .into_par_iter()
-        .map(|task| {
-            let lo = task * chunk;
-            let hi = ((task + 1) * chunk).min(m);
+    // not partition by output index; each block of rows accumulates a
+    // full-width partial and the partials are added over a fixed pairwise tree.
+    // The blocks are a function of `m` alone, so the product's bits are the
+    // same at every pool width (blocks sized from the pool width made the
+    // spectrum follow `RAYON_NUM_THREADS`). The partials live along the fold's
+    // join stacks — `O(threads · log(m) · m)` doubles against the `m²/2`
+    // triangle the kernel is reading.
+    let block = PARALLEL_MIN_ROWS;
+    let sum = crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        m.div_ceil(block),
+        block,
+        |blocks| {
+            let lo = blocks.start * block;
+            let hi = (blocks.end * block).min(m);
             let mut local = vec![0.0_f64; m];
-            if lo < hi {
-                serial_packed_symmetric_matvec(m, packed, v, &mut local, lo, hi);
-            }
+            serial_packed_symmetric_matvec(m, packed, v, &mut local, lo, hi);
             local
-        })
-        .collect();
-    p.fill(0.0);
-    for local in &partials {
-        for (target, &value) in p.iter_mut().zip(local.iter()) {
-            *target += value;
-        }
-    }
+        },
+        |mut acc, other| {
+            for (target, &value) in acc.iter_mut().zip(other.iter()) {
+                *target += value;
+            }
+            acc
+        },
+    )
+    .expect("m >= PARALLEL_MIN_ROWS leaves at least one block");
+    p.copy_from_slice(&sum);
 }
 
 /// Accumulate rows `lo..hi` of the packed symmetric product into `p`.
@@ -354,7 +357,7 @@ fn serial_packed_symmetric_matvec(
 /// `S := S − v wᵀ − w vᵀ` on the packed upper triangle of the symmetric
 /// `m × m` `S`.
 fn packed_symmetric_rank2_downdate(m: usize, packed: &mut [f64], v: &[f64], w: &[f64]) {
-    if m < PARALLEL_MIN_ROWS || rayon::current_num_threads() < 2 {
+    if m < PARALLEL_MIN_ROWS {
         serial_packed_symmetric_rank2_downdate(m, packed, v, w, 0);
         return;
     }
@@ -611,4 +614,44 @@ mod tests {
         assert!(error.contains("probe entry"), "unexpected error: {error}");
     }
 
+    /// The packed matvec above `PARALLEL_MIN_ROWS` splits its rows into
+    /// shape-sized blocks, so the spectrum and the probe carry the same words on
+    /// every pool width.
+    #[test]
+    fn spectrum_words_do_not_depend_on_the_pool_width() {
+        let m = 700usize;
+        let mut state = 0x7ACC_u64;
+        let mut packed = Vec::with_capacity(m * (m + 1) / 2);
+        for i in 0..m {
+            for j in i..m {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let unit = (state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5;
+                packed.push(if i == j { 4.0 + unit } else { unit / m as f64 });
+            }
+        }
+        let probe: Vec<f64> = (0..m).map(|i| (0.13 * i as f64).cos()).collect();
+        let at_width = |width: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(width).build().expect("pool");
+            pool.install(|| {
+                let mut product = vec![0.0; m];
+                packed_symmetric_matvec(m, &packed, &probe, &mut product);
+                let mut reduced = packed.clone();
+                let mut rotated = probe.clone();
+                let values = packed_symmetric_spectrum_with_probe(m, &mut reduced, &mut rotated)
+                    .expect("spectrum");
+                values
+                    .iter()
+                    .chain(rotated.iter())
+                    .chain(product.iter())
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<u64>>()
+            })
+        };
+        let single = at_width(1);
+        for width in [2, 3, 8] {
+            assert!(single == at_width(width), "pool width {width} changed the words");
+        }
+    }
 }

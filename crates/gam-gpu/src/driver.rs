@@ -556,7 +556,7 @@ fn is_cuda_compute_component(component: &str) -> bool {
 fn complete_mapped_cuda_stack(mapped: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     let canonical = |p: &Path| {
         p.canonicalize().unwrap_or_else(|error| {
-            log::debug!(
+            log::trace!(
                 "cuda stack: cannot canonicalize {}: {error}; \
                  comparing the path as given",
                 p.display()

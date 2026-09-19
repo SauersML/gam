@@ -11,7 +11,7 @@ Pipeline
    (same prompts/rows in both layers — the paired input a crosscoder needs).
 2. Fit a 2-layer manifold crosscoder with ONE shared latent chart `t` and two
    honest per-layer decoders `B^(L)`, `B^(L+1)` through the unified outer-REML
-   engine (``gamfit.sae_crosscoder_fit``).
+   engine (``gamfit.sae.sae_crosscoder_fit``).
 3. For each fitted circle atom, measure the empirical anchor→block transport map
    and its phase-shift-law fit (``measure_atom_transport_between`` in
    ``crates/gam-sae/src/manifold/transport_law.rs``): phase_r2 and the deviation
@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    from gamfit import sae_crosscoder_fit  # noqa: E402  (import after data load)
+    from gamfit.sae import sae_crosscoder_fit  # noqa: E402  (import after data load)
 
     controls = {
         "n_atoms": args.n_atoms,

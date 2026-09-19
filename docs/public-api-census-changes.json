@@ -4477,6 +4477,18 @@
     "evidence": "git grep -w at d10950d360: every caller is in gam-solve's rho_optimizer (run.rs, bridges.rs, run_plan_tests.rs, rail_projection_tests.rs, arc_curvature_stationary_2817_tests.rs) and resolves through the re-export; gam-pyffi names none of them."
   },
   {
+    "base": "ae20ed3b52b554c6379b92ae588611a08d2376a3",
+    "removed": {
+      "crates/gam-inference/src/model_comparison.rs::corrected_edf": 1,
+      "crates/gam-inference/src/model_comparison.rs::rho_uncertainty_df": 1,
+      "crates/gam-solve/src/evidence.rs::compare_reml_fits": 1,
+      "crates/gam-solve/src/evidence.rs::criterion_gap": 1,
+      "crates/gam-solve/src/evidence.rs::ranking_score": 1
+    },
+    "reason": "slop.md G2 / pyGAM audit d11: model comparison ranks on the smoothing-corrected AIC through one Rust function. corrected_edf and CorrectedEdf::rho_uncertainty_df move from gam-inference::model_comparison to gam_solve::inference::information_criteria under the same names, so the fitted summary can form aic_corrected. compare_reml_fits (which ranked on ranking_score, the uncorrected -2*loglik + 2*edf) is replaced by evidence::compare_models ranking on aic_corrected, and criterion_gap by log_evidence_ratio, half the corrected-AIC gap.",
+    "evidence": "At the base, git grep -w finds compare_reml_fits, ranking_score and criterion_gap only in crates/gam-solve/src/evidence.rs and the gam-pyffi FFI (ffi_prelude.rs imports, model_ffi.rs), and corrected_edf / rho_uncertainty_df only in gam-inference; every caller is rewritten in this change. See the matching docs/source-removal-changes.json entry."
+  },
+  {
     "base": "da5b1ad4bd7ecf8081e094aaf5e8573a7d9792af",
     "removed": {
       "crates/gam-models/src/fit_orchestration/materialize/marginal_slope.rs::resolve_marginal_slope_base_link": 1
@@ -4519,5 +4531,40 @@
     },
     "reason": "pyGAM audit F4/G6: the sigma-point cubature smoothing correction, its GPU stream-pool lane, the cost-gated rho_uncertainty sampler and the post-fit rho-posterior normality diagnostic are deleted (see docs/source-removal-changes.json). The analytic first-order Vp = Vb + J V_rho J^T, already the correction for every fit the cubature gates refused, is now the only one.",
     "evidence": "git grep -w at the head finds no call of any listed function. Remaining occurrences of the names are unrelated locals and fields (active_directions, first_order_variance, skipped) and make_first_order, now a private helper of the eval.rs test module. The callers were the deleted cubature dispatch in reml/eval.rs, the deleted run.rs diagnostic and tests of those paths. tests/test_smoothing_correction_first_order.py pins the replacement: the first-order correction on 6-smooth GLMs and nominal coverage for Gaussian, Poisson and binomial."
+  },
+  {
+    "base": "c981848bcb2ddbde8a46383c9c065105a19e4525",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::consumed": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::from_model": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::required": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::session": 1
+    },
+    "reason": "gam#3002: OuterWarmStart's four methods staged a saved model's point as a one-entry outer cache session. They are replaced by resolve_warm_start, which builds a gam_model_api::WarmStart (the point, its certified value, and whether the inputs are the parent's), and every outer search takes it through OuterProblem::with_warm_start. See docs/source-removal-changes.json at the same base.",
+    "evidence": "At the landing tree git grep finds no call of OuterWarmStart::from_model, .session(), .required() or .consumed() on a warm start; gam-pyffi's geometry_ffi.rs, the only production caller of from_model, calls resolve_warm_start. public_api_census.py at 5bd6913b9b on 55212405d7 refused exactly these four identities without this entry, and verified 13342 -> 13345 public function declarations with it."
+  },
+  {
+    "base": "a5a71e516b0a0f1afd3b29b7e1e080926e4bb206",
+    "removed": {
+      "crates/gam-terms/src/basis/bspline_eval.rs::create_difference_penalty_matrix": 1
+    },
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix was a coefficient-difference penalty DᵀD. SPEC puts penalties on the function; production B-spline penalties are bspline_derivative_penalty_matrix, and the function's one production caller discarded its result. Deleted together with the dead penalty output of compute_geometric_constraint_transform (see docs/source-removal-changes.json).",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call, in duchon_thinplate.rs compute_geometric_constraint_transform, whose output both bspline_build.rs callers bind to `_`; all other uses are tests, now served by the test-only gam_linalg_test_support::coefficient_difference_penalty. cargo check --workspace --all-targets RC 0."
+  },
+  {
+    "base": "e110c67a94b801ddc9cc3756a3d0c61dada87550",
+    "removed": {
+      "crates/gam-math/src/probability.rs::signed_weighted_chi_square_sf_to_tolerance": 1
+    },
+    "reason": "pyGAM audit pv-tails-numerics (inference L4). The caller-tolerance Imhof evaluator lost all relative accuracy below about 1e-16, because 1/2 + I/pi cancels there. Its tolerance argument was the reason the smooth-term LR driver clamped the request to [1e-13, 1e-3]. It is replaced by signed_weighted_chi_square_sf in crates/gam-math/src/probability/weighted_chi_square.rs, re-exported from gam_math::probability. The replacement takes no tolerance and returns a TailProbability whose relative error bound is derived. Its only caller, smooth_term_lr.rs (conditional_tail_with_bound), calls the replacement.",
+    "evidence": "public_api_census.py, run with base 0b7f21d97b and head 5e41417f1c, reported exactly this identity as removed (13342 public function declarations before, 13343 after). git grep -c -w signed_weighted_chi_square_sf_to_tolerance finds 0 files under crates, src and tests at the landing tree. crates/gam-math/tests/tail_references.rs passes all five of its tests against the stored mpmath references."
+  },
+  {
+    "base": "0b0d0120c207ebec5299e3cbe19e8cc9a3d6335d",
+    "removed": {
+      "crates/gam-solve/src/topology_selector.rs::bic_score": 1
+    },
+    "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
+    "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
   }
 ]

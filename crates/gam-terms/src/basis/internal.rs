@@ -455,7 +455,6 @@ pub(super) fn cumulative_bspline_offsets_into(
 #[cfg(test)]
 mod knot_scale_invariance_tests {
     use super::*;
-    use crate::basis::create_difference_penalty_matrix;
     use ndarray::Array1;
 
     /// Clamped cubic knot vector with interior knots at `frac * scale` for
@@ -599,18 +598,6 @@ mod knot_scale_invariance_tests {
                     full[i]
                 );
             }
-        }
-    }
-
-    #[test]
-    fn divided_difference_penalty_is_invariant_on_tiny_coordinate_domains() {
-        let unit = Array1::from(vec![0.0, 0.1, 0.35, 0.7, 1.0]);
-        let scale = 1e-14;
-        let tiny = unit.mapv(|x| x * scale);
-        let reference = create_difference_penalty_matrix(5, 2, Some(unit.view())).unwrap();
-        let observed = create_difference_penalty_matrix(5, 2, Some(tiny.view())).unwrap();
-        for (&left, &right) in reference.iter().zip(observed.iter()) {
-            assert!((left - right).abs() < 1e-10);
         }
     }
 

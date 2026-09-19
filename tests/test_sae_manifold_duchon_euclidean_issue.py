@@ -36,7 +36,7 @@ def test_sae_manifold_fit_duchon_atom_dim_succeeds(
     random_data: np.ndarray, atom_dim: int
 ) -> None:
     """sae_manifold_fit(atom_basis="duchon", d_atom=d) should succeed for d in {1,2,3}."""
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=random_data,
         K=1,
         atom_basis="duchon",
@@ -61,7 +61,7 @@ def test_sae_manifold_fit_euclidean_atom_dim_succeeds(
     with the same Duchon errors. Euclidean atoms are mathematically distinct from
     thin-plate splines and should get their own builder.
     """
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=random_data,
         K=1,
         atom_basis="euclidean",
@@ -79,7 +79,7 @@ def test_sae_manifold_fit_duchon_2d_does_not_violate_collocation(
     random_data: np.ndarray,
 ) -> None:
     """The exact failure mode from the issue: d=2 trips 2*(p+s) > d+2."""
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=random_data,
         K=1,
         atom_basis="duchon",
@@ -95,7 +95,7 @@ def test_sae_manifold_fit_duchon_1d_builds_primary_penalty(
     random_data: np.ndarray,
 ) -> None:
     """The exact 1D failure: 'sae_build_duchon_atom: primary penalty was not built'."""
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=random_data,
         K=1,
         atom_basis="duchon",
@@ -109,7 +109,7 @@ def test_sae_manifold_fit_duchon_1d_builds_primary_penalty(
 
 def test_sae_manifold_fit_multi_atom_duchon_mix(random_data: np.ndarray) -> None:
     """Per-atom mixed Duchon dims should all work, not just one."""
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=random_data,
         K=3,
         atom_basis="duchon",
@@ -128,7 +128,7 @@ def test_euclidean_atom_is_not_thin_plate(random_data: np.ndarray) -> None:
     A clear contract: when atom_basis="euclidean", the geometry plan should
     distinguish it from "duchon". Today they share the underlying builder.
     """
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=random_data,
         K=1,
         atom_basis="euclidean",

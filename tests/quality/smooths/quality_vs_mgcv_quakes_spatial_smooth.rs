@@ -399,9 +399,9 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data() {
 fn diag_quakes_spatial_1074() {
     init_parallelism();
     // Install the crate logger and raise the level so the optimizer's
-    // env-free `log::debug!` #1074 ρ-sweep records reach stderr.
+    // env-free `log::trace!` #1074 ρ-sweep records reach stderr.
     gam::solver::progress_log::init_logging();
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(log::LevelFilter::Trace);
     let ds = load_csvwith_inferred_schema(Path::new(QUAKES_CSV)).unwrap();
     let col = ds.column_map();
     let (long_idx, lat_idx, depth_idx, mag_idx) =

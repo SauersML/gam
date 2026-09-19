@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::io::BufWriter;
 
 /// The CLI transport of the MPD surface (#2951). It reads the request document and
-/// the named NPY arrays, runs the same Rust entry `gamfit.run_parameter_decomposition`
+/// the named NPY arrays, runs the same Rust entry `gamfit.sae.run_parameter_decomposition`
 /// runs, and writes `report.json` and one NPY per array the report names. Every
 /// validation and refusal belongs to the surface.
 pub(crate) fn run_parameter_decomposition_cli(args: ParameterDecompositionArgs) -> CliResult<()> {
@@ -124,7 +124,7 @@ mod tests {
             .split_whitespace()
             .filter(|token| token.starts_with("--"))
             .collect();
-        let expected: BTreeSet<&str> = ["--request", "--tensor", "--out", "--log-level", "--help"]
+        let expected: BTreeSet<&str> = ["--request", "--tensor", "--out", "--verbose", "--help"]
             .into_iter()
             .collect();
         assert_eq!(

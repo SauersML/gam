@@ -808,7 +808,40 @@ pub enum LocalLawMixture {
     VanishingAtTruncation { floor: f64 },
 }
 
+/// How the flexible row algebra integrates a row over its latent law — the one
+/// property of a law that a row kernel has to implement (gam#3000). The CPU
+/// row lowering takes one branch per form, and a device kernel declares the
+/// forms it transcribes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LatentIntegral {
+    /// Closed-form moments of the standard normal density on each denested
+    /// cubic cell.
+    GaussianCellMoments,
+    /// A finite weighted sum over the law's grid nodes.
+    DiscreteGrid,
+}
+
+impl LatentIntegral {
+    /// The capability a kernel needs to compute a model of this form.
+    pub(crate) const fn capability(self) -> &'static str {
+        match self {
+            Self::GaussianCellMoments => "the Gaussian cell-moment latent integral",
+            Self::DiscreteGrid => "the discrete-grid latent integral of an empirical latent law",
+        }
+    }
+}
+
 impl LatentMeasureKind {
+    /// The form in which the row algebra integrates over this law.
+    pub(crate) fn integral(&self) -> LatentIntegral {
+        match self {
+            Self::StandardNormal => LatentIntegral::GaussianCellMoments,
+            Self::GlobalEmpirical { .. } | Self::LocalEmpirical { .. } => {
+                LatentIntegral::DiscreteGrid
+            }
+        }
+    }
+
     pub fn validate(&self, context: &str) -> Result<(), String> {
         match self {
             Self::StandardNormal => Ok(()),
@@ -1377,7 +1410,7 @@ impl LatentZRankIntCalibration {
         // Φ⁻¹(p); clip away from {0, 1} to keep the quantile finite.
         standard_normal_quantile(p).unwrap_or_else(|err| {
             let clipped = if p < 0.5 { -8.0 } else { 8.0 };
-            log::debug!(
+            log::trace!(
                 "standard_normal_quantile({p}) failed ({err}); clipping the latent score to {clipped}"
             );
             clipped
@@ -2612,7 +2645,7 @@ pub(crate) fn build_latent_measure_decision(
                         grid_size,
                         "estimated latent law",
                     )?;
-                    log::info!(
+                    log::debug!(
                         "[{context} latent-z] the conditional law of the score does not move on \
                          the marginal-index span ({}) and the score passes the standard-normal \
                          adequacy screen ({}); fitting the closed-form Gaussian law, to be \
@@ -2640,7 +2673,7 @@ pub(crate) fn build_latent_measure_decision(
                          evaluates only the closed form",
                         adequacy.ledger()
                     );
-                    log::warn!(
+                    log::debug!(
                         "[{context} latent-z] fitting the closed form uncertified: {missing} \
                          (gam#2926)"
                     );
@@ -2664,7 +2697,7 @@ pub(crate) fn build_latent_measure_decision(
                     grid_size,
                     "estimated latent law",
                 )?;
-                log::info!(
+                log::debug!(
                     "[{context} latent-z] the conditional law of the score does not move on the \
                      marginal-index span ({}) and the score fails the standard-normal adequacy \
                      check ({}); anchoring on its estimated law of {} nodes, the score on its own \
@@ -2688,7 +2721,7 @@ pub(crate) fn build_latent_measure_decision(
                      this configuration's row kernel evaluates only the closed form",
                     evidence.summary()
                 );
-                log::warn!(
+                log::debug!(
                     "[{context} latent-z] fitting the closed form uncertified: {missing} (gam#2926)"
                 );
                 return Ok(LatentMeasureDecision {
@@ -2732,7 +2765,7 @@ pub(crate) fn build_latent_measure_decision(
             )
             .map_err(|error| error.to_string())?;
             let fitted = candidates.fitted_arm();
-            log::info!(
+            log::debug!(
                 "[{context} latent-z] the conditional law of the score moves on the \
                  marginal-index span ({}); fitting the {} law, to be certified against the \
                  other arms ({}) by their cross-fitted excess anchoring loss at the converged \
@@ -2790,7 +2823,7 @@ pub(crate) fn build_latent_measure_decision(
                 DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
                 "estimated latent law",
             )?;
-            log::warn!(
+            log::debug!(
                 "[{context} latent-z] the Gaussian latent law was declared, and the score fails \
                  the standard-normal adequacy screen (adequacy ledger, x = statistic / bound, \
                  x<=1 passed: {}); fitting the declared closed form, whose estimated excess \
@@ -2847,7 +2880,7 @@ pub(crate) fn build_latent_measure_decision(
                     let zeta = cal.apply(z.view(), a_block)?;
                     let (kind, build) =
                         build_global_empirical_latent_measure(&zeta, weights, grid_size)?;
-                    log::info!(
+                    log::debug!(
                         "[{context} latent-z] declared conditional location-scale law: \
                          basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e}; the \
                          residual is anchored on its empirical law (gam#2926)",

@@ -386,6 +386,19 @@ pub(crate) fn laplace_gaussian_fallback(
             rationale,
         )?,
         (None, None) => {
+            // An expectile fit's Hessian rebuilds the Gaussian working-model
+            // `Vb`, not the sandwich its bands and summary are priced from.
+            if let gam_models::inference::model::FittedEstimator::Expectile { .. } =
+                model.estimator()
+            {
+                return Err(match fit.artifacts.covariance_declined.as_ref() {
+                    Some(declined) => format!("{rationale}: {}", declined.explain()),
+                    None => format!(
+                        "{rationale}: this expectile fit published no sandwich covariance to \
+                         draw from; refit"
+                    ),
+                });
+            }
             let h = fit.penalized_hessian().ok_or_else(|| {
                 format!(
                     "{rationale}: posterior fallback requires the explicit penalised Hessian; \
@@ -838,7 +851,7 @@ fn constrained_laplace_fallback(
                 || saved_spec
                     .smooth_terms
                     .iter()
-                    .any(|term| !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None))
+                    .any(|term| !term.shape.is_none())
         })
         .unwrap_or(false);
     let has_persisted_inequality = fit
@@ -907,7 +920,7 @@ fn sample_standard(
         || saved_spec
             .smooth_terms
             .iter()
-            .any(|term| !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None));
+            .any(|term| !term.shape.is_none());
     let constrained_posterior = fit
         .geometry
         .as_ref()
@@ -924,6 +937,20 @@ fn sample_standard(
         constrained_posterior.is_some(),
         likelihood.is_gaussian_identity(),
     )?;
+    // Every route but the closed form draws from the Gaussian working
+    // likelihood's own posterior (its Hessian, or NUTS on its log density).
+    // An expectile fit has no such likelihood: its coefficient uncertainty is
+    // the published Newey–Powell sandwich, which only the closed form reads.
+    if let gam_models::inference::model::FittedEstimator::Expectile { tau } = model.estimator()
+        && route != StandardPosteriorRoute::GaussianClosedForm
+    {
+        return Err(format!(
+            "expectile(tau={tau}) posterior sampling draws from the published sandwich \
+             covariance, which has no inequality-truncated or bounded-coefficient sampler; \
+             this fit's constrained coefficients would be drawn from the Gaussian working \
+             likelihood instead"
+        ));
+    }
     match route {
         StandardPosteriorRoute::InequalityTruncated => {
             return sample_standard_truncated(&fit, cfg);

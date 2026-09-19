@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gamfit import ManifoldSAE
+from gamfit.sae import ManifoldSAE
 from gamfit import _sae_manifold as facade
 
 

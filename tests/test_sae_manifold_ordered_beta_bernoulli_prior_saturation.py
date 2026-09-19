@@ -74,7 +74,7 @@ def _criterion(fit) -> float:
 def _select_k(z: np.ndarray, candidates: list[int], alpha: float) -> tuple[int, dict[int, float]]:
     scores: dict[int, float] = {}
     for k in candidates:
-        fit = gamfit.sae_manifold_fit(
+        fit = gamfit.sae.sae_manifold_fit(
             X=z,
             K=k,
             atom_basis="periodic",
@@ -112,7 +112,7 @@ def test_ordered_beta_bernoulli_assignments_decay_not_truncate_under_saturation(
     (they decay, they do not hard-truncate to zero) — a truncation to
     exact zero would be an unrecoverable masking bug, not a soft prior."""
     z = _multi_harmonic_data(n=600, p=64, k_true=5, noise=0.04, seed=0)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=15,
         atom_basis="periodic",

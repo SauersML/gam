@@ -27,7 +27,7 @@ The model's own evidence numbers show the failure directly: ``small`` and
 gets the *better* (lower) score every time, by a near-constant margin of ~3
 nats — so it is the evidence/REML score itself that fails to penalise the extra
 term, not a ranking-direction or normalisation disagreement between entry
-points (``Model.evidence``, now ``Model.conditional_aic``, and ``Model.bayes_factor_vs`` agree with
+points (``Model.evidence``, now ``Summary.aic_corrected``, and ``Model.bayes_factor_vs`` agree with
 ``compare_models`` here, all preferring ``big``).
 
 The direction is confirmed by a relevant-``z`` control: when ``z`` genuinely
@@ -91,13 +91,11 @@ def _big_selection_rate(z_relevant: bool, n_seeds: int) -> tuple[float, list[flo
         result = gamfit.compare_models([small, big], names=["small", "big"])
         if result["winner"] == "big":
             big_wins += 1
-            # Raw REML/LAML criterion ratio of the winner (big) over small, for
-            # diagnostics.
+            # Log REML/LAML criterion ratio of the best-scoring fit over small,
+            # for diagnostics (the ratio itself overflows on the relevant-z data).
             for row in result["score_table"]:
                 if row["name"] == "small":
-                    bayes_factors.append(
-                        float(row["reml_criterion_ratio_best_over_model"])
-                    )
+                    bayes_factors.append(float(row["delta_reml"]))
     return big_wins / n_seeds, bayes_factors
 
 
@@ -121,7 +119,7 @@ def test_compare_models_does_not_always_prefer_a_pure_noise_smooth() -> None:
     assert rate_noise <= 0.5, (
         "compare_models selected the model with a PURE-NOISE smooth s(z) added "
         f"(z drawn independently of y) on {rate_noise:.0%} of {N_NOISE} seeds "
-        f"(median Bayes factor 'big over small' = {median_bf:.1f}). A calibrated "
+        f"(median log REML ratio 'best over small' = {median_bf:.1f}). A calibrated "
         "evidence comparison Occam-penalises a null term and should prefer the "
         "smaller model the majority of the time; instead the REML evidence "
         "headline improves whenever a spurious smooth is added (see "

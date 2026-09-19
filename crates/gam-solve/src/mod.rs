@@ -36,9 +36,8 @@ pub(crate) mod priority_selection;
 pub mod progress_log;
 pub mod psi_gram_tensor;
 // Pareto-smoothed importance sampling (descended #1521): leaf numerics with no
-// crate-internal dependencies, consumed by `reml::objective` and the
-// monolith's `inference::{rho_posterior, model_comparison}` (which now reach
-// it via the `gam-solve` re-export at the monolith crate root).
+// crate-internal dependencies, consumed by `gam-inference`'s `rho_posterior`
+// adequacy diagnostic and `model_comparison`, and by `gam-problem`.
 pub mod psis;
 // Rho-prior penalty/barrier evaluation (descended #1521): depends only on
 // `gam_spec::RhoPrior`; consumed by `reml::atoms` and (after #1521) the

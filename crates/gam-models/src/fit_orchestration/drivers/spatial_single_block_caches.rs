@@ -137,7 +137,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         // Every accepted step realizes a new design revision, so this rebuild
         // runs once per step inside the gradient call, where nothing clocked it
         // (#2735).
-        log::info!(
+        log::debug!(
             "[STAGE] {} psi derivative rebuild (design revision {revision}, {} directions): {:.3}s",
             kind.label(),
             dirs.len(),
@@ -209,7 +209,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         // evaluations on the 6-D k=100 fit. Which points those are — a line
         // search, a probe ladder, or one evaluation re-entered — cannot be read
         // from a line that prints only how long it took (#2735).
-        log::info!(
+        log::debug!(
             "[STAGE] ensure_theta (apply_log_kappa, {} terms) psi={:?}: {:.3}s",
             self.spatial_terms.len(),
             theta
