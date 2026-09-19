@@ -4483,5 +4483,13 @@
     },
     "reason": "gam#2999: the pub(super) marginal-slope base-link resolver read only the formula's link(...). It is replaced, in the same file, by resolve_marginal_slope_link, which also reads the request's link and flexible_link arguments, so no link spelling goes unread. Its two callers, the bernoulli marginal-slope and the survival marginal-slope materializers, call the replacement.",
     "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
+  },
+  {
+    "base": "0b7f21d97b0a57f7343e0858b6dced6b0d6f2259",
+    "removed": {
+      "crates/gam-math/src/probability.rs::signed_weighted_chi_square_sf_to_tolerance": 1
+    },
+    "reason": "pyGAM audit pv-tails-numerics (inference L4). The caller-tolerance Imhof evaluator lost all relative accuracy below about 1e-16, because 1/2 + I/pi cancels there. Its tolerance argument was the reason the smooth-term LR driver clamped the request to [1e-13, 1e-3]. It is replaced by signed_weighted_chi_square_sf in crates/gam-math/src/probability/weighted_chi_square.rs, re-exported from gam_math::probability. The replacement takes no tolerance and returns a TailProbability whose relative error bound is derived. Its only caller, smooth_term_lr.rs (conditional_tail_with_bound), calls the replacement.",
+    "evidence": "public_api_census.py, run with base 0b7f21d97b and head 5e41417f1c, reported exactly this identity as removed (13342 public function declarations before, 13343 after). git grep -c -w signed_weighted_chi_square_sf_to_tolerance finds 0 files under crates, src and tests at the landing tree. crates/gam-math/tests/tail_references.rs passes all five of its tests against the stored mpmath references."
   }
 ]
