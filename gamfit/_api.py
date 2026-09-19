@@ -250,7 +250,7 @@ def _build_fit_payload(
     *,
     family: str,
     negative_binomial_theta: float | None,
-    expectile_tau: float | None,
+    expectile_tau: float | Sequence[float] | None,
     offset: str | None,
     weights: str | None,
     persistent_warm_start_root: str | Path | None,
@@ -295,7 +295,13 @@ def _build_fit_payload(
             payload["ctn_stage1"] = recipe.native_document()
     kwarg_items: dict[str, Any] = {
         "negative_binomial_theta": negative_binomial_theta,
-        "expectile_tau": expectile_tau,
+        # One level, or a strictly increasing sequence fitted jointly; a
+        # sequence rides the JSON document as a list.
+        "expectile_tau": (
+            expectile_tau
+            if expectile_tau is None or isinstance(expectile_tau, (int, float))
+            else [float(tau) for tau in expectile_tau]
+        ),
         "transformation_normal": transformation_normal,
         "survival_likelihood": survival_likelihood,
         "survival_time_anchor": survival_time_anchor,
@@ -596,7 +602,7 @@ def fit(
     *,
     family: str = ...,
     negative_binomial_theta: float | None = ...,
-    expectile_tau: float | None = ...,
+    expectile_tau: float | Sequence[float] | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
@@ -642,7 +648,7 @@ def fit(
     *,
     family: str = ...,
     negative_binomial_theta: float | None = ...,
-    expectile_tau: float | None = ...,
+    expectile_tau: float | Sequence[float] | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
@@ -687,7 +693,7 @@ def fit(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -763,9 +769,13 @@ def fit(
         This is the Python spelling of CLI ``--negative-binomial-theta`` and
         the shared request field ``negative_binomial_theta``.
     expectile_tau:
-        Optional target in the open interval ``(0, 1)`` for
-        ``family="expectile"``. This is the Python spelling of CLI
-        ``--expectile-tau`` and the shared request field ``expectile_tau``.
+        Optional expectile level in the open interval ``(0, 1)`` for
+        ``family="expectile"``, or a strictly increasing sequence of levels.
+        A sequence is fitted jointly as one location-scale model whose level
+        curves ``mu(x) + c_tau * E[sigma(x)]`` never cross; ``predict`` then
+        returns an ``(n, K)`` array with one column per level. This is the
+        Python spelling of CLI ``--expectile-tau`` (comma-separated) and the
+        shared request field ``expectile_tau``.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:
@@ -1183,7 +1193,7 @@ def fit_array(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -1483,7 +1493,7 @@ def validate_formula(
     *,
     family: str = "auto",
     negative_binomial_theta: float | None = None,
-    expectile_tau: float | None = None,
+    expectile_tau: float | Sequence[float] | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,

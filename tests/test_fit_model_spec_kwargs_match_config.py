@@ -71,6 +71,7 @@ def _payload(**overrides: typing.Any) -> dict[str, typing.Any]:
         ("noise_formula", "s(x)"),
         ("negative_binomial_theta", 2.5),
         ("expectile_tau", 0.9),
+        ("expectile_tau", [0.1, 0.5, 0.9]),
         ("noise_offset", "logvar"),
         ("flexible_link", True),
         ("survival_time_anchor", 25.0),
@@ -79,6 +80,10 @@ def _payload(**overrides: typing.Any) -> dict[str, typing.Any]:
 )
 def test_model_spec_kwarg_sets_its_request_key(kwarg: str, value: typing.Any) -> None:
     assert _payload(**{kwarg: value}).get(kwarg) == value
+
+
+def test_expectile_level_sequence_rides_the_request_as_a_list() -> None:
+    assert _payload(expectile_tau=(0.1, 0.9))["expectile_tau"] == [0.1, 0.9]
 
 
 @pytest.mark.parametrize(

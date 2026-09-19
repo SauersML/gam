@@ -152,9 +152,14 @@ struct PredictionPayload {
     model_class: String,
     /// Response-scale point column of this class (`PredictModelClass::point_column`).
     point_column: &'static str,
-    /// Point-payload shape of this class (`PredictModelClass::point_shape`); the
-    /// Python shaper branches on it instead of the class label.
+    /// Point-payload shape of this model (`FittedModel::prediction_point_shape`);
+    /// the Python shaper branches on it instead of the class label.
     point_shape: &'static str,
+    /// Ordered point columns of a multi-curve point (`expectile_curves`: one
+    /// column per expectile level, in increasing level order). Omitted for
+    /// single-column points, which `point_column` names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_columns: Option<Vec<String>>,
     /// Inverse-link family kind tag (`identity`, `logit`, `probit`, `log`, ...).
     family: String,
     /// Provenance of the returned prediction interval (#942). Present only on
@@ -6385,6 +6390,7 @@ mod prediction_payload_tests {
             model_class: "standard".to_string(),
             point_column: "posterior_mean",
             point_shape: "estimand_explicit",
+            point_columns: None,
             family: "identity".to_string(),
             interval_method: None,
             covariance_source: Some("smoothing-corrected".to_string()),
@@ -6420,6 +6426,7 @@ mod prediction_payload_tests {
             model_class: "bernoulli marginal-slope".to_string(),
             point_column: "posterior_mean",
             point_shape: "estimand_explicit",
+            point_columns: None,
             family: "probit".to_string(),
             interval_method: None,
             covariance_source: None,

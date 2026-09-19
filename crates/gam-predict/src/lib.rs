@@ -2,6 +2,7 @@ pub mod affine_design;
 pub mod alo;
 pub mod conformal;
 pub mod conformal_routes;
+pub mod expectile_curves;
 pub mod generative;
 pub mod input;
 pub mod interval_policy;
@@ -13,6 +14,7 @@ pub mod term_diagnostics;
 pub use affine_design::*;
 pub use alo::*;
 pub use conformal::*;
+pub use expectile_curves::*;
 pub use gam_models::inference::predict_io::{
     BernoulliMarginalSlopePredictor, LatentConditioningSpan, PredictInput, PredictResult,
 };
@@ -1116,6 +1118,22 @@ pub trait PredictableModel {
         if input.design.nrows() == 0 {
             return Err(EstimationError::InvalidInput(
                 "predict_noise_scale requires at least one observation".to_string(),
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Posterior mean of the response-side noise scale, `E[σ | data]`,
+    /// integrating the scale block's posterior instead of plugging in its
+    /// mode. `None` for models without a per-observation noise scale.
+    fn predict_posterior_mean_noise_scale(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        if input.design.nrows() == 0 {
+            return Err(EstimationError::InvalidInput(
+                "predict_posterior_mean_noise_scale requires at least one observation"
+                    .to_string(),
             ));
         }
         Ok(None)
@@ -4028,6 +4046,46 @@ mod tests {
             .expect("gaussian location-scale uncertainty");
         assert!(out.eta_se.is_none());
         assert!(out.mean_se.is_none());
+    }
+
+    #[test]
+    fn gaussian_location_scale_posterior_mean_sigma_integrates_log_sigma_posterior() {
+        // Scale-block variance 0.4 on the single log-σ coefficient: the
+        // posterior mean of σ = f + exp(η_s) is f + exp(m + v/2), strictly
+        // above the plug-in σ(m); without covariance it is the plug-in.
+        let floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+        let mut predictor = GaussianLocationScalePredictor {
+            beta_mu: array![0.0],
+            beta_noise: array![0.3],
+            sigma_floor: floor,
+            response_scale: 2.0,
+            covariance: Some(array![[1.0, 0.0], [0.0, 0.4]]),
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let integrated = predictor
+            .predict_posterior_mean_noise_scale(&input)
+            .expect("posterior-mean sigma")
+            .expect("gaussian location-scale reports sigma");
+        let expected = 2.0 * floor + (0.3_f64 + 0.2).exp();
+        assert!((integrated[0] / expected - 1.0).abs() < 1e-14);
+        predictor.covariance = None;
+        let plugin = predictor
+            .predict_noise_scale(&input)
+            .expect("plug-in sigma")
+            .expect("gaussian location-scale reports sigma");
+        let degraded = predictor
+            .predict_posterior_mean_noise_scale(&input)
+            .expect("posterior-mean sigma")
+            .expect("gaussian location-scale reports sigma");
+        assert_eq!(plugin, degraded);
     }
 
     #[test]

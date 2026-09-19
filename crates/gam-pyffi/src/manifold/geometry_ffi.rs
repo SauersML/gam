@@ -7188,6 +7188,21 @@ fn predict_array_impl(
     // `posterior_mean` (#2785); the remaining classes retain their
     // class-specific point column. `PredictModelClass::point_column` owns
     // that choice, together with `predict_columns` below.
+    if let Some(curve_columns) = model.expectile_curve_columns() {
+        // A joint expectile fit's point is one curve per level: `(n, K)` in
+        // increasing level order, with or without an interval request.
+        let n = columns
+            .get(model_class.point_column())
+            .map_or(0, Vec::len);
+        let mut out = Array2::<f64>::zeros((n, curve_columns.len()));
+        for (k, name) in curve_columns.iter().enumerate() {
+            let curve = columns
+                .get(name)
+                .ok_or_else(|| format!("predict_array: expectile curve `{name}` missing"))?;
+            out.column_mut(k).assign(&ndarray::ArrayView1::from(curve.as_slice()));
+        }
+        return Ok(out);
+    }
     if options.interval.is_none() {
         let point_column = model_class.point_column();
         let mean = columns
@@ -7213,7 +7228,8 @@ fn predict_dataset_with_options_impl(
         columns,
         model_class: prediction_model_class_label(model),
         point_column: model_class.point_column(),
-        point_shape: model_class.point_shape(),
+        point_shape: model.prediction_point_shape(),
+        point_columns: model.expectile_curve_columns(),
         family: family_link_kind(&model_likelihood_spec(model)).to_string(),
         // The plain dataset predict path returns the model-based credible /
         // predictive band (or no interval at all); a conformal provenance tag
@@ -7530,6 +7546,15 @@ fn predict_columns(
     {
         columns.insert("noise_scale".to_string(), noise_scale.to_vec());
     }
+    // A joint expectile fit publishes its level curves `E[μ] + c_k·E[σ]`.
+    if let Some(curves) =
+        gam_predict::joint_expectile_curves(model, &*predictor, &predict_input, &posterior_mean)
+            .map_err(|err| format!("expectile curve prediction failed: {err}"))?
+    {
+        for (name, curve) in curves {
+            columns.insert(name, curve.to_vec());
+        }
+    }
 
     Ok((columns, provenance))
 }
@@ -7580,6 +7605,7 @@ fn predict_encoded_table_conformal_impl(
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
+        point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(
             "split-conformal (distribution-free, finite-sample marginal coverage)".to_string(),
@@ -7614,6 +7640,7 @@ fn predict_encoded_table_full_conformal_impl(
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
+        point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(format!(
             "full-conformal at frozen smoothing parameters (exact set given Sλ; the \

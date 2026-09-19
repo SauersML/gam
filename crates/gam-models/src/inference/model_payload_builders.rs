@@ -22,16 +22,17 @@ use crate::bms::{
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
-    DispersionLocationScaleFitResult, FitConfig, FitRequest, FitResult, StandardFitResult,
-    WorkflowError, expectile_tau_for_config, fit_expectile_if_requested,
+    DispersionLocationScaleFitResult, ExpectileFit, ExpectileLocationScaleFitResult, FitConfig,
+    FitRequest, FitResult, StandardFitResult, WorkflowError, expectile_levels_for_config,
+    fit_expectile_if_requested,
     fit_materialized_standard_with_notes, fit_model, materialize,
 };
 use crate::gamlss::{
     BinomialLocationScaleFitResult, DispersionFamilyKind, GaussianLocationScaleFitResult,
 };
 use crate::inference::model::{
-    FittedEstimator, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
+    FittedEstimator, FittedFamily, FittedModelPayload, JOINT_EXPECTILE_FAMILY_TAG,
+    MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
     SavedResidualCascade, SavedSplineScan, SavedSurvivalLocationScaleStructure,
     SavedTransformationNormalGeometry, TransformationNormalParameterization,
     TransformationScoreCalibration,
@@ -384,14 +385,22 @@ pub fn assemble_standard_payload(
             "standard fit reached payload assembly without its resolved likelihood family"
                 .to_string()
         })?;
-    let estimator = expectile_tau_for_config(fit_config)
+    let estimator = match expectile_levels_for_config(fit_config)
         .map_err(|error| format!("failed to persist estimator metadata: {error}"))?
-        .map_or(FittedEstimator::Likelihood, |tau| {
-            FittedEstimator::Expectile { tau }
-        });
-    let family_label = match estimator {
-        FittedEstimator::Likelihood => family.name().to_string(),
+        .as_deref()
+    {
+        None => FittedEstimator::Likelihood,
+        Some([tau]) => FittedEstimator::Expectile { tau: *tau },
+        Some(levels) => {
+            return Err(format!(
+                "a standard fit cannot persist the joint expectile levels {levels:?}; they are \
+                 fitted as one location-scale model"
+            ));
+        }
+    };
+    let family_label = match &estimator {
         FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
+        _ => family.name().to_string(),
     };
     let full_conformal =
         standard_conformal_substrates(&formula, dataset, fit_config, &family, &fit, &design);
@@ -1541,12 +1550,15 @@ pub fn fit_formula_to_payload(
                     .to_string(),
             });
         }
-        let mut payload = assemble_standard_payload(StandardPayloadInputs {
-            formula,
-            dataset,
-            fit_config,
-            result: expectile_result,
-        })?;
+        let mut payload = match expectile_result {
+            ExpectileFit::Single(result) => assemble_standard_payload(StandardPayloadInputs {
+                formula,
+                dataset,
+                fit_config,
+                result,
+            })?,
+            ExpectileFit::Joint(joint) => payload_for_joint_expectile(formula, dataset, fit_config, joint)?,
+        };
         // The LAWS driver materializes its inner Gaussian design itself; there are
         // no outer materialize advisories to carry (matches `fit_from_formula`).
         apply_request_metadata(&mut payload, fit_config, Vec::new());
@@ -2445,6 +2457,37 @@ fn payload_for_gaussian_location_scale(
             noise_offset_column: fit_config.noise_offset_column.clone(),
         },
     )
+}
+
+/// Saved payload of a joint multi-level expectile fit: the Gaussian
+/// location-scale payload of its `μ`/`σ` surfaces, tagged with the joint
+/// estimator that turns them into one non-crossing curve per level.
+fn payload_for_joint_expectile(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    joint: ExpectileLocationScaleFitResult,
+) -> Result<FittedModelPayload, String> {
+    let noise_formula = crate::fit_orchestration::expectile_noise_formula(&formula, fit_config)
+        .map_err(|error| error.to_string())?;
+    let location_scale_config = FitConfig {
+        noise_formula: Some(noise_formula),
+        ..fit_config.clone()
+    };
+    let response_scale = joint.location_scale.response_scale;
+    let mut payload = payload_for_gaussian_location_scale(
+        formula,
+        dataset,
+        &location_scale_config,
+        joint.location_scale,
+        response_scale,
+    )?;
+    payload.family = JOINT_EXPECTILE_FAMILY_TAG.to_string();
+    payload.estimator = FittedEstimator::ExpectileLocationScale {
+        levels: joint.levels,
+        standardized_expectiles: joint.standardized_expectiles,
+    };
+    Ok(payload)
 }
 
 /// Map the optional `(knots, degree, beta)` link-wiggle parts a location-scale
