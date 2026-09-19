@@ -3992,75 +3992,46 @@ impl MixtureQuantile {
 
 /// Settle every quantile of `projections` against the one cached node set.
 ///
-/// Each pass visits the nodes once, in fixed blocks whose partial sums are
-/// combined in block order, so the endpoints do not depend on the thread count,
-/// and evaluates the CDF and density at every unsettled quantile of every row.
-/// Rows share the nodes, so a batch of rows costs one node visit per pass rather
-/// than one cubature per row.
+/// Rows are independent, so they settle in parallel, and each row forms its
+/// conditional means `m_i` once and then iterates both of its quantiles to
+/// convergence over them. A pass sums over the nodes in their fixed order, so
+/// an endpoint does not depend on the thread count or on which other rows
+/// share the batch.
 fn settle_mixture_quantiles(
     nodes: &NormalNodes,
     projections: &mut [MixtureProjection],
 ) -> Result<(), String> {
-    let node_count = nodes.weight.len();
-    let block = ORTHANT_MOMENT_INITIAL_POINTS;
-    loop {
-        let open: Vec<(usize, usize)> = projections
-            .iter()
-            .enumerate()
-            .flat_map(|(index, projection)| {
-                projection
-                    .quantiles
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, quantile)| quantile.value.is_none())
-                    .map(move |(side, _)| (index, side))
-            })
-            .collect();
-        if open.is_empty() {
-            return Ok(());
-        }
-        let partials: Vec<Vec<(f64, f64)>> = (0..node_count.div_ceil(block))
-            .into_par_iter()
-            .map(|block_index| {
-                let range = block_index * block..((block_index + 1) * block).min(node_count);
-                let weights = nodes.weight.slice(ndarray::s![range.clone()]);
-                let mut sums = vec![(0.0, 0.0); open.len()];
-                let mut position = 0;
-                while position < open.len() {
-                    // `open` lists a row's open quantiles consecutively, so a row's
-                    // conditional means are formed once per block.
-                    let index = open[position].0;
-                    let projection = &projections[index];
-                    let means = nodes.conditional_means(
-                        range.clone(),
-                        &projection.projection_lift,
-                        projection.ambient_mean,
-                    );
-                    while position < open.len() && open[position].0 == index {
-                        let point = projection.quantiles[open[position].1].point;
-                        let scale = projection.residual_sd;
-                        let (cdf, density) = &mut sums[position];
-                        for (&mean, &weight) in means.iter().zip(weights.iter()) {
-                            let (phi_cdf, phi_pdf) = normal_cdf_and_pdf((point - mean) / scale);
-                            *cdf += weight * phi_cdf;
-                            *density += weight * phi_pdf;
-                        }
-                        *density /= scale;
-                        position += 1;
-                    }
-                }
-                sums
-            })
-            .collect();
-        for (position, &(index, side)) in open.iter().enumerate() {
-            let (cdf, density) = partials
+    projections.par_iter_mut().try_for_each(|projection| {
+        let means = nodes.conditional_means(
+            0..nodes.weight.len(),
+            &projection.projection_lift,
+            projection.ambient_mean,
+        );
+        let scale = projection.residual_sd;
+        loop {
+            let open: Vec<usize> = (0..projection.quantiles.len())
+                .filter(|&side| projection.quantiles[side].value.is_none())
+                .collect();
+            if open.is_empty() {
+                return Ok(());
+            }
+            let points: Vec<f64> = open
                 .iter()
-                .fold((0.0, 0.0), |(cdf, density), block_sums| {
-                    (cdf + block_sums[position].0, density + block_sums[position].1)
-                });
-            projections[index].quantiles[side].advance(cdf, density)?;
+                .map(|&side| projection.quantiles[side].point)
+                .collect();
+            let mut sums = vec![(0.0, 0.0); open.len()];
+            for (&mean, &weight) in means.iter().zip(nodes.weight.iter()) {
+                for (sum, &point) in sums.iter_mut().zip(points.iter()) {
+                    let (phi_cdf, phi_pdf) = normal_cdf_and_pdf((point - mean) / scale);
+                    sum.0 += weight * phi_cdf;
+                    sum.1 += weight * phi_pdf;
+                }
+            }
+            for (&side, &(cdf, density)) in open.iter().zip(sums.iter()) {
+                projection.quantiles[side].advance(cdf, density / scale)?;
+            }
         }
-    }
+    })
 }
 
 /// Closed-form moments of `N(mean, variance)` restricted to `[0, upper]`.
