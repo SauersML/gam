@@ -813,6 +813,14 @@ impl<'a> MultinomialPredictiveModel<'a> {
         // Every augmented solve is warm-started at `base_mode`, so its first
         // iteration's training curvature is this one.
         let base_training = model.training_state(&base_mode);
+        let base = PredictiveBase {
+            mode: &base_mode,
+            training: &base_training,
+            anchor: &base_theta,
+            tilt,
+            value: base_value,
+            logdet: base_logdet,
+        };
 
         let rows = x_new.nrows();
         let k = self.n_classes;
@@ -823,19 +831,7 @@ impl<'a> MultinomialPredictiveModel<'a> {
         // failing row in row order, as the serial sweep would.
         let per_row: Vec<Result<PredictiveRow, EstimationError>> = (0..rows)
             .into_par_iter()
-            .map(|row| {
-                model.predictive_row(
-                    row,
-                    x_new.row(row),
-                    &base_mode,
-                    &base_training,
-                    &base_theta,
-                    tilt,
-                    base_value,
-                    base_logdet,
-                    want_second_moments,
-                )
-            })
+            .map(|row| model.predictive_row(row, x_new.row(row), &base, want_second_moments))
             .collect();
         let mut class_mean = Array2::<f64>::zeros((rows, k));
         let mut mass_defect = Array1::<f64>::zeros(rows);
@@ -865,17 +861,11 @@ impl<'a> MultinomialPredictiveModel<'a> {
     /// One prediction row's renormalised class means, mass defect and (when
     /// requested) renormalised second moments: `K` augmented solves for the
     /// means and `K(K+1)/2` more for the second moments.
-    #[allow(clippy::too_many_arguments)]
     fn predictive_row(
         &self,
         row: usize,
         design_row: ArrayView1<'_, f64>,
-        base_mode: &[f64],
-        base_training: &(Array1<f64>, Array2<f64>),
-        base_theta: &[f64],
-        tilt: &[f64],
-        base_value: f64,
-        base_logdet: f64,
+        base: &PredictiveBase<'_>,
         want_second_moments: bool,
     ) -> Result<PredictiveRow, EstimationError> {
         let k = self.n_classes;
@@ -886,8 +876,8 @@ impl<'a> MultinomialPredictiveModel<'a> {
                 class,
             }];
             let (_, value, logdet) =
-                self.augmented_mode(base_mode, Some(base_training), &extra, base_theta, tilt)?;
-            raw[class] = (value - base_value + 0.5 * (base_logdet - logdet)).exp();
+                self.augmented_mode(base.mode, Some(base.training), &extra, base.anchor, base.tilt)?;
+            raw[class] = (value - base.value + 0.5 * (base.logdet - logdet)).exp();
         }
         let total: f64 = raw.iter().sum();
         if !total.is_finite() || total <= 0.0 {
@@ -916,8 +906,8 @@ impl<'a> MultinomialPredictiveModel<'a> {
                         },
                     ];
                     let (_, value, logdet) =
-                        self.augmented_mode(base_mode, Some(base_training), &extra, base_theta, tilt)?;
-                    let entry = (value - base_value + 0.5 * (base_logdet - logdet)).exp();
+                        self.augmented_mode(base.mode, Some(base.training), &extra, base.anchor, base.tilt)?;
+                    let entry = (value - base.value + 0.5 * (base.logdet - logdet)).exp();
                     raw_second[c * k + dd] = entry;
                     raw_second[dd * k + c] = entry;
                 }
@@ -944,6 +934,18 @@ impl<'a> MultinomialPredictiveModel<'a> {
             second_moment,
         })
     }
+}
+
+/// The un-augmented side every ratio shares: the base mode, its cached
+/// [`MultinomialPredictiveModel::training_state`], the expansion anchor and
+/// tilt, and the base objective value and log-determinant.
+struct PredictiveBase<'b> {
+    mode: &'b [f64],
+    training: &'b (Array1<f64>, Array2<f64>),
+    anchor: &'b [f64],
+    tilt: &'b [f64],
+    value: f64,
+    logdet: f64,
 }
 
 /// One prediction row's share of [`MultinomialPredictiveMoments`].
