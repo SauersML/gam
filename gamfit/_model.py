@@ -440,10 +440,12 @@ class Model:
             # the 1-D response-scale prediction vector, not the engine's
             # full estimand-explicit column matrix. The FFI returns the lone
             # response-scale `posterior_mean` column as `(n, 1)`; drop the
-            # trailing axis.
+            # trailing axis. A joint expectile fit's point is its `(n, K)`
+            # level curves, returned as is.
             import numpy as np
 
-            return np.asarray(result).reshape(-1)
+            result = np.asarray(result)
+            return result.reshape(-1) if result.shape[1] == 1 else result
         return result
 
     def summary(self) -> Summary:

@@ -88,6 +88,7 @@ fn fit_result_kind(fit: &FitResult) -> &'static str {
         FitResult::Ctn(_) => "Ctn",
         FitResult::Standard(_) => "Standard",
         FitResult::GaussianLocationScale(_) => "GaussianLocationScale",
+        FitResult::ExpectileLocationScale(_) => "ExpectileLocationScale",
         FitResult::BinomialLocationScale(_) => "BinomialLocationScale",
         FitResult::SurvivalLocationScale(_) => "SurvivalLocationScale",
         FitResult::SurvivalTransformation(_) => "SurvivalTransformation",
