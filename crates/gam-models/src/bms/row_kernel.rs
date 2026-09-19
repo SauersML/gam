@@ -4,6 +4,7 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::*;
 use crate::fnv1a::Fnv1a;
+use crate::row_kernel::RowSet;
 use std::sync::{Mutex, OnceLock};
 
 // ── Same-β rigid third/fourth-tensor cache ───────────────────────────
@@ -693,28 +694,13 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// scatter writes (`w_mm = t[0][0]`, `w_mg = t[0][1]`, `w_gg = t[1][1]`),
     /// reduced in a different summation order.
     ///
-    /// Claims only the full-data unit-weight `RowSet::All` case with dense
-    /// designs; otherwise returns `None` so the generic per-row Horvitz-Thompson
-    /// path runs.
+    /// Handles every `RowSet`: each walked row's contraction weights carry its
+    /// Horvitz-Thompson weight. Declines (`None`) only a sparse design block.
     fn directional_derivative_dense_override(
         &self,
-        rows: &crate::row_kernel::RowSet,
+        rows: &RowSet,
         d_beta: &[f64],
     ) -> Option<Result<Array2<f64>, String>> {
-        if !matches!(rows, crate::row_kernel::RowSet::All) {
-            // Diagnostic fires once per process, not once per inner-Newton kernel
-            // call: this dispatch runs on every directional-derivative evaluation,
-            // so an unguarded line floods the biobank fit log with thousands of
-            // identical entries.
-            static DD_NOT_TAKEN_LOGGED: std::sync::Once = std::sync::Once::new();
-            DD_NOT_TAKEN_LOGGED.call_once(|| {
-                log::debug!(
-                    "[STAGE] BMS rigid directional_derivative BLAS-3 path NOT taken: RowSet is a \
-                     subsample (generic per-row Horvitz-Thompson scatter)"
-                );
-            });
-            return None;
-        }
         // The chunked `Xᵀ diag(w) X` Gram slices contiguous design rows via
         // `try_row_chunk` inside `directional_derivative_dense_blas3` (which
         // already handles operator-backed / residualised designs row-chunk by
@@ -729,7 +715,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         if marginal_sparse || slope_sparse {
             return None;
         }
-        Some(self.directional_derivative_dense_blas3(d_beta))
+        Some(self.directional_derivative_dense_blas3(rows, d_beta))
     }
 
     /// BLAS-3 override of the BATCHED all-axes FIRST directional derivative of
@@ -750,13 +736,13 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// the same chunked `Xᵀ diag(w) X` / `Xᵀ diag(w) G` BLAS-3 machinery the
     /// first-directional override uses. Bit-for-bit the same entries the per-row
     /// `add_pullback_hessian` scatter writes, reduced in BLAS-3 in-row order, so
-    /// axis `a` matches `row_kernel_directional_derivative(self, All, e_a)`.
+    /// axis `a` matches `row_kernel_directional_derivative(self, rows, e_a)`.
     ///
-    /// Claims only the full-data unit-weight `RowSet::All` dense-design case;
-    /// otherwise `None` → unchanged generic per-axis Horvitz-Thompson sweep.
+    /// Handles every `RowSet`, Horvitz-Thompson weights included. Declines
+    /// (`None`) only a sparse design block.
     fn directional_derivative_all_axes_dense_override(
         &self,
-        rows: &crate::row_kernel::RowSet,
+        rows: &RowSet,
         p: usize,
     ) -> Option<Result<Vec<Array2<f64>>, String>> {
         // The dispatcher passes `p = n_coefficients()`; a mismatch is a hard
@@ -770,15 +756,12 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
                 self.n_coefficients(),
             )));
         }
-        if !matches!(rows, crate::row_kernel::RowSet::All) {
-            return None;
-        }
         let marginal_sparse = self.family.marginal_design.is_sparse();
         let slope_sparse = self.family.slope_design.is_sparse();
         if marginal_sparse || slope_sparse {
             return None;
         }
-        Some(self.directional_derivative_all_axes_blas3())
+        Some(self.directional_derivative_all_axes_blas3(rows))
     }
 
     /// BLAS-3 override of the dense joint-Hessian assembly for the rigid
@@ -791,19 +774,13 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// (`w_mm = h[0][0]`, `w_mg = h[0][1]`, `w_gg = h[1][1]`) from the cached
     /// `K×K` row Hessians and close each chunk with `Xᵀ diag(w) X` /
     /// `Xᵀ diag(w) G`. Bit-for-bit the same entries the scatter writes, reduced
-    /// in BLAS-3 in-row order. Claims only the full-data unit-weight
-    /// `RowSet::All` dense-design case; otherwise `None` → unchanged generic
-    /// per-row Horvitz-Thompson path.
+    /// in BLAS-3 in-row order. Handles every `RowSet`, Horvitz-Thompson
+    /// weights included; declines (`None`) only a sparse design block.
     fn hessian_dense_override(
         &self,
-        rows: &crate::row_kernel::RowSet,
+        rows: &RowSet,
         row_hessians: &[[[f64; 2]; 2]],
     ) -> Option<Result<Array2<f64>, String>> {
-        // Only the full-data unit-weight measure is BLAS-3 accelerated; a
-        // Horvitz-Thompson subsample keeps the generic per-row HT path.
-        if !matches!(rows, crate::row_kernel::RowSet::All) {
-            return None;
-        }
         if row_hessians.len() != self.family.y.len() {
             return Some(Err(format!(
                 "BMS rigid hessian_dense_override row-Hessian length mismatch: got {}, expected {}",
@@ -835,19 +812,23 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             return None;
         }
         // Route an eligible whole-design joint Gram through one CUDA dispatch.
-        // `Ok(None)` means CUDA was declined before execution (non-materialized
-        // design, no runtime, or below policy); after admission, a missing
-        // device result is an error and cannot select the CPU algorithm.
-        match rigid_joint_hessian_on_gpu(
-            &self.family.marginal_design,
-            &self.family.slope_design,
-            row_hessians,
-        ) {
-            Ok(Some(joint)) => return Some(Ok(joint)),
-            Ok(None) => {}
-            Err(error) => return Some(Err(error)),
+        // The device Gram runs over every design row with unit weight, so only
+        // `RowSet::All` is eligible. `Ok(None)` means CUDA was declined before
+        // execution (non-materialized design, no runtime, or below policy);
+        // after admission, a missing device result is an error and cannot
+        // select the CPU algorithm.
+        if let RowSet::All = rows {
+            match rigid_joint_hessian_on_gpu(
+                &self.family.marginal_design,
+                &self.family.slope_design,
+                row_hessians,
+            ) {
+                Ok(Some(joint)) => return Some(Ok(joint)),
+                Ok(None) => {}
+                Err(error) => return Some(Err(error)),
+            }
         }
-        Some(self.hessian_dense_blas3(row_hessians))
+        Some(self.hessian_dense_blas3(rows, row_hessians))
     }
 
     /// BLAS-3 override of the BATCHED all-axes second directional derivative of
@@ -886,18 +867,20 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// the per-row `add_pullback_hessian` scatter writes, reduced in BLAS-3
     /// in-row order.
     ///
-    /// Claims only the full-data unit-weight `RowSet::All` dense-design case;
-    /// otherwise `None` → unchanged generic per-axis Horvitz-Thompson sweep.
+    /// Handles every `RowSet`, Horvitz-Thompson weights included. Declines
+    /// (`None`) only a sparse design block.
     fn second_directional_derivative_all_axes_dense_override(
         &self,
-        rows: &crate::row_kernel::RowSet,
+        rows: &RowSet,
         d_beta_u: &[f64],
     ) -> Option<Result<Vec<Array2<f64>>, String>> {
-        if !matches!(rows, crate::row_kernel::RowSet::All) {
-            return None;
-        }
         if d_beta_u.len() != self.slices.total {
-            return None;
+            return Some(Err(format!(
+                "bms second_directional_derivative_all_axes_dense_override: fixed direction has \
+                 {} entries, expected {}",
+                d_beta_u.len(),
+                self.slices.total,
+            )));
         }
         // Same structural gate as the first-directional override: the chunked
         // Gram machinery slices contiguous design rows via `try_row_chunk`,
@@ -908,7 +891,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         if marginal_sparse || slope_sparse {
             return None;
         }
-        Some(self.second_directional_derivative_all_axes_blas3(d_beta_u))
+        Some(self.second_directional_derivative_all_axes_blas3(rows, d_beta_u))
     }
 }
 
@@ -939,6 +922,43 @@ fn blas3_gram_chunk_rows(n: usize) -> usize {
     let target_chunks = (workers * OVERSUBSCRIBE).max(1);
     let by_target = n.div_ceil(target_chunks);
     by_target.clamp(MIN_CHUNK_ROWS, MAX_CHUNK_ROWS).max(1)
+}
+
+/// Gram chunks `(start, end)` over the walk positions `0..rows.walk_len(n)`,
+/// each [`blas3_gram_chunk_rows`] positions tall (the last one shorter).
+fn row_set_gram_chunks(rows: &RowSet, n: usize) -> Vec<(usize, usize)> {
+    let m = rows.walk_len(n);
+    let chunk_rows = blas3_gram_chunk_rows(m);
+    (0..m).step_by(chunk_rows).map(|start| (start, (start + chunk_rows).min(m))).collect()
+}
+
+/// Design rows at walk positions `start..end` of `rows`. Under `RowSet::All`
+/// this is the contiguous full-data block: a zero-copy slice of a materialised
+/// design, one `try_row_chunk` of an operator-backed one. Under a subsample it
+/// is the stored rows gathered in walk order. A failed materialisation is a
+/// hard error: the design row buffer is fixed for the whole fit.
+fn row_set_design_rows<'a>(
+    design: &'a gam_linalg::matrix::DesignMatrix,
+    rows: &RowSet,
+    (start, end): (usize, usize),
+    what: &str,
+) -> Result<ndarray::CowArray<'a, f64, ndarray::Ix2>, String> {
+    match rows {
+        RowSet::All => match design.as_dense_ref() {
+            Some(full) => Ok(full.slice(s![start..end, ..]).into()),
+            None => design
+                .try_row_chunk(start..end)
+                .map(Into::into)
+                .map_err(|e| format!("{what} try_row_chunk({start}..{end}): {e}")),
+        },
+        RowSet::Subsample { rows: stored, .. } => {
+            let indices = stored[start..end].iter().map(|row| row.index).collect::<Vec<_>>();
+            design
+                .try_row_gather(&indices)
+                .map(Into::into)
+                .map_err(|e| format!("{what} try_row_gather over positions {start}..{end}: {e}"))
+        }
+    }
 }
 
 /// Whole-design GPU dispatch for the rigid `Xᵀ diag(w) X` joint Hessian.
@@ -1010,19 +1030,16 @@ fn rigid_joint_hessian_on_gpu(
 impl BernoulliRigidRowKernel {
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::hessian_dense_override`]. `row_hessians[row]` is the cached
-    /// primary `2×2` row Hessian; `RowSet::All` (unit weights) is guaranteed by
-    /// the caller. Materialization and any selected CUDA Gram execution report
-    /// errors through the row-kernel dense-Hessian contract.
-    fn hessian_dense_blas3(&self, row_hessians: &[[[f64; 2]; 2]]) -> Result<Array2<f64>, String> {
+    /// primary `2×2` row Hessian, indexed by full-data row; each walked row of
+    /// `rows` enters with its Horvitz-Thompson weight. Materialization and any
+    /// selected CUDA Gram execution report errors through the row-kernel
+    /// dense-Hessian contract.
+    fn hessian_dense_blas3(&self, rows: &RowSet, row_hessians: &[[[f64; 2]; 2]]) -> Result<Array2<f64>, String> {
         let slices = &self.slices;
-        let n = self.family.y.len();
-
-        let chunk_rows = blas3_gram_chunk_rows(n);
-        let chunks = (0..n)
-            .step_by(chunk_rows)
-            .map(|start| (start, (start + chunk_rows).min(n)))
-            .collect::<Vec<_>>();
-        // Each chunk slices a contiguous block of design rows. For a
+        let chunks = row_set_gram_chunks(rows, self.family.y.len());
+        let chunk_rows = chunks.first().map_or(1, |&(start, end)| end - start);
+        // Each chunk covers a block of walk positions. Under `RowSet::All` that
+        // is a contiguous block of design rows; for a
         // materialised-dense design that is a zero-copy `ArrayView2`; for an
         // operator-backed / residualised design it is one `try_row_chunk`
         // materialisation of just `CHUNK_ROWS` rows — the same mechanism the
@@ -1055,42 +1072,16 @@ impl BernoulliRigidRowKernel {
                 let mut w_mm = Array1::<f64>::zeros(len);
                 let mut w_mg = Array1::<f64>::zeros(len);
                 let mut w_gg = Array1::<f64>::zeros(len);
-                let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                    match self.family.marginal_design.as_dense_ref() {
-                        Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                        None => self
-                            .family
-                            .marginal_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| {
-                                format!(
-                                    "bernoulli rigid hessian_dense_blas3 marginal_design \
-                                     try_row_chunk({start}..{end}): {e}"
-                                )
-                            })?
-                            .into(),
-                    };
-                let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                    match self.family.slope_design.as_dense_ref() {
-                        Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                        None => self
-                            .family
-                            .slope_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| {
-                                format!(
-                                    "bernoulli rigid hessian_dense_blas3 slope_design \
-                                     try_row_chunk({start}..{end}): {e}"
-                                )
-                            })?
-                            .into(),
-                    };
-                for row in start..end {
-                    let local = row - start;
+                let x_chunk =
+                    row_set_design_rows(&self.family.marginal_design, rows, (start, end), "bernoulli rigid marginal_design")?;
+                let g_chunk =
+                    row_set_design_rows(&self.family.slope_design, rows, (start, end), "bernoulli rigid slope_design")?;
+                for local in 0..len {
+                    let (row, w) = rows.row_at(start + local);
                     let h = &row_hessians[row];
-                    w_mm[local] = h[0][0];
-                    w_mg[local] = h[0][1];
-                    w_gg[local] = h[1][1];
+                    w_mm[local] = w * h[0][0];
+                    w_mg[local] = w * h[0][1];
+                    w_gg[local] = w * h[1][1];
                 }
                 acc.add_weighted_design_grams_from_chunks(&x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg)?;
                 Ok(acc)
@@ -1127,9 +1118,8 @@ impl BernoulliRigidRowKernel {
 
     /// Chunked BLAS-3 implementation backing
     /// [`RowKernel::directional_derivative_dense_override`].
-    fn directional_derivative_dense_blas3(&self, d_beta: &[f64]) -> Result<Array2<f64>, String> {
+    fn directional_derivative_dense_blas3(&self, rows: &RowSet, d_beta: &[f64]) -> Result<Array2<f64>, String> {
         let slices = &self.slices;
-        let n = self.family.y.len();
         let d_beta = ndarray::ArrayView1::from(d_beta);
         // Single-column `(p_block × 1)` direction blocks so the per-chunk
         // projection `X_chunk · dir` is one GEMM each (matching the per-row
@@ -1147,11 +1137,8 @@ impl BernoulliRigidRowKernel {
         // lookup instead of triggering the build nested in a worker.
         let third_full = self.third_full_cache();
 
-        let chunk_rows = blas3_gram_chunk_rows(n);
-        let chunks = (0..n)
-            .step_by(chunk_rows)
-            .map(|start| (start, (start + chunk_rows).min(n)))
-            .collect::<Vec<_>>();
+        let chunks = row_set_gram_chunks(rows, self.family.y.len());
+        let chunk_rows = chunks.first().map_or(1, |&(start, end)| end - start);
         let chunk_body =
             |(start, end): (usize, usize)| -> Result<BernoulliBlockHessianAccumulator, String> {
                 // Same nested-parallel pin as `hessian_dense_blas3`: the per-chunk
@@ -1165,42 +1152,22 @@ impl BernoulliRigidRowKernel {
                     let mut w_mm = Array1::<f64>::zeros(len);
                     let mut w_mg = Array1::<f64>::zeros(len);
                     let mut w_gg = Array1::<f64>::zeros(len);
-                    let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                        match self.family.marginal_design.as_dense_ref() {
-                            Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                            None => self
-                                .family
-                                .marginal_design
-                                .try_row_chunk(start..end)
-                                .map_err(|e| {
-                                    format!("bernoulli marginal_design try_row_chunk: {e}")
-                                })?
-                                .into(),
-                        };
-                    let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                        match self.family.slope_design.as_dense_ref() {
-                            Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                            None => self
-                                .family
-                                .slope_design
-                                .try_row_chunk(start..end)
-                                .map_err(|e| {
-                                    format!("bernoulli slope_design try_row_chunk: {e}")
-                                })?
-                                .into(),
-                        };
+                    let x_chunk =
+                    row_set_design_rows(&self.family.marginal_design, rows, (start, end), "bernoulli rigid marginal_design")?;
+                    let g_chunk =
+                    row_set_design_rows(&self.family.slope_design, rows, (start, end), "bernoulli rigid slope_design")?;
                     let marginal_projected =
                         gam_linalg::faer_ndarray::fast_ab(&x_chunk, &marginal_dir_mat);
                     let slope_projected =
                         gam_linalg::faer_ndarray::fast_ab(&g_chunk, &slope_dir_mat);
-                    for row in start..end {
-                        let local = row - start;
+                    for local in 0..len {
+                        let (row, w) = rows.row_at(start + local);
                         let dq = marginal_projected[[local, 0]];
                         let dg = slope_projected[[local, 0]];
                         let t = contract_third_full(&third_full[row], dq, dg);
-                        w_mm[local] = t[0][0];
-                        w_mg[local] = t[0][1];
-                        w_gg[local] = t[1][1];
+                        w_mm[local] = w * t[0][0];
+                        w_mg[local] = w * t[0][1];
+                        w_gg[local] = w * t[1][1];
                     }
                     acc.add_weighted_design_grams_from_chunks(
                         &x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg,
@@ -1270,6 +1237,7 @@ impl BernoulliRigidRowKernel {
     /// bit-for-bit.
     fn second_directional_derivative_all_axes_blas3(
         &self,
+        rows: &RowSet,
         d_beta_u: &[f64],
     ) -> Result<Vec<Array2<f64>>, String> {
         let slices = &self.slices;
@@ -1295,45 +1263,26 @@ impl BernoulliRigidRowKernel {
             &[("fourth", fourth_full.len())],
         )?;
 
-        let chunk_rows = blas3_gram_chunk_rows(n);
-        let chunks = (0..n)
-            .step_by(chunk_rows)
-            .map(|start| (start, (start + chunk_rows).min(n)))
-            .collect::<Vec<_>>();
+        let chunks = row_set_gram_chunks(rows, n);
+        let m = rows.walk_len(n);
 
-        // Hoisted per-row `u`-projection `(uq_r, ug_r)`, built ONCE via one
-        // chunked GEMM per block. `uq[r] = X.row(r)·u_marg`, `ug[r] = G.row(r)·u_logs`
-        // — bit-identical to `jacobian_action(row, d_beta_u)` (a single design-row
-        // dot per axis), just batched.
-        let mut uq = Array1::<f64>::zeros(n);
-        let mut ug = Array1::<f64>::zeros(n);
+        // Hoisted per-position `u`-projection `(uq_k, ug_k)` of walked row `r`,
+        // built ONCE via one chunked GEMM per block. `uq[k] = X.row(r)·u_marg`,
+        // `ug[k] = G.row(r)·u_logs` — bit-identical to `jacobian_action(r, d_beta_u)`
+        // (a single design-row dot per axis), just batched.
+        let mut uq = Array1::<f64>::zeros(m);
+        let mut ug = Array1::<f64>::zeros(m);
         for &(start, end) in &chunks {
             gam_problem::with_nested_parallel(|| -> Result<(), String> {
-                let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                    match self.family.marginal_design.as_dense_ref() {
-                        Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                        None => self
-                            .family
-                            .marginal_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?
-                            .into(),
-                    };
-                let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                    match self.family.slope_design.as_dense_ref() {
-                        Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                        None => self
-                            .family
-                            .slope_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli slope_design try_row_chunk: {e}"))?
-                            .into(),
-                    };
+                let x_chunk =
+                    row_set_design_rows(&self.family.marginal_design, rows, (start, end), "bernoulli rigid marginal_design")?;
+                let g_chunk =
+                    row_set_design_rows(&self.family.slope_design, rows, (start, end), "bernoulli rigid slope_design")?;
                 let uq_chunk = gam_linalg::faer_ndarray::fast_ab(&x_chunk, &u_marg_mat);
                 let ug_chunk = gam_linalg::faer_ndarray::fast_ab(&g_chunk, &u_logs_mat);
-                for row in start..end {
-                    uq[row] = uq_chunk[[row - start, 0]];
-                    ug[row] = ug_chunk[[row - start, 0]];
+                for position in start..end {
+                    uq[position] = uq_chunk[[position - start, 0]];
+                    ug[position] = ug_chunk[[position - start, 0]];
                 }
                 Ok(())
             })?;
@@ -1360,35 +1309,16 @@ impl BernoulliRigidRowKernel {
                     |(start, end): (usize, usize)| -> Result<BernoulliBlockHessianAccumulator, String> {
                         let len = end - start;
                         let mut acc = BernoulliBlockHessianAccumulator::new(slices);
-                        let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                            match self.family.marginal_design.as_dense_ref() {
-                                Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                                None => self
-                                    .family
-                                    .marginal_design
-                                    .try_row_chunk(start..end)
-                                    .map_err(|e| {
-                                        format!("bernoulli marginal_design try_row_chunk: {e}")
-                                    })?
-                                    .into(),
-                            };
-                        let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                            match self.family.slope_design.as_dense_ref() {
-                                Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                                None => self
-                                    .family
-                                    .slope_design
-                                    .try_row_chunk(start..end)
-                                    .map_err(|e| {
-                                        format!("bernoulli slope_design try_row_chunk: {e}")
-                                    })?
-                                    .into(),
-                            };
+                        let x_chunk =
+                    row_set_design_rows(&self.family.marginal_design, rows, (start, end), "bernoulli rigid marginal_design")?;
+                        let g_chunk =
+                    row_set_design_rows(&self.family.slope_design, rows, (start, end), "bernoulli rigid slope_design")?;
                         let mut w_mm = Array1::<f64>::zeros(len);
                         let mut w_mg = Array1::<f64>::zeros(len);
                         let mut w_gg = Array1::<f64>::zeros(len);
-                        for row in start..end {
-                            let local = row - start;
+                        for local in 0..len {
+                            let position = start + local;
+                            let (row, w) = rows.row_at(position);
                             // `dir_v = jacobian_action(row, e_a)`: a unit pick of
                             // one design column, zero in the other block. Read the
                             // exact same scalar the generic per-axis path reads.
@@ -1401,14 +1331,14 @@ impl BernoulliRigidRowKernel {
                             // `(dir_u = (uq, ug), dir_v = (vq, vg))`.
                             let m = contract_fourth_full(
                                 &fourth_full[row],
-                                uq[row],
-                                ug[row],
+                                uq[position],
+                                ug[position],
                                 vq,
                                 vg,
                             );
-                            w_mm[local] = m[0][0];
-                            w_mg[local] = m[0][1];
-                            w_gg[local] = m[1][1];
+                            w_mm[local] = w * m[0][0];
+                            w_mg[local] = w * m[0][1];
+                            w_gg[local] = w * m[1][1];
                         }
                         acc.add_weighted_design_grams_from_chunks(
                             &x_chunk, &g_chunk, &w_mm, &w_mg, &w_gg,
@@ -1462,7 +1392,7 @@ impl BernoulliRigidRowKernel {
     /// Gram reduces in the identical in-row order as `hessian_dense_blas3`, so
     /// axis `a` matches `row_kernel_directional_derivative(self, All, e_a)`
     /// bit-for-bit.
-    fn directional_derivative_all_axes_blas3(&self) -> Result<Vec<Array2<f64>>, String> {
+    fn directional_derivative_all_axes_blas3(&self, rows: &RowSet) -> Result<Vec<Array2<f64>>, String> {
         let slices = &self.slices;
         let n = self.family.y.len();
         let p_m = slices.marginal.len();
@@ -1476,32 +1406,31 @@ impl BernoulliRigidRowKernel {
             &[("third", third_full.len())],
         )?;
 
-        let chunk_rows = blas3_gram_chunk_rows(n);
-        let chunks = (0..n)
-            .step_by(chunk_rows)
-            .map(|start| (start, (start + chunk_rows).min(n)))
-            .collect::<Vec<_>>();
+        let chunks = row_set_gram_chunks(rows, n);
+        let m = rows.walk_len(n);
 
-        // Per-row axis-independent partial contractions, built ONCE:
-        //   A_r = contract_third_full(T³ᵣ, 1, 0)   (marginal-axis unit weight)
-        //   B_r = contract_third_full(T³ᵣ, 0, 1)   (slope-axis unit weight)
+        // Per-position axis-independent partial contractions of walked row `r`,
+        // HT weight `w` folded in, built ONCE:
+        //   A_k = w · contract_third_full(T³ᵣ, 1, 0)   (marginal-axis unit weight)
+        //   B_k = w · contract_third_full(T³ᵣ, 0, 1)   (slope-axis unit weight)
         // Each is a symmetric `2×2`; we keep the three independent entries
         // `(mm, mg, gg)` the design-row Gram consumes.
-        let mut a_mm = Array1::<f64>::zeros(n);
-        let mut a_mg = Array1::<f64>::zeros(n);
-        let mut a_gg = Array1::<f64>::zeros(n);
-        let mut b_mm = Array1::<f64>::zeros(n);
-        let mut b_mg = Array1::<f64>::zeros(n);
-        let mut b_gg = Array1::<f64>::zeros(n);
-        for row in 0..n {
+        let mut a_mm = Array1::<f64>::zeros(m);
+        let mut a_mg = Array1::<f64>::zeros(m);
+        let mut a_gg = Array1::<f64>::zeros(m);
+        let mut b_mm = Array1::<f64>::zeros(m);
+        let mut b_mg = Array1::<f64>::zeros(m);
+        let mut b_gg = Array1::<f64>::zeros(m);
+        for position in 0..m {
+            let (row, w) = rows.row_at(position);
             let a = contract_third_full(&third_full[row], 1.0, 0.0);
             let b = contract_third_full(&third_full[row], 0.0, 1.0);
-            a_mm[row] = a[0][0];
-            a_mg[row] = a[0][1];
-            a_gg[row] = a[1][1];
-            b_mm[row] = b[0][0];
-            b_mg[row] = b[0][1];
-            b_gg[row] = b[1][1];
+            a_mm[position] = w * a[0][0];
+            a_mg[position] = w * a[0][1];
+            a_gg[position] = w * a[1][1];
+            b_mm[position] = w * b[0][0];
+            b_mg[position] = w * b[0][1];
+            b_gg[position] = w * b[1][1];
         }
 
         // One axis = one independent full-data design-row Gram. A marginal axis
@@ -1523,49 +1452,29 @@ impl BernoulliRigidRowKernel {
                     |(start, end): (usize, usize)| -> Result<BernoulliBlockHessianAccumulator, String> {
                         let len = end - start;
                         let mut acc = BernoulliBlockHessianAccumulator::new(slices);
-                        let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                            match self.family.marginal_design.as_dense_ref() {
-                                Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                                None => self
-                                    .family
-                                    .marginal_design
-                                    .try_row_chunk(start..end)
-                                    .map_err(|e| {
-                                        format!("bernoulli marginal_design try_row_chunk: {e}")
-                                    })?
-                                    .into(),
-                            };
-                        let g_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                            match self.family.slope_design.as_dense_ref() {
-                                Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                                None => self
-                                    .family
-                                    .slope_design
-                                    .try_row_chunk(start..end)
-                                    .map_err(|e| {
-                                        format!("bernoulli slope_design try_row_chunk: {e}")
-                                    })?
-                                    .into(),
-                            };
+                        let x_chunk =
+                    row_set_design_rows(&self.family.marginal_design, rows, (start, end), "bernoulli rigid marginal_design")?;
+                        let g_chunk =
+                    row_set_design_rows(&self.family.slope_design, rows, (start, end), "bernoulli rigid slope_design")?;
                         let mut w_mm = Array1::<f64>::zeros(len);
                         let mut w_mg = Array1::<f64>::zeros(len);
                         let mut w_gg = Array1::<f64>::zeros(len);
-                        for row in start..end {
-                            let local = row - start;
+                        for local in 0..len {
+                            let position = start + local;
                             // Axis projection scalar `s = jacobian_action(row, e_a)`
                             // in the active block, scaling the precomputed unit-axis
                             // contraction. `contract_third_full` is linear, so this
                             // equals `contract_third_full(T³ᵣ, vq_r, vg_r)` exactly.
                             if marginal_axis {
                                 let s = x_chunk[[local, local_col]];
-                                w_mm[local] = s * a_mm[row];
-                                w_mg[local] = s * a_mg[row];
-                                w_gg[local] = s * a_gg[row];
+                                w_mm[local] = s * a_mm[position];
+                                w_mg[local] = s * a_mg[position];
+                                w_gg[local] = s * a_gg[position];
                             } else {
                                 let s = g_chunk[[local, local_col]];
-                                w_mm[local] = s * b_mm[row];
-                                w_mg[local] = s * b_mg[row];
-                                w_gg[local] = s * b_gg[row];
+                                w_mm[local] = s * b_mm[position];
+                                w_mg[local] = s * b_mg[position];
+                                w_gg[local] = s * b_gg[position];
                             }
                         }
                         acc.add_weighted_design_grams_from_chunks(
