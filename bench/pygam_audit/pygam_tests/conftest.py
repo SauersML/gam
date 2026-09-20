@@ -23,11 +23,21 @@ import gamfit  # noqa: E402
 
 
 def pdep(model, term, data, grid=None, n_points=100):
-    """partial_dependence across wheel (term, data, grid) and HEAD (term, grid) signatures."""
+    """partial_dependence across wheel (term, data, grid) and HEAD (term, grid) signatures,
+    as the wheel's dict: HEAD returns a gamfit.PartialEffect, read here by the same keys."""
     params = inspect.signature(model.partial_dependence).parameters
     if "data" in params:
         return model.partial_dependence(term, data, grid=grid, n_points=n_points)
-    return model.partial_dependence(term, grid=grid, n_points=n_points)
+    effect = model.partial_dependence(term, grid=grid, n_points=n_points)
+    if isinstance(effect, dict):
+        return effect
+    return {
+        "grid": effect.x if len(effect.axes) == 1 else effect.grid,
+        "axes": list(effect.axes),
+        "predicted": effect.fit,
+        "standard_error": effect.se,
+        "covariance_source": effect.covariance_source,
+    }
 
 
 def eta_of(model, data):

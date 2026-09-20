@@ -37,9 +37,14 @@ linear predictor stays bounded on the training hull (a heavy-tailed covariate
 must not overflow the Poisson mean in the truth itself). Held-out rows see the
 truth held at its boundary value outside the training range.
 
-The `full` plan is 180 cases x 4 `n` x 3 families = **2 160 reps, 4 320 fits**.
+The `full` plan is 180 cases x `n` in {30, 100, 1 000} x 3 families, plus
+the first 24 cases (which draw every `p` from 1 to 8) at `n = 10 000`:
+**1 692 reps, 3 384 fits**. A rep at `n = 10 000` costs one to fifteen
+single-threaded minutes, about a hundred times one at `n = 1 000`.
 `quick` is the seeded fixture of every root cause this fuzzer found and fixed
-(`run.FIXTURES`) plus the first six cases at `n` in {30, 100}.
+(`run.FIXTURES`), and `test_quick.py` requires zero failures on it. A cause
+that is still open, in this lane or another, shows up in the `full` report
+and gets its fixture in `quick` in the same change that fixes it.
 
 ## What one rep checks (`worker.py`)
 
@@ -80,5 +85,26 @@ problem has more than one optimum, which is a finding of its own).
 
 ## Results
 
-See the PR that introduced this directory for the before/after table by
-cause; `triage.py DIR_BEFORE DIR_AFTER` regenerates it from two runs.
+`triage.py DIR_BEFORE DIR_AFTER` regenerates the before/after table from two
+runs. The full plan on main at 99940493 (before) and with the latched
+spectral-position block of the #784 correction (after), by primary cause,
+message heads abbreviated:
+
+| cause | before | after |
+|---|---:|---:|
+| `raise:fit` outer optimization did not certify a stationary optimum | 157 | 147 |
+| `raise:fit` smooth term remains under-resolution-uncertain | 76 | 76 |
+| `raise:fit` #784 block-local correction: order search refused | 32 | 32 |
+| `hang` | 26 | 22 |
+| `raise:refit` outer optimization did not certify a stationary optimum | 19 | 24 |
+| `raise:fit` declined a certified optimum that an evaluated state beats | 8 | 8 |
+| `raise:fit` Newton decrement above tolerance | 5 | 5 |
+| `reml_mismatch:refit_worse` | 3 | 3 |
+| `reml_mismatch:fit_worse` | 1 | 2 |
+| `raise:fit` / `raise:refit` under-resolution-uncertain (other types) | 2 | 4 |
+| `nonfinite:*_reml_score` exactly interpolating Gaussian fit | 2 | 2 |
+| **total** | **331 / 1692 (19.56%)** | **325 / 1692 (19.21%)** |
+
+The fixed cause's fixture is `run.FIXTURES` (`case0/binomial/n1000`). The
+rest of the net change is outer-search trajectories moving, both ways, once
+the criterion no longer jumps; those failures belong to the causes above.
