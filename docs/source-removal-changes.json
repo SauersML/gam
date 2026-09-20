@@ -2691,5 +2691,18 @@
     ],
     "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
     "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
+  },
+  {
+    "base": "08628afb310729629275eb487e7714732662d59e",
+    "items": [
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:duchon_radial_jacobian_second",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:duchon_radial_jacobian_third",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:jacobian_second",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:jacobian_third",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:target_matrix",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:struct:IsometryDuchonRadialSource"
+    ],
+    "reason": "IsometryDuchonRadialSource had no constructor anywhere in the workspace: IsometryPenalty::duchon_radial_source was set to None in new_euclidean and only ever cloned, so its Duchon Jacobian adapters (duchon_radial_jacobian_second/third), the target_matrix helper they read, and the jacobian_second/jacobian_third wrappers that fell back to them were dead, and every duchon_radial_source.is_none() guard was always true. The gradient, GN majorizer and exact HVP now read the installed H/K caches after the evaluation precondition, which already refuses a missing jet by name.",
+    "evidence": "git grep on the base tree finds no struct literal or constructor of IsometryDuchonRadialSource and no assignment to duchon_radial_source other than `duchon_radial_source: None` in IsometryPenalty::new_euclidean and the field-wise clone; the same-named target_matrix/jacobian_second/jacobian_third occurrences the guard counts belong to other penalties (block_sparsity, nuclear_norm, orthogonality, row_precision) and to the deleted wrappers' own call sites in isometry.rs."
   }
 ]
