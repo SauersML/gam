@@ -1180,6 +1180,23 @@ impl LinearTermSpec {
         }
     }
 
+    /// Whether this term owns a one-column penalty block in the realized
+    /// design: the function-mass ridge of a `double_penalty` term, or the
+    /// latent-scale ridge a `bounded()` coefficient carries under the default
+    /// [`BoundedCoefficientPriorSpec::Shrinkage`] prior. The design builder
+    /// emits exactly one block per such term, in term order, ahead of the
+    /// random-effect ridges.
+    pub fn owns_penalty_block(&self) -> bool {
+        self.double_penalty
+            || matches!(
+                self.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded {
+                    prior: BoundedCoefficientPriorSpec::Shrinkage,
+                    ..
+                }
+            )
+    }
+
     /// Realize this linear term's `(n,)` design column from `data`.
     ///
     /// The column is the elementwise product of every numeric feature column
@@ -1409,6 +1426,20 @@ impl TermCollectionSpec {
                 LinearCoefficientGeometry::Bounded { .. }
             )
         })
+    }
+
+    /// Global penalty-block index (and so smoothing-parameter index) of the
+    /// ridge owned by `random_effect_terms[term_idx]`.
+    ///
+    /// The realized layout is one block per penalty-owning linear term
+    /// ([`LinearTermSpec::owns_penalty_block`]), then one `RandomEffectRidge`
+    /// per random-effect term in term order, then the smooth penalties.
+    pub fn random_effect_penalty_index(&self, term_idx: usize) -> usize {
+        self.linear_terms
+            .iter()
+            .filter(|term| term.owns_penalty_block())
+            .count()
+            + term_idx
     }
 
     /// Return every feature column that is interpreted as a categorical factor

@@ -12,7 +12,6 @@ use crate::inference::model::{
     SchemaColumn,
 };
 use gam_solve::estimate::{BlockRole, UnifiedFitResult};
-use gam_terms::smooth::TermCollectionSpec;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -155,7 +154,7 @@ fn extend_model_with_random_effect_level(
         (
             term_idx,
             spec.random_effect_terms[term_idx].feature_col,
-            random_effect_penalty_index(spec, term_idx),
+            spec.random_effect_penalty_index(term_idx),
         )
     };
     let schema = payload
@@ -336,10 +335,6 @@ fn json_level_to_f64(value: &serde_json::Value) -> Result<f64, String> {
 
 fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|error| format!("<unserializable: {error}>"))
-}
-
-fn random_effect_penalty_index(spec: &TermCollectionSpec, term_idx: usize) -> usize {
-    usize::from(spec.linear_terms.iter().any(|term| term.double_penalty)) + term_idx
 }
 
 fn extension_prior_parameters(
