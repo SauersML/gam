@@ -56,11 +56,15 @@ class PartialEffect:
         The curve and its standard error, one entry per grid row.
     lower, upper:
         Pointwise intervals at :attr:`level`: ``fit ∓ pointwise_critical · se``.
+        The critical value is the two-sided quantile of the fit's pivot law:
+        Student-t on ``n - edf_total`` when the fit estimates its dispersion
+        (Gaussian, Gamma, ...), standard normal when the scale is known.
     simultaneous_lower, simultaneous_upper:
         A band that covers the whole curve over the grid with probability
         :attr:`level`: ``fit ∓ simultaneous_critical · se``. The critical value
         is the ``level`` quantile of ``max |standardized curve error|`` over
-        the grid, from :attr:`simulations` posterior draws (seed :attr:`seed`);
+        the grid (a multivariate-t supremum when the dispersion is estimated),
+        calibrated from :attr:`simulations` posterior draws (seed :attr:`seed`);
         the draw count holds the Monte-Carlo error of the attained coverage to
         a fixed fraction of its miss rate.
     scale, quantity, contribution, held:

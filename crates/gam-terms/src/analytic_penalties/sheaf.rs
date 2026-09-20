@@ -619,18 +619,12 @@ impl AnalyticPenalty for SheafConsistencyPenalty {
         SheafConsistencyPenalty::gradient(self, target)
     }
 
-    fn hessian_diag(
-        &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
-    ) -> Option<Array1<f64>> {
-        assert!(
-            rho.iter().all(|x| x.is_finite()),
-            "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
-        );
-        Some(SheafConsistencyPenalty::hessian_diag(self, target))
-    }
-
+    // `hessian_diag` keeps the trait default `None`: the Hessian `weight·L`
+    // couples every edge's endpoints, so it is not diagonal. That `None` is
+    // also what routes `psd_majorizer_hvp` to the exact Laplacian `hvp`,
+    // which is the PSD majorizer of this convex quadratic; a `Some(diag(L))`
+    // would make the trait default apply `diag(L) ⊙ v` and drop every edge
+    // coupling, and `diag(L)` is not `⪰ L` on any edge.
     fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
@@ -1038,5 +1032,61 @@ mod tests {
         // Now break consistency: s_1 = (0, 0). δs = (1, 3). Value = ½·2·(1+9) = 10.
         let s2 = array![1.0_f64, 0.0, 0.0, 0.0];
         assert_abs_diff_eq!(pen.value(s2.view()), 10.0, epsilon = 1e-12);
+    }
+
+    // The penalty is a convex quadratic, so its PSD majorizer must be the exact
+    // Hessian `weight·L`, not its diagonal. `diag(L)` is not a majorizer of `L`:
+    // on the single edge below, `diag(L) − L` has a negative eigenvalue.
+    #[test]
+    fn sheaf_psd_majorizer_is_the_exact_weighted_laplacian() {
+        let edges = vec![(0usize, 1usize), (1usize, 2usize), (2usize, 2usize)];
+        let restrictions = vec![
+            EdgeRestriction::paired(array![[0.9_f64, 0.1], [-0.2, 0.7]], identity(2)),
+            EdgeRestriction::single(array![[0.5_f64, -0.3], [0.4, 0.8]]),
+            EdgeRestriction::paired(
+                array![[0.6_f64, 0.2], [0.1, 1.1]],
+                array![[0.3_f64, 0.0], [0.5, 0.2]],
+            ),
+        ];
+        let weight = 1.7_f64;
+        let pen = SheafConsistencyPenalty::new(edges, restrictions, weight, vec![2, 2, 2])
+            .expect("build");
+        let n = pen.total_dim();
+        let s = Array1::from_shape_fn(n, |i| 0.3 * i as f64 - 0.5);
+        let rho = Array1::<f64>::zeros(0);
+        assert!(
+            AnalyticPenalty::hessian_diag(&pen, s.view(), rho.view()).is_none(),
+            "a non-diagonal Hessian has no diagonal to report"
+        );
+        assert!(
+            AnalyticPenalty::psd_majorizer_diag(&pen, s.view(), rho.view()).is_none(),
+            "a non-diagonal Hessian has no diagonal majorizer to report"
+        );
+        let l = dense_laplacian(&pen);
+        let mut b = Array2::<f64>::zeros((n, n));
+        let mut e = Array1::<f64>::zeros(n);
+        for j in 0..n {
+            e[j] = 1.0;
+            let col = pen.psd_majorizer_hvp(s.view(), rho.view(), e.view());
+            let exact = AnalyticPenalty::hvp(&pen, s.view(), rho.view(), e.view());
+            for i in 0..n {
+                b[[i, j]] = col[i];
+                assert_abs_diff_eq!(col[i], exact[i], epsilon = 1e-12);
+                assert_abs_diff_eq!(col[i], weight * l[[i, j]], epsilon = 1e-12);
+            }
+            e[j] = 0.0;
+        }
+        // The diagonal the trait default used to apply is not a majorizer: the
+        // matrix `diag(B) − B` must have a clearly negative eigenvalue here.
+        let mut gap = -b.clone();
+        for i in 0..n {
+            gap[[i, i]] += b[[i, i]];
+        }
+        let (gap_evals, _) = gap.eigh(Side::Lower).expect("eigh");
+        let min_gap = gap_evals.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            min_gap < -0.1,
+            "diag(weight·L) − weight·L should be indefinite, min eigenvalue {min_gap}"
+        );
     }
 }

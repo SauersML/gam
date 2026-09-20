@@ -144,12 +144,11 @@ pub(crate) fn stripe_score_warp_across_z_coords(
                     structure_hint: None,
                     op: None,
                 });
-            block.nullspace_dims.push(
-                base_nullspaces
-                    .get(penalty_idx)
-                    .copied()
-                    .unwrap_or_default(),
-            );
+            // An empty base list means eigenvalue rank detection; defaulting a
+            // missing entry to 0 would instead declare the copy full rank.
+            if let Some(&nullity) = base_nullspaces.get(penalty_idx) {
+                block.nullspace_dims.push(nullity);
+            }
         }
     }
 

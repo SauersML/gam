@@ -87,3 +87,49 @@ fn omitted_gamma_prior_matches_uninformed_fit_bitwise() {
         max_relative = 1e-12
     );
 }
+
+#[test]
+fn block_specific_gamma_prior_overrides_term_wide_default() {
+    // `g:0` names the random-effect block itself, `g` the whole term. The
+    // block-specific key must win whatever the byte order of the two labels,
+    // and the shadowed term-wide key is a known label, not an unknown one.
+    let data = grouped_fixture(50);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        penalty_block_gamma_priors: vec![
+            ("g".to_string(), 1.0, 1.0),
+            ("g:0".to_string(), 1_000.0, 1.0),
+        ],
+        ..FitConfig::default()
+    };
+    let fit = match fit_from_formula("y ~ group(g)", &data, &cfg).expect("layered-prior fit") {
+        FitResult::Standard(fit) => fit,
+        _ => panic!("expected standard fit"),
+    };
+    let lambda = fit.fit.lambdas[0];
+    assert!(
+        (lambda - 1_000.0).abs() / 1_000.0 < 0.10,
+        "the block-specific prior should dominate lambda: {lambda}"
+    );
+}
+
+#[test]
+fn two_block_specific_gamma_priors_for_one_block_are_ambiguous() {
+    let data = grouped_fixture(12);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        penalty_block_gamma_priors: vec![
+            ("g:0".to_string(), 1_000.0, 1.0),
+            ("penalty:0".to_string(), 1.0, 1.0),
+        ],
+        ..FitConfig::default()
+    };
+    let message = match fit_from_formula("y ~ group(g)", &data, &cfg) {
+        Ok(_) => panic!("two equally specific keys for one block must be rejected"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        message.contains("ambiguous"),
+        "expected an ambiguity error, got: {message}"
+    );
+}

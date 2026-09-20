@@ -62,9 +62,11 @@ pub fn canonical_standard_fit_options(
         // Formula/CLI fits are the interactive/default path: keep coefficient
         // covariance and the analytic first-order smoothing correction, which
         // the returned fit needs. The rho-posterior adequacy diagnostic (Tier-0
-        // PSIS over dozens of refits, and its Tier-1/Tier-2 escalations) is not
-        // needed to build that fit, so it runs only for lower-level callers that
-        // request it (`skip_rho_posterior_inference: false`).
+        // PSIS over dozens of refits, and its Tier-1/Tier-2 escalations) has no
+        // reader on this path, so the fit publishes
+        // `NotComputed(InferenceNotRequested)` and spends no criterion
+        // evaluation on it (#3010); lower-level callers that read it request it
+        // (`skip_rho_posterior_inference: false`).
         skip_rho_posterior_inference: true,
         // The count for the loops that still take one: the negative-binomial
         // alternation, the expectile LAWS iterations, the bounded-effect
@@ -1826,9 +1828,7 @@ pub fn drop_zero_weight_rows<'a>(
         return Ok(Cow::Borrowed(data));
     }
     if keep.is_empty() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
-        });
+        return Err(no_positive_weight_error(name, weights.len()));
     }
     data.select_rows(&keep)
         .map(Cow::Owned)
