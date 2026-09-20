@@ -954,8 +954,15 @@ impl SmoothTerm {
 
 /// Numeric core of [`SmoothTerm::wald_unpenalized_dim`]: the dimension of the
 /// joint null space `∩_k null(S_k) = null(Σ_k S_k)` of a term's local penalty
-/// blocks, with a conservative fallback when a penalty is not materialized as a
-/// full `p_local × p_local` matrix (e.g. a Kronecker tensor factor).
+/// blocks.
+///
+/// Every active penalty is stored as its full `p_local × p_local` block: the
+/// filter keeps the symmetrized dense matrix of the certified
+/// `ConstructiveQuadratic` (a tensor penalty is the materialized Kronecker
+/// product, its factors ride along only as a spectral hint), and the design
+/// builder places each one with `BlockwisePenalty::new`, which asserts that
+/// shape. A block of any other shape is a construction defect, not a case with
+/// a sensible default, so it is asserted here too rather than guessed.
 pub(crate) fn joint_unpenalized_dim(p_local: usize, active_penalties: &[ActivePenalty]) -> usize {
     use gam_linalg::faer_ndarray::FaerEigh;
     if p_local == 0 {
@@ -965,52 +972,40 @@ pub(crate) fn joint_unpenalized_dim(p_local: usize, active_penalties: &[ActivePe
         // No penalty ⇒ a wholly unpenalized (fixed-effect) block.
         return p_local;
     }
-    // Sum the penalties that are materialized as full `p_local × p_local`
-    // blocks (the common smooth case). The covariance block the Wald test
-    // slices lives in this same coefficient basis (post joint-null rotation),
-    // so the rank is computed in the right metric.
+    // The covariance block the Wald test slices lives in this same coefficient
+    // basis (post joint-null rotation), so the rank is computed in the right
+    // metric.
     let mut s_total = Array2::<f64>::zeros((p_local, p_local));
-    let mut materialized = 0usize;
     for penalty in active_penalties {
         let s = &penalty.matrix;
-        if s.nrows() == p_local && s.ncols() == p_local {
-            s_total += s;
-            materialized += 1;
-        }
+        assert_eq!(
+            s.dim(),
+            (p_local, p_local),
+            "active penalty {:?} is {}×{} on a {p_local}-coefficient term",
+            penalty.info.source,
+            s.nrows(),
+            s.ncols(),
+        );
+        s_total += s;
     }
-    if materialized == active_penalties.len() {
-        let symmetric = {
-            let transpose = s_total.t().to_owned();
-            (&s_total + &transpose) * 0.5
-        };
-        if let Ok((evals, _)) = symmetric.eigh(faer::Side::Lower) {
-            let max_abs = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-            if max_abs == 0.0 {
-                // All penalties identically zero ⇒ unpenalized block.
-                return p_local;
-            }
-            // The joint null space is read at the crate's one penalty-spectrum rank
-            // cutoff, so this dimension agrees with the ranks the term's penalties
-            // carry everywhere else.
-            let tol = crate::basis::spectral_tolerance(&evals);
-            let rank = evals.iter().filter(|&&v| v > tol).count();
-            return p_local.saturating_sub(rank);
-        }
+    let symmetric = {
+        let transpose = s_total.t().to_owned();
+        (&s_total + &transpose) * 0.5
+    };
+    let (evals, _) = symmetric
+        .eigh(faer::Side::Lower)
+        .expect("symmetric eigendecomposition of a sum of certified PSD penalties");
+    let max_abs = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    if max_abs == 0.0 {
+        // All penalties identically zero ⇒ unpenalized block.
+        return p_local;
     }
-    // Conservative fallback when a penalty is not a materialized full block
-    // (e.g. a Kronecker tensor factor): with ≥2 active penalties the joint
-    // null space is almost always empty (the only over-rejecting direction);
-    // with a single penalty it is exactly that penalty's own null space.
-    if active_penalties.len() >= 2 {
-        0
-    } else {
-        active_penalties
-            .iter()
-            .map(|penalty| penalty.nullity)
-            .min()
-            .unwrap_or(0)
-            .min(p_local)
-    }
+    // The joint null space is read at the crate's one penalty-spectrum rank
+    // cutoff, so this dimension agrees with the ranks the term's penalties
+    // carry everywhere else.
+    let tol = crate::basis::spectral_tolerance(&evals);
+    let rank = evals.iter().filter(|&&v| v > tol).count();
+    p_local.saturating_sub(rank)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2370,11 +2365,34 @@ pub struct TermCollectionPredictionDesign {
     pub affine_offset: Array1<f64>,
     /// Each linear term's name and global coefficient range, in spec order.
     pub linear_ranges: Vec<(String, Range<usize>)>,
+    /// Each random-effect term's name and global coefficient range, in spec order.
+    pub random_effect_ranges: Vec<(String, Range<usize>)>,
     /// Each smooth term's name and global coefficient range, in spec order.
     pub smooth_ranges: Vec<(String, Range<usize>)>,
 }
 
 impl TermCollectionPredictionDesign {
+    /// The global coefficient range of the linear, random-effect or smooth term
+    /// named `term`.
+    pub fn term_range(&self, term: &str) -> Option<Range<usize>> {
+        self.linear_ranges
+            .iter()
+            .chain(&self.random_effect_ranges)
+            .chain(&self.smooth_ranges)
+            .find(|(name, _)| name == term)
+            .map(|(_, range)| range.clone())
+    }
+
+    /// Every non-intercept term's name, in design order.
+    pub fn term_names(&self) -> Vec<&str> {
+        self.linear_ranges
+            .iter()
+            .chain(&self.random_effect_ranges)
+            .chain(&self.smooth_ranges)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
     /// See [`TermCollectionDesign::compose_offset`].
     pub fn compose_offset(
         &self,
