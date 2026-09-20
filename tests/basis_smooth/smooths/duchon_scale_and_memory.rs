@@ -6,9 +6,14 @@
 //! known smooth truth.
 //!
 //! OBJECTIVE METRICS (the only pass/fail claims here): for each fit we assert
-//! (a) the fit completes, (b) every fitted value is finite, and (c) the
-//! truth-recovery RMSE on a held-out interior grid is clearly below the trivial
-//! mean/zero predictor (RMS of the demeaned truth). We do NOT compare against
+//! (a) the fit completes, (b) every fitted value is finite, and (c) the fit
+//! recovers the truth on a held-out interior grid to within its own Bayesian
+//! band: the across-the-function coverage statistic of the fit's `Vb` against
+//! the known truth must not exceed its derived bound (see
+//! [`across_function_coverage`]). That bar tightens with `n` on its own, since
+//! the band narrows as the data grow, and a fit that keeps only part of the
+//! signal fails because the lost signal enters the error while the band does
+//! not widen to cover it (gam#4505). We do NOT compare against
 //! any reference tool and we do NOT assert closeness to a reference output —
 //! these tests stand on gam's own truth recovery at scale. (The companion file
 //! `quality_vs_mgcv_duchon_smooth.rs` owns the match-or-beat-mgcv comparison.)
@@ -28,14 +33,86 @@ use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::probability::chi_square_quantile;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
-/// Root-mean-square of a slice (used for the trivial-predictor floor).
-fn rms(v: &[f64]) -> f64 {
-    (v.iter().map(|&t| t * t).sum::<f64>() / v.len() as f64).sqrt()
+/// Family-wise significance level of each test's coverage gates, split
+/// Bonferroni-style over the independent fits the test makes.
+const FAMILY_ALPHA: f64 = 0.01;
+
+/// Across-the-function coverage statistic of the fit's Bayesian band
+/// (Nychka 1988; Marra & Wood 2012), with its derived upper bound.
+///
+/// `x_probe` is the probe design, `cov` the fit's conditional Bayesian
+/// coefficient covariance `Vb` (`fit.beta_covariance()`) and `err` the
+/// errors `f̂(x_i) − f(x_i)` against the known truth. With `C = X_p Vb X_pᵀ`,
+/// `s_i = √C_ii` and correlation `R = D⁻¹CD⁻¹`, the statistic is
+/// `Q = (1/P) Σ e_i²/s_i²`. Under the model behind the band, `e ~ N(0, C)`, so
+/// `E[Q] = 1` and `Var[Q] = 2·tr(R²)/P²`. Smoothing bias adds to `e` while
+/// over-smoothing shrinks `s`, so a fit that loses signal drives `Q ≫ 1`.
+/// The returned bound is the `1 − alpha` quantile of the moment-matched
+/// scaled `χ²` (Satterthwaite): `Q ≈ g·χ²_h` with `g = tr(R²)/P²`, `h = 1/g`.
+fn across_function_coverage(
+    x_probe: &Array2<f64>,
+    cov: &Array2<f64>,
+    err: &[f64],
+    alpha: f64,
+) -> Result<(f64, f64), String> {
+    let c = x_probe.dot(cov).dot(&x_probe.t());
+    let p = err.len();
+    let s: Vec<f64> = (0..p).map(|i| c[[i, i]].sqrt()).collect();
+    if let Some(i) = s.iter().position(|v| !(v.is_finite() && *v > 0.0)) {
+        return Err(format!("posterior SE at probe {i} is {}", s[i]));
+    }
+    let q = err
+        .iter()
+        .zip(s.iter())
+        .map(|(e, si)| (e / si).powi(2))
+        .sum::<f64>()
+        / p as f64;
+    let mut tr_r2 = 0.0;
+    for i in 0..p {
+        for j in 0..p {
+            let r = c[[i, j]] / (s[i] * s[j]);
+            tr_r2 += r * r;
+        }
+    }
+    let g = tr_r2 / (p * p) as f64;
+    let bound = g * chi_square_quantile(1.0 - alpha, 1.0 / g);
+    Ok((q, bound))
+}
+
+/// Gate one fit on [`across_function_coverage`] at level `alpha`, panicking
+/// with `label`, the statistic, its bound and the RMSE when the gate fails.
+fn assert_covers_truth(
+    label: &str,
+    fit: &gam::StandardFitResult,
+    x_probe: &Array2<f64>,
+    gam_fitted: &[f64],
+    y_truth: &[f64],
+    alpha: f64,
+) {
+    let err: Vec<f64> = gam_fitted
+        .iter()
+        .zip(y_truth.iter())
+        .map(|(f, t)| f - t)
+        .collect();
+    let recovery_rmse = rmse(gam_fitted, y_truth);
+    let cov = fit
+        .fit
+        .beta_covariance()
+        .unwrap_or_else(|| panic!("{label}: fit carries no Bayesian covariance Vb"));
+    let (q, bound) = across_function_coverage(x_probe, cov, &err, alpha)
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+    eprintln!("{label}: recovery_rmse={recovery_rmse:.5} Q={q:.3} (E=1, bound={bound:.3})");
+    assert!(
+        q <= bound,
+        "{label}: coverage statistic Q={q:.3} > bound {bound:.3} (alpha={alpha:.4}); \
+         recovery_rmse={recovery_rmse:.5}"
+    );
 }
 
 /// Build a single-feature dataset `{x, y}` from parallel vectors.
@@ -91,7 +168,9 @@ fn duchon_1d_recovers_truth_across_increasing_n() {
     // the raw input array (~0.6 MiB) and all linear algebra trivially in-RAM for
     // CI; pushing n higher buys no extra coverage here and only burns CI time.
     let sigma = 0.05;
-    for &n in &[2_000usize, 10_000, 40_000] {
+    let sizes = [2_000usize, 10_000, 40_000];
+    let alpha = FAMILY_ALPHA / sizes.len() as f64;
+    for n in sizes {
         let mut rng = StdRng::seed_from_u64(0xD0_C0_00 ^ n as u64);
         let noise = Normal::new(0.0, sigma).expect("normal");
         let mut x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
@@ -133,23 +212,17 @@ fn duchon_1d_recovers_truth_across_increasing_n() {
             "duchon 1d n={n}: non-finite fitted value on the test grid"
         );
 
-        let recovery_rmse = rmse(&gam_fitted, &y_truth);
-        // Trivial-predictor floor: a constant predictor scores RMS of the
-        // demeaned truth = RMS(sin over interior) ≈ 0.707. A real reconstruction
-        // of a single-period sine from n≥2000 points at σ=0.05 sits far below
-        // that; 0.20 is a principled non-degeneracy bar that still catches a
-        // blown-up or collapsed fit without encoding the noise floor.
-        let truth_mean = y_truth.iter().sum::<f64>() / m as f64;
-        let demeaned: Vec<f64> = y_truth.iter().map(|&t| t - truth_mean).collect();
-        let trivial = rms(&demeaned);
-        eprintln!(
-            "duchon-scale-1d: n={n} sigma={sigma} k=40 recovery_rmse={recovery_rmse:.4} \
-             trivial_predictor_rms={trivial:.4}"
-        );
-        assert!(
-            recovery_rmse < 0.20,
-            "duchon 1d n={n}: failed to recover sin(2πx): recovery_rmse={recovery_rmse:.4} \
-             (trivial-predictor RMS≈{trivial:.4}); fit is degenerate"
+        // The estimation error of a resolved truth is σ·√(edf/n) — about 0.004
+        // at n = 2 000 and 0.001 at n = 40 000 — so a fixed RMSE bar cannot
+        // test recovery across n. The fit's own band scales the same way, and
+        // the coverage gate holds every n to it.
+        assert_covers_truth(
+            &format!("duchon-scale-1d n={n} sigma={sigma} k=40"),
+            &fit,
+            &design.design.to_dense(),
+            &gam_fitted,
+            &y_truth,
+            alpha,
         );
     }
 }
@@ -223,22 +296,16 @@ fn duchon_2d_recovers_smooth_surface() {
         "duchon 2d: non-finite fitted value on the test grid"
     );
 
-    let recovery_rmse = rmse(&gam_fitted, &y_truth);
-    let truth_mean = y_truth.iter().sum::<f64>() / y_truth.len() as f64;
-    let demeaned: Vec<f64> = y_truth.iter().map(|&t| t - truth_mean).collect();
-    let trivial = rms(&demeaned);
-    eprintln!(
-        "duchon-scale-2d: n={n} k={k} sigma={sigma} recovery_rmse={recovery_rmse:.4} \
-         trivial_predictor_rms={trivial:.4}"
-    );
-    // The surface has RMS amplitude ≈ 0.5 over the interior; a constant
-    // predictor scores ≈ that. Half of it is a principled non-degeneracy bar
-    // that a real reconstruction clears with room to spare while still failing a
-    // collapsed/blown-up fit.
-    assert!(
-        recovery_rmse < 0.5 * trivial,
-        "duchon 2d: failed to recover sin(2πx)cos(2πz): recovery_rmse={recovery_rmse:.4} \
-         vs trivial-predictor RMS={trivial:.4}; fit is degenerate"
+    // The surface has RMS amplitude ≈ 0.5 over the interior, so a bar on the
+    // RMSE relative to the trivial predictor passes a fit that keeps half of
+    // it. The fit's own band holds it to its estimation error instead.
+    assert_covers_truth(
+        &format!("duchon-scale-2d n={n} k={k} sigma={sigma}"),
+        &fit,
+        &design.design.to_dense(),
+        &gam_fitted,
+        &y_truth,
+        FAMILY_ALPHA,
     );
 }
 
