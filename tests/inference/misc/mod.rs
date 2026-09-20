@@ -21,6 +21,5 @@ mod sbc_multinomial_prediction_interval_coverage;
 mod sbc_multinomial_smooth_significance_size_curve;
 mod sbc_random_effect_variance_component_size_curve;
 mod sbc_wood_smooth_test_family_size_curve;
-mod tensor_smooth_lr_beside_a_factor;
 mod sbc_skovgaard_rstar_size_curve;
 mod bounded_fit_smoothing_corrected_covariance_2903;
