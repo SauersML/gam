@@ -324,16 +324,23 @@ pub fn information_criteria(
     fit: &UnifiedFitResult,
     log_likelihood: f64,
 ) -> Result<InformationCriteria, EstimationError> {
-    let phi = fit.dispersion_phi()?;
+    let spec = fit.likelihood_family.as_ref().ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "information criteria require an engine-level likelihood family".into(),
+        )
+    })?;
     let edf_conditional = fit.edf_total().ok_or_else(|| {
         EstimationError::InvalidInput(
             "information criteria require a retained conditional EDF".into(),
         )
     })?;
+    // A scale contract with no scalar dispersion (Royston-Parmar survival) is
+    // still a full likelihood with a conditional EDF, so its conditional AIC is
+    // defined; only the WPS correction, which needs a coefficient-covariance
+    // scale, is unavailable (gam#3297).
     let covariance_scale = fit
-        .likelihood_family
-        .as_ref()
-        .map(|spec| {
+        .scalar_dispersion_phi()?
+        .map(|phi| {
             GlmLikelihoodSpec {
                 spec: spec.clone(),
                 scale: fit.likelihood_scale,
@@ -358,11 +365,7 @@ pub fn information_criteria(
         fit.log_lambdas.len(),
         method_certified_exact,
     )?;
-    let scale_dof = fit
-        .likelihood_family
-        .as_ref()
-        .map(|spec| scale_parameter_count(spec, &fit.likelihood_scale))
-        .unwrap_or(0.0);
+    let scale_dof = scale_parameter_count(spec, &fit.likelihood_scale);
     information_criteria_from_parts(log_likelihood, edf, scale_dof)
 }
 
