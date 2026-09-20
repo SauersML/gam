@@ -556,71 +556,53 @@ fn build_reduced_slope_reparam(
              terms or supply covariates that separate them from the marginal index."
                 .to_string(),
         ),
+        ReducedSlopeOutcome::VanishingMetric => Err(
+            "BMS score-slope confound audit has no geometry: the rigid pilot's probit row \
+             metric vanishes on every row where the marginal or score-slope design is \
+             supported, so neither surface is measured at the pilot and no confound between \
+             them can be decided."
+                .to_string(),
+        ),
     }
 }
 
-/// Whether a learned Gaussian-shift frailty scale is identified (gam#3059).
-///
-/// The probit row likelihood reads the frailty only through the observed slope
-/// `s(σ)·g(x)`, `s = 1/√(1+σ²)`, on every route: the anchor solves
-/// `Σ_m w_m Φ(a + s·g·u_m) = Φ(q)` and the row evaluates `Φ(a + s·g·z)`. The
-/// slope is `g = o + G·β` with the fixed part `o_i = baseline + slope_offset_i`,
-/// so a move of σ is matched exactly by rescaling `β` whenever `s·o` stays in
-/// `span(G)` — that is, whenever `o ∈ span(G)`. The likelihood is then flat in
-/// σ, and the only σ-dependence left in the criterion is the Laplace Jacobian of
-/// the unpenalized slope directions, `p₀·ln s`, which has no stationary point.
-/// `o` is in the span when the sine of its angle to `span(G)` is inside the
-/// rounding band of the orthonormalization, `max(n, p + 1)·ε` (the same
-/// backward-error band as [`reduced_slope_transform_effective`]).
-pub(crate) fn learned_frailty_scale_is_identified(
-    slope: ArrayView2<'_, f64>,
-    slope_offset: &Array1<f64>,
-    baseline_slope: f64,
-) -> Result<bool, String> {
-    let n = slope.nrows();
-    if slope_offset.len() != n {
-        return Err(format!(
-            "learned frailty identifiability: slope design has {n} rows, slope offset {}",
-            slope_offset.len()
-        ));
-    }
-    let fixed = slope_offset.mapv(|offset| offset + baseline_slope);
-    if fixed.iter().any(|v| !v.is_finite()) {
-        return Err("learned frailty identifiability: the fixed slope part is non-finite".to_string());
-    }
-    let norm = fixed.dot(&fixed).sqrt();
-    if norm == 0.0 {
-        return Ok(false);
-    }
-    let direction = fixed / norm;
-    let p = slope.ncols();
-    let band = (n.max(p + 1) as f64) * f64::EPSILON;
-    let (basis, _) = equilibrated_range_basis(&slope.to_owned(), band)?;
-    let residual = &direction - &basis.dot(&basis.t().dot(&direction));
-    Ok(residual.dot(&residual).sqrt() > band)
-}
-
+/// gam#3059: the Bernoulli marginal-slope fit asks the shared identification rule
+/// ([`crate::survival::lognormal_kernel::frailty_identification`]) about the slope's
+/// fixed part `o = baseline + slope_offset`: a learned frailty is identified only
+/// where `o` leaves the slope design's span.
 #[cfg(test)]
 mod learned_frailty_identifiability_tests {
-    use super::learned_frailty_scale_is_identified;
+    use crate::survival::lognormal_kernel::{FrailtyIdentification, frailty_identification};
     use ndarray::{Array1, Array2};
 
     fn covariate(n: usize) -> Array1<f64> {
         Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin() + 0.1 * i as f64))
     }
 
+    /// Whether the fixed part `baseline + slope_offset` identifies σ on `slope`.
+    fn identified(slope: &Array2<f64>, slope_offset: &Array1<f64>, baseline: f64) -> bool {
+        let fixed = slope_offset.mapv(|offset| offset + baseline);
+        match frailty_identification(&[slope.view()], fixed.view()).expect("a decision") {
+            FrailtyIdentification::IdentifiedByOffset { .. } => true,
+            FrailtyIdentification::NotIdentified { .. } => false,
+            FrailtyIdentification::Undecided { surface } => {
+                panic!("the span of slope surface {surface} is resolved on this fixture")
+            }
+        }
+    }
+
     #[test]
     fn intercept_slope_with_constant_fixed_part_is_unidentified_3059() {
         let n = 50;
         let slope = Array2::from_elem((n, 1), 1.0);
-        assert!(!learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+        assert!(!identified(&slope, &Array1::zeros(n), 0.8));
     }
 
     #[test]
     fn covariate_only_slope_with_constant_fixed_part_is_identified_3059() {
         let n = 50;
         let slope = covariate(n).insert_axis(ndarray::Axis(1));
-        assert!(learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+        assert!(identified(&slope, &Array1::zeros(n), 0.8));
     }
 
     #[test]
@@ -630,9 +612,9 @@ mod learned_frailty_identifiability_tests {
         let mut slope = Array2::from_elem((n, 2), 1.0);
         slope.column_mut(1).assign(&x);
         let offset = x.mapv(|v| 2.5 * v - 0.3);
-        assert!(!learned_frailty_scale_is_identified(slope.view(), &offset, 0.8).unwrap());
+        assert!(!identified(&slope, &offset, 0.8));
         let outside = x.mapv(|v| v * v);
-        assert!(learned_frailty_scale_is_identified(slope.view(), &outside, 0.8).unwrap());
+        assert!(identified(&slope, &outside, 0.8));
     }
 }
 
@@ -653,6 +635,10 @@ pub(crate) enum ReducedSlopeOutcome {
     /// `r == 0`: the entire effective slope image is W-explained by the
     /// effective marginal span — the block is unidentified.
     FullyConfounded,
+    /// Neither effective image has a nonzero column: the row metric vanishes
+    /// wherever either design is supported, so the audit has no geometry to
+    /// compare the two spans in. Not a confound: nothing is measured (#3217).
+    VanishingMetric,
 }
 
 /// Build the reduced slope basis `T` (p_g × r) from the EFFECTIVE BMS pilot
@@ -664,7 +650,9 @@ pub(crate) enum ReducedSlopeOutcome {
 /// [`ReducedSlopeOutcome::FullyConfounded`] when the entire effective
 /// slope image collapses into the effective marginal span (`r == 0`), so the
 /// caller can refuse the unidentified block instead of conflating the two
-/// cases.
+/// cases. When the row metric leaves both effective images empty it returns
+/// [`ReducedSlopeOutcome::VanishingMetric`]: that is the metric's degeneracy,
+/// not a confound.
 ///
 /// At the rigid pilot the effective Jacobians are
 ///     M_eff = diag(c) · M,   c_i = sqrt(1 + (s·g_i)²)
@@ -755,6 +743,11 @@ pub(crate) fn reduced_slope_transform_effective(
     let (slope_basis, slope_coefficients) =
         equilibrated_range_basis(&g_eff, factor_singular_band(n, p_g, 1.0))?;
     if slope_basis.ncols() == 0 {
+        // With the marginal image empty too, the metric measured neither
+        // surface: an empty span is not a confound between two (#3217).
+        if marginal_basis.ncols() == 0 {
+            return Ok(ReducedSlopeOutcome::VanishingMetric);
+        }
         // Every effective slope direction has `C v = 0`: no curvature at all.
         return Ok(ReducedSlopeOutcome::FullyConfounded);
     }
@@ -1369,6 +1362,7 @@ mod runaway_tests {
                 match other {
                     ReducedSlopeOutcome::FullRank => "FullRank",
                     ReducedSlopeOutcome::FullyConfounded => "FullyConfounded",
+                    ReducedSlopeOutcome::VanishingMetric => "VanishingMetric",
                     ReducedSlopeOutcome::Reduced(_) => unreachable!(),
                 }
             ),
@@ -1428,6 +1422,42 @@ mod runaway_tests {
         assert!(
             matches!(outcome, ReducedSlopeOutcome::FullyConfounded),
             "fully effective-confounded slope must surface the distinct FullyConfounded outcome"
+        );
+    }
+
+    // #3217: a separated pilot's row metric underflows to zero on every row.
+    // The confounded fixture above then measures neither surface, and the audit
+    // must say the metric vanished rather than report the spans confounded;
+    // a metric live on one row still decides the confound.
+    #[test]
+    pub(crate) fn effective_reduction_on_a_vanished_metric_is_not_a_confound_3217() {
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        let g = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
+        let zero = Array1::<f64>::zeros(3);
+        let audit = |w: &Array1<f64>| {
+            reduced_slope_transform_effective(
+                m.view(),
+                g.view(),
+                &z,
+                w,
+                &zero,
+                &zero,
+                0.0,
+                0.0,
+                1.0,
+            )
+            .expect("effective reduction must succeed")
+        };
+        let vanished = audit(&zero);
+        assert!(
+            matches!(vanished, ReducedSlopeOutcome::VanishingMetric),
+            "a zero metric must surface VanishingMetric, got {vanished:?}"
+        );
+        let one_row = audit(&Array1::from_vec(vec![0.0, 1.0, 0.0]));
+        assert!(
+            matches!(one_row, ReducedSlopeOutcome::FullyConfounded),
+            "a metric live on one row measures both surfaces, got {one_row:?}"
         );
     }
 
@@ -2220,7 +2250,6 @@ fn inner_fit(
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, FitFailure> {
-    let mut options = options.clone();
     // The exact outer Hessian stays declared. Every custom-family search runs
     // gradient-only on the family's exact gradient (#2898,
     // `with_prefer_gradient_only`), so that Hessian is priced at the mint and
@@ -2229,8 +2258,7 @@ fn inner_fit(
     // verdict (#2954) is taken only where curvature is in hand. Disabling it
     // left the certificate a first-order band, on which gnomon#2359's ρ = −2
     // seed certified a saddle at 128.32 with descent left.
-    options.outer_tol = options.outer_tol.max(2.0e-5);
-    crate::custom_family::fit_custom_family(family, blocks, &options).map_err(FitFailure::from)
+    crate::custom_family::fit_custom_family(family, blocks, options).map_err(FitFailure::from)
 }
 
 fn inner_fit_from_certified_outer(
@@ -2243,7 +2271,6 @@ fn inner_fit_from_certified_outer(
 ) -> Result<UnifiedFitResult, FitFailure> {
     let mut options = crate::outer_subsample::exact_outer_options(options);
     options.use_outer_hessian = false;
-    options.outer_tol = options.outer_tol.max(2.0e-5);
     fit_custom_family_fixed_log_lambdas_from_mode_selection(
         family, blocks, &options, mode, theta, outer,
     )
@@ -2256,6 +2283,189 @@ fn inner_fit_from_certified_outer(
 struct ClosedFormFallback {
     decision: LatentMeasureDecision,
     hints: ThetaHints,
+}
+
+/// A finite latent law in the score's standard units `(m, s)` (gam#3231).
+///
+/// On a finite law `{u_k, w_k}` the anchor `Σ_k w_k Φ(a + b·u_k) = Φ(q)` with
+/// `η = a + b·z` is unchanged under `z → (z − m)/s`, `u_k → (u_k − m)/s`,
+/// `b → b·s`, `a → a + b·m`, so the score's units are a coordinate choice there,
+/// and the fit solves in the coordinates where the score has weighted mean 0 and
+/// SD 1, whatever units it was recorded in. Returns the law on that axis and the
+/// `(m, s)` of the map. The standard-normal law states that the score is
+/// `N(0, 1)` as given, and a calibrated law reads the scale-free `ζ` axis, so
+/// both keep the score's own axis, `(0, 1)`.
+fn finite_law_in_standard_units(
+    kind: LatentMeasureKind,
+    calibration: &LatentMeasureCalibration,
+    (mean, sd): (f64, f64),
+) -> Result<(LatentMeasureKind, (f64, f64)), String> {
+    if !matches!(calibration, LatentMeasureCalibration::None) {
+        return Ok((kind, (0.0, 1.0)));
+    }
+    let standardize = |grid: &EmpiricalZGrid| {
+        EmpiricalZGrid::new(
+            grid.nodes.iter().map(|&u| (u - mean) / sd).collect(),
+            grid.weights.clone(),
+            "bernoulli marginal-slope finite latent law in standard units",
+        )
+    };
+    let kind = match kind {
+        LatentMeasureKind::StandardNormal => return Ok((kind, (0.0, 1.0))),
+        LatentMeasureKind::GlobalEmpirical { grid } => LatentMeasureKind::GlobalEmpirical {
+            grid: standardize(&grid)?,
+        },
+        LatentMeasureKind::LocalEmpirical {
+            feature_cols,
+            input_scales,
+            centers,
+            grids,
+            top_k,
+            bandwidth,
+            mixture,
+            train_row_mixtures,
+        } => LatentMeasureKind::LocalEmpirical {
+            feature_cols,
+            input_scales,
+            centers,
+            grids: grids.iter().map(standardize).collect::<Result<_, _>>()?,
+            top_k,
+            bandwidth,
+            mixture,
+            train_row_mixtures,
+        },
+    };
+    Ok((kind, (mean, sd)))
+}
+
+/// The converged coefficients a re-solve starts from when it reads the score on
+/// the axis `to` and the converged fit read it on `from`, each `(m, s)` with the
+/// score `(z − m)/s`, or `None` for the row-varying calibrated `ζ` axis. The
+/// marginal and residual blocks read no score axis and always carry over. The
+/// slope is `s` times the slope on the score as given, so it carries over scaled
+/// by `s_to/s_from` between two fixed axes (a shift is absorbed by the row
+/// intercept) and not at all to or from `ζ`. The flex deviations are functions on
+/// the axis itself and carry over only onto the same axis.
+fn hints_across_score_axes(
+    from: Option<(f64, f64)>,
+    to: Option<(f64, f64)>,
+    block_states: &[ParameterBlockState],
+    residual: bool,
+    beta_h: Option<&Array1<f64>>,
+    beta_w: Option<&Array1<f64>>,
+) -> ThetaHints {
+    let same_axis = from == to;
+    let slope_beta = match (from, to) {
+        _ if same_axis => Some(block_states[1].beta.clone()),
+        (Some((_, sd_from)), Some((_, sd_to))) => {
+            Some(block_states[1].beta.mapv(|beta| beta * (sd_to / sd_from)))
+        }
+        _ => None,
+    };
+    ThetaHints {
+        marginal_beta: Some(block_states[0].beta.clone()),
+        slope_beta,
+        residual_beta: residual.then(|| block_states[2].beta.clone()),
+        score_warp_beta: if same_axis { beta_h.cloned() } else { None },
+        link_dev_beta: if same_axis { beta_w.cloned() } else { None },
+    }
+}
+
+#[cfg(test)]
+mod score_units_tests {
+    use super::*;
+    use gam_math::probability::normal_cdf;
+
+    /// The law moves onto the score's standard units node by node, keeping its
+    /// masses, and the anchor on it is the raw-unit anchor under
+    /// `b → b·s`, `a → a + b·m` (gam#3231).
+    #[test]
+    fn a_global_finite_law_moves_onto_the_standard_units_and_keeps_its_anchor() {
+        let raw = EmpiricalZGrid::new(vec![1.0, 2.0, 4.0], vec![0.2, 0.5, 0.3], "test law")
+            .expect("a valid law");
+        let (mean, sd) = (2.0, 0.5);
+        let (kind, units) = finite_law_in_standard_units(
+            LatentMeasureKind::GlobalEmpirical { grid: raw.clone() },
+            &LatentMeasureCalibration::None,
+            (mean, sd),
+        )
+        .expect("the law in standard units");
+        assert_eq!(units, (mean, sd));
+        let LatentMeasureKind::GlobalEmpirical { grid } = kind else {
+            panic!("a global law stays global");
+        };
+        assert_eq!(grid.nodes, vec![-2.0, 0.0, 4.0]);
+        assert_eq!(grid.weights, raw.weights);
+
+        let (a, b) = (-0.3, 0.7);
+        let anchor = |a: f64, b: f64, law: &EmpiricalZGrid| {
+            law.pairs().map(|(u, w)| w * normal_cdf(a + b * u)).sum::<f64>()
+        };
+        let raw_anchor = anchor(a, b, &raw);
+        let standard_anchor = anchor(a + b * mean, b * sd, &grid);
+        // Each argument is a few roundings of `|a| + |b|·max|u|` apart, passed
+        // through `φ ≤ 1`, plus the rounding of the three-term sum.
+        let band = f64::EPSILON * (3.0 + 4.0 * (a.abs() + b.abs() * 4.0));
+        assert!(
+            (raw_anchor - standard_anchor).abs() <= band,
+            "the anchor must not depend on the units: {raw_anchor} vs {standard_anchor}"
+        );
+    }
+
+    #[test]
+    fn the_standard_normal_law_keeps_the_score_as_given() {
+        let (kind, units) = finite_law_in_standard_units(
+            LatentMeasureKind::StandardNormal,
+            &LatentMeasureCalibration::None,
+            (2.0, 0.5),
+        )
+        .expect("the standard-normal law");
+        assert_eq!(kind, LatentMeasureKind::StandardNormal);
+        assert_eq!(units, (0.0, 1.0));
+    }
+
+    /// Between two fixed axes the slope carries over as `s` times the slope on
+    /// the score as given; the flex deviations are functions on the axis and
+    /// carry over only onto the same one, and nothing on the axis crosses to ζ.
+    #[test]
+    fn hints_carry_the_slope_across_score_axes() {
+        let state = |beta: Vec<f64>| ParameterBlockState {
+            beta: Array1::from(beta),
+            eta: Array1::zeros(1),
+        };
+        let blocks = [state(vec![0.1, 0.2]), state(vec![3.0])];
+        let flex = Array1::from(vec![0.4]);
+        let rescaled = hints_across_score_axes(
+            Some((0.0, 1.0)),
+            Some((5.0, 0.25)),
+            &blocks,
+            false,
+            Some(&flex),
+            Some(&flex),
+        );
+        assert_eq!(rescaled.marginal_beta, Some(blocks[0].beta.clone()));
+        assert_eq!(rescaled.slope_beta, Some(Array1::from(vec![0.75])));
+        assert_eq!(rescaled.score_warp_beta, None);
+        assert_eq!(rescaled.link_dev_beta, None);
+        assert_eq!(rescaled.residual_beta, None);
+
+        let same = hints_across_score_axes(
+            Some((5.0, 0.25)),
+            Some((5.0, 0.25)),
+            &blocks,
+            false,
+            Some(&flex),
+            Some(&flex),
+        );
+        assert_eq!(same.slope_beta, Some(blocks[1].beta.clone()));
+        assert_eq!(same.score_warp_beta, Some(flex.clone()));
+        assert_eq!(same.link_dev_beta, Some(flex.clone()));
+
+        let to_zeta =
+            hints_across_score_axes(Some((5.0, 0.25)), None, &blocks, false, None, None);
+        assert_eq!(to_zeta.slope_beta, None);
+        assert_eq!(to_zeta.marginal_beta, Some(blocks[0].beta.clone()));
+    }
 }
 
 /// One fit's outcome under its latent-law certificate.
@@ -2359,7 +2569,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     armed: bool,
     search_refusal: &RefCell<Option<JeffreysArmingEvidence>>,
 ) -> Result<CertifiedFit, FitFailure> {
-    use gam_problem::FailureCategory;
+    use gam_problem::{EstimationError, FailureCategory};
     search_refusal.replace(None);
     let mut spec = spec;
     let data_view = data;
@@ -2432,6 +2642,13 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // The raw score is kept for the training score below, which is computed from
     // it through the map prediction applies (gam#3016).
     let z_raw = std::mem::replace(&mut spec.z, z_standardized);
+    // gam#3231: the score's standard units, the axis a fit on an uncalibrated
+    // finite law solves in.
+    let standard_units = {
+        let units = weighted_location_scale(&spec.z, &spec.weights, "bernoulli marginal-slope")
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        (units.mean, units.sd)
+    };
     // #2750/#2754/#2761: resolve every AUTO measure-jet representer range
     // against the response before any design is built here.
     //
@@ -2631,8 +2848,20 @@ fn fit_bernoulli_marginal_slope_terms_under(
         empirical_build: latent_measure_build,
         certificate_law: latent_certificate_law,
         consumed: mut latent_law_consumed,
-        moving_law: latent_moving_law,
+        moving_law: mut latent_moving_law,
     } = decision;
+    if let Some(candidates) = latent_moving_law.as_mut() {
+        candidates.set_standard_units(standard_units.0, standard_units.1);
+    }
+    let (latent_measure, fit_units) =
+        finite_law_in_standard_units(latent_measure, &latent_z_calibration, standard_units)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+    // The fit's score is `(z − m)/s` in the policy's units, so the saved map
+    // composes the policy's normalisation with it.
+    let z_normalization = LatentZNormalization {
+        mean: z_normalization.mean + z_normalization.sd * fit_units.0,
+        sd: z_normalization.sd * fit_units.1,
+    };
 
     let y = Arc::new(spec.y.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -2662,6 +2891,10 @@ fn fit_bernoulli_marginal_slope_terms_under(
         mean: z_normalization.mean,
         sd: z_normalization.sd,
     };
+    // The slope offset is a slope on the score as given; on the fit's score
+    // `(z − mean)/sd` the same slope is `sd` times it (prediction applies the
+    // identical factor).
+    spec.slope_offset *= saved_normalization.sd;
     let z = Arc::new(
         FittedLatentScoreMap {
             normalization: &saved_normalization,
@@ -2710,11 +2943,25 @@ fn fit_bernoulli_marginal_slope_terms_under(
             Some(Arc::new(runtime))
         }
     };
-    // Unclassified by name (#2937): the pooled pilot refuses the data (a
-    // length mismatch, no positive weight, one outcome carrying all of it) and
-    // reports its own Newton solve's failure in the same text.
-    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights)
-        .map_err(|reason| FitFailure::raised(FailureCategory::Unclassified, reason))?;
+    // Unarmed, a latent score that separates the outcomes gives the pooled
+    // probit no finite mode: its certificate is typed arming evidence, so the
+    // route re-solves armed, where the pilot is the Jeffreys-penalized mode
+    // (#3217). Every other refusal is Unclassified by name (#2937): the pilot
+    // refuses the data (a length mismatch, no positive weight, one outcome
+    // carrying all of it) and reports its own Newton solve's failure in the
+    // same text.
+    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights, armed)
+        .map_err(|refusal| match refusal {
+            PooledPilotRefusal::Separated(separation) => {
+                FitFailure::from(EstimationError::PrefitLatentScoreSeparationDetected {
+                    threshold: separation.threshold,
+                    positive_above_threshold: separation.positive_above_threshold,
+                })
+            }
+            PooledPilotRefusal::Refused(reason) => {
+                FitFailure::raised(FailureCategory::Unclassified, reason)
+            }
+        })?;
     // The probit marginal index is the pilot's own probit intercept: `q = η`
     // exactly (gam#2978), with no probability formed and inverted.
     require_probit_marginal_slope_link(&spec.base_link, "bernoulli marginal-slope baseline")
@@ -2725,22 +2972,39 @@ fn fit_bernoulli_marginal_slope_terms_under(
             .design
             .try_to_dense_arc("bernoulli marginal-slope learned frailty identifiability")
             .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-        let identified = learned_frailty_scale_is_identified(
-            slope_dense.view(),
-            &spec.slope_offset,
-            baseline.1,
+        // The slope's fixed part, pilot baseline plus slope offset, decides it
+        // through the one identification rule both marginal-slope families share
+        // (gam#2938, gam#3059).
+        let fixed_part = spec.slope_offset.mapv(|offset| offset + baseline.1);
+        match crate::survival::lognormal_kernel::frailty_identification(
+            &[slope_dense.view()],
+            fixed_part.view(),
         )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-        if !identified {
-            return Err(FitFailure::raised(
-                FailureCategory::Input,
-                "bernoulli marginal-slope: a learned GaussianShift frailty scale is not \
-                 identified: the probit likelihood reads σ only through the observed slope \
-                 s(σ)·g(x), s = 1/√(1+σ²), and the fixed part of g (pilot baseline + slope \
-                 offset) lies in the slope design's span, so any σ is matched exactly by \
-                 rescaling the slope coefficients; fix σ (frailty_sd / FrailtyScale::Fixed \
-                 { sigma }) or give the slope a fixed part outside its span (gam#3059)",
-            ));
+        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?
+        {
+            crate::survival::lognormal_kernel::FrailtyIdentification::IdentifiedByOffset {
+                ..
+            } => {}
+            crate::survival::lognormal_kernel::FrailtyIdentification::NotIdentified { .. } => {
+                return Err(FitFailure::raised(
+                    FailureCategory::Input,
+                    "bernoulli marginal-slope: a learned GaussianShift frailty scale is not \
+                     identified: the probit likelihood reads σ only through the observed slope \
+                     s(σ)·g(x), s = 1/√(1+σ²), and the fixed part of g (pilot baseline + slope \
+                     offset) lies in the slope design's span, so any σ is matched exactly by \
+                     rescaling the slope coefficients; fix σ (frailty_sd / FrailtyScale::Fixed \
+                     { sigma }) or give the slope a fixed part outside its span (gam#3059)",
+                ));
+            }
+            crate::survival::lognormal_kernel::FrailtyIdentification::Undecided { .. } => {
+                return Err(FitFailure::raised(
+                    FailureCategory::Input,
+                    "bernoulli marginal-slope: a learned GaussianShift frailty scale is refused: \
+                     the slope design's column space is not separated from rounding at its rank \
+                     boundary, so whether the fixed part of the slope identifies σ cannot be \
+                     decided (gam#3059)",
+                ));
+            }
         }
     }
 
@@ -2804,7 +3068,8 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // jacobian` carries the out-of-fold `J = ∂z/∂θ₁`; the realized leakage
     // directions `Z_infl = diag(s_f·β̂₀)·J` are residualised against the fitted
     // marginal+slope target span and appended to the additive marginal-index
-    // block as a fixed-ridge absorber, so the joint penalised solve makes the
+    // block as a REML-learned ridge absorber, so the joint penalised solve
+    // makes the
     // (α,β) score orthogonal to the remaining nuisance span without letting the
     // absorber compete for identifiable β(x) signal. `None` ⇒ raw z, and the
     // free score_warp spline below is the x-free-column fallback. β̂₀(x_i) is
@@ -2845,7 +3110,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         // the rigid-pilot W-metric.  For BMS the absorbed columns are installed
         // in the same additive predictor as the marginal surface; if we protect
         // only M, any component of Z_infl aligned with the slope design G can
-        // be assigned to the fixed-ridge absorber by the joint solve, erasing
+        // be assigned to the ridge absorber by the joint solve, erasing
         // genuine β(x) heterogeneity.  Projecting out [M | G] keeps the nuisance
         // absorber orthogonal to both parametric target surfaces while still
         // absorbing Stage-1 leakage directions outside that identifiable target
@@ -2854,7 +3119,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
         let rigid_slope_at_rows = &spec.slope_offset + baseline.1;
         let residualized = crate::marginal_slope_orthogonal::residualized_influence_block(
             jac,
-            z_train,
             &rigid_slope_at_rows,
             probit_scale,
             protected_dense.view(),
@@ -3811,13 +4075,16 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         },
                         moving_law: None,
                     },
-                    hints: ThetaHints {
-                        marginal_beta: Some(block_states[0].beta.clone()),
-                        slope_beta: Some(block_states[1].beta.clone()),
-                        residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
-                        score_warp_beta: beta_h.cloned(),
-                        link_dev_beta: beta_w.cloned(),
-                    },
+                    // The closed form reads the score as given; the finite law
+                    // is solved in its standard units.
+                    hints: hints_across_score_axes(
+                        Some((0.0, 1.0)),
+                        Some(standard_units),
+                        block_states,
+                        residual_runtime.is_some(),
+                        beta_h,
+                        beta_w,
+                    ),
                 }));
             }
         }
@@ -3925,25 +4192,18 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 certificate.chosen.label(),
                 certificate.summary()
             );
-            // The slope and the flex deviations live on the latent axis: they carry
-            // over only when the chosen arm reads the same axis as the fitted one.
-            let calibrated_axis = |arm: MovingLawArm| {
-                matches!(
-                    arm,
-                    MovingLawArm::LocationScaleGaussian | MovingLawArm::LocationScaleEmpirical
-                )
-            };
-            let same_axis = calibrated_axis(certificate.chosen) == calibrated_axis(certificate.fitted);
+            let hints = hints_across_score_axes(
+                candidates.score_axis(certificate.fitted),
+                candidates.score_axis(certificate.chosen),
+                block_states,
+                residual_runtime.is_some(),
+                beta_h,
+                beta_w,
+            );
             let chosen = certificate.chosen;
             return Ok(CertifiedFit::ReSolve(ClosedFormFallback {
                 decision: candidates.decision_for(chosen, Some(certificate))?,
-                hints: ThetaHints {
-                    marginal_beta: Some(block_states[0].beta.clone()),
-                    slope_beta: same_axis.then(|| block_states[1].beta.clone()),
-                    residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
-                    score_warp_beta: if same_axis { beta_h.cloned() } else { None },
-                    link_dev_beta: if same_axis { beta_w.cloned() } else { None },
-                },
+                hints,
             }));
         }
     }

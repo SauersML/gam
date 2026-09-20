@@ -265,14 +265,14 @@ impl std::fmt::Debug for ConstantCurvatureProfile<'_> {
 enum RangeSolveOutcome {
     /// `V_ηη > 0` at an η strictly inside the box that the outer engine's
     /// stationarity certificate accepted and did not report as railed.
-    /// The envelope and Schur reductions of the profile
-    /// are both valid, and the residual `V_η` costs `V_η·η̂′` on the first
-    /// derivative — a term that is present under every non-`InteriorMinimum`
-    /// outcome too, because `V_p′` is reported as `V_κ` in all of them. What
-    /// this variant actually buys is `V_p″`: the Schur term `−V_κη²/V_ηη` is
-    /// non-positive, so an interior minimum misfiled as anything else has its
-    /// profile curvature OVERSTATED, and that curvature is what the outer
-    /// solve's terminal stationarity certificate is denominated in (#2458).
+    /// The profile is read at the Newton minimizer of the jet's quadratic in
+    /// η, so the residual `V_η` the certificate leaves costs `V_p′` nothing to
+    /// first order (gam#3426, see
+    /// [`ProfiledRemlPsiJet::eta_profiled_kappa_jet`]), and the Schur reduction
+    /// gives `V_p″`: the term `−V_κη²/V_ηη` is non-positive, so an interior
+    /// minimum misfiled as anything else has its profile curvature OVERSTATED,
+    /// and that curvature is what the outer solve's terminal stationarity
+    /// certificate is denominated in (#2458).
     InteriorMinimum,
     /// The user pinned the range with an explicit `length_scale=`, so η is not
     /// a coordinate at all: `η̂(κ) ≡ η_pinned` and `dη̂/dκ = 0` identically.
@@ -667,8 +667,10 @@ impl<'a> ConstantCurvatureProfile<'a> {
     /// one-dimensional likelihood the point estimate, the CI and the flatness
     /// test all consume.
     ///
-    /// At a certified interior η̂ the envelope theorem gives `V_p′ = V_κ` and the
-    /// Schur complement gives `V_p″ = V_κκ − V_κη²/V_ηη`.
+    /// At a certified interior η̂ the profile is read at the Newton minimizer of
+    /// the jet's quadratic in η: `V_p′ = V_κ − V_κη·V_η/V_ηη`, the envelope
+    /// theorem with the certificate's residual `V_η` carried rather than
+    /// dropped, and the Schur complement `V_p″ = V_κκ − V_κη²/V_ηη`.
     ///
     /// Otherwise the reduction is absent and what replaces it depends on WHY,
     /// which is the whole content of [`RangeSolveOutcome`]. Where `dη̂/dκ = 0` is

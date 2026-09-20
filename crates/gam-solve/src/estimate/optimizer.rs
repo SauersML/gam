@@ -14,6 +14,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
 use gam_problem::OrderedRhoBounds;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -1749,6 +1750,14 @@ where
                  rho: &Array1<f64>,
                  face: &[usize]| { state.rail_face_limit(rho, face) },
             );
+            // The λ→0 end: a covered zero-smoothing face is analytic in λ, so
+            // its first-order law is exact and the face is proven from the
+            // signs of the slopes.
+            let obj = obj.with_zero_smoothing_face(
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>,
+                 face: &[usize]| { state.zero_smoothing_face(rho, face) },
+            );
             // #2676: publish the criterion's EXACT invariance — the directions
             // of rho along which the penalty map, and therefore the criterion,
             // does not move at all. The outer certificate deflates them instead
@@ -3163,14 +3172,10 @@ where
     //
     // The identity check is BITWISE on ρ, not a re-judged gradient norm: the
     // retained certificate is the analytic stationarity authority minted at
-    // `outer_result.rho` by the full certification machinery (noise-floor
-    // widenings, flatness probes, asymptote rails). In the deep-smoothing
-    // regime the analytic gradient is a noise instrument (|Pg| redraws across
-    // evaluations of the SAME point — the reproducibility floor exists because
-    // of it), so re-drawing it once here and comparing against the certified
-    // band refuses honest noise-band certificates with coin-flip probability
-    // while adding nothing to point-identity (which bit equality decides
-    // exactly). The evaluation itself is kept: it installs the inner state at
+    // `outer_result.rho` by the full certification machinery (derived bands,
+    // flatness probes, asymptote rails). Re-judging a second gradient here
+    // would add nothing to point-identity, which bit equality decides exactly.
+    // The evaluation itself is kept: it installs the inner state at
     // the shipped point and supplies the shipped value/gradient fields.
     let (final_value, finalgrad, finalgrad_norm) = if final_rho.is_empty() {
         (outer_result.final_value, Array1::zeros(0), 0.0)
@@ -3829,36 +3834,14 @@ where
             );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // The only typed absence is an outer Hessian with no
-                    // analytic form for this fit at all (a non-canonical Firth
-                    // link, routed to BFGS): nothing about the optimum is
-                    // suspect, the correction simply cannot be formed, and the
-                    // fit was accepted with that link on purpose (#2158).
+                    // Every Firth link carries its analytic outer ρ-Hessian
+                    // (#3203), so an unavailable correction is a real defect.
                     // Railed coordinates are not a reason: the correction
                     // excludes them exactly as the certificate did, so a
                     // refusal on a railed fit is a real defect like any other.
-                    if !matches!(
-                        reason,
-                        crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    ) {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "exact smoothing-corrected covariance unavailable: {reason:?}"
-                        )));
-                    }
-                    log::debug!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
-                         fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
-                    );
-                    smoothing_correction_absence = Some(
-                        crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail: format!("{reason:?}"),
-                        },
-                    );
-                    rho_covariance = None;
-                    smoothing_correction = None;
-                    smoothing_correction_method = None;
-                    smoothing_correction_first_order = None;
-                    smoothing_correction_method_first_order = None;
+                    return Err(EstimationError::InvalidInput(format!(
+                        "exact smoothing-corrected covariance unavailable: {reason:?}"
+                    )));
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
@@ -4221,6 +4204,19 @@ where
                 ))
             })?;
     }
+    // The working residual in its Pearson form: at the accepted step the score
+    // is `u = W_F(z − η)` with `W_F` the score-side Fisher weight, and the norm
+    // is `Σ u²/W_F`, each row of null mean `φ` (not `Σ u²/W_H` in the observed
+    // curvature `finalweights`, which is biased for a non-canonical link;
+    // gam#3832). The identity-link weighted RSS is that sum, formed from the
+    // response directly and snapped with the dispersion it sets.
+    let working_residual = if cfg.likelihood.spec.is_gaussian_identity() {
+        Some(WorkingResidual { weighted_norm: weighted_rss, rows: n as usize })
+    } else {
+        let scores = &pirls_res.solveweights
+            * &(&pirls_res.solveworking_response - &pirls_res.final_eta);
+        WorkingResidual::of(pirls_res.solveweights.view(), scores.view())
+    };
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
         penalty_block_trace,
@@ -4240,6 +4236,7 @@ where
         coefficient_influence,
         weighted_gram,
         identified_subspace,
+        working_residual,
     });
 
     let pirls_status = pirls_res.status;

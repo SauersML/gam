@@ -143,7 +143,8 @@ est.fit(X, y)
 
 # Diagnose, plot, report
 model.diagnose(train).metrics
-model.plot(train, x="x", kind="prediction")
+model.plot_terms()                        # each term's partial effect with bands
+model.partial_dependence("s(x)").simultaneous_upper
 model.report("report.html")
 ```
 
@@ -161,7 +162,7 @@ model.report("report.html")
 | `gamfit.results.SurvivalPrediction` | Per-row hazard / survival surface. |
 | `gamfit.results.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
 | `gamfit.MultinomialModel` | Multinomial-logit / softmax model. |
-| `gamfit.results.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
+| `gamfit.results.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive` | Posterior interface. |
 | `gamfit.ResponseGeometryModel`, `sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`, `closure` | Response-geometry utilities. |
 | `gamfit.smooth.Duchon`, `Matern`, `BSpline`, `TensorBSpline`, `MeasureJet`, `Sphere` | Smooth descriptors for `smooths=` and torch. |
 | `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |

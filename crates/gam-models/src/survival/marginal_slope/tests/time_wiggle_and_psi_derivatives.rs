@@ -1071,9 +1071,7 @@ fn timewiggle_design_psi_hessian_all_beta_axes_matches_single_axis_2893() {
 
 /// gam#3061: on every ζ frame, the time-wiggle `{D_β_a ∂_θ H}` sweep of a baseline-chart
 /// coordinate through the ζ composition reproduces the single-direction baseline Hessian drift
-/// on every coefficient axis, for every coordinate of a Gompertz–Makeham chart. The
-/// single-direction FLEX family program evaluates the time-constant slope frame only, so the
-/// follow-up-varying slope frame has no single-axis reference here.
+/// on every coefficient axis, for every coordinate of a Gompertz–Makeham chart.
 #[test]
 fn timewiggle_baseline_psi_hessian_all_beta_axes_matches_single_axis_3061() {
     let config = crate::survival::construction::SurvivalBaselineConfig {
@@ -1092,10 +1090,7 @@ fn timewiggle_baseline_psi_hessian_all_beta_axes_matches_single_axis_3061() {
         .expect("build baseline geometry")
         .expect("Gompertz-Makeham has a nonlinear baseline chart"),
     );
-    for frame in TimewiggleDesignPsiFrame::ALL
-        .into_iter()
-        .filter(|frame| !matches!(frame, TimewiggleDesignPsiFrame::RigidFollowUpSlope))
-    {
+    for frame in TimewiggleDesignPsiFrame::ALL {
         let mut family = frame.family();
         family.family_hyper =
             SurvivalMarginalSlopeFamilyHyperState::new(Some(Arc::clone(&geometry)), None)
@@ -1326,6 +1321,124 @@ fn timewiggle_baseline_psi_third_information_matches_finite_difference_3061() {
                             .expect("a time wiggle publishes the baseline Hessian sweep")
                     },
                 );
+            }
+        }
+    }
+}
+
+/// gam#3304: on every ζ frame, the time-wiggle baseline-chart objects the outer Hessian reads
+/// beside `∂_θ H`, served through the ζ composition, match Ridders differences along the chart:
+/// the drift `D_β ∂_θ H[v]` against the displaced `D_β H[v]`, the chart pair terms
+/// `∂²_θθ' {ℓ̄, ∇_β ℓ̄, H}` against the displaced `∂_θ` terms, and the chart-by-design pair
+/// terms `∂²_θψ {ℓ̄, ∇_β ℓ̄, H}` against the displaced design ψ terms, for every coordinate of a
+/// Gompertz–Makeham chart and every design ψ the frame serves.
+#[test]
+fn timewiggle_baseline_psi_drift_and_pair_terms_match_finite_difference_3304() {
+    let options = BlockwiseFitOptions::default();
+    let blocks = timewiggle_design_psi_blocks();
+    let dense_hessian = |dense: &Array2<f64>, operator: Option<&Arc<dyn gam_problem::HyperOperator>>, total: usize| {
+        match operator {
+            Some(operator) => operator.mul_mat(&Array2::<f64>::eye(total)),
+            None => dense.clone(),
+        }
+    };
+    for frame in TimewiggleDesignPsiFrame::ALL {
+        let base = timewiggle_baseline_family_at(frame, 0, 0.0);
+        assert!(base.timewiggle_zeta_available());
+        let beta = timewiggle_marginal_slope_beta(&base);
+        let states = timewiggle_marginal_slope_states(&base, &beta);
+        let total = beta.len();
+        let v = Array1::from_shape_fn(total, |i| ((i * 5 + 1) % 13) as f64 / 13.0 - 0.5);
+        let theta_len = base
+            .rigid_baseline_geometry()
+            .expect("the fixture installs a baseline chart")
+            .theta
+            .len();
+        for axis in 0..theta_len {
+            let label = format!("{frame:?} θ {axis}");
+            let drift = base
+                .baseline_exact_joint_psihessian_directional_derivative_with_options(
+                    &states, axis, &v, &options,
+                )
+                .expect("baseline Hessian drift")
+                .expect("a baseline axis publishes its Hessian drift");
+            assert_matches_ridders_2893(&format!("{label} drift"), &drift, &|t| {
+                let family = timewiggle_baseline_family_at(frame, axis, t);
+                family
+                    .exact_newton_joint_hessian_directional_derivative(
+                        &timewiggle_marginal_slope_states(&family, &beta),
+                        &v,
+                    )
+                    .expect("displaced D_beta H[v]")
+                    .expect("a time wiggle publishes D_beta H")
+            });
+            for other_axis in 0..theta_len {
+                let pair_label = format!("{frame:?} θ pair ({axis},{other_axis})");
+                let pair = base
+                    .baseline_exact_joint_psisecond_order_terms_with_options(
+                        &states, axis, other_axis, &options,
+                    )
+                    .expect("baseline pair terms")
+                    .expect("a baseline pair publishes its terms");
+                let pair_hessian =
+                    dense_hessian(&pair.hessian_psi_psi, pair.hessian_psi_psi_operator.as_ref(), total);
+                let first_at = |t: f64| {
+                    let family = timewiggle_baseline_family_at(frame, other_axis, t);
+                    family
+                        .baseline_exact_joint_psi_terms_with_options(
+                            &timewiggle_marginal_slope_states(&family, &beta),
+                            axis,
+                            &options,
+                        )
+                        .expect("displaced baseline θ terms")
+                        .expect("a nonlinear baseline chart publishes θ terms")
+                };
+                assert_matches_ridders_2893(
+                    &format!("{pair_label} objective"),
+                    &Array2::from_elem((1, 1), pair.objective_psi_psi),
+                    &|t| Array2::from_elem((1, 1), first_at(t).objective_psi),
+                );
+                assert_matches_ridders_2893(
+                    &format!("{pair_label} score"),
+                    &pair.score_psi_psi.clone().insert_axis(Axis(1)),
+                    &|t| first_at(t).score_psi.insert_axis(Axis(1)),
+                );
+                assert_matches_ridders_2893(&format!("{pair_label} Hessian"), &pair_hessian, &|t| {
+                    let first = first_at(t);
+                    dense_hessian(&first.hessian_psi, first.hessian_psi_operator.as_ref(), total)
+                });
+            }
+            for psi in frame.psi_axes() {
+                let mixed_label = format!("{frame:?} θ {axis} × ψ {psi}");
+                let mixed = base
+                    .baseline_design_exact_joint_psisecond_order_terms_with_options(
+                        &states, &blocks, axis, psi, &options,
+                    )
+                    .expect("baseline-by-design pair terms")
+                    .expect("a baseline-by-design pair publishes its terms");
+                let mixed_hessian =
+                    dense_hessian(&mixed.hessian_psi_psi, mixed.hessian_psi_psi_operator.as_ref(), total);
+                let design_at = |t: f64| {
+                    let family = timewiggle_baseline_family_at(frame, axis, t);
+                    family
+                        .psi_terms(&timewiggle_marginal_slope_states(&family, &beta), &blocks, psi)
+                        .expect("displaced design ψ terms")
+                        .expect("a design ψ publishes its terms")
+                };
+                assert_matches_ridders_2893(
+                    &format!("{mixed_label} objective"),
+                    &Array2::from_elem((1, 1), mixed.objective_psi_psi),
+                    &|t| Array2::from_elem((1, 1), design_at(t).objective_psi),
+                );
+                assert_matches_ridders_2893(
+                    &format!("{mixed_label} score"),
+                    &mixed.score_psi_psi.clone().insert_axis(Axis(1)),
+                    &|t| design_at(t).score_psi.insert_axis(Axis(1)),
+                );
+                assert_matches_ridders_2893(&format!("{mixed_label} Hessian"), &mixed_hessian, &|t| {
+                    let first = design_at(t);
+                    dense_hessian(&first.hessian_psi, first.hessian_psi_operator.as_ref(), total)
+                });
             }
         }
     }
