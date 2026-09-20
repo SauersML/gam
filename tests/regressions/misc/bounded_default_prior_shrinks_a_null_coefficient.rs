@@ -214,3 +214,37 @@ fn bounded_unpenalised_fit_certifies_an_optimum_on_the_rail() {
         "the box-constrained optimum is the rail min = 1, got {slope}"
     );
 }
+
+/// A box that does not bind leaves the fit unconstrained, so on an unpenalised
+/// coefficient the `constrain()` route must return the `linear()` route's slope
+/// (#3339). Both solve the same two-column least-squares problem: the box is
+/// interior (the noise slope 0.03 sits deep inside `[-1, 1]`), and neither term
+/// carries a penalty. The constrained route used to refuse here: its
+/// constraint-KKT gate measured stationarity against `‖score‖ + ‖S_λβ‖`, and at
+/// an unpenalised interior optimum both vanish, so a fully converged fit read a
+/// relative stationarity residual of about 1.
+#[test]
+fn interior_constrain_box_on_an_unpenalised_slope_is_the_unconstrained_fit() {
+    init_parallelism();
+    let (x, y) = fixture();
+    let data = dataset(&x, &y);
+    let free = bounded_slope("y ~ linear(x, double_penalty=false)", &data);
+    let boxed = bounded_slope("y ~ constrain(x, min=-1, max=1, double_penalty=false)", &data);
+    let ols = ols_slope(&x, &y);
+    // Every slope here solves the same two-column normal equations, whose
+    // right-hand side accumulates `n = 200` products of magnitude about 1: a
+    // rounding difference of order `n·ε ≈ 4e-14` there, divided by
+    // `Σ(x − x̄)² ≈ 67`, moves the slope by about 1e-15. The 1e-12 band sits
+    // three orders above that and ten orders below the slope itself.
+    // Non-vacuity: the unpenalised slope is the fixture's noise slope, well
+    // inside the box and well away from zero.
+    assert!(
+        (free - ols).abs() <= 1e-12 && free.abs() > 0.02 && free.abs() < 1.0,
+        "the unpenalised linear slope must be the least-squares slope {ols}, got {free}"
+    );
+    assert!(
+        (boxed - free).abs() <= 1e-12,
+        "an interior box on an unpenalised slope must not move it: constrain {boxed} against \
+         linear {free}"
+    );
+}

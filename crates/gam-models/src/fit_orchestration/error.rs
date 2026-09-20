@@ -988,12 +988,11 @@ mod fit_failure_tests {
     fn context_and_notes_keep_the_category_and_the_old_text_2937() {
         let failure = FitFailure::from(seeds_refused())
             .context("exact two-block spatial optimization failed")
-            .annotated("the automatic Firth/Jeffreys rescue WAS attempted");
+            .annotated("no fit was minted");
         assert_eq!(
             failure.to_string(),
             format!(
-                "exact two-block spatial optimization failed: {}; the automatic Firth/Jeffreys \
-                 rescue WAS attempted",
+                "exact two-block spatial optimization failed: {}; no fit was minted",
                 seeds_refused()
             )
         );
@@ -1003,7 +1002,7 @@ mod fit_failure_tests {
             vec![
                 "exact two-block spatial optimization failed".to_string(),
                 seeds_refused().to_string(),
-                "the automatic Firth/Jeffreys rescue WAS attempted".to_string(),
+                "no fit was minted".to_string(),
             ]
         );
         assert!(std::error::Error::source(&failure).is_some());

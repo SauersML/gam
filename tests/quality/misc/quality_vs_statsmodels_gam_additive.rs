@@ -117,13 +117,13 @@ fn gam_additive_matches_statsmodels_gam() {
     let (i1, i2, i3) = (col["x1"], col["x2"], col["x3"]);
     let ncols = ds.headers.len();
 
-    // ---- fit gam: y ~ s(x1,ps) + cc(x2) + matern(x3), Gaussian/REML --------
+    // ---- fit gam: y ~ s(x1,ps) + cyclic(x2) + matern(x3), Gaussian/REML --------
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "y ~ s(x1, bs='ps', k=10) + cc(x2, k=8, period_start=0, period_end=1) + matern(x3, nu=1.5, k=12)",
+        "y ~ s(x1, bs='ps', k=10) + cyclic(x2, k=8, period_start=0, period_end=1) + matern(x3, nu=1.5, k=12)",
         &ds,
         &cfg,
     )
@@ -319,7 +319,7 @@ emit("edf_total", [float(res.hat_matrix_trace)])
     );
     assert!(
         p2 > 0.95,
-        "cyclic term cc(x2) fails to recover cos component: pearson={p2:.4}"
+        "cyclic term cyclic(x2) fails to recover cos component: pearson={p2:.4}"
     );
     assert!(
         p3 > 0.95,
