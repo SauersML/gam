@@ -1,9 +1,8 @@
 """Regression gate for the convergence fuzzer.
 
 ``test_quick_plan_has_no_failures`` runs the real ``quick`` plan end to end -
-the seeded fixture of every root cause the fuzzer found and fixed, plus the
-first cases of the DGP space at small ``n`` - each rep in its own isolated
-worker, and requires zero failures of any kind. The other tests pin the
+the seeded fixture of every root cause the fuzzer found and fixed - each rep
+in its own isolated worker, and requires zero failures of any kind. The other tests pin the
 classifier on hand-built records, so a triage that stopped recognising a
 failure would fail here rather than quietly passing the gate.
 """
@@ -17,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .dgp import FAMILIES, case_spec, draw
-from .run import FIXTURES, PLANS
+from .run import FIXTURES, N_GRID, PLANS
 from .triage import failure_causes
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
@@ -63,9 +62,12 @@ def test_quick_plan_carries_every_fixture() -> None:
 
 def test_full_plan_meets_the_lane_size() -> None:
     reps = PLANS["full"]()
-    assert len(reps) >= 2000
+    # Every rep is two fits: the model and its permuted/rescaled twin.
+    assert 2 * len(reps) >= 2000
     assert {r.family for r in reps} == set(FAMILIES)
-    assert {case_spec(r.case).p for r in reps} == set(range(1, 9))
+    assert {r.n for r in reps} == set(N_GRID)
+    for n in N_GRID:
+        assert {case_spec(r.case).p for r in reps if r.n == n} == set(range(1, 9)), n
 
 
 def test_draw_is_seeded() -> None:
@@ -108,3 +110,44 @@ def test_triage_labels() -> None:
         "pred_finite": False,
     }
     assert failure_causes(nonfinite) == ["nonfinite:predict"]
+    unresolved = {**nonfinite, "pred_nonfinite_exact": False}
+    assert failure_causes(unresolved) == ["nonfinite:predict"]
+    overflow = {**nonfinite, "pred_nonfinite_exact": True}
+    assert failure_causes(overflow) == []
+
+
+def test_log_link_posterior_mean_overflow_is_exact() -> None:
+    """On case12/poisson/n30, probe x1 at 10^0 .. 10^4 training ranges below
+    the data with every other covariate at its median. Past the data the
+    smooth extrapolates in its unpenalized linear null space, so eta grows
+    linearly and Var(eta) quadratically, and the posterior mean
+    exp(eta + Var(eta)/2) crosses DBL_MAX inside the probe: +inf is the
+    correctly rounded value of every row past it, and every finite row of the
+    same prediction matches the exact formula."""
+    import numpy as np
+
+    import gamfit
+
+    from .worker import LOG_DBL_MAX, _overflows_exactly
+
+    data = draw(12, "poisson", 30)
+    model = gamfit.fit(data.train, data.spec.formula, family="poisson")
+    x1 = data.train["x1"]
+    reach = 10.0 ** np.arange(5)
+    probe = {k: np.full(reach.size, np.median(v)) for k, v in data.train.items()}
+    probe["x1"] = x1.min() - reach * (x1.max() - x1.min())
+    pred = np.asarray(model.predict(probe), dtype=float).reshape(-1)
+    bad = ~np.isfinite(pred)
+    assert 0 < bad.sum() < reach.size
+    assert _overflows_exactly(model, probe, pred)
+    ok = {k: v[~bad] for k, v in probe.items()}
+    design = model.design_matrix(ok)
+    eta = design.offset + design.matrix @ design.coefficients
+    var = np.einsum(
+        "ij,jk,ik->i",
+        design.eta_gradient,
+        design.covariance_conditional,
+        design.eta_gradient,
+    )
+    assert np.all(eta + 0.5 * var < LOG_DBL_MAX)
+    np.testing.assert_allclose(pred[~bad], np.exp(eta + 0.5 * var), rtol=1e-10)
