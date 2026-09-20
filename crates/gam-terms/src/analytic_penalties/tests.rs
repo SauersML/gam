@@ -1683,6 +1683,88 @@ fn scadmcp_value_grad_self_consistent_fd() {
     );
 }
 
+/// Both SCAD and MCP, with a learnable weight, checked against central
+/// differences in every analytic channel: `grad_target` against `value`,
+/// `hessian_diag` against `grad_target` (the penalty is coordinate-separable,
+/// so the diagonal is the whole Hessian), and `grad_rho` against `value` in
+/// the log-weight.
+///
+/// The effective weight is `w = 0.5·e^{0.2} ≈ 0.611` and `ε = 0.05`. The SCAD
+/// knots (`γ = 3.7`) are at `r = w ≈ 0.611` and `r = γw ≈ 2.260`; the MCP knot
+/// (`γ = 3`) is at `r = γw ≈ 1.832`. Every probe sits at least 0.16 from a knot,
+/// so the `h = 1e-5` stencil never straddles one, and together the probes hit
+/// every branch of both variants (SCAD linear / quadratic / flat, MCP
+/// active / flat).
+///
+/// Tolerances come from the stencil error `h²/6·|f'''| + ε_mach·|f|/h`. The
+/// largest third derivative is at `t = 0.03` (`r ≈ 0.058`, closest to the
+/// smoothing scale):
+/// * value→grad: `|f'''| = 3wε²|t|/r⁵ ≈ 2e2`, so the error is ≈ `3e-9`
+///   (tolerance `1e-7`);
+/// * grad→hessian: `|f''''| = 3wε²|r⁻⁵ − 5t²r⁻⁷| ≈ 2.2e3`, so the error is
+///   ≈ `4e-8` (tolerance `1e-6`);
+/// * value→grad_rho: on each branch `value = a·w + b·w² + c` in `w = w₀e^ρ`,
+///   so `∂³/∂ρ³ = a·w + 8b·w²`, which sums to ≈ 16 over these probes. The
+///   error is then ≈ `3e-10` (tolerance `1e-7`).
+#[test]
+fn scadmcp_learnable_hessian_and_grad_rho_match_central_differences() {
+    let t = array![0.03_f64, -0.2, 0.9, -1.4, 2.0, 2.8, -3.1];
+    let n_eff = t.len();
+    let rho = array![0.2_f64];
+    let h = 1.0e-5;
+    for (variant, gamma) in [(PenaltyConcavity::Scad, 3.7), (PenaltyConcavity::Mcp, 3.0)] {
+        let pen = ScadMcpPenalty::new(
+            PsiSlice::full(n_eff, Some(1)),
+            0.5,
+            n_eff,
+            gamma,
+            0.05,
+            variant,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pen.rho_count(), 1);
+
+        let worst_grad = value_grad_fd_max_abs_error(&pen, t.view(), rho.view(), h);
+        assert!(
+            worst_grad <= 1.0e-7,
+            "{variant:?} value↔grad FD max abs error = {worst_grad:.3e}"
+        );
+
+        let hess = pen
+            .hessian_diag(t.view(), rho.view())
+            .expect("SCAD/MCP expose an exact Hessian diagonal");
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        for i in 0..n_eff {
+            tp[i] = t[i] + h;
+            tm[i] = t[i] - h;
+            let fd = (pen.grad_target(tp.view(), rho.view())[i]
+                - pen.grad_target(tm.view(), rho.view())[i])
+                / (2.0 * h);
+            tp[i] = t[i];
+            tm[i] = t[i];
+            assert!(
+                (hess[i] - fd).abs() <= 1.0e-6,
+                "{variant:?} hessian_diag[{i}] = {} vs FD {fd} at t = {}",
+                hess[i],
+                t[i]
+            );
+        }
+
+        let grad_rho = pen.grad_rho(t.view(), rho.view());
+        assert_eq!(grad_rho.len(), 1);
+        let fd_rho = (pen.value(t.view(), array![rho[0] + h].view())
+            - pen.value(t.view(), array![rho[0] - h].view()))
+            / (2.0 * h);
+        assert!(
+            (grad_rho[0] - fd_rho).abs() <= 1.0e-7,
+            "{variant:?} grad_rho = {} vs FD {fd_rho}",
+            grad_rho[0]
+        );
+    }
+}
+
 #[test]
 fn nuclear_norm_value_grad_self_consistent_fd() {
     let n_eff = 4usize;
