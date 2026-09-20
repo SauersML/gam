@@ -39,6 +39,8 @@ mod beta_logistic_saturated_row_2902_tests;
 #[cfg(test)]
 mod firth_noncanonical_curvature_2273_tests;
 #[cfg(test)]
+mod bernoulli_log_jet_3317_tests;
+#[cfg(test)]
 mod gaussian_row_log_free_tests;
 #[cfg(test)]
 mod residuals_tests;
@@ -108,7 +110,7 @@ pub use reweight::{
     ExactNewtonDecrementEvidence, exact_newton_decrement_evidence, runworking_model_pirls,
 };
 
-pub use state::{array1_l2_norm, relative_gradient_residual};
+pub use state::{array1_l2_norm, penalized_gradient_natural_scale, relative_gradient_residual};
 
 // Surface the `WorkingModel` trait (defined in the private `working_model_trait`
 // module) at the `pirls` root so out-of-crate engine implementors (gam-models
