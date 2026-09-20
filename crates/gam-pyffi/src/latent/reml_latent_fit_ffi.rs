@@ -4690,53 +4690,9 @@ fn survival_null_curve_from_train<'py>(
             train_events.len()
         )));
     }
-    let curve = gam::families::survival::risk_calibration::km_curve_on_grid(
-        &train_times,
-        &train_events,
-        &grid,
-    );
+    let curve = gam::families::survival::predict::KaplanMeier::fit(&train_times, &train_events)
+        .on_grid(&grid);
     Ok(Array1::from_vec(curve).into_pyarray(py).unbind())
-}
-
-/// Thin wrapper over
-/// [`gam::families::survival::risk_calibration::cox_calibrated_survival_matrix`],
-/// which owns the univariate Cox fit and the Breslow baseline. pyffi only maps
-/// the core error into a Python exception.
-fn benchmark_survival_matrix_from_risk(
-    train_times: &[f64],
-    train_events: &[f64],
-    train_risk: &[f64],
-    test_risk: &[f64],
-    grid: &[f64],
-) -> PyResult<Array2<f64>> {
-    gam::families::survival::risk_calibration::cox_calibrated_survival_matrix(
-        train_times,
-        train_events,
-        train_risk,
-        test_risk,
-        grid,
-    )
-    .map_err(PyValueError::new_err)
-}
-
-#[pyfunction]
-fn survival_matrix_from_risk_calibration<'py>(
-    py: Python<'py>,
-    train_times: Vec<f64>,
-    train_events: Vec<f64>,
-    train_risk: Vec<f64>,
-    test_risk: Vec<f64>,
-    grid: Vec<f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    Ok(benchmark_survival_matrix_from_risk(
-        &train_times,
-        &train_events,
-        &train_risk,
-        &test_risk,
-        &grid,
-    )?
-    .into_pyarray(py)
-    .unbind())
 }
 
 #[pyfunction(signature = (event_times, events, grid, survival_matrix, null_survival_matrix = None))]

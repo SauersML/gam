@@ -4938,10 +4938,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
     module.add_function(wrap_pyfunction!(
-        survival_matrix_from_risk_calibration,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
         survival_lifted_metrics_from_predictions,
         module
     )?)?;
