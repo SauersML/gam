@@ -85,12 +85,6 @@ const MAX_BACKTRACKS: usize = 8;
 /// Per-step line-search contraction factor (halving).
 const LINE_SEARCH_SHRINK: f64 = 0.5;
 
-/// First-order optimality gate (gam#856) as a fraction of `1 + max_diag`: the
-/// unridged penalized gradient norm must fall below this curvature-scaled
-/// threshold before convergence is declared, certifying stationarity on the
-/// identified subspace rather than a premature step-norm stall.
-const OPTIMALITY_GRAD_FRACTION: f64 = 1.0e-6;
-
 /// Class-space metric of the replicated smoothing penalty (#1587).
 ///
 /// * `Diagonal` — the historical `diag_a(λ_a) ⊗ S`: each active output's
@@ -274,10 +268,12 @@ pub struct VectorGlmStall {
     pub log_likelihood: f64,
     /// Penalty term at the abandoned iterate.
     pub penalty_term: f64,
-    /// Norm of the exact penalized score at the checkpoint.
-    pub gradient_norm: f64,
-    /// Curvature-scaled score bound required by the stationarity certificate.
-    pub gradient_bound: f64,
+    /// Half the squared Newton decrement `½·gᵀH⁺g` of the exact penalized
+    /// score at the checkpoint, in objective units.
+    pub newton_decrement: f64,
+    /// Rounding band of the penalized objective at the checkpoint: the
+    /// decrement the stationarity certificate requires.
+    pub decrement_bound: f64,
 }
 
 impl VectorGlmStall {
@@ -320,9 +316,9 @@ impl VectorGlmStall {
             reason,
             objective_value: -self.log_likelihood + self.penalty_term,
             stationarity: FixedLambdaStationarityEvidence {
-                kind: FixedLambdaResidualKind::PenalizedGradientNorm,
-                residual: self.gradient_norm,
-                bound: self.gradient_bound,
+                kind: FixedLambdaResidualKind::NewtonDecrement,
+                residual: self.newton_decrement,
+                bound: self.decrement_bound,
             },
             checkpoint,
         })
@@ -592,6 +588,81 @@ fn fill_penalized_gradient(
         }
         ClassPenaltyMetric::EquivariantPerClass => {}
     }
+}
+
+/// Minimum-norm Newton step `δ = −H⁺·g` on the penalized Hessian
+/// `H = block(XᵀWX) + penalty`.
+///
+/// A positive-definite `H` takes the exact Newton step through one Cholesky
+/// factorization. `H` can also be exactly rank-deficient: a multinomial class
+/// block with quasi-separated or collinear columns and a small per-class λ
+/// leaves `XᵀW_aX + λ_a S` singular (gam#856). The step that descends on the
+/// identified subspace is then the minimum-norm one on `H`'s resolved positive
+/// eigenspace, and the directions the data and penalty do not identify take no
+/// step. Bunch–Kaufman back-substitution through a zero pivot gives an
+/// arbitrary null-space component instead.
+///
+/// `−gᵀδ = gᵀH⁺g` is the squared Newton decrement, the affine-invariant
+/// stationarity measure the convergence certificate reads. `stage` names the
+/// iterate in diagnostics.
+fn minimum_norm_newton_step(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    context: &str,
+    stage: &str,
+) -> Result<Array1<f64>, EstimationError> {
+    let step = match hessian.cholesky(Side::Lower) {
+        Ok(factor) => factor.solvevec(gradient).mapv(|v| -v),
+        Err(_) => pseudo_inverse_step(hessian, gradient, context, stage)?,
+    };
+    if !step.iter().all(|v| v.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{context}: minimum-norm Newton step is non-finite at {stage} (grad_norm={:.3e})",
+            gradient.iter().map(|v| v * v).sum::<f64>().sqrt(),
+        )));
+    }
+    Ok(step)
+}
+
+/// `−H⁺·g` over the eigenvalues above the solver's positive-eigenvalue floor:
+/// the Newton step of a penalized Hessian that is not positive definite.
+fn pseudo_inverse_step(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    context: &str,
+    stage: &str,
+) -> Result<Array1<f64>, EstimationError> {
+    let (eigenvalues, eigenvectors) = hessian.eigh(Side::Lower).map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "{context}: penalized Hessian eigendecomposition failed at {stage}: {error}"
+        ))
+    })?;
+    let threshold = gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
+        eigenvalues.as_slice().ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "{context}: penalized Hessian eigenvalues are not contiguous at {stage}"
+            ))
+        })?,
+    );
+    let projected_gradient = eigenvectors.t().dot(gradient);
+    let mut step = Array1::<f64>::zeros(gradient.len());
+    for k in 0..gradient.len() {
+        if eigenvalues[k] > threshold {
+            step.scaled_add(
+                -projected_gradient[k] / eigenvalues[k],
+                &eigenvectors.column(k),
+            );
+        }
+    }
+    Ok(step)
+}
+
+/// Rounding band of the penalized objective `−ℓ + penalty`: it accumulates
+/// `n·(m+1)` row terms and `m·p²` penalty products, all non-negative, so
+/// `γ·|f|` bounds the error of the computed value. The line search's descent
+/// test and the stationarity certificate both read this one band.
+fn penalized_objective_band(objective: f64, n_obs: usize, m: usize, p: usize) -> f64 {
+    gam_linalg::roundoff::accumulation_growth(n_obs * (m + 1) + m * p * p) * objective.abs()
 }
 
 /// Invert the symmetric penalized Hessian `H` to the joint Laplace covariance
@@ -935,63 +1006,12 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         );
 
         // δ = −H⁺·grad on the penalized Hessian `H = block(XᵀWX) + diag_a(λ_a S)`.
-        // A positive-definite `H` takes the exact Newton step through one
-        // Cholesky factorization. `H` can also be exactly rank-deficient: a
-        // multinomial class block with quasi-separated or collinear columns and a
-        // small per-class λ leaves `XᵀW_aX + λ_a S` singular (gam#856). The step
-        // that descends on the identified subspace is then the minimum-norm one
-        // on `H`'s resolved positive eigenspace, and the directions the data and
-        // penalty do not identify take no step. Bunch–Kaufman back-substitution
-        // through a zero pivot gives an arbitrary null-space component instead,
-        // and a ridge escalated from a picked fraction of `max_diag` only
-        // approximated the minimum-norm answer.
-        let max_diag =
-            (0..beta_flat_dim).fold(0.0_f64, |acc, idx| acc.max(hessian[[idx, idx]].abs()));
-        let cholesky_step = match hessian.cholesky(Side::Lower) {
-            Ok(factor) => {
-                let step = factor.solvevec(&grad_flat).mapv(|v| -v);
-                step.iter().all(|v| v.is_finite()).then_some(step)
-            }
-            Err(_) => None,
-        };
-        let delta = match cholesky_step {
-            Some(step) => step,
-            None => {
-                let (eigenvalues, eigenvectors) = hessian.eigh(Side::Lower).map_err(|error| {
-                    EstimationError::InvalidInput(format!(
-                        "{context}: penalized Hessian eigendecomposition failed at iter {iter}: \
-                         {error}"
-                    ))
-                })?;
-                let threshold =
-                    gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
-                        eigenvalues.as_slice().ok_or_else(|| {
-                            EstimationError::InvalidInput(format!(
-                                "{context}: penalized Hessian eigenvalues are not contiguous at \
-                                 iter {iter}"
-                            ))
-                        })?,
-                    );
-                let projected_gradient = eigenvectors.t().dot(&grad_flat);
-                let mut step = Array1::<f64>::zeros(beta_flat_dim);
-                for k in 0..beta_flat_dim {
-                    if eigenvalues[k] > threshold {
-                        step.scaled_add(
-                            -projected_gradient[k] / eigenvalues[k],
-                            &eigenvectors.column(k),
-                        );
-                    }
-                }
-                if !step.iter().all(|v| v.is_finite()) {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "{context}: minimum-norm Newton step is non-finite at iter {iter} \
-                         (grad_norm={:.3e}, max_diag={max_diag:.3e})",
-                        grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt(),
-                    )));
-                }
-                step
-            }
-        };
+        let delta = minimum_norm_newton_step(
+            &hessian,
+            &grad_flat,
+            context,
+            &format!("iter {iter}"),
+        )?;
 
         // Damped acceptance: full step first, halve up to `MAX_BACKTRACKS` times
         // if the penalized negative log-likelihood fails to decrease. The first
@@ -1023,14 +1043,11 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 Ok(Some((objective, candidate)))
             },
             // A trial is a decrease unless it rises beyond the objective's rounding
-            // band: `−ℓ + penalty` accumulates `n·(m+1)` row terms and `m·p²` penalty
-            // products, so a rise inside `γ·|f|` is arithmetic and a step flat to
-            // that resolution is not rejected.
+            // band: a rise inside it is arithmetic, and a step flat to that
+            // resolution is not rejected.
             |_, f| {
                 f.is_finite()
-                    && f <= last_objective
-                        + gam_linalg::roundoff::accumulation_growth(n_obs * (m + 1) + m * p * p)
-                            * last_objective.abs()
+                    && f <= last_objective + penalized_objective_band(last_objective, n_obs, m, p)
             },
         )?;
         let Some(accepted) = accepted else {
@@ -1043,6 +1060,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         };
         let accepted_beta = accepted.payload;
         let new_objective = accepted.value;
+        let pre_step_objective = last_objective;
 
         let mut step_norm_sq = 0.0_f64;
         let mut beta_norm_sq = 0.0_f64;
@@ -1063,20 +1081,19 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         // First-order optimality gate (gam#856): the step-norm test alone can
         // fire prematurely when a backtracking line search has shrunk α on a
         // poor direction, leaving a point that is NOT stationary. `grad_flat`
-        // is the unridged penalized gradient ∇F(β) at the pre-step β; with a
-        // small step it is ≈ ∇F at the accepted β. Its norm reflects only
-        // identified directions (it is exactly zero along an unidentified null
-        // direction such as a duplicate-column e₁−e₂ split), so requiring it to
-        // be small certifies first-order optimality on the identified subspace
-        // without penalizing legitimate non-identifiability. Scale the gate by
-        // the data magnitude so it is invariant to problem scale.
-        let grad_norm = grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt();
-        // Curvature-scaled optimality threshold: `max_diag` is the dominant
-        // penalized-Hessian diagonal entry, so `OPTIMALITY_GRAD_FRACTION·max_diag`
-        // is a tiny gradient relative to the problem's curvature scale and is
-        // reached by a few quadratically-converging Newton steps on this smooth,
-        // bounded softmax/binomial likelihood.
-        let grad_optimal = grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + max_diag);
+        // is the unridged penalized gradient ∇F(β) at the pre-step β and
+        // `delta = −H⁺·grad_flat`, so `½·gᵀH⁺g = −½·gᵀδ` is half the squared
+        // Newton decrement: the objective decrease the local quadratic model
+        // still promises, in objective units. It is invariant under any linear
+        // reparameterization of β (a rescaled design column moves `g` and `H`
+        // together), and it is exactly zero along a direction `H⁺` does not
+        // resolve, such as a duplicate-column e₁−e₂ split, so it certifies
+        // stationarity on the identified subspace without penalizing
+        // legitimate non-identifiability. A promised decrease inside the
+        // objective's own rounding band is one no further step can realize.
+        let half_decrement_sq = -0.5 * grad_flat.dot(&delta);
+        let grad_optimal = half_decrement_sq
+            <= penalized_objective_band(pre_step_objective, n_obs, m, p);
         if step_norm <= tol * (1.0 + beta_norm) && grad_optimal {
             small_step_reached = true;
             break;
@@ -1089,8 +1106,8 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     let penalty_term = weighted_penalty_sum(&beta, penalty, lambdas, class_penalty_metric);
 
     // Re-assemble the final penalized Hessian before certification. This is not
-    // posterior work: its diagonal supplies the same curvature scale used by
-    // the loop's first-order gate. Covariance inversion remains below the gate
+    // posterior work: its minimum-norm Newton step gives the decrement the
+    // post-step certificate reads. Covariance inversion remains below the gate
     // and is therefore impossible for an uncertified iterate.
     //
     // Joint Laplace covariance `H⁻¹` at the converged mode (#1101). Re-assemble
@@ -1165,14 +1182,12 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         class_penalty_metric,
         &mut grad_flat,
     );
-    let final_grad_norm = grad_flat
-        .iter()
-        .map(|value| value * value)
-        .sum::<f64>()
-        .sqrt();
-    let final_max_diag =
-        (0..beta_flat_dim).fold(0.0_f64, |acc, i| acc.max(hessian_final[[i, i]].abs()));
-    let final_grad_optimal = final_grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + final_max_diag);
+    let final_step =
+        minimum_norm_newton_step(&hessian_final, &grad_flat, context, "the final iterate")?;
+    let final_half_decrement_sq = -0.5 * grad_flat.dot(&final_step);
+    let final_decrement_bound =
+        penalized_objective_band(-log_likelihood + penalty_term, n_obs, m, p);
+    let final_grad_optimal = final_half_decrement_sq <= final_decrement_bound;
     if !(small_step_reached && final_grad_optimal) {
         if small_step_reached {
             stall_reason = VectorGlmStallReason::PostStepCertificateFailed;
@@ -1188,8 +1203,8 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             iterations,
             log_likelihood,
             penalty_term,
-            gradient_norm: final_grad_norm,
-            gradient_bound: OPTIMALITY_GRAD_FRACTION * (1.0 + final_max_diag),
+            newton_decrement: final_half_decrement_sq,
+            decrement_bound: final_decrement_bound,
         }));
     }
 
