@@ -581,13 +581,16 @@ fn stabilizing_shift_core(
     // Recover a near-minimal shift without an `O(p³)`-per-eigenpair eigh: use the
     // Gershgorin shift only as a guaranteed-PD upper bracket and bisect the PD
     // frontier with Cholesky. `cholesky(H + δI)` succeeds iff `δ > −λ_min(H)`, a
-    // monotone step in `δ`, so a handful of bisections between the known-indefinite
-    // `δ = 0` (the fast-path Cholesky above already failed) and the known-PD
-    // Gershgorin bracket squeeze `δ` to within `2⁻ⁿ` of the minimal PD shift. Each
-    // step is one `O(p³/3)` Cholesky; the iteration count is capped and only runs
-    // on the indefinite cycles the fast path did not already clear, so the cost is
-    // bounded and self-vanishing. The final `+ floor` restores the `≥ floor`
-    // positive-definiteness margin the downstream solve relies on.
+    // monotone step in `δ`, so bisecting between the known-indefinite `δ = 0` (the
+    // fast-path Cholesky above already failed) and the known-PD Gershgorin bracket
+    // locates the minimal PD shift. The bisection stops at the resolution of the
+    // pass/fail test itself, `floor` (below it the computed Cholesky frontier is
+    // not resolved), so the returned shift overshoots the minimal one by at most
+    // that resolution plus the `+ floor` margin — independent of how loose the
+    // Gershgorin bracket is (gam#3660). The midpoint is geometric, so the order of
+    // magnitude of `δ*` is found in `log₂ log₂(bracket/floor)` Choleskys and the
+    // remaining steps refine it relative to `δ*`; each step is one `O(p³/3)`
+    // Cholesky and only runs on the indefinite cycles the fast path did not clear.
     let p = gershgorin_src.nrows();
     let mut gershgorin_min = f64::INFINITY;
     for i in 0..p {
@@ -635,14 +638,18 @@ fn stabilizing_shift_core(
     };
     // Bisect the minimal PD shift `δ*` (where Cholesky just succeeds) in
     // `(0, bracket]`. `δ = 0` is known-indefinite (fast path failed above); the
-    // bracket is known-PD. Cap iterations (relative squeeze to ~2⁻¹² of the
-    // bracket) so the extra Choleskys stay bounded even when the shift fires on
-    // every cycle of a coupled K-block fit.
-    const MAX_BISECT: usize = 12;
+    // bracket is known-PD. Stop once the bracket is no wider than `floor`, the
+    // resolution of the Cholesky pass/fail test. The midpoint is the geometric
+    // mean, with the unresolved lower end `0` read as `floor` (no shift below the
+    // test's resolution is distinguishable from `0`), so `log(hi/lo)` halves per
+    // step: the scale of `δ*` is reached in `log₂ log₂(bracket/floor)` steps, and
+    // near `lo ≈ hi` the geometric mean is the arithmetic one to first order, so
+    // the width then halves per step down to `floor`. A barely-indefinite matrix
+    // (small `δ*`) therefore costs few Choleskys however loose the bracket is.
     let mut lo = 0.0_f64; // indefinite
     let mut hi = bracket; // PD
-    for _ in 0..MAX_BISECT {
-        let mid = 0.5 * (lo + hi);
+    while hi - lo > floor {
+        let mid = lo.max(floor).sqrt() * hi.sqrt();
         if mid <= lo || mid >= hi {
             break;
         }
@@ -652,8 +659,9 @@ fn stabilizing_shift_core(
             lo = mid;
         }
     }
-    // `hi` is the tightest bracket known PD (λ_min(cholesky_test + hi·I) ≈ 0⁺).
-    // Add `floor` to restore the strict `≥ floor` margin, clamped to the original
+    // `hi` is known PD and within `floor` of the known-indefinite `lo`, so it sits
+    // on the computed PD frontier to the test's resolution. Add `floor` to
+    // restore the strict `≥ floor` margin, clamped to the original
     // guaranteed-PD Gershgorin shift so we never exceed the conservative bound.
     Some((hi + floor).min(bracket))
 }

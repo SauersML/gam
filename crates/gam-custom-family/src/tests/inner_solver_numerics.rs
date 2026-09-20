@@ -2427,6 +2427,53 @@ pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_pen
     );
 }
 
+/// gam#3660: the stabilizing shift of a barely-indefinite Hessian must sit at
+/// the minimal PD shift to the Cholesky test's resolution, not at a fixed
+/// fraction of the (loose) Gershgorin bracket. `H = J − ε·I` with `J` the 3×3
+/// all-ones matrix has eigenvalues `3 − ε, −ε, −ε`, so the minimal PD shift is
+/// `δ* = ε`, while its Gershgorin bound `(1 − ε) − 2` gives a bracket of about
+/// 1. A fixed 12-step arithmetic bisection returned `≈ 2⁻¹² ≈ 2.4e-4`, about
+/// 244·δ* for `ε = 1e-6`.
+#[test]
+pub(crate) fn barely_indefinite_stabilizing_shift_is_minimal_to_cholesky_resolution() {
+    let eps = 1.0e-6_f64;
+    let mut h = Array2::<f64>::ones((3, 3));
+    for d in 0..3 {
+        h[[d, d]] -= eps;
+    }
+    let delta_star = eps;
+    // A caller floor far above the matrix's own rounding (γ₄·max|H_ii| ≈ 4e-16),
+    // so the resolution the shift is judged against is exactly `ridge_floor`.
+    let ridge_floor = 1.0e-12_f64;
+    let shift = exact_newton_stabilizing_shift_psd_penalized(&h, &h, ridge_floor)
+        .expect("indefinite Hessian must yield a stabilizing shift");
+
+    // The bisection stops with `hi − lo ≤ floor`, `lo` Cholesky-indefinite (so
+    // `lo` lies below the computed frontier, which is `δ*` up to rounding far
+    // below `floor`), and the returned shift is `hi + floor`. Hence
+    // `δ* < shift ≤ δ* + 2·floor` up to that rounding; one further `floor` of
+    // slack covers the frontier's rounding.
+    assert!(
+        shift > delta_star,
+        "shift {shift:.6e} must lift the −{eps:.0e} eigenvalue past zero"
+    );
+    assert!(
+        shift - delta_star <= 3.0 * ridge_floor,
+        "shift {shift:.6e} overshoots the minimal PD shift {delta_star:.0e} by {:.3e}, \
+         more than the Cholesky test's resolution allows ({:.3e})",
+        shift - delta_star,
+        3.0 * ridge_floor,
+    );
+    let mut stabilized = h.clone();
+    for d in 0..3 {
+        stabilized[[d, d]] += shift;
+    }
+    assert!(
+        stabilized.cholesky(Side::Lower).is_ok(),
+        "H + shift·I must be Cholesky-PD"
+    );
+}
+
 #[test]
 pub(crate) fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
     let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
