@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::model_types::{Dispersion, EstimationError};
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::utils::stack_offsets;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use gam_problem::{
     FitStationarityEvidence, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
     LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization, MixtureLinkSpec,
@@ -169,6 +170,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -281,6 +283,7 @@ mod per_term_edf_tests {
                 coefficient_influence: Some(influence),
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -357,6 +360,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -561,6 +565,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -3011,9 +3016,6 @@ pub enum SmoothingCorrectionAbsence {
     OuterHessianUndeclared { reason: OuterHessianAbsence },
     /// The interior ρ-Hessian was formed but refused inversion on its identified subspace.
     InteriorRhoHessianRefused { refusal: String },
-    /// The outer ρ-Hessian has no analytic form for this fit: a non-canonical Firth link whose
-    /// outer search ran first-order.
-    OuterHessianNotAnalytic { detail: String },
     /// The optimum is certified on an infinite-smoothing rail, where ρ has no finite variance.
     ///
     /// No longer produced: the correction excludes railed coordinates exactly as the outer
@@ -3066,9 +3068,6 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
             }
             Self::InteriorRhoHessianRefused { refusal } => {
                 write!(f, "the interior rho-Hessian refused inversion: {refusal}")
-            }
-            Self::OuterHessianNotAnalytic { detail } => {
-                write!(f, "the outer rho-Hessian has no analytic form: {detail}")
             }
             Self::RailCertified { detail } => write!(
                 f,
@@ -3227,6 +3226,13 @@ pub struct FitInference {
     /// does not form this Hessian.
     #[serde(default)]
     pub identified_subspace: Option<IdentifiedCoefficientSubspace>,
+    /// The working residual `‖z − Xβ̂‖²_W` over the `n⁺` rows that carry
+    /// curvature, in the metric of [`Self::weighted_gram`]. The smooth score
+    /// test's estimated scale reads the full model's unpenalized residual off
+    /// it (gam#3832). `None` where the fit publishes no working model in that
+    /// metric.
+    #[serde(default)]
+    pub working_residual: Option<WorkingResidual>,
 }
 
 /// The wire form [`FitInference`] deserializes through.
@@ -3273,6 +3279,8 @@ struct FitInferenceWire {
     weighted_gram: Option<Array2<f64>>,
     #[serde(default)]
     identified_subspace: Option<IdentifiedCoefficientSubspace>,
+    #[serde(default)]
+    working_residual: Option<WorkingResidual>,
 }
 
 impl From<FitInferenceWire> for FitInference {
@@ -3302,6 +3310,7 @@ impl From<FitInferenceWire> for FitInference {
             coefficient_influence: wire.coefficient_influence,
             weighted_gram: wire.weighted_gram,
             identified_subspace: wire.identified_subspace,
+            working_residual: wire.working_residual,
         }
     }
 }
@@ -3870,6 +3879,7 @@ mod assembly_inner_status_gate_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -4707,9 +4717,9 @@ mod assembly_inner_status_gate_tests {
                 weighted_gram: &gram,
                 coeff_range: 0..2,
                 structural_penalties: &[Array2::eye(2)],
-                covariance_scale: 1.0,
-                residual_df: Some(50.0),
-                scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
+                scale: gam_terms::inference::smooth_score_test::ScoreTestScale::Known {
+                    covariance_scale: 1.0,
+                },
             },
         )
         .expect("the term is testable")
