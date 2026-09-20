@@ -2270,6 +2270,94 @@ fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partia
     }
 }
 
+/// #4135: inside the small-χ basin (κR ≤ 1/8), the hybrid kernel's radial
+/// table must be the kernel itself. It must not be only the Riesz tail
+/// `Σ_n (−1)^n C(b+n−1,n) κ^{2n} R_{a+b+n}`. The analytic part
+/// `E(R) = Σ_i e_i R^{2i}` it dropped is a constant `≈ 1/(8πκ³)` here. The
+/// partial-fraction chart and the diagonal both carry that constant, so
+/// close pairs came out near zero while every other entry was about 0.116,
+/// and the constrained pair block was indefinite.
+///
+/// These are cases whose `(−Δ)^q f` spectrum is integrable, so `g_q` is an
+/// ordinary function with an elementary closed form:
+/// - d = 3, m = s = 1, q = 1: `ĝ = ρ^{-2}(κ²+ρ²)^{-2}`, and
+///   `g(r) = (1 − e^{−κr})/(4πκ⁴r) − e^{−κr}/(8πκ³)` by residues of the
+///   3-D radial transform `g = (2π²r)^{-1} ∫_0^∞ ρ sin(ρr) ĝ(ρ) dρ`.
+/// - d = 2, m = s = 1, q = 2: `ĝ = (κ²+ρ²)^{-2}`, the order-2 Matérn block
+///   `g(r) = r K_1(κr)/(4πκ)`.
+///
+/// Each side is a short sum of terms that are each accurate to a few ulps
+/// (statrs Γ is Lanczos, relative error below 1e-15). The comparison is
+/// therefore charged at `1e-12` of the sum of those terms' magnitudes:
+/// several decades above the accumulated rounding, and ten decades below the
+/// O(1) relative defect this pins.
+#[test]
+fn test_small_chi_chart_is_the_kernel_not_its_riesz_tail() {
+    use super::closed_form_penalty::{
+        DUCHON_SMALL_CHI_SERIES_MAX, radial_derivatives_of_isotropic_duchon,
+        radial_derivatives_of_isotropic_duchon_kappa_partial,
+    };
+    use std::f64::consts::PI;
+    let rel = 1e-12_f64;
+
+    // d = 3, m = s = 1, q = 1: g = −(f'' + 2 f'/r).
+    let kappa = 0.7_f64;
+    let edge = DUCHON_SMALL_CHI_SERIES_MAX / kappa;
+    for &r in &[0.01_f64, 0.05, 0.1, 0.17, edge] {
+        let f = radial_derivatives_of_isotropic_duchon(3, 1, 1.0, kappa, r, 2);
+        let got = -(f[2] + 2.0 * f[1] / r);
+        let got_scale = f[2].abs() + (2.0 * f[1] / r).abs();
+        let x = kappa * r;
+        let decay = (-x).exp();
+        let first = -(-x).exp_m1() / (4.0 * PI * kappa.powi(4) * r);
+        let second = decay / (8.0 * PI * kappa.powi(3));
+        let expected = first - second;
+        let tol = rel * (got_scale + first.abs() + second.abs());
+        assert!(
+            (got - expected).abs() <= tol,
+            "d=3 m=s=1 q=1 κ={kappa} r={r}: g_1 got={got:.15e} expected={expected:.15e} tol={tol:.3e}"
+        );
+
+        // ∂g/∂κ of the same closed form, against the chart's κ-partial.
+        let fk = radial_derivatives_of_isotropic_duchon_kappa_partial(3, 1, 1, kappa, r, 2);
+        let got_k = -(fk[2] + 2.0 * fk[1] / r);
+        let got_k_scale = fk[2].abs() + (2.0 * fk[1] / r).abs();
+        let terms_k = [
+            decay / (4.0 * PI * kappa.powi(4)),
+            (-x).exp_m1() / (PI * kappa.powi(5) * r),
+            r * decay / (8.0 * PI * kappa.powi(3)),
+            3.0 * decay / (8.0 * PI * kappa.powi(4)),
+        ];
+        let expected_k: f64 = terms_k.iter().sum();
+        let tol_k = rel * (got_k_scale + terms_k.iter().map(|t| t.abs()).sum::<f64>());
+        assert!(
+            (got_k - expected_k).abs() <= tol_k,
+            "d=3 m=s=1 q=1 κ={kappa} r={r}: ∂_κ g_1 got={got_k:.15e} expected={expected_k:.15e} tol={tol_k:.3e}"
+        );
+    }
+
+    // d = 2, m = s = 1, q = 2: g = Δ² f = f'''' + 2f'''/r − f''/r² + f'/r³.
+    let kappa = 0.4_f64;
+    let edge = DUCHON_SMALL_CHI_SERIES_MAX / kappa;
+    for &r in &[0.02_f64, 0.1, 0.25, edge] {
+        let f = radial_derivatives_of_isotropic_duchon(2, 1, 1.0, kappa, r, 4);
+        let terms = [
+            f[4],
+            2.0 * f[3] / r,
+            -f[2] / (r * r),
+            f[1] / (r * r * r),
+        ];
+        let got: f64 = terms.iter().sum();
+        let got_scale: f64 = terms.iter().map(|t| t.abs()).sum();
+        let expected = r * bessel_k(1.0, kappa * r) / (4.0 * PI * kappa);
+        let tol = rel * (got_scale + expected.abs());
+        assert!(
+            (got - expected).abs() <= tol,
+            "d=2 m=s=1 q=2 κ={kappa} r={r}: g_2 got={got:.15e} expected={expected:.15e} tol={tol:.3e}"
+        );
+    }
+}
+
 #[test]
 fn test_even_log_riesz_small_kappa_uses_full_taylor_series() {
 
