@@ -2724,14 +2724,6 @@ fn certify_four_spends_order_four_once_and_prices_the_curvature_against_the_crit
     );
 }
 
-// The historical bridge-side `rejects_oversized_bfgs_cost_probe_before_objective`
-// test exercised a mechanism (returning `BFGS_LINE_SEARCH_REJECT_COST`
-// from `eval_cost` on overreach) that has been retired in favor of
-// `opt::Bfgs::with_axis_step_caps` — the line-search direction is now
-// shortened up front by opt itself, so the bridge never sees an
-// oversized probe in the first place. The equivalent invariant now
-// lives in opt's `with_axis_step_caps` test surface.
-
 #[test]
 fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
     let eval_calls = Arc::new(AtomicUsize::new(0));
@@ -6344,8 +6336,8 @@ mod run_plan_saddle_escape_tests;
 #[path = "stratum_boundary_2939_tests.rs"]
 mod stratum_boundary_2939_tests;
 
-// #2953: an outer result's gradient is a measurement at a point, and the
-// reproducibility floor reads it only at the point being certified.
+// #2953: an outer result's gradient is a measurement at a point; #3531: a
+// second same-ρ measurement never widens the stationarity bound.
 #[path = "run_plan_measurement_point_2953_tests.rs"]
 mod run_plan_measurement_point_2953_tests;
 
