@@ -5948,6 +5948,29 @@ impl UnifiedFitResult {
         Ok(resolved.phi())
     }
 
+    /// [`Self::dispersion_phi`] when the fit's scale contract has a scalar
+    /// response dispersion, and `None` exactly when it has none: a fit with no
+    /// engine-level family (a custom family), or a family whose resolved scale
+    /// is [`gam_problem::ResolvedLikelihoodScale::Unspecified`] (Royston-Parmar
+    /// survival). The answer is read from the resolved scale, so every other
+    /// dispersion failure is still an error (gam#3297).
+    pub fn scalar_dispersion_phi(&self) -> Result<Option<f64>, EstimationError> {
+        let Some(spec) = self.likelihood_family.as_ref() else {
+            return Ok(None);
+        };
+        let glm = GlmLikelihoodSpec {
+            spec: spec.clone(),
+            scale: self.likelihood_scale,
+        };
+        match glm
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+        {
+            gam_problem::ResolvedLikelihoodScale::Unspecified => Ok(None),
+            _ => self.dispersion_phi().map(Some),
+        }
+    }
+
     /// Multiplier that turns the stored unscaled inverse penalized Hessian
     /// `H⁻¹` into the reported coefficient covariance `Vb = H⁻¹·scale`.
     ///

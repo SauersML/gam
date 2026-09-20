@@ -3,11 +3,11 @@ use super::*;
 /// The criterion value and iteration count a first-order run ended at, when it ended by
 /// converging or stalling: the ends at which the search may cross into the stratum of a
 /// trial it refused for keeping a different rank (#2765). A budget verdict or a failure
-/// crosses nothing. A run whose every probe was refused stalled where it started.
+/// crosses nothing. A run whose every probe was refused stalled where it started, and
+/// the guard published that start (#3219).
 fn stratum_run_end(
     outcome: &Result<Solution, BfgsError>,
     cost_stall_exit: &Mutex<Option<CostStallExit>>,
-    start_cost: f64,
 ) -> Option<(f64, usize)> {
     match outcome {
         Ok(solution) => Some((solution.final_value, solution.iterations)),
@@ -19,11 +19,6 @@ fn stratum_run_end(
                 .lock()
                 .ok()
                 .and_then(|slot| slot.as_ref().map(|exit| (exit.value, exit.iterations)))
-        }
-        Err(BfgsError::ObjectiveFailed { message })
-            if message.starts_with(PROBE_REFUSAL_FATAL_SENTINEL) =>
-        {
-            Some((start_cost, 0))
         }
         Err(_) => None,
     }
@@ -1939,7 +1934,6 @@ pub(crate) fn run_outer_with_plan(
                                 value_probe_cache: Vec::new(),
                                 cost_stall: Some(cost_stall_guard),
                                 cost_stall_bounds: Some((lo.clone(), hi.clone())),
-                                consecutive_probe_refusals: 0,
                                 accepted_steps: Arc::clone(&accepted_steps),
                                 pending_first_order: Vec::new(),
                                 incumbent: Some(OuterIncumbent {
@@ -2102,7 +2096,7 @@ pub(crate) fn run_outer_with_plan(
                         let outcome = optimizer.run();
                         drop(optimizer);
                         let probe = stratum_probe.lock().ok().and_then(|mut slot| slot.take());
-                        let run_end = stratum_run_end(&outcome, &cost_stall_exit, stratum_eval.cost);
+                        let run_end = stratum_run_end(&outcome, &cost_stall_exit);
                         let (Some(from_rank), Some(probe), Some((final_value, run_iterations))) =
                             (stratum_rank, probe, run_end)
                         else {
@@ -2315,21 +2309,6 @@ pub(crate) fn run_outer_with_plan(
                                      iterate ({context})"
                                 ))),
                             }
-                        }
-                        Err(BfgsError::ObjectiveFailed { message })
-                            if message.starts_with(PROBE_REFUSAL_FATAL_SENTINEL) =>
-                        {
-                            // The bridge's probe-refusal non-termination guard
-                            // (#NaN-outer-loop): every line-search cost probe at
-                            // this seed was infeasible, so BFGS would have spent
-                            // its entire max_iterations budget on inner solves
-                            // that all fail. Route as a seed rejection so the
-                            // cascade tries the next seed instead of propagating
-                            // a fatal error.
-                            Err(EstimationError::RemlOptimizationFailed(format!(
-                                "BFGS aborted: globally infeasible neighbourhood \
-                                 at seed (probe-refusal guard): {message}"
-                            )))
                         }
                         Err(BfgsError::ObjectiveFailed { message }) => {
                             Err(objective_failure_from_publication(

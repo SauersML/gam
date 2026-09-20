@@ -2785,9 +2785,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 steps: certified.certificate.steps,
             },
         )
-    } else if family.exact_newton_joint_hessian_beta_dependent()
-        && !family.inner_coefficient_objective_is_globally_convex()
-    {
+    } else if inner_objective_may_have_several_modes(family) {
         match anchored_continuation_seed(
             family,
             specs,
@@ -2839,6 +2837,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // re-solve on a surface that does not depend on the path taken, so the
     // fallback is the anchored mode: cold means CANONICAL, not arbitrary.
     let canonical_seed = initial_warm_cache.clone();
+    // gam#3173: the fit's fixed starts, the anchored mode and the caller's seed. Every evaluation
+    // also solves a mode from each and publishes the certified one with the lowest penalized
+    // objective (`evaluate_on_branch`). A family whose inner objective has one mode needs none.
+    let fixed_starts = fixed_mode_starts(
+        family,
+        [canonical_seed.clone(), persistent_warm_start.clone()],
+    );
     let problem = OuterProblem::new(n_rho)
         .with_stuck_stall_cold_reeval_signal(
             Arc::clone(&outer_force_cold),
@@ -2991,10 +2996,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // A value probe seeds nothing: only an accepted iterate's mode does (#2668).
         if matches!(order, OuterEvalOrder::Value) {
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
-            let warm_ref = if force_cold {
-                canonical_seed.as_ref()
+            let starts = if force_cold {
+                ModeStarts {
+                    incumbent: canonical_seed.as_ref(),
+                    fixed: &fixed_starts,
+                }
             } else {
-                outer.warm_start_for(rho)
+                outer.mode_starts_for(rho)
             };
             return match evaluate_on_branch(
                 family,
@@ -3002,7 +3010,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 &outer_options,
                 &label_layout,
                 rho,
-                warm_ref,
+                starts,
                 &rho_prior,
                 EvalMode::ValueOnly,
             ) {
@@ -3084,10 +3092,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // consumed by certified fit assembly. A failed analytic probe must not
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
-        let warm_ref = if force_cold {
-            canonical_seed.as_ref()
+        let starts = if force_cold {
+            ModeStarts {
+                incumbent: canonical_seed.as_ref(),
+                fixed: &fixed_starts,
+            }
         } else {
-            outer.warm_start_for(rho)
+            outer.mode_starts_for(rho)
         };
         let eval_result = match evaluate_on_branch(
             family,
@@ -3095,7 +3106,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &outer_options,
             &label_layout,
             rho,
-            warm_ref,
+            starts,
             &rho_prior,
             if request_hessian {
                 EvalMode::ValueGradientHessian
@@ -3226,7 +3237,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             force_cold,
             accepted_steps,
         )
-        .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule()),
+        .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule())
+        .with_fixed_starts(fixed_starts.clone()),
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Start from the incumbent's inner mode when there is one — a converged
             // inner solution gives a much better starting point. This was previously
@@ -3243,10 +3255,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer.adopt_accepted_steps();
             outer.last_criterion_rank = None;
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
-            let warm_ref = if force_cold {
-                canonical_seed.as_ref()
+            let starts = if force_cold {
+                ModeStarts {
+                    incumbent: canonical_seed.as_ref(),
+                    fixed: &fixed_starts,
+                }
             } else {
-                outer.warm_start_for(rho)
+                outer.mode_starts_for(rho)
             };
             match evaluate_on_branch(
                 family,
@@ -3254,7 +3269,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 &outer_options,
                 &label_layout,
                 rho,
-                warm_ref,
+                starts,
                 &rho_prior,
                 EvalMode::ValueOnly,
             ) {

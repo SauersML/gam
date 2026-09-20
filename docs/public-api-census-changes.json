@@ -4756,5 +4756,14 @@
     },
     "reason": "#3024 slice A: GpuDispatchPolicy::fused_kernel_min_n, twice the xtwx Gram's crossover borrowed as the survival row jet's and the Polya-Gamma batch's admission threshold, is deleted, and both kernels are admitted on their own measured executors (gam_gpu::row_kernel_race). The two public functions built on that threshold go with it: GpuRuntime::resolve_if_fused_batch_exceeds_floor (the pre-probe floor) and GpuDispatchPolicy::polya_gamma_batch_target_is_gpu (the PG predicate). draw_batch now decides through gam_gpu::decide_row_kernel.",
     "evidence": "public_api_census.py, run against this entry's base with the slice-A commit as head, reports exactly these two identities as removed (13600 public function declarations before and 13604 after at the gate base 15c6d195ef). git grep -w finds neither name under crates, src or tests at the head tree."
+  },
+  {
+    "base": "b7f57a0fd4754157b2068201f65d69b8ea35b192",
+    "removed": {
+      "crates/gam-custom-family/src/assembly.rs::outerobjectivegradienthessian_internal": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::outerobjectivegradienthessian_labeled": 1
+    },
+    "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
+    "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
   }
 ]

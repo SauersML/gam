@@ -1173,14 +1173,41 @@ fn manifest_const_string(source: &str, key: &str) -> std::io::Result<String> {
     ))
 }
 
+/// The gamfit release line: pyproject.toml's `[tool.gamfit] version`.
+///
+/// `[project]` declares its version dynamic, because the build backend
+/// (`scripts/gamfit_version.py`) derives each build's version from the commit
+/// it is built from, starting at this line (gam#3157). A `release:` commit
+/// sets it together with the two copies checked below.
 fn read_gamfit_project_version(manifest_dir: &Path) -> std::io::Result<String> {
     let path = manifest_dir.join("pyproject.toml");
     let content = fs::read_to_string(&path)?;
-    read_toml_version_line(&content).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "pyproject.toml is missing a top-level version",
-        )
+    toml_table_lines(&content, "tool.gamfit")
+        .find_map(|(_, line)| read_quoted_value_after_prefix(line.trim(), "version = "))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pyproject.toml has no [tool.gamfit] version (the gamfit release line)",
+            )
+        })
+}
+
+/// The lines of one `[table]` of a TOML file, with their indexes: from its
+/// header to the next table or array-of-tables header.
+fn toml_table_lines<'a>(
+    content: &'a str,
+    table: &str,
+) -> impl Iterator<Item = (usize, &'a str)> + use<'a> {
+    let header = format!("[{table}]");
+    let mut inside = false;
+    content.lines().enumerate().filter(move |(_, line)| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            inside = trimmed == header;
+            return false;
+        }
+        inside
     })
 }
 
@@ -1195,7 +1222,8 @@ fn scan_for_non_latest_gamfit_versions(
         latest,
         offenders,
     );
-    require_uv_lock_gamfit_version(root, latest, offenders);
+    require_dynamic_project_version(root, offenders);
+    require_uv_lock_gamfit_dynamic(root, offenders);
 
     visit_files(root, root, &mut |rel, content| {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -1249,66 +1277,99 @@ fn require_toml_version(
     ));
 }
 
-fn require_uv_lock_gamfit_version(
-    root: &Path,
-    latest: &str,
-    offenders: &mut Vec<(PathBuf, usize, String)>,
-) {
+/// `[project]` must list `version` in `dynamic` and must not set it: the build
+/// backend computes it, and PEP 621 forbids a backend to change a static field.
+fn require_dynamic_project_version(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+    let rel = Path::new("pyproject.toml");
+    let content = match fs::read_to_string(root.join(rel)) {
+        Ok(content) => content,
+        Err(_) => {
+            offenders.push((rel.to_path_buf(), 1, "missing pyproject.toml".to_string()));
+            return;
+        }
+    };
+    let mut dynamic = false;
+    for (idx, line) in toml_table_lines(&content, "project") {
+        let trimmed = line.trim();
+        if trimmed.starts_with("version =") {
+            offenders.push((
+                rel.to_path_buf(),
+                idx + 1,
+                format!("{line}  <- [project] version is derived by the build backend; list it in dynamic"),
+            ));
+        }
+        if trimmed.starts_with("dynamic =") && trimmed.contains("\"version\"") {
+            dynamic = true;
+        }
+    }
+    if !dynamic {
+        offenders.push((
+            rel.to_path_buf(),
+            1,
+            "[project] must declare dynamic = [\"version\"]: the build backend derives it".to_string(),
+        ));
+    }
+}
+
+/// uv.lock's own `gamfit` package, written the way uv writes a project whose
+/// version is dynamic: `name = "gamfit"` and `source = { editable = "." }` with
+/// no version line. `uv lock` on this tree writes exactly that (measured with
+/// uv 0.12.17, gam#3157), so a version line is a lock written while the
+/// version was static, and a relock is owed.
+fn require_uv_lock_gamfit_dynamic(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     let rel = Path::new("uv.lock");
     let content = match fs::read_to_string(root.join(rel)) {
         Ok(content) => content,
         Err(_) => {
-            offenders.push((
-                rel.to_path_buf(),
-                1,
-                format!("missing uv.lock gamfit package; expected {latest}"),
-            ));
+            offenders.push((rel.to_path_buf(), 1, "missing uv.lock".to_string()));
             return;
         }
     };
 
     let mut inside_package = false;
-    let mut inside_gamfit = false;
+    let mut gamfit_line = None;
+    let mut editable_root = false;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "[[package]]" {
-            inside_package = true;
-            inside_gamfit = false;
+        if trimmed.starts_with('[') {
+            // The entry's own keys come before its first sub-table header.
+            if gamfit_line.is_some() {
+                break;
+            }
+            inside_package = trimmed == "[[package]]";
             continue;
         }
         if !inside_package {
             continue;
         }
-        if trimmed == "name = \"gamfit\"" {
-            inside_gamfit = true;
+        if gamfit_line.is_none() {
+            if trimmed == "name = \"gamfit\"" {
+                gamfit_line = Some(idx);
+            }
             continue;
         }
-        if inside_gamfit && trimmed.starts_with("version = ") {
-            match read_quoted_value_after_prefix(trimmed, "version = ") {
-                Some(version) if version == latest => return,
-                Some(_) | None => {
-                    offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
-                    return;
-                }
-            }
+        if trimmed.starts_with("version =") {
+            offenders.push((
+                rel.to_path_buf(),
+                idx + 1,
+                format!("{line}  <- gamfit's version is dynamic; relock with `uv lock`"),
+            ));
+        }
+        if trimmed == "source = { editable = \".\" }" {
+            editable_root = true;
         }
     }
 
-    offenders.push((
-        rel.to_path_buf(),
-        1,
-        format!("missing gamfit package version; expected {latest}"),
-    ));
-}
-
-fn read_toml_version_line(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(version) = read_quoted_value_after_prefix(trimmed, "version = ") {
-            return Some(version.to_string());
-        }
+    match gamfit_line {
+        None => offenders.push((rel.to_path_buf(), 1, "no gamfit package in uv.lock".to_string())),
+        Some(idx) if !editable_root => offenders.push((
+            rel.to_path_buf(),
+            idx + 1,
+            "uv.lock's gamfit package is not the editable project root (source = { editable = \".\" })"
+                .to_string(),
+        )),
+        Some(_) => {}
     }
-    None
 }
 
 fn read_quoted_value_after_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
