@@ -2422,6 +2422,48 @@ pub(crate) fn a_workspace_family_materializes_its_declared_curvature_once_per_fi
     );
 }
 
+/// gam#3002: a family that does not fingerprint its likelihood data cannot key
+/// a persistent warm-start record, so a configured store is refused by name
+/// instead of being silently dropped into a cold fit. The refusal comes from
+/// the key, before the store is opened, so the root is never touched.
+#[test]
+pub(crate) fn a_configured_store_is_refused_by_a_family_without_a_fingerprint_3002() {
+    let family = declared_dense_quartic_family(false, false, JointHessianSourcePreference::Dense);
+    let specs = declared_dense_quartic_specs();
+    assert!(
+        family
+            .persistent_warm_start_fingerprint(&specs, &declared_dense_quartic_options())
+            .is_none(),
+        "the quartic test family must inherit the no-fingerprint default for this to pin anything",
+    );
+    let root = std::env::temp_dir().join(format!(
+        "gam-3002-unopened-warm-start-root-{}",
+        std::process::id()
+    ));
+    let options = BlockwiseFitOptions {
+        persistent_warm_start_store: Some(gam_solve::persistent_warm_start::configured_store(
+            root.clone(),
+        )),
+        ..declared_dense_quartic_options()
+    };
+    let refused = fit_custom_family(&family, &specs, &options)
+        .expect_err("a store the family cannot key must be refused, not ignored");
+    let message = refused.to_string();
+    assert!(
+        message.contains("DeclaredDenseQuarticWorkspaceFamily")
+            && message.contains("does not fingerprint"),
+        "the refusal must name the family and the missing fingerprint: {message}",
+    );
+    assert!(
+        !root.exists(),
+        "the refusal must come before the store is opened",
+    );
+
+    // The same fit without the store certifies: the store alone was refused.
+    fit_custom_family(&family, &specs, &declared_dense_quartic_options())
+        .expect("the quartic REML fit without a store must certify");
+}
+
 /// #979, gam#1088: a NaN only in the declared curvature of a workspace-source family is
 /// refused, with the canonical message, by both fit entries.
 #[test]
@@ -2916,6 +2958,7 @@ pub(crate) fn workspace_first_order_terms_are_single_authority_without_direct_re
         None,
         true,
         Some(Arc::new(AuthoritativeWorkspace)),
+        &JeffreysPsiWorkspace::Likelihood,
     )
     .expect("workspace-owned first-order coordinate");
 
@@ -3074,6 +3117,7 @@ pub(crate) fn jeffreys_psi_mixed_geometry_preserves_workspace_authority() {
         None,
         false,
         Some(Arc::new(workspace)),
+        &JeffreysPsiWorkspace::Likelihood,
     )
     .expect("one coherent workspace-owned Jeffreys psi coordinate");
 
@@ -3301,6 +3345,7 @@ pub(crate) fn contracted_explicit_jeffreys_psi_route_matches_materialized_route_
             None,
             false,
             Some(Arc::new(workspace)),
+            &JeffreysPsiWorkspace::Likelihood,
         )
         .expect("explicit-psi Jeffreys coordinates");
         (
@@ -3376,6 +3421,344 @@ pub(crate) fn contracted_explicit_jeffreys_psi_route_matches_materialized_route_
             drift_gap <= 1e-10 * drift_scale,
             "psi axis {psi}: contracted drift differs by {drift_gap:e} (max {drift_scale:e})"
         );
+    }
+}
+
+/// gam#4313: `Φ = ½ log|Z_Jᵀ H_info Z_J|₊` is priced on the full-data information, so its
+/// explicit ψ derivatives read the full-data ψ motion of `H_info` even when the likelihood ψ
+/// workspace reads an outer score subsample. The likelihood ψ terms stay subsampled.
+#[test]
+pub(crate) fn subsampled_likelihood_keeps_full_data_jeffreys_psi_motion_4313() {
+    const P: usize = 3;
+    const PSI: usize = 2;
+
+    fn symmetric(seed: f64) -> Array2<f64> {
+        let raw = Array2::from_shape_fn((P, P), |(i, j)| {
+            (seed + 0.37 * i as f64 - 0.19 * j as f64).sin()
+                + 0.5 * ((i + j) as f64 * seed).cos()
+        });
+        (&raw + &raw.t()).mapv(|value| 0.5 * value)
+    }
+    fn information() -> Array2<f64> {
+        array![[30.0, 1.0, 0.2], [1.0, 12.0, 0.1], [0.2, 0.1, 0.5]]
+    }
+    // Full-data `∂_ψH_info`, `∂_ψ∂_ψH_info` and `∂_ψ D_βH_info[e_a]`.
+    fn first(psi: usize) -> Array2<f64> {
+        symmetric(7.0 + 2.0 * psi as f64)
+    }
+    fn second(psi_i: usize, psi_j: usize) -> Array2<f64> {
+        symmetric(40.0 + (psi_i + psi_j) as f64).mapv(|value| 0.5 * value)
+    }
+    fn axis_tensor(psi: usize, axis: usize) -> Array2<f64> {
+        symmetric(20.0 + 3.0 * psi as f64 + 1.7 * axis as f64)
+    }
+
+    /// The same ψ calculus on every row (`subsampled == false`) or a reweighted subsample
+    /// whose Hessian motion differs from the full-data one.
+    struct RowPsi {
+        subsampled: bool,
+    }
+
+    impl RowPsi {
+        fn reweight(&self, full: Array2<f64>, seed: f64) -> Array2<f64> {
+            if self.subsampled {
+                full.mapv(|value| 0.6 * value) + symmetric(seed).mapv(|value| 0.3 * value)
+            } else {
+                full
+            }
+        }
+    }
+
+    impl ExactNewtonJointPsiWorkspace for RowPsi {
+        fn first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+            Ok(Some(
+                (0..PSI)
+                    .map(|psi| {
+                        let mut terms = ExactNewtonJointPsiTerms::zeros(P);
+                        terms.hessian_psi = self.reweight(first(psi), 50.0 + psi as f64);
+                        if self.subsampled {
+                            terms.objective_psi = 1.25 + psi as f64;
+                            terms.score_psi = array![0.1, -0.2, 0.3].mapv(|v| v * (psi + 1) as f64);
+                        }
+                        terms
+                    })
+                    .collect(),
+            ))
+        }
+
+        fn second_order_terms(
+            &self,
+            psi_i: usize,
+            psi_j: usize,
+        ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+            assert!(psi_i < PSI && psi_j < PSI);
+            Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+                objective_psi_psi: if self.subsampled { 0.7 } else { 0.0 },
+                score_psi_psi: Array1::zeros(P),
+                hessian_psi_psi: self.reweight(second(psi_i, psi_j), 70.0 + (psi_i + psi_j) as f64),
+                hessian_psi_psi_operator: None,
+            }))
+        }
+
+        fn hessian_directional_derivative(
+            &self,
+            psi_index: usize,
+            direction: &Array1<f64>,
+        ) -> Result<Option<DriftDerivResult>, String> {
+            assert!(psi_index < PSI);
+            let mut derivative = Array2::<f64>::zeros((P, P));
+            for (axis, &weight) in direction.iter().enumerate() {
+                derivative.scaled_add(
+                    weight,
+                    &self.reweight(axis_tensor(psi_index, axis), 90.0 + axis as f64),
+                );
+            }
+            Ok(Some(DriftDerivResult::Dense(derivative)))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FullDataJeffreysFamily;
+
+    impl CustomFamily for FullDataJeffreysFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            assert_states_finite(block_states, "full-data Jeffreys family evaluate");
+            Ok(FamilyEvaluation {
+                log_likelihood: 0.0,
+                blockworking_sets: Vec::new(),
+            })
+        }
+
+        fn joint_jeffreys_term_required(&self) -> bool {
+            true
+        }
+
+        fn joint_jeffreys_information_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_states_finite(block_states, "full-data Jeffreys information");
+            assert_specs_consistent(specs, "full-data Jeffreys information");
+            Ok(Some(information()))
+        }
+
+        fn joint_jeffreys_information_directional_derivative_with_specs(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            direction: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert_states_finite(block_states, "full-data Jeffreys information drift");
+            assert_specs_consistent(specs, "full-data Jeffreys information drift");
+            let mut derivative = Array2::<f64>::zeros((P, P));
+            for (axis, &weight) in direction.iter().enumerate() {
+                derivative.scaled_add(weight, &symmetric(1.0 + axis as f64));
+            }
+            Ok(Some(derivative))
+        }
+
+        fn exact_newton_joint_psi_workspace(
+            &self,
+            block_states: &[ParameterBlockState],
+            specs: &[ParameterBlockSpec],
+            hyper_layout: &CustomFamilyHyperLayout,
+        ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+            assert_states_finite(block_states, "full-data Jeffreys psi workspace");
+            assert_specs_consistent(specs, "full-data Jeffreys psi workspace");
+            assert_eq!(hyper_layout.len(), PSI);
+            Ok(Some(Arc::new(RowPsi { subsampled: false })))
+        }
+    }
+
+    let family = FullDataJeffreysFamily;
+    let spec = ParameterBlockSpec {
+        name: "full-data-jeffreys".to_string(),
+        design: DesignMatrix::from(array![[1.0, 0.5, -0.25]]),
+        offset: array![0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let specs = vec![spec];
+    let beta = array![0.2, -0.1, 0.3];
+    let states = vec![ParameterBlockState {
+        eta: array![0.075],
+        beta: beta.clone(),
+    }];
+    let layout = Arc::new(
+        CustomFamilyHyperLayout::new(vec![Vec::new()], vec![0, 1], array![0.0, 0.0])
+            .expect("two explicit family axes"),
+    );
+    let subsampled: Arc<dyn ExactNewtonJointPsiWorkspace> = Arc::new(RowPsi { subsampled: true });
+    let full_data: Arc<dyn ExactNewtonJointPsiWorkspace> = Arc::new(RowPsi { subsampled: false });
+
+    // The evaluation routes Φ to the full-data rows exactly when the likelihood is subsampled.
+    let full_options = BlockwiseFitOptions::default();
+    let subsample_options = BlockwiseFitOptions {
+        outer_score_subsample: Some(Arc::new(
+            gam_model_api::OuterScoreSubsample::from_uniform_inclusion_mask(vec![0], 2, 4313),
+        )),
+        ..BlockwiseFitOptions::default()
+    };
+    let route = |options: &BlockwiseFitOptions| {
+        JeffreysPsiWorkspace::for_evaluation(
+            &family,
+            &states,
+            &specs,
+            &layout,
+            options,
+            Some(&subsampled),
+        )
+        .expect("Jeffreys psi workspace route")
+    };
+    assert!(matches!(route(&full_options), JeffreysPsiWorkspace::Likelihood));
+    let routed = route(&subsample_options);
+    assert!(matches!(routed, JeffreysPsiWorkspace::FullData(Some(_))));
+
+    let coords_with = |likelihood: &Arc<dyn ExactNewtonJointPsiWorkspace>,
+                       jeffreys: &JeffreysPsiWorkspace| {
+        build_psi_hyper_coords(
+            &family,
+            &states,
+            &specs,
+            &layout,
+            &beta,
+            &[],
+            &[0],
+            None,
+            false,
+            Some(Arc::clone(likelihood)),
+            jeffreys,
+        )
+        .expect("explicit-psi Jeffreys coordinates")
+    };
+    let candidate = coords_with(&subsampled, &routed);
+    let reference = coords_with(&full_data, &JeffreysPsiWorkspace::Likelihood);
+    let pre_fix = coords_with(&subsampled, &JeffreysPsiWorkspace::Likelihood);
+    let likelihood_terms = subsampled
+        .first_order_terms_all()
+        .expect("subsampled terms")
+        .expect("subsampled terms present");
+
+    let z = build_joint_jeffreys_subspace(&family, &specs, &block_param_ranges(&specs))
+        .expect("Jeffreys span")
+        .expect("Jeffreys span present");
+    let phi = |h: &Array2<f64>| {
+        gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(h.view(), z.view())
+            .expect("Jeffreys plan")
+            .value()
+    };
+    let step = 1e-4;
+    let max_abs = |values: &Array2<f64>| values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+
+    for psi in 0..PSI {
+        // The likelihood ψ terms keep the subsample; the Jeffreys part is the full-data one.
+        let jeffreys_value = candidate[psi].a - likelihood_terms[psi].objective_psi;
+        assert!(
+            (jeffreys_value - reference[psi].a).abs() <= 1e-12 * reference[psi].a.abs().max(1.0),
+            "psi axis {psi}: Jeffreys value derivative {jeffreys_value} against full-data {}",
+            reference[psi].a
+        );
+        let fd = -(phi(&(information() + first(psi).mapv(|v| v * step)))
+            - phi(&(information() - first(psi).mapv(|v| v * step))))
+            / (2.0 * step);
+        assert!(
+            (reference[psi].a - fd).abs() <= 1e-6 * fd.abs().max(1.0),
+            "psi axis {psi}: -dPhi/dpsi {} against central difference {fd}",
+            reference[psi].a
+        );
+        let pre_fix_value = pre_fix[psi].a - likelihood_terms[psi].objective_psi;
+        assert!(
+            (pre_fix_value - fd).abs() > 1e-3 * fd.abs().max(1.0),
+            "psi axis {psi}: the fixture must separate subsampled from full-data Jeffreys motion"
+        );
+
+        let jeffreys_score = &candidate[psi].g - &likelihood_terms[psi].score_psi;
+        let score_gap = (&jeffreys_score - &reference[psi].g)
+            .iter()
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let score_scale = reference[psi].g.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(score_scale > 1e-8, "psi axis {psi}: Jeffreys score correction not exercised");
+        assert!(
+            score_gap <= 1e-10 * score_scale,
+            "psi axis {psi}: Jeffreys score differs by {score_gap:e} (max {score_scale:e})"
+        );
+
+        let candidate_drift = candidate[psi].drift.dense.as_ref().expect("candidate drift")
+            - &likelihood_terms[psi].hessian_psi;
+        let reference_drift = reference[psi].drift.dense.as_ref().expect("reference drift")
+            - &first(psi);
+        let drift_scale = max_abs(&reference_drift);
+        assert!(drift_scale > 1e-8, "psi axis {psi}: Jeffreys curvature drift not exercised");
+        assert!(
+            max_abs(&(&candidate_drift - &reference_drift)) <= 1e-10 * drift_scale,
+            "psi axis {psi}: Jeffreys curvature drift differs from the full-data one"
+        );
+    }
+
+    // ψψ: the pair value carries the subsampled likelihood `V_ij` and the full-data `−∂²Φ`.
+    let pairs_with = |likelihood: &Arc<dyn ExactNewtonJointPsiWorkspace>,
+                      jeffreys: JeffreysPsiWorkspace| {
+        build_psi_pair_callbacks(
+            &family,
+            &states,
+            &specs,
+            Arc::clone(&layout),
+            &beta,
+            &[],
+            &[0],
+            None,
+            Some(Arc::clone(likelihood)),
+            jeffreys,
+            Some((z.clone(), information())),
+            None,
+        )
+        .expect("psi pair callbacks")
+        .0
+    };
+    let candidate_pairs = pairs_with(&subsampled, routed.clone());
+    let reference_pairs = pairs_with(&full_data, JeffreysPsiWorkspace::Likelihood);
+    let information_at = |psi: [f64; PSI]| {
+        let mut h = information();
+        for k in 0..PSI {
+            h.scaled_add(psi[k], &first(k));
+            for l in 0..PSI {
+                h.scaled_add(0.5 * psi[k] * psi[l], &second(k, l));
+            }
+        }
+        h
+    };
+    for psi_i in 0..PSI {
+        for psi_j in 0..PSI {
+            let candidate_a = candidate_pairs(psi_i, psi_j).expect("candidate pair").a - 0.7;
+            let reference_a = reference_pairs(psi_i, psi_j).expect("reference pair").a;
+            assert!(
+                (candidate_a - reference_a).abs() <= 1e-12 * reference_a.abs().max(1.0),
+                "psi pair ({psi_i}, {psi_j}): Jeffreys value {candidate_a} against full-data \
+                 {reference_a}"
+            );
+            let at = |si: f64, sj: f64| {
+                let mut psi = [0.0; PSI];
+                psi[psi_i] += si * step;
+                psi[psi_j] += sj * step;
+                phi(&information_at(psi))
+            };
+            let fd = -(at(1.0, 1.0) - at(1.0, -1.0) - at(-1.0, 1.0) + at(-1.0, -1.0))
+                / (4.0 * step * step);
+            assert!(
+                (reference_a - fd).abs() <= 1e-4 * fd.abs().max(1.0),
+                "psi pair ({psi_i}, {psi_j}): -d2Phi {reference_a} against central difference {fd}"
+            );
+        }
     }
 }
 
@@ -3551,6 +3934,7 @@ pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tab
         &[0],
         None,
         Some(Arc::new(PartialContractedPsiWorkspace)),
+        JeffreysPsiWorkspace::Likelihood,
         None,
         None,
     )
@@ -3636,6 +4020,7 @@ pub(crate) fn contracted_psi_hook_rejects_wrong_score_width_before_installing_op
         &[0],
         None,
         Some(Arc::new(WrongScoreWidthPsiWorkspace)),
+        JeffreysPsiWorkspace::Likelihood,
         None,
         None,
     ) {
