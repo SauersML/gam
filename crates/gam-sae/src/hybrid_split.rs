@@ -964,52 +964,83 @@ fn build_collapse_rescue_linear_image(
     if !(w_sum > 0.0) {
         return None;
     }
-    // Top mass-weighted output direction `v` of the residual via power iteration on
-    // `M = Σᵢ wᵢ yᵢyᵢᵀ` (p×p, never materialized): `v ← normalize(Σᵢ wᵢ yᵢ (yᵢ·v))`.
-    // Seed from the per-channel weighted energy so a rank-1 residual converges in
-    // one step and the seed is deterministic (no RNG).
-    let mut v = Array1::<f64>::zeros(p);
-    for j in 0..p {
+    // Top mass-weighted output direction `v` of the residual: the leading
+    // eigenvector of `M = Σᵢ wᵢ yᵢyᵢᵀ` (p×p, never materialized), certified by
+    // the full-reorthogonalization extreme Lanczos solve. Its step budget
+    // `min(p, n)` is exact, not a guess: `rank M ≤ min(p, n)`, so the Krylov
+    // space cannot grow past it, and a solve that does not certify within it
+    // errors, which refuses the rescue instead of persisting an unconverged
+    // direction. The start vector is the per-channel weighted energy, so the
+    // seed is deterministic (no RNG) and a rank-1 residual is exhausted in one
+    // step. `trace M = Σⱼ energyⱼ` is exact from that seed.
+    let apply_m = |x: &[f64], out: &mut [f64]| {
+        out.fill(0.0);
+        for i in 0..n {
+            let a = assign[i];
+            let mut proj = 0.0_f64;
+            for j in 0..p {
+                proj += target_resid[[i, j]] * x[j];
+            }
+            let wp = a * a * proj;
+            for j in 0..p {
+                out[j] += wp * target_resid[[i, j]];
+            }
+        }
+    };
+    let mut seed = vec![0.0_f64; p];
+    for (j, slot) in seed.iter_mut().enumerate() {
         let mut e = 0.0_f64;
         for i in 0..n {
             let a = assign[i];
             let y = target_resid[[i, j]];
             e += a * a * y * y;
         }
-        v[j] = e;
+        *slot = e;
     }
-    let mut vnorm = v.dot(&v).sqrt();
-    if !(vnorm > 0.0) {
+    let trace = seed.iter().sum::<f64>();
+    let seed_norm = seed.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if !(trace > 0.0 && trace.is_finite() && seed_norm > 0.0) {
         return None;
     }
-    v.mapv_inplace(|x| x / vnorm);
-    for _ in 0..32 {
-        let mut mv = Array1::<f64>::zeros(p);
-        for i in 0..n {
-            let a = assign[i];
-            let w = a * a;
-            let mut proj = 0.0_f64;
-            for j in 0..p {
-                proj += target_resid[[i, j]] * v[j];
-            }
-            let wp = w * proj;
-            for j in 0..p {
-                mv[j] += wp * target_resid[[i, j]];
-            }
-        }
-        vnorm = mv.dot(&mv).sqrt();
-        if !(vnorm > 0.0) {
-            return None;
-        }
-        mv.mapv_inplace(|x| x / vnorm);
-        let cos = mv.dot(&v).abs();
-        v = mv;
-        // Two unit vectors whose dot product sits inside its own rounding band
-        // `γ_p` of 1 are the same direction to working precision.
-        if 1.0 - cos <= gam_linalg::roundoff::accumulation_growth(p) {
-            break;
-        }
+    // Normalize the operator by the seed's Rayleigh quotient `ρ₀ ≤ λ₁`, so the
+    // solver's `max(|λ|, 1)` residual scale is `λ₁/ρ₀ ≥ 1` itself: the residual
+    // certificate is then relative to `λ₁` whatever the residual's units.
+    let mut m_seed = vec![0.0_f64; p];
+    apply_m(&seed, &mut m_seed);
+    let rho0 = seed.iter().zip(&m_seed).map(|(s, m)| s * m).sum::<f64>()
+        / (seed_norm * seed_norm);
+    if !(rho0 > 0.0 && rho0.is_finite()) {
+        return None;
     }
+    let pairs = gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs(
+        p,
+        &seed,
+        gam_linalg::lanczos::SymmetricExtremeLanczosOptions {
+            target_rank: 1,
+            max_steps: p.min(n),
+            check_every: 10usize.min((p / 10).max(1)),
+            relative_residual_tol: f64::EPSILON.sqrt(),
+            breakdown_tol: f64::EPSILON * trace / rho0,
+        },
+        |x, out| {
+            apply_m(x, out);
+            for value in out.iter_mut() {
+                *value /= rho0;
+            }
+            Ok(())
+        },
+    )
+    .ok()?;
+    let mut v = pairs.eigenvectors.column(0).to_owned();
+    let vnorm = v.dot(&v).sqrt();
+    if !(vnorm > 0.0 && vnorm.is_finite()) {
+        return None;
+    }
+    // The eigenvector's sign is a gauge; orient it along the non-negative
+    // energy seed so the persisted direction is deterministic.
+    let orientation = v.iter().zip(&seed).map(|(a, b)| a * b).sum::<f64>();
+    let sign = if orientation < 0.0 { -1.0 } else { 1.0 };
+    v.mapv_inplace(|x| sign * x / vnorm);
     // Fresh per-row codes `uᵢ = yᵢ·v` and the weighted line fit against them.
     let mut u = Array1::<f64>::zeros(n);
     let mut t_bar = 0.0_f64;
