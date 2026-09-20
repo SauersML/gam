@@ -3754,7 +3754,7 @@ pub fn residual_cascade_fast_path(
 }
 
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
-fn family_requests_transformation_normal(family: Option<&str>) -> bool {
+pub(crate) fn family_requests_transformation_normal(family: Option<&str>) -> bool {
     family
         .map(|name| name.trim().to_ascii_lowercase().replace('_', "-"))
         .as_deref()
