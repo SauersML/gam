@@ -4775,13 +4775,13 @@
     "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
   },
   {
-    "base": "9584180fcf1f9629ba9de2606a906df22af1a178",
+    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
     "removed": {
       "crates/gam-sae/src/manifold/certificate.rs::curved_dictionary_global_optimality_verdict": 1,
       "crates/gam-sae/src/manifold/certificate.rs::is_certified": 1,
       "crates/gam-sae/src/manifold/certificate.rs::margin": 1
     },
     "reason": "#2946 census T1/C1: curved_dictionary_global_optimality_verdict was the decision rule of GlobalOptimalityVerdict::CertifiedGlobal, which published 'unique global optimum' from the underived sufficient condition mu_hat <= c0*a^2*(1-1/SNR)*(1-C_kappa*kappa)/K with the chosen constants c0 = 1.0 and C_kappa = 0.125; margin and is_certified were that verdict's accessors. SPEC: 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' The verdict is deleted; its measured inputs survive as DictionaryIncoherenceReport (mu_hat, per_atom_kappa_hat, peak_activity_floor, snr_proxy).",
-    "evidence": "At base 9584180fcf public_api_census.py reports exactly these 3 identities. At head git grep -w finds no occurrence of curved_dictionary_global_optimality_verdict or GlobalOptimalityVerdict outside CHANGELOG.md and the ledgers; the remaining is_certified/margin names belong to other types (Verdict::is_certified and others) and are untouched. The Python dict keys global_optimality, global_optimality_certified and global_optimality_margin had no Python reader. cargo check --workspace --tests rc 0."
+    "evidence": "At base 5834fb219d public_api_census.py reports exactly these 3 identities. At head git grep -w finds no occurrence of curved_dictionary_global_optimality_verdict or GlobalOptimalityVerdict outside CHANGELOG.md and the ledgers; the remaining is_certified/margin names belong to other types (Verdict::is_certified and others) and are untouched. The Python dict keys global_optimality, global_optimality_certified and global_optimality_margin had no Python reader. cargo check --workspace --tests rc 0."
   }
 ]
