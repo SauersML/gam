@@ -37,6 +37,7 @@
 //! Every experiment falls on one side of the same G2 split, and observed rows
 //! taken across the fence are refused.
 
+use gam_linalg::utils::splitmix64_hash;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -385,19 +386,12 @@ impl fmt::Display for InterventionCalibrationError {
 
 impl std::error::Error for InterventionCalibrationError {}
 
-/// SplitMix64 — the split's hash. A fixed, well-known mixing function so the
-/// group→side assignment is reproducible across languages and releases.
-#[inline]
-fn splitmix64(x: u64) -> u64 {
-    gam_linalg::utils::splitmix64_hash(x)
-}
-
 /// The G2 per-group predicate: group `g` is eval-forever under a split whose
 /// seed hashes to `seed_mix` iff `splitmix64(g ^ seed_mix)` is odd. The single
 /// place the split's membership is decided, called by [`eval_forever_mask`].
 #[inline]
 fn group_is_eval_forever(g: i64, seed_mix: u64) -> bool {
-    splitmix64((g as u64) ^ seed_mix) & 1 == 1
+    splitmix64_hash((g as u64) ^ seed_mix) & 1 == 1
 }
 
 /// Per-record eval-forever mask: `mask[i]` is true iff record `i`'s `group[i]`
@@ -408,7 +402,7 @@ fn group_is_eval_forever(g: i64, seed_mix: u64) -> bool {
 /// any future Python or CLI surface must call through here rather than
 /// reimplement the SplitMix64 split.
 pub fn eval_forever_mask(group: &[i64], seed: u64) -> Vec<bool> {
-    let seed_mix = splitmix64(seed);
+    let seed_mix = splitmix64_hash(seed);
     group
         .iter()
         .map(|&g| group_is_eval_forever(g, seed_mix))
@@ -891,7 +885,7 @@ impl GaussianLoadingLaw {
             }
             orthonormal_frames.push(orthonormal);
         }
-        let mut state = splitmix64(key.seed ^ splitmix64(key.stream));
+        let mut state = splitmix64_hash(key.seed ^ splitmix64_hash(key.stream));
         let mut next =
             || standard_normal_from_uniform_bits(gam_linalg::utils::splitmix64(&mut state));
         let z = std::iter::repeat_with(&mut next)
@@ -1658,7 +1652,7 @@ impl InterventionExperimentPlan {
             }
         }
         let has_forward_path = forward_path.as_ref().is_some_and(|path| !path.is_empty());
-        let seed_mix = splitmix64(split_seed);
+        let seed_mix = splitmix64_hash(split_seed);
         let mut law_arms = BTreeSet::new();
         for (index, experiment) in experiments.iter().enumerate() {
             validate_experiment(
@@ -1700,7 +1694,7 @@ impl InterventionExperimentPlan {
     /// Indices of the experiments on `side` of the permanent split, in plan order.
     /// Membership is [`eval_forever_mask`]'s predicate on the unit's group.
     pub fn experiments_on(&self, side: SplitSide) -> Vec<usize> {
-        let seed_mix = splitmix64(self.split_seed);
+        let seed_mix = splitmix64_hash(self.split_seed);
         let want_eval = side == SplitSide::EvalForever;
         (0..self.experiments.len())
             .filter(|&index| {
@@ -2350,8 +2344,8 @@ mod tests {
     fn splitmix_reference_values_pin_the_cross_language_contract() {
         // A change here moves permanent train/eval membership and is a
         // calibration-contract break, not a refactor.
-        assert_eq!(splitmix64(0), 0xE220_A839_7B1D_CDAF);
-        assert_eq!(splitmix64(1), 0x910A_2DEC_8902_5CC1);
+        assert_eq!(splitmix64_hash(0), 0xE220_A839_7B1D_CDAF);
+        assert_eq!(splitmix64_hash(1), 0x910A_2DEC_8902_5CC1);
     }
 
     fn group_on_side(seed: u64, eval: bool) -> i64 {

@@ -4894,5 +4894,14 @@
     },
     "reason": "#3604: dead posterior_eta_bands path deleted; draw_bands_from_matrices is the single posterior-band reducer.",
     "evidence": "No caller of eta_bands_from_matrix_link remains in the workspace."
+  },
+  {
+    "base": "a022dd5e672406ab853e3d4a4ca508be0705067a",
+    "removed": {
+      "crates/gam-sae/examples/common/mod.rs::splitmix64": 1,
+      "crates/gam-sae/src/manifold/support_seed.rs::splitmix64": 1
+    },
+    "reason": "#4454: two wrappers that only forwarded to gam_linalg::utils::splitmix64 under a local name are deleted; callers call the canonical SplitMix64 directly (single source of truth).",
+    "evidence": "https://github.com/SauersML/gam/issues/4454: examples/common/mod.rs held only the wrapper and is deleted with the three `mod common;` declarations in scale_k, tiered_gpu_scale and tiered_k2000_measure; the two call sites inside support_seed.rs now call gam_linalg::utils::splitmix64_hash (the wrapper had no caller outside that file); git grep finds no remaining caller of the removed paths."
   }
 ]

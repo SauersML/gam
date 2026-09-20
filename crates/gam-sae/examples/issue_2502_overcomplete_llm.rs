@@ -33,6 +33,7 @@
 //! convergence; `--resume` continues a stream from such a checkpoint, bit for bit, with the
 //! same configuration.
 
+use gam_linalg::utils::splitmix64;
 use gam_sae::sparse_dict::{
     BlockSparseConfig, BlockSparseStreamState, block_sparse_dictionary_transform,
     coordinate_partition_frames, reconstruct_block_sparse_rows,
@@ -327,15 +328,6 @@ enum SeedPolicy {
     Rows,
 }
 
-/// splitmix64, so the row seed is reproducible without an RNG dependency.
-fn splitmix64_next(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
 /// `G` blocks of `b` orthonormal rows, each block grown from `b` distinct centred
 /// training rows by modified Gram-Schmidt. A block whose rows are degenerate
 /// (a zero row, or rows that collapse) keeps the coordinate-partition frame for
@@ -355,7 +347,7 @@ fn row_sample_frames(
     for block in 0..g {
         let mut rows: Vec<Vec<f32>> = Vec::with_capacity(b);
         for _ in 0..b {
-            let idx = (splitmix64_next(&mut state) % n_train as u64) as usize;
+            let idx = (splitmix64(&mut state) % n_train as u64) as usize;
             train.read_into(idx, scratch.view_mut(), Some(centre));
             rows.push(scratch.row(0).to_vec());
         }

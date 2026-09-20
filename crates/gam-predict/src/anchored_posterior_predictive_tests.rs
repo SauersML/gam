@@ -24,6 +24,7 @@ use crate::test_support::init_parallelism;
 use crate::{FittedModelPredictExt, PosteriorMeanOptions, PredictInput, PredictableModel};
 use gam_data::encode_recordswith_inferred_schema;
 use gam_linalg::faer_ndarray::FaerEigh;
+use gam_linalg::utils::splitmix64;
 use gam_math::probability::normal_cdf;
 use gam_models::bms::{EmpiricalZGrid, LatentMeasureKind};
 use gam_models::fit_orchestration::FitConfig;
@@ -37,12 +38,8 @@ use std::collections::HashMap;
 
 const MC_DRAWS: usize = 100_000;
 
-fn splitmix(state: &mut u64) -> u64 {
-    gam_linalg::utils::splitmix64(state)
-}
-
 pub(crate) fn uniform(state: &mut u64) -> f64 {
-    (splitmix(state) >> 11) as f64 / (1u64 << 53) as f64
+    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 pub(crate) fn gaussian(state: &mut u64) -> f64 {

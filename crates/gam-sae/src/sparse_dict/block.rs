@@ -47,6 +47,7 @@
 //! block-tiled exactly as the atom lane tiles columns.
 
 use super::scoring::TopSSelector;
+use gam_linalg::utils::splitmix64_hash;
 use gam_math::roundoff::gram_schmidt_residual_band;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
@@ -1661,7 +1662,7 @@ pub fn coordinate_partition_frames(n_blocks: usize, b: usize, p: usize) -> Array
     for block in 0..n_blocks {
         let mut used: Vec<usize> = Vec::with_capacity(b);
         for axis in 0..b {
-            state = splitmix64_block(state ^ block as u64 ^ ((axis as u64) << 32));
+            state = splitmix64_hash(state ^ block as u64 ^ ((axis as u64) << 32));
             let mut coord = (state as usize) % p;
             while used.contains(&coord) {
                 coord = (coord + 1) % p;
@@ -1807,16 +1808,6 @@ pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize)
         }
     }
     decoder
-}
-
-/// splitmix64 mixing step for the deterministic coordinate seed. A local copy so
-/// the seed stream is self-contained and does not depend on any RNG crate.
-fn splitmix64_block(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 /// Choose the initial block dictionary per [`BlockSeedPolicy`].

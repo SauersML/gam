@@ -52,6 +52,7 @@
 //! and a caller-owned seed.
 
 use super::*;
+use gam_linalg::utils::splitmix64_hash;
 
 /// Caller-owned cross-fitting resolution.
 #[derive(Debug, Clone, Copy)]
@@ -89,7 +90,7 @@ impl KFoldAssignment {
         // of hash collisions, so no fold is ever starved.
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&row| {
-            splitmix64(seed ^ (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            splitmix64_hash(seed ^ (row as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
         });
         let mut fold_of_row = vec![0usize; n];
         for (rank, &row) in order.iter().enumerate() {
@@ -111,12 +112,6 @@ impl KFoldAssignment {
             .filter(|&row| self.fold_of_row[row] != fold)
             .collect()
     }
-}
-
-/// splitmix64 — a tiny deterministic finalizer, used only for reproducible fold
-/// assignment (never for statistical sampling).
-fn splitmix64(x: u64) -> u64 {
-    gam_linalg::utils::splitmix64_hash(x)
 }
 
 /// Result of a reconstruction cross-fit: the naive (double-use) explained

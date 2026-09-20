@@ -41,6 +41,7 @@ use crate::evidence::{
 };
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use crate::row_sampling_measure::CoresetCertificate;
+use gam_linalg::utils::splitmix64_hash;
 use ndarray::{Array2, ArrayView2};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -1728,14 +1729,6 @@ pub fn fit_ring_of_clusters_rung(
 pub type HeldOutDensityProvider<'a> =
     Box<dyn Fn(&[usize], &[usize]) -> Result<Vec<f64>, String> + 'a>;
 
-/// SplitMix64 finalizer — a full-avalanche integer hash. Pure and deterministic:
-/// it never touches the clock or any RNG state, so the folding it drives is
-/// reproducible for a given `(seed, index)` and decorrelated across seeds.
-#[inline]
-fn splitmix64(x: u64) -> u64 {
-    gam_linalg::utils::splitmix64_hash(x)
-}
-
 /// Deterministic, seed-reproducible, exactly balanced `folds`-way CV partition
 /// of `0..n` (no clock randomness). Rows are ordered by `hash(seed, i)` and
 /// assigned round-robin, so:
@@ -1756,7 +1749,7 @@ pub fn deterministic_cv_folds_seeded(
         return Vec::new();
     }
     let mut order = (0..n).collect::<Vec<_>>();
-    order.sort_unstable_by_key(|&row| (splitmix64(seed ^ splitmix64(row as u64)), row));
+    order.sort_unstable_by_key(|&row| (splitmix64_hash(seed ^ splitmix64_hash(row as u64)), row));
     let mut assign = vec![0usize; n];
     for (rank, row) in order.into_iter().enumerate() {
         assign[row] = rank % folds;

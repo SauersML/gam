@@ -2732,5 +2732,30 @@
     ],
     "reason": "#3604: posterior_eta_bands had no Python caller (retired in docs/public-api-2829-disposition.tsv); its hand-copied band reducer never validated draws. draw_bands_from_matrices is the single reducer; matrix_bands calls quantile_from_sorted directly.",
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
+  },
+  {
+    "base": "a022dd5e672406ab853e3d4a4ca508be0705067a",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs:fn:splitmix",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:fn:split_mix64",
+      "crates/gam-models/src/marginal_slope_shared.rs:fn:splitmix64",
+      "crates/gam-predict/src/anchored_posterior_predictive_tests.rs:fn:splitmix",
+      "crates/gam-sae/examples/common/mod.rs:fn:splitmix64",
+      "crates/gam-sae/examples/issue_2502_overcomplete_llm.rs:fn:splitmix64_next",
+      "crates/gam-sae/examples/issue_2572_shape_fuzz.rs:fn:splitmix64",
+      "crates/gam-sae/examples/issue_2575_joint_rate.rs:fn:splitmix64",
+      "crates/gam-sae/src/atlas/mod.rs:fn:splitmix64",
+      "crates/gam-sae/src/atom_codes.rs:fn:splitmix64",
+      "crates/gam-sae/src/inference/intervention_shard.rs:fn:splitmix64",
+      "crates/gam-sae/src/manifold/cross_fit.rs:fn:splitmix64",
+      "crates/gam-sae/src/manifold/support_seed.rs:fn:splitmix64",
+      "crates/gam-sae/src/manifold/tests_collapse_2132.rs:fn:splitmix_u64",
+      "crates/gam-sae/src/sparse_dict/block.rs:fn:splitmix64_block",
+      "crates/gam-sae/src/spectrometer.rs:fn:split_next",
+      "crates/gam-sae/src/tiered/code_space.rs:fn:splitmix64",
+      "crates/gam-solve/src/topology_selector.rs:fn:splitmix64"
+    ],
+    "reason": "#4454: private SplitMix64 copies duplicated gam_linalg::utils::{splitmix64, splitmix64_hash}. Eleven named copies of the full algorithm (same golden increment, multipliers 0xBF58_476D_1CE4_E5B9 / 0x94D0_49BB_1331_11EB, shifts 30/27/31) and seven thin wrappers that forwarded to the canonical function under a local name are deleted; block.rs splitmix64_block is renamed at its callers to splitmix64_hash. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'.",
+    "evidence": "https://github.com/SauersML/gam/issues/4454: each deleted body was checked token-for-token against the canonical stream or hash form before replacement, every former call site now calls gam_linalg::utils::splitmix64 or splitmix64_hash, and git grep -w finds no remaining call to a removed name in the edited files."
   }
 ]

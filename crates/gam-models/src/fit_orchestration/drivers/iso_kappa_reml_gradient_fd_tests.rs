@@ -1021,15 +1021,9 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
     // N(0, 0.05²). Reproducing the same X(ψ) is the only way the fast harness
     // sees the SAME analytic ψ-gradient (≈ +16.11) and the SAME h-flat gap.
     let mut st: u64 = 0x9A7E_7212_0001;
-    fn splitmix(s: &mut u64) -> u64 {
-        *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
+    use gam_linalg::utils::splitmix64;
     fn next_unit(s: &mut u64) -> f64 {
-        (splitmix(s) >> 11) as f64 / (1u64 << 53) as f64
+        (splitmix64(s) >> 11) as f64 / (1u64 << 53) as f64
     }
     fn next_gauss(s: &mut u64) -> f64 {
         let u1 = next_unit(s).max(1.0e-12);

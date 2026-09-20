@@ -379,15 +379,10 @@ pub struct CensusPairVerdict {
 /// scrambling needs a hash order; splitmix64 is deterministic (no RNG state),
 /// so identical inputs still give identical verdicts.
 fn hashed_permutation(f: usize, m: usize) -> Vec<usize> {
-    fn splitmix64(mut z: u64) -> u64 {
-        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
+    use gam_linalg::utils::splitmix64_hash;
     let salt = ((m as u64) + 1) << 48;
     let mut idx: Vec<usize> = (0..f).collect();
-    idx.sort_by_key(|&i| splitmix64(i as u64 ^ salt));
+    idx.sort_by_key(|&i| splitmix64_hash(i as u64 ^ salt));
     idx
 }
 

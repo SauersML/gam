@@ -13,6 +13,7 @@
 //! cargo run -p gam-sae --release --example issue_2572_shape_fuzz
 //! ```
 
+use gam_linalg::utils::splitmix64_hash;
 use gam_sae::front_door::{SaeFitLane, admit_topk_manifold};
 use gam_sae::manifold::{
     SaeSupportSeedRequest, SaeSupportTermSeedRequest, build_sae_support_seed,
@@ -24,16 +25,8 @@ use gam_solve::arrow_schur::{
 };
 use ndarray::{Array2, Axis};
 
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
 fn unit(seed: u64) -> f64 {
-    ((splitmix64(seed) >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
+    ((splitmix64_hash(seed) >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
 }
 
 /// A structured chart: a sparse mixture of curved 1-D features in `p` outputs,

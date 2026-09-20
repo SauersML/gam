@@ -40,19 +40,8 @@ use crate::manifold::{
     GraphCompressionKind, LocalAtlas, LocalAtlasConfig, observe_atlas_topology,
     tests_topology_fixtures::{circle, cylinder_strip, mobius_strip, sphere, trefoil_knot},
 };
+use gam_linalg::utils::splitmix64;
 use ndarray::{Array2, ArrayView2};
-
-/// SplitMix64, the reference finalizer. The three shift widths and two odd
-/// multipliers are the published algorithm's, not tuning: they are what make the
-/// generator equidistributed over its full period, and changing any of them
-/// changes which generator this is rather than how well it is tuned.
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
 
 /// One uniform in `(0, 1]` from the stream: the top 53 bits are the f64 mantissa,
 /// shifted off zero so the Box–Muller logarithm below cannot see it.

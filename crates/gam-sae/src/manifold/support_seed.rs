@@ -8,6 +8,7 @@
 
 use crate::assignment_state::{SaeAssignmentAtomSpec, SaeAssignmentState};
 use crate::front_door::{SaeFitAdmission, SaeFitLane};
+use gam_linalg::utils::splitmix64_hash;
 use ndarray::{Array2, Array3, ArrayView2, s};
 use rayon::prelude::*;
 
@@ -59,10 +60,6 @@ struct RankedAtom {
     score: f64,
 }
 
-pub(super) fn splitmix64(value: u64) -> u64 {
-    gam_linalg::utils::splitmix64_hash(value)
-}
-
 /// Bounded-work CountSketch projection. At small P each coordinate appears in
 /// the cyclic hash permutation; at large P eight deterministic samples keep
 /// routing cost independent of the ambient output width.
@@ -75,7 +72,7 @@ pub(super) fn projection(row: &[f64], atom: usize, axis: usize, random_state: u6
             ^ (atom as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
             ^ (axis as u64).wrapping_mul(0xa5a3_564e_27f8_864d)
             ^ (sample as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        let hash = splitmix64(key);
+        let hash = splitmix64_hash(key);
         let column = (sample + hash as usize % width) % width;
         total += if hash >> 63 == 0 {
             -row[column]
@@ -522,7 +519,7 @@ fn bounded_atom_chart_samples(
     }
     for row in retained..rows {
         for axis in 0..seed_width {
-            let hash = splitmix64(
+            let hash = splitmix64_hash(
                 random_state
                     ^ (atom as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
                     ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
