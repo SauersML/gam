@@ -1,4 +1,4 @@
-//! Regression coverage for the `cyclic()` / `cc()` / `cp()` period-declaration
+//! Regression coverage for the `cyclic()` period-declaration
 //! bugs #815 and #816.
 //!
 //! Both are "documented option silently ignored" failures in the cyclic
@@ -173,25 +173,6 @@ fn cyclic_declared_period_wraps_at_seam() {
             "`{formula}` does not wrap at 2π: f(0.3)={:.6}, f(0.3+2π)={:.6}, gap={gap:.3e}",
             pred[0],
             pred[1],
-        );
-    }
-}
-
-/// The `cc` / `cp` aliases share the dispatch arm and must honour `period=` too.
-#[test]
-fn cc_and_cp_aliases_honour_period_option() {
-    let grid = probe_grid();
-    let reference = fit_predict(
-        "y ~ cyclic(theta, k=10, period_start=0, period_end=2*pi)",
-        &grid,
-    );
-    for alias in ["cc", "cp"] {
-        let form = fit_predict(&format!("y ~ {alias}(theta, k=10, period=2*pi)"), &grid);
-        let diff = max_abs_diff(&form, &reference);
-        assert!(
-            diff < 1e-9,
-            "`{alias}(theta, period=2*pi)` disagrees with the cyclic endpoint reference \
-             (max abs diff {diff:.3e})"
         );
     }
 }

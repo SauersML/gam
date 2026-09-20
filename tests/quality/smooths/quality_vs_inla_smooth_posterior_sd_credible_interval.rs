@@ -150,7 +150,7 @@ fn gam_posterior_mean_sd(
     let x1_idx = col["x1"];
     let x2_idx = col["x2"];
 
-    let result = fit_from_formula("y ~ s(x1, bs='ps', k=20) + s(x2, bs='tp', k=15)", &ds, cfg)
+    let result = fit_from_formula("y ~ s(x1, bs='ps', k=20) + s(x2, bs='tps', k=15)", &ds, cfg)
         .expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit");

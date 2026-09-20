@@ -126,6 +126,50 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
     );
 }
 
+/// The same criterion and seed with no declared problem size, so no criterion
+/// resolution and a solver band of `1e-3` (#3286). ARC reaches `ρ*` to within
+/// `3.9e-7`, where `|g| = 3.9e-2` and `H = 1e5` still leave `½g²/H = 7.6e-9` of
+/// decrease, about 50× the criterion's rounding. Its Newton step there is
+/// `3.9e-7`, but the point `fl(ρ + s)` it lands on is off the step by up to
+/// `ulp(6.9)/2 = 4.4e-16`. The model gradient at the represented step is then
+/// `H·r ≈ 4.4e-11`, while opt's termination test asked for `θ‖s‖² ≈ 1.5e-13`,
+/// so every trial was refused before evaluation, σ climbed to its ceiling and
+/// the run ended on `trust_region_reject_floor` at `|g| = 3.9e-2`.
+#[test]
+fn arc_takes_the_newton_step_whose_represented_point_rounds_3286() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_tolerance(1.0e-3)
+        .with_initial_rho(array![SEED_3017]);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(value_3017(theta[0])),
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: value_3017(theta[0]),
+                gradient: array![gradient_3017(theta[0])],
+                hessian: HessianValue::Dense(array![[hessian_3017(theta[0])]]),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let cap = obj.capability();
+    assert_eq!(plan(&cap).solver, Solver::Arc, "the fixture must run the dense ARC route");
+    let result = problem
+        .run(&mut obj, "#3286 represented step")
+        .unwrap_or_else(|error| panic!("ARC must certify ρ* = {:.6}: {error}", optimum_3017()));
+    assert!(result.converged(), "the run must certify its optimum");
+    let gradient = gradient_3017(result.rho[0]).abs();
+    assert!(
+        gradient <= 1.0e-3,
+        "the certified point must meet the solver band: |g| = {gradient:.3e} at ρ = {:.12}",
+        result.rho[0]
+    );
+}
+
 /// Drive the dense ARC bridge from the #3017 seed through `trials`, each one
 /// above the seed's criterion. `report_accepted` says whether `opt` accepted
 /// them. Returns the outcome of every evaluation up to the first stop.

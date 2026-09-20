@@ -11,6 +11,7 @@
 //! the caller unchanged.
 
 use super::*;
+use crate::test_support::outerobjectivegradienthessian_labeled;
 use gam_solve::model_types::UnifiedFitResult;
 use ndarray::array;
 

@@ -48,6 +48,7 @@ pub struct CorrectedEdf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorrectedEdfUnavailable {
     MissingWeightedGram,
+    WeightedGramWithoutSavedFrameForm,
     MissingSmoothingCorrection,
     MissingCovarianceScale,
     MissingMethodProvenance,
@@ -60,6 +61,11 @@ impl CorrectedEdfUnavailable {
             Self::MissingWeightedGram => {
                 "the fit retained no weighted Gram X'WX, so the smoothing-parameter \
                  uncertainty correction tr(X'WX·C) cannot be formed"
+            }
+            Self::WeightedGramWithoutSavedFrameForm => {
+                "the fit's weighted Gram X'WX lives in a rectangular coefficient gauge's \
+                 active frame and has no unique saved-frame form to pair with the \
+                 saved-frame smoothing correction C"
             }
             Self::MissingSmoothingCorrection => {
                 "the fit retained no first-order smoothing-parameter covariance \
@@ -109,17 +115,19 @@ pub struct InformationCriteria {
 /// coefficient-covariance correction and `s` is the coefficient-covariance
 /// ownership scale (`V_beta = s H⁻¹`). The engine stores the genuine
 /// symmetric-PSD weighted Gram `X'WX = H − S(λ)` directly on the fit
-/// ([`UnifiedFitResult::weighted_gram`], issue #1027) — pairing it with
+/// ([`UnifiedFitResult::saved_frame_weighted_gram`], issue #1027; read in the
+/// saved frame of `C`, gam#3346) — pairing it with
 /// `C` makes the correction the nonnegative `tr(A½ B A½)` it is defined to
 /// be, instead of the indefinite `H·F`
 /// reconstruction (where the stored `H` need not satisfy `H·F = X'WX`) that
 /// drove the corrected EDF below the conditional EDF.
 ///
 /// Missing artifacts or method provenance produce `corrected=None` with a
-/// typed reason; malformed present inputs are errors.
+/// typed reason (`weighted_gram` carries the caller's reason the Gram is
+/// unavailable); malformed present inputs are errors.
 pub fn corrected_edf(
     edf_conditional: f64,
-    weighted_gram: Option<ArrayView2<'_, f64>>,
+    weighted_gram: Result<ArrayView2<'_, f64>, CorrectedEdfUnavailable>,
     smoothing_correction: Option<ArrayView2<'_, f64>>,
     covariance_scale: Option<f64>,
     smoothing_dimension: usize,
@@ -147,8 +155,9 @@ pub fn corrected_edf(
     if !method_certified_exact {
         return unavailable(CorrectedEdfUnavailable::MissingMethodProvenance);
     }
-    let Some(xwx) = weighted_gram else {
-        return unavailable(CorrectedEdfUnavailable::MissingWeightedGram);
+    let xwx = match weighted_gram {
+        Ok(xwx) => xwx,
+        Err(reason) => return unavailable(reason),
     };
     let Some(correction) = smoothing_correction else {
         return unavailable(CorrectedEdfUnavailable::MissingSmoothingCorrection);
@@ -324,16 +333,23 @@ pub fn information_criteria(
     fit: &UnifiedFitResult,
     log_likelihood: f64,
 ) -> Result<InformationCriteria, EstimationError> {
-    let phi = fit.dispersion_phi()?;
+    let spec = fit.likelihood_family.as_ref().ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "information criteria require an engine-level likelihood family".into(),
+        )
+    })?;
     let edf_conditional = fit.edf_total().ok_or_else(|| {
         EstimationError::InvalidInput(
             "information criteria require a retained conditional EDF".into(),
         )
     })?;
+    // A scale contract with no scalar dispersion (Royston-Parmar survival) is
+    // still a full likelihood with a conditional EDF, so its conditional AIC is
+    // defined; only the WPS correction, which needs a coefficient-covariance
+    // scale, is unavailable (gam#3297).
     let covariance_scale = fit
-        .likelihood_family
-        .as_ref()
-        .map(|spec| {
+        .scalar_dispersion_phi()?
+        .map(|phi| {
             GlmLikelihoodSpec {
                 spec: spec.clone(),
                 scale: fit.likelihood_scale,
@@ -350,19 +366,20 @@ pub fn information_criteria(
         fit.smoothing_correction_method_first_order(),
         Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
     );
+    let weighted_gram = fit.saved_frame_weighted_gram();
     let edf = corrected_edf(
         edf_conditional,
-        fit.weighted_gram().map(|g| g.view()),
+        match &weighted_gram {
+            Ok(Some(gram)) => Ok(gram.view()),
+            Ok(None) => Err(CorrectedEdfUnavailable::MissingWeightedGram),
+            Err(_) => Err(CorrectedEdfUnavailable::WeightedGramWithoutSavedFrameForm),
+        },
         fit.smoothing_correction_first_order().map(|c| c.view()),
         covariance_scale,
         fit.log_lambdas.len(),
         method_certified_exact,
     )?;
-    let scale_dof = fit
-        .likelihood_family
-        .as_ref()
-        .map(|spec| scale_parameter_count(spec, &fit.likelihood_scale))
-        .unwrap_or(0.0);
+    let scale_dof = scale_parameter_count(spec, &fit.likelihood_scale);
     information_criteria_from_parts(log_likelihood, edf, scale_dof)
 }
 
@@ -376,7 +393,7 @@ mod tests {
         // X'WX = I, s = 2 → correction is tr(corr)/s.
         let xwx = Array2::<f64>::eye(3);
         let corr = array![[2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 6.0]];
-        let edf = corrected_edf(3.0, Some(xwx.view()), Some(corr.view()), Some(2.0), 1, true)
+        let edf = corrected_edf(3.0, Ok(xwx.view()), Some(corr.view()), Some(2.0), 1, true)
             .expect("corrected EDF");
         // tr(corr)/s = (2+4+6)/2 = 6, so corrected = 3 + 6 = 9, ρ-df = 6.
         assert_eq!(edf.corrected, Some(9.0));
@@ -386,7 +403,15 @@ mod tests {
 
     #[test]
     fn corrected_edf_reports_unavailable_without_inputs() {
-        let edf = corrected_edf(5.5, None, None, Some(1.0), 1, true).expect("availability result");
+        let edf = corrected_edf(
+            5.5,
+            Err(CorrectedEdfUnavailable::MissingWeightedGram),
+            None,
+            Some(1.0),
+            1,
+            true,
+        )
+        .expect("availability result");
         assert_eq!(edf.conditional, 5.5);
         assert_eq!(edf.corrected, None);
         assert_eq!(edf.rho_uncertainty_df(), None);

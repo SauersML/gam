@@ -90,23 +90,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// cycling). `None` ⇒ unconstrained, no projection (raw norm). Cheap to hold
     /// (the outer dimension is the smoothing-param count).
     pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
-    /// Count of consecutive `eval_cost` calls that returned `Recoverable`
-    /// without a single success in between. When every trial step in every
-    /// search direction is infeasible (the inner solve refuses to converge at
-    /// any neighboring ρ), BFGS would otherwise spend its full
-    /// `max_iterations × line_search_budget` budget doing inner solves that
-    /// all fail — the non-termination reported in issue #NaN-outer-loop.
-    ///
-    /// Once this counter exceeds [`PROBE_REFUSAL_FATAL_THRESHOLD`] and no
-    /// gradient evaluation has ever been accepted on this seed (`first_order_evals ==
-    /// 0`), the bridge escalates to `Fatal` so BFGS exits immediately via
-    /// `ObjectiveFailed`. The seed loop treats that outcome as a rejected seed
-    /// and moves on, keeping the cascade bounded.
-    ///
-    /// Reset to 0 on any successful cost evaluation so normal line-search
-    /// noise (a few recoverable probes followed by an accepted step) never
-    /// trips this guard.
-    pub(crate) consecutive_probe_refusals: usize,
     /// Accepted-outer-step signal published by [`OuterAcceptObserver`] (#2613).
     ///
     /// The cost-stall guard above counts *accepted outer steps*. Before #2613
@@ -139,7 +122,9 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// The last iterate known to be accepted — the seed, then each accepted
     /// step. The reference point for reconciling [`AcceptedOuterStep`] against
     /// [`Self::pending_first_order`], and the point a refused trial's linear
-    /// model is taken at (#3018).
+    /// model is taken at (#3018). The seed is installed here from the runner's
+    /// initial sample, so a run whose every probe is refused is judged against
+    /// the seed's own gradient and resolution from its first probe (#3219).
     pub(crate) incumbent: Option<OuterIncumbent>,
     /// Kept rank of the criterion at this run's start (#2765), read from
     /// [`OuterObjective::criterion_rank`]. A trial whose criterion keeps a different
@@ -154,40 +139,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
 pub(crate) const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
 
 pub(crate) const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
-
-/// Number of consecutive recoverable `eval_cost` failures (every line-search
-/// probe infeasible) before the bridge escalates to `Fatal` and forces an
-/// immediate BFGS exit. This guard fires only before the first accepted
-/// gradient step (`first_order_evals == 0`): once BFGS has accepted at least one
-/// outer iteration the current ρ is feasible and isolated probe refusals are
-/// normal line-search noise, not a stuck loop.
-///
-/// The threshold covers one full StrongWolfe attempt (up to 20 probes)
-/// plus one backtracking fallback (up to 50 probes) with a small margin,
-/// so a SINGLE failed direction does not fire the guard. Two consecutive
-/// direction failures (120 probes) always does — once both Wolfe and
-/// backtracking exhausted two complete directions with no success, the
-/// neighborhood is globally infeasible and further BFGS iterations are
-/// pure waste.
-pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD: usize = 150;
-
-/// Tighter probe-refusal threshold used when the bridge has never seen a
-/// `eval_grad` call of its own — i.e. the seed (cost, gradient) was supplied
-/// via `with_initial_sample` so `last_value_grad_rho` is `None` and every
-/// `trial_rho_distance` prints as NaN.  In this case the seed gradient is
-/// already confirmed feasible externally; if even the first line-search
-/// direction exhausts its Wolfe probes without success (≈ 20 probes), the
-/// neighborhood IS globally infeasible and further iterations just repeat
-/// the same expensive inner solve 150 more times.  One generous Wolfe
-/// budget (25 probes) is enough to confirm the failure; 13 seeds ×
-/// 150 probes × ~3 s each would otherwise cause an observed ~97 min hang.
-pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED: usize = 25;
-
-/// Sentinel prefix embedded in the fatal [`ObjectiveEvalError`] message the
-/// bridge returns when [`PROBE_REFUSAL_FATAL_THRESHOLD`] fires. The seed-loop
-/// runner matches this prefix and routes the failed seed to
-/// typed [`SeedRejection`] accounting rather than propagating a fatal error.
-pub(crate) const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL";
 
 /// Sentinel embedded in the fatal [`ObjectiveEvalError`] message the bridge
 /// returns when [`CostStallGuard`] halts BFGS on a cost stall. `opt::Bfgs`
@@ -295,10 +246,11 @@ pub(crate) enum CostStallVerdict {
     },
 }
 
-/// The window of the per-atom fixed-point walk's progress certificate
-/// ([`FixedPointProgress`]) and of `opt`'s own BFGS cost stall on the GPU walk.
-/// A fixed-point map has no model decrease, so the accepted-step stall rule
-/// (#3018) does not apply to it as it stands (#3176).
+/// The accepted-step window `opt`'s BFGS cost stall takes on the GPU walk.
+/// `CostStallConfig` at the pinned `opt` has no window-free form; the host
+/// routes judge each step on its own resolution (#3018) and the fixed-point
+/// walks each evaluation on its own (#3176), so this is its last consumer, and
+/// it goes with the `opt` bump that brings the window-free stall rule (#3018).
 pub(crate) const COST_STALL_WINDOW: usize = 6;
 
 /// One sample the cost-stall guard judges (#3018).
@@ -1849,11 +1801,6 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         remember_value_probe(&mut self.value_probe_cache, x, cached_outcome);
         match &result {
             Ok(cost) => {
-                // A successful probe resets the consecutive-refusal counter: the
-                // current ρ neighbourhood has at least one feasible point, so
-                // isolated refusals on other directions are normal line-search
-                // noise, not a globally-infeasible neighbourhood.
-                self.consecutive_probe_refusals = 0;
                 log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={}",
                     stage_start.elapsed().as_secs_f64(),
@@ -1882,6 +1829,18 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     // A refused probe has no value, so the linear model at the
                     // incumbent, the one the line search takes its sufficient
                     // decrease against, decides whether it stalls (#3018).
+                    //
+                    // This is also what ends a run whose every probe is refused
+                    // (#3219). A line search shrinks `α` by a factor `β < 1` along
+                    // `d`, so the model decrease is `p(α) = α·|g_bᵀd|`, and the
+                    // first probe with `p ≤ R_b` stalls: the direction reaches a
+                    // verdict within `⌈log_{1/β}(α₀·|g_bᵀd| / R_b)⌉ + 1` refused
+                    // probes, a number the incumbent's own gradient and resolution
+                    // fix. A stall at a stationary incumbent converges. One at a
+                    // non-stationary incumbent is granted its first escape, and
+                    // the next stall stops the run through the progress licence,
+                    // since refused probes buy no descent (#2817). A route
+                    // without the guard ends on the line search's own failure.
                     let predicted_decrease = self
                         .incumbent
                         .as_ref()
@@ -1971,47 +1930,6 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                             return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
                         }
                     }
-                }
-                // Non-termination guard (#NaN-outer-loop): when every
-                // line-search probe is infeasible and BFGS has never
-                // accepted a gradient step (`first_order_evals == 0`), the
-                // neighbourhood around the seed is globally degenerate.
-                // BFGS would otherwise spend its entire max_iterations ×
-                // line_search_budget doing inner solves that all fail.
-                // Escalate to Fatal so BFGS exits immediately; the seed
-                // loop routes it as a rejected seed.
-                self.consecutive_probe_refusals = self.consecutive_probe_refusals.saturating_add(1);
-                // When the bridge seed (cost, gradient) was supplied via
-                // `with_initial_sample` the bridge's own `eval_grad` is
-                // never called, so `last_value_grad_rho` stays `None` and
-                // every `trial_rho_distance` prints as NaN.  The seed IS
-                // feasible (it was evaluated externally), but if every
-                // line-search probe is Recoverable from the very first
-                // direction, the neighbourhood is globally infeasible.
-                // Use the tighter NaN-seed threshold so the guard fires
-                // after one generous Wolfe budget instead of 150 probes
-                // (which, at ~3 s each × 13 seeds, would produce an
-                // observed ~97 min hang on real D=5120 LLM activations).
-                let threshold = if self.last_value_grad_rho.is_none() {
-                    PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED
-                } else {
-                    PROBE_REFUSAL_FATAL_THRESHOLD
-                };
-                if self.first_order_evals == 0 && self.consecutive_probe_refusals >= threshold {
-                    log::debug!(
-                        "[OUTER] probe-refusal non-termination guard fired after {} consecutive \
-                         infeasible cost probes with no accepted gradient step \
-                         (nan_seed={}); escalating to Fatal to abort this seed \
-                         (first-order bridge, eval={})",
-                        self.consecutive_probe_refusals,
-                        self.last_value_grad_rho.is_none(),
-                        self.first_order_evals,
-                    );
-                    return Err(ObjectiveEvalError::fatal(format!(
-                            "{PROBE_REFUSAL_FATAL_SENTINEL}: {consecutive} consecutive \
-                             infeasible probes with no accepted outer step",
-                            consecutive = self.consecutive_probe_refusals,
-                        )));
                 }
             }
             Err(_err) => {
@@ -2134,10 +2052,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
-        // A successful gradient evaluation means the current ρ is feasible;
-        // reset the consecutive-probe-refusal counter so the guard only fires
-        // when ALL probes in EVERY subsequent direction fail.
-        self.consecutive_probe_refusals = 0;
         self.value_probe_cache
             .retain(|entry| value_probe_reject_outcome(&entry.outcome));
         log::debug!(
@@ -3149,6 +3063,22 @@ impl OuterSecondOrderBridge<'_> {
         let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
         let projected = project_gradient_vector(x, gradient, rail_bounds.as_ref());
         let projected_norm = projected.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // #2568: the certificate caps every rung at the caller's |Pg|
+        // requirement, so the loop keeps going past a point that requirement
+        // refuses. Stopping here would hand the certificate a point it must
+        // refuse, or, before the cap reached the ladder's top, one it minted
+        // short of what the caller asked for (#3311).
+        if let Some(required) = self
+            .decrement_verdict_config
+            .and_then(|config| config.required_projected_gradient_norm)
+            && !(projected_norm <= required)
+        {
+            log::debug!(
+                "[OUTER] ARC online stop declined: |Pg|={projected_norm:.3e} exceeds the \
+                 caller's requirement {required:.3e} (#2568)"
+            );
+            return None;
+        }
         // #2954: the certificate's verdict, where it is taken, is the rung.
         let verdict_decided = self
             .decrement_verdict_config
@@ -4802,75 +4732,66 @@ pub(crate) fn build_bridge_hessian_for_source(
 /// iteration count (#2817).
 ///
 /// A fixed-point walk is not a descent method: neither its cost nor its step is
-/// monotone along it, and a limit cycle of the map buys nothing forever. What
-/// the walk can buy is a better incumbent, a value lower by more than the
-/// criterion's resolution `τ` ([`super::run::outer_criterion_resolution`]), or
-/// near the fixed point a smaller
-/// proposed step at the incumbent. `window` evaluations without a resolved
-/// improvement fill a window, and a filled window continues only when, since
-/// the previous licensed window, the incumbent improved by a resolution or its
-/// step contracted: the rule [`CostStallGuard::license_continuation`] applies on
-/// the gradient routes, with the proposed step standing in for the gradient.
+/// monotone along it, and a limit cycle of the map buys nothing forever. Each
+/// evaluation is judged on its own, by the two things a walk can buy (#3176):
+///
+/// - a resolved improvement of the incumbent: a value [`resolvably_below`] the
+///   best one so far. An EFS evaluation publishes no certificate evidence, so
+///   each value is charged only its own rounding `γ₁·|V|`
+///   ([`gam_math::roundoff::accumulation_growth`]`(1)`): the improvement is
+///   judged against `γ₁|V_best| + γ₁|V|`. The criterion's statistical
+///   resolution `τ` is a decrease-*left* quantity, the certificate's decrement
+///   tolerance, not the arithmetic error of one value; charging it here would
+///   stop a walk still improving by less than `τ` but by far more than its
+///   values' rounding.
+/// - contraction of the map: a proposed step shorter than the previous one.
+///   A fixed-point iteration converges only where its map contracts, so a
+///   step that shrinks is the walk's evidence it is closing on a fixed point.
+///
+/// An evaluation that buys neither stops the walk: the map is not contracting
+/// there and the criterion saw no resolvable progress, so no evidence says
+/// another step would. The stop is no convergence claim; the runner judges the
+/// best iterate and continues on the analytic gradient where one is declared.
 ///
 /// Termination needs no count. The criterion is bounded below on the declared
-/// domain, so resolved improvements are finite, and every other licence strictly
-/// lowers a floating-point step norm bounded below by zero.
+/// domain and each resolved improvement strictly lowers the floating-point
+/// incumbent, so resolved improvements are finite, and between two of them
+/// every continuing evaluation strictly lowers a floating-point step norm
+/// bounded below by zero.
 pub(crate) struct FixedPointProgress {
-    /// The criterion's absolute resolution `τ`.
-    resolution: f64,
-    window: usize,
     best_value: f64,
-    best_step_norm: f64,
-    streak: usize,
-    licensed_incumbent: Option<(f64, f64)>,
+    previous_step_norm: f64,
     evaluations: usize,
 }
 
 impl FixedPointProgress {
-    pub(crate) fn new(resolution: f64, window: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            resolution,
-            window,
             best_value: f64::INFINITY,
-            best_step_norm: f64::INFINITY,
-            streak: 0,
-            licensed_incumbent: None,
+            previous_step_norm: f64::INFINITY,
             evaluations: 0,
         }
     }
 
-    /// Fold one evaluated point in. `true` when a filled window has bought
-    /// nothing since the previous licensed one, so the walk should stop.
+    /// Fold one evaluated point in. `true` when it bought neither a resolved
+    /// improvement of the incumbent nor a contraction of the step, so the walk
+    /// should stop.
     pub(crate) fn observe(&mut self, value: f64, step_norm: f64) -> bool {
         self.evaluations = self.evaluations.saturating_add(1);
         if !value.is_finite() || !step_norm.is_finite() {
             return false;
         }
-        if value < self.best_value {
-            let resolved = self.best_value - value > self.resolution;
-            self.best_value = value;
-            self.best_step_norm = step_norm;
-            if resolved {
-                self.streak = 0;
-                return false;
-            }
-        }
-        self.streak = self.streak.saturating_add(1);
-        if self.streak < self.window {
-            return false;
-        }
-        self.streak = 0;
-        let licensed = match self.licensed_incumbent {
-            None => true,
-            Some((previous_value, previous_step_norm)) => {
-                previous_value - self.best_value > self.resolution
-                    || self.best_step_norm < previous_step_norm
-            }
-        };
-        if licensed {
-            self.licensed_incumbent = Some((self.best_value, self.best_step_norm));
-        }
-        !licensed
+        let rounding = |v: f64| gam_math::roundoff::accumulation_growth(1) * v.abs();
+        let improved = resolvably_below(
+            self.best_value,
+            rounding(self.best_value),
+            value,
+            rounding(value),
+        );
+        let contracted = step_norm < self.previous_step_norm;
+        self.best_value = self.best_value.min(value);
+        self.previous_step_norm = step_norm;
+        !(improved || contracted)
     }
 
     /// Evaluations folded in so far.
@@ -5221,9 +5142,9 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 status: FixedPointStatus::Stop,
             });
         }
-        // #2817 — a walk that has bought neither a resolved improvement nor a
-        // smaller step since its previous window stops at the incumbent, rather
-        // than walking until an iteration count runs out.
+        // #2817/#3176 — an evaluation that bought neither a resolved
+        // improvement nor a smaller step stops the walk, rather than walking
+        // until an iteration count runs out.
         if self
             .progress
             .observe(current_cost, raw_step.dot(&raw_step).sqrt())
@@ -5234,9 +5155,9 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             }
             log::debug!(
                 "[OUTER] fixed-point walk stopping at an unprogressing stall after \
-                 {evaluations} evaluation(s): a window bought no resolved improvement of the \
-                 incumbent and no contraction of its step since the previous one; the terminal \
-                 certificate judges the incumbent (#2817). cost={current_cost:.6e}"
+                 {evaluations} evaluation(s): the evaluation bought no resolved improvement of \
+                 the incumbent and no contraction of the step; the terminal certificate judges \
+                 the best iterate (#2817, #3176). cost={current_cost:.6e}"
             );
             return Ok(FixedPointSample {
                 value: current_cost,
