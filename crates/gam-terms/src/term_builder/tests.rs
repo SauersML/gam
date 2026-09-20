@@ -54,8 +54,9 @@ fn unique_count_column_uses_canonical_level_bits() {
 /// #1867: a 1-D radial smooth must not be dimensioned coarser than the
 /// univariate `s(x)` on the same data and route. On a route whose loop grows it
 /// the floor is the rate-derived pilot `s(x)` starts from: the order-2 null
-/// space plus the penalized resolution rank `⌈n^{1/5}⌉`, held to the distinct
-/// values; everywhere else it is the provisioned `s(x)`.
+/// space plus the minimal-embedding-order penalized resolution rank
+/// `⌈n^{1/3}⌉`, held to the distinct values; everywhere else it is the
+/// provisioned `s(x)`.
 #[test]
 fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
     for n in [30usize, 1_000, 100_000] {
@@ -63,7 +64,7 @@ fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
         let univariate_floor = pilot_univariate_spline_basis_dim(col.view(), col.len());
         assert_eq!(
             univariate_floor,
-            DEFAULT_PENALTY_ORDER + penalized_resolution_rank(n, 1, DEFAULT_PENALTY_ORDER),
+            DEFAULT_PENALTY_ORDER + penalized_resolution_rank(n, 1, minimal_embedding_order(1)),
             "univariate spline pilot at n={n}"
         );
         // A radial plan starved below the floor is lifted to it.
@@ -1708,11 +1709,12 @@ fn multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_
 
 /// #3149: the default `s(x)` is built at the provisioned default, adequate
 /// without growth, and only the standard workflow, whose loop grows it, starts
-/// it at its pilot: at n = 1000 the provisioned default is 8 internal knots (12
-/// cubic functions) and the pilot 2 (6).
+/// it at its pilot: at n = 10 000 the provisioned default is 8 internal knots
+/// (12 cubic functions) and the pilot 20 (24, the order-2 null space plus
+/// `⌈n^{1/3}⌉`; #3331). At n = 1000 the two coincide at 12 functions.
 #[test]
 fn default_bspline_is_provisioned_and_the_loop_starts_it_at_its_pilot_3149() {
-    let n = 1_000;
+    let n = 10_000;
     let ds = continuous_dataset(
         &["y", "x"],
         (0..n)
@@ -1739,14 +1741,15 @@ fn default_bspline_is_provisioned_and_the_loop_starts_it_at_its_pilot_3149() {
         } => *num_internal_knots,
         other => panic!("unexpected default knot spec {other:?}"),
     };
-    assert_eq!(internal + spec.degree + 1, 12, "the provisioned default s(x) at n = 1000");
+    assert_eq!(internal + spec.degree + 1, 12, "the provisioned default s(x) at n = 10 000");
     assert_eq!(
         crate::smooth::starting_resolution(basis, ds.values.view()),
         Some(crate::smooth::AdaptiveResolution::InternalKnots(
             pilot_internal_knots(n, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER)
         ))
     );
-    assert_eq!(pilot_internal_knots(n, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) + DEFAULT_BSPLINE_DEGREE + 1, 6);
+    assert_eq!(pilot_internal_knots(n, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) + DEFAULT_BSPLINE_DEGREE + 1, 24);
+    assert_eq!(pilot_internal_knots(1_000, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) + DEFAULT_BSPLINE_DEGREE + 1, 12);
 }
 
 /// The provisioned open B-spline default: `unique / 4` internal knots, held
@@ -4476,9 +4479,12 @@ fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedval
 #[test]
 fn pilot_internal_knots_follow_the_resolution_rate_not_a_fixed_cap() {
     // The pilot open cubic basis is the order-2 null space plus the penalized
-    // resolution rank `⌈n^{1/5}⌉`: dims 5/6/9/12 at n = 1e2..1e5, with no
+    // resolution rank `⌈n^{1/3}⌉` of the roughest admissible truth (the
+    // minimal embedding order, #3331): dims 7/12/24/49 at n = 1e2..1e5, with no
     // fixed ceiling (the old rule clamped every column to 8 internal knots).
-    for (n, dim) in [(100usize, 5usize), (1_000, 6), (10_000, 9), (100_000, 12)] {
+    // At n = 1000 it is the 12 functions (11 identified columns) the
+    // pre-#3191 default had, which the order-2 rate `⌈n^{1/5}⌉` had cut to 6.
+    for (n, dim) in [(100usize, 7usize), (1_000, 12), (10_000, 24), (100_000, 49)] {
         let col = Array1::from_iter((0..n).map(|v| v as f64));
         assert_eq!(
             pilot_internal_knots(col.len(), DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER)
@@ -6022,13 +6028,14 @@ fn factor_smooth_default_marginal_is_the_rank_bounded_group_pilot_3264() {
         );
 
         // A group with exactly as many distinct values as the pilot keeps the
-        // full pilot (the old `u − 2` rule cut it to five functions); the
-        // rank bound holds the provisioned default to the same support.
+        // full pilot (the old `u − 2` rule cut it to `u − 2` functions); the
+        // provisioned default is held to the provisioned 10-function marginal
+        // and to the same support.
         let pilot_dim = pilot_internal_knots(1_000, degree, order) + degree + 1;
         let ds = two_group_factor_dataset((1_000, pilot_dim), (1_000, 1_000));
         assert_eq!(
             start_dim(formula, &ds),
-            (pilot_dim, pilot_dim),
+            (FACTOR_SMOOTH_PROVISIONED_BASIS_DIM.min(pilot_dim), pilot_dim),
             "{formula}: marginal at the support bound keeps the pilot"
         );
 

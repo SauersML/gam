@@ -19,7 +19,7 @@ use crate::basis::{
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
     default_spatial_center_strategy, provisioned_spherical_harmonic_degree,
-    SPHERICAL_HARMONIC_MAX_DEGREE, penalized_resolution_rank,
+    SPHERICAL_HARMONIC_MAX_DEGREE, minimal_embedding_order, penalized_resolution_rank,
     select_r_uniform_subsample_centers,
     starting_num_centers, thin_plate_penalty_order,
 };
@@ -4802,22 +4802,33 @@ pub(crate) fn factor_smooth_pilot_internal_knots(
 }
 
 /// Pilot basis dimension of a default univariate penalized spline with an
-/// `nullspace_dim`-dimensional unpenalized space and an order-`penalty_order`
-/// roughness penalty, fitted on `n` rows:
-/// `nullspace_dim + penalized_resolution_rank(n, 1, penalty_order)`.
+/// `nullspace_dim`-dimensional unpenalized space, fitted on `n` rows:
+/// `nullspace_dim + penalized_resolution_rank(n, 1, minimal_embedding_order(1))`,
+/// i.e. `nullspace_dim + ⌈n^{1/3}⌉`.
 ///
 /// The penalty, not the basis size, controls the fitted smoothness, so the
-/// basis only has to span the functions the data can resolve: the unpenalized
-/// null space (always estimable) plus the `⌈n^{1/(2m+1)}⌉` penalized directions
-/// that an order-`m` smoother resolves at `n` rows (see
-/// [`crate::basis::penalized_resolution_rank`]). This is only the *starting*
-/// resolution of the formula default: the standard formula workflow refines the
-/// basis while the converged fit's own REML evidence prefers the richer basis,
-/// up to the covariate's distinct-value support and the design's rank (see
-/// `finish_adaptive_spatial_fit`). Starting from the resolvable rank is what
-/// lets a null or linear truth finish on a small, cheap basis.
-pub(crate) fn pilot_spline_basis_dim(n: usize, nullspace_dim: usize, penalty_order: usize) -> usize {
-    nullspace_dim.saturating_add(penalized_resolution_rank(n, 1, penalty_order.max(1)))
+/// basis has to span every penalized direction an optimally smoothed fit keeps.
+/// That count grows as `n^{1/(2s+1)}` in the smoothness `s` of the *truth*, not
+/// in the order `m` of the roughness penalty (for a truth rougher than the
+/// penalty assumes, `s < m`, REML shrinks less and keeps more directions). The
+/// truth's smoothness is unknown before the fit, so the pilot is sized for the
+/// roughest truth the smoothing framework admits: a function of the order-1
+/// Sobolev space, the least order whose penalty embeds a 1-D function space in
+/// the continuous functions ([`crate::basis::minimal_embedding_order`], the same
+/// order every radial smooth's [`crate::basis::starting_num_centers`] pilot is
+/// sized with). Sizing it at the penalty's own order instead (`⌈n^{1/5}⌉` for
+/// the default second-order penalty) held the pilot at the rank a truth exactly
+/// as smooth as the penalty needs — 4 penalized directions at n = 1000 — so the
+/// truncation, not REML, decided the fit of any rougher truth (#3331). A basis
+/// holding more directions than the truth needs is harmless because the penalty
+/// shrinks what the data do not support.
+///
+/// This is only the *starting* resolution of the formula default: the standard
+/// formula workflow refines the basis while the converged fit's own REML
+/// evidence prefers the richer basis, up to the covariate's distinct-value
+/// support and the design's rank (see `finish_adaptive_spatial_fit`).
+pub(crate) fn pilot_spline_basis_dim(n: usize, nullspace_dim: usize) -> usize {
+    nullspace_dim.saturating_add(penalized_resolution_rank(n, 1, minimal_embedding_order(1)))
 }
 
 /// Pilot internal-knot count of a default open degree-`degree` B-spline smooth
@@ -4826,7 +4837,7 @@ pub(crate) fn pilot_spline_basis_dim(n: usize, nullspace_dim: usize, penalty_ord
 /// [`pilot_spline_basis_dim`] with the penalty's `penalty_order`-dimensional
 /// polynomial null space, never below the zero-knot (single-polynomial) basis.
 pub(crate) fn pilot_internal_knots(n: usize, degree: usize, penalty_order: usize) -> usize {
-    pilot_spline_basis_dim(n, penalty_order, penalty_order).saturating_sub(degree + 1)
+    pilot_spline_basis_dim(n, penalty_order).saturating_sub(degree + 1)
 }
 
 /// Cap a default open B-spline `(internal_knots, degree)` so its basis
@@ -4962,15 +4973,15 @@ pub(crate) fn tensor_margin_sizes(caps: &[usize], budget: usize) -> Vec<usize> {
     k_list
 }
 
-/// Pilot basis dimension of a default degree-`degree` cyclic B-spline with an
-/// order-`penalty_order` cyclic roughness penalty on `n` rows.
+/// Pilot basis dimension of a default degree-`degree` cyclic B-spline on `n`
+/// rows.
 ///
 /// A periodic spline has no polynomial null space beyond the constant — the
 /// wrap removes every other polynomial — so its pilot is
 /// [`pilot_spline_basis_dim`] with a one-dimensional null space, never below
 /// the `degree + 1` functions a periodic degree-`degree` basis needs to wrap.
-pub(crate) fn pilot_cyclic_basis_dim(n: usize, degree: usize, penalty_order: usize) -> usize {
-    pilot_spline_basis_dim(n, 1, penalty_order).max(degree + 1)
+pub(crate) fn pilot_cyclic_basis_dim(n: usize, degree: usize) -> usize {
+    pilot_spline_basis_dim(n, 1).max(degree + 1)
 }
 
 // ---------------------------------------------------------------------------
