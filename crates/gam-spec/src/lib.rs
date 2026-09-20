@@ -894,15 +894,25 @@ impl ResponseFamily {
     /// unbounded and the binomial deviance leaves its domain. Strict `{0, 1}`
     /// binarity remains an auto-inference policy, not the support of an
     /// explicitly requested binomial model.
+    ///
+    /// `Poisson` and `NegativeBinomial` are count distributions: their support
+    /// is the non-negative integers, and a non-integer `y` is refused rather
+    /// than evaluated through the `ln_gamma` continuation of the log-mass
+    /// (see [`is_count_value`]). `Tweedie` (1 < p < 2) is the family whose
+    /// support is the non-negative reals, so it is what the refusal points at.
     #[inline]
     pub(crate) fn response_support_requirement(&self) -> Option<&'static str> {
         match self {
             Self::Gamma | Self::InverseGaussian => {
                 Some("strictly positive response values (y > 0)")
             }
-            Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
-                Some("non-negative response values (y ≥ 0)")
-            }
+            Self::Poisson | Self::NegativeBinomial { .. } => Some(
+                "non-negative integer counts (y = 0, 1, 2, ...); for non-negative \
+                 non-integer data use a Tweedie family (for example \
+                 family='tweedie(p=1.5)'), and model a rate as an integer count \
+                 with a log-exposure offset",
+            ),
+            Self::Tweedie { .. } => Some("non-negative response values (y ≥ 0)"),
             Self::Beta { .. } => Some(
                 "response values strictly in the open interval (0, 1) \
                  (a binary {0, 1} response is a Binomial GLM, not Beta; route it through the Binomial family instead)",
@@ -928,9 +938,8 @@ impl ResponseFamily {
     fn response_support_contains(&self, yi: f64) -> bool {
         match self {
             Self::Gamma | Self::InverseGaussian => yi.is_finite() && yi > 0.0,
-            Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
-                yi.is_finite() && yi >= 0.0
-            }
+            Self::Poisson | Self::NegativeBinomial { .. } => is_count_value(yi),
+            Self::Tweedie { .. } => yi.is_finite() && yi >= 0.0,
             Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
             Self::Binomial => yi.is_finite() && (0.0..=1.0).contains(&yi),
             Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => true,
@@ -968,21 +977,35 @@ impl ResponseFamily {
     /// enforced here: `0 ≤ y ≤ 1` keeps the Bernoulli / grouped-binomial
     /// log-likelihood bounded.
     ///
+    /// Only rows with a positive prior weight are judged. A zero weight is
+    /// this workspace's excluded-row convention (the count certification, the
+    /// deviance and the dispersion estimators all skip such rows), so an
+    /// excluded row's response never enters the likelihood and cannot make the
+    /// model ill-posed. `weights` must be the caller-validated prior weights
+    /// (finite, non-negative) of the same length as `y`; an unweighted fit
+    /// passes ones.
+    ///
     /// Up to `ResponseSupportViolation::MAX_REPORTED` offending row indices
     /// are returned in the violation so the message stays bounded on large
     /// datasets while still identifying offending rows.
     pub fn validate_response_support(
         &self,
         y: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
     ) -> Result<(), ResponseSupportViolation> {
+        assert_eq!(
+            y.len(),
+            weights.len(),
+            "response and prior-weight vectors must have one entry per row"
+        );
         let requirement = match self.response_support_requirement() {
             Some(r) => r,
             None => return Ok(()),
         };
         let mut offending: Vec<(usize, f64)> = Vec::new();
         let mut total_violations: usize = 0;
-        for (i, &yi) in y.iter().enumerate() {
-            if !self.response_support_contains(yi) {
+        for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
+            if wi > 0.0 && !self.response_support_contains(yi) {
                 total_violations += 1;
                 if offending.len() < ResponseSupportViolation::MAX_REPORTED {
                     offending.push((i, yi));
@@ -1009,7 +1032,10 @@ impl ResponseFamily {
     /// rejects out-of-domain *values* (e.g. a negative Poisson count); this
     /// rejects *distributions* that send the saturated MLE to a boundary at
     /// which the score diverges. Each family answers the question for itself
-    /// — adding a new family does not require touching workflow.rs.
+    /// — adding a new family does not require touching workflow.rs. As for
+    /// support, only positive-weight rows are judged: a response that is
+    /// all-ones among the rows that enter the likelihood is degenerate however
+    /// many zero-weight rows carry a 0.
     ///
     /// Concretely:
     /// * `Binomial` — refuses an all-zero or all-one response: the saturated
@@ -1017,114 +1043,72 @@ impl ResponseFamily {
     /// * `Poisson` / `NegativeBinomial` — refuse an all-zero response: the
     ///   count-rate optimum is at η = −∞, so no finite mode or posterior
     ///   moments exist (#2255).
+    ///
+    /// `Gaussian` has no degeneracy rule. Its REML criterion is equivariant
+    /// under `y → c·y`: the profiled scale becomes `c²·σ²` and the criterion
+    /// shifts by the constant `n·log|c|`, so the smoothing parameters and the
+    /// fitted surface (times `c`) are unchanged. A response's absolute spread
+    /// therefore says nothing about whether its fit is well posed, and any
+    /// absolute floor on it refuses valid data measured in small units (#332
+    /// refused `N(0, 1e-13)` noise that fits exactly like `N(0, 1)`). The one
+    /// Gaussian limit with no finite scale, an exactly constant response, is
+    /// the deterministic zero-dispersion fit (#1856, #2254).
     pub fn validate_response_degeneracy(
         &self,
         y: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
     ) -> Result<(), ResponseDegeneracy> {
-        match self {
+        assert_eq!(
+            y.len(),
+            weights.len(),
+            "response and prior-weight vectors must have one entry per row"
+        );
+        let mut included = y
+            .iter()
+            .zip(weights.iter())
+            .filter(|&(_, &wi)| wi > 0.0)
+            .map(|(&yi, _)| yi)
+            .peekable();
+        if included.peek().is_none() {
+            return Ok(());
+        }
+        let kind = match self {
             Self::Binomial => {
-                if y.is_empty() {
-                    return Ok(());
+                let (mut any_nonzero, mut any_nonone) = (false, false);
+                for yi in included {
+                    any_nonzero |= yi != 0.0;
+                    any_nonone |= yi != 1.0;
                 }
-                let all_zeros = y.iter().all(|&yi| yi == 0.0);
-                let all_ones = y.iter().all(|&yi| yi == 1.0);
-                let kind = if all_zeros {
+                if !any_nonzero {
                     ResponseDegeneracyKind::BinomialAllZeros
-                } else if all_ones {
+                } else if !any_nonone {
                     ResponseDegeneracyKind::BinomialAllOnes
                 } else {
                     return Ok(());
-                };
-                Err(ResponseDegeneracy {
-                    family_label: self.response_support_label(),
-                    kind,
-                })
-            }
-            Self::Gaussian => {
-                // A Gaussian fit's marginal REML log-likelihood carries a
-                // `−n/2·log σ²` term; for an effectively-constant response the
-                // ML scale `σ → 0` drives it to `+∞`, so the outer objective
-                // rejects every seed with "reml_score must be finite, got inf"
-                // (#332). Reject pre-fit when the two-pass, mean-centred sample
-                // sd is at or below `GAUSSIAN_MIN_SAMPLE_SD`. Fewer than two
-                // observations carries no estimable scale degeneracy (the
-                // sample-size gate handles too-small data), and any non-finite
-                // value is left to the dedicated finiteness checks rather than
-                // poisoning the sd, so it is skipped here.
-                //
-                // Exception (#1856): a *genuinely* zero-variance response —
-                // every observation bit-for-bit identical — is not the
-                // pathological near-constant case above but the well-posed
-                // degenerate limit. The penalized fit collapses cleanly to the
-                // constant (intercept = the shared value, every smooth shrunk
-                // to zero) and predicts that constant, so it must fit rather
-                // than be rejected. Only a response that *varies* below the sd
-                // floor without being exactly constant keeps the #332
-                // rejection, whose REML score genuinely diverges to +∞.
-                let mut count = 0usize;
-                let mut mean = 0.0f64;
-                for &yi in y.iter() {
-                    if !yi.is_finite() {
-                        return Ok(());
-                    }
-                    count += 1;
-                    mean += yi;
                 }
-                if count < 2 {
+            }
+            Self::Poisson | Self::NegativeBinomial { .. } => {
+                if !included.all(|yi| yi == 0.0) {
                     return Ok(());
                 }
-                mean /= count as f64;
-                let mut sumsq = 0.0f64;
-                for &yi in y.iter() {
-                    let d = yi - mean;
-                    sumsq += d * d;
-                }
-                let sample_sd = (sumsq / (count as f64 - 1.0)).sqrt();
-                if sample_sd <= GAUSSIAN_MIN_SAMPLE_SD {
-                    // Genuine zero variance (all values exactly equal) is the
-                    // well-posed constant limit, not the #332 divergence: accept
-                    // it and let the fitter return the constant surface (#1856).
-                    let first = y[0];
-                    if y.iter().all(|&yi| yi == first) {
-                        return Ok(());
-                    }
-                    return Err(ResponseDegeneracy {
-                        family_label: self.response_support_label(),
-                        kind: ResponseDegeneracyKind::GaussianNearConstant {
-                            sample_sd,
-                            min_sd: GAUSSIAN_MIN_SAMPLE_SD,
-                        },
-                    });
-                }
-                Ok(())
-            }
-            Self::Poisson => {
-                if !y.is_empty() && y.iter().all(|&yi| yi == 0.0) {
-                    Err(ResponseDegeneracy {
-                        family_label: self.response_support_label(),
-                        kind: ResponseDegeneracyKind::PoissonAllZeros,
-                    })
+                if matches!(self, Self::Poisson) {
+                    ResponseDegeneracyKind::PoissonAllZeros
                 } else {
-                    Ok(())
+                    ResponseDegeneracyKind::NegativeBinomialAllZeros
                 }
             }
-            Self::NegativeBinomial { .. } => {
-                if !y.is_empty() && y.iter().all(|&yi| yi == 0.0) {
-                    Err(ResponseDegeneracy {
-                        family_label: self.response_support_label(),
-                        kind: ResponseDegeneracyKind::NegativeBinomialAllZeros,
-                    })
-                } else {
-                    Ok(())
-                }
-            }
-            Self::Tweedie { .. }
+            Self::Gaussian
+            | Self::Tweedie { .. }
             | Self::Beta { .. }
             | Self::Gamma
             | Self::InverseGaussian
             | Self::RoystonParmar
-            | Self::StudentT { .. } => Ok(()),
-        }
+            | Self::StudentT { .. } => return Ok(()),
+        };
+        Err(ResponseDegeneracy {
+            family_label: self.response_support_label(),
+            kind,
+        })
     }
 
     /// Auto-infer a likelihood family when the user did not specify one.
@@ -1178,7 +1162,7 @@ impl ResponseFamily {
                 // parses to itself exactly, so a value a rounding away from an
                 // integer did not come from an integer column.
                 let count = !y.is_empty()
-                    && y.iter().all(|&v| v.is_finite() && v >= 0.0 && v == v.round())
+                    && y.iter().all(|&v| is_count_value(v))
                     && y.iter().any(|&v| v >= 2.0);
                 if count {
                     Ok(Self::Poisson)
@@ -1211,27 +1195,44 @@ impl ResponseSupportViolation {
     /// the user at concrete bad rows to inspect.
     pub(crate) const MAX_REPORTED: usize = 5;
 
-    /// Format the violation against a specific response column name. The
-    /// column name is supplied by the caller because [`ResponseFamily`] does
-    /// not know which column the user pointed at.
-    pub fn message_for(&self, response_name: &str) -> String {
-        let shown = self
-            .offending
-            .iter()
-            .map(|(i, v)| format!("y[{i}]={v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let more = if self.total_violations > self.offending.len() {
-            format!(", ... ({} total)", self.total_violations)
+    /// The violation as the problem clause of a data error on the response
+    /// column: `column '<name>' <problem>`. Rows are reported 1-based, like
+    /// every other fit-boundary data error.
+    pub fn problem(&self) -> String {
+        let (first_row, first_value) = self.offending[0];
+        let more = if self.total_violations > 1 {
+            let rows = self
+                .offending
+                .iter()
+                .map(|(i, _)| (i + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let prefix = if self.total_violations > self.offending.len() {
+                "first "
+            } else {
+                ""
+            };
+            format!(
+                " ({} offending rows; {prefix}rows {rows})",
+                self.total_violations
+            )
         } else {
             String::new()
         };
         format!(
-            "{family} family requires {req}; response column '{name}' violates this constraint at row(s) [{shown}{more}]",
+            "is outside the {family} family's support, which requires {req}; \
+             first offending row {row} has value {first_value}{more}",
             family = self.family_label,
             req = self.requirement,
-            name = response_name,
+            row = first_row + 1,
         )
+    }
+
+    /// Format the violation against a specific response column name. The
+    /// column name is supplied by the caller because [`ResponseFamily`] does
+    /// not know which column the user pointed at.
+    pub fn message_for(&self, response_name: &str) -> String {
+        format!("column '{response_name}' {}", self.problem())
     }
 }
 
@@ -1242,26 +1243,6 @@ impl std::fmt::Display for ResponseSupportViolation {
 }
 
 impl std::error::Error for ResponseSupportViolation {}
-
-/// Minimum admissible sample standard deviation for a `Gaussian` response.
-///
-/// A response whose two-pass, mean-centred sample sd is at or below this
-/// threshold is *effectively constant* in `f64` arithmetic: the marginal REML
-/// log-likelihood carries a `−n/2·log σ²` term that diverges to `+∞` as the
-/// fitted scale `σ → 0`, so the outer objective rejects every seed with
-/// `reml_score must be finite, got inf` (#332). The bound is chosen well below
-/// any well-conditioned scientific signal (genuine data has sd many orders of
-/// magnitude larger) yet above the f64 round-off floor, so it never trips a
-/// real fit while catching responses that carry no signal (e.g. a column read
-/// in the wrong scale, or a constant accidentally fed as the response).
-///
-/// One case below the floor is *not* rejected: a genuinely zero-variance
-/// response whose values are all bit-for-bit identical. That is the well-posed
-/// constant limit (the fit collapses to the constant, smooths shrunk to zero)
-/// rather than the divergent near-constant case, so it fits (#1856); only a
-/// response that varies below this floor without being exactly constant is
-/// rejected.
-pub(crate) const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
 
 /// Classifier for a [`ResponseDegeneracy`]. Each variant carries the family-
 /// specific evidence the caller needs to format a useful message without
@@ -1278,18 +1259,6 @@ pub enum ResponseDegeneracyKind {
     /// Negative-Binomial response with no positive counts. As for Poisson, the
     /// log-rate likelihood has no finite optimum or finite posterior moments.
     NegativeBinomialAllZeros,
-    /// Gaussian response that is effectively constant in `f64` arithmetic
-    /// (sample standard deviation at or below `GAUSSIAN_MIN_SAMPLE_SD`). The
-    /// marginal REML log-likelihood `−n/2·log σ²` diverges to `+∞` as the
-    /// fitted scale `σ → 0`, so every outer evaluation rejects with a
-    /// non-finite score. Carries the observed `sample_sd` and the `min_sd`
-    /// threshold so the message can quote both verbatim (#332).
-    GaussianNearConstant {
-        /// The two-pass, mean-centred sample standard deviation of the response.
-        sample_sd: f64,
-        /// The rejection threshold (`GAUSSIAN_MIN_SAMPLE_SD`).
-        min_sd: f64,
-    },
 }
 
 /// Degenerate-response detail produced by
@@ -1306,51 +1275,42 @@ pub struct ResponseDegeneracy {
 }
 
 impl ResponseDegeneracy {
+    /// The degeneracy as the problem clause of a data error on the response
+    /// column: `column '<name>' <problem>`.
+    pub fn problem(&self) -> String {
+        let family = self.family_label;
+        match self.kind {
+            ResponseDegeneracyKind::BinomialAllZeros => format!(
+                "is degenerate for the {family} family: all values are 0 (no events). \
+                 The maximum-likelihood logit is −∞ at this boundary, so the REML score \
+                 is not finite. Fix: ensure the response contains at least one 0 and \
+                 at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
+                 sample that includes both classes). Rows with zero weight are excluded."
+            ),
+            ResponseDegeneracyKind::BinomialAllOnes => format!(
+                "is degenerate for the {family} family: all values are 1 (no non-events). \
+                 The maximum-likelihood logit is +∞ at this boundary, so the REML score \
+                 is not finite. Fix: ensure the response contains at least one 0 and \
+                 at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
+                 sample that includes both classes). Rows with zero weight are excluded."
+            ),
+            ResponseDegeneracyKind::PoissonAllZeros
+            | ResponseDegeneracyKind::NegativeBinomialAllZeros => format!(
+                "is degenerate for the {family} family: all counts are 0. \
+                 The log-rate likelihood is maximized only as η → −∞, so there is no \
+                 finite fitted mode or finite posterior mean/variance to report. Fix: \
+                 ensure the response contains at least one positive count (for example, \
+                 drop the empty subgroup or pool it with observations containing events). \
+                 Rows with zero weight are excluded."
+            ),
+        }
+    }
+
     /// Format the degeneracy against a specific response column name. The
     /// column name is supplied by the caller because [`ResponseFamily`] does
     /// not know which column the user pointed at.
     pub fn message_for(&self, response_name: &str) -> String {
-        match self.kind {
-            ResponseDegeneracyKind::BinomialAllZeros => format!(
-                "{family} response '{name}' is degenerate: it has only one class (all values \
-                 are 0, no events). \
-                 The maximum-likelihood logit is −∞ at this boundary, so the REML score \
-                 is not finite. Fix: ensure the response contains at least one 0 and \
-                 at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
-                 sample that includes both classes).",
-                family = self.family_label,
-                name = response_name,
-            ),
-            ResponseDegeneracyKind::BinomialAllOnes => format!(
-                "{family} response '{name}' is degenerate: it has only one class (all values \
-                 are 1, no non-events). \
-                 The maximum-likelihood logit is +∞ at this boundary, so the REML score \
-                 is not finite. Fix: ensure the response contains at least one 0 and \
-                 at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
-                 sample that includes both classes).",
-                family = self.family_label,
-                name = response_name,
-            ),
-            ResponseDegeneracyKind::PoissonAllZeros
-            | ResponseDegeneracyKind::NegativeBinomialAllZeros => format!(
-                "{family} response '{name}' is degenerate: all counts are 0. \
-                 The log-rate likelihood is maximized only as η → −∞, so there is no \
-                 finite fitted mode or finite posterior mean/variance to report. Fix: \
-                 ensure the response contains at least one positive count (for example, \
-                 drop the empty subgroup or pool it with observations containing events).",
-                family = self.family_label,
-                name = response_name,
-            ),
-            ResponseDegeneracyKind::GaussianNearConstant { sample_sd, min_sd } => format!(
-                "{family} response '{name}' is effectively constant (sample sd ~ {sample_sd:.3e} \
-                 <= {min_sd:.0e}); the marginal REML log-likelihood −n/2·log σ² diverges to \
-                 +∞ as σ → 0. Fix: check the response column units (is it being read in the \
-                 right scale?), centre/rescale the response, or drop the column if it carries \
-                 no signal.",
-                family = self.family_label,
-                name = response_name,
-            ),
-        }
+        format!("column '{response_name}' {}", self.problem())
     }
 }
 
@@ -2326,6 +2286,27 @@ impl LikelihoodSpec {
 #[inline]
 pub const fn is_valid_tweedie_power(p: f64) -> bool {
     p.is_finite() && p > 1.0 && p < 2.0
+}
+
+/// The row-level count-response contract: finite, non-negative, and an exact
+/// integer.
+///
+/// The integrality test is EXACT (`y == y.round()`), and that is a derivation
+/// rather than a strictness preference. Every count `k` with `|k| < 2^53` is
+/// exactly representable in `f64`, so a genuine count read from data satisfies
+/// `y == y.round()` with no slack to allocate -- there is no rounding step
+/// between "the datum is an integer" and "the bits say so". A tolerance band
+/// would therefore admit only values that are NOT counts, and the Poisson /
+/// negative-binomial log-likelihood is defined (through `ln_gamma`) at
+/// non-integer `y`, so such a value does not fail loudly downstream: it
+/// silently evaluates a different likelihood.
+///
+/// This is the single definition: the fit-boundary support check
+/// ([`ResponseFamily::validate_response_support`]), count auto-inference, and
+/// the solver's P-IRLS / HMC count certification all call it.
+#[inline]
+pub fn is_count_value(y: f64) -> bool {
+    y.is_finite() && y >= 0.0 && y == y.round()
 }
 
 /// Error returned when an `InverseLink` cannot be paired with a particular
@@ -3527,6 +3508,11 @@ mod tests {
     use super::*;
     use ndarray::arr1;
 
+    /// Unit prior weights for `y`: every row enters the likelihood.
+    fn unit_weights(y: &Array1<f64>) -> Array1<f64> {
+        Array1::ones(y.len())
+    }
+
     #[test]
     fn the_same_gamma_family_answers_the_wald_scale_question_by_its_shape_ownership() {
         // The divergence this predicate exists to remove (#2470). Both fits are
@@ -4048,7 +4034,7 @@ mod tests {
     fn binomial_response_one_ulp_from_all_ones_is_not_saturated() {
         let saturated = arr1(&[1.0_f64, 1.0, 1.0]);
         assert!(matches!(
-            ResponseFamily::Binomial.validate_response_degeneracy(saturated.view()),
+            ResponseFamily::Binomial.validate_response_degeneracy(saturated.view(), unit_weights(&saturated).view()),
             Err(ResponseDegeneracy {
                 kind: ResponseDegeneracyKind::BinomialAllOnes,
                 ..
@@ -4057,7 +4043,7 @@ mod tests {
         let soft = arr1(&[1.0_f64, 1.0 - f64::EPSILON / 2.0, 1.0]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_degeneracy(soft.view())
+                .validate_response_degeneracy(soft.view(), unit_weights(&soft).view())
                 .is_ok()
         );
     }
@@ -4071,7 +4057,7 @@ mod tests {
         let y = arr1(&[-100.0_f64, 0.0, 100.0]);
         assert!(
             ResponseFamily::Gaussian
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
@@ -4081,7 +4067,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 1.0, 2.0]);
         assert!(
             ResponseFamily::Gamma
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4091,7 +4077,7 @@ mod tests {
         let y = arr1(&[-1.0_f64, 1.0]);
         assert!(
             ResponseFamily::Gamma
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4101,7 +4087,7 @@ mod tests {
         let y = arr1(&[0.1_f64, 1.0, 100.0]);
         assert!(
             ResponseFamily::Gamma
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
@@ -4111,7 +4097,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 0.5, 1.0]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
@@ -4121,7 +4107,7 @@ mod tests {
         let y = arr1(&[0.0_f64, -0.1, 1.1]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4131,7 +4117,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 1.0, 0.0, 1.0]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
@@ -4141,7 +4127,7 @@ mod tests {
         let y = arr1(&[-1.0_f64, 0.0, 1.0]);
         assert!(
             ResponseFamily::Poisson
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4151,7 +4137,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 1.0, 2.0, 10.0]);
         assert!(
             ResponseFamily::Poisson
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
@@ -4161,7 +4147,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 0.5]);
         assert!(
             ResponseFamily::Beta { phi: 1.0 }
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4171,7 +4157,7 @@ mod tests {
         let y = arr1(&[0.5_f64, 1.0]);
         assert!(
             ResponseFamily::Beta { phi: 1.0 }
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4181,8 +4167,56 @@ mod tests {
         let y = arr1(&[0.1_f64, 0.5, 0.9]);
         assert!(
             ResponseFamily::Beta { phi: 1.0 }
-                .validate_response_support(y.view())
+                .validate_response_support(y.view(), unit_weights(&y).view())
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn count_support_rejects_non_integer_values() {
+        let y = arr1(&[0.0_f64, 1.0, 2.5, 4.0]);
+        for family in [
+            ResponseFamily::Poisson,
+            ResponseFamily::NegativeBinomial {
+                theta: 1.0,
+                theta_fixed: true,
+            },
+        ] {
+            let err = family
+                .validate_response_support(y.view(), unit_weights(&y).view())
+                .expect_err("a non-integer count is outside the count support");
+            assert_eq!(err.offending, vec![(2, 2.5)]);
+            let msg = err.message_for("count");
+            assert!(msg.contains("tweedie"), "message: {msg}");
+        }
+    }
+
+    #[test]
+    fn tweedie_support_accepts_non_integer_non_negative_values() {
+        let y = arr1(&[0.0_f64, 0.25, 2.5]);
+        assert!(
+            ResponseFamily::Tweedie { p: 1.5 }
+                .validate_response_support(y.view(), unit_weights(&y).view())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn support_is_judged_over_positive_weight_rows_only() {
+        // Zero weight is the excluded-row convention: an out-of-support value
+        // in an excluded row never enters the likelihood.
+        let y = arr1(&[0.0_f64, 1.0, 2.0]);
+        let excluded = arr1(&[0.0_f64, 1.0, 1.0]);
+        assert!(
+            ResponseFamily::Gamma
+                .validate_response_support(y.view(), excluded.view())
+                .is_ok()
+        );
+        let included = arr1(&[0.5_f64, 1.0, 1.0]);
+        assert!(
+            ResponseFamily::Gamma
+                .validate_response_support(y.view(), included.view())
+                .is_err()
         );
     }
 
@@ -4195,7 +4229,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 0.0, 0.0]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_degeneracy(y.view())
+                .validate_response_degeneracy(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4205,7 +4239,7 @@ mod tests {
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_degeneracy(y.view())
+                .validate_response_degeneracy(y.view(), unit_weights(&y).view())
                 .is_err()
         );
     }
@@ -4215,7 +4249,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 1.0, 0.0]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_degeneracy(y.view())
+                .validate_response_degeneracy(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
@@ -4225,7 +4259,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 0.5, 0.75]);
         assert!(
             ResponseFamily::Binomial
-                .validate_response_degeneracy(y.view())
+                .validate_response_degeneracy(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
@@ -4234,7 +4268,7 @@ mod tests {
     fn poisson_degeneracy_all_zeros_errors() {
         let y = arr1(&[0.0_f64, 0.0, 0.0]);
         let error = ResponseFamily::Poisson
-            .validate_response_degeneracy(y.view())
+            .validate_response_degeneracy(y.view(), unit_weights(&y).view())
             .expect_err("an all-zero Poisson response has no finite log-rate optimum");
         assert!(matches!(
             error.kind,
@@ -4255,7 +4289,7 @@ mod tests {
             theta_fixed: true,
         };
         let error = family
-            .validate_response_degeneracy(y.view())
+            .validate_response_degeneracy(y.view(), unit_weights(&y).view())
             .expect_err("an all-zero negative-binomial response has no finite log-rate optimum");
         assert!(matches!(
             error.kind,
@@ -4268,7 +4302,7 @@ mod tests {
         let y = arr1(&[0.0_f64, 0.0, 2.0]);
         assert!(
             ResponseFamily::Poisson
-                .validate_response_degeneracy(y.view())
+                .validate_response_degeneracy(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
         assert!(
@@ -4276,54 +4310,38 @@ mod tests {
                 theta: 1.0,
                 theta_fixed: true,
             }
-            .validate_response_degeneracy(y.view())
+            .validate_response_degeneracy(y.view(), unit_weights(&y).view())
             .is_ok()
         );
     }
 
     #[test]
     fn gaussian_degeneracy_exactly_constant_ok() {
-        // A *genuinely* zero-variance response \u{2014} every value bit-for-bit
-        // identical \u{2014} is the well-posed constant limit, not the #332
-        // divergence: the fit collapses to the constant (intercept = the shared
-        // value, smooths shrunk to zero). The guard must accept it and let the
-        // fitter return the constant surface (#1856); only a response that
-        // varies below the sd floor without being exactly constant keeps the
-        // rejection (see `gaussian_degeneracy_near_constant_reproducer_errors`).
+        // A *genuinely* zero-variance response — every value bit-for-bit
+        // identical — is the well-posed constant limit: the fit collapses
+        // to the constant (intercept = the shared value, smooths shrunk to
+        // zero) through the deterministic zero-dispersion fit (#1856).
         let y = arr1(&[1.0_f64, 1.0, 1.0]);
         assert!(
             ResponseFamily::Gaussian
-                .validate_response_degeneracy(y.view())
+                .validate_response_degeneracy(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
 
     #[test]
-    fn gaussian_degeneracy_near_constant_reproducer_errors() {
-        // The issue reproducer: a response with sd ~ 1e-13, well below the
-        // `1e-10` floor, so the REML score blows up to +inf without the guard.
-        let y = arr1(&[
-            5.0_f64,
-            5.0 + 1.0e-13,
-            5.0 - 1.0e-13,
-            5.0 + 2.0e-13,
-            5.0 - 2.0e-13,
-        ]);
-        let err = ResponseFamily::Gaussian
-            .validate_response_degeneracy(y.view())
-            .expect_err("near-constant Gaussian response must be rejected");
-        match err.kind {
-            ResponseDegeneracyKind::GaussianNearConstant { sample_sd, min_sd } => {
-                assert!(
-                    sample_sd <= min_sd,
-                    "guard must fire only when sample_sd ({sample_sd:.3e}) <= min_sd ({min_sd:.0e})"
-                );
-                assert_eq!(min_sd, GAUSSIAN_MIN_SAMPLE_SD);
-                // The message quotes both numbers verbatim.
-                let msg = err.message_for("y");
-                assert!(msg.contains("effectively constant"), "msg = {msg}");
-            }
-            other => panic!("expected GaussianNearConstant, got {other:?}"),
+    fn gaussian_degeneracy_has_no_absolute_spread_floor() {
+        // The Gaussian REML criterion is equivariant under `y -> c*y`, so the
+        // same relative pattern is accepted at every scale; the retired #332
+        // floor refused the 1e-13 copy of data it accepted at unit scale.
+        for scale in [1.0e-300_f64, 1.0e-13, 1.0, 1.0e13, 1.0e300] {
+            let y = arr1(&[5.0_f64, 5.1, 4.9, 5.2, 4.8]).mapv(|v| v * scale);
+            assert!(
+                ResponseFamily::Gaussian
+                    .validate_response_degeneracy(y.view(), unit_weights(&y).view())
+                    .is_ok(),
+                "scale {scale:e}"
+            );
         }
     }
 
@@ -4333,34 +4351,35 @@ mod tests {
         let y = arr1(&[-2.0_f64, 0.5, 1.7, 3.0, -1.1, 2.2]);
         assert!(
             ResponseFamily::Gaussian
-                .validate_response_degeneracy(y.view())
+                .validate_response_degeneracy(y.view(), unit_weights(&y).view())
                 .is_ok()
         );
     }
 
     #[test]
-    fn gaussian_degeneracy_small_signal_above_floor_ok() {
-        // sd ~ 1e-6 is small but far above the 1e-10 floor: a legitimately
-        // small-but-real signal (e.g. a finely-resolved measurement) must fit,
-        // so the guard must not over-reject.
-        let y = arr1(&[1.0_f64, 1.0 + 1.0e-6, 1.0 - 1.0e-6, 1.0 + 2.0e-6]);
-        assert!(
-            ResponseFamily::Gaussian
-                .validate_response_degeneracy(y.view())
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn gaussian_degeneracy_single_observation_ok() {
-        // Fewer than two observations carries no estimable scale degeneracy;
-        // the sample-size gate handles too-small data separately.
-        let y = arr1(&[42.0_f64]);
-        assert!(
-            ResponseFamily::Gaussian
-                .validate_response_degeneracy(y.view())
-                .is_ok()
-        );
+    fn degeneracy_is_judged_over_positive_weight_rows_only() {
+        // The only 0 sits in an excluded (zero-weight) row, so the rows that
+        // enter the likelihood are all ones: the saturated logit is +inf.
+        let y = arr1(&[1.0_f64, 0.0, 1.0, 1.0]);
+        let w = arr1(&[1.0_f64, 0.0, 2.0, 1.0]);
+        assert!(matches!(
+            ResponseFamily::Binomial.validate_response_degeneracy(y.view(), w.view()),
+            Err(ResponseDegeneracy {
+                kind: ResponseDegeneracyKind::BinomialAllOnes,
+                ..
+            })
+        ));
+        // Likewise a single positive count in an excluded row leaves no
+        // positive count in the likelihood.
+        let y = arr1(&[0.0_f64, 3.0, 0.0]);
+        let w = arr1(&[1.0_f64, 0.0, 1.0]);
+        assert!(matches!(
+            ResponseFamily::Poisson.validate_response_degeneracy(y.view(), w.view()),
+            Err(ResponseDegeneracy {
+                kind: ResponseDegeneracyKind::PoissonAllZeros,
+                ..
+            })
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -4403,11 +4422,26 @@ mod tests {
     fn violation_message_names_column() {
         let y = arr1(&[-1.0_f64]);
         let err = ResponseFamily::Gamma
-            .validate_response_support(y.view())
+            .validate_response_support(y.view(), unit_weights(&y).view())
             .unwrap_err();
         let msg = err.message_for("my_column");
         assert!(msg.contains("my_column"), "message: {msg}");
         assert!(msg.contains("Gamma"), "message: {msg}");
+    }
+
+    #[test]
+    fn violation_message_reports_first_offending_row_one_based() {
+        let y = arr1(&[0.0_f64, 1.0, 0.0, 0.5, 2.0]);
+        let err = ResponseFamily::Binomial
+            .validate_response_support(y.view(), unit_weights(&y).view())
+            .unwrap_err();
+        let msg = err.message_for("y");
+        assert!(msg.starts_with("column 'y' "), "message: {msg}");
+        assert!(msg.contains("Binomial family"), "message: {msg}");
+        assert!(
+            msg.contains("first offending row 5 has value 2"),
+            "message: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4690,11 +4724,16 @@ mod tests {
             ResponseFamily::InverseGaussian,
             InverseLink::Standard(StandardLink::InverseSquared),
         );
-        assert!(spec.response.validate_response_support(arr1(&[0.5, 2.0]).view()).is_ok());
+        let weights = arr1(&[1.0, 1.0]);
+        assert!(
+            spec.response
+                .validate_response_support(arr1(&[0.5, 2.0]).view(), weights.view())
+                .is_ok()
+        );
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let violation = spec
                 .response
-                .validate_response_support(arr1(&[1.0, bad]).view())
+                .validate_response_support(arr1(&[1.0, bad]).view(), weights.view())
                 .unwrap_err();
             assert_eq!(violation.total_violations, 1, "y = {bad}");
         }
