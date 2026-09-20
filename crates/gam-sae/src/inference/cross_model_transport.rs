@@ -19,7 +19,9 @@
 //! their own uncertainty scale, and otherwise reports the measured obstruction
 //! rather than fitting it away.
 
-use crate::inference::layer_transport::{ChartTopology, FittedTransport, fit_transport_map};
+use crate::inference::layer_transport::{
+    ChartTopology, FittedTransport, PairLaw, fit_transport_map,
+};
 use crate::inference::transport_class::{
     CircleTransportClass, CircleTransportReport, classify_circle_transport_fit,
 };
@@ -154,6 +156,9 @@ pub fn fit_cross_model_transport(
         to.coordinate.view(),
         from.topology,
         to.topology,
+        // Each model's coordinate is its own estimate of the row's position, so
+        // the pairs scatter about the transport.
+        PairLaw::Stochastic,
     )
     .map_err(|e| {
         format!(

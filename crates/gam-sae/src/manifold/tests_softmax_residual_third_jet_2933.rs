@@ -21,6 +21,7 @@
 //! (`residual_target = None` skips the residual third legs) as a positive control,
 //! which must miss the difference by far more than the analytic side is allowed to.
 
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::*;
 use gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR;
 use ndarray::{Array1, Array2, s};

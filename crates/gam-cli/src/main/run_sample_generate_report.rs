@@ -473,52 +473,52 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
 
             if model.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
                 let y = ds.values.column(y_col).to_owned();
-                if let Some(predictor) = model.predictor() {
-                    let (report_offset, report_noise_offset) = resolve_predict_offsets(
-                        &model,
-                        &ds,
-                        &col_map,
-                        saved_offset_column,
-                        saved_noise_offset_column,
-                    )?;
-                    let pred_input = build_predict_input_for_model(
-                        &model,
-                        ds.values.view(),
-                        &col_map,
-                        training_headers,
-                        &report_offset,
-                        &report_noise_offset,
-                        saved_noise_offset_column.is_some(),
-                    )?;
-                    let pred = predictor
-                        .predict_plugin_response(&pred_input)
-                        .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
+                let predictor = model.predictor()
+                    .map_err(|reason| format!("prediction for report diagnostics failed: {reason}"))?;
+                let (report_offset, report_noise_offset) = resolve_predict_offsets(
+                    &model,
+                    &ds,
+                    &col_map,
+                    saved_offset_column,
+                    saved_noise_offset_column,
+                )?;
+                let pred_input = build_predict_input_for_model(
+                    &model,
+                    ds.values.view(),
+                    &col_map,
+                    training_headers,
+                    &report_offset,
+                    &report_noise_offset,
+                    saved_noise_offset_column.is_some(),
+                )?;
+                let pred = predictor
+                    .predict_plugin_response(&pred_input)
+                    .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
 
-                    // Bernoulli response: randomized-quantile residuals (the
-                    // raw y − p residual is two-valued and can never track a
-                    // normal Q-Q reference), plus equal-count calibration
-                    // deciles.
-                    let y_vec = y.to_vec();
-                    let p_vec = pred.mean.to_vec();
-                    let leverage = alo_data
-                        .as_ref()
-                        .map(|alo| alo.rows.iter().map(|row| row.leverage).collect::<Vec<_>>());
-                    let residuals = report_residual_diagnostics(
-                        &ResponseFamily::Binomial,
-                        &y_vec,
-                        &p_vec,
-                        leverage.as_deref(),
-                        edf_total,
-                        &mut notes,
-                    )?;
-                    let calibration = binary_calibration_deciles(&y_vec, &p_vec);
-                    diagnostics = Some(report::DiagnosticsInput {
-                        residuals,
-                        y_observed: y_vec,
-                        y_predicted: p_vec,
-                        calibration,
-                    });
-                }
+                // Bernoulli response: randomized-quantile residuals (the
+                // raw y − p residual is two-valued and can never track a
+                // normal Q-Q reference), plus equal-count calibration
+                // deciles.
+                let y_vec = y.to_vec();
+                let p_vec = pred.mean.to_vec();
+                let leverage = alo_data
+                    .as_ref()
+                    .map(|alo| alo.rows.iter().map(|row| row.leverage).collect::<Vec<_>>());
+                let residuals = report_residual_diagnostics(
+                    &ResponseFamily::Binomial,
+                    &y_vec,
+                    &p_vec,
+                    leverage.as_deref(),
+                    edf_total,
+                    &mut notes,
+                )?;
+                let calibration = binary_calibration_deciles(&y_vec, &p_vec);
+                diagnostics = Some(report::DiagnosticsInput {
+                    residuals,
+                    y_observed: y_vec,
+                    y_predicted: p_vec,
+                    calibration,
+                });
             } else if matches!(
                 model.predict_model_class(),
                 PredictModelClass::Standard | PredictModelClass::BinomialLocationScale
@@ -806,7 +806,7 @@ fn report_residual_diagnostics(
     y: &[f64],
     mu: &[f64],
     leverage: Option<&[f64]>,
-    edf_total: f64,
+    edf_total: Option<f64>,
     notes: &mut Vec<String>,
 ) -> Result<Option<report::ResidualDiagnostics>, String> {
     match report_family_residuals(response, y, mu, leverage, edf_total) {
@@ -845,7 +845,7 @@ fn report_family_residuals(
     y: &[f64],
     mu: &[f64],
     leverage: Option<&[f64]>,
-    edf_total: f64,
+    edf_total: Option<f64>,
 ) -> Result<FamilyResiduals, String> {
     use rand::RngExt;
     use statrs::distribution::{
@@ -856,15 +856,30 @@ fn report_family_residuals(
     if n == 0 {
         return Err("no observations".to_string());
     }
-    // Residual degrees of freedom for the Pearson dispersion estimates. With none
-    // left there is no residual scale to estimate, and the diagnostics are omitted
-    // rather than divided by a dof of one that the fit does not have.
-    let residual_dof = n as f64 - edf_total;
-    if !(residual_dof > 0.0) {
-        return Err(format!(
-            "no residual degrees of freedom to estimate a scale (n = {n}, edf = {edf_total})"
-        ));
-    }
+    // Residual degrees of freedom for the Pearson dispersion estimates, needed
+    // only by the families whose scale the saved model does not carry. A fit
+    // that retained no total EDF has no known n − edf, and a fit with none left
+    // has no residual scale to estimate: either way those diagnostics are
+    // omitted rather than divided by a dof the fit does not have (#3978).
+    let residual_dof = || -> Result<f64, String> {
+        let edf = edf_total.ok_or_else(|| {
+            "the fit retained no total EDF, so the residual degrees of freedom n − edf \
+             are unknown"
+                .to_string()
+        })?;
+        if !(edf.is_finite() && edf >= 0.0) {
+            return Err(format!(
+                "invalid total EDF {edf}: expected a finite nonnegative value"
+            ));
+        }
+        let dof = n as f64 - edf;
+        if !(dof > 0.0) {
+            return Err(format!(
+                "no residual degrees of freedom to estimate a scale (n = {n}, edf = {edf})"
+            ));
+        }
+        Ok(dof)
+    };
     let mut rng = StdRng::seed_from_u64(REPORT_RESIDUAL_SEED);
     // Predictive CDF value → normal scale. Only the exact endpoints have no
     // finite quantile, so u is held inside the representable open interval:
@@ -876,7 +891,7 @@ fn report_family_residuals(
     match response {
         ResponseFamily::Gaussian => {
             let ssr: f64 = (0..n).map(|i| (y[i] - mu[i]).powi(2)).sum();
-            let sigma = (ssr / residual_dof).sqrt();
+            let sigma = (ssr / residual_dof()?).sqrt();
             if !(sigma.is_finite() && sigma > 0.0) {
                 return Err("Gaussian residual scale is zero or non-finite".to_string());
             }
@@ -989,7 +1004,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| ((y[i] - mu[i]) / mu[i]).powi(2))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("Gamma dispersion estimate is not positive".to_string());
             }
@@ -1015,7 +1030,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| (y[i] - mu[i]).powi(2) / mu[i].powi(3))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("inverse-Gaussian dispersion estimate is not positive".to_string());
             }
@@ -1085,7 +1100,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| (y[i] - mu[i]).powi(2) / mu[i].powf(p))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("Tweedie dispersion estimate is not positive".to_string());
             }

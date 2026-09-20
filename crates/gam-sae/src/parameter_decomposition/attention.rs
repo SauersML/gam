@@ -97,9 +97,10 @@ use std::fmt;
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::categorical::{CategoricalError, log_softmax_with_error};
 use gam_runtime::resource::{MemoryGovernor, MemoryReservation, MemoryReservationError};
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, CowArray, Ix2, ShapeBuilder};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, CowArray, Ix2, ShapeBuilder};
 use serde::{Deserialize, Serialize};
 
+use crate::parameter_decomposition::block::{down, rms_norm_band, up};
 use crate::parameter_decomposition::gated_rewrite::{GatedRewriteError, MaskedNorm};
 
 /// Largest position magnitude whose differences stay exact in `f64`:
@@ -555,21 +556,29 @@ pub fn head_rms_norm(
 ///
 /// For one head row `x̂` with radius `r`, `y(x) = w ⊙ x ν(x)` with
 /// `ν = s^{-1/2}`, `s(x) = mean x² + ε`. The radius bounds `|y_c(x) − fl(y_c(x̂))|` for
-/// every `x` in the box, by the identity
-/// `y_c(x) − y_c(x̂) = w_c [(x_c − x̂_c) ν(x) + x̂_c (ν(x) − ν(x̂))]`:
-/// - each square's box bound gives `|s(x) − s(x̂)| ≤ Δs = mean(2|x̂_d| r_d + r_d²)`;
-/// - so `s ≥ s_lo = max(ŝ (1 − γ_{d+2}) − Δs / (1 − γ_{d+4}) − γ_7 (ŝ + Δs), ε)`,
-///   covering the rounding of `ŝ`, of `Δs` (a box product per coordinate, `d − 1`
-///   sums and the mean, so `γ_{d+4}`; it is rounded up where it is subtracted) and
-///   the expression's own seven: the two constants `1 − γ`, the product, the
-///   division, the two subtractions, and the allowance's own sum;
-/// - `ν` and `|ν'| = ½ s^{-3/2}` both decrease in `s`, so `ν(x) ≤ s_lo^{-1/2}` and, by
-///   the mean value inequality, `|ν(x) − ν(x̂)| ≤ ½ s_lo^{-3/2} Δs`.
+/// every `x` in the box by the smaller of two bounds.
 ///
-/// The radius is `|w_c| (r_c s_lo^{-1/2} + |x̂_c| ½ s_lo^{-3/2} Δs)`, plus the
-/// evaluation's own rounding `γ_{d+6} |fl(y_c)|` (`ν` from the stored row is `γ_{d+4}`
-/// relative, the two products `γ_2`). The total is divided by `1 − γ_{d+12}` for the
-/// radius's own arithmetic.
+/// The derived bound is `|y_c(x) − y_c(x̂)| + |y_c(x̂) − fl(y_c(x̂))|`:
+/// - The second term is the head row's [`rms_norm_band`]. That is the band of this
+///   program, and it carries binary64's underflow.
+/// - The first term uses the identity
+///   `y_c(x) − y_c(x̂) = w_c [(x_c − x̂_c) ν(x) + x̂_c (ν(x) − ν(x̂))]`.
+///   - Each square's box bound gives `|s(x) − s(x̂)| ≤ Δs = mean(r_d (2|x̂_d| + r_d))`,
+///     so `s(x) ≥ s_lo = max(s(x̂) − Δs, ε)`.
+///   - `ν` and `|ν'| = ½ s^{-3/2}` both decrease in `s`. So `ν(x) ≤ s_lo^{-1/2}`, and by
+///     the mean value inequality `|ν(x) − ν(x̂)| ≤ ½ s_lo^{-3/2} Δs`.
+///   - Together the term is at most `|w_c| (r_c s_lo^{-1/2} + |x̂_c| ½ s_lo^{-3/2} Δs)`.
+///
+/// The range bound is `|w_c| √d + |fl(y_c(x̂))|`. Every `x` has `x_c² ≤ d · mean x²`, so
+/// `|y_c(x)| ≤ |w_c| √d`, and this bound holds on any box. It alone is the radius where:
+/// - `s_lo = 0`, a box that reaches `x = 0` at `ε = 0`;
+/// - [`rms_norm_band`] refuses the head row;
+/// - the derived bound overflows.
+///
+/// Every operation rounds to nearest and then steps one float outward, down for `s_lo` and
+/// up elsewhere. So `s_lo` is a lower bound and the radius an upper bound, both computed in
+/// binary64. A square that rounds into the subnormal range moves by at most an absolute
+/// `2^-1075`, and the one-float step covers that too.
 pub fn head_rms_norm_with_radius(
     rows: ProjectedRows<'_>,
     head_dim: usize,
@@ -587,31 +596,43 @@ pub fn head_rms_norm_with_radius(
     let values = head_rms_norm(rows.values, head_dim, epsilon, gain)?;
     let per_head = head_rows(&rows.values, head_dim)?;
     let per_head_radius = head_rows(&rows.radius, head_dim)?;
-    let evaluation = accumulation_growth(head_dim + 6);
-    let square_growth = accumulation_growth(head_dim + 2);
-    let spread_growth = accumulation_growth(head_dim + 4);
-    let floor_growth = accumulation_growth(7);
-    let dominance = 1.0 - accumulation_growth(head_dim + 12);
     let head_width = head_dim as f64;
+    let root_width = up(head_width.sqrt());
     let values_view = values.view();
     let normalized = head_rows(&values_view, head_dim)?;
     let mut normalized_radius = Array2::zeros(normalized.dim());
-    for (row, (x, r)) in per_head.rows().into_iter().zip(per_head_radius.rows()).enumerate() {
-        let computed = x.iter().map(|value| value * value).sum::<f64>() / head_width + epsilon;
-        let spread = x
+    for (row, ((x, r), y)) in per_head
+        .rows()
+        .into_iter()
+        .zip(per_head_radius.rows())
+        .zip(normalized.rows())
+        .enumerate()
+    {
+        let squares = x.iter().fold(0.0, |sum, &value| down(sum + down(value * value)));
+        let spread = up(x
             .iter()
             .zip(r.iter())
-            .map(|(&value, &radius)| box_product(value, radius, value, radius))
-            .sum::<f64>()
-            / head_width;
-        let floor = (computed * (1.0 - square_growth) - spread / (1.0 - spread_growth) - floor_growth * (computed + spread))
-            .max(epsilon);
-        let inverse_root = floor.sqrt().recip();
-        let slope = 0.5 * inverse_root * inverse_root * inverse_root;
+            .fold(0.0, |sum, (&value, &radius)| up(sum + up(radius * up(2.0 * value.abs() + radius))))
+            / head_width);
+        let floor = down(down(down(squares / head_width) + epsilon) - spread).max(epsilon);
+        let band = if floor > 0.0 {
+            rms_norm_band(epsilon, gain, x.insert_axis(Axis(0)), y.insert_axis(Axis(0))).ok()
+        } else {
+            None
+        };
+        let inverse_root = up(down(floor.sqrt()).recip());
+        let slope_spread = up(0.5 * up(inverse_root * up(inverse_root * up(inverse_root * spread))));
         for c in 0..head_dim {
-            normalized_radius[[row, c]] = (gain[c].abs() * (r[c] * inverse_root + x[c].abs() * slope * spread)
-                + evaluation * normalized[[row, c]].abs())
-                / dominance;
+            let weight = gain[c].abs();
+            let range = up(up(weight * root_width) + y[c].abs());
+            let derived = band.as_ref().map(|band| {
+                up(up(weight * up(up(r[c] * inverse_root) + up(x[c].abs() * slope_spread))) + band[[0, c]])
+            });
+            // A derived bound that overflowed, or is NaN from `0 · ∞`, is not below the range bound.
+            normalized_radius[[row, c]] = match derived {
+                Some(bound) if bound < range => bound,
+                _ => range,
+            };
         }
     }
     let radius = normalized_radius
@@ -2609,9 +2630,8 @@ mod tests {
     ///   `(0, 1/4)`, unit gains and `ε = 1/64`.
     /// - Why first order fails: moving `x_2` down by its radius raises `ν` convexly,
     ///   so `y_1` moves by more than the linearization's bound.
-    /// - How it is compared: the exact norm at each dyadic sample is checked in
-    ///   double-double without a square root. For `y = x_c / √s > 0`,
-    ///   `y ∈ [ŷ − ρ, ŷ + ρ]` holds exactly when `max(ŷ − ρ, 0)² s ≤ x_c² ≤ (ŷ + ρ)² s`.
+    /// - How it is compared: the exact norm at each dyadic sample is checked by
+    ///   [`encloses_unit_rms_norm`].
     /// - Control: the first-order radius misses the sample `x_2 = 1/4`.
     #[test]
     fn query_key_norm_radius_encloses_the_exact_norm_across_the_input_box() {
@@ -2622,15 +2642,7 @@ mod tests {
         let (normalized, bound) =
             head_rms_norm_with_radius(ProjectedRows { values: rows.view(), radius: radius.view() }, 2, epsilon, gain.view())
                 .expect("finite head row");
-        let quad = Quad::from_f64;
-        let encloses = |x: [f64; 2], c: usize, center: f64, reach: f64| {
-            let s = (quad(x[0]) * quad(x[0]) + quad(x[1]) * quad(x[1])) / quad(2.0) + quad(epsilon);
-            let square = quad(x[c]) * quad(x[c]);
-            let low = quad(center) - quad(reach);
-            let low = if low.0 < 0.0 { quad(0.0) } else { low };
-            let high = quad(center) + quad(reach);
-            (low * low * s - square).0 <= 0.0 && (square - high * high * s).0 <= 0.0
-        };
+        let encloses = |x: [f64; 2], c: usize, center: f64, reach: f64| encloses_unit_rms_norm(&x, epsilon, c, center, reach);
         for x2 in [0.25, 0.375, 0.5, 0.625, 0.75] {
             for c in 0..2 {
                 assert!(
@@ -2649,5 +2661,109 @@ mod tests {
             !encloses([0.125, 0.25], 0, normalized[[0, 0]], first_order),
             "the first-order radius {first_order} must miss the exact norm at x_2 = 1/4"
         );
+    }
+
+    /// Whether the exact unit-gain RMS norm `y_c = x_c / √s`, `s = mean x² + ε`, lies in
+    /// `[center − reach, center + reach]`, checked in double-double without a square root.
+    /// `y_c` has the sign of `x_c`, so for `x_c < 0` the interval is reflected through zero.
+    /// For `y ≥ 0`, `y ∈ [low, high]` holds exactly when `high ≥ 0` and
+    /// `max(low, 0)² s ≤ x_c² ≤ high² s`.
+    fn encloses_unit_rms_norm(x: &[f64], epsilon: f64, c: usize, center: f64, reach: f64) -> bool {
+        let quad = Quad::from_f64;
+        let s = x.iter().fold(quad(0.0), |sum, &value| sum + quad(value) * quad(value)) / quad(x.len() as f64)
+            + quad(epsilon);
+        let center = if x[c] < 0.0 { -center } else { center };
+        let square = quad(x[c]) * quad(x[c]);
+        let low = quad(center) - quad(reach);
+        let low = if low.0 < 0.0 { quad(0.0) } else { low };
+        let high = quad(center) + quad(reach);
+        high.0 >= 0.0 && (low * low * s - square).0 <= 0.0 && (square - high * high * s).0 <= 0.0
+    }
+
+    /// A zero-epsilon head row whose squares round into the subnormal range keeps its
+    /// radius around the exact norm, where the relative-only band misses by ten orders.
+    /// - Setup: the head row `x̂ = (10^-160, 0)` with zero radius, unit gains and `ε = 0`.
+    ///   Its square `10^-320` is subnormal, so `ŷ_1` is off `√2` by a relative `5.6·10^-6`.
+    /// - How it is compared: with `ε = 0` the exact norm is scale invariant, so
+    ///   `y(x̂) = y(1, 0) = (√2, 0)` exactly, checked at `(1, 0)` where double-double is exact
+    ///   enough.
+    /// - Control: the relative-only band `γ_(d+6) |ŷ_1|` misses `√2`.
+    #[test]
+    fn query_key_norm_radius_encloses_a_zero_epsilon_row_whose_squares_underflow() {
+        let rows = array![[1e-160, 0.0]];
+        let radius = array![[0.0, 0.0]];
+        let gain = array![1.0, 1.0];
+        let (normalized, bound) =
+            head_rms_norm_with_radius(ProjectedRows { values: rows.view(), radius: radius.view() }, 2, 0.0, gain.view())
+                .expect("finite head row");
+        for c in 0..2 {
+            assert!(
+                encloses_unit_rms_norm(&[1.0, 0.0], 0.0, c, normalized[[0, c]], bound[[0, c]]),
+                "coordinate {c}: the exact norm lies outside {} ± {}",
+                normalized[[0, c]],
+                bound[[0, c]]
+            );
+        }
+        assert!(
+            bound[[0, 0]] < 0.01,
+            "the radius {} must come from the underflow-aware band, not the range bound √2 + |ŷ_1|",
+            bound[[0, 0]]
+        );
+        let relative = accumulation_growth(2 + 6) * normalized[[0, 0]].abs();
+        assert!(
+            !encloses_unit_rms_norm(&[1.0, 0.0], 0.0, 0, normalized[[0, 0]], relative),
+            "the relative-only band {relative} must miss the exact norm √2 of {}",
+            normalized[[0, 0]]
+        );
+    }
+
+    /// A zero-epsilon head row whose radius box reaches `x = 0` has no lower bound on its
+    /// mean square, so its radius is the range bound `|w_c| √d + |ŷ_c|`: finite, and it
+    /// encloses the exact norm at every sample of the box, of either sign.
+    /// - Setup: `x̂ = (1, 0)` with radius `(2, 0)`, unit gains and `ε = 0`.
+    #[test]
+    fn query_key_norm_radius_of_a_box_that_reaches_zero_is_the_range_bound() {
+        let rows = array![[1.0, 0.0]];
+        let radius = array![[2.0, 0.0]];
+        let gain = array![1.0, 1.0];
+        let (normalized, bound) =
+            head_rms_norm_with_radius(ProjectedRows { values: rows.view(), radius: radius.view() }, 2, 0.0, gain.view())
+                .expect("finite head row");
+        assert!(bound.iter().all(|reach| reach.is_finite()), "the radius {bound} must be finite");
+        for x1 in [-1.0, -0.5, 0.5, 1.5, 3.0] {
+            for c in 0..2 {
+                assert!(
+                    encloses_unit_rms_norm(&[x1, 0.0], 0.0, c, normalized[[0, c]], bound[[0, c]]),
+                    "coordinate {c} at x_1 = {x1}: the exact norm lies outside {} ± {}",
+                    normalized[[0, c]],
+                    bound[[0, c]]
+                );
+            }
+        }
+    }
+
+    /// Control: a normal-scale head row with zero radius keeps the relative band of its
+    /// `d + 6` roundings, within `γ_(d+8) |ŷ_c|`, so the underflow terms and directed
+    /// rounding do not inflate it.
+    #[test]
+    fn query_key_norm_radius_of_an_exact_normal_row_is_its_relative_band() {
+        let rows = array![[0.125, 0.5]];
+        let radius = array![[0.0, 0.0]];
+        let gain = array![1.0, 1.0];
+        let (normalized, bound) = head_rms_norm_with_radius(
+            ProjectedRows { values: rows.view(), radius: radius.view() },
+            2,
+            0.015625,
+            gain.view(),
+        )
+        .expect("finite head row");
+        for c in 0..2 {
+            let relative = accumulation_growth(2 + 8) * normalized[[0, c]].abs();
+            assert!(
+                bound[[0, c]] <= relative,
+                "coordinate {c}: the radius {} exceeds the relative band {relative}",
+                bound[[0, c]]
+            );
+        }
     }
 }

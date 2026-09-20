@@ -126,6 +126,28 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::KeyedPtxModuleCache;
+
+        #[test]
+        fn poisoned_keyed_module_map_remains_accessible() {
+            let cache = KeyedPtxModuleCache::<u32>::new();
+            assert!(cache.lock_modules().is_empty());
+            let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let entries = cache.lock_modules();
+                assert!(entries.is_empty());
+                panic!("injected lock-holder failure");
+            }));
+            assert!(refusal.is_err());
+            assert!(cache.modules.is_poisoned());
+            let recovered = cache.lock_modules();
+            assert!(recovered.is_empty());
+            drop(recovered);
+            assert!(cache.lock_modules().is_empty());
+        }
+    }
+
     impl<K: Eq + std::hash::Hash + Copy + std::fmt::Display> Default for KeyedPtxModuleCache<K> {
         fn default() -> Self {
             Self::new()

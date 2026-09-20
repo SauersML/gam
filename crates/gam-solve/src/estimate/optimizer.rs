@@ -1,19 +1,19 @@
 use super::*;
+use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
 use crate::estimate::evaluation::{
     materialize_link_outer_hessian, sas_effective_epsilon, sas_effective_epsilon_second,
     sas_log_delta_edge_barriercostgrad, sas_log_delta_edge_barriercostgradhess,
     sas_log_deltaridgeweight,
 };
-use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
 use crate::estimate::penalty::scaled_covariance;
 use crate::estimate::prefit::{
     arm_jeffreys_on_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
     reject_prefit_unpenalized_rank_deficiency,
 };
 use gam_linalg::matrix::FactorizedSystem;
-use gam_linalg::utils::KahanSum;
-use gam_problem::dispersion_cov::se_from_covariance;
+use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::OrderedRhoBounds;
+use gam_problem::dispersion_cov::se_from_covariance;
 use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -244,14 +244,15 @@ impl<'a> OriginalBasisHessianFactor<'a> {
         &self,
         dimension: usize,
     ) -> Result<f64, gam_linalg::utils::CertifiedSymmetricSolveError> {
-        let solve = |values: &mut [f64]| -> Result<(), gam_linalg::utils::CertifiedSymmetricSolveError> {
-            let rhs = Array2::from_shape_fn((dimension, 1), |(row, _)| values[row]);
-            let solution = self.solve_matrix(&rhs)?;
-            for (slot, value) in values.iter_mut().zip(solution.iter()) {
-                *slot = *value;
-            }
-            Ok(())
-        };
+        let solve =
+            |values: &mut [f64]| -> Result<(), gam_linalg::utils::CertifiedSymmetricSolveError> {
+                let rhs = Array2::from_shape_fn((dimension, 1), |(row, _)| values[row]);
+                let solution = self.solve_matrix(&rhs)?;
+                for (slot, value) in values.iter_mut().zip(solution.iter()) {
+                    *slot = *value;
+                }
+                Ok(())
+            };
         gam_linalg::condition::estimate_inverse_one_norm(dimension, solve, solve)
     }
 }
@@ -401,12 +402,19 @@ fn negbin_theta_root_rho_gain(
     if basis.nrows() != n || basis.ncols() == 0 {
         return None;
     }
-    if hessian.iter().chain(root_gradient.iter()).any(|v| !v.is_finite()) {
+    if hessian
+        .iter()
+        .chain(root_gradient.iter())
+        .any(|v| !v.is_finite())
+    {
         return None;
     }
     let compressed = crate::penalty_invariance::compress_to_judged_subspace(hessian, basis);
     let (eigenvalues, eigenvectors) = compressed.eigh(faer::Side::Lower).ok()?;
-    if eigenvalues.iter().any(|value| !(value.is_finite() && *value > 0.0)) {
+    if eigenvalues
+        .iter()
+        .any(|value| !(value.is_finite() && *value > 0.0))
+    {
         return None;
     }
     let projected = basis.t().dot(root_gradient);
@@ -675,8 +683,10 @@ fn factorized_marginal_constraint_truncation(
     geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
     conditional_times_constraints: &Array2<f64>,
     factor: &Array2<f64>,
-) -> Result<Result<Option<crate::constrained_posterior::ConstrainedPosteriorCorrection>, String>, EstimationError>
-{
+) -> Result<
+    Result<Option<crate::constrained_posterior::ConstrainedPosteriorCorrection>, String>,
+    EstimationError,
+> {
     let constraints = &geometry.constraints;
     let p = factor.nrows();
     if constraints.a.ncols() != p
@@ -703,11 +713,13 @@ fn factorized_marginal_constraint_truncation(
     };
     let marginal_times_constraints =
         conditional_times_constraints + &factor.dot(&factor.t().dot(&constraints.a.t()));
-    Ok(crate::constrained_posterior::constrained_posterior_correction(
-        marginal_times_constraints.view(),
-        center,
-        constraints,
-    ))
+    Ok(
+        crate::constrained_posterior::constrained_posterior_correction(
+            marginal_times_constraints.view(),
+            center,
+            constraints,
+        ),
+    )
 }
 
 /// Reserve the square matrices that remain live even when inference stays
@@ -946,7 +958,7 @@ pub(crate) fn gaussian_identity_response_center(
         return None;
     }
     let mut weight_sum = 0.0_f64;
-    let mut weighted = KahanSum::default();
+    let mut weighted = CompensatedSum::default();
     for ((&yi, &wi), &oi) in y.iter().zip(w.iter()).zip(offset.iter()) {
         if wi > 0.0 {
             weight_sum += wi;
@@ -956,7 +968,7 @@ pub(crate) fn gaussian_identity_response_center(
     if weight_sum <= 0.0 {
         return None;
     }
-    let m = weighted.sum() / weight_sum;
+    let m = weighted.value() / weight_sum;
     (m.is_finite() && m != 0.0).then_some(m)
 }
 
@@ -1013,7 +1025,7 @@ pub(crate) fn gaussian_identity_response_scale(
         return None;
     }
     let mut weight_sum = 0.0_f64;
-    let mut weighted_sq = KahanSum::default();
+    let mut weighted_sq = CompensatedSum::default();
     for ((&yi, &wi), &oi) in y.iter().zip(w.iter()).zip(offset.iter()) {
         if wi > 0.0 {
             weight_sum += wi;
@@ -1024,7 +1036,7 @@ pub(crate) fn gaussian_identity_response_scale(
     if weight_sum <= 0.0 {
         return None;
     }
-    let rms = (weighted_sq.sum() / weight_sum).sqrt();
+    let rms = (weighted_sq.value() / weight_sum).sqrt();
     // Only normalize when the magnitude is far enough from `O(1)` to matter; a
     // factor within ~one order of magnitude of unity cannot push the objective
     // through the absolute floors, so leave the exact previous path untouched.
@@ -1196,9 +1208,7 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         }
     }
     for anchor in &anchors {
-        if let Err(error) =
-            reml_state.compute_cost_with_ext_count(anchor, external_hyper_count)
-        {
+        if let Err(error) = reml_state.compute_cost_with_ext_count(anchor, external_hyper_count) {
             log::trace!("[OUTER] nuisance anchor candidate rejected: {error:?}");
             continue;
         }
@@ -1504,7 +1514,11 @@ where
         .map(|s| s.initial_rho.len())
         .unwrap_or(0);
     let sas_dim = if sas_optspec.is_some() { 2 } else { 0 };
-    let student_t_dim = if student_t_reference_scale.is_some() { 2 } else { 0 };
+    let student_t_dim = if student_t_reference_scale.is_some() {
+        2
+    } else {
+        0
+    };
     let sasridgeweight = if sas_dim > 0 {
         sas_log_deltaridgeweight()
     } else {
@@ -1613,7 +1627,11 @@ where
             } else {
                 problem
             };
-            let problem = match (corrected_continuation, negbin_rho_seed.as_ref(), continuation_curvature.as_ref()) {
+            let problem = match (
+                corrected_continuation,
+                negbin_rho_seed.as_ref(),
+                continuation_curvature.as_ref(),
+            ) {
                 (true, Some(seed), Some(hessian)) => {
                     problem.with_initial_curvature(seed.clone(), hessian.clone())
                 }
@@ -1670,8 +1688,16 @@ where
                 crate::estimate::rho_domain::coordinate_domain(None, None)
             } else {
                 (
-                    rho_model_domain.0.iter().copied().fold(f64::INFINITY, f64::min),
-                    rho_model_domain.1.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                    rho_model_domain
+                        .0
+                        .iter()
+                        .copied()
+                        .fold(f64::INFINITY, f64::min),
+                    rho_model_domain
+                        .1
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max),
                 )
             };
             let start_bounds = OrderedRhoBounds::new(envelope_lower, envelope_upper)?;
@@ -1749,6 +1775,14 @@ where
                 |state: &mut &mut crate::estimate::reml::RemlState<'_>,
                  rho: &Array1<f64>,
                  face: &[usize]| { state.rail_face_limit(rho, face) },
+            );
+            // The λ→0 end: a covered zero-smoothing face is analytic in λ, so
+            // its first-order law is exact and the face is proven from the
+            // signs of the slopes.
+            let obj = obj.with_zero_smoothing_face(
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>,
+                 face: &[usize]| { state.zero_smoothing_face(rho, face) },
             );
             // #2676: publish the criterion's EXACT invariance — the directions
             // of rho along which the penalty map, and therefore the criterion,
@@ -1857,8 +1891,9 @@ where
             } else if use_sas {
                 let (epsilon_lower, epsilon_upper) =
                     crate::estimate::evaluation::sas_epsilon_domain();
-                let (log_delta_lower, log_delta_upper) =
-                    crate::mixture_link::smooth_bound_support(crate::mixture_link::SAS_LOG_DELTA_BOUND);
+                let (log_delta_lower, log_delta_upper) = crate::mixture_link::smooth_bound_support(
+                    crate::mixture_link::SAS_LOG_DELTA_BOUND,
+                );
                 (
                     vec![epsilon_lower, log_delta_lower],
                     vec![epsilon_upper, log_delta_upper],
@@ -2276,28 +2311,24 @@ where
             // score's own rounding band (#3349), not a literal outer tolerance.
             let log_theta_curvature =
                 theta * theta * theta_profile.info - theta * theta_profile.score;
-            let root_sensitivity = pirls::negbin_theta_score_eta_gradient(
-                y_o.view(),
-                &final_eta,
-                w_o.view(),
-                theta,
-            )
-            .ok()
-            .and_then(|score_eta_gradient| {
-                negbin_theta_root_sensitivity(
-                    &reml_state,
-                    &pirls_res,
-                    &final_rho,
-                    &score_eta_gradient,
-                    theta,
-                    log_theta_curvature,
-                )
-            });
+            let root_sensitivity =
+                pirls::negbin_theta_score_eta_gradient(y_o.view(), &final_eta, w_o.view(), theta)
+                    .ok()
+                    .and_then(|score_eta_gradient| {
+                        negbin_theta_root_sensitivity(
+                            &reml_state,
+                            &pirls_res,
+                            &final_rho,
+                            &score_eta_gradient,
+                            theta,
+                            log_theta_curvature,
+                        )
+                    });
             let theta_root_displacement = root_sensitivity.as_ref().map_or(0.0, |sensitivity| {
                 // The inner certificate accepts `‖r‖ < tol · natural scale`.
-                let mode_band = pirls_res
-                    .final_kkt_tolerance
-                    .map_or(0.0, |tolerance| tolerance * pirls_res.gradient_natural_scale);
+                let mode_band = pirls_res.final_kkt_tolerance.map_or(0.0, |tolerance| {
+                    tolerance * pirls_res.gradient_natural_scale
+                });
                 let mode_displacement = sensitivity.mode_gain * mode_band;
                 let rho_gain = if final_rho.is_empty() {
                     Some(0.0)
@@ -2309,8 +2340,7 @@ where
                                 .as_ref()
                                 .map(|certificate| certificate.lambdas_railed.clone())
                                 .unwrap_or_default();
-                            let invariance =
-                                reml_state.criterion_invariant_directions(&final_rho);
+                            let invariance = reml_state.criterion_invariant_directions(&final_rho);
                             let judged = crate::penalty_invariance::judged_subspace_basis(
                                 final_rho.len(),
                                 &railed,
@@ -2694,8 +2724,9 @@ where
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<InferenceHessianFactor> = None;
-    // The Tier-0 seam runs only inside the inference pass below; a fit run without
-    // inference keeps this typed reason instead of an unexplained absence (#2627).
+    // The Tier-0 seam runs only inside the inference pass below, and only when the
+    // caller requested rho-posterior inference (#3010); any other fit keeps this
+    // typed reason instead of an unexplained absence (#2627).
     let mut rho_posterior = gam_problem::rho_posterior::RhoPosteriorOutcome::NotComputed(
         gam_problem::rho_posterior::RhoPosteriorNotComputed::InferenceNotRequested,
     );
@@ -2753,12 +2784,15 @@ where
         // seed 0) the fs block's raw trace was 6.09e4 against its rank of 22, the
         // admission clamped it to 22, and `edf_total` read 7.322 where
         // `tr(H⁻¹(H − S̃))` is 9.309.
-        let applied_penalties = pirls_res.reparam_result.applied_penalties().map_err(|error| {
-            EstimationError::LayoutError(format!(
-                "projecting the EDF penalty blocks onto the reparameterization's penalized \
+        let applied_penalties = pirls_res
+            .reparam_result
+            .applied_penalties()
+            .map_err(|error| {
+                EstimationError::LayoutError(format!(
+                    "projecting the EDF penalty blocks onto the reparameterization's penalized \
                  subspace failed: {error}"
-            ))
-        })?;
+                ))
+            })?;
         let mut traces = vec![0.0f64; k];
         let mut trace_bands = vec![0.0f64; k];
         let inverse_one_norm = factor.inverse_one_norm_estimate(p_dim)?;
@@ -2908,11 +2942,13 @@ where
                     let mut traces_f = vec![0.0f64; k];
                     let mut trace_bands_f = vec![0.0f64; k];
                     let inverse_one_norm_f =
-                        h_factor.inverse_one_norm_estimate(p_orig).map_err(|error| {
-                            EstimationError::RemlOptimizationFailed(format!(
-                                "EDF reconciliation trace band solve did not certify: {error}"
-                            ))
-                        })?;
+                        h_factor
+                            .inverse_one_norm_estimate(p_orig)
+                            .map_err(|error| {
+                                EstimationError::RemlOptimizationFailed(format!(
+                                    "EDF reconciliation trace band solve did not certify: {error}"
+                                ))
+                            })?;
                     for (kk, cp) in applied_penalties.iter().enumerate() {
                         if kk >= lambdas.len() {
                             continue;
@@ -2943,8 +2979,9 @@ where
                         // (#2470, #2901).
                         let solved_rhs = h_factor.solved_rhs(&root_orig);
                         let residual = h_orig.dot(&sol) - &solved_rhs;
-                        let h_orig_max_abs =
-                            h_orig.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+                        let h_orig_max_abs = h_orig
+                            .iter()
+                            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
                         trace_bands_f[kk] = gam_linalg::roundoff::solved_penalty_trace_band(
                             lambdas[kk],
                             solved_rhs.view(),
@@ -3112,17 +3149,16 @@ where
             // 1/φ factor, which cancels in H⁻¹g; multiplying this displacement
             // by `cov_scale=φ` would move the Gaussian centre by an extra φ.
             let center_t = pirls_res.beta_transformed.as_ref() - &center_step_unscaled;
-            let mut correction =
-                crate::constrained_posterior::constrained_posterior_correction(
-                    sigma_at.view(),
-                    &center_t,
-                    constraints,
-                )
-                .map_err(|reason| {
-                    EstimationError::RemlOptimizationFailed(format!(
-                        "constrained posterior moments failed: {reason}"
-                    ))
-                })?;
+            let mut correction = crate::constrained_posterior::constrained_posterior_correction(
+                sigma_at.view(),
+                &center_t,
+                constraints,
+            )
+            .map_err(|reason| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "constrained posterior moments failed: {reason}"
+                ))
+            })?;
             let qs = &pirls_res.reparam_result.qs;
             if let Some(value) = correction.as_mut() {
                 value.lift = qs.dot(&value.lift);
@@ -3133,12 +3169,14 @@ where
                         .to_string(),
                 )
             })?;
-            Some(crate::constrained_posterior::ConstrainedPosteriorGeometry::with_moments(
-                constraints_internal.clone(),
-                beta_orig_internal.clone(),
-                qs.dot(&center_t),
-                correction,
-            ))
+            Some(
+                crate::constrained_posterior::ConstrainedPosteriorGeometry::with_moments(
+                    constraints_internal.clone(),
+                    beta_orig_internal.clone(),
+                    qs.dot(&center_t),
+                    correction,
+                ),
+            )
         }
         None if needs_constrained_posterior => {
             return Err(EstimationError::RemlOptimizationFailed(
@@ -3180,15 +3218,15 @@ where
         // -- the same projection the certified |Pg| was measured with, even
         // though this gate never weighs one against the other.
         let bounds = (lower, upper);
-        let projected =
-            crate::rho_optimizer::rail_projected_gradient_norm(&final_rho, &gradient, Some(&bounds));
+        let projected = crate::rho_optimizer::rail_projected_gradient_norm(
+            &final_rho,
+            &gradient,
+            Some(&bounds),
+        );
         (value, gradient, projected)
     };
-    let shipped_point_is_certified = shipped_joint_point_is_certified(
-        &final_rho,
-        &final_link_coords,
-        &outer_result.rho,
-    );
+    let shipped_point_is_certified =
+        shipped_joint_point_is_certified(&final_rho, &final_link_coords, &outer_result.rho);
     let certificate_valid = final_rho.is_empty()
         || (outer_result.converged()
             && outer_result
@@ -3286,7 +3324,9 @@ where
                         super::reml::CriterionRankPredicate::RootScale => true,
                         // Only a Firth term supplies a structural rank, and a Firth
                         // fit publishes no band-identified subspace.
-                        super::reml::CriterionRankPredicate::StructuralRank => break 'subspace None,
+                        super::reml::CriterionRankPredicate::StructuralRank => {
+                            break 'subspace None;
+                        }
                     };
                     (
                         super::identified_hessian::FittedHessianSpectrum::from_eigensystem(
@@ -3315,7 +3355,10 @@ where
                 Some(crate::model_types::RankConstancyNotEvaluated::NoSmoothingParameters)
             } else if !final_link_coords.is_empty() {
                 Some(crate::model_types::RankConstancyNotEvaluated::LinkCoordinates)
-            } else if reml_state.active_constraint_free_basis(priced_pirls).is_some() {
+            } else if reml_state
+                .active_constraint_free_basis(priced_pirls)
+                .is_some()
+            {
                 Some(crate::model_types::RankConstancyNotEvaluated::ActiveConstraintFace)
             } else if priced_pirls.finalweights.len() != rows
                 || (priced_pirls.solve_c_nontrivial
@@ -3553,12 +3596,16 @@ where
             // `y ~ s(x) + s(x, g, bs='fs')`, spectrum [−1.12e5, 7.94e4] against
             // [−1.2e-15, 121] for the engine's `S̃`.
             let p_t = qs.ncols();
-            let applied_penalties = pirls_res.reparam_result.applied_penalties().map_err(|error| {
-                EstimationError::LayoutError(format!(
-                    "projecting the influence-matrix penalty blocks onto the \
+            let applied_penalties =
+                pirls_res
+                    .reparam_result
+                    .applied_penalties()
+                    .map_err(|error| {
+                        EstimationError::LayoutError(format!(
+                            "projecting the influence-matrix penalty blocks onto the \
                      reparameterization's penalized subspace failed: {error}"
-                ))
-            })?;
+                        ))
+                    })?;
             let mut s_t = Array2::<f64>::zeros((p_t, p_t));
             for (kk, cp) in applied_penalties.iter().enumerate() {
                 if kk >= lambdas.len() {
@@ -3672,6 +3719,30 @@ where
         // errors beside the conditional ones below, because a `p × p` matrix is
         // what its governor refused (#3283); it charges the correction's
         // workspace here, where the dense bundle already holds it.
+        //
+        // The ρ-block rails, not the theta-wide `railed_facts`: the Hessians
+        // judged and sampled below (this correction and the Tier-0 proposal)
+        // are ρ-Hessians, and a railed link-shape coordinate is not one of
+        // their axes.
+        let certified_railed_rho: Vec<usize> = outer_result
+            .criterion_certificate
+            .as_ref()
+            .map(|certificate| {
+                certificate
+                    .lambdas_railed
+                    .iter()
+                    .copied()
+                    .chain(
+                        certificate
+                            .stationarity
+                            .rails()
+                            .iter()
+                            .map(|rail| rail.index),
+                    )
+                    .filter(|&index| index < final_rho.len())
+                    .collect()
+            })
+            .unwrap_or_default();
         let smoothing_workspace = if beta_covariance_unscaled.is_some() {
             Ok(None)
         } else {
@@ -3748,7 +3819,9 @@ where
                 certificate_contradicted_curvature_error(
                     outer_result.criterion_certificate.as_ref(),
                     outer_result.final_hessian.as_ref(),
-                    reml_state.criterion_invariant_directions(&final_rho).as_ref(),
+                    reml_state
+                        .criterion_invariant_directions(&final_rho)
+                        .as_ref(),
                 )
             } else {
                 None
@@ -3772,22 +3845,6 @@ where
                 )
             }))
             .collect();
-            // The ρ-block rails, not the theta-wide `railed_facts`: the Hessian
-            // judged below is the ρ-Hessian, and a railed link-shape
-            // coordinate is not one of its axes.
-            let certified_railed_rho: Vec<usize> = outer_result
-                .criterion_certificate
-                .as_ref()
-                .map(|certificate| {
-                    certificate
-                        .lambdas_railed
-                        .iter()
-                        .copied()
-                        .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
-                        .filter(|&index| index < final_rho.len())
-                        .collect()
-                })
-                .unwrap_or_default();
             let smoothing_outcome = reml_state.compute_smoothing_correction_outcome(
                 &final_rho,
                 &lambdas,
@@ -3797,9 +3854,7 @@ where
                 // definiteness must be judged against. Without it the
                 // correction applies a strictly stronger standard than the
                 // certificate did and can reject a fit the outer loop passed.
-                outer_result
-                    .final_gradient()
-                    .unwrap_or(&no_outer_gradient),
+                outer_result.final_gradient().unwrap_or(&no_outer_gradient),
                 // #2748: the rho-Hessian the CERTIFICATE judged, so the
                 // correction can measure how far its own fresh assembly of the
                 // same object at the same point is from it. The gate inside
@@ -3868,16 +3923,23 @@ where
         // inference (`skip_rho_posterior_inference = false`), together with the
         // escalation tier it grades for (quadrature or NUTS over ρ, whichever
         // needs fewer criterion evaluations). Every other fit keeps the typed
-        // `NotComputed(InferenceNotRequested)` set above.
+        // `NotComputed(InferenceNotRequested)` set above. A requested run is not
+        // charged to the search (#3010), so the fitted model, its search-work
+        // counters included, is the same either way.
         if !opts.skip_rho_posterior_inference {
-            (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-                &final_rho,
-                // The box is where λ is numerically resolvable, not the
-                // posterior's support: a draw past a saturated face is valued by
-                // the criterion's exact affine limit from that face, so no
-                // posterior mass is dropped when the box edge moves.
-                &rho_continuation,
-            );
+            (rho_posterior, rho_posterior_escalation) =
+                reml_state.arena.without_charging_the_search(|| {
+                    reml_state.rho_posterior_inference(
+                        &final_rho,
+                        // The box is where λ is numerically resolvable, not the
+                        // posterior's support: a draw past a saturated face is
+                        // valued by the criterion's exact affine limit from that
+                        // face, so no posterior mass is dropped when the box
+                        // edge moves.
+                        &rho_continuation,
+                        &certified_railed_rho,
+                    )
+                });
         }
 
         // Standard errors: prefer the diagonal of the full inverse when
@@ -3971,14 +4033,15 @@ where
                     )
                 },
             )?;
-            factorized_standard_errors = Some(crate::estimate::penalty::factorized_standard_errors(
-                &conditioning,
-                &inverse_diagonal,
-                cov_scale,
-                None,
-                correction,
-                zero_covariance_boundary,
-            )?);
+            factorized_standard_errors =
+                Some(crate::estimate::penalty::factorized_standard_errors(
+                    &conditioning,
+                    &inverse_diagonal,
+                    cov_scale,
+                    None,
+                    correction,
+                    zero_covariance_boundary,
+                )?);
             // #3283: the corrected standard errors of `Vp = Vb + B·Bᵀ` from the
             // same solved diagonal. A constrained fit truncates `Vp` at its own
             // lift, as the dense branch does, from `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`:
@@ -4014,12 +4077,11 @@ where
                             marginal_correction.as_ref(),
                             false,
                         )?;
-                        smoothing_correction_factorized = Some(
-                            crate::model_types::FactorizedSmoothingCorrection {
+                        smoothing_correction_factorized =
+                            Some(crate::model_types::FactorizedSmoothingCorrection {
                                 factor,
                                 standard_errors,
-                            },
-                        );
+                            });
                     }
                     Err(reason) => {
                         log::debug!(
@@ -4203,10 +4265,13 @@ where
     // gam#3832). The identity-link weighted RSS is that sum, formed from the
     // response directly and snapped with the dispersion it sets.
     let working_residual = if cfg.likelihood.spec.is_gaussian_identity() {
-        Some(WorkingResidual { weighted_norm: weighted_rss, rows: n as usize })
+        Some(WorkingResidual {
+            weighted_norm: weighted_rss,
+            rows: n as usize,
+        })
     } else {
-        let scores = &pirls_res.solveweights
-            * &(&pirls_res.solveworking_response - &pirls_res.final_eta);
+        let scores =
+            &pirls_res.solveweights * &(&pirls_res.solveworking_response - &pirls_res.final_eta);
         WorkingResidual::of(pirls_res.solveweights.view(), scores.view())
     };
     let inference = opts.compute_inference.then(|| FitInference {
@@ -4294,8 +4359,10 @@ where
             sigma: fitted_sigma,
             nu: fitted_nu,
         },
-    ) = (&mut reported_family.response, &pirls_res.likelihood.spec.response)
-    {
+    ) = (
+        &mut reported_family.response,
+        &pirls_res.likelihood.spec.response,
+    ) {
         *sigma = *fitted_sigma;
         *nu = *fitted_nu;
     }
@@ -4694,7 +4761,10 @@ mod negative_binomial_joint_certificate_tests {
             array![[1.0, 2.0], [2.0, 1.0]],
             array![[f64::NAN, 0.0], [0.0, 1.0]],
         ] {
-            assert_eq!(negbin_theta_root_rho_gain(&hessian, judged.as_ref(), &j), None);
+            assert_eq!(
+                negbin_theta_root_rho_gain(&hessian, judged.as_ref(), &j),
+                None
+            );
         }
         assert_eq!(
             negbin_theta_root_rho_gain(&array![[1.0]], judged.as_ref(), &j),
@@ -4711,11 +4781,20 @@ mod negative_binomial_joint_certificate_tests {
         let scores = profile(3.0, 5.0, 1.0e-9);
         let rounding = theta * 1.0e-9 / (theta * theta * 5.0 - theta * 3.0);
         assert_eq!(negbin_theta_joint_bound(theta, &scores, 0.0), rounding);
-        assert_eq!(negbin_theta_joint_bound(theta, &scores, 1.0e-6), rounding + 1.0e-6);
+        assert_eq!(
+            negbin_theta_joint_bound(theta, &scores, 1.0e-6),
+            rounding + 1.0e-6
+        );
         for undefined in [f64::NAN, f64::INFINITY, -1.0] {
-            assert_eq!(negbin_theta_joint_bound(theta, &scores, undefined), rounding);
+            assert_eq!(
+                negbin_theta_joint_bound(theta, &scores, undefined),
+                rounding
+            );
         }
-        assert_eq!(negbin_theta_joint_bound(theta, &profile(2.0, 1.0, 1.0e-9), 0.0), 0.0);
+        assert_eq!(
+            negbin_theta_joint_bound(theta, &profile(2.0, 1.0, 1.0e-9), 0.0),
+            0.0
+        );
     }
 
     /// `∂score/∂η` against a central difference of the profile score itself.

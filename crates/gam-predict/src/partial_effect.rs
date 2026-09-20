@@ -4,10 +4,13 @@
 //! The grid comes from the saved term specification
 //! (`gam_inference::partial_dependence`), the design from the model's own
 //! mean-block builder at those rows, and the bands from
-//! `gam_inference::effects::effect_bands` on the term's coefficient block and
-//! the covariance the fit publishes. Every front end (Python, CLI) reads this
-//! one function, so their numbers agree by construction.
+//! `gam_inference::effects::effect_bands` on the term's coefficient block, the
+//! covariance the fit publishes and the fit's own interval reference (Student-t
+//! on `n − edf` when the dispersion is estimated, normal otherwise). Every front
+//! end (Python, CLI) reads this one function, so their numbers agree by
+//! construction.
 
+use crate::IntervalReference;
 use gam_data::EncodedDataset;
 use gam_inference::effects::{EffectBands, effect_bands};
 pub use gam_inference::partial_dependence::PartialDependenceGrid;
@@ -135,6 +138,8 @@ pub struct PartialEffect {
 /// centred effect the fit estimated and its covariance is the term block
 /// `V_tt` of the covariance the fit publishes: smoothing-parameter corrected
 /// when the fit carries it, conditional otherwise, and named in the result.
+/// The critical values come from the fit's [`IntervalReference`], the same
+/// pivot law its predict intervals and Wald tests read.
 pub fn partial_effect(
     model: &FittedModel,
     term: &str,
@@ -192,11 +197,13 @@ pub fn partial_effect(
             term_design.ncols()
         ));
     }
+    let reference = IntervalReference::of_fit(fit).map_err(|error| error.to_string())?;
     let bands = effect_bands(
         fit.beta.slice(s![block.clone()]),
         covariance.slice(s![block.clone(), block]),
         term_design.view(),
         level,
+        reference,
     )
     .map_err(|error| format!("partial effect of {term:?}: {error}"))?;
     Ok(PartialEffect {

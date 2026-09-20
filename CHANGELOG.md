@@ -1,5 +1,18 @@
 ## Unreleased
 
+- **Warm-start lookup cache rows belong to one store root and see sibling writes** (#3882, #3885).
+  The process-global lookup cache was keyed by fingerprint alone, so a second
+  `WarmStartStore` on a different root returned, touched and could TTL-expire the
+  first root's entry. Rows are now keyed by the key directory. The fast path also
+  checked only the chosen meta file's mtime, so it never saw a better entry that a
+  sibling process wrote into the same key dir, and its own access-stamp rewrite
+  invalidated the row on every hit. A hit now requires both the meta and the key-dir
+  mtimes to match, and the row is re-recorded after the touch. `touch_lookup_hit` is
+  removed.
+- **`process_monitor` reads every `/proc/self` field through one parser** (#4073).
+  `parse_status_kb`, `parse_status_count` and `parse_io_bytes` were three copies of
+  "the integer after the key"; they are replaced by `parse_proc_value`, which takes the
+  first whitespace-separated token after the key for `status` and `io` lines alike.
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is
@@ -8,13 +21,6 @@
   fields that no dispatch decision read: `xtwx_n_min`, `xtwx_use_fused_below_p`,
   `syevd_min_p`, `sparse_min_nnz`, `keep_design_resident_min_bytes`,
   `prefer_gpu_factorization_min_p` and `mixed_precision`.
-
-- **One NVRTC module-cache entry** (#4097). `PtxModuleCache::get_or_load`, the entry for a
-  kernel with its own NVRTC options, is removed: its only caller (the survival V/G/H
-  row-jet kernel) compiled with the shared options anyway, and now uses `get_or_compile`.
-  Every cache compile goes through one shared-options path, so a missing libnvrtc keeps its
-  typed error and compile failures are labelled once. `KeyedPtxModuleCache` recovers a
-  poisoned lock instead of silently recompiling on every call.
 
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from

@@ -8,7 +8,6 @@ arguments through the FFI, hands payloads off to ``_survival`` /
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Sequence, cast, overload
@@ -205,23 +204,30 @@ class Model:
             NB theta frozen at its fitted value) and Gamma-log (Pearson score,
             so the set is a band in ``y / mu``) refit the augmented penalized
             likelihood per candidate at the frozen penalty. Discrete ties are
-            broken by a seeded uniform so the set is exact rather than
-            conservative. Offsets are honoured. A model fitted with prior
+            broken by one independent uniform per prediction row. Numerical
+            uncertainty is enclosed conservatively. Offsets are honoured. A model
+            fitted with prior
             weights raises ``InvalidConfigurationError``: the candidate point
             has no weight, so use ``calibration=`` (split conformal) instead.
             The saved model carries only the ``p x p`` frozen penalty and its
             smoothing-parameter count, never per-row training data, so the
             labeled rows are passed again here. The per-row
             ``conformal_certificate`` output column is 0 (exact_frozen: nothing
-            to re-select) or 1 (honest_refit) where the guarantee holds; a
+            to re-select), 1 (honest_refit), or 2 (conservative_frozen: GLM
+            numerical enclosure) where the guarantee holds; a
             negative code is a typed refusal where the row carries the
             frozen-penalty set with no finite-sample guarantee for the
             selection step (several smoothing parameters, a payload without the
             count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
             non-Gaussian fit that selected a smoothing parameter or NB theta).
+            Coverage is marginal under exchangeability of the supplied rows
+            and a fixed symmetric design/penalty construction, not conditional
+            on features. A training-only learned basis need not satisfy this.
             The set is a union of ``conformal_set_components`` intervals and
             the bounds report its outer envelope (NaN for an empty randomized
-            set). With ``calibration`` it is the
+            set). ``conformal_lower_closed`` and ``conformal_upper_closed`` are
+            1 when the corresponding finite endpoint is included and 0 otherwise;
+            both are 0 for an empty set. With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
@@ -1570,8 +1576,9 @@ class Model:
         (``Summary.aic_corrected``) that ``gamfit.compare_models`` ranks on
         (Burnham & Anderson's relative likelihood). Returns ``> 1`` when this
         fit is better supported than ``other`` and ``< 1`` otherwise, agreeing
-        with the winner ``gamfit.compare_models`` reports. Both fits must share
-        the response family and the number of observations.
+        with the winner ``gamfit.compare_models`` reports; ``inf`` / ``0.0``
+        once the ratio leaves the float range (AIC_c gap past ~1419.6). Both
+        fits must share the response family and the number of observations.
 
         This is **not** a Bayes factor: it integrates over no prior and must
         not be read against Jeffreys / Kass-Raftery thresholds.
@@ -1581,10 +1588,9 @@ class Model:
             raise TypeError(
                 f"evidence_ratio_vs expects a gamfit.Model, got {type(other).__name__}"
             )
-        log_ratio = rust_module().log_evidence_ratio(
+        return rust_module().evidence_ratio(
             self._prediction_model, other._prediction_model
         )
-        return math.exp(log_ratio)
 
     def _model_class_from_payload(self) -> str:
         return self._prediction_model.predict_class_name

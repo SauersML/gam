@@ -5,8 +5,8 @@ use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, FaerSvd};
 use gam_linalg::matrix::symmetrize_in_place;
-use gam_linalg::utils::KahanSum;
-use ndarray::{Array1, Array2, ArcArray2, ArrayView2, ArrayViewMut2, s};
+use gam_math::sparse_grid::CompensatedSum;
+use ndarray::{ArcArray2, Array1, Array2, ArrayView2, ArrayViewMut2, s};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -42,8 +42,7 @@ pub enum PenaltyRepresentation {
     },
 }
 
-impl PenaltyRepresentation {
-}
+impl PenaltyRepresentation {}
 
 #[derive(Clone)]
 pub struct PenaltyMatrix {
@@ -212,16 +211,16 @@ fn trace_root_penalty_in_orthogonal_basis(
         1.0,
         Par::Seq,
     );
-    let mut trace = KahanSum::default();
+    let mut trace = CompensatedSum::default();
     for l in 0..cols {
-        let mut diag_ll = KahanSum::default();
+        let mut diag_ll = CompensatedSum::default();
         for i in 0..root.nrows() {
             let v = projected[(i, l)];
             diag_ll.add(v * v);
         }
-        trace.add(diag_ll.sum() / (rotated_eigenvalues[l] + delta));
+        trace.add(diag_ll.value() / (rotated_eigenvalues[l] + delta));
     }
-    trace.sum()
+    trace.value()
 }
 
 pub fn trace_reduced_penalty_covariance(
@@ -234,13 +233,13 @@ pub fn trace_reduced_penalty_covariance(
         "trace_reduced_penalty_covariance dimension mismatch"
     );
     let r = covariance_basis.nrows();
-    let mut trace = KahanSum::default();
+    let mut trace = CompensatedSum::default();
     for i in 0..r {
         for j in 0..r {
             trace.add(covariance_basis[[i, j]] * reduced_penalty[[j, i]]);
         }
     }
-    trace.sum()
+    trace.value()
 }
 
 pub fn trace_penalty_covariance_in_orthogonal_basis(
@@ -384,9 +383,7 @@ pub(crate) fn robust_eigh_faer(
             let eigenvalues = (0..values.dim()).map(|idx| values[idx]).collect();
             Ok((eigenvalues, eigenvectors))
         },
-        |err, _| {
-            EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err))
-        },
+        |err, _| EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err)),
     )
 }
 
@@ -518,7 +515,6 @@ fn compose_qs_from_split(q_pen: &Mat<f64>, q_null: &Mat<f64>, p: usize) -> Mat<f
     }
     qs
 }
-
 
 /// Result of the stable reparameterization algorithm from Wood (2011) Appendix B
 #[derive(Clone)]
@@ -800,12 +796,11 @@ fn decompose_kronecker_factors(
         // Build the factor root from ONLY the range (positive-curvature)
         // directions via the canonical classifier — never the null or
         // negative-curvature directions (#1425).
-        let factor_classes =
-            crate::basis::SpectralClassification::new(
-                &analysis.eigenvalues,
-                analysis.rank_tol,
-                analysis.noise_tol,
-            );
+        let factor_classes = crate::basis::SpectralClassification::new(
+            &analysis.eigenvalues,
+            analysis.rank_tol,
+            analysis.noise_tol,
+        );
         let mut root_j = Array2::zeros((analysis.rank, q_j));
         let mut pos_eigs = Vec::with_capacity(analysis.rank);
         for (row_idx, &i) in factor_classes.range_idx.iter().enumerate() {
@@ -1188,7 +1183,10 @@ impl CanonicalPenalty {
                 self.prior_mean.clone(),
             )
         } else {
-            PenaltyCoordinate::from_dense_root_with_mean(self.root.to_owned(), self.prior_mean.clone())
+            PenaltyCoordinate::from_dense_root_with_mean(
+                self.root.to_owned(),
+                self.prior_mean.clone(),
+            )
         }
     }
 }
@@ -1707,8 +1705,9 @@ fn penalty_spec_has_structure_hint(spec: &crate::PenaltySpec) -> bool {
 fn penalty_spec_local_matrix(spec: &crate::PenaltySpec) -> Array2<f64> {
     match spec {
         crate::PenaltySpec::Block { local, .. } => local.to_owned(),
-        crate::PenaltySpec::Dense(matrix)
-        | crate::PenaltySpec::DenseWithMean { matrix, .. } => matrix.to_owned(),
+        crate::PenaltySpec::Dense(matrix) | crate::PenaltySpec::DenseWithMean { matrix, .. } => {
+            matrix.to_owned()
+        }
     }
 }
 
@@ -1891,7 +1890,9 @@ where
     }
     let balanced = array_to_faer(&balanced_penalty_sum(components, p_total));
     let (eigenvalues, _) = robust_eigh_faer(&balanced, Side::Lower, "balanced penalty matrix")?;
-    let max_bal = eigenvalues.iter().fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    let max_bal = eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
     let tol = balanced_penalty_rank_tolerance(max_bal);
     Ok(eigenvalues.iter().filter(|&&value| value > tol).count())
 }
@@ -2609,11 +2610,8 @@ fn penalized_block_spectrum(
     }
     let resolution = if have_rotation {
         let sigma_max = range_eigenvalues_sorted.first().map_or(0.0, |d| d.sqrt());
-        let band = gam_linalg::roundoff::factor_singular_band(
-            total_root_rows,
-            penalized_rank,
-            sigma_max,
-        );
+        let band =
+            gam_linalg::roundoff::factor_singular_band(total_root_rows, penalized_rank, sigma_max);
         band * band
     } else {
         gam_linalg::roundoff::symmetric_spectrum_rounding_band(&range_eigenvalues_sorted)
@@ -2744,11 +2742,7 @@ pub fn stable_reparameterizationwith_invariant(
         // are used ONLY to build `E`/`S⁺`/traces below; they are NOT applied to
         // `q_pen` or `rs_transformed`, so `Q_s` stays λ-independent and the
         // quasi-Newton coordinate system does not drift at eigenvalue crossings.
-        penalized_block_spectrum(
-            &rs_transformed,
-            lambdas,
-            penalized_rank,
-        )?
+        penalized_block_spectrum(&rs_transformed, lambdas, penalized_rank)?
     } else {
         PenalizedBlockSpectrum {
             eigenvalues: Vec::new(),
@@ -2834,7 +2828,7 @@ pub fn stable_reparameterizationwith_invariant(
     // matching the rank structure embedded in `e_transformed_mat` and avoiding
     // a 1/0 in the trace contraction when an eigenvalue was floored to 0.
     let mut floored_eigs: Vec<f64> = Vec::with_capacity(range_eigs_sorted.len());
-    let mut log_det_sum = KahanSum::default();
+    let mut log_det_sum = CompensatedSum::default();
     for (idx, &ev) in range_eigs_sorted.iter().enumerate() {
         if !ev.is_finite() || ev < -eigenvalue_floor {
             return Err(EstimationError::LayoutError(format!(
@@ -2847,7 +2841,7 @@ pub fn stable_reparameterizationwith_invariant(
             log_det_sum.add(safe_ev.ln());
         }
     }
-    let log_det = log_det_sum.sum();
+    let log_det = log_det_sum.value();
     let delta = 0.0;
 
     // The det1 contractions are independent once the eigensystem is fixed.  Use
@@ -3017,7 +3011,7 @@ pub fn stable_reparameterization_original_frame(
         max_cross_gram_abs: 0.0,
     };
     let mut det1 = Array1::<f64>::zeros(penalties.len());
-    let mut log_det = KahanSum::default();
+    let mut log_det = CompensatedSum::default();
     let penalized_rank = invariant.split.rank();
     let mut s_original = Array2::<f64>::zeros((p, p));
     let mut e_original = Array2::<f64>::zeros((penalized_rank, p));
@@ -3073,7 +3067,7 @@ pub fn stable_reparameterization_original_frame(
 
     Ok(ReparamResult {
         s_transformed: s_original,
-        log_det: log_det.sum(),
+        log_det: log_det.value(),
         det1,
         qs: Array2::eye(p),
         canonical_transformed: penalties.to_vec(),
@@ -3161,7 +3155,7 @@ fn block_original_frame(
         // Each eigenvalue is a sum of non-negative products, exact to its own
         // relative rounding: there is no unresolved one to floor, and one that
         // is not strictly positive has a `−∞` log.
-        let mut log_det = KahanSum::default();
+        let mut log_det = CompensatedSum::default();
         for (index, &eigenvalue) in eigenvalues.iter().enumerate() {
             if !(eigenvalue.is_finite() && eigenvalue > 0.0) {
                 return Err(EstimationError::LayoutError(format!(
@@ -3175,11 +3169,11 @@ fn block_original_frame(
         let mut null_leakage = Vec::with_capacity(members.len());
         for &k in members {
             let local = penalties[k].local_ref();
-            let mut trace = KahanSum::default();
+            let mut trace = CompensatedSum::default();
             for (&eigenvalue, &col) in eigenvalues.iter().zip(cols) {
                 trace.add(local[[col, col]] / eigenvalue);
             }
-            det1.push((k, lambdas[k] * trace.sum()));
+            det1.push((k, lambdas[k] * trace.value()));
             let mut total_sq = 0.0_f64;
             let mut null_sq = 0.0_f64;
             for (col, &is_null) in null_cols.iter().enumerate() {
@@ -3188,12 +3182,16 @@ fn block_original_frame(
                     null_sq += local[[col, col]];
                 }
             }
-            let rel_sq = if total_sq > 0.0 { null_sq / total_sq } else { 0.0 };
+            let rel_sq = if total_sq > 0.0 {
+                null_sq / total_sq
+            } else {
+                0.0
+            };
             null_leakage.push((k, null_sq, rel_sq));
         }
         return Ok(BlockOriginalFrame {
             root: BlockOriginalRoot::Diagonal { eigenvalues },
-            log_det: log_det.sum(),
+            log_det: log_det.value(),
             det1,
             null_leakage,
             cross_gram_abs: 0.0,
@@ -3228,7 +3226,11 @@ fn block_original_frame(
         );
         let null_sq = null_part.squared_norm_l2();
         let total_sq = null_sq + product.squared_norm_l2();
-        let rel_sq = if total_sq > 0.0 { null_sq / total_sq } else { 0.0 };
+        let rel_sq = if total_sq > 0.0 {
+            null_sq / total_sq
+        } else {
+            0.0
+        };
         null_leakage.push((k, null_sq, rel_sq));
         rs_local.push(product);
     }
@@ -3252,7 +3254,7 @@ fn block_original_frame(
         (Vec::new(), Mat::<f64>::zeros(0, 0), 0.0)
     };
     let mut floored = Vec::with_capacity(pen_rank);
-    let mut log_det = KahanSum::default();
+    let mut log_det = CompensatedSum::default();
     for (index, &value) in eigenvalues.iter().enumerate() {
         let value = floor_penalized_eigenvalue(value, index, eigenvalue_floor)?;
         log_det.add(value.ln());
@@ -3285,7 +3287,7 @@ fn block_original_frame(
     }
     Ok(BlockOriginalFrame {
         root: BlockOriginalRoot::Dense(mat_to_array(&e_local)),
-        log_det: log_det.sum(),
+        log_det: log_det.value(),
         det1,
         null_leakage,
         cross_gram_abs,
@@ -3620,8 +3622,7 @@ mod tests {
             .expect("precompute invariant");
 
         let lambdas_inf = vec![f64::INFINITY, 3.0];
-        let inf_result =
-            stable_reparameterizationwith_invariant(&canonical, &lambdas_inf, p, &inv);
+        let inf_result = stable_reparameterizationwith_invariant(&canonical, &lambdas_inf, p, &inv);
         assert!(
             inf_result.is_err(),
             "an infinite lambda must surface as an error, not be silently clamped (#1074)"
@@ -4120,8 +4121,7 @@ mod tests {
             .zip(perturbed.iter())
             .map(|(a, b)| a * b)
             .sum::<f64>();
-        let cosine =
-            inner / (base_norm * perturbed.iter().map(|v| v * v).sum::<f64>().sqrt());
+        let cosine = inner / (base_norm * perturbed.iter().map(|v| v * v).sum::<f64>().sqrt());
         assert!(
             cosine > 1.0 - 1e-8,
             "the fixture must be one the OLD cos > 1 - 1e-8 screen accepted; got cos = {cosine}"
