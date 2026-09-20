@@ -1275,13 +1275,18 @@ impl SaeManifoldTerm {
     /// Weights must be finite and nonnegative, with positive total mass and one
     /// value per term row. Exact zeros represent rows excluded by a designed
     /// estimation split; no numerical epsilon is substituted for zero. They
-    /// are self-normalized to mean `1.0` here (only the *relative* design
-    /// correction matters at the fitted sample size; the absolute `n/budget`
-    /// scale would silently inflate the dispersion estimate against the
-    /// sample-sized dof). Weights that are identically equal after
-    /// normalization (an exact full pass, or any uniform design) are stored
-    /// as `None`, so the unweighted path stays bit-for-bit identical rather
-    /// than "multiplied by 1.0".
+    /// are self-normalized to mean `1.0` over the positive-weight (live) rows
+    /// here (only the *relative* design correction matters at the fitted
+    /// sample size; the absolute `n/budget` scale would silently inflate the
+    /// dispersion estimate against the sample-sized dof). The live rows are
+    /// the fitted sample: `fitted_response_scalar_counts` counts exactly them,
+    /// so the total mass is `Σw = n_live` and a 0/1 estimation mask is stored
+    /// as exactly 0/1. Averaging over the excluded rows as well would scale
+    /// every live row by `n / n_live`, inflating the likelihood dispersion and
+    /// the data-versus-penalty balance by that factor. Weights that are
+    /// identically equal after normalization (an exact full pass, or any
+    /// uniform design) are stored as `None`, so the unweighted path stays
+    /// bit-for-bit identical rather than "multiplied by 1.0".
     pub fn set_row_loss_weights(&mut self, weights: Vec<f64>) -> Result<(), String> {
         // The reciprocal of `with_crosscoder_blocks`'s refusal: block pricing
         // snapshots a full-N pristine copy and prices the Jacobian at the full
@@ -1320,13 +1325,16 @@ impl SaeManifoldTerm {
             self.row_loss_weights = None;
             return Ok(());
         }
-        let mean = weights.iter().sum::<f64>() / weights.len() as f64;
+        // Normalize over the live rows only: a zero-weight row is outside the
+        // fitted sample and must not dilute the mean.
+        let live_rows = weights.iter().filter(|w| **w > 0.0).count();
+        let mean = weights.iter().sum::<f64>() / live_rows as f64;
         self.row_loss_weights = Some(weights.into_iter().map(|w| w / mean).collect());
         Ok(())
     }
 
-    /// The installed (mean-1 normalized) design honesty weights, `None` on the
-    /// exact unweighted path.
+    /// The installed design honesty weights (mean 1 over the positive-weight
+    /// rows), `None` on the exact unweighted path.
     pub fn row_loss_weights(&self) -> Option<&[f64]> {
         self.row_loss_weights.as_deref()
     }
@@ -5464,9 +5472,10 @@ impl SaeManifoldTerm {
         let ard_precisions = self.validated_ard_precisions(rho)?;
         let n = self.n_obs();
         // Design-honesty weights change the relative contribution of rows while
-        // preserving total sample mass: `set_row_loss_weights` normalizes them to
-        // mean one. The ARD energy therefore uses the per-row weights, while its
-        // log-partition normalizer counts the priced coordinate slots exactly.
+        // preserving the live sample mass: `set_row_loss_weights` normalizes them
+        // to mean one over the positive-weight rows. The ARD energy therefore
+        // uses the per-row weights, while its log-partition normalizer counts
+        // the priced coordinate slots exactly.
         let row_w = self.row_loss_weights.as_deref();
         // A hard-TopK coordinate exists only on the rows that select its atom, where
         // `½·log|A|` integrates it (#2933 F27, see `Self::coordinate_prior_rows`).
