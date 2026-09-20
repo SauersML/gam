@@ -184,7 +184,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             log_likelihood,
             penalty_value,
         )?;
-        log::info!("[survival-marginal-slope] frozen-time certificate {verdict:?}");
+        log::debug!("[survival-marginal-slope] frozen-time certificate {verdict:?}");
         Ok(verdict.refusal_reason())
     }
 
