@@ -1437,18 +1437,39 @@ pub fn exact_binary64_sum_sign(
 /// is `(+∞, +1)`; only with negative sign, `(+∞, −1)` (a log-magnitude of
 /// `+∞` with sign `−1` encodes the value `−∞`); with both signs the sum is
 /// the indeterminate `+∞ − ∞`, returned as `(NaN, 0.0)`.  A `−∞`
-/// log-magnitude is `exp(−∞) = 0` and is correctly dropped.
+/// log-magnitude is `exp(−∞) = 0` and is correctly dropped. A `NaN` sign, or a
+/// `NaN` log-magnitude carried by a nonzero sign, is an undefined term and makes
+/// the whole sum undefined: `(NaN, 0.0)`.
 pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
+    signed_log_sum_exp_by(log_mags, |idx| signs[idx])
+}
+
+/// `log Σ_i e^{x_i}`: [`signed_log_sum_exp`] with every sign `+1`. A `−∞` term
+/// contributes `e^{−∞} = 0`, so an empty or all-`−∞` sum is `−∞`; a `+∞` term
+/// makes the sum `+∞`; a `NaN` term makes it `NaN`. Callers that must refuse
+/// those inputs use [`crate::categorical::log_sum_exp`], which validates first.
+pub fn positive_log_sum_exp(log_terms: &[f64]) -> f64 {
+    signed_log_sum_exp_by(log_terms, |_| 1.0).0
+}
+
+/// The reduction behind [`signed_log_sum_exp`] and [`positive_log_sum_exp`],
+/// with the sign of term `idx` read from `sign(idx)`.
+fn signed_log_sum_exp_by(log_mags: &[f64], sign: impl Fn(usize) -> f64) -> (f64, f64) {
     // Infinite-magnitude terms dominate any finite contribution, so resolve
     // them before the finite log-sum-exp reduction below. `−∞` log-magnitudes
-    // are `exp(−∞) = 0` and need no special handling.
+    // are `exp(−∞) = 0` and need no special handling. An undefined term makes
+    // the sum undefined; `f64::max` below would otherwise skip it silently.
     let mut has_pos_inf = false;
     let mut has_neg_inf = false;
     for (idx, &lm) in log_mags.iter().enumerate() {
+        let term_sign = sign(idx);
+        if term_sign.is_nan() || (lm.is_nan() && term_sign != 0.0) {
+            return (f64::NAN, 0.0);
+        }
         if lm == f64::INFINITY {
-            if signs[idx] > 0.0 {
+            if term_sign > 0.0 {
                 has_pos_inf = true;
-            } else if signs[idx] < 0.0 {
+            } else if term_sign < 0.0 {
                 has_neg_inf = true;
             }
         }
@@ -1466,9 +1487,9 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     let mut pos_max = f64::NEG_INFINITY;
     let mut neg_max = f64::NEG_INFINITY;
     for (idx, &lm) in log_mags.iter().enumerate() {
-        if signs[idx] > 0.0 {
+        if sign(idx) > 0.0 {
             pos_max = pos_max.max(lm);
-        } else if signs[idx] < 0.0 {
+        } else if sign(idx) < 0.0 {
             neg_max = neg_max.max(lm);
         }
     }
@@ -1489,11 +1510,11 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     let mut absolute_scaled_sum = 0.0_f64;
     let mut finite_term_count = 0usize;
     for (idx, &lm) in log_mags.iter().enumerate() {
-        if !lm.is_finite() || !(signs[idx] > 0.0 || signs[idx] < 0.0) {
+        if !lm.is_finite() || !(sign(idx) > 0.0 || sign(idx) < 0.0) {
             continue;
         }
         let magnitude = (lm - common_max).exp();
-        let term = if signs[idx] > 0.0 {
+        let term = if sign(idx) > 0.0 {
             magnitude
         } else {
             -magnitude
@@ -1532,13 +1553,13 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
         if !lm.is_finite() {
             continue;
         }
-        if signs[idx] > 0.0 {
+        if sign(idx) > 0.0 {
             let term = (lm - pos_max).exp();
             let combined = pos_sum + term;
             let shifted = combined - pos_sum;
             pos_tail += (pos_sum - (combined - shifted)) + (term - shifted);
             pos_sum = combined;
-        } else if signs[idx] < 0.0 {
+        } else if sign(idx) < 0.0 {
             let term = (lm - neg_max).exp();
             let combined = neg_sum + term;
             let shifted = combined - neg_sum;
@@ -3365,6 +3386,41 @@ mod tests {
         let (lm, sg) = signed_log_sum_exp(&[f64::INFINITY, f64::INFINITY], &[1.0, -1.0]);
         assert!(lm.is_nan());
         assert_eq!(sg, 0.0);
+    }
+
+    #[test]
+    fn slse_undefined_term_makes_the_sum_undefined() {
+        // `f64::max` skips a NaN, so a NaN log-magnitude used to vanish from the
+        // sum and leave a finite, wrong answer.
+        for (log_mags, signs) in [
+            ([f64::NAN, 1.0], [1.0, 1.0]),
+            ([1.0, f64::NAN], [1.0, -1.0]),
+            ([f64::NAN, f64::INFINITY], [1.0, 1.0]),
+            ([1.0, 2.0], [f64::NAN, 1.0]),
+        ] {
+            let (lm, sg) = signed_log_sum_exp(&log_mags, &signs);
+            assert!(lm.is_nan(), "{log_mags:?} {signs:?} gave {lm}");
+            assert_eq!(sg, 0.0);
+        }
+        // A zero sign removes the term whatever its magnitude.
+        let (lm, sg) = signed_log_sum_exp(&[f64::NAN, 2.0], &[0.0, 1.0]);
+        assert_eq!((lm, sg), (2.0, 1.0));
+    }
+
+    #[test]
+    fn positive_log_sum_exp_edge_cases() {
+        assert_eq!(positive_log_sum_exp(&[]), f64::NEG_INFINITY);
+        assert_eq!(
+            positive_log_sum_exp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(positive_log_sum_exp(&[0.0, f64::INFINITY]), f64::INFINITY);
+        assert!(positive_log_sum_exp(&[0.0, f64::NAN]).is_nan());
+        let ln2 = std::f64::consts::LN_2;
+        assert!((positive_log_sum_exp(&[0.0, 0.0]) - ln2).abs() <= 2.0 * f64::EPSILON);
+        // Max-shifted: terms far beyond `exp`'s range stay finite.
+        let big = positive_log_sum_exp(&[1000.0, 1000.0, f64::NEG_INFINITY]);
+        assert!((big - (1000.0 + ln2)).abs() <= 1000.0 * f64::EPSILON);
     }
 
     // ── normal_logcdf ─────────────────────────────────────────────────────────

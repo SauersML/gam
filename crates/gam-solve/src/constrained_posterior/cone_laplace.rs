@@ -810,11 +810,6 @@ impl ConeLaplace {
         &self.normal_solves
     }
 
-    /// The unit normals of the rows inside the horizon, `Aᵀ`, `p × q`.
-    pub fn retained_normals(&self) -> Array2<f64> {
-        self.rows.t().to_owned()
-    }
-
     /// Rows inside the horizon.
     pub fn retained_rows(&self) -> usize {
         self.rows.nrows()

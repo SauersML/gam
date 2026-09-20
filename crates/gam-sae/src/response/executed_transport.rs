@@ -54,12 +54,15 @@
 //! - **Rigid transition error.** The departure of the executed chart map from a
 //!   rigid O(2) map: [`classify_circle_transport`]'s defect `1 − max(R₊, R₋)`, its
 //!   standard error, and the Shift/Reflect/Mixing posteriors.
-//! - **Non-rigid part.** The REML smooth map `h` of the executed pairs
-//!   ([`fit_transport_map`]): its winding degree, its fold certificate, its
-//!   isometry defect `mean((|h′| − 1)²)`, and the scatter of the pairs about `h`.
-//!   Both a warp and mixing lower the resultant. A warp is a fold-free cover with
-//!   a non-zero isometry defect and no scatter about `h`. Mixing leaves the pairs
-//!   scattered about any smooth map.
+//! - **Non-rigid part.** The transport map `h` of the executed pairs
+//!   ([`fit_transport_map`]): its winding degree, its fold certificate, and its
+//!   isometry defect `mean((|h′| − 1)²)`. A held other state makes each executed
+//!   coordinate one function of its patched coordinate, so `h` is the exact
+//!   minimum-curvature interpolant of the pairs ([`PairLaw::Deterministic`]); a
+//!   resampled one scatters the pairs, so `h` is the REML smooth
+//!   ([`PairLaw::Stochastic`]). Both a warp and mixing lower the resultant. A
+//!   warp is a fold-free cover with a non-zero isometry defect. Mixing has no
+//!   fold-free cover through its pairs.
 //!
 //! # The patch contract
 //!
@@ -81,7 +84,9 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
 use crate::chart_coordinate_solve::{ChartBasisKind, PeriodicCurveExtrema};
-use crate::inference::layer_transport::{ChartTopology, FittedTransport, fit_transport_map};
+use crate::inference::layer_transport::{
+    ChartTopology, FittedTransport, PairLaw, fit_transport_map,
+};
 use crate::inference::transport_class::{CircleTransportReport, classify_circle_transport};
 use crate::manifold::{
     AtomTransportReport, AtomTransportStatus, CrosscoderLayer, CrosscoderLayout, SaeManifoldTerm,
@@ -351,6 +356,12 @@ pub fn measure_executed_atom_transport(
         ArrayView1::from(theta_out.as_slice()),
         ChartTopology::Circle,
         ChartTopology::Circle,
+        // A held other state makes each executed coordinate one deterministic
+        // function of its patched coordinate; a resampled one scatters it.
+        match design.other_state {
+            OtherStateLaw::Held => PairLaw::Deterministic,
+            OtherStateLaw::Resampled => PairLaw::Stochastic,
+        },
     )
     .map_err(|error| {
         ExecutedTransportError::Measurement(format!("smooth map of the executed pairs: {error}"))
@@ -1008,11 +1019,18 @@ mod tests {
             "a warp must not be classified as mixing: {:?}",
             warped.transition_law
         );
+        // Held pairs are interpolated exactly, so mixing shows as a map through
+        // them that folds, not as scatter about it.
         assert!(
-            scrambled.smooth_map.residual_rms > warped.smooth_map.residual_rms,
-            "mixing must leave more scatter about the smooth map than a warp: scrambled {}, warp {}",
-            scrambled.smooth_map.residual_rms,
-            warped.smooth_map.residual_rms
+            !scrambled.smooth_map.topology_preserved,
+            "mixing has no fold-free cover through its pairs: {:?}",
+            scrambled.smooth_map
+        );
+        assert!(
+            scrambled.smooth_map.isometry_defect > warped.smooth_map.isometry_defect,
+            "mixing must be further from an isometry than a warp: scrambled {}, warp {}",
+            scrambled.smooth_map.isometry_defect,
+            warped.smooth_map.isometry_defect
         );
     }
 }

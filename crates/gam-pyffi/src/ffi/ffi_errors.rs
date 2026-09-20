@@ -549,9 +549,6 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         | EstimationError::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
-        EstimationError::PrefitNearDegenerateDesignDetected { .. } => {
-            IllConditionedError::new_err(message)
-        }
         EstimationError::ModelIsIllConditioned { .. } => IllConditionedError::new_err(message),
         EstimationError::InvalidInput(_) | EstimationError::ProfiledResidualUnresolved { .. } => {
             InvalidInputError::new_err(message)

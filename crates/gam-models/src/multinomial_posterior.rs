@@ -18,7 +18,7 @@
 
 use crate::model_types::EstimationError;
 use gam_linalg::faer_ndarray::FaerEigh;
-use gam_math::quadrature::gauss_hermite_rule as physicists_gauss_hermite_rule;
+use gam_math::quadrature::standard_normal_gauss_hermite_rule;
 use gam_math::sparse_grid::{self, QuadratureAccumulator, SmolyakLevelError, StandardNormalRule};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::collections::BTreeMap;
@@ -837,7 +837,7 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
             let outer_eta = outer_mean + self.outer_standard_deviation * standard_normal;
             let conditioned_mean = self.active_mean[self.conditioned_class]
                 + self.conditional_regression * (outer_eta - outer_mean);
-            let scalar_location = conditioned_mean - gam_linalg::utils::stable_softplus(outer_eta);
+            let scalar_location = conditioned_mean - gam_math::special::softplus(outer_eta);
             let (selected_mean, selected_slope) =
                 gam_solve::quadrature::logit_posterior_meanwith_deriv(
                     scalar_location,
@@ -848,7 +848,7 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
                         "conditioned three-class scalar logistic-normal evaluation failed: {error}"
                     ))
                 })?;
-            let outer_share = (-gam_linalg::utils::stable_softplus(-outer_eta)).exp();
+            let outer_share = (-gam_math::special::softplus(-outer_eta)).exp();
             let reference_share = 1.0 - outer_share;
             let selected_second = selected_mean - selected_slope;
             let remainder_second = 1.0 - selected_mean - selected_slope;
@@ -1761,26 +1761,14 @@ fn gauss_hermite_rule(index: usize) -> Result<GaussHermiteRule, EstimationError>
                 "multinomial posterior Gauss-Hermite order overflowed usize".to_string(),
             )
         })?;
-    let physicists = physicists_gauss_hermite_rule(node_count).map_err(|error| {
-        EstimationError::InvalidInput(format!(
-            "multinomial posterior Gauss-Hermite rule {node_count} construction failed: {error}"
-        ))
-    })?;
-    let nodes = physicists
-        .nodes
+    let (nodes, weights) = standard_normal_gauss_hermite_rule(node_count)
+        .map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "multinomial posterior Gauss-Hermite rule {node_count} construction failed: {error}"
+            ))
+        })?
         .into_iter()
-        .map(|node| std::f64::consts::SQRT_2 * node)
-        .collect::<Vec<_>>();
-    let mut weights = physicists.weights;
-    let weight_sum: f64 = weights.iter().sum();
-    if !(weight_sum.is_finite() && weight_sum > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "multinomial posterior Gauss-Hermite rule {node_count} has invalid weight sum {weight_sum}"
-        )));
-    }
-    for weight in &mut weights {
-        *weight /= weight_sum;
-    }
+        .unzip();
     Ok(GaussHermiteRule { nodes, weights })
 }
 

@@ -29,12 +29,14 @@
 //! significance test reads comes from the fit itself.
 //!
 //! Reference-distribution inputs are read off the fit, not off the caller:
-//! `wald_residual_degrees_of_freedom` for the denominator and
-//! `LikelihoodScaleMetadata::wald_scale_is_estimated` for the `χ²`-vs-`F`
-//! choice. Those two WERE a live divergence — the persisted path keyed the
-//! scale predicate on the family NAME, which cannot distinguish a Gamma whose
-//! shape was estimated from one whose shape the user pinned — and both are now
-//! single-sourced (`fd998d957`).
+//! `LikelihoodScaleMetadata::wald_scale_is_estimated` for the known-vs-estimated
+//! choice, and, for an estimated scale, the fit's persisted working residual
+//! (`FitInference::working_residual`), from which the score test forms the full
+//! model's unpenalized residual `D′` on `ν = n⁺ − rank(X'WX)` (gam#3832). The
+//! scale predicate WAS a live divergence — the persisted path keyed it on the
+//! family NAME, which cannot distinguish a Gamma whose shape was estimated from
+//! one whose shape the user pinned — and it is now single-sourced
+//! (`fd998d957`).
 //!
 //! One asymmetry survives on purpose: `continuous_order` and `basis_note` are
 //! computed here for every caller, but the persisted-model payload has no field
