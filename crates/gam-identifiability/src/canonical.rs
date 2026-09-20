@@ -1462,16 +1462,25 @@ fn canonicalize_for_identifiability_inner(
                     }
                 }
                 Err(_) => {
-                    // Fall back: embed the flat design at its native rows.
-                    if let Ok(flat) = spec
+                    // Fall back: embed the flat design at its native rows. A
+                    // design that will not densify is refused: leaving its
+                    // columns zero would lower rank(J_pre) and rank(J_can)
+                    // together, so the post-T and MAP-uniqueness certificates
+                    // below would be taken on a design the fit never sees.
+                    let flat = spec
                         .design
                         .try_to_dense_arc("canonicalize_rank_check")
-                        .map(|a| a.as_ref().clone())
-                    {
-                        for i in 0..n_rows.min(flat.nrows()).min(r_map) {
-                            for j in 0..p_b.min(flat.ncols()) {
-                                j_pre[[i, col_off + j]] = flat[[i, j]];
-                            }
+                        .map_err(|reason| CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "canonicalize_for_identifiability_with_operating_scalars: the \
+                                 post-T rank certificate could not materialise the design for \
+                                 block '{}': {reason}",
+                                spec.name,
+                            ),
+                        })?;
+                    for i in 0..n_rows.min(flat.nrows()).min(r_map) {
+                        for j in 0..p_b.min(flat.ncols()) {
+                            j_pre[[i, col_off + j]] = flat[[i, j]];
                         }
                     }
                 }
