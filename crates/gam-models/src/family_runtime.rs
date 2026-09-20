@@ -4,6 +4,7 @@ use crate::quadrature::{
     QuadratureContext, cloglog_posterior_meanvariance,
     integrated_family_moments_jet, integrated_inverse_link_jetwith_state,
     integrated_inverse_link_mean_and_derivative, logit_posterior_meanvariance,
+    logit_posterior_meanwith_deriv,
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_meanvariance, reciprocal_link_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
@@ -311,7 +312,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok((eta + 0.5 * se_eta * se_eta).exp())
             }
             (ResponseFamily::Beta { .. }, _) => {
-                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta).0)
+                logit_posterior_meanwith_deriv(eta, se_eta).map(|(mean, _)| mean)
             }
             (ResponseFamily::RoystonParmar, _) => Ok(survival_posterior_mean(quadctx, eta, se_eta)),
         }
@@ -346,10 +347,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 other
             ))),
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
-                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
+                logit_posterior_meanvariance(eta, se_eta)
             }
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
-                Ok(probit_posterior_meanvariance(quadctx, eta, se_eta))
+                Ok(probit_posterior_meanvariance(eta, se_eta))
             }
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
@@ -425,7 +426,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok(lognormal_meanvariance(eta, se_eta))
             }
             (ResponseFamily::Beta { .. }, _) => {
-                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
+                logit_posterior_meanvariance(eta, se_eta)
             }
             (ResponseFamily::RoystonParmar, _) => {
                 Ok(survival_posterior_meanvariance(quadctx, eta, se_eta))

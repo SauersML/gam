@@ -4299,6 +4299,16 @@ impl SaeManifoldTerm {
                 )));
             }
         }
+        // #2231 — the crosscoder block weights reach `½log|A|` through the scaled target
+        // (`crosscoder_block_logdet_traces`), which only the dense and arrow-orbit routes
+        // contract; the probe bundle holds no weight on the eliminated coordinates' blocks.
+        if evidence.is_some() && !rho.block_flat_range().is_empty() {
+            return Err(OuterGradientError::internal(format!(
+                "analytic_outer_rho_gradient_components_with_bundle: the streaming exact-A \
+                 route has no log-determinant trace for the {} crosscoder block weights",
+                rho.block_flat_range().len()
+            )));
+        }
         let n_params = rho.flat_coordinates().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
@@ -4334,7 +4344,7 @@ impl SaeManifoldTerm {
         // and returned `½tr(B⁻¹∂B)` channels from cached `B` geometry.
         let exact_a_logdet_route = logdet_derivative_bundle.is_none();
         // #2822 — an output-scale coordinate moves `A` through the target
-        // (`output_scale_logdet_traces`). The streaming route's probes are β-space `S⁻¹`
+        // (`crosscoder_block_logdet_traces`). The streaming route's probes are β-space `S⁻¹`
         // solves, which hold no joint weight to contract that operator against.
         if !exact_a_logdet_route && !rho.log_lambda_block.is_empty() {
             return Err(OuterGradientError::internal(
@@ -4775,9 +4785,11 @@ impl SaeManifoldTerm {
                 },
             )
         })?;
-        let block_span = rho.block_flat_start()..rho.block_flat_start() + rho.log_lambda_block.len();
+        // The block weights sit before the curvature tail, so their range is
+        // derived forwards from the flat layout, not as an offset from the end.
+        let block_range = rho.block_flat_range();
         for coord in 0..n_params {
-            let rhs = if block_span.contains(&coord) {
+            let rhs = if block_range.contains(&coord) {
                 let &(p_x, ref block_dims) =
                     self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
                         OuterGradientError::internal(
@@ -4786,7 +4798,7 @@ impl SaeManifoldTerm {
                                 .to_string(),
                         )
                     })?;
-                let block = coord - block_span.start;
+                let block = coord - block_range.start;
                 let start = p_x + block_dims[..block].iter().sum::<usize>();
                 self.crosscoder_block_ift_rhs(cache, target, start..start + block_dims[block])
                     .map_err(OuterGradientError::internal)?
@@ -5896,6 +5908,119 @@ impl SaeManifoldTerm {
         Ok((delta_trace, delta_gamma_t))
     }
 
+    /// #2231 — `½⟨W, ∂A/∂log λ_ℓ⟩` for each crosscoder output block (or the global dispersion's
+    /// log precision, #2822), `W` the route's weight on `dA`; empty when no crosscoder pricing is installed. Block `ℓ` moves the scaled target
+    /// along `D_ℓ = ½·Z̃_ℓ` on its own columns. At a fixed state the exact Hessian reads the
+    /// target only through its residual-curvature legs, which are linear in the residual, so
+    /// `∂A/∂log λ_ℓ = A(t + D_ℓ) − A(t)` exactly: two probes of the same operator, differenced
+    /// before they are contracted.
+    pub(crate) fn crosscoder_block_logdet_traces<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        weight: &W,
+    ) -> Result<Vec<f64>, String> {
+        let Some((p_x, block_dims)) = self.crosscoder_pricing_spans.as_ref() else {
+            return Ok(Vec::new());
+        };
+        // An embedded-sphere row's `B` carries `−c_g·P_g` with `c_g = ⟨g_raw, x_g⟩`, which
+        // reads the residual, so its `B` and `Φ` move with the target too. The probes hold
+        // the cache's `B`, so that leg is not priced here and the coordinate is refused.
+        if !self.sphere_tangent_blocks(&cache.row_dims)?.is_empty() {
+            return Err(
+                "crosscoder_block_logdet_traces: an embedded-sphere row's B carries -c_g P_g \
+                 with c_g = <g_raw, x_g>, which moves with the target; that leg of \
+                 d log|A| / d log(lambda) is not priced, so output-scale coordinates are \
+                 refused on sphere rows"
+                    .to_string(),
+            );
+        }
+        enum Probed {
+            Dense(Array2<f64>),
+            Arrow(ArrowJointBlocks),
+        }
+        let probe = |at: ArrayView2<'_, f64>| -> Result<Probed, String> {
+            if weight.dense().is_some() {
+                let (a, _) = self.materialize_exact_hessian_dense_with_gap_border(rho, at, cache)?;
+                Ok(Probed::Dense(a))
+            } else {
+                let mut blocks = ArrowJointBlocks::zeros(&cache.row_offsets, cache.k);
+                self.probe_exact_hessian_arrow(rho, at, cache, &mut blocks)?;
+                Ok(Probed::Arrow(blocks))
+            }
+        };
+        let base = probe(target)?;
+        let mut shifted = target.to_owned();
+        let mut traces = Vec::with_capacity(block_dims.len());
+        let mut start = *p_x;
+        for &p_l in block_dims {
+            shifted.assign(&target);
+            shifted
+                .slice_mut(s![.., start..start + p_l])
+                .mapv_inplace(|value| 1.5 * value);
+            let contraction = match (probe(shifted.view())?, &base) {
+                (Probed::Dense(mut moved), Probed::Dense(base)) => {
+                    moved -= base;
+                    let dense = weight.dense().ok_or_else(|| {
+                        "crosscoder_block_logdet_traces: the dense weight vanished".to_string()
+                    })?;
+                    (dense * &moved).sum()
+                }
+                (Probed::Arrow(mut moved), Probed::Arrow(base)) => {
+                    moved.subtract(base)?;
+                    moved.contract(weight)?
+                }
+                _ => {
+                    return Err(
+                        "crosscoder_block_logdet_traces: the two probes took different layouts"
+                            .to_string(),
+                    );
+                }
+            };
+            traces.push(0.5 * contraction);
+            start += p_l;
+        }
+        Ok(traces)
+    }
+
+    /// Write [`Self::crosscoder_block_logdet_traces`] into the block coordinates of a
+    /// flat log-determinant trace.
+    pub(crate) fn add_crosscoder_block_logdet_traces<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        weight: &W,
+        logdet_trace: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let traces = self.crosscoder_block_logdet_traces(rho, target, cache, weight)?;
+        let range = rho.block_flat_range();
+        if traces.is_empty() {
+            return if range.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "crosscoder block log-determinant traces: rho carries {} block coordinates \
+                     but no crosscoder pricing spans are installed",
+                    range.len()
+                ))
+            };
+        }
+        if traces.len() != range.len() {
+            return Err(format!(
+                "crosscoder block log-determinant traces: {} traces for the {} block \
+                 coordinates of rho",
+                traces.len(),
+                range.len()
+            ));
+        }
+        for (coord, trace) in range.zip(traces) {
+            logdet_trace[coord] += trace;
+        }
+        Ok(())
+    }
+
     pub(crate) fn dense_exact_a_logdet_channels(
         &self,
         target: ArrayView2<'_, f64>,
@@ -5964,10 +6089,8 @@ impl SaeManifoldTerm {
         }
         // One per-coordinate map at a time: the metric channel below builds its own.
         drop(da_by_flat);
-        // #2822 — the output-scale coordinates move `A` through the target.
-        for (flat, trace) in self.output_scale_logdet_traces(rho, target, cache, a_pinv)? {
-            logdet_trace[flat] = trace;
-        }
+        // #2231 — the crosscoder block weights reach `A` through the scaled target.
+        self.add_crosscoder_block_logdet_traces(rho, target, cache, a_pinv, &mut logdet_trace)?;
         // Ordered-Beta–Bernoulli sparse coordinate: its ∂A/∂ρ_sparse is the exact
         // integrated-marginal logit Hessian (cross-row), absent from the operator
         // map above (softmax-only). Add its ½log|A| trace directly.
@@ -6025,74 +6148,6 @@ impl SaeManifoldTerm {
             theta_adjoint: gamma,
             stationarity_adjoint,
         })
-    }
-
-    /// #2822 — `½⟨W, ∂A/∂log λ_ℓ⟩` for each output-scale coordinate (a crosscoder block's or
-    /// the global dispersion's log precision), as `(flat index, trace)`.
-    ///
-    /// The criterion is priced on the rescaled target `y' = √λ·y`, so `∂y'/∂log λ_ℓ = ½P_ℓy'`
-    /// with `P_ℓ` the block's column selector. At fixed θ, `A = B_raw + ΔC` is affine in the
-    /// target: `B_raw` is the Gauss--Newton majorizer the cache holds, and `ΔC` is linear in the
-    /// residual. So `∂A/∂log λ_ℓ = A(y' + ½P_ℓy') − A(y')` exactly, and both operators come from
-    /// the same probes against the same cache, contracted as they are written.
-    ///
-    /// An embedded-sphere row's `B` carries `−c_g·P_g` with `c_g = ⟨g_raw, x_g⟩`, which reads
-    /// the residual, so its `B` and `Φ` move with the target too; that leg is not priced here
-    /// and the coordinate is refused.
-    pub(crate) fn output_scale_logdet_traces<W: JointWeight + ?Sized>(
-        &self,
-        rho: &SaeManifoldRho,
-        target: ArrayView2<'_, f64>,
-        cache: &ArrowFactorCache,
-        weight: &W,
-    ) -> Result<Vec<(usize, f64)>, String> {
-        if rho.log_lambda_block.is_empty() {
-            return Ok(Vec::new());
-        }
-        let &(p_x, ref block_dims) = self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
-            "output_scale_logdet_traces: the state carries output-scale coordinates but no \
-             pricing spans"
-                .to_string()
-        })?;
-        if block_dims.len() != rho.log_lambda_block.len() {
-            return Err(format!(
-                "output_scale_logdet_traces: {} output-scale coordinates for {} pricing spans",
-                rho.log_lambda_block.len(),
-                block_dims.len()
-            ));
-        }
-        if !self.sphere_tangent_blocks(&cache.row_dims)?.is_empty() {
-            return Err(
-                "output_scale_logdet_traces: an embedded-sphere row's B carries -c_g P_g with \
-                 c_g = <g_raw, x_g>, which moves with the target; that leg of \
-                 d log|A| / d log(lambda) is not priced, so output-scale coordinates are refused \
-                 on sphere rows"
-                    .to_string(),
-            );
-        }
-        let mut traces = Vec::with_capacity(block_dims.len());
-        let mut start = p_x;
-        for (block, &width) in block_dims.iter().enumerate() {
-            let columns = start..start + width;
-            start += width;
-            if columns.end > target.ncols() {
-                return Err(format!(
-                    "output_scale_logdet_traces: pricing span {columns:?} exceeds the target's {} \
-                     columns",
-                    target.ncols()
-                ));
-            }
-            let mut shifted = target.to_owned();
-            shifted
-                .slice_mut(s![.., columns.clone()])
-                .mapv_inplace(|value| 1.5 * value);
-            let mut sink = ContractingExactHessianProbe::new(weight);
-            self.probe_exact_hessian_arrow(rho, shifted.view(), cache, &mut sink)?;
-            sink.scale = -1.0;
-            self.probe_exact_hessian_arrow(rho, target, cache, &mut sink)?;
-            traces.push((rho.block_flat_start() + block, 0.5 * sink.sum));
-        }
-        Ok(traces)
     }
 
     /// #2933 F07 — `(½⟨X, ∂Φ/∂ρ⟩, ⟨X, ∂Φ/∂θ⟩)` for a dense symmetric weight `X` on the

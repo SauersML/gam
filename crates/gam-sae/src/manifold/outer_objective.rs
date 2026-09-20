@@ -1357,14 +1357,18 @@ impl SaeManifoldOuterObjective {
             .block_log_lambda_gradient()
             .map_err(OuterGradientError::internal)?
         {
-            // The block weights are NOT the last sub-vector any more: #2604
-            // appends per-atom curvature after them. Locating the block tail by
-            // `len - block_len` was correct only while it was last, and would
-            // silently write the block gradient into the curvature slots for any
-            // dictionary carrying both. Subtract every tail that follows it.
-            let tail = rho.block_flat_start();
-            for (block, value) in block_grad.into_iter().enumerate() {
-                gradient[tail + block] += value;
+            // The block weights are NOT the last sub-vector: #2604 appends
+            // per-atom curvature after them, so the range comes from the layout.
+            let range = rho.block_flat_range();
+            if range.len() != block_grad.len() {
+                return Err(OuterGradientError::internal(format!(
+                    "block gradient carries {} entries for the {} block coordinates of rho",
+                    block_grad.len(),
+                    range.len()
+                )));
+            }
+            for (coord, value) in range.zip(block_grad) {
+                gradient[coord] += value;
             }
         }
         Ok(gradient)
@@ -1618,12 +1622,11 @@ impl SaeManifoldOuterObjective {
     /// block_jacobian(ρ) = −Σ_ℓ (n·p_ℓ/2)·log λ_ℓ.
     /// ```
     ///
-    /// With the scaled-block residual `R_ℓ` flowing through the half-SSE data
-    /// term, `∂C/∂log λ_ℓ = ½·λ_ℓ·R_ℓ − n·p_ℓ/2`, stationary at
-    /// `λ_ℓ = n·p_ℓ/R_ℓ` and coercive at both ends (`λ→0` the Jacobian wall
-    /// `+∞`, `λ→∞` the scaled residual `+∞`) — the interior minimum the Inc-B
-    /// contract pins assert. Returns `0` when crosscoder pricing is off (plain
-    /// SAE byte-identity).
+    /// The criterion is coercive at both ends (`λ→0` the Jacobian wall `+∞`,
+    /// `λ→∞` the scaled residual `+∞`) — the interior minimum the Inc-B contract
+    /// pins assert; its gradient is assembled by [`Self::block_log_lambda_gradient`]
+    /// and the components assembler. Returns `0` when crosscoder pricing is off
+    /// (plain SAE byte-identity).
     fn block_jacobian(&self, rho: &SaeManifoldRho) -> f64 {
         let Some(blocks) = self.crosscoder_blocks.as_ref() else {
             return 0.0;
@@ -1639,13 +1642,14 @@ impl SaeManifoldOuterObjective {
     }
 
     /// #2231 Inc-B / #2822 — the explicit data channel of each block coordinate,
-    /// `D_ℓ = ∂(data)/∂log λ_ℓ = ½·⟨P_ℓ ỹ, r̃⟩` at the converged state, or `None`
-    /// when no block pricing is installed.
+    /// `D_ℓ = ∂(data)/∂log λ_ℓ` at the converged state, or `None` when no block
+    /// pricing is installed.
     ///
-    /// `ỹ` is the ALREADY block-scaled target (every eval lane calls
-    /// `apply_block_scaling` before the inner solve) and `r̃ = ỹ − f` its residual,
-    /// with the loss's row weights and whitening metric
-    /// ([`SaeManifoldTerm::output_scale_data_derivatives`]). This is the envelope
+    /// `log λ_ℓ` moves the ALREADY block-scaled target `ỹ` (every eval lane calls
+    /// `apply_block_scaling` before the inner solve) along `½·P_ℓ ỹ` on block `ℓ`'s
+    /// columns while the fitted state `f` stays put, so the half-SSE data term moves
+    /// by `D_ℓ = ½·⟨ỹ − f, P_ℓ ỹ⟩_w` with the loss's row weights and whitening metric
+    /// ([`SaeManifoldTerm::data_fit_target_derivative`]). This is the envelope
     /// derivative of the minimized penalized loss. It is not `½‖P_ℓ r̃‖²`, which
     /// would drop `½⟨P_ℓ f, r̃⟩` — nonzero at a penalized optimum. Callers must
     /// invoke this only after the lane's inner solve.
@@ -1653,30 +1657,37 @@ impl SaeManifoldOuterObjective {
         let Some(blocks) = self.crosscoder_blocks.as_ref() else {
             return Ok(None);
         };
-        let mut ranges = Vec::with_capacity(blocks.block_dims.len());
+        let mut direction = Array2::<f64>::zeros(self.target.raw_dim());
+        let mut out = Vec::with_capacity(blocks.block_dims.len());
         let mut off = blocks.p_x;
         for &p_l in &blocks.block_dims {
-            ranges.push(off..off + p_l);
+            direction.fill(0.0);
+            direction
+                .slice_mut(s![.., off..off + p_l])
+                .assign(&self.target.slice(s![.., off..off + p_l]));
+            direction.mapv_inplace(|value| 0.5 * value);
+            out.push(
+                self.term
+                    .data_fit_target_derivative(self.target.view(), direction.view())?,
+            );
             off += p_l;
         }
-        self.term
-            .output_scale_data_derivatives(self.target.view(), &ranges)
-            .map(Some)
+        Ok(Some(out))
     }
 
     /// #2231 Inc-B / #2822 — the EXPLICIT block-coordinate gradient channels
     /// `D_ℓ − (n·p_ℓ − null_ℓ)/2`, one entry per block, or `None` when no block
     /// pricing is installed. NOT the complete `∂C/∂log λ_ℓ` on its own.
     ///
-    /// Scaling block `ℓ`'s target columns by `√λ_ℓ` enters the criterion in three
+    /// Scaling block `ℓ`'s target columns by `√λ_ℓ` enters the criterion in four
     /// places: the penalized loss (its envelope derivative is the data channel
     /// [`Self::block_data_derivatives`]), the change-of-variables Jacobian
-    /// ([`Self::block_jacobian`]), and the Laplace `½log|H|` term through the
-    /// fitted state's response `θ̂(λ_ℓ)`. That last channel is the `−½·Γᵀθ̂_ρ`
-    /// adjoint every ρ coordinate carries, supplied by the components assembler via
-    /// [`SaeManifoldTerm::crosscoder_block_ift_rhs`]. This function returns the
-    /// first two, which the gradient lane ADDS to the assembler's tail (never
-    /// overwrites; #2087).
+    /// ([`Self::block_jacobian`]), the `½tr(A⁺ ∂A/∂log λ_ℓ)` trace (the
+    /// residual-curvature legs of the exact Hessian are affine in the target), and
+    /// the implicit `−½·Γᵀθ̂_ρ` adjoint through
+    /// [`SaeManifoldTerm::crosscoder_block_ift_rhs`]. The last two come from the
+    /// components assembler; this function returns the first two, which the
+    /// gradient lane ADDS to the assembler's tail (never overwrites; #2087).
     fn block_log_lambda_gradient(&self) -> Result<Option<Vec<f64>>, String> {
         let Some(data) = self.block_data_derivatives()? else {
             return Ok(None);
@@ -3067,7 +3078,7 @@ impl SaeManifoldOuterObjective {
         // `−½·Γᵀθ̂_ρ` Laplace adjoint (`crosscoder_block_ift_rhs`); a proposal
         // without it has a different zero. No-op for a plain SAE.
         if let Some(data) = self.block_data_derivatives()? {
-            let tail = rho.block_flat_start();
+            let tail = rho.block_flat_range().start;
             for (l, &d_l) in data.iter().enumerate() {
                 record_precision_step(tail + l, 2.0 * d_l, format!("output block {l}"));
             }
@@ -4184,7 +4195,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // value for it and hands back its literal target, which is not a claim about
             // the domain. Left there, the noise precision was boxed at its seed and every
             // planted-circle fit railed on it. It keeps the objective-domain face.
-            let block_start = self.baseline_rho.block_flat_start();
+            let block_start = self.baseline_rho.block_flat_range().start;
             for index in block_start..block_start + self.baseline_rho.log_lambda_block.len() {
                 reactive_upper[index] = log_strength_upper[index];
             }
@@ -4818,58 +4829,6 @@ pub struct CurvatureWalkReport {
     pub reseeds: usize,
 }
 
-pub(crate) fn sae_cholesky_solve_neg_gradient(
-    h: ArrayView2<'_, f64>,
-    g: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let n = h.nrows();
-    if h.ncols() != n || g.len() != n {
-        return Err(format!(
-            "sae_cholesky_solve_neg_gradient: shape mismatch H={:?}, g={}",
-            h.dim(),
-            g.len()
-        ));
-    }
-    let mut l = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = h[[i, j]];
-            for k in 0..j {
-                sum -= l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if !(sum.is_finite() && sum > 0.0) {
-                    return Err(format!("non-positive Cholesky pivot at {i}: {sum}"));
-                }
-                l[[i, j]] = sum.sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]];
-            }
-        }
-    }
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut sum = -g[i];
-        for k in 0..i {
-            sum -= l[[i, k]] * y[k];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    for ii in 0..n {
-        let i = n - 1 - ii;
-        let mut sum = y[i];
-        for k in i + 1..n {
-            sum -= l[[k, i]] * x[k];
-        }
-        x[i] = sum / l[[i, i]];
-    }
-    if !x.iter().all(|v| v.is_finite()) {
-        return Err("sae_cholesky_solve_neg_gradient: non-finite solution".into());
-    }
-    Ok(x)
-}
-
 pub(crate) fn solve_basis_transport(
     new_phi: ArrayView2<'_, f64>,
     old_phi: ArrayView2<'_, f64>,
@@ -5413,7 +5372,7 @@ mod crosscoder_reset_baseline_2627_tests {
         for crosscoder in [true, false] {
             let (mut obj, _, _) = stacked_line_objective(crosscoder);
             let rho_flat = obj.baseline_rho.flat_coordinates();
-            let coord = obj.baseline_rho.block_flat_start();
+            let coord = obj.baseline_rho.block_flat_range().start;
             let analytic = obj
                 .eval_with_order(&rho_flat, OuterEvalOrder::ValueAndGradient)
                 .expect("the seed's value and gradient")

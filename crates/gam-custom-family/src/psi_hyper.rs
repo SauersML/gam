@@ -2951,15 +2951,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 .into_par_iter()
                 .map(|b| {
                     let spec = &specs[b];
-                    let p = spec.design.ncols();
-                    let lambdas = exact_lambdas_from_log_strengths(
-                        &per_block[b],
-                        &format!("psi hyper logdet block {b} log strength"),
-                    )?;
-                    let mut s_lambda = Array2::<f64>::zeros((p, p));
-                    for (k, s) in spec.penalties.iter().enumerate() {
-                        s.add_scaled_to(lambdas[k], &mut s_lambda);
-                    }
+                    // The block curvature every other consumer reads, on the
+                    // roots (#2954).
+                    let s_lambda = crate::blockwise_solve::block_s_lambda(b, spec, &per_block[b])?;
                     // No metadata-based structural-nullity hint: the
                     // PenaltyPseudologdet classifier derives the positive
                     // eigenspace from the assembled spectrum alone (issues
@@ -4749,15 +4743,9 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             .into_par_iter()
             .map(|b| {
                 let spec = &specs[b];
-                let p = spec.design.ncols();
-                let lambdas = exact_lambdas_from_log_strengths(
-                    &per_block[b],
-                    &format!("psi fixed-point logdet block {b} log strength"),
-                )?;
-                let mut s_lambda = Array2::<f64>::zeros((p, p));
-                for (k, s) in spec.penalties.iter().enumerate() {
-                    s.add_scaled_to(lambdas[k], &mut s_lambda);
-                }
+                // The block curvature every other consumer reads, on the roots
+                // (#2954).
+                let s_lambda = crate::blockwise_solve::block_s_lambda(b, spec, &per_block[b])?;
                 // No metadata-based structural-nullity hint: the
                 // PenaltyPseudologdet classifier derives the positive
                 // eigenspace from the assembled spectrum alone (issues

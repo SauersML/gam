@@ -194,10 +194,6 @@ pub(crate) const SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF: f64 = 1.0e-9;
 /// caller passes a zero base ridge.
 pub(crate) const SAE_MANIFOLD_ROW_RIDGE_FLOOR: f64 = 1.0e-12;
 
-/// Multiplicative factor by which the LM ridge is escalated after a failed
-/// Cholesky factorisation of a per-row Hessian.
-pub(crate) const SAE_MANIFOLD_ROW_RIDGE_GROWTH: f64 = 10.0;
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SaeBetaPenaltyAssembly {
     pub(crate) dense_written: bool,

@@ -2010,9 +2010,9 @@ pub(crate) fn audit_stationary_point_in(
 // travel together, so the smoothing correction re-judges a direction at the certificate's shift
 // rather than at its own eigensolver's backward error.
 pub(crate) use opt::{
-    certificate_curvature_shift,
+    NegativeCurvatureClaim, certificate_curvature_shift,
     hessian_is_psd_at_resolution as certificate_hessian_is_psd_at_resolution,
-    newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+    negative_curvature_claim, newton_predicted_decrease, newton_predicted_decrease_at_resolution,
 };
 
 /// PSD verdict of the outer Hessian restricted to its UN-RAILED coordinates
@@ -2357,53 +2357,6 @@ pub(crate) fn interior_curvature_floor_clearance(
     })
 }
 
-/// Whether a negative-curvature claim is falsifiable by any step the
-/// adjudication may take (#3036).
-///
-/// At a stationary point the claim `vᵀHv = λ_min < 0` predicts
-/// `V(ρ ± αv) − V(ρ) ≈ ½λ_min α²` for every step `α ≤ α_max`. It is falsifiable
-/// iff the largest step predicts a decrease the criterion can represent,
-/// `½|λ_min|·α_max² > objective_resolution`; its falsifiable range is then
-/// `[α_min, α_max]` with `α_min = sqrt(2·objective_resolution/|λ_min|)`.
-/// Otherwise no allowed step can produce a decrease the criterion resolves, and
-/// no probe outcome — a decrease under the resolution, a rise, or a failed
-/// evaluation — can confirm or falsify the claim.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum NegativeCurvatureClaim {
-    /// The claim can be falsified by steps from `α_max` down to `alpha_min`.
-    Resolvable { alpha_min: f64 },
-    /// Even the largest step predicts only `predicted_at_largest`, which the
-    /// criterion's resolution does not exceed.
-    Unresolvable { predicted_at_largest: f64 },
-}
-
-/// Classify a negative-curvature claim against the criterion's resolution
-/// ([`NegativeCurvatureClaim`]). `None` when the inputs carry no claim to judge:
-/// `λ_min` not a finite negative number, `α_max` not a finite positive step, or
-/// no finite positive resolution.
-pub(crate) fn negative_curvature_claim(
-    lambda_min: f64,
-    alpha_max: f64,
-    objective_resolution: f64,
-) -> Option<NegativeCurvatureClaim> {
-    if !(lambda_min.is_finite() && lambda_min < 0.0)
-        || !(alpha_max.is_finite() && alpha_max > 0.0)
-        || !(objective_resolution.is_finite() && objective_resolution > 0.0)
-    {
-        return None;
-    }
-    let predicted_at_largest = 0.5 * lambda_min.abs() * alpha_max * alpha_max;
-    Some(if predicted_at_largest > objective_resolution {
-        NegativeCurvatureClaim::Resolvable {
-            alpha_min: (2.0 * objective_resolution / lambda_min.abs()).sqrt(),
-        }
-    } else {
-        NegativeCurvatureClaim::Unresolvable {
-            predicted_at_largest,
-        }
-    })
-}
-
 /// What the CRITERION said about a Hessian's reported negative direction
 /// (#2357/#2155/#2612).
 ///
@@ -2674,7 +2627,7 @@ pub(crate) fn adjudicate_negative_curvature(
     // when they evaluate and "decline" when they fail, and the declined exit
     // refused the point on a curvature its criterion cannot resolve.
     let lambda_min = eigenvalues[min_idx];
-    let alpha_max = 1.0_f64;
+    let alpha_max = NEGATIVE_CURVATURE_LADDER_LARGEST_STEP;
     let alpha_min = match negative_curvature_claim(lambda_min, alpha_max, objective_resolution) {
         Some(NegativeCurvatureClaim::Resolvable { alpha_min }) => alpha_min,
         Some(NegativeCurvatureClaim::Unresolvable {
@@ -8451,23 +8404,29 @@ pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// The largest step the negative-curvature adjudication takes along its eigenvector: one
+/// e-fold of `log λ` ([`adjudicate_negative_curvature`]).
+pub(crate) const NEGATIVE_CURVATURE_LADDER_LARGEST_STEP: f64 = 1.0;
+
 /// The criterion's curvature resolution `2·τ` over its objective resolution
 /// `τ` ([`outer_criterion_resolution`]; #1082, #2817).
 ///
 /// Along an eigenvector of `λ < 0` at a stationary point the quadratic model
 /// predicts the decrease `½|λ|α²`. The largest step the negative-curvature
-/// adjudication takes is one e-fold of `log λ` (`α = 1`), so a direction with
-/// `½|λ| ≤ τ` predicts nothing the criterion resolves anywhere in the range
-/// that could falsify it. The bridge's definiteness verdict, the seed's
-/// verdict, and the decrement that both the in-loop stop and the certificate's
-/// curvature rung take all read this one number. `0.0` (the arithmetic shift
+/// adjudication takes is [`NEGATIVE_CURVATURE_LADDER_LARGEST_STEP`], so a direction
+/// with `½|λ|·α_max² ≤ τ` predicts nothing the criterion resolves anywhere in the
+/// range that could falsify it: this is `opt::unresolvable_curvature_magnitude` at
+/// that step and resolution, the number the adjudication's own resolvability verdict
+/// (`opt::negative_curvature_claim`, #3036) reads. The bridge's definiteness verdict,
+/// the seed's verdict, and the decrement that both the in-loop stop and the
+/// certificate's curvature rung take all read it too. `0.0` (the arithmetic shift
 /// alone) when the resolution is zero or unusable.
 pub(crate) fn criterion_curvature_resolution(objective_resolution: f64) -> f64 {
-    if objective_resolution.is_finite() && objective_resolution > 0.0 {
-        2.0 * objective_resolution
-    } else {
-        0.0
-    }
+    opt::unresolvable_curvature_magnitude(
+        NEGATIVE_CURVATURE_LADDER_LARGEST_STEP,
+        objective_resolution,
+    )
+    .unwrap_or(0.0)
 }
 
 /// Whether the certified objective strictly dropped between two refusals of the

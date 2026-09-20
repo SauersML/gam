@@ -439,6 +439,19 @@ impl SaeManifoldRho {
         self.log_lambda_block.len()
     }
 
+    /// Flat coordinates of the crosscoder block weights, consistent with
+    /// [`Self::to_flat`]: after the ARD block and BEFORE the per-atom curvature
+    /// tail. Empty for a plain SAE.
+    #[must_use]
+    pub(crate) fn block_flat_range(&self) -> std::ops::Range<usize> {
+        let ard_len = match self.ard_sharing {
+            ArdSharing::PerAtom => self.log_ard.iter().map(|a| a.len()).sum::<usize>(),
+            ArdSharing::Shared => self.max_ard_axes(),
+        };
+        let start = self.smooth_flat_start() + self.log_lambda_smooth.len() + ard_len;
+        start..start + self.log_lambda_block.len()
+    }
+
     /// Largest per-atom ARD axis count `max_k d_k` (0 when ARD is disabled on
     /// every atom). This is the number of SHARED outer ARD coordinates in
     /// [`ArdSharing::Shared`] mode.
@@ -487,18 +500,7 @@ impl SaeManifoldRho {
     /// `ard_flat_index` uses.
     pub(crate) fn kappa_flat_index(&self, atom: usize) -> Option<usize> {
         let curvature_index = self.kappa_atoms.binary_search(&atom).ok()?;
-        Some(self.block_flat_start() + self.log_lambda_block.len() + curvature_index)
-    }
-
-    /// Flat index of the first `log_lambda_block` coordinate: after the smoothing
-    /// and ARD blocks, before the curvature tail. Derived forwards from the prefix
-    /// arithmetic so a later tail cannot shift it.
-    pub(crate) fn block_flat_start(&self) -> usize {
-        let ard_len = match self.ard_sharing {
-            ArdSharing::PerAtom => self.log_ard.iter().map(|a| a.len()).sum::<usize>(),
-            ArdSharing::Shared => self.max_ard_axes(),
-        };
-        self.smooth_flat_start() + self.log_lambda_smooth.len() + ard_len
+        Some(self.block_flat_range().end + curvature_index)
     }
 
     pub fn ard_flat_index(&self, atom: usize, axis: usize) -> usize {

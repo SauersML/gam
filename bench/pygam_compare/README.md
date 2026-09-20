@@ -58,6 +58,7 @@ These are the plans (see `plans.py`):
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
+| `postfit`   | n ∈ {1e3, 1e5} × n_predict ∈ {1e2, 1e4, 1e6}, all families × {`p5`, `p20`, `te`}, `gamfit` and `pygam_gs` only, with the post-fit phases | 1 |
 | `gaussian_small` | n ∈ {1e2, 1e3, 1e4}, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`} (the nightly Gaussian regression cells) | 3 |
 | `gaussian_1e5` | n=1e5, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`} | 3 |
 | `gaussian_1e6` | n=1e6, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`}: wall, CPU and peak RSS at the largest scale | 3 |
@@ -71,6 +72,8 @@ These are the plans (see `plans.py`):
 | `fuzz_families_quick` | gamfit only: n ∈ {50, 500}, every family/link label × {base, edge, zeros, lowdisp} (the 0-failure regression test) | 1 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
 | `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
+| `fuzz_terms` | gamfit only: 120 seeded term-structure cases × n ∈ {50, 500, 5000} × all families (1080 fits) | 1 |
+| `fuzz_terms_quick` | gamfit only: the fixed cases in `FUZZ_QUICK_CASES`, which cover every term kind, × n ∈ {50, 500} × all families (a 0-failure regression test) | 1 |
 
 The positive-response families are Gamma on the log link (`gamma_log`, shape 3),
 heavy right skew with responses near zero (`gamma_skew`, shape 0.5), Gamma on the
@@ -122,7 +125,31 @@ thread-scaling table (speedup over one thread) and a process fan-out table
 The workflow `.github/workflows/pygam-compare.yml` runs `quick` weekly and
 `gaussian_small` nightly; any plan can be dispatched by name.
 
-Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.
+Overrides: `--reps`, `--timeout`, `--memcap-mb`, `--only-libs gamfit,pygam_gs`,
+`--designs d1,d2` (every n and family of just those designs, e.g. to re-run
+the designs a generator change touched) and `--shard I/K`, which runs every
+K-th design starting at design I, so K shards started side by side cover the
+plan between them. `--lib-path DIR` puts a pinned library build first on every
+worker's `PYTHONPATH` (workers never inherit the caller's), so a before/after
+comparison measures the build it names; every gamfit record carries `lib_file`.
+
+### Convergence fuzz over term structure
+
+The `fuzz_terms*` plans draw their formulas from `fuzz_terms.py`. A case number
+fixes the term structure: tensor products with two or three margins, `ti`,
+factor and numeric `by=` smooths (including empty and singleton levels), fixed
+factors with rare levels, random intercepts with 5 to 2000 levels, cyclic,
+2-D isotropic, shape-constrained and concurvity terms. The seed draws the data.
+To triage one or more run directories by failure cause, term kind, family and n:
+
+```bash
+python -m pygam_compare.fuzz_terms RUN_DIR [RUN_DIR ...]
+```
+
+A rep counts as a failure if it raised, hung, did not certify its optimum or
+predicted a non-finite value. For each cause the table names one example rep as
+`FAMILY N DESIGN SEED`, so `python bench/pygam_compare/worker.py gamfit FAMILY N
+DESIGN SEED` reruns it in isolation.
 
 To regenerate the docs page from committed baselines:
 
@@ -145,10 +172,13 @@ host load hits all of them alike.
 **Time.** Each phase is timed as both wall time (`perf_counter`) and process
 CPU time (`process_time`). The phases are import, one cold fit, a warm refit
 of the same data in the same process (the per-fit cost once imports and lazy
-initialisation are paid), point predict on n fresh rows, and a 95% interval
-predict. CPU time is the primary metric, because wall time on a shared box also
-measures the neighbours. The 1-minute load average is recorded at the start and
-end of each rep.
+initialisation are paid), point predict on n fresh rows (or `n_predict` rows
+when the cell sets it), and a 95% interval predict. Plans with `postfit` also
+time a term's partial dependence on a 200-point grid, the summary, a save/load
+round trip (`save_bytes` records the file size), 100 posterior coefficient
+draws and gamfit's smooth significance. CPU time is the primary metric, because
+wall time on a shared box also measures the neighbours. The 1-minute load
+average is recorded at the start and end of each rep.
 
 **Memory.** The worker's own peak RSS comes from `ru_maxrss`. The driver also
 polls the process-tree RSS and thread count with psutil every 50 ms.
@@ -205,6 +235,9 @@ tail and the traceback of the failed phase.
 
 - `bench/pygam_compare/test_pygam_compare_smoke.py` runs the `smoke` plan end to
   end and pins the verdict rules. It runs in `python-contracts.yml` (bench step).
+- `bench/pygam_compare/test_fuzz_terms_quick.py` runs the `fuzz_terms_quick`
+  plan and requires every fit to be clean. It also checks that the quick cases
+  cover every term kind.
 - `.github/workflows/pygam-compare.yml` is optional. It runs on manual dispatch
   (with a `plan` input, default `quick`) and weekly, never per PR. It uploads
   `records.jsonl`, `meta.json` and `report.md` as an artifact and writes the

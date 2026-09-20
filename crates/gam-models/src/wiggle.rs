@@ -583,12 +583,15 @@ pub(crate) fn select_wiggle_basis_from_seed(
 /// needs [`WarpKnotEnds::Simple`].
 ///
 /// [`WarpKnotEnds::Clamped`] is not a second opinion about the mathematics — it
-/// is where a subsystem's SAVED-MODEL runtime still reconstructs its deviation
-/// on the clamped convention (the BMS anchored-cubic replay and the
-/// marginal-slope deviation runtime both do) and has to move to the ramp
-/// definition before its knots can. Each one is its own piece of work; doing it
-/// half-way would leave a fit and its replay reading different functions, which
-/// is the fault this issue is about.
+/// is for a basis evaluated at FIXED arguments, where no β moves an evaluation
+/// point across a boundary knot (the marginal-slope score warp, read at the
+/// data's `z`), and for a subsystem whose SAVED-MODEL runtime still
+/// reconstructs its deviation on the clamped convention and has to move to the
+/// ramp definition before its knots can. Doing that half-way would leave a fit
+/// and its replay reading different functions, which is the fault this issue is
+/// about. The marginal-slope link deviation, read at `a + b·z`, is simple-ended;
+/// its runtime evaluates the ramp and its saved models replay frozen span
+/// tables (gam#3011).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WarpKnotEnds {
     Clamped,

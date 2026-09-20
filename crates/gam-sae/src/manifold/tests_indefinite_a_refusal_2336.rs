@@ -4,6 +4,7 @@
 //! `SaeCriterionError::IndefiniteObservedInformation` variant that #2330 Phase-2a
 //! introduced when it made `½log|A|` the ranked value.
 
+#![cfg(test)]
 use super::tests::*;
 use super::*;
 use gam_solve::rho_optimizer::OuterObjective;
