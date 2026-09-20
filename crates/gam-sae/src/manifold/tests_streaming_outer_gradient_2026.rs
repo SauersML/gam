@@ -344,6 +344,287 @@ fn production_gradient_lane_returns_the_streaming_gradient_where_direct_logdet_i
     }
 }
 
+/// A K=1 softmax term on a non-periodic `EuclideanPatch` atom (latent dimension 1, the
+/// given monomial degree) decoding a planted parabolic arc embedded in `R^p`, seeded at
+/// the planted coordinate with its least-squares decoder. The chart has no orbit generator, so the
+/// streaming route prices it through the rational lane and its derivative bundle.
+fn planted_arc_seed_term(
+    n: usize,
+    p: usize,
+    degree: usize,
+    sigma: f64,
+) -> (SaeManifoldTerm, Array2<f64>) {
+    use super::tests::deterministic_circle_noise;
+    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| {
+        -1.0 + 2.0 * (row as f64) / (n as f64 - 1.0)
+    });
+    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        let t = coords[[row, 0]];
+        deterministic_circle_noise(col, 0) * t
+            + deterministic_circle_noise(col, 1) * t * t
+            + sigma * deterministic_circle_noise(row, col)
+    });
+    let evaluator = Arc::new(
+        crate::basis::EuclideanPatchEvaluator::new(1, degree)
+            .expect("a positive latent dimension is a valid Euclidean patch"),
+    );
+    let (phi, jet) = evaluator
+        .evaluate(coords.view())
+        .expect("the planted coordinates lie in the Euclidean patch domain");
+    let decoder = fast_ata(&phi)
+        .cholesky(Side::Lower)
+        .expect("the planted arc's patch Gram is positive definite")
+        .solve_mat(&fast_atb(&phi, &target));
+    let m = phi.ncols();
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
+        "arc",
+        SaeAtomBasisKind::EuclideanPatch,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(m),
+    )
+    .expect("phi, jet, decoder and gram were built with matching shapes")
+    .with_basis_evaluator(evaluator);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Euclidean],
+        AssignmentMode::softmax(1.0),
+    )
+    .expect("one logit column, coordinate block and manifold");
+    (
+        SaeManifoldTerm::new(vec![atom], assignment).expect("one atom over the same rows"),
+        target,
+    )
+}
+
+/// #2933 F29 — the premise [`SaeManifoldOuterObjective::logdet_gradient_probe_samples`]
+/// splits the surrogate gradient on: the streaming gradient is affine in its derivative
+/// bundle's second moment under the channels' `1/|V|` normalization, so the gradient on
+/// the whole bundle `V` is the mean of the gradients taken on each vector of `V` alone.
+/// A channel normalized by anything else, or nonlinear in a vector, breaks the identity
+/// and with it the per-probe rows the recertification's standard error comes from.
+///
+/// The host reading is starved the way the #979 lane test starves it, so the evaluation
+/// takes the streaming route; the chart is a non-periodic arc, so that route carries a
+/// derivative bundle rather than the circle orbit lane's exact elimination.
+#[test]
+fn streaming_gradient_is_affine_in_the_derivative_bundle_second_moment_2933() {
+    gam_runtime::test_support::install_diagnostic_logger();
+    let (mut objective, _) = starved_planted_arc_objective();
+    let rho_flat = objective.baseline_rho.flat_coordinates();
+    let rho = objective
+        .baseline_rho
+        .from_flat(rho_flat.view())
+        .expect("typed rho layout");
+    let evaluation = objective
+        .evaluate_outer_criterion_route(&rho, false, false)
+        .expect("streaming evaluation");
+    let (full, rows) = objective
+        .streaming_gradient_per_bundle_vector(&rho, &evaluation)
+        .expect("gradients on the bundle and on each of its vectors")
+        .expect("premise: the starved host reading evaluates on the streaming route");
+    assert!(
+        rows.len() >= 2,
+        "premise: the bundle carries several vectors to average; it carries {}",
+        rows.len()
+    );
+    // The two sides sum the same terms in different orders: each gradient reduces
+    // over the `n` data rows, and the mean adds `r` per-vector gradients. The
+    // first-order bound on reordering a sum of `n + r` terms is `(n + r)·ε` times
+    // the largest magnitude summed.
+    let count = rows.len() as f64;
+    let n_rows = 256.0;
+    for coordinate in 0..full.len() {
+        let mean = rows.iter().map(|row| row[coordinate]).sum::<f64>() / count;
+        let magnitude = rows
+            .iter()
+            .map(|row| row[coordinate].abs())
+            .fold(full[coordinate].abs(), f64::max);
+        let tolerance = (n_rows + count) * f64::EPSILON * magnitude;
+        let gap = (full[coordinate] - mean).abs();
+        assert!(
+            gap <= tolerance,
+            "coordinate {coordinate}: gradient on the bundle {:.17e} differs from the mean \
+             of its {} per-vector gradients {mean:.17e} by {gap:.3e} > {tolerance:.3e}",
+            full[coordinate],
+            rows.len()
+        );
+    }
+}
+
+/// The planted arc of [`planted_arc_seed_term`] with the host reading one byte short of
+/// the reserve floor plus its exact-stationarity resident, so the planner admits the
+/// matrix-free route and refuses the direct one; also returns that default reading.
+fn starved_planted_arc_objective() -> (SaeManifoldOuterObjective, usize) {
+    let (mut term, target) = planted_arc_seed_term(256, 4, 2, 0.02);
+    term.gpu_policy = gam_gpu::GpuPolicy::Off;
+    let default_host = term.host_available_bytes;
+    let default_plan = term
+        .streaming_plan()
+        .expect("streaming plan at the default host reading");
+    term.host_available_bytes = super::streaming_plan::SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES
+        .saturating_add(default_plan.estimated_exact_stationarity_bytes)
+        .saturating_sub(1);
+    let starved_plan = term
+        .streaming_plan()
+        .expect("streaming plan at the starved host reading");
+    assert!(
+        starved_plan.matrix_free_admitted && !starved_plan.direct_logdet_admitted(),
+        "premise: the planner admits matrix-free evidence and refuses direct evidence; \
+         plan={starved_plan:?}"
+    );
+    let seed_rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    let objective =
+        SaeManifoldOuterObjective::new(term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6);
+    (objective, default_host)
+}
+
+/// The planted arc on a degree-7 patch (`M = 8`, border `k = M·p = 32`), whose dense
+/// exact-A pencil lane's eight `k × k` blocks outgrow the matrix-free resident, with the
+/// host reading at the reserve floor plus exactly that resident. The planner then admits
+/// matrix-free evidence, refuses the direct route, and the pencil lane does not fit the
+/// budget, so log|S| is priced on the rational surrogate plan. The border is widened
+/// through `M`, not `p`: past `p = M` the decoder frame caps it at `M·r`. The rows are
+/// few enough that the matrix-free resident, linear in `n`, stays under the pencil, and
+/// many enough that the exact stationarity route is not admitted as a tiny allocation.
+fn rational_lane_planted_arc_objective() -> SaeManifoldOuterObjective {
+    let (mut term, target) = planted_arc_seed_term(200, 4, 7, 0.02);
+    term.gpu_policy = gam_gpu::GpuPolicy::Off;
+    let default_plan = term
+        .streaming_plan()
+        .expect("streaming plan at the default host reading");
+    term.host_available_bytes = super::streaming_plan::SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES
+        .saturating_add(default_plan.estimated_matrix_free_peak_bytes);
+    let plan = term
+        .streaming_plan()
+        .expect("streaming plan at the matrix-free reading");
+    let pencil_bytes = gam_solve::arrow_schur::dense_lane_exact_a_pencil_peak_bytes(term.beta_dim())
+        .expect("the pencil lane's byte count fits usize");
+    assert!(
+        plan.matrix_free_admitted
+            && !plan.direct_logdet_admitted()
+            && pencil_bytes > plan.in_core_budget_bytes,
+        "premise: matrix-free evidence is admitted, the direct route refused, and the pencil \
+         lane's {pencil_bytes} bytes exceed the budget; plan={plan:?}"
+    );
+    let seed_rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    SaeManifoldOuterObjective::new(term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6)
+}
+
+/// The route is read from the live state at every probe, so a fit can cross from the
+/// streaming lane onto the direct one (an atom rank-reduces and its smaller resident
+/// fits the host). The basin envelope the direct route engages must be sized by that
+/// same state. Sized once at construction, where the direct route was refused, its
+/// capacity was 0 and the first envelope probe refused its own seed.
+///
+/// The crossing is driven here by restoring the host reading after construction; the
+/// shape-driven crossing on the planted circle reaches it too, but that fit then stops
+/// on the circle orbit's missing arrow-route criterion (#2234).
+#[test]
+fn basin_envelope_is_sized_by_the_state_that_admits_it_2933() {
+    gam_runtime::test_support::install_diagnostic_logger();
+    let (mut objective, default_host) = starved_planted_arc_objective();
+    objective.term.host_available_bytes = default_host;
+    assert!(
+        objective
+            .term
+            .streaming_plan()
+            .expect("streaming plan at the restored host reading")
+            .direct_logdet_admitted(),
+        "premise: the restored host reading admits the direct route"
+    );
+    let seed = objective.baseline_rho.flat_coordinates();
+    let evaluation =
+        OuterObjective::eval(&mut objective, &seed).expect("the envelope admits its own seed");
+    assert!(
+        evaluation.cost.is_finite(),
+        "the direct route prices the planted arc's seed; cost={}",
+        evaluation.cost
+    );
+    let telemetry = objective.probe_telemetry();
+    assert!(
+        telemetry.basin_envelope_evals > 0,
+        "premise: the direct route prices through the envelope; telemetry={telemetry:?}"
+    );
+    assert!(
+        telemetry.basin_max_members >= 1
+            && telemetry.basin_member_capacity >= telemetry.basin_max_members,
+        "the envelope retains its seed within the capacity of the state it priced; \
+         telemetry={telemetry:?}"
+    );
+}
+
+/// #2933 F29 — a certificate the streaming lane's rational log|S| surrogate issued is
+/// judged on probes the search never saw before it is stamped. At the planted arc's
+/// seed the criterion's gradient is far from zero, so a certificate claiming a band of
+/// 0 must be contradicted by the unseen probes, returned as `SurrogateDisagrees` at the
+/// installed point with the doubled plan installed. A band the gradient clears stands,
+/// and stamps the criterion re-scored on the (again doubled) validation plan.
+#[test]
+fn surrogate_certificate_is_rescored_on_unseen_probes_before_stamping_2933() {
+    use gam_solve::model_types::{
+        CertifiedRung, CurvatureEvidence, OuterCriterionCertificate,
+        OuterStationarityCertificate,
+    };
+    gam_runtime::test_support::install_diagnostic_logger();
+    let mut objective = rational_lane_planted_arc_objective();
+    let seed = objective.baseline_rho.flat_coordinates();
+    let evaluation = OuterObjective::eval(&mut objective, &seed).expect("streaming evaluation");
+    assert!(evaluation.cost.is_finite(), "cost={}", evaluation.cost);
+    let search_probes = sae_surrogate_lane_config().num_probes;
+    assert_eq!(
+        objective.surrogate_probe_count(),
+        Some(search_probes),
+        "premise: the matrix-free reading prices log|S| on the search's rational plan"
+    );
+    let certificate = |bound: f64| OuterCriterionCertificate {
+        stationarity: OuterStationarityCertificate::AnalyticGradient {
+            grad_norm: 0.0,
+            projected_grad_norm: 0.0,
+            bound,
+            rung: CertifiedRung {
+                label: "#2933-F29-test".to_string(),
+                derived_standard: false,
+            },
+        },
+        curvature: CurvatureEvidence::NotAvailable,
+        lambdas_railed: Vec::new(),
+        railed_facts: Vec::new(),
+        curvature_floor: None,
+        newton_polish: None,
+    };
+    match objective.validate_surrogate_certificate(&certificate(0.0)) {
+        Err(SaeOuterCertificationError::SurrogateDisagrees { rho, detail }) => {
+            assert_eq!(
+                rho.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                seed.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "the disagreement is reported at the installed point"
+            );
+            assert!(detail.contains("unseen probes"), "detail: {detail}");
+        }
+        other => panic!("a band of 0 at a non-stationary seed must disagree; got {other:?}"),
+    }
+    assert_eq!(
+        objective.surrogate_probe_count(),
+        Some(2 * search_probes),
+        "the disagreement leaves the doubled plan installed for the resumed search"
+    );
+    let stamped = objective
+        .validate_surrogate_certificate(&certificate(f64::INFINITY))
+        .expect("a band the gradient clears stands")
+        .expect("the streaming lane re-scores the criterion it stamps");
+    assert!(stamped.is_finite(), "stamped criterion {stamped}");
+    assert_eq!(
+        objective.surrogate_probe_count(),
+        Some(4 * search_probes),
+        "the stamped criterion is re-scored on the plan drawn past every probe it judged"
+    );
+}
+
 /// #2515 blocker 3 — WHICH assembly the stale-pair guard is comparing.
 ///
 /// `production_objective_forced_streaming_value_gradient_matches_dense` dies on
