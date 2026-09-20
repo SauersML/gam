@@ -444,9 +444,13 @@ pub(crate) fn materialize_survival<'a>(
     // The formula's `link(...)` with its initialization options names the
     // inverse link, as `link` does; both are read, and a `link` argument that
     // names a different link from the formula's is refused by name. A fit
-    // without a link takes its inverse link from the residual law.
+    // without a link takes its inverse link from the residual law. The link
+    // choice (strict or flexible) is the resolver's reading of all three
+    // spellings, so a `flexible(...)` in the `link` argument beside the
+    // formula's `link(...)`, or `flexible_link=True`, is read (gam#3298).
     let formula_link = parsed.linkspec.as_ref();
-    resolve_link_spellings(formula_link, config.link.as_deref(), false)?;
+    let resolved_link_choice =
+        resolve_link_spellings(formula_link, config.link.as_deref(), config.flexible_link)?;
     let link_name = formula_link
         .map(|spec| spec.link.as_str())
         .or(config.link.as_deref());
@@ -467,8 +471,7 @@ pub(crate) fn materialize_survival<'a>(
     // link deviation can flex, so a request to flex one, by `flexible_link` or
     // by `flexible(...)`, is refused here rather than dropped or refused only
     // after the location-scale fit has run (gam#3298).
-    let link_choice = parse_link_choice(link_name, config.flexible_link)?;
-    let link_choice = match link_choice {
+    let link_choice = match resolved_link_choice {
         Some(choice)
             if choice.mixture_components.is_none()
                 && matches!(choice.link, LinkFunction::LogLog | LinkFunction::Cauchit) =>

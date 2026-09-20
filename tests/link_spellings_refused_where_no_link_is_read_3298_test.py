@@ -61,3 +61,23 @@ def test_the_weibull_survival_likelihood_refuses_every_link_spelling(options, sp
         gamfit.fit(data, "Surv(time, event) ~ s(x)", survival_likelihood="weibull", **options)
     assert spelling in str(refused.value)
     gamfit.fit(data, "Surv(time, event) ~ s(x)", survival_likelihood="weibull")
+
+
+@pytest.mark.parametrize(
+    ("formula", "options"),
+    [
+        ("Surv(time, event) ~ x + link(type=loglog)", {"link": "flexible(loglog)"}),
+        ("Surv(time, event) ~ x + link(type=cauchit)", {"flexible_link": True}),
+        ("Surv(time, event) ~ x", {"link": "loglog", "flexible_link": True}),
+    ],
+)
+def test_survival_location_scale_reads_a_flexible_request_from_every_spelling(
+    formula, options
+) -> None:
+    # A flexed survival loglog/cauchit link is refused, so the refusal shows the
+    # flexible request was read. Before, the location-scale fit took its link
+    # choice from the formula's name alone, dropped a `flexible(...)` in `link=`
+    # beside it, and fitted the plain link.
+    data = _survival_data()
+    with pytest.raises(gamfit.GamfitError, match="single-component mixture"):
+        gamfit.fit(data, formula, survival_likelihood="location-scale", **options)
