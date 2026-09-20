@@ -50,7 +50,7 @@ fn duchon_matern_family_radial_derivative_reference(
         }
         terms = next_terms;
     }
-    let mut value = KahanSum::default();
+    let mut value = CompensatedSum::default();
     for term in terms {
         if term.coeff == 0.0 {
             continue;
@@ -58,7 +58,7 @@ fn duchon_matern_family_radial_derivative_reference(
         let k_term = bessel_k_real_half_integer_or_integer(term.bessel_order.abs(), z)?;
         value.add(term.coeff * kappa.powi(term.kappa_power as i32) * r.powf(term.r_power) * k_term);
     }
-    Ok(value.sum())
+    Ok(value.value())
 }
 
 #[test]
@@ -2254,11 +2254,7 @@ fn periodic_hybrid_duchon_kernel_matches_spectral_sum_and_is_psd_2372() {
 /// (gam#2372), from a different angle than the boundary-continuity check.
 #[test]
 fn periodic_hybrid_duchon_basis_builds_psd_across_length_scales_2372() {
-    let x = Array2::from_shape_vec(
-        (7, 1),
-        vec![0.0, 0.13, 0.29, 0.44, 0.61, 0.78, 0.95],
-    )
-    .unwrap();
+    let x = Array2::from_shape_vec((7, 1), vec![0.0, 0.13, 0.29, 0.44, 0.61, 0.78, 0.95]).unwrap();
     let centers = Array2::from_shape_vec((6, 1), (0..6).map(|i| i as f64 / 6.0).collect()).unwrap();
     for &ls in &[0.15_f64, 0.25, 0.5, 1.0, 3.0] {
         let spec = DuchonBasisSpec {
@@ -2271,7 +2267,10 @@ fn periodic_hybrid_duchon_basis_builds_psd_across_length_scales_2372() {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            boundary: OneDimensionalBoundary::Cyclic { start: 0.0, end: 1.0 },
+            boundary: OneDimensionalBoundary::Cyclic {
+                start: 0.0,
+                end: 1.0,
+            },
         };
         let built = build_duchon_basis(x.view(), &spec)
             .unwrap_or_else(|e| panic!("cyclic hybrid Duchon build failed at ls={ls}: {e:?}"));
@@ -4591,11 +4590,8 @@ fn filter_penalty_candidates_preserves_matching_kronecker_factors() {
     let identity = Array2::<f64>::eye(2);
     let kron = gam_problem::penalty_matrix::kronecker_product(&s, &identity);
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
-        matrix: ConstructiveQuadratic::try_from_dense_psd(
-            kron,
-            "matching Kronecker test penalty",
-        )
-        .expect("PSD Kronecker penalty"),
+        matrix: ConstructiveQuadratic::try_from_dense_psd(kron, "matching Kronecker test penalty")
+            .expect("PSD Kronecker penalty"),
         source: PenaltySource::TensorMarginal { dim: 0 },
         normalization_scale: 1.0,
         kronecker_factors: Some(vec![s.clone(), identity.clone()]),
@@ -5434,9 +5430,8 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
     for k in 0..p {
         for j in 0..p {
             let r = (centers[[k, 0]] - centers[[j, 0]]).abs();
-            let core =
-                duchon_radial_core_value_jet(r, length_scale, p_order, s_order, d, &coeffs)
-                    .unwrap();
+            let core = duchon_radial_core_value_jet(r, length_scale, p_order, s_order, d, &coeffs)
+                .unwrap();
             let (phi_psi, _) = duchon_direction_derivatives(
                 DuchonPsiDirection::Global,
                 core.value,
@@ -5876,9 +5871,8 @@ fn test_duchonspectral_scaling_matches_implementation() {
     assert!((jets_2.q - op_scale * jets_1.q).abs() < 1e-8);
     assert!((jets_2.lap - op_scale * jets_1.lap).abs() < 1e-8);
 
-    let core =
-        duchon_radial_core_value_jet(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "radial core", e));
+    let core = duchon_radial_core_value_jet(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "radial core", e));
     let (phi_psi, phi_psi_psi) = duchon_direction_derivatives(
         DuchonPsiDirection::Global,
         core.value,
@@ -6040,4 +6034,3 @@ fn test_duchon_radial_jets_t_equals_phi_rr_minus_q_over_r2() {
         );
     }
 }
-

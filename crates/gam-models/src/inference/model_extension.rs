@@ -12,7 +12,6 @@ use crate::inference::model::{
     SchemaColumn,
 };
 use gam_solve::estimate::{BlockRole, UnifiedFitResult};
-use gam_terms::smooth::TermCollectionSpec;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -155,9 +154,30 @@ fn extend_model_with_random_effect_level(
         (
             term_idx,
             spec.random_effect_terms[term_idx].feature_col,
-            random_effect_penalty_index(spec, term_idx),
+            spec.random_effect_penalty_index(term_idx),
         )
     };
+    let coefficient_index = payload
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?
+        .beta
+        .len();
+    let (coefficient_mean, supplied_variance) = extension_prior_parameters(prior.as_ref())?;
+    let coefficient_variance = match supplied_variance {
+        Some(variance) => variance,
+        None => default_unseen_level_prior_variance(
+            payload
+                .fit_result
+                .as_ref()
+                .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?,
+            penalty_index,
+            term_name,
+        )?,
+    };
+    for fit in [payload.fit_result.as_ref(), payload.unified.as_ref()].into_iter().flatten() {
+        unscaled_prior_precision(fit, coefficient_variance)?;
+    }
     let schema = payload
         .data_schema
         .as_mut()
@@ -197,51 +217,6 @@ fn extend_model_with_random_effect_level(
             compact_json(&level)
         ));
     }
-    let coefficient_index = payload
-        .fit_result
-        .as_ref()
-        .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?
-        .beta
-        .len();
-    let (coefficient_mean, supplied_variance) = extension_prior_parameters(prior.as_ref())?;
-    let coefficient_variance = match supplied_variance {
-        Some(variance) => variance,
-        None => {
-            let fit = payload
-                .fit_result
-                .as_ref()
-                .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?;
-            let lambda = fit
-                .lambdas
-                .get(penalty_index)
-                .copied()
-                .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
-                .ok_or_else(|| {
-                    format!(
-                        "extend_with_group term '{term_name}' has no finite positive prior lambda"
-                    )
-                })?;
-            // The unseen-level default prior is the fitted random-effect
-            // variance component `σ_b² = φ̂ / λ` (mgcv's `λ = φ̂ / σ_b²`
-            // convention), NOT the scale-free `1 / λ`. `φ̂` is the residual
-            // dispersion that scales every predict-time covariance: `1` for
-            // fixed-scale families (Poisson/Binomial — where `φ̂/λ` collapses
-            // to the old `1/λ`), but `σ̂²` for Gaussian and the estimated
-            // dispersion for Gamma/Tweedie/NB. Omitting `φ̂` made the prior
-            // (and any deployment interval built from it) wrong by `1/φ̂` and,
-            // for an estimated scale, not response-scale equivariant. See #674.
-            let phi = fit
-                .dispersion_phi()
-                .map_err(|err| format!("cannot resolve unseen-level prior dispersion: {err}"))?;
-            if !(phi.is_finite() && phi > 0.0) {
-                return Err(format!(
-                    "extend_with_group term '{term_name}' has a non-finite or non-positive \
-                     dispersion (φ̂ = {phi}); cannot form the default prior variance"
-                ));
-            }
-            phi / lambda
-        }
-    };
     extend_training_feature_range(
         payload.training_feature_ranges.as_mut(),
         feature_col,
@@ -338,10 +313,6 @@ fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|error| format!("<unserializable: {error}>"))
 }
 
-fn random_effect_penalty_index(spec: &TermCollectionSpec, term_idx: usize) -> usize {
-    usize::from(spec.linear_terms.iter().any(|term| term.double_penalty)) + term_idx
-}
-
 fn extension_prior_parameters(
     prior: Option<&serde_json::Value>,
 ) -> Result<(f64, Option<f64>), String> {
@@ -381,6 +352,69 @@ fn extension_prior_parameters(
     Ok((mean, variance))
 }
 
+/// The default prior variance of an unseen random-effect level: the fitted
+/// variance component `σ_b²` of the term's ridge, in the same units as the
+/// reported coefficient covariance `Vb = scale · H⁻¹`.
+///
+/// The penalty `λ·S` enters the stored `H = XᵀWX + S_λ` unscaled, so the
+/// ridge's prior precision in `H` units is `λ` and its covariance in `Vb`
+/// units is `scale / λ`, where `scale` is
+/// [`UnifiedFitResult::coefficient_covariance_scale`]: the profiled `σ̂²` for
+/// the scale-free Gaussian (mgcv's `λ = σ̂² / σ_b²`, #674) and `1` for every
+/// family whose working weight already carries `1/φ` (Gamma, Tweedie, Beta,
+/// NB, fixed-scale Gaussian, Poisson, Binomial). The response-level
+/// `dispersion_phi()` is a different quantity (`1/shape` for Gamma) and would
+/// scale these families' prior by `φ` a second time.
+fn default_unseen_level_prior_variance(
+    fit: &UnifiedFitResult,
+    penalty_index: usize,
+    term_name: &str,
+) -> Result<f64, String> {
+    let lambda = fit
+        .lambdas
+        .get(penalty_index)
+        .copied()
+        .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
+        .ok_or_else(|| {
+            format!("extend_with_group term '{term_name}' has no finite positive prior lambda")
+        })?;
+    let variance = extension_covariance_scale(fit)? / lambda;
+    if !(variance.is_finite() && variance > 0.0) {
+        return Err(format!("extend_with_group term '{term_name}' prior variance is not finite and positive ({variance})"));
+    }
+    Ok(variance)
+}
+
+/// `scale` in `Vb = scale · H⁻¹` for a saved fit, required finite and
+/// positive: a new coordinate's prior variance and its entry in the unscaled
+/// penalized Hessian are related through it.
+fn extension_covariance_scale(fit: &UnifiedFitResult) -> Result<f64, String> {
+    let scale = fit.coefficient_covariance_scale().map_err(|err| {
+        format!("cannot resolve the coefficient-covariance scale for the unseen-level prior: {err}")
+    })?;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(format!(
+            "extend_with_group saved fit has a non-finite or non-positive coefficient-covariance \
+             scale ({scale}); cannot place the new level's prior"
+        ));
+    }
+    Ok(scale)
+}
+
+/// The new coordinate's diagonal in the UNSCALED penalized Hessian
+/// (`UnscaledPrecision`, `Vb = scale · H⁻¹`) for a prior variance stated in
+/// `Vb` units. For the default prior this is exactly the ridge's `λ`.
+fn unscaled_prior_precision(fit: &UnifiedFitResult, variance: f64) -> Result<f64, String> {
+    if !(variance.is_finite() && variance > 0.0) {
+        return Err(format!("extend_with_group prior variance must be finite and positive; got {variance}"));
+    }
+    let precision = extension_covariance_scale(fit)? / variance;
+    if !(precision.is_finite() && precision > 0.0) {
+        return Err(format!("extend_with_group unscaled prior precision is not finite and positive ({precision})"));
+    }
+    Ok(precision)
+}
+
 fn extend_training_feature_range(
     ranges: Option<&mut Vec<(f64, f64)>>,
     feature_col: usize,
@@ -410,6 +444,10 @@ fn insert_coefficient_into_saved_fit(
             "extend_with_group coefficient variance must be finite and positive; got {variance}"
         ));
     }
+    // `variance` is in reported-covariance units; the Hessians below are the
+    // unscaled `H` of `Vb = scale · H⁻¹`, so the new diagonal is
+    // `scale / variance` (resolved before any mutation).
+    let precision_diag = unscaled_prior_precision(fit, variance)?;
     if index > fit.beta.len() {
         return Err(format!(
             "extend_with_group coefficient index {index} exceeds fit coefficient length {}",
@@ -488,11 +526,13 @@ fn insert_coefficient_into_saved_fit(
     //   -log p(b) = 1/2 (b - mu)' (lambda_new S_new) (b - mu) + const.
     //
     // Since no old likelihood rows or old penalties are recomputed, the joint
-    // precision is blockdiag(H_old, lambda_new S_new).  Therefore the
-    // conditional covariance is blockdiag(V_old, S_new^{-1}/lambda_new).  The
-    // current API extends one iid random-effect coordinate at a time, so
-    // S_new = [1] and `variance` is exactly 1/lambda_new, or the caller's
-    // supplied scalar prior covariance.
+    // unscaled precision is blockdiag(H_old, lambda_new S_new), and the
+    // reported covariance is scale * blockdiag(H_old, lambda_new S_new)^{-1}
+    // = blockdiag(V_old, scale S_new^{-1}/lambda_new).  The current API
+    // extends one iid random-effect coordinate at a time, so S_new = [1] and
+    // `variance` is exactly scale/lambda_new (see
+    // `default_unseen_level_prior_variance`), or the caller's supplied scalar
+    // prior covariance; either way the unscaled Hessian gains scale/variance.
     if let Some(cov) = fit.covariance_conditional.as_mut() {
         *cov = insert_symmetric_array2(cov, index, variance)?;
     }
@@ -500,7 +540,6 @@ fn insert_coefficient_into_saved_fit(
         *cov = insert_symmetric_array2(cov, index, variance)?;
     }
     let variance_diag = variance;
-    let precision_diag = 1.0 / variance_diag;
     if let Some(inference) = fit.inference.as_mut() {
         // Boundary adapter: `penalized_hessian` is the `UnscaledPrecision`
         // newtype; unwrap for the `insert_symmetric_array2` helper and wrap
@@ -601,4 +640,179 @@ fn insert_symmetric_array2(
     }
     out[[index, index]] = diagonal;
     Ok(out)
+}
+
+#[cfg(test)]
+mod unseen_level_prior_scale_tests {
+    use super::*;
+    use gam_problem::types::{LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization};
+    use gam_solve::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
+    use gam_solve::pirls::PirlsStatus;
+    use ndarray::array;
+
+    fn saved_fit(
+        likelihood_family: LikelihoodSpec,
+        likelihood_scale: LikelihoodScaleMetadata,
+        standard_deviation: f64,
+        lambda: f64,
+    ) -> UnifiedFitResult {
+        let log_lambda = lambda.ln();
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda).expect("finite fixture strength");
+        let blocks = vec![FittedBlock {
+            beta: array![0.25, -0.5],
+            role: BlockRole::Mean,
+            edf: 1.5,
+            lambdas: array![lambda],
+        }];
+        let lambdas = array![lambda];
+        UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
+            blocks,
+            training_sample_size: 16,
+            log_lambdas: array![log_lambda],
+            lambdas,
+            likelihood_family: Some(likelihood_family),
+            likelihood_scale,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: Some(0.0),
+            stable_penalty_term: 0.0,
+            penalized_objective: Some(0.0),
+            used_device: false,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: None,
+            standard_deviation,
+            covariance_conditional: Some(Array2::zeros((2, 2))),
+            covariance_corrected: Some(Array2::zeros((2, 2))),
+            inference: None,
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: vec![],
+            pirls_status: PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts {
+                pirls: None,
+                null_space_logdet: None,
+                null_space_dim: None,
+                survival_link_wiggle_knots: None,
+                survival_link_wiggle_degree: None,
+                criterion_certificate: None,
+                rho_posterior: Default::default(),
+                rho_posterior_escalation: None,
+                rho_covariance: None,
+                joint_log_lambdas: None,
+                firth_bias_reduction: false,
+                covariance_declined: None,
+                jeffreys_arming_evidence: None,
+                improper_penalty_null_posterior: None,
+                outer_warm_start: None,
+                null_deviance: None,
+                coefficient_mode_selection:
+                    gam_solve::model_types::CoefficientModeSelection::NotRecorded,
+                random_effect_tests: Vec::new(),
+            },
+            inner_cycles: 0,
+        })
+        .expect("test fixture fit must assemble")
+    }
+
+    /// The unseen-level prior is `scale / λ` in reported-covariance units and
+    /// enters the unscaled Hessian as exactly `λ`, for a family whose working
+    /// weight carries `1/φ` (Gamma: scale 1, although `dispersion_phi` is
+    /// `1/shape`) and for the scale-free profiled Gaussian (scale `σ̂²`).
+    #[test]
+    fn unseen_level_prior_uses_the_coefficient_covariance_scale() {
+        let lambda = 2.0;
+        let gamma = saved_fit(
+            LikelihoodSpec::gamma_log(),
+            LikelihoodScaleMetadata::EstimatedGammaShape { shape: 4.0 },
+            1.0,
+            lambda,
+        );
+        assert_eq!(gamma.coefficient_covariance_scale().unwrap(), 1.0);
+        assert_eq!(gamma.dispersion_phi().unwrap(), 0.25);
+        let gaussian = saved_fit(
+            LikelihoodSpec::gaussian_identity(),
+            LikelihoodScaleMetadata::ProfiledGaussian,
+            2.0,
+            lambda,
+        );
+        assert_eq!(gaussian.coefficient_covariance_scale().unwrap(), 4.0);
+
+        for (fit, expected_variance) in [(&gamma, 1.0 / lambda), (&gaussian, 4.0 / lambda)] {
+            let variance = default_unseen_level_prior_variance(fit, 0, "g").unwrap();
+            assert!(
+                (variance - expected_variance).abs() <= 1e-15,
+                "prior variance {variance} != scale/lambda {expected_variance}"
+            );
+            let precision = unscaled_prior_precision(fit, variance).unwrap();
+            assert!(
+                (precision - lambda).abs() <= 1e-15,
+                "unscaled prior precision {precision} != lambda {lambda}"
+            );
+        }
+    }
+    #[test]
+    fn unseen_level_prior_refuses_unrepresentable_variance_and_precision() {
+        let gamma = saved_fit(
+            LikelihoodSpec::gamma_log(),
+            LikelihoodScaleMetadata::EstimatedGammaShape { shape: 4.0 },
+            1.0,
+            2.0,
+        );
+        let overflow = saved_fit(
+            LikelihoodSpec::gaussian_identity(),
+            LikelihoodScaleMetadata::ProfiledGaussian,
+            1e100,
+            1e-200,
+        );
+        assert!(default_unseen_level_prior_variance(&overflow, 0, "g").is_err());
+        for variance in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::from_bits(1)] {
+            assert!(unscaled_prior_precision(&gamma, variance).is_err(), "variance={variance}");
+        }
+        let gaussian = saved_fit(
+            LikelihoodSpec::gaussian_identity(),
+            LikelihoodScaleMetadata::ProfiledGaussian,
+            1e-100,
+            1e200,
+        );
+        assert!(default_unseen_level_prior_variance(&gaussian, 0, "g").is_err());
+        assert!(unscaled_prior_precision(&gaussian, f64::MAX).is_err());
+    }
+
+    #[test]
+    fn unseen_level_insertion_preserves_covariance_precision_scale() {
+        for (family, scale, standard_deviation, variance) in [
+            (LikelihoodSpec::gamma_log(), LikelihoodScaleMetadata::EstimatedGammaShape { shape: 4.0 }, 1.0, 0.5),
+            (LikelihoodSpec::gaussian_identity(), LikelihoodScaleMetadata::ProfiledGaussian, 2.0, 2.0),
+        ] {
+            let mut fit = saved_fit(family, scale, standard_deviation, 2.0);
+            let covariance_scale = fit.coefficient_covariance_scale().unwrap();
+            fit.covariance_conditional = Some(Array2::eye(2) * covariance_scale);
+            fit.covariance_corrected = Some(Array2::eye(2) * covariance_scale);
+            fit.geometry = Some(gam_solve::model_types::FitGeometry {
+                coefficient_gauge: gam_problem::gauge::Gauge::identity(&[2]),
+                penalized_hessian: Array2::eye(2).into(),
+                constrained_posterior: None,
+                working: None,
+            });
+            insert_coefficient_into_saved_fit(Some(&mut fit), 2, 0.75, variance).unwrap();
+            assert_eq!(fit.beta.to_vec(), vec![0.25, -0.5, 0.75]);
+            for covariance in [&fit.covariance_conditional, &fit.covariance_corrected] {
+                let covariance = covariance.as_ref().unwrap();
+                assert_eq!(covariance.dim(), (3, 3));
+                assert_eq!(covariance[[0, 0]], covariance_scale);
+                assert_eq!(covariance[[2, 2]], variance);
+                assert_eq!(covariance[[0, 2]], 0.0);
+            }
+            let geometry = fit.geometry.as_ref().unwrap();
+            assert_eq!(geometry.coefficient_gauge.raw_total(), 3);
+            assert_eq!(geometry.coefficient_gauge.reduced_total(), 3);
+            assert_eq!(geometry.penalized_hessian.as_array()[[2, 2]], 2.0);
+            assert_eq!(geometry.penalized_hessian.as_array()[[0, 0]], 1.0);
+        }
+    }
+
 }

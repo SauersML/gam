@@ -51,6 +51,11 @@ class LinearDictionaryFit:
     # linear (mean-free) behavior byte-identical.
     centered: bool = False
     mean: np.ndarray | None = None
+    # Softmax routing temperature the model was fitted with. ``transform`` must
+    # encode with the fitted assignment rule (and, for ``"softmax"``, this
+    # temperature) so held-out codes come from the same encoder as
+    # ``assignments``.
+    temperature: float = 0.25
 
     def reconstruct(self, assignments: Any | None = None) -> np.ndarray:
         codes = self.assignments if assignments is None else _as_2d_float(assignments, "assignments")
@@ -66,9 +71,11 @@ class LinearDictionaryFit:
     def transform(self, X: Any, top_k: int | None = None) -> np.ndarray:
         """Encode held-out rows ``X`` (``M x P``) against the fitted dictionary.
 
-        Routes the top-``top_k`` ridge least-squares encode through the Rust
-        core (``linear_dictionary_transform``); Python only applies the affine
-        centering used by the K=1 centered lane. Returns the ``M x K`` codes.
+        Routes the fitted model's assignment rule (top-``top_k`` ridge least
+        squares, or the top-``top_k`` softmax at the fitted ``temperature``)
+        through the Rust core (``linear_dictionary_transform``); Python only
+        applies the affine centering used by the K=1 centered lane. Returns the
+        ``M x K`` codes.
         """
         x = _as_2d_float(X, "X")
         if x.shape[1] != self.atoms.shape[1]:
@@ -85,7 +92,9 @@ class LinearDictionaryFit:
             np.ascontiguousarray(x_eff, dtype=np.float64),
             np.ascontiguousarray(self.atoms, dtype=np.float64),
             int(k_active),
-            float(self.code_ridge),
+            code_ridge=float(self.code_ridge),
+            assignment=str(self.assignment),
+            temperature=float(self.temperature),
         )
         return np.ascontiguousarray(codes)
 
@@ -139,6 +148,7 @@ def linear_dictionary_fit(
         training_data=x,
         centered=is_centered,
         mean=np.ascontiguousarray(mean, dtype=np.float64),
+        temperature=float(temperature),
     )
 
 

@@ -25,8 +25,16 @@ pub enum QuadratureError {
         index: usize,
         value: f64,
     },
-    /// The implicit-shift QL iteration did not deflate one eigenvalue within
-    /// its dimension-derived work bound.
+    /// A probe carried through the eigenvector rotations has one entry per
+    /// row of the tridiagonal.
+    InvalidProbeLength { dimension: usize, probe: usize },
+    /// The carried probe must be finite.
+    NonFiniteProbeEntry { index: usize, value: f64 },
+    /// An eigenvalue or rotated probe component left the finite `f64` range
+    /// when restored to the caller's units.
+    SpectrumNotRepresentable,
+    /// The implicit-shift QL iteration exhausted its dimension-derived sweep
+    /// budget before deflating this eigenvalue.
     EigenIterationDidNotConverge {
         eigenvalue: usize,
         iterations: usize,
@@ -61,12 +69,23 @@ impl fmt::Display for QuadratureError {
                     "off-diagonal"
                 }
             ),
+            Self::InvalidProbeLength { dimension, probe } => write!(
+                formatter,
+                "symmetric tridiagonal of dimension {dimension} cannot carry a probe of length {probe}"
+            ),
+            Self::NonFiniteProbeEntry { index, value } => write!(
+                formatter,
+                "symmetric tridiagonal probe entry {index} is not finite: {value}"
+            ),
+            Self::SpectrumNotRepresentable => formatter.write_str(
+                "symmetric tridiagonal eigenvalue or rotated probe component is not representable as a finite f64",
+            ),
             Self::EigenIterationDidNotConverge {
                 eigenvalue,
                 iterations,
             } => write!(
                 formatter,
-                "symmetric tridiagonal QL failed to converge for eigenvalue {eigenvalue} after {iterations} iterations"
+                "symmetric tridiagonal QL failed to converge for eigenvalue {eigenvalue} after {iterations} sweeps"
             ),
             Self::EmptyGaussHermiteRule => {
                 formatter.write_str("Gauss-Hermite quadrature needs at least one node")
@@ -87,21 +106,73 @@ impl From<QuadratureError> for String {
     }
 }
 
+/// Sweeps the implicit-shift QL iteration may spend on an `n × n` symmetric
+/// tridiagonal, per unit of dimension, before it reports non-convergence
+/// rather than returning an unconverged diagonal.
+///
+/// LAPACK `dsteqr` bounds its whole decomposition by the same `30·n` sweeps
+/// (`MAXIT = 30`, `NMAXIT = N·MAXIT`). The Wilkinson-shifted iteration
+/// converges cubically and spends two or three sweeps per eigenvalue, so
+/// exhausting this budget is a failure to report, never a tolerance to widen.
+const QL_SWEEPS_PER_DIMENSION: usize = 30;
+
 /// Eigenvalues and first eigenvector components of a symmetric tridiagonal.
 ///
 /// For `T = Q diag(lambda) Q'`, the returned vectors contain `lambda_i` and
 /// `Q[0, i]` in matching (not necessarily sorted) order.  This is precisely the
-/// spectral information used by Golub-Welsch and Lanczos quadrature.
-pub(crate) fn symmetric_tridiagonal_eigen_first_components(
+/// spectral information used by Golub-Welsch and Lanczos quadrature: it is
+/// [`symmetric_tridiagonal_eigen_with_probe`] with the probe `e₁`.
+pub fn symmetric_tridiagonal_eigen_first_components(
     diagonal: &[f64],
     off_diagonal: &[f64],
 ) -> Result<(Vec<f64>, Vec<f64>), QuadratureError> {
+    let mut first_components = vec![0.0; diagonal.len()];
+    if let Some(first) = first_components.first_mut() {
+        *first = 1.0;
+    }
+    let eigenvalues =
+        symmetric_tridiagonal_eigen_with_probe(diagonal, off_diagonal, &mut first_components)?;
+    Ok((eigenvalues, first_components))
+}
+
+/// Eigenvalues of a symmetric tridiagonal `T = W diag(lambda) Wᵀ` together
+/// with `Wᵀ probe`, by implicit-shift QL with Wilkinson shifts.
+///
+/// Every Givens rotation is applied to the single vector `probe` instead of an
+/// `n × n` accumulator: `O(n²)` arithmetic and `O(n)` storage.  With
+/// `probe = e₁` this is Golub-Welsch (the first row of `W`); with a general
+/// vector it is that vector's coordinates in the eigenbasis, which is what
+/// `gam_linalg::packed_symmetric_spectrum` needs after its Householder
+/// reduction.
+///
+/// On return `probe[i]` is the coordinate of the entry vector along the unit
+/// eigenvector belonging to the returned `lambda[i]`; the eigenvalues are in
+/// the (unsorted) order the iteration deflates them into.  Eigenvector sign is
+/// not determined, so only sign-independent functionals of `probe` (squares,
+/// sums of them) are reproducible.
+///
+/// # Errors
+///
+/// A shape mismatch between `diagonal`, `off_diagonal` and `probe`; a
+/// non-finite entry; an eigenvalue or rotated probe component outside the
+/// finite `f64` range; non-convergence within `30·n` sweeps.
+pub fn symmetric_tridiagonal_eigen_with_probe(
+    diagonal: &[f64],
+    off_diagonal: &[f64],
+    probe: &mut [f64],
+) -> Result<Vec<f64>, QuadratureError> {
     let dimension = diagonal.len();
     let expected_off_diagonal = dimension.saturating_sub(1);
     if off_diagonal.len() != expected_off_diagonal {
         return Err(QuadratureError::InvalidTridiagonalShape {
             diagonal: dimension,
             off_diagonal: off_diagonal.len(),
+        });
+    }
+    if probe.len() != dimension {
+        return Err(QuadratureError::InvalidProbeLength {
+            dimension,
+            probe: probe.len(),
         });
     }
     if let Some((index, &value)) = diagonal
@@ -126,52 +197,101 @@ pub(crate) fn symmetric_tridiagonal_eigen_first_components(
             value,
         });
     }
+    if let Some((index, &value)) = probe
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(QuadratureError::NonFiniteProbeEntry { index, value });
+    }
     if dimension == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Vec::new());
     }
 
-    let mut eigenvalues = diagonal.to_vec();
+    // Positive rescaling preserves the eigenvectors. Iterating at unit entry
+    // scale keeps the sums of adjacent diagonal magnitudes, the norm below and
+    // the shift arithmetic inside the exponent range whatever `T`'s magnitude
+    // is, so diag=(1e308,1e308) cannot deflate merely because two magnitudes
+    // sum to infinity.
+    let entry_scale = diagonal
+        .iter()
+        .chain(off_diagonal.iter())
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    if entry_scale == 0.0 {
+        // The identity eigenbasis is a valid choice for the zero matrix.
+        return Ok(vec![0.0; dimension]);
+    }
+    let mut eigenvalues = diagonal
+        .iter()
+        .map(|value| value / entry_scale)
+        .collect::<Vec<_>>();
     // The implicit QL recurrence reads one sentinel beyond the physical
     // off-diagonal.  Keeping that zero explicitly removes boundary branches
     // from the rotations.
     let mut off = vec![0.0; dimension];
-    off[..expected_off_diagonal].copy_from_slice(off_diagonal);
-    let mut first_components = vec![0.0; dimension];
-    first_components[0] = 1.0;
+    for (slot, value) in off.iter_mut().zip(off_diagonal) {
+        *slot = value / entry_scale;
+    }
 
-    // LAPACK's symmetric-tridiagonal eigensolvers bound total iteration by a
-    // constant multiple of matrix dimension.  Applying that same 30*n work
-    // envelope to each active block makes the guard scale with the problem
-    // rather than introducing a quadrature-order ceiling.
-    let maximum_iterations = 30usize.saturating_mul(dimension.max(1));
+    // Absolute deflation floor: `eps · ‖T‖_∞`.
+    //
+    // THE RELATIVE TEST ALONE DOES NOT TERMINATE, and the failure is not
+    // exotic — it is what a rank-deficient Gram produces every time. On
+    // `F Fᵀ` with `F` of `296 × 148` standard normals, `‖T‖ ≈ 9·10²` while the
+    // 148 null directions arrive as `d ≈ 10⁻¹³`, `e ≈ 10⁻¹³`. The classical
+    // criterion asks `|e_i| ⩽ ε(|d_i| + |d_{i+1}|) ≈ 4·10⁻²⁹` there, which the
+    // plane rotations cannot reach: every sweep re-injects rounding of order
+    // `ε‖T‖ ≈ 2·10⁻¹³`. The sweep count then runs out on an eigenvalue that was
+    // already correct to every digit the arithmetic holds.
+    //
+    // Deflating at `ε‖T‖` perturbs `T` by exactly the amount its own
+    // factorization already carries, so the eigenvalues move by no more than
+    // the accuracy any backward-stable dense method delivers. What it forfeits
+    // is RELATIVE accuracy on eigenvalues below that floor, which this routine
+    // never promised: a Gauss rule's nodes are absolute quantities, and the
+    // certified packed-spectrum consumer discards every mode inside its own
+    // `ε·rank·θ_max` floor, a floor `rank` times WIDER than this one.
+    //
+    // The classical relative test is kept beside it: where two adjacent
+    // diagonal magnitudes sum past `‖T‖_∞` it is the looser of the two.
+    let mut norm = 0.0_f64;
+    for index in 0..dimension {
+        let previous = if index > 0 { off[index - 1].abs() } else { 0.0 };
+        norm = norm.max(eigenvalues[index].abs() + previous + off[index].abs());
+    }
+    let deflation_floor = f64::EPSILON * norm;
+
+    let maximum_sweeps = QL_SWEEPS_PER_DIMENSION.saturating_mul(dimension);
+    let mut sweeps = 0usize;
     for left in 0..dimension {
-        let mut iterations = 0usize;
         loop {
-            let mut split = dimension - 1;
-            for index in left..dimension - 1 {
-                let local_scale = eigenvalues[index].abs() + eigenvalues[index + 1].abs();
-                if off[index].abs() <= f64::EPSILON * local_scale {
-                    split = index;
+            // Split at the first negligible off-diagonal at or after `left`.
+            let mut split = left;
+            while split + 1 < dimension {
+                let local_scale = eigenvalues[split].abs() + eigenvalues[split + 1].abs();
+                let coupling = off[split].abs();
+                if coupling + local_scale == local_scale || coupling <= deflation_floor {
                     break;
                 }
+                split += 1;
             }
             if split == left {
                 break;
             }
-            iterations += 1;
-            if iterations > maximum_iterations {
+            if sweeps == maximum_sweeps {
                 return Err(QuadratureError::EigenIterationDidNotConverge {
                     eigenvalue: left,
-                    iterations,
+                    iterations: sweeps,
                 });
             }
+            sweeps += 1;
 
+            // Wilkinson shift, formed from the leading 2x2 of the active block.
             let mut shift_coordinate =
                 (eigenvalues[left + 1] - eigenvalues[left]) / (2.0 * off[left]);
             let mut radius = shift_coordinate.hypot(1.0);
             shift_coordinate = eigenvalues[split] - eigenvalues[left]
-                + off[left]
-                    / (shift_coordinate + radius.copysign(shift_coordinate));
+                + off[left] / (shift_coordinate + radius.copysign(shift_coordinate));
             let (mut sine, mut cosine) = (1.0, 1.0);
             let mut diagonal_correction = 0.0;
             let mut deflated_inside_sweep = false;
@@ -182,6 +302,8 @@ pub(crate) fn symmetric_tridiagonal_eigen_first_components(
                 radius = rotated_off.hypot(shift_coordinate);
                 off[index + 1] = radius;
                 if radius == 0.0 {
+                    // An exactly-zero rotation radius splits the block here;
+                    // recover the shift and restart the sweep.
                     eigenvalues[index + 1] -= diagonal_correction;
                     off[split] = 0.0;
                     deflated_inside_sweep = true;
@@ -196,13 +318,11 @@ pub(crate) fn symmetric_tridiagonal_eigen_first_components(
                 eigenvalues[index + 1] = shift_coordinate + diagonal_correction;
                 shift_coordinate = cosine * radius - preserved_off;
 
-                // Carry only row zero of Q through the rotations.  Quadrature
-                // weights never inspect any other eigenvector component.
-                rotated_off = first_components[index + 1];
-                first_components[index + 1] =
-                    sine * first_components[index] + cosine * rotated_off;
-                first_components[index] =
-                    cosine * first_components[index] - sine * rotated_off;
+                // Carry the probe through the same rotation instead of an
+                // n x n eigenvector accumulator.
+                rotated_off = probe[index + 1];
+                probe[index + 1] = sine * probe[index] + cosine * rotated_off;
+                probe[index] = cosine * probe[index] - sine * rotated_off;
             }
             if deflated_inside_sweep {
                 continue;
@@ -213,7 +333,17 @@ pub(crate) fn symmetric_tridiagonal_eigen_first_components(
         }
     }
 
-    Ok((eigenvalues, first_components))
+    for value in eigenvalues.iter_mut() {
+        *value *= entry_scale;
+    }
+    if eigenvalues
+        .iter()
+        .chain(probe.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(QuadratureError::SpectrumNotRepresentable);
+    }
+    Ok(eigenvalues)
 }
 
 /// Physicists' Gauss-Hermite rule for `integral exp(-x²) f(x) dx`.
@@ -622,5 +752,43 @@ mod tests {
             symmetric_tridiagonal_eigen_first_components(&[f64::NAN], &[]),
             Err(QuadratureError::NonFiniteEntry { diagonal: true, .. })
         ));
+        assert!(matches!(
+            symmetric_tridiagonal_eigen_with_probe(&[1.0, 2.0], &[0.5], &mut [1.0]),
+            Err(QuadratureError::InvalidProbeLength { dimension: 2, probe: 1 })
+        ));
+        assert!(matches!(
+            symmetric_tridiagonal_eigen_with_probe(&[1.0, 2.0], &[0.5], &mut [1.0, f64::NAN]),
+            Err(QuadratureError::NonFiniteProbeEntry { index: 1, .. })
+        ));
+    }
+
+    /// The path-graph Laplacian `tridiag(-1; 1, 2, …, 2, 1)` has the exact
+    /// spectrum `2 − 2cos(kπ/n)`, including an exact zero, and its eigenvector
+    /// rotations must preserve the probe's Euclidean mass.
+    #[test]
+    fn tridiagonal_probe_spectrum_matches_the_path_laplacian() {
+        let n = 64usize;
+        let mut diagonal = vec![2.0; n];
+        diagonal[0] = 1.0;
+        diagonal[n - 1] = 1.0;
+        let off_diagonal = vec![-1.0; n - 1];
+        let mut probe = (0..n).map(|i| (0.37 * i as f64).sin() + 0.5).collect::<Vec<_>>();
+        let mass = probe.iter().map(|value| value * value).sum::<f64>();
+        let mut eigenvalues =
+            symmetric_tridiagonal_eigen_with_probe(&diagonal, &off_diagonal, &mut probe)
+                .expect("path Laplacian spectrum");
+        eigenvalues.sort_by(f64::total_cmp);
+        // Backward stability: every eigenvalue within `n·ε·‖T‖_∞`, `‖T‖_∞ = 4`.
+        let tolerance = n as f64 * f64::EPSILON * 4.0;
+        for (k, actual) in eigenvalues.iter().enumerate() {
+            let expected = 2.0 - 2.0 * (std::f64::consts::PI * k as f64 / n as f64).cos();
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "eigenvalue {k}: {actual} vs {expected}"
+            );
+        }
+        let rotated_mass = probe.iter().map(|value| value * value).sum::<f64>();
+        // At most `n` rotations per sweep over `O(n)` sweeps, each exact to `ε`.
+        assert!((rotated_mass - mass).abs() <= (n * n) as f64 * f64::EPSILON * mass);
     }
 }

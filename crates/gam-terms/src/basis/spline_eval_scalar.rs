@@ -701,9 +701,36 @@ pub(crate) fn create_ispline_dense(
         &mut left_offsets,
     );
 
+    // Right-boundary cumulative masses `R_j(right) = Σ_{m≥j} B_m(right)`. They
+    // are formed as the complement `1 − Σ_{m<j} B_m(right)` so a column wholly
+    // left of the right support block carries exactly 1, and on a clamped knot
+    // vector (whose right-boundary support is `[0, …, 0, 1]`) every column
+    // carries exactly 1. On an open knot vector the last `bs_degree` columns
+    // carry the partial mass of the B-splines that straddle `right`.
+    let mut right_local = vec![0.0_f64; support];
+    let mut right_scratch = internal::BsplineScratch::new(bs_degree);
+    let right_start = internal::evaluate_splines_sparse_into(
+        right,
+        bs_degree,
+        knot_vector,
+        &mut right_local,
+        &mut right_scratch,
+    );
+    let mut right_mass = vec![1.0_f64; num_bspline_basis];
+    let mut below = 0.0_f64;
+    for (offset, &b) in right_local.iter().enumerate() {
+        let j = right_start + offset;
+        if j >= num_bspline_basis {
+            break;
+        }
+        right_mass[j] = 1.0 - below;
+        below += b;
+    }
+
     // Outside the knot domain the I-spline saturates: every basis is anchored
-    // at 0 at `left` and reaches its right-cumulative mass (≈ 1 minus the
-    // left-boundary offset) by `right`. Saturation is the definition of the
+    // at 0 at `left` and reaches its right-cumulative mass `R_j(right) − L_j`
+    // by `right`, so the saturated value is the left limit of the interior
+    // value at `right` on every knot vector. Saturation is the definition of the
     // cumulative integral of an M-spline whose support is `[left, right]`, and
     // it preserves the I-spline value range [0, 1] — linearly extending past
     // the boundary would produce NEGATIVE basis entries for `x < left` and
@@ -731,8 +758,8 @@ pub(crate) fn create_ispline_dense(
         }
         if x >= right {
             for j in 1..num_bspline_basis {
-                let value = 1.0 - left_offsets[j];
-                let band = offset_growth * left_offsets[j];
+                let value = right_mass[j] - left_offsets[j];
+                let band = offset_growth * (right_mass[j] + left_offsets[j]);
                 out[[row_i, j - 1]] = if value.abs() <= band { 0.0 } else { value };
             }
             continue;
@@ -745,9 +772,13 @@ pub(crate) fn create_ispline_dense(
             &mut scratch,
         );
         let total = local.iter().copied().sum::<f64>();
+        // A column wholly left of the support block has accumulated the full
+        // active mass, `R_j(x) = total`, and is anchored like every other column.
         let lead_end = start.min(num_bspline_basis);
-        if lead_end > 1 {
-            out.slice_mut(s![row_i, 0..(lead_end - 1)]).fill(total);
+        for j in 1..lead_end {
+            let value = total - left_offsets[j];
+            let band = offset_growth * (total + left_offsets[j]);
+            out[[row_i, j - 1]] = if value.abs() <= band { 0.0 } else { value };
         }
         let mut running = 0.0f64;
         for offset in (0..support).rev() {
@@ -1114,6 +1145,92 @@ mod ispline_exterior_derivative_2695_tests {
                 m1, 1.0,
                 "at x={x} the warp value is constant, so its multiplier must be exactly 1"
             );
+        }
+    }
+}
+
+/// `create_ispline_dense` on an OPEN (simple-ended, non-clamped) knot vector.
+///
+/// The I-spline column `j − 1` is `R_j(x) − R_j(left)` with
+/// `R_j(x) = Σ_{m≥j} B_m(x)`. On a clamped knot vector the left offsets
+/// `R_j(left)` vanish for `j ≥ 1` and every right mass `R_j(right)` is one, so
+/// a lead column (wholly left of the support block) equal to the support total
+/// and a saturated row of `1 − R_j(left)` are both right. On an open knot
+/// vector neither holds: the first `bs_degree` columns carry a nonzero left
+/// offset and the last `bs_degree` columns a partial right mass. Filling the
+/// lead columns with the bare total made column 0 jump by `R_1(left)` the
+/// moment `x` crossed into a span whose support block no longer contained
+/// `B_1`, and saturating at `1 − R_j(left)` made the last columns jump at
+/// `right`. The oracle here is the closed-form uniform quadratic B-spline.
+#[cfg(test)]
+mod ispline_open_knot_value_tests {
+    use super::*;
+
+    /// I-spline degree; the internal B-spline is quadratic.
+    const DEGREE: usize = 1;
+    const LEFT: f64 = 2.0;
+    const RIGHT: f64 = 6.0;
+
+    /// Open uniform knots `0, 1, …, 8`: six quadratic B-splines
+    /// `B_m(x) = N_2(x − m)` whose partition of unity holds on `[2, 6]`.
+    fn open_knots() -> Array1<f64> {
+        Array1::from_vec((0..=8).map(|k| k as f64).collect())
+    }
+
+    /// `Σ_{m<j} B_m(x)`, so `R_j(x) = 1 − partial(x, j)` on `[LEFT, RIGHT]`.
+    fn partial(x: f64, j: usize) -> f64 {
+        (0..j)
+            .map(|m| cardinal_bspline_value(x - m as f64, DEGREE + 1))
+            .sum()
+    }
+
+    /// `I_{j−1}(x) = R_j(clamp(x)) − R_j(LEFT)`, zero below `LEFT`.
+    fn expected(x: f64, j: usize) -> f64 {
+        if x < LEFT {
+            return 0.0;
+        }
+        partial(LEFT, j) - partial(x.min(RIGHT), j)
+    }
+
+    #[test]
+    fn open_knot_ispline_matches_the_anchored_cumulative_sum_everywhere() {
+        let knots = open_knots();
+        let mut points: Vec<f64> = (0..=64).map(|k| 1.0 + 6.0 * k as f64 / 64.0).collect();
+        points.extend_from_slice(&[2.0, 3.0, 4.0, 4.5, 5.0, 6.0, 6.5]);
+        let data = Array1::from_vec(points.clone());
+        let basis = create_ispline_dense(data.view(), knots.view(), DEGREE)
+            .expect("open-knot i-spline value");
+        assert_eq!(basis.ncols(), 5, "six quadratic B-splines give five I-splines");
+        for (row, &x) in points.iter().enumerate() {
+            for col in 0..basis.ncols() {
+                let want = expected(x, col + 1);
+                let got = basis[[row, col]];
+                assert!(
+                    (got - want).abs() <= 1e-12,
+                    "I-spline column {col} at x={x}: got {got:.15}, want {want:.15} \
+                     (R_j(x) − R_j(left) on an open knot vector)"
+                );
+            }
+        }
+    }
+
+    /// The same defect stated as the property it breaks: an I-spline column is
+    /// a continuous, non-decreasing function of `x`, including across `right`.
+    #[test]
+    fn open_knot_ispline_is_continuous_across_interior_knots_and_right() {
+        let knots = open_knots();
+        let eps = 1e-9;
+        for x0 in [3.0_f64, 4.0, 5.0, RIGHT] {
+            let data = Array1::from_vec(vec![x0 - eps, x0 + eps]);
+            let basis = create_ispline_dense(data.view(), knots.view(), DEGREE)
+                .expect("open-knot i-spline value");
+            for col in 0..basis.ncols() {
+                let jump = basis[[1, col]] - basis[[0, col]];
+                assert!(
+                    (-1e-12..=1e-8).contains(&jump),
+                    "I-spline column {col} jumps by {jump:.3e} across x={x0}"
+                );
+            }
         }
     }
 }

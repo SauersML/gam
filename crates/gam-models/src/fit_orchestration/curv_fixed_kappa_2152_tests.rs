@@ -142,3 +142,57 @@ fn pinned_out_of_chart_kappa_is_rejected() {
          at κ=-50, so validate_chart_points must fire); got Ok — κ was silently re-derived"
     );
 }
+
+/// gam#3763: the κ/range profile's design is `[1 | curv block]` alone, so a κ̂,
+/// ℓ̂, CI and flatness p-value selected on it describe the fitted model only
+/// when that model IS `y ~ curv(...)`. With another term in the formula the
+/// estimates belong to a model the fit does not realize, so a FREE κ inside a
+/// larger model must be refused rather than silently profiled on the curv
+/// term by itself.
+#[test]
+fn free_kappa_inside_larger_model_is_refused_3763() {
+    let ds = small_ball_dataset(300, 3763);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    match fit_from_formula("y ~ x + curv(x, z, centers=20)", &ds, &cfg) {
+        Ok(_) => panic!(
+            "a free-κ curv() beside a linear term must be refused: its κ̂/ℓ̂ would be \
+             profiled on `y ~ 1 + curv(x, z)` alone, not on the fitted model"
+        ),
+        Err(err) => {
+            let message = err.to_string();
+            assert!(
+                message.contains("exactly `y ~ curv(...)`"),
+                "refusal must name the sole-term precondition; got: {message}"
+            );
+        }
+    }
+}
+
+/// Pinning κ leaves range as a profile coordinate. An unsupported full model
+/// must refuse that profile instead of silently retaining its initial range.
+#[test]
+fn pinned_kappa_with_free_range_inside_larger_model_is_refused_3763() {
+    let ds = small_ball_dataset(300, 3764);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ x + curv(x, z, kappa=1, centers=20)", &ds, &cfg);
+    let message = result.err().expect("a free range requires the full profile criterion").to_string();
+    assert!(message.contains("exactly `y ~ curv(...)`"), "{message}");
+}
+
+/// Fully fixed geometry needs no profile and remains legal in a larger model.
+#[test]
+fn pinned_kappa_and_range_inside_larger_model_still_fit_3763() {
+    let ds = small_ball_dataset(300, 3764);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ x + curv(x, z, kappa=1, length_scale=1, centers=20)", &ds, &cfg);
+    assert!(result.is_ok(), "fixed-geometry curv term must fit: {:?}", result.err());
+}

@@ -16,9 +16,9 @@ use ndarray::{Array2, s};
 use std::sync::Arc;
 
 use crate::manifold::{
-    AssignmentMode, CrosscoderLayer, CrosscoderLayout, LatentManifold, PeriodicHarmonicEvaluator,
-    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldTerm,
-    measure_crosscoder_drift,
+    AssignmentMode, CrosscoderDriftReport, CrosscoderLayer, CrosscoderLayout, LatentManifold,
+    LayerStepDrift, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
+    SaeManifoldAtom, SaeManifoldTerm, measure_crosscoder_drift,
 };
 
 const P: usize = 4; // shared residual-stream ambient width per layer
@@ -309,4 +309,65 @@ fn rejects_layers_of_differing_ambient_width() {
         err.contains("layer widths differ"),
         "unexpected error: {err}"
     );
+}
+
+/// A layer at which an atom's decoder is numerically dead has no drift magnitude,
+/// so the atom's total is undefined and the ranking skips it. Counting the dead
+/// steps as zero would name an atom dead at every layer as the most stable one.
+#[test]
+fn atom_dead_at_a_layer_is_not_ranked() {
+    let step = |atom: usize, s: usize, drift: f64| LayerStepDrift {
+        atom,
+        source: if s == 0 {
+            CrosscoderLayer::Anchor
+        } else {
+            CrosscoderLayer::Block(s - 1)
+        },
+        target: CrosscoderLayer::Block(s),
+        drift,
+        principal_angles: Vec::new(),
+    };
+    let report = CrosscoderDriftReport {
+        num_atoms: 3,
+        layer_chain: vec![
+            CrosscoderLayer::Anchor,
+            CrosscoderLayer::Block(0),
+            CrosscoderLayer::Block(1),
+        ],
+        steps: vec![
+            // Atom 0 moves at both steps.
+            step(0, 0, 0.4),
+            step(0, 1, 0.3),
+            // Atom 1 is dead at every layer.
+            step(1, 0, f64::NAN),
+            step(1, 1, f64::NAN),
+            // Atom 2 barely moves, then vanishes from the last layer.
+            step(2, 0, 0.01),
+            step(2, 1, f64::NAN),
+        ],
+    };
+    assert!(report.atom_total_drift(1).is_nan());
+    assert!(report.atom_total_drift(2).is_nan());
+    assert_close(
+        report.atom_total_drift(0),
+        0.7,
+        1e-12,
+        "live atom total drift",
+    );
+    assert_eq!(report.most_stable_atom(), Some(0));
+    assert_eq!(report.most_drifting_atom(), Some(0));
+    assert_close(
+        report.mean_drift(),
+        (0.4 + 0.3 + 0.01) / 3.0,
+        1e-12,
+        "mean over the defined steps",
+    );
+
+    let all_dead = CrosscoderDriftReport {
+        num_atoms: 1,
+        layer_chain: report.layer_chain.clone(),
+        steps: vec![step(0, 0, f64::NAN), step(0, 1, f64::NAN)],
+    };
+    assert_eq!(all_dead.most_stable_atom(), None);
+    assert_eq!(all_dead.most_drifting_atom(), None);
 }
