@@ -953,6 +953,47 @@ impl HessianFactorization for SparseCholeskyOperator {
     fn dim(&self) -> usize {
         self.n_dim
     }
+
+    /// Componentwise (#2954), the sparse form of [`DenseCholeskyOperator`]'s
+    /// bound. The computed factor is exact for `H + δH` with
+    /// `|δH| ≤ γ_(r+1)·|L||Lᵀ|` (Higham, *Accuracy and Stability of Numerical
+    /// Algorithms*, Thm 10.3, whose `n`-term inner products are here at most
+    /// `r`-term, `r` the most entries in a row of `L`:
+    /// [`gam_linalg::sparse_exact::SparseExactFactor::factor_max_row_nnz`]).
+    /// With `D = diag(H)^(1/2)` and `H̃ = D⁻¹HD⁻¹` the dense argument carries
+    /// over unchanged: `δ log|H| = tr(H⁻¹δH) ≤ p·γ_(r+1)·‖H̃⁻¹‖_F` and
+    /// `‖H̃⁻¹‖_F ≤ tr H̃⁻¹ = Σ_i H_ii·(H⁻¹)_ii`, whose diagonal the selected
+    /// inverse holds exactly.
+    ///
+    /// Without it the sparse exact path published no log-determinant error,
+    /// so the Newton-decrement verdict was never taken there and the same REML
+    /// fit stopped by a different rung on the sparse and the dense design
+    /// (#3294).
+    fn logdet_forward_error(&self) -> Option<f64> {
+        let hessian = self.hessian.as_deref()?;
+        let computed;
+        let inverse = match self.takahashi.as_deref() {
+            Some(inverse) => inverse,
+            None => {
+                computed = self.factor.selected_inverse().ok()?;
+                &computed
+            }
+        };
+        let col_ptr = hessian.symbolic().col_ptr();
+        let row_idx = hessian.symbolic().row_idx();
+        let values = hessian.val();
+        let mut scaled_inverse_trace = 0.0_f64;
+        for i in 0..self.n_dim {
+            let diagonal = (col_ptr[i]..col_ptr[i + 1])
+                .find(|&entry| row_idx[entry] == i)
+                .map(|entry| values[entry])?;
+            scaled_inverse_trace += diagonal.abs() * inverse.get(i, i);
+        }
+        let bound = self.n_dim as f64
+            * gam_linalg::roundoff::accumulation_growth(self.factor.factor_max_row_nnz() + 1)
+            * scaled_inverse_trace;
+        (bound.is_finite() && bound > 0.0).then_some(bound)
+    }
 }
 
 // BlockCoupledDerivativeProvider was removed — its functionality is now handled

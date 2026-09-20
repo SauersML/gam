@@ -4775,24 +4775,6 @@
     "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
   },
   {
-    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
-    "removed": {
-      "crates/gam-solve/src/arrow_schur/newton_step.rs::arrow_factor_slab_to_f32": 1,
-      "crates/gam-solve/src/arrow_schur/newton_step.rs::arrow_rhs": 1,
-      "crates/gam-solve/src/arrow_schur/newton_step.rs::cholesky_solve_lower_f32": 1,
-      "crates/gam-solve/src/arrow_schur/newton_step.rs::mixed_precision_kappa_gate_failure": 1,
-      "crates/gam-solve/src/arrow_schur/newton_step.rs::solve_arrow_system_f32": 1,
-      "crates/gam-solve/src/arrow_schur/newton_step.rs::try_mixed_precision_arrow_solve": 1,
-      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::matrix_inf_norm": 1,
-      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::mixed_precision_reduced_beta": 1,
-      "crates/gam-solve/src/arrow_schur/solve_options.rs::certified_mixed": 1,
-      "crates/gam-solve/src/arrow_schur/solve_options.rs::is_enabled": 1,
-      "crates/gam-solve/src/arrow_schur/solve_options.rs::with_streaming_solve_precision_default": 1
-    },
-    "reason": "#2946 census T10: these functions implemented or gated the arrow-Schur CertifiedMixed solve, which copied already-computed f64 Cholesky factors to f32 and refined f32 solves with f64 residuals. That work was strictly additional to the one f64 triangular solve the same factor answers, and it was gated by chosen constants. SPEC: 'Unnecessary choices and options should be deleted, not included.' arrow_rhs and matrix_inf_norm had no other caller.",
-    "evidence": "At base 5834fb219d public_api_census.py reports exactly these 11 identities. At head none of the names occurs outside CHANGELOG.md and the ledgers (is_enabled here is ArrowSolvePrecisionPolicy::is_enabled; other is_enabled methods are untouched). cargo check --workspace --tests rc 0."
-  },
-  {
     "base": "98e38107cebdf056bd726d03b0a7e2788e1b3ca6",
     "removed": {
       "crates/gam-solve/src/reml/block_quadrature_correction.rs::block_correction_latched": 1
@@ -4807,5 +4789,49 @@
     },
     "reason": "X'WX stays beside H in the active frame and is read in the saved frame through the gauge, so lift_to_saved_frame no longer refuses a fit carrying a weighted Gram: the frame-ambiguous accessor weighted_gram() is replaced by saved_frame_weighted_gram().",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3389 (fix-3346-lift-weighted-gram, Fixes #3346) merged as ed78ff5628326615b5ca13682cb99e0935bb8d15 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from ed78ff5628326615b5ca13682cb99e0935bb8d15's own tree with --base c5eb78d6864c62efd309cf31043d55e891e7506e --head ed78ff5628326615b5ca13682cb99e0935bb8d15 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> ed78ff5628326615b5ca13682cb99e0935bb8d15 -- <its path> gives 0 for every item except weighted_gram (17, other uses of the same word)."
+  },
+  {
+    "base": "8256e9b70f568d96c311c361f4724ab8589e0be2",
+    "removed": {
+      "crates/gam-cli/src/main/model_summary.rs::build_model_summary": 1
+    },
+    "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary has one owner. build_model_summary was the CLI's second summary builder (the gam_solve ModelSummary Display path); `gam summary` renders saved_model_summary's payload through gam_models::inference::summary_text::render_summary_text, the same function gamfit's Model.summary() prints. The conditional and corrected AIC the report prints come from main's gam_solve::inference::information_criteria through SummaryInformationCriteria, so nothing moved into this change.",
+    "evidence": "public_api_census.py with base 9af3c66f1b and head the merge commit refused exactly this identity (13440 -> 13441 public function declarations). After this change git grep -w finds build_model_summary only in a historical doc sentence in saved_summary.rs."
+  },
+  {
+    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "removed": {
+      "crates/gam-sae/src/manifold/rho.rs::seed_scaled_by_dispersion_with_sparse_policy": 1
+    },
+    "reason": "A multi-atom separable-gate seed took only max(ln φ, 0) of the dispersion shift, a clamp nothing derives, so on clean data a K > 1 seed started 1/φ times stiffer than the construction value. The clamp and its scale_sparse policy flag go: seed_scaled_by_dispersion_with_sparse_policy is removed, and every scale-coupled log-strength takes the full ln φ at every K.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3357 (fix-3233-seed-dispersion-clamp, Fixes #3233) merged as 53dfd6479c37a261096d31a5bf0763668ca8a229 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 53dfd6479c37a261096d31a5bf0763668ca8a229's own tree with --base 1d02ffcb1218e325f5030aa3c767a7967264c05f --head 53dfd6479c37a261096d31a5bf0763668ca8a229 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> 53dfd6479c37a261096d31a5bf0763668ca8a229 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "53dfd6479c37a261096d31a5bf0763668ca8a229",
+    "removed": {
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs::normal_solves": 1,
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs::retained_normals": 1
+    },
+    "reason": "The cone normalizer's EP now runs over u = m0 + Bz in whichever is smaller, the rows or the supported columns (#3130's support-space EP, ported onto main), with rank-one site updates. It no longer Gauss-Jordan inverts the q x q (I + WT) on every evaluation. The q-row machinery goes with it: inverse_i_plus_wt, log_det_i_plus_wt, the row-space posterior and quadratic_part, the 2q x 2q SiteMotionSystem and its linearized_fixed_point, and the row-space accessors normal_solves (R = M^-1 A^T) and retained_normals (A^T).",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
+  },
+  {
+    "base": "81623168aa8f5acb6e51d9e2f28c83c05c14b684",
+    "removed": {
+      "crates/gam-sae/src/manifold/certificate.rs::curved_dictionary_global_optimality_verdict": 1,
+      "crates/gam-sae/src/manifold/certificate.rs::is_certified": 1,
+      "crates/gam-sae/src/manifold/certificate.rs::margin": 1
+    },
+    "reason": "#2946 census T1/C1: curved_dictionary_global_optimality_verdict was the decision rule of GlobalOptimalityVerdict::CertifiedGlobal, which published 'unique global optimum' from the underived sufficient condition mu_hat <= c0*a^2*(1-1/SNR)*(1-C_kappa*kappa)/K with the chosen constants c0 = 1.0 and C_kappa = 0.125; margin and is_certified were that verdict's accessors. SPEC: 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' The verdict is deleted; its measured inputs survive as DictionaryIncoherenceReport (mu_hat, per_atom_kappa_hat, peak_activity_floor, snr_proxy).",
+    "evidence": "At base 81623168aa public_api_census.py reports exactly these 3 identities. At head git grep -w finds no occurrence of curved_dictionary_global_optimality_verdict or GlobalOptimalityVerdict outside CHANGELOG.md and the ledgers; the remaining is_certified/margin names belong to other types (Verdict::is_certified and others) and are untouched. The Python dict keys global_optimality, global_optimality_certified and global_optimality_margin had no Python reader. cargo check --workspace --tests rc 0."
+  },
+  {
+    "base": "a5c3a5b6e7df11b78179fc274d6843687abe66a3",
+    "removed": {
+      "crates/gam-terms/src/term_builder.rs::canonicalize_smooth_type": 1,
+      "crates/gam-terms/src/term_builder.rs::parse_penalty_order_alias": 1
+    },
+    "reason": "One canonical spelling per behavior (SPEC: unnecessary choices and options are deleted). Alias spellings in the formula DSL and the family and link parsers now raise an error that names the canonical spelling, from one removed-spellings table per layer. The alias machinery goes: canonicalize_smooth_type, parse_penalty_order_alias, parse_optional_f64_option_alias, LinkFunction::aliases, and the tests that pinned alias spellings as accepted.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3144 (pygam-spec-aliases) merged as c663ba6dbaaaab008f9ec054a7ea349637fb649a with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c663ba6dbaaaab008f9ec054a7ea349637fb649a's own tree with --base a5c3a5b6e7df11b78179fc274d6843687abe66a3 --head c663ba6dbaaaab008f9ec054a7ea349637fb649a (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> c663ba6dbaaaab008f9ec054a7ea349637fb649a -- <its path> gives 0 for every item."
   }
 ]

@@ -39,7 +39,7 @@
 //! row z_j = 1{Y = j}; we share the covariate effects g(x) + β·x2 across cut-
 //! points and let cutpoint-specific intercepts (threshold dummies thr2, thr3,
 //! with j=1 the baseline) realize θ_2, θ_3. gam fits this stacked frame with
-//!     z ~ s(x, bs='cc') + x2 + linear(thr2, double_penalty=false)
+//!     z ~ s(x, bs='cyclic') + x2 + linear(thr2, double_penalty=false)
 //!         + linear(thr3, double_penalty=false)
 //! and mgcv fits the identical stacked frame and cyclic smooth by REML. The
 //! threshold dummies are intercepts, so they opt out of the null-recovery ridge
@@ -72,7 +72,7 @@ use std::path::Path;
 
 /// Latent periodic x-effect: one clean oscillation over the data window
 /// [-3, 3] with period exactly 6, so g(-3) = g(3) = 0. This honors the seam
-/// continuity that a cyclic-cubic (`bs='cc'`) smooth imposes (f(min) = f(max)),
+/// continuity that a cyclic-cubic (`bs='cyclic'`) smooth imposes (f(min) = f(max)),
 /// making the cyclic basis the genuinely correct model — not an approximation
 /// fighting a boundary discontinuity.
 fn g_of_x(x: f64) -> f64 {
@@ -210,7 +210,7 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     // For each obs i, emit one binary row for every cutpoint j in {1,2,3} that
     // the obs REACHED (y_i >= j): response z = 1{y_i == j} ("stop here"), with
     // covariates x_i, x2_i and cutpoint dummies thr2 = 1{j>=2}, thr3 = 1{j>=3}.
-    // Shared s(x,bs='cc') + x2; the threshold dummies are plain linear fixed
+    // Shared s(x,bs='cyclic') + x2; the threshold dummies are plain linear fixed
     // effects giving theta_2, theta_3 relative to the j=1 baseline intercept.
     // The summed Bernoulli log-likelihood over these rows IS the stopping-ratio
     // multinomial log-likelihood (chain-rule factorization).
@@ -264,7 +264,7 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "z ~ s(x, bs='cc') + x2 + linear(thr2, double_penalty=false) \
+        "z ~ s(x, bs='cyclic') + x2 + linear(thr2, double_penalty=false) \
          + linear(thr3, double_penalty=false)",
         &ds,
         &cfg,

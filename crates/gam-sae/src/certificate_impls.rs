@@ -4,8 +4,8 @@
 //! These `impl Certificate for …` blocks were relocated out of the monolith
 //! root (`gam::inference::certificate_impls`) to satisfy the coherence orphan
 //! rule: the [`Certificate`] trait now lives in the neutral `gam-problem` crate
-//! and the implemented types ([`ResidualGaugeReport`], [`CertificateInputs`])
-//! are owned here in `gam-sae`, so the impls must be
+//! and the implemented types ([`ResidualGaugeReport`] and the chart
+//! certificates) are owned here in `gam-sae`, so the impls must be
 //! defined in the type's home crate. The bodies are byte-identical to the
 //! monolith originals: each [`Certificate::verdict`] is still defined in terms
 //! of the type's own (unchanged) decision rule, so there remains exactly one
@@ -14,10 +14,7 @@
 use gam_problem::topology_certificates::{Certificate, Claim, Evidence, Verdict};
 
 use crate::identifiability::ResidualGaugeReport;
-use crate::manifold::{
-    CertificateInputs, CoordinateFidelityCertificate, GlobalOptimalityVerdict,
-    TopologyPersistenceCertificate,
-};
+use crate::manifold::{CoordinateFidelityCertificate, TopologyPersistenceCertificate};
 
 /// Helper: insert a scalar only when finite, else record it as text "n/a" so the
 /// evidence is explicit about a missing quantity (never a silent 0.0).
@@ -87,55 +84,6 @@ impl Certificate for ResidualGaugeReport {
             Verdict::Certified
         } else {
             Verdict::Insufficient
-        }
-    }
-}
-
-// ── 6. Dictionary incoherence / global optimality (#1008) ────────────────────
-
-impl Certificate for CertificateInputs {
-    fn claim(&self) -> Claim {
-        Claim::new(
-            "global-optimality",
-            "the fitted dictionary's basin stationary point is the unique global \
-             optimum up to the residual gauge group: a conservative sufficient \
-             condition on mutual coherence, per-atom curvature, activity floors, \
-             and reconstruction SNR holds with positive margin",
-        )
-    }
-
-    fn evidence(&self) -> Evidence {
-        let mut e = Evidence::new();
-        put_finite(&mut e, "mu_hat", self.mu_hat);
-        put_finite(&mut e, "mean_activity_floor", self.mean_activity_floor);
-        put_finite(&mut e, "peak_activity_floor", self.peak_activity_floor);
-        put_finite(&mut e, "snr_proxy", self.snr_proxy);
-        put_finite(&mut e, "dispersion", self.dispersion);
-        if let Some(margin) = self.global_optimality.margin() {
-            put_finite(&mut e, "global_optimality_margin", margin);
-        }
-        e.insert(
-            "global_optimality",
-            if self.global_optimality.is_certified() {
-                "certified_global"
-            } else {
-                "uncertified"
-            }
-            .into(),
-        );
-        e.insert("atom_count", self.per_atom_mean_activity.len().into());
-        e.insert("note", self.note.clone().into());
-        e
-    }
-
-    fn verdict(&self) -> Verdict {
-        // The unchanged decision rule is `GlobalOptimalityVerdict::is_certified`:
-        // a `CertifiedGlobal { margin > 0 }` is never wrong (conservative
-        // sufficient condition), an `Uncertified` is "cannot decide" — not
-        // "non-unique" — so it maps to `Insufficient`, never a false pass.
-        match self.global_optimality {
-            GlobalOptimalityVerdict::CertifiedGlobal { .. } => Verdict::Certified,
-            GlobalOptimalityVerdict::Uncertified { .. } => Verdict::Insufficient,
         }
     }
 }

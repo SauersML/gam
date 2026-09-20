@@ -17,7 +17,7 @@ def main() -> None:
     }
     model = gamfit.fit(
         data,
-        "sphere ~ s(x, type='duchon', centers=16)",
+        "sphere ~ s(x, bs='duchon', centers=16)",
         response_geometry="spherical",
         response_columns=["sx", "sy", "sz"],
         fisher_rao_w=np.diag([1.0, 1.5, 2.0]),

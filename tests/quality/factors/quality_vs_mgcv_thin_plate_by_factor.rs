@@ -94,7 +94,7 @@ fn gam_thin_plate_by_factor_recovers_per_level_truth() {
         }
     }
 
-    // ---- fit with gam: y ~ s(x, by=g, bs='tp', k=15), REML ----------------
+    // ---- fit with gam: y ~ s(x, by=g, bs='tps', k=15), REML ----------------
     let headers = vec!["x".to_string(), "g".to_string(), "y".to_string()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| StringRecord::from(vec![x[i].to_string(), g[i].clone(), y[i].to_string()]))
@@ -108,7 +108,7 @@ fn gam_thin_plate_by_factor_recovers_per_level_truth() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, by=g, bs='tp', k=15)", &ds, &cfg).expect("gam fit");
+    let result = fit_from_formula("y ~ s(x, by=g, bs='tps', k=15)", &ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian by-factor smooth");
     };
@@ -335,7 +335,7 @@ fn gam_thin_plate_by_factor_recovers_per_level_truth() {
 }
 
 /// Regression for #704: the predict-time design rebuild of a by-factor *spatial*
-/// smooth (`bs='tp'`) must REPLAY the frozen fitted basis, never recompute the
+/// smooth (`bs='tps'`) must REPLAY the frozen fitted basis, never recompute the
 /// data-dependent kernel / Wood-TPRS eigen-truncation / sum-to-zero constraint on
 /// the prediction rows. Two independent guarantees, neither needing R:
 ///
@@ -386,7 +386,7 @@ fn gam_thin_plate_by_factor_predict_replays_frozen_basis() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, by=g, bs='tp', k=15)", &ds, &cfg).expect("gam fit");
+    let result = fit_from_formula("y ~ s(x, by=g, bs='tps', k=15)", &ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian by-factor smooth");
     };
