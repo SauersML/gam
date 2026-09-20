@@ -1,5 +1,6 @@
-use gam_math::bivariate_normal::bivariate_normal_interval_probability;
+use gam_math::bivariate_normal::{BoundedProbability, bivariate_normal_interval_probability};
 use gam_math::probability::normal_cdf;
+use gam_math::roundoff::accumulation_growth;
 use gam_math::special::{CertifiedGaussLegendreRule, gauss_legendre_certified};
 use gam_runtime::resource::{ByteLruCache, ResidentBytes};
 use smallvec::{SmallVec, smallvec};
@@ -619,6 +620,11 @@ pub type CellMomentVec = SmallVec<[f64; CELL_MOMENT_INLINE_CAPACITY]>;
 pub struct CellMomentState {
     pub branch: ExactCellBranch,
     pub value: f64,
+    /// A bound on `value`'s absolute error at the cell's computed coefficients
+    /// (gam#3216, from PR #3374). It scales with `value` however small that
+    /// is, so a sum of cell values keeps its relative accuracy in a deep tail
+    /// and a caller resolving a calibration there in log space can charge it.
+    pub value_rounding: f64,
     pub moments: CellMomentVec,
 }
 
@@ -2365,7 +2371,7 @@ fn affine_value_from_moment_primitive(
     beta: f64,
     left: f64,
     right: f64,
-) -> Result<f64, String> {
+) -> Result<BoundedProbability, String> {
     // Exact formula via bivariate normal CDF.
     //
     // V(α,β,l,r) = ∫_l^r Φ(α+βz)φ(z)dz
@@ -2380,9 +2386,7 @@ fn affine_value_from_moment_primitive(
     let s = beta.hypot(1.0);
     let h = alpha / s;
     let rho = -beta / s;
-    bivariate_normal_interval_probability(h, left, right, rho)
-        .map(|bounded| bounded.value)
-        .map_err(String::from)
+    bivariate_normal_interval_probability(h, left, right, rho).map_err(String::from)
 }
 
 fn validate_cell_inputs(cell: DenestedCubicCell) -> Result<(), String> {
@@ -2437,7 +2441,8 @@ pub(crate) fn evaluate_affine_cell_state(
     let value = affine_value_from_moment_primitive(cell.c0, cell.c1, cell.left, cell.right)?;
     Ok(CellMomentState {
         branch: ExactCellBranch::Affine,
-        value,
+        value: value.value,
+        value_rounding: value.rounding,
         moments: affine_cell_moments(cell, max_degree),
     })
 }
@@ -2867,6 +2872,12 @@ fn evaluate_non_affine_cell_simd_body<const COMPUTE_VALUE: bool>(
     )
 }
 
+/// Rounded operations in one node term of the terminal-rule value sum of a
+/// curved cell (`evaluate_non_affine_cell_value_terminal`) beyond its accumulation: the node
+/// map (2), the expanded cubic (6), `exp` and `Φ` (one ulp each, 2), the two
+/// products (2), then the trailing `half_width` and `√τ` (2).
+pub const NON_AFFINE_VALUE_TERM_OPERATIONS: usize = 14;
+
 /// Value-only evaluation of a non-affine cell on the terminal 384-node rule.
 ///
 /// Returns the cell probability integral `∫ exp(-½z²)·Φ(η(z)) dz` (pre the
@@ -2917,9 +2928,18 @@ fn evaluate_non_affine_cell_state(
     // half_width factor is already applied inside the rule evaluator, so divide
     // by sqrt(TAU) here (a true division, NOT multiply-by-reciprocal) to
     // reproduce the reference's final rounding bit-for-bit.
+    let value = value_integral / (std::f64::consts::TAU).sqrt();
+    // Every node term `w·exp(−z²/2)·Φ(η)` is non-negative and formed to a few
+    // ulps of itself (the node map, the cubic, `exp`, `Φ` and two products), so
+    // the rule's sum, its `half_width` and the `√τ` division keep the value's
+    // relative accuracy: Wilkinson's `γ` over the nodes plus those per-term
+    // operations bounds it (gam#3216).
     Ok(CellMomentState {
         branch,
-        value: value_integral / (std::f64::consts::TAU).sqrt(),
+        value,
+        value_rounding: accumulation_growth(
+            TERMINAL_GL_ORDER + NON_AFFINE_VALUE_TERM_OPERATIONS,
+        ) * value,
         moments,
     })
 }
@@ -4229,7 +4249,7 @@ mod tests {
                 }
             }
             let value = affine_value_from_moment_primitive(scale, beta,
-                f64::NEG_INFINITY, f64::INFINITY).unwrap();
+                f64::NEG_INFINITY, f64::INFINITY).unwrap().value;
             assert!((value - normal_cdf(1.0)).abs() < 2.0 * f64::EPSILON);
         }
     }
@@ -6285,9 +6305,13 @@ mod tests {
             for moment in &mut moments {
                 *moment *= half_width;
             }
+            let value = value_integral * half_width / (std::f64::consts::TAU).sqrt();
             CellMomentState {
                 branch,
-                value: value_integral * half_width / (std::f64::consts::TAU).sqrt(),
+                value,
+                value_rounding: accumulation_growth(
+                    TERMINAL_GL_ORDER + NON_AFFINE_VALUE_TERM_OPERATIONS,
+                ) * value,
                 moments,
             }
         }

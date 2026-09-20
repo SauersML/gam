@@ -75,13 +75,21 @@ impl<'a> PredictionCovarianceBackend<'a> {
         if !has_nonzero {
             return Err("prediction precision backend requires a non-zero Hessian".to_string());
         }
+        // `phi` is the coefficient-covariance scale of `Vb = phi * H^{-1}`.
+        // Zero is a legitimate value (the exact-fit profiled Gaussian, whose
+        // stored dense `Vb` is `0 * H^{-1}`), so it is applied as-is; a
+        // non-finite or negative scale is not a covariance scale at all and is
+        // refused rather than replaced by 1, which would silently publish the
+        // unscaled `H^{-1}` as `Vb`.
+        if !(phi.is_finite() && phi >= 0.0) {
+            return Err(format!(
+                "prediction precision backend requires a finite non-negative coefficient-covariance \
+                 scale, got {phi}"
+            ));
+        }
         let dim = hessian.nrows();
         let factor = hessian.factorize()?;
-        let phi_scale = if phi.is_finite() && phi > 0.0 {
-            phi
-        } else {
-            1.0
-        };
+        let phi_scale = phi;
         Ok(Self::Factorized {
             factor,
             dim,
@@ -521,6 +529,47 @@ mod tests {
             assert!((out[0][0][i] - expected00).abs() <= 1e-12);
             assert!((out[0][1][i] - expected01).abs() <= 1e-12);
             assert!((out[1][1][i] - expected11).abs() <= 1e-12);
+        }
+    }
+
+    #[test]
+    fn factorized_covariance_scaling_matches_independent_diagonal_inverse() {
+        let rhs = array![[1.0, -3.0], [2.0, 5.0]];
+        for phi in [0.0, -0.0, 1.0e-8, 0.25, 1.0, 2.5] {
+            let backend = PredictionCovarianceBackend::from_factorized_hessian_scaled(
+                SymmetricMatrix::Dense(array![[4.0, 0.0], [0.0, 9.0]]), phi).unwrap();
+            let got = backend.apply_columns(&rhs).unwrap();
+            for row in 0..2 { for col in 0..2 {
+                let expected = phi * rhs[[row,col]] / [4.0,9.0][row];
+                assert!((got[[row,col]]-expected).abs() <= 4.0*f64::EPSILON*expected.abs(),
+                    "phi={phi}, row={row}, col={col}: {} vs {expected}", got[[row,col]]);
+            }}
+        }
+    }
+
+    #[test]
+    fn factorized_backend_applies_a_zero_scale_and_refuses_an_invalid_one() {
+        let precision = array![[4.0, 0.6], [0.6, 3.0]];
+        let rhs = array![[1.0, -0.5], [0.2, 2.0]];
+        // The exact-fit profiled Gaussian publishes `Vb = 0 * H^{-1}` on the
+        // dense route; the factorized route must agree instead of returning
+        // the unscaled `H^{-1}`.
+        let zero = PredictionCovarianceBackend::from_factorized_hessian_scaled(
+            SymmetricMatrix::Dense(precision.clone()),
+            0.0,
+        )
+        .expect("a zero coefficient-covariance scale is valid");
+        let columns = zero.apply_columns(&rhs).expect("covariance columns");
+        assert!(columns.iter().all(|&v| v == 0.0), "{columns:?}");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -f64::MIN_POSITIVE] {
+            let refusal = PredictionCovarianceBackend::from_factorized_hessian_scaled(
+                SymmetricMatrix::Dense(precision.clone()),
+                bad,
+            );
+            assert!(
+                refusal.is_err(),
+                "an invalid coefficient-covariance scale {bad} must be refused"
+            );
         }
     }
 

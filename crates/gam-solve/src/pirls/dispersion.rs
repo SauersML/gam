@@ -247,12 +247,20 @@ pub(crate) fn estimate_beta_phi_from_eta(
                 upper: f64::MAX,
             });
         }
-        let jet = logit_inverse_link_jet5(eta[i]);
-        if !(jet.mu > 0.0 && jet.mu < 1.0 && jet.d1.is_finite() && jet.d1 > 0.0) {
-            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Beta mean/variance", eta[i], jet.d1));
+        // The exact logit pair, as in the working-state row: the rounded mean
+        // reaches 1 at eta ~ 36.7 while 1 - mu is still a normal number, so
+        // neither the residual nor the variance may be formed from the rounded
+        // mean.
+        let (mu, one_minus_mu) = logit_probability_pair(eta[i]);
+        let variance = mu * one_minus_mu;
+        if !(variance.is_finite() && variance > 0.0) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Beta mean/variance", eta[i], variance));
         }
-        let resid = y[i] - jet.mu;
-        let statistic = wi * resid * resid / jet.d1;
+        // In the upper half take y - mu = (1 - mu) - (1 - y), so the residual
+        // carries the complement's full relative precision (1 - y is exact
+        // for y >= 1/2).
+        let resid = if mu > 0.5 { one_minus_mu - (1.0 - y[i]) } else { y[i] - mu };
+        let statistic = wi * (resid / variance) * resid;
         if !(statistic.is_finite() && statistic >= 0.0) {
             return Err(EstimationError::pirls_row_geometry_unrepresentable(
                 i,

@@ -11,17 +11,20 @@ harvests, for each token, the exact low-rank input shard that gam's
   scaled so that ``U_n U_nᵀ`` reconstructs the rank-r truncation of ``G_n``
   (column ``k`` is ``√λ_k · v_k``). This is exactly the factor convention
   ``RowMetric::output_fisher`` expects: it forms ``W_n = U_n U_nᵀ`` directly;
-* ``mass_residual`` — an optional estimate of
-  ``trace(G_n) − Σ_{k≤r} λ_k``. It is a scalar diagnostic, never an operator
-  certificate and never evidence that a randomized factor is a PSD lower bound.
+* ``mass_residual`` — an optional estimate of the truncation tail
+  ``trace(G_n) − Σ_{k≤r} λ_k = trace(P G_n P)``, ``P = I − V_r V_rᵀ``
+  (non-negative by construction, exact when ``trace_probes >= p``). It is a
+  scalar diagnostic, never an operator certificate and never evidence that a
+  randomized factor is a PSD lower bound.
 
 Everything is matrix-free. The Jacobian ``J_n`` (``C × p``) and the pullback
 ``G_n`` (``p × p``) are **never materialized**. The only primitive used is the
 pullback matvec ``v ↦ G_n v = J_nᵀ (F (J_n v))``, assembled from one
 JVP (``J_n v``), a Fisher-apply (``F u = p ⊙ u − p (pᵀu)``), and one VJP
 (``J_nᵀ w``). The top-r eigenpairs come from subspace iteration + a small
-``m × m`` Rayleigh–Ritz eigendecomposition (``m = r + oversample``); ``trace``
-is a matrix-free Hutchinson estimate using the same matvec. No ``C × p`` or
+``m × m`` Rayleigh–Ritz eigendecomposition (``m = r + oversample``); the
+tail is a matrix-free Hutchinson estimate on the deflated operator
+``P G_n P`` built from JVPs alone. No ``C × p`` or
 ``p × p`` object is ever allocated in the harvest loop.
 
 **Rung 1 — the sketch that enters the reconstruction loss.**
@@ -347,8 +350,27 @@ def _top_r_eigenpairs(
     return ritz_vals, ritz_vecs
 
 
-def _trace_estimate(
-    matvec: Callable[[torch.Tensor], torch.Tensor],
+def _fisher_energy(probs: torch.Tensor, jv: torch.Tensor) -> torch.Tensor:
+    """Per-column softmax-Fisher energy ``uᵀ F u`` of output tangents ``u = J v``.
+
+    ``jv`` is ``(..., C, m)`` (``(C, m)`` same-position, ``(T, C, m)``
+    downstream) and ``probs`` is ``jv.shape[:-1]``, the softmax at each output
+    position. With ``F = diag(p) − p pᵀ`` and ``Σ p = 1``,
+    ``uᵀ F u = Σ_c p_c (u_c − pᵀu)²`` — the variance of ``u`` under ``p``,
+    summed over positions. That form is a sum of non-negative terms, so it is
+    non-negative in floating point, unlike ``Σ p u² − (pᵀu)²``, which cancels.
+    Returns ``(m,)``.
+    """
+    w = probs.unsqueeze(-1)  # (..., C, 1)
+    mean = (w * jv).sum(dim=-2, keepdim=True)  # (..., 1, m)
+    centered = jv - mean
+    return (w * centered * centered).reshape(-1, jv.shape[-1]).sum(dim=0)
+
+
+def _deflated_tail_trace(
+    jvp_fn: Callable[[torch.Tensor], torch.Tensor],
+    probs: torch.Tensor,
+    basis: torch.Tensor,
     p: int,
     *,
     n_probes: int,
@@ -356,29 +378,37 @@ def _trace_estimate(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Matrix-free ``trace(G)`` from the matvec.
+    """Matrix-free ``trace(P G P)`` with ``P = I − Q Qᵀ``, ``Q = basis`` ``(p, r)``.
 
-    Exact when ``n_probes >= p``: probe with the standard basis ``I_p`` so
-    ``Σ_i e_iᵀ G e_i = trace(G)`` exactly (still only matvecs, no ``p × p``).
-    Otherwise a Rademacher Hutchinson estimate ``E[zᵀ G z] = trace(G)``. Probes
-    are batched as a ``(p, n_probes)`` block through a single matvec call.
+    ``Q`` holds the orthonormal top-r Ritz vectors, so
+    ``trace(P G P) = trace(G) − trace(Qᵀ G Q) = trace(G) − Σ_{k≤r} λ_k``: the
+    truncation tail. Each probe ``z`` is projected first and priced as the
+    Fisher energy of ``J (P z)`` (:func:`_fisher_energy`), so every term is
+    ``≥ 0`` and the estimate is non-negative by construction — no clamp.
+
+    Exact when ``n_probes >= p``: identity probes give
+    ``Σ_i (P e_i)ᵀ G (P e_i) = trace(P G P)``. Otherwise a Rademacher
+    Hutchinson estimate with ``E[zᵀ P G P z] = trace(P G P)``. Deflating before
+    probing is what makes the estimate usable: Hutchinson's variance is
+    ``2(‖A‖_F² − Σ_i A_ii²)``, so probing ``G`` itself and subtracting the
+    Ritz sum carries noise on the scale of the leading eigenvalue ``λ_1``,
+    while probing ``P G P`` carries noise on the scale of the tail only.
+    Only JVPs are needed (no VJP): the quadratic form is ``‖J P z‖²_F``.
     """
     if n_probes >= p:
-        # Exact: identity-basis probes, no randomness, fully deterministic.
         Z = torch.eye(p, dtype=dtype, device=device)
-        GZ = matvec(Z)  # (p, p)
-        return (Z * GZ).sum()  # = trace(G) exactly
-    n_probes = max(1, n_probes)
-    # Sample Rademacher ±1 on the generator's device (CPU), then move.
-    Z = (
-        torch.randint(0, 2, (p, n_probes), generator=generator, dtype=torch.int64)
-        .to(dtype)
-        * 2
-        - 1
-    ).to(device)
-    GZ = matvec(Z)  # (p, n_probes)
-    quad = (Z * GZ).sum(dim=0)  # (n_probes,)
-    return quad.mean()
+        scale = 1.0
+    else:
+        # Sample Rademacher ±1 on the generator's device (CPU), then move.
+        Z = (
+            torch.randint(0, 2, (p, n_probes), generator=generator, dtype=torch.int64)
+            .to(dtype)
+            * 2
+            - 1
+        ).to(device)
+        scale = 1.0 / n_probes
+    PZ = Z - basis @ (basis.transpose(0, 1) @ Z)  # (p, probes)
+    return _fisher_energy(probs, jvp_fn(PZ)).sum() * scale
 
 
 # ---------------------------------------------------------------------------
@@ -531,8 +561,9 @@ def harvest_output_fisher_factors(
         Subspace-iteration controls. ``m = min(p, r + oversample)`` subspace
         width and ``n_iter`` power steps before the Rayleigh–Ritz eig.
     trace_probes
-        Number of Hutchinson probes for the ``trace(G_n)`` estimate that feeds
-        ``mass_residual``.
+        Number of Hutchinson probes (``>= 1``) for the deflated tail
+        ``trace(P G_n P)`` that is ``mass_residual``; ``>= p`` probes it
+        exactly with the identity basis.
     seed
         Fixed RNG seed for the randomized subspace + Hutchinson probes — fully
         deterministic, no clock entropy.
@@ -547,6 +578,8 @@ def harvest_output_fisher_factors(
     """
     if rank < 1:
         raise ValueError(f"rank must be >= 1; got {rank}")
+    if trace_probes < 1:
+        raise ValueError(f"trace_probes must be >= 1; got {trace_probes}")
 
     act_flat, logits_from_act = _capture_activations(model, hook_module, inputs)
     n, p = int(act_flat.shape[0]), int(act_flat.shape[1])
@@ -632,17 +665,17 @@ def harvest_output_fisher_factors(
 
         gen_tr = torch.Generator(device="cpu")
         gen_tr.manual_seed(seed + 10_000 + row)
-        trace = _trace_estimate(
-            matvec,
+        tail = _deflated_tail_trace(
+            jvp_fn,
+            probs,
+            evecs,
             p,
             n_probes=trace_probes,
             generator=gen_tr,
             dtype=work_dtype,
             device=device,
         )
-        residual = float(trace.item() - float(evals.sum().item()))
-        # PSD ⇒ residual ≥ 0; clamp tiny Hutchinson noise that dips below.
-        mass_residual[row] = max(residual, 0.0)
+        mass_residual[row] = float(tail.item())
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
     factor_kind = "exact_full" if rank == p else "uncertified_approximation"
@@ -813,6 +846,8 @@ def harvest_downstream_output_fisher_factors(
     """
     if rank < 1:
         raise ValueError(f"rank must be >= 1; got {rank}")
+    if trace_probes < 1:
+        raise ValueError(f"trace_probes must be >= 1; got {trace_probes}")
 
     act_flat, logits_all_from_act = _capture_activations_downstream(
         model, hook_module, inputs
@@ -897,16 +932,17 @@ def harvest_downstream_output_fisher_factors(
 
         gen_tr = torch.Generator(device="cpu")
         gen_tr.manual_seed(seed + 10_000 + row)
-        trace = _trace_estimate(
-            matvec,
+        tail = _deflated_tail_trace(
+            jvp_fn,
+            probs_future,
+            evecs,
             p,
             n_probes=trace_probes,
             generator=gen_tr,
             dtype=work_dtype,
             device=device,
         )
-        residual = float(trace.item() - float(evals.sum().item()))
-        mass_residual[row] = max(residual, 0.0)
+        mass_residual[row] = float(tail.item())
         U[row] = scaled.detach().to(torch.float32).cpu().numpy()
 
     factor_kind = "exact_full" if rank == p else "uncertified_approximation"

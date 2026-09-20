@@ -6,7 +6,7 @@
 //! inconsistent triple — with rotation-gauge invariance of the verdict.
 
 use gam::inference::layer_transport::{
-    ChartTopology, composition_defect, fit_transport_map, transport_ladder,
+    ChartTopology, PairLaw, composition_defect, fit_transport_map, transport_ladder,
 };
 use ndarray::Array1;
 use std::f64::consts::TAU;
@@ -52,6 +52,7 @@ fn degree_one_map_recovers_degree_and_isometry_defect() {
         observed.view(),
         ChartTopology::Circle,
         ChartTopology::Circle,
+        PairLaw::Stochastic,
     )
     .expect("degree-1 transport fit");
 
@@ -108,6 +109,7 @@ fn reflected_map_recovers_degree_minus_one() {
         observed.view(),
         ChartTopology::Circle,
         ChartTopology::Circle,
+        PairLaw::Stochastic,
     )
     .expect("degree -1 transport fit");
 
@@ -131,6 +133,7 @@ fn collapsed_map_breaks_topology() {
         observed.view(),
         ChartTopology::Circle,
         ChartTopology::Circle,
+        PairLaw::Stochastic,
     )
     .expect("collapsed transport fit");
 
@@ -155,6 +158,7 @@ fn interval_stretch_map_reports_compute_layer_defect() {
         observed.view(),
         ChartTopology::Interval { lo: 0.0, hi: 1.0 },
         ChartTopology::Interval { lo: 0.0, hi: 2.0 },
+        PairLaw::Stochastic,
     )
     .expect("interval transport fit");
 
@@ -188,9 +192,9 @@ fn composition_stack(seed: u64) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
 fn composition_law_passes_on_consistent_triples_and_does_not_fit_target_shift_away() {
     let (t, coords_b, coords_c) = composition_stack(0x1013_0005);
     let circle = ChartTopology::Circle;
-    let h_ab = fit_transport_map(t.view(), coords_b.view(), circle, circle).expect("h_ab");
-    let h_bc = fit_transport_map(coords_b.view(), coords_c.view(), circle, circle).expect("h_bc");
-    let h_ac = fit_transport_map(t.view(), coords_c.view(), circle, circle).expect("h_ac");
+    let h_ab = fit_transport_map(t.view(), coords_b.view(), circle, circle, PairLaw::Stochastic).expect("h_ab");
+    let h_bc = fit_transport_map(coords_b.view(), coords_c.view(), circle, circle, PairLaw::Stochastic).expect("h_bc");
+    let h_ac = fit_transport_map(t.view(), coords_c.view(), circle, circle, PairLaw::Stochastic).expect("h_ac");
 
     let report = composition_defect(&h_ab, &h_bc, &h_ac)
         .expect("consistent composition test");
@@ -210,7 +214,7 @@ fn composition_law_passes_on_consistent_triples_and_does_not_fit_target_shift_aw
     // fresh target rotation here would erase it.
     let rotated_c = coords_c.mapv(|v| (v + 1.3).rem_euclid(TAU));
     let h_ac_rot =
-        fit_transport_map(t.view(), rotated_c.view(), circle, circle).expect("rotated h_ac");
+        fit_transport_map(t.view(), rotated_c.view(), circle, circle, PairLaw::Stochastic).expect("rotated h_ac");
     let rotated = composition_defect(&h_ab, &h_bc, &h_ac_rot)
         .expect("rotated composition test");
     assert!(
@@ -231,8 +235,8 @@ fn composition_law_passes_on_consistent_triples_and_does_not_fit_target_shift_aw
 fn composition_law_rejects_a_planted_inconsistent_triple() {
     let (t, coords_b, coords_c) = composition_stack(0x1013_0006);
     let circle = ChartTopology::Circle;
-    let h_ab = fit_transport_map(t.view(), coords_b.view(), circle, circle).expect("h_ab");
-    let h_bc = fit_transport_map(coords_b.view(), coords_c.view(), circle, circle).expect("h_bc");
+    let h_ab = fit_transport_map(t.view(), coords_b.view(), circle, circle, PairLaw::Stochastic).expect("h_ab");
+    let h_bc = fit_transport_map(coords_b.view(), coords_c.view(), circle, circle, PairLaw::Stochastic).expect("h_bc");
 
     // Planted incoherence: the direct A→C map carries an extra 0.5·sin(2t)
     // warp that no circle isometry (rotation/reflection) can remove.
@@ -244,7 +248,7 @@ fn composition_law_rejects_a_planted_inconsistent_triple() {
             .map(|&v| (g(f(v)) + 0.5 * (2.0 * v).sin() + rng.jitter(NOISE)).rem_euclid(TAU)),
     );
     let h_ac_bad =
-        fit_transport_map(t.view(), coords_c_bad.view(), circle, circle).expect("bad h_ac");
+        fit_transport_map(t.view(), coords_c_bad.view(), circle, circle, PairLaw::Stochastic).expect("bad h_ac");
 
     let report = composition_defect(&h_ab, &h_bc, &h_ac_bad)
         .expect("inconsistent composition test");
@@ -272,7 +276,7 @@ fn transport_ladder_wires_adjacent_two_hop_and_composition_fields() {
     let coords = [t, coords_b, coords_c];
     let topologies = [ChartTopology::Circle; 3];
 
-    let ladder = transport_ladder(&layers, &coords, &topologies).expect("ladder");
+    let ladder = transport_ladder(&layers, &coords, &topologies, PairLaw::Stochastic).expect("ladder");
     assert_eq!(ladder.adjacent.len(), 2);
     assert_eq!(ladder.two_hop.len(), 1);
     let adj = &ladder.adjacent[0];

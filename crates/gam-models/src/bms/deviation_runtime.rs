@@ -1208,7 +1208,9 @@ impl DeviationRuntime {
         ))
     }
 
-    pub(super) fn span_index_for(&self, value: f64) -> Result<usize, String> {
+    /// The span holding `value`; an interior breakpoint belongs to the span on
+    /// its left (`span_index_for_breakpoints`).
+    pub(super) fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
         span_index_for_breakpoints(
             self.endpoint_points.as_slice().ok_or_else(|| {
                 String::from(DeviationRuntimeError::InvalidInput {
@@ -1218,17 +1220,6 @@ impl DeviationRuntime {
             value,
             "deviation span lookup",
         )
-    }
-
-    pub(super) fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
-        let mut span_idx = self.span_index_for(value)?;
-        // Bias to the LEFT-hand span at internal breakpoints. The cubic basis
-        // is C², so value, first derivative, and second derivative are
-        // unchanged; only the span-local third derivative needs a convention.
-        if span_idx > 0 && value == self.endpoint_points[span_idx] {
-            span_idx -= 1;
-        }
-        Ok(span_idx)
     }
 
     pub(super) fn span_derivative_polynomial_coefficients(

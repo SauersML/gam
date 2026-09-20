@@ -208,14 +208,6 @@ fn log_max_hermite3_density(lo: f64, hi: f64) -> f64 {
     best
 }
 
-fn log_sum_exp(values: impl Iterator<Item = f64> + Clone) -> f64 {
-    let max = values.clone().fold(f64::NEG_INFINITY, f64::max);
-    if !max.is_finite() {
-        return max;
-    }
-    max + values.map(|v| (v - max).exp()).sum::<f64>().ln()
-}
-
 /// `log(1 + e^x)`.
 fn log1p_exp(x: f64) -> f64 {
     if x > 36.0 { x } else { x.exp().ln_1p() }
@@ -356,7 +348,10 @@ impl CompressedLaw {
         let mut contributions = vec![contribution(&bins[0])];
         loop {
             let worst = (0..points.len())
-                .map(|p| (p, log_sum_exp(contributions.iter().map(|c| c[p])) - points[p].2))
+                .map(|p| {
+                    let log_terms: Vec<f64> = contributions.iter().map(|c| c[p]).collect();
+                    (p, gam_math::probability::positive_log_sum_exp(&log_terms) - points[p].2)
+                })
                 .fold(None, |best: Option<(usize, f64)>, (p, excess)| match best {
                     Some((_, top)) if top >= excess => best,
                     _ => Some((p, excess)),
@@ -433,7 +428,8 @@ impl CompressedLaw {
 
     /// `log E(α, b)`.
     fn log_error_bound(&self, alpha: f64, slope: f64) -> f64 {
-        log_sum_exp(self.bins.iter().map(|bin| bin.log_error(alpha, slope)))
+        let log_terms: Vec<f64> = self.bins.iter().map(|bin| bin.log_error(alpha, slope)).collect();
+        gam_math::probability::positive_log_sum_exp(&log_terms)
     }
 
     /// Certify the anchor `root` solved on the compressed law at `(q, b)`: the

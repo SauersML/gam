@@ -1820,6 +1820,8 @@ fn hypoexponential_survival(rates: &[f64], t: f64) -> f64 {
     log_sum.exp()
 }
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

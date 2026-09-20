@@ -551,9 +551,6 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(t) = self.target_matrix(target) else {
             return Array1::<f64>::zeros(target.len());
         };
@@ -1815,9 +1812,6 @@ impl AnalyticPenalty for OrthogonalityPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(t) = self.target_matrix(target) else {
             return Array1::<f64>::zeros(target.len());
         };

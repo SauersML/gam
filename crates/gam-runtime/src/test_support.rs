@@ -133,14 +133,13 @@ pub fn simulated_cgroup_memory_environment(
     cgroup_limit_bytes: u64,
     cgroup_current_bytes: u64,
 ) -> crate::resource::MemoryAvailability {
-    let cgroup = crate::resource::CgroupMemoryAvailability::from_consistent_counters(
+    let cgroup = crate::resource::CgroupMemoryAvailability::from_counters(
         "/simulated/cgroup/memory",
         cgroup_limit_bytes,
         cgroup_current_bytes,
         0,
         6,
-    )
-    .expect("simulated cgroup counters must be internally consistent");
+    );
     crate::resource::MemoryAvailability::from_observation(
         host_available_bytes,
         host_total_bytes,

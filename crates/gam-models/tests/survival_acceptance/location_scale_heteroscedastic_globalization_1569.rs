@@ -228,107 +228,59 @@ fn heteroscedastic_records(
     (headers, rows)
 }
 
-/// #2695: a payload written before the whole-residual kernel is refused by name
-/// when both its log-σ predictor and its time-warp coefficients can move, since it
-/// was then fit as a different model, one whose σ had no likelihood of its own. Two
-/// payloads of the same version load, one per arm of the rule. The σ ≡ 1 arm is the
-/// heteroscedastic payload with its log-σ predictor set identically to zero: its warp
-/// still moves, and `u = h − η_t` under both kernels. The `h ≡ 0` arm is the
-/// constant-scale fit with no noise formula, which takes the σ-scaled log-t baseline
-/// (#892): it saves an all-zero warp with a free log-σ intercept, so the two kernels
-/// are the same model on its rows.
+/// #2695: a payload written before the whole-residual kernel was fit under the
+/// location-only kernel `u = h(t) − η_t/σ`, so a heteroscedastic one whose log-σ
+/// predictor and time warp both move means something else under `u = (h(t) − η_t)/σ`.
+/// Every payload that old is refused by its version (#3001), before the kernel is read.
 #[test]
-fn a_pre_2695_heteroscedastic_payload_is_refused_and_a_constant_scale_one_loads_2695() {
-    use gam_models::inference::model::{FittedModel, FittedModelPayload, WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION};
+fn a_pre_2695_heteroscedastic_payload_is_refused_by_its_version_2695() {
+    use gam_models::inference::model::{FittedModel, MODEL_PAYLOAD_VERSION};
     use gam_models::inference::model_payload_builders::fit_formula_to_payload;
     use gam_problem::BlockRole;
 
     super::initialize_cpu_fitting();
-    let fit = |scale_amp: f64, noise_formula: Option<&str>| {
-        let (headers, rows) = heteroscedastic_records(180, scale_amp, 7);
-        let data = encode_recordswith_inferred_schema(headers, rows).expect("encode data");
-        let cfg = FitConfig {
-            survival_likelihood: Some("location-scale".to_string()),
-            survival_distribution: "gaussian".to_string(),
-            noise_formula: noise_formula.map(str::to_string),
-            ..FitConfig::default()
-        };
-        fit_formula_to_payload("Surv(entry, exit, event) ~ s(x, k=8)".to_string(), &data, &cfg)
-            .expect("#2695: survival location-scale fit")
+    let (headers, rows) = heteroscedastic_records(180, 1.2, 7);
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode data");
+    let cfg = FitConfig {
+        survival_likelihood: Some("location-scale".to_string()),
+        survival_distribution: "gaussian".to_string(),
+        noise_formula: Some("s(x, k=8)".to_string()),
+        ..FitConfig::default()
     };
-    let block_can_move = |payload: &FittedModelPayload, role: BlockRole| {
-        payload
+    let heteroscedastic =
+        fit_formula_to_payload("Surv(entry, exit, event) ~ s(x, k=8)".to_string(), &data, &cfg)
+            .expect("#2695: survival location-scale fit");
+    let block_can_move = |role: BlockRole| {
+        heteroscedastic
             .fit_result
             .as_ref()
             .and_then(|fit| fit.block_by_role(role))
             .map(|block| block.beta.iter().any(|value| *value != 0.0))
             .expect("#2695: the survival location-scale fit carries this block")
     };
-    let stale_version = WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION - 1;
-
-    let heteroscedastic = fit(1.2, Some("s(x, k=8)"));
     assert!(
-        block_can_move(&heteroscedastic, BlockRole::Scale)
-            && block_can_move(&heteroscedastic, BlockRole::Time),
+        block_can_move(BlockRole::Scale) && block_can_move(BlockRole::Time),
         "#2695: the heteroscedastic fit must carry a moving log-σ and a moving warp, or the \
-         refusal below is not the kernel-change arm"
+         refusal below is not the kernel-change case"
     );
     FittedModel::from_payload(heteroscedastic.clone())
         .validate_for_persistence()
         .expect("#2695: the current payload validates");
-    assert!(
-        heteroscedastic.noise_offset_column.is_none(),
-        "#2695: the σ ≡ 1 arm below needs a payload without a declared noise offset"
-    );
-    let mut unit_scale = heteroscedastic.clone();
+
+    // Payload version 25 is the last one written under the location-only kernel.
     let mut stale = heteroscedastic;
-    stale.version = stale_version;
+    stale.version = 25;
     let error = FittedModel::from_payload(stale)
         .validate_for_persistence()
         .expect_err("#2695: a heteroscedastic payload from before the kernel change is refused");
     assert!(
-        error.to_string().contains("pre-#2695 location-only kernel")
+        error.to_string().contains("payload schema mismatch")
+            && error.to_string().contains("file has version=25")
             && error
                 .to_string()
-                .contains("refit required: σ was unidentified under the pre-#2695 likelihood"),
-        "#2695: the refusal must name the kernel change and require a refit, got: {error}"
+                .contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
+        "#2695: the refusal must name the payload's version, got: {error}"
     );
-
-    for saved in [unit_scale.fit_result.as_mut(), unit_scale.unified.as_mut()]
-        .into_iter()
-        .flatten()
-    {
-        for block in saved.blocks.iter_mut().filter(|block| block.role == BlockRole::Scale) {
-            block.beta.fill(0.0);
-        }
-    }
-    unit_scale.survival_beta_log_sigma = unit_scale
-        .survival_beta_log_sigma
-        .as_ref()
-        .map(|beta| vec![0.0; beta.len()]);
-    assert!(
-        !block_can_move(&unit_scale, BlockRole::Scale)
-            && block_can_move(&unit_scale, BlockRole::Time),
-        "#2695: the σ ≡ 1 payload must carry a zero log-σ predictor beside a moving warp, or \
-         the load below does not exercise that arm"
-    );
-    unit_scale.version = stale_version;
-    FittedModel::from_payload(unit_scale)
-        .validate_for_persistence()
-        .expect("#2695: a σ ≡ 1 payload is the same model under both kernels and loads");
-
-    let constant_scale = fit(0.0, None);
-    assert!(
-        block_can_move(&constant_scale, BlockRole::Scale)
-            && !block_can_move(&constant_scale, BlockRole::Time),
-        "#2695: the constant-scale fit must carry a free log-σ intercept on an all-zero warp, \
-         or the control below does not exercise the h ≡ 0 arm"
-    );
-    let mut stale = constant_scale;
-    stale.version = stale_version;
-    FittedModel::from_payload(stale)
-        .validate_for_persistence()
-        .expect("#2695: an h ≡ 0 payload is the same model under both kernels and loads");
 }
 
 /// #2695: a saved survival location-scale model, predicting every training row at its

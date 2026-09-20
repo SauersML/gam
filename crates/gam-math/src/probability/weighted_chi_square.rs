@@ -240,6 +240,8 @@ enum Chart {
     Log,
 }
 
+
+
 /// The saddle-point quantities at one value of the parameter `y`.
 struct Point {
     y: f64,

@@ -2422,6 +2422,48 @@ pub(crate) fn a_workspace_family_materializes_its_declared_curvature_once_per_fi
     );
 }
 
+/// gam#3002: a family that does not fingerprint its likelihood data cannot key
+/// a persistent warm-start record, so a configured store is refused by name
+/// instead of being silently dropped into a cold fit. The refusal comes from
+/// the key, before the store is opened, so the root is never touched.
+#[test]
+pub(crate) fn a_configured_store_is_refused_by_a_family_without_a_fingerprint_3002() {
+    let family = declared_dense_quartic_family(false, false, JointHessianSourcePreference::Dense);
+    let specs = declared_dense_quartic_specs();
+    assert!(
+        family
+            .persistent_warm_start_fingerprint(&specs, &declared_dense_quartic_options())
+            .is_none(),
+        "the quartic test family must inherit the no-fingerprint default for this to pin anything",
+    );
+    let root = std::env::temp_dir().join(format!(
+        "gam-3002-unopened-warm-start-root-{}",
+        std::process::id()
+    ));
+    let options = BlockwiseFitOptions {
+        persistent_warm_start_store: Some(gam_solve::persistent_warm_start::configured_store(
+            root.clone(),
+        )),
+        ..declared_dense_quartic_options()
+    };
+    let refused = fit_custom_family(&family, &specs, &options)
+        .expect_err("a store the family cannot key must be refused, not ignored");
+    let message = refused.to_string();
+    assert!(
+        message.contains("DeclaredDenseQuarticWorkspaceFamily")
+            && message.contains("does not fingerprint"),
+        "the refusal must name the family and the missing fingerprint: {message}",
+    );
+    assert!(
+        !root.exists(),
+        "the refusal must come before the store is opened",
+    );
+
+    // The same fit without the store certifies: the store alone was refused.
+    fit_custom_family(&family, &specs, &declared_dense_quartic_options())
+        .expect("the quartic REML fit without a store must certify");
+}
+
 /// #979, gam#1088: a NaN only in the declared curvature of a workspace-source family is
 /// refused, with the canonical message, by both fit entries.
 #[test]
