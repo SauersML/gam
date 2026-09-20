@@ -3378,22 +3378,6 @@ fn posterior_draw_bands(
 }
 
 #[pyfunction]
-#[pyo3(signature = (eta, family_kind, level, link_spec=None))]
-fn posterior_eta_bands(
-    py: Python<'_>,
-    eta: PyReadonlyArray2<'_, f64>,
-    family_kind: String,
-    level: f64,
-    link_spec: Option<String>,
-) -> PyResult<Py<PyDict>> {
-    let eta = owned_row_major_f64(eta.as_array());
-    let payload = detach_py_result(py, "posterior_eta_bands", move || {
-        posterior_eta_bands_impl(eta, &family_kind, level, link_spec.as_deref())
-    })?;
-    posterior_bands_payload_to_py(py, payload)
-}
-
-#[pyfunction]
 fn posterior_credible_interval(
     py: Python<'_>,
     samples: PyReadonlyArray2<'_, f64>,
