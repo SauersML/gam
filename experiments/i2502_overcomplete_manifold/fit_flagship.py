@@ -85,7 +85,7 @@ def run_arm(out, name, base, fitfn, X_train, X_test):
         rec["test_mean_l0"] = round(l0, 2)
         rec["alive_atoms_test"] = n_alive
         try:
-            rec["description_length_bits"] = model.description_length()
+            rec["description_length_bits"] = model.description_length(X_train)
         except Exception as e:  # noqa: BLE001
             rec["description_length_bits"] = f"<err {type(e).__name__}>"
         try:

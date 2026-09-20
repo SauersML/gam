@@ -88,15 +88,16 @@ fn views(blocks: &[Array2<f64>]) -> Vec<ArrayView2<'_, f64>> {
 }
 
 /// The native ledger with a declared zero-width dictionary, so every bit and all
-/// of the budget belong to the codes. The fixtures' gates vary independently per
-/// atom and are not simplex rows.
+/// of the distortion belong to the codes and the residual. The fixtures' gates
+/// vary independently per atom and are not simplex rows.
 fn try_describe(
     assignments: &Array2<f64>,
     plans: &[SaeAtomGeometryPlan],
     decoders: &[Array2<f64>],
     coords: &[Array2<f64>],
     tier0_scale: Option<&Array1<f64>>,
-    ev: f64,
+    target: &Array2<f64>,
+    fitted: &Array2<f64>,
 ) -> Result<ManifoldFitDl, String> {
     let decoder_views = views(decoders);
     let coord_views = views(coords);
@@ -111,21 +112,33 @@ fn try_describe(
         decoder_blocks: &decoder_views,
         coords: &coord_views,
         tier0_scale: tier0_scale.map(|scale| scale.view()),
-        ev,
+        target: target.view(),
+        fitted: fitted.view(),
         dictionary: &dictionary,
     })
 }
 
+/// The ledger of the fit whose reconstruction is the decoded model and whose
+/// target is that reconstruction plus `residual`.
 fn describe(
     assignments: &Array2<f64>,
     plans: &[SaeAtomGeometryPlan],
     decoders: &[Array2<f64>],
     coords: &[Array2<f64>],
     tier0_scale: Option<&Array1<f64>>,
-    ev: f64,
+    residual: &Array2<f64>,
 ) -> ManifoldFitDl {
-    try_describe(assignments, plans, decoders, coords, tier0_scale, ev)
+    let fitted = decoded(plans, decoders, coords, assignments);
+    let target = &fitted + residual;
+    try_describe(assignments, plans, decoders, coords, tier0_scale, &target, &fitted)
         .expect("native description length")
+}
+
+/// A deterministic dense `(n, p)` residual aligned with no channel.
+fn planted_residual(n: usize, p: usize) -> Array2<f64> {
+    Array2::from_shape_fn((n, p), |(i, c)| {
+        0.3 * (2.3 * (i + 1) as f64 + 1.1 * (c + 1) as f64).sin()
+    })
 }
 
 fn code_sources(
@@ -190,26 +203,37 @@ fn assert_spectra_match(left: &[ActiveCodeSource], right: &[ActiveCodeSource], w
 fn native_code_rate_is_the_output_metric_gaussian_rate_2933_f11() {
     // Audit check 3. Independent latent coordinates with variances in the ratio
     // (100, 1), decoded by diag(0.1, 1), so the decoded output covariance is
-    // isotropic. At EV 0.9 the Gaussian output rate–distortion value is log2(10)
-    // bits per token. Water filling the latent spectrum instead spends the budget
-    // on the insensitive coordinate: 1.729 bits and an achieved EV of 0.4545.
+    // isotropic with spectrum (1, 1). The fit leaves a residual of energy 0.3 in the
+    // channel the atom does not decode. Joint water filling of the code (1, 1) and
+    // the residual (0.3) to the delivered distortion 0.3 sets the water level
+    // 0.3 / 3 = 0.1, so the Gaussian output rate of the code is log2(10) bits per
+    // token and the residual costs ½·log2(3). Water filling the latent spectrum
+    // instead spends the budget on the insensitive coordinate.
     let coords = array![[10.0, 1.0], [-10.0, 1.0], [10.0, -1.0], [-10.0, -1.0]];
-    let decoder = array![[0.0, 0.0], [0.1, 0.0], [0.0, 1.0]];
+    let decoder = array![[0.0, 0.0, 0.0], [0.0, 0.1, 0.0], [0.0, 0.0, 1.0]];
     let assignments = Array2::from_elem((4, 1), 1.0);
+    let amplitude = 0.3_f64.sqrt();
+    let residual = Array2::from_shape_fn((4, 3), |(i, c)| {
+        if c == 0 { amplitude * [1.0, -1.0, -1.0, 1.0][i] } else { 0.0 }
+    });
     let dl = describe(
         &assignments,
         &[linear_plan(2)],
         &[decoder],
         &[coords],
         None,
-        0.9,
+        &residual,
     );
     let expected = 10.0_f64.log2();
     assert!(
         (dl.code_bits_per_token - expected).abs() < 1.0e-12,
-        "output-metric Gaussian rate at EV 0.9 is {expected}; got {}",
+        "output-metric Gaussian rate at distortion 0.3 is {expected}; got {}",
         dl.code_bits_per_token
     );
+    assert!((dl.residual_bits_per_token - 0.5 * 3.0_f64.log2()).abs() < 1.0e-12);
+    assert!((dl.distortion - 0.3).abs() < 1.0e-12, "distortion {}", dl.distortion);
+    // TSS: the decoded channels have unit variance each, the residual channel 0.3.
+    assert!((dl.ev - (1.0 - 0.3 / 2.3)).abs() < 1.0e-12, "ev {}", dl.ev);
 }
 
 #[test]
@@ -293,7 +317,7 @@ fn native_code_rate_is_invariant_to_compensated_coordinate_rescaling_2933_f11() 
         &original_decoders,
         &original_coords,
         Some(&tier0_scale),
-        0.85,
+        &planted_residual(n, 3),
     );
     let other = describe(
         &assignments,
@@ -301,7 +325,7 @@ fn native_code_rate_is_invariant_to_compensated_coordinate_rescaling_2933_f11() 
         &rescaled_decoders,
         &rescaled_coords,
         Some(&tier0_scale),
-        0.85,
+        &planted_residual(n, 3),
     );
     assert!(
         relative_gap(base.code_bits_per_token, other.code_bits_per_token) < 1.0e-10,
@@ -372,8 +396,8 @@ fn native_code_rate_is_invariant_to_shifted_angle_charts_2933_f11() {
     );
     assert_spectra_match(&original, &moved, "shifted angle chart");
 
-    let base = describe(&assignments, &plans, &original_decoders, &original_coords, None, 0.9);
-    let other = describe(&assignments, &plans, &shifted_decoders, &shifted_coords, None, 0.9);
+    let base = describe(&assignments, &plans, &original_decoders, &original_coords, None, &planted_residual(n, 4));
+    let other = describe(&assignments, &plans, &shifted_decoders, &shifted_coords, None, &planted_residual(n, 4));
     assert!(
         relative_gap(base.code_bits_per_token, other.code_bits_per_token) < 1.0e-10,
         "a shifted angle chart changed the code ledger: {} vs {}",
@@ -422,8 +446,8 @@ fn native_code_source_ignores_coordinates_of_non_firing_rows_2933_f12() {
         .expect("a non-firing NaN is never read");
     assert_eq!(unset_sources, quiet_sources);
 
-    let quiet_dl = describe(&assignments, &plans, &decoders, &quiet_coords, None, 0.9);
-    let loud_dl = describe(&assignments, &plans, &decoders, &loud_coords, None, 0.9);
+    let quiet_dl = describe(&assignments, &plans, &decoders, &quiet_coords, None, &planted_residual(n, 3));
+    let loud_dl = describe(&assignments, &plans, &decoders, &loud_coords, None, &planted_residual(n, 3));
     assert_eq!(quiet_dl.code_bits.to_bits(), loud_dl.code_bits.to_bits());
 }
 
@@ -444,7 +468,7 @@ fn native_code_source_is_unchanged_by_inactive_atoms_and_rows_where_it_is_off_29
     ];
     let coords = [line.clone(), phases.clone()];
     let base = code_sources(&assignments, &plans, &decoders, &coords, None).expect("base sources");
-    let base_dl = describe(&assignments, &plans, &decoders, &coords, None, 0.8);
+    let base_dl = describe(&assignments, &plans, &decoders, &coords, None, &planted_residual(n, 3));
 
     // A wholly inactive atom with arbitrary coordinates changes no other source
     // and no code bit.
@@ -467,7 +491,7 @@ fn native_code_source_is_unchanged_by_inactive_atoms_and_rows_where_it_is_off_29
     assert_eq!(&wide[..2], &base[..]);
     assert_eq!(wide[2].firing_rows, 0);
     assert!(wide[2].output_spectrum.iter().all(|&value| value == 0.0));
-    let wide_dl = describe(&widened, &wide_plans, &wide_decoders, &wide_coords, None, 0.8);
+    let wide_dl = describe(&widened, &wide_plans, &wide_decoders, &wide_coords, None, &planted_residual(n, 3));
     assert_eq!(
         wide_dl.code_bits_per_token.to_bits(),
         base_dl.code_bits_per_token.to_bits()
@@ -508,43 +532,56 @@ fn native_code_source_is_unchanged_by_inactive_atoms_and_rows_where_it_is_off_29
 
 #[test]
 fn native_description_length_validates_its_input_domain_2933_f44() {
-    // The persisted-artifact entry keeps the F44 domain: EV at most one (negative
-    // held-out EV valid, EV = 1 an infinite continuous rate), finite gates and
-    // finite coordinates, and at least one token.
+    // The persisted-artifact entry keeps the F44 domain: finite gates, coordinates,
+    // target and reconstruction of one shape, a target with variance, and at least
+    // one token. A reconstruction worse than the mean is a valid negative EV, and an
+    // exact reconstruction is an infinite continuous rate.
     let plans = [linear_plan(1)];
     let decoders = [dense_decoder(&plans[0], 2, 0.6)];
     let assignments = array![[1.0], [1.0], [0.0], [1.0]];
     let coords = [array![[0.0], [1.0], [2.0], [3.0]]];
-    for impossible in [1.5, 1.0 + 1.0e-12, f64::NAN, f64::INFINITY] {
-        assert!(
-            try_describe(&assignments, &plans, &decoders, &coords, None, impossible).is_err(),
-            "ev {impossible} must be rejected"
-        );
-    }
-    assert!(try_describe(&assignments, &plans, &decoders, &coords, None, 1.0 - 1.0e-12).is_ok());
-    assert!(
-        try_describe(&assignments, &plans, &decoders, &coords, None, -0.5).is_ok(),
-        "negative held-out EV is valid"
-    );
-    let exact = describe(&assignments, &plans, &decoders, &coords, None, 1.0);
+    let fitted = decoded(&plans, &decoders, &coords, &assignments);
+    let target = &fitted + &planted_residual(4, 2);
+    let check = |target: &Array2<f64>, fitted: &Array2<f64>| {
+        try_describe(&assignments, &plans, &decoders, &coords, None, target, fitted)
+    };
+    assert!(check(&target, &fitted).is_ok());
+    let reversed = &target + &(&target - &fitted).mapv(|v| 5.0 * v);
+    let poor = check(&reversed, &fitted).expect("a reconstruction worse than the mean is valid");
+    assert!(poor.ev < 0.0, "negative EV expected, got {}", poor.ev);
+    let exact = check(&fitted, &fitted).expect("an exact reconstruction");
+    assert_eq!(exact.distortion, 0.0);
     assert!(
         exact.code_bits.is_infinite(),
         "zero distortion is an infinite continuous rate, got {}",
         exact.code_bits
     );
+    let wrong_shape = Array2::from_shape_fn((4, 3), |(i, c)| (i * 3 + c) as f64);
+    let error = check(&wrong_shape, &wrong_shape).expect_err("decoders have two channels");
+    assert!(error.contains("output channels"), "{error}");
+    assert!(check(&target, &wrong_shape).is_err(), "target and fitted must share a shape");
+    let constant = Array2::from_elem((4, 2), 1.5);
+    let error = check(&constant, &fitted).expect_err("a constant target has no EV");
+    assert!(error.contains("no variance"), "{error}");
     for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut broken = target.clone();
+        broken[[2, 1]] = bad;
+        let error = check(&broken, &fitted).expect_err("a nonfinite target must be rejected");
+        assert!(error.contains("target[2, 1]"), "{error}");
         let gates = array![[1.0], [bad], [0.0], [1.0]];
-        let error = try_describe(&gates, &plans, &decoders, &coords, None, 0.5)
+        let error = try_describe(&gates, &plans, &decoders, &coords, None, &target, &fitted)
             .expect_err("a nonfinite gate must be rejected");
         assert!(error.contains("assignments[1, 0]"), "{error}");
         let stored = [array![[0.0], [1.0], [bad], [3.0]]];
-        let error = try_describe(&assignments, &plans, &decoders, &stored, None, 0.5)
+        let error = try_describe(&assignments, &plans, &decoders, &stored, None, &target, &fitted)
             .expect_err("a nonfinite coordinate must be rejected");
         assert!(error.contains("coords[0][2, 0]"), "{error}");
     }
     let no_rows = Array2::<f64>::zeros((0, 1));
+    let no_output = Array2::<f64>::zeros((0, 2));
     assert!(
-        try_describe(&no_rows, &plans, &decoders, &[no_rows.clone()], None, 0.5).is_err(),
+        try_describe(&no_rows, &plans, &decoders, &[no_rows.clone()], None, &no_output, &no_output)
+            .is_err(),
         "a report needs at least one token"
     );
 }
@@ -854,29 +891,19 @@ fn native_description_length_charges_gate_amplitudes_on_a_fixed_support_2933_f10
     // decoded curve is the constant 3 and the output is 3·a. The support and the
     // coordinate are fixed; only the amplitudes change. For a = 0.1, 0.2, …, 0.9 the
     // output has unbiased variance 9 · 0.075 = 0.675 while the coordinate code is
-    // free. At EV 0.9 the budget is (1 − 0.9) · 0.675, so the amplitude costs
-    // ½log₂(0.675 / 0.0675) = ½log₂10 bits per token. A constant gate on the same
-    // support transmits nothing.
-    let n = 9;
-    let plans = [periodic_plan()];
-    let width = plans[0].basis_size().expect("plan width");
-    let mut decoder = Array2::<f64>::zeros((width, 1));
-    decoder[[0, 0]] = 3.0;
-    let decoders = [decoder];
-    let coords = [Array2::from_elem((n, 1), 0.25)];
-    let varying = Array2::from_shape_fn((n, 1), |(i, _)| 0.1 + 0.1 * i as f64);
-    let constant = Array2::from_elem((n, 1), 0.5);
-    let output = decoded(&plans, &decoders, &coords, &varying);
-    let mean = output.sum() / n as f64;
-    let output_variance =
-        output.iter().map(|value| (value - mean) * (value - mean)).sum::<f64>() / (n - 1) as f64;
-    assert!(
-        (output_variance - 0.675).abs() < 1.0e-12,
-        "fixture: the decoded output varies ({output_variance})"
-    );
-
-    let varying_dl = describe(&varying, &plans, &decoders, &coords, None, 0.9);
-    let constant_dl = describe(&constant, &plans, &decoders, &coords, None, 0.9);
+    // free. The fit leaves a residual of raw energy 0.135, so joint water filling of
+    // the amplitude (0.675) and the residual (0.135) to the delivered distortion
+    // 0.135 sets the water level 0.0675: the amplitude costs
+    // ½log₂(0.675 / 0.0675) = ½log₂10 bits per token and the residual
+    // ½log₂(0.135 / 0.0675) = ½ bit. A constant gate on the same support transmits
+    // nothing, and its residual, whose whole energy is the delivered distortion,
+    // is free.
+    let amplitude = 0.135_f64.sqrt();
+    let residual = Array2::from_shape_fn((n, 1), |(i, _)| {
+        if i % 2 == 0 { amplitude } else { -amplitude }
+    });
+    let varying_dl = describe(&varying, &plans, &decoders, &coords, None, &residual);
+    let constant_dl = describe(&constant, &plans, &decoders, &coords, None, &residual);
     assert_eq!(
         varying_dl.atom_code_bits_per_token,
         vec![0.0],
@@ -894,8 +921,11 @@ fn native_description_length_charges_gate_amplitudes_on_a_fixed_support_2933_f10
         varying_dl.selection_bits, constant_dl.selection_bits,
         "the support is unchanged"
     );
+    assert!((varying_dl.residual_bits_per_token - 0.5).abs() < 1.0e-12);
+    assert!(constant_dl.residual_bits_per_token.abs() < 1.0e-12);
     assert!(
-        (varying_dl.total_bits - constant_dl.total_bits - n as f64 * expected).abs() < 1.0e-9,
+        (varying_dl.total_bits - constant_dl.total_bits - n as f64 * (expected + 0.5)).abs()
+            < 1.0e-9,
         "{} vs {}",
         varying_dl.total_bits,
         constant_dl.total_bits

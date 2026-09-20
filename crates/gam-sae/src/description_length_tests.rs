@@ -2032,7 +2032,12 @@ fn native_description_length_gains_nothing_by_moving_a_gate_below_a_threshold_29
         assert!((left - right).abs() <= 1e-12 * left.abs().max(1.0), "fixture decode differs");
     }
 
-    let describe = |gates: &Array2<f64>, decoder_0: &Array2<f64>| {
+    // The fit leaves a residual; both representations reconstruct the same rows.
+    let target = &original_decoded
+        + &Array2::from_shape_fn(original_decoded.dim(), |(i, c)| {
+            0.2 * (1.9 * (i + 1) as f64 + 0.8 * (c + 1) as f64).sin()
+        });
+    let describe = |gates: &Array2<f64>, decoder_0: &Array2<f64>, fitted: &Array2<f64>| {
         let decoders = [decoder_0.view(), decoder_1.view()];
         let coords = [coords_0.view(), coords_1.view()];
         let dictionary =
@@ -2045,13 +2050,14 @@ fn native_description_length_gains_nothing_by_moving_a_gate_below_a_threshold_29
             decoder_blocks: &decoders,
             coords: &coords,
             tier0_scale: None,
-            ev: 0.8,
+            target: target.view(),
+            fitted: fitted.view(),
             dictionary: &dictionary,
         })
         .expect("native description length")
     };
-    let original = describe(&gates, &decoder_0);
-    let rescaled = describe(&scaled_gates, &scaled_decoder_0);
+    let original = describe(&gates, &decoder_0, &original_decoded);
+    let rescaled = describe(&scaled_gates, &scaled_decoder_0, &rescaled_decoded);
     assert_eq!(
         rescaled.atom_occupancy,
         vec![1.0, 1.0],

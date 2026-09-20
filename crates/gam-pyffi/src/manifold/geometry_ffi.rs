@@ -417,9 +417,12 @@ pub(crate) fn manifold_description_length_to_pydict<'py>(
     out.set_item("bits_per_token", dl.bits_per_token)?;
     out.set_item("total_bits", dl.total_bits)?;
     out.set_item("code_bits", dl.code_bits)?;
+    out.set_item("residual_bits", dl.residual_bits)?;
     out.set_item("selection_bits", dl.selection_bits)?;
     out.set_item("dict_bits", dl.dict_bits)?;
     out.set_item("code_bits_per_token", dl.code_bits_per_token)?;
+    out.set_item("residual_bits_per_token", dl.residual_bits_per_token)?;
+    out.set_item("distortion", dl.distortion)?;
     out.set_item("selection_bits_per_token", dl.selection_bits_per_token)?;
     out.set_item("dict_bits_per_token", dl.dict_bits_per_token)?;
     out.set_item("coordinate_rate_bits", dl.coordinate_rate_bits)?;

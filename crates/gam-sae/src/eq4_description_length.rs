@@ -206,7 +206,7 @@ pub struct Eq4DescriptionLength {
 /// fives had spectrum 0 while its squared error is 25 (#2933 F18). No mean is
 /// estimated, so there is no Bessel factor, and the scored batch alone defines
 /// the moment.
-fn second_moment_eigenvalues(values: ArrayView2<f64>) -> Result<Array1<f64>, String> {
+pub(crate) fn second_moment_eigenvalues(values: ArrayView2<f64>) -> Result<Array1<f64>, String> {
     let n = values.nrows().max(1) as f64;
     let mut moment = values.t().dot(&values);
     moment.mapv_inplace(|v| v / n);

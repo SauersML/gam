@@ -1021,10 +1021,17 @@ pub fn persisted_decoder_dictionary_code(
 /// `p_k Σ_j ½log₂(λ_kj/θ)⁺` bits per token. Each rate stays attached to the atom
 /// that incurs it and is never averaged across atoms.
 ///
+/// A residual spectrum, when one is supplied, joins the same allocation at weight
+/// one: the residual coder transmits whatever of the fit's error lies above the
+/// shared water level, so the stated budget `D` is the WHOLE output distortion the
+/// message delivers, split optimally between leaving residual uncoded and
+/// quantizing the codes (#2933 F21, #3435). Without one, `D` is spent on the
+/// codes alone and the fit's own error is not part of the ledger.
+///
 /// `bits_per_token = total_bits / n_tokens` is the headline. It is the code
-/// length per token of the WHOLE representation (codes + amortised dictionary),
-/// so two fits at matched EV but different topologies are comparable in
-/// the currency the manifold thesis is stated in.
+/// length per token of the WHOLE representation (codes + residual + amortised
+/// dictionary), so two fits at matched EV but different topologies are
+/// comparable in the currency the manifold thesis is stated in.
 #[derive(Clone, Debug)]
 pub struct ManifoldFitDl {
     /// Explained variance the reconstruction achieves (the demoted EV line).
@@ -1067,15 +1074,24 @@ pub struct ManifoldFitDl {
     /// Code bits per token,
     /// `Σ_k atom_code_bits_per_token[k] + gate_amplitude_bits_per_token`.
     pub code_bits_per_token: f64,
+    /// Residual-coder bits per token: the rate of the residual spectrum at the
+    /// shared water level (zero when no residual spectrum joins the allocation).
+    pub residual_bits_per_token: f64,
+    /// The expected per-token output distortion the whole message delivers, in
+    /// the distortion metric of the spectra. On the native route it is the fit's
+    /// own residual energy (#3435).
+    pub distortion: f64,
     /// Amortised dictionary bits per token, `dict_bits / N`.
     pub dict_bits_per_token: f64,
     /// Total code bits over the corpus, `N · code_bits_per_token`.
     pub code_bits: f64,
+    /// Total residual bits over the corpus, `N · residual_bits_per_token`.
+    pub residual_bits: f64,
     /// Total selection bits over the corpus, `N · selection_bits_per_token`.
     pub selection_bits: f64,
     /// Total dictionary bits (not per token).
     pub dict_bits: f64,
-    /// Total description length in bits, `code + selection + dict`.
+    /// Total description length in bits, `code + residual + selection + dict`.
     pub total_bits: f64,
     /// The headline currency: `total_bits / n_tokens`.
     pub bits_per_token: f64,
@@ -1118,6 +1134,7 @@ pub fn manifold_fit_description_length(
         codes,
         atom_code_spectra,
         &[],
+        &[],
         distortion_budget,
         ev,
         dictionary,
@@ -1126,12 +1143,16 @@ pub fn manifold_fit_description_length(
 
 /// [`manifold_fit_description_length`] with the continuous gate-amplitude
 /// components ([`crate::native_code_source::GateAmplitudeCode::components`],
-/// #2933 F10) in the same allocation. Each is a `(weight, spectrum)` pair in the
-/// distortion metric of `distortion_budget`; none transmits no amplitudes.
+/// #2933 F10) and the fit's residual spectrum in the same allocation. Each
+/// amplitude component is a `(weight, spectrum)` pair in the distortion metric of
+/// `distortion_budget`; none transmits no amplitudes. `residual_spectrum` is the
+/// raw second-moment spectrum of the fit's residual in the same metric, entered
+/// at weight one; an empty spectrum leaves the residual out of the ledger.
 pub fn manifold_fit_description_length_with_gate_amplitudes(
     codes: &SparseAtomCodes,
     atom_code_spectra: &[Vec<f64>],
     gate_amplitude_components: &[(f64, Vec<f64>)],
+    residual_spectrum: &[f64],
     distortion_budget: f64,
     ev: f64,
     dictionary: &DictionaryCode,
@@ -1187,6 +1208,10 @@ pub fn manifold_fit_description_length_with_gate_amplitudes(
     // GATE AMPLITUDES: each amplitude source enters with its own weight.
     components.extend_from_slice(gate_amplitude_components);
     let amplitude_end = k_atoms + gate_amplitude_components.len();
+    // RESIDUAL: what the fit leaves unexplained, coded above the shared level.
+    components.push((1.0, residual_spectrum.to_vec()));
+    let residual_index = amplitude_end;
+    let dictionary_start = residual_index + 1;
 
     // DICTIONARY: a declared precision is priced directly; a quantized decoder
     // joins the same allocation. The decoder is sent once for N tokens, so a
@@ -1243,6 +1268,7 @@ pub fn manifold_fit_description_length_with_gate_amplitudes(
     let coordinate_bits_per_token: f64 = atom_code_bits_per_token.iter().sum();
     let gate_amplitude_bits_per_token: f64 = allocation.rates[k_atoms..amplitude_end].iter().sum();
     let code_bits_per_token = coordinate_bits_per_token + gate_amplitude_bits_per_token;
+    let residual_bits_per_token = allocation.rates[residual_index];
 
     let (n_params, dictionary_code, l_param_bits, dictionary_header_bits, dictionary_distortion, dict_bits) =
         match dictionary {
@@ -1270,8 +1296,8 @@ pub fn manifold_fit_description_length_with_gate_amplitudes(
                 });
                 let n_params = n_params
                     .ok_or_else(|| "decoder coefficient count overflowed".to_string())?;
-                let coefficient_bits = n * allocation.rates[amplitude_end..].iter().sum::<f64>();
-                let distortion: f64 = allocation.spectra[amplitude_end..]
+                let coefficient_bits = n * allocation.rates[dictionary_start..].iter().sum::<f64>();
+                let distortion: f64 = allocation.spectra[dictionary_start..]
                     .iter()
                     .map(|(weight, variances)| {
                         weight
@@ -1300,8 +1326,9 @@ pub fn manifold_fit_description_length_with_gate_amplitudes(
         .map_err(|_| "manifold fit description length parameter count exceeds i64".to_string())?;
 
     let code_bits = n * code_bits_per_token;
+    let residual_bits = n * residual_bits_per_token;
     let selection_bits = n * selection_bits_per_token;
-    let total_bits = code_bits + selection_bits + dict_bits;
+    let total_bits = code_bits + residual_bits + selection_bits + dict_bits;
     let transmitted_scalars = n * occupied_scalars;
     let coordinate_rate_bits = if transmitted_scalars > 0.0 {
         n * coordinate_bits_per_token / transmitted_scalars
@@ -1326,8 +1353,11 @@ pub fn manifold_fit_description_length_with_gate_amplitudes(
         dictionary_distortion,
         selection_bits_per_token,
         code_bits_per_token,
+        residual_bits_per_token,
+        distortion: distortion_budget,
         dict_bits_per_token: dict_bits / n,
         code_bits,
+        residual_bits,
         selection_bits,
         dict_bits,
         total_bits,
@@ -1364,10 +1394,14 @@ pub struct NativeDescriptionLengthRequest<'a> {
     pub decoder_blocks: &'a [ArrayView2<'a, f64>],
     /// One `(N, latent_dim_k)` coordinate block per atom.
     pub coords: &'a [ArrayView2<'a, f64>],
-    /// The per-channel standardization the fit's `ev` was measured under.
+    /// The per-channel standardization that defines the output metric
+    /// `M = diag(σ⁻²)` every code, the residual and the explained variance are
+    /// measured in. `None` is the identity metric.
     pub tier0_scale: Option<ArrayView1<'a, f64>>,
-    /// The fit's explained variance.
-    pub ev: f64,
+    /// The `(N, P)` rows the fit reconstructs, in the physical frame.
+    pub target: ArrayView2<'a, f64>,
+    /// The fit's `(N, P)` reconstruction of `target`, in the same frame.
+    pub fitted: ArrayView2<'a, f64>,
     /// The decoder message.
     pub dictionary: &'a DictionaryCode,
 }
@@ -1382,12 +1416,20 @@ pub struct NativeDescriptionLengthRequest<'a> {
 /// ([`native_active_code_sources`]): moments over the rows where the atom
 /// fires, whitened by the mean pullback metric of its gated decoder. The gate
 /// amplitudes the support does not determine are further sources in the same
-/// metric ([`native_gate_amplitude_code`]). The budget
-/// `D = (1 − ev)·(Σ_k p_k Σ_j λ_kj + Σ_c w_c Σ_u μ_cu)` leaves the transmitted
-/// codes the same relative output fidelity the fit leaves unexplained, measured
-/// in their own decoded variance. The decoded distortion of reconstructing the
-/// gates under the gate model is spent from `D` before the codes are allocated,
-/// and the ledger is [`manifold_fit_description_length_with_gate_amplitudes`].
+/// metric ([`native_gate_amplitude_code`]).
+///
+/// The ledger is priced at the distortion the fit actually delivers (#3435):
+/// `D = (1/N) Σ_i ‖x_i − x̂_i‖²_M`, the fit's own residual energy in the output
+/// metric, and `ev = 1 − D / TSS_M` with `TSS_M` centered on the column means of
+/// `target`. The residual `x − x̂` is itself a weight-one Gaussian component at
+/// its raw second-moment spectrum (no residual mean is transmitted), water-filled
+/// jointly with the codes, the gate amplitudes and the dictionary. The decoded
+/// distortion of reconstructing the gates under the gate model is spent from `D`
+/// first. The reported `distortion` is `D`, so `(total_bits, distortion)` is one
+/// operating point of the coder, and the dictionary's quantization error is
+/// part of `D` rather than added on top of it. A fit whose gate representation
+/// alone costs more than `D` has no such operating point and is an `Err`. The
+/// ledger is [`manifold_fit_description_length_with_gate_amplitudes`].
 pub fn native_manifold_description_length(
     request: NativeDescriptionLengthRequest<'_>,
 ) -> Result<ManifoldFitDl, String> {
@@ -1398,7 +1440,8 @@ pub fn native_manifold_description_length(
         decoder_blocks,
         coords,
         tier0_scale,
-        ev,
+        target,
+        fitted,
         dictionary,
     } = request;
     let (n_obs, k_atoms) = assignments.dim();
@@ -1406,13 +1449,6 @@ pub fn native_manifold_description_length(
         return Err(format!(
             "manifold description length expected {k_atoms} coordinate blocks, got {}",
             coords.len()
-        ));
-    }
-    // EV = 1 − RSS/TSS is negative on a poor held-out fit, which is valid, but
-    // it never exceeds one: a larger value would create a negative budget.
-    if !ev.is_finite() || ev > 1.0 {
-        return Err(format!(
-            "manifold description length ev must be finite and at most one; got {ev}"
         ));
     }
     if let Some(((row, atom), gate)) = assignments
@@ -1440,6 +1476,36 @@ pub fn native_manifold_description_length(
         }
     }
 
+    if target.nrows() != n_obs || fitted.dim() != target.dim() {
+        return Err(format!(
+            "manifold description length: target {:?} and fitted {:?} must both have \
+             the {n_obs} rows of the assignments and one shape",
+            target.dim(),
+            fitted.dim()
+        ));
+    }
+    if let Some((atom, block)) = decoder_blocks
+        .iter()
+        .enumerate()
+        .find(|(_, block)| block.ncols() != target.ncols())
+    {
+        return Err(format!(
+            "manifold description length: decoder {atom} has {} output channels, the \
+             target has {}",
+            block.ncols(),
+            target.ncols()
+        ));
+    }
+    for (name, values) in [("target", target), ("fitted", fitted)] {
+        if let Some(((row, col), value)) =
+            values.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "manifold description length {name}[{row}, {col}] must be finite; got {value}"
+            ));
+        }
+    }
+
     let mut codes = SparseAtomCodes::empty(n_obs, k_atoms);
     for row in 0..n_obs {
         for atom in 0..k_atoms {
@@ -1463,32 +1529,83 @@ pub fn native_manifold_description_length(
         coords,
         tier0_scale,
     )?;
-    let decoded_code_variance: f64 = sources
-        .iter()
-        .map(|source| source.firing_probability * source.output_spectrum.iter().sum::<f64>())
-        .sum::<f64>()
-        + amplitudes.decoded_variance();
-    // A reconstruction with ev = 1 leaves no distortion, and the water-filling
-    // rate of a continuous coordinate at zero distortion is infinite: that is its
-    // description length, not a value to floor away.
-    let budget = (1.0 - ev) * decoded_code_variance;
-    let distortion_budget = budget - amplitudes.representation_distortion;
+    let (ev, distortion, residual_spectrum) =
+        metric_residual_distortion(target, fitted, tier0_scale)?;
+    // The fit's own residual is the distortion it delivers. A fit with no residual
+    // leaves no distortion, and the water-filling rate of a continuous coordinate
+    // at zero distortion is infinite: that is its description length, not a value
+    // to floor away.
+    let distortion_budget = distortion - amplitudes.representation_distortion;
     if distortion_budget < 0.0 {
         return Err(format!(
             "manifold description length: reconstructing the fitted gates under the \
-             {gate_model:?} gate model costs output distortion {}, more than the budget {budget} \
-             the fit leaves unexplained",
+             {gate_model:?} gate model costs output distortion {}, more than the \
+             distortion {distortion} the fit delivers",
             amplitudes.representation_distortion
         ));
     }
-    manifold_fit_description_length_with_gate_amplitudes(
+    let mut report = manifold_fit_description_length_with_gate_amplitudes(
         &codes,
         &atom_code_spectra,
         &amplitudes.components,
+        &residual_spectrum,
         distortion_budget,
         ev,
         dictionary,
-    )
+    )?;
+    report.distortion = distortion;
+    Ok(report)
+}
+
+/// The fit's delivered distortion in the output metric `M = diag(σ⁻²)`.
+///
+/// Returns `(ev, D, ρ)`: `D = (1/N) Σ_i ‖x_i − x̂_i‖²_M`, the raw (uncentered)
+/// second-moment spectrum `ρ` of the metric-scaled residual, whose trace is `D`,
+/// and `ev = 1 − D / TSS_M` with `TSS_M = (1/N) Σ_i ‖x_i − x̄‖²_M`. A target with
+/// no variance in the metric leaves `ev` undefined and is an `Err`.
+fn metric_residual_distortion(
+    target: ArrayView2<'_, f64>,
+    fitted: ArrayView2<'_, f64>,
+    tier0_scale: Option<ArrayView1<'_, f64>>,
+) -> Result<(f64, f64, Vec<f64>), String> {
+    let (n_obs, p_out) = target.dim();
+    if n_obs == 0 {
+        return Err("manifold description length needs at least one row".to_string());
+    }
+    let weights = crate::native_code_source::output_metric_weights(tier0_scale, p_out)?;
+    let root_weights: Vec<f64> = weights.iter().map(|w| w.sqrt()).collect();
+    let mut residual = target.to_owned();
+    residual -= &fitted;
+    for mut row in residual.rows_mut() {
+        for (value, root) in row.iter_mut().zip(root_weights.iter()) {
+            *value *= root;
+        }
+    }
+    let n = n_obs as f64;
+    let distortion = residual.iter().map(|v| v * v).sum::<f64>() / n;
+    let mean = target
+        .mean_axis(ndarray::Axis(0))
+        .ok_or_else(|| "manifold description length needs at least one row".to_string())?;
+    let total = target
+        .rows()
+        .into_iter()
+        .map(|row| {
+            row.iter()
+                .zip(mean.iter())
+                .zip(weights.iter())
+                .map(|((x, m), w)| w * (x - m) * (x - m))
+                .sum::<f64>()
+        })
+        .sum::<f64>()
+        / n;
+    if !(total > 0.0) {
+        return Err(format!(
+            "manifold description length: the target has no variance in the output metric \
+             (TSS {total}), so its explained variance is undefined"
+        ));
+    }
+    let spectrum = crate::eq4_description_length::second_moment_eigenvalues(residual.view())?;
+    Ok((1.0 - distortion / total, distortion, spectrum.to_vec()))
 }
 
 #[cfg(test)]

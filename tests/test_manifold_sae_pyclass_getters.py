@@ -191,7 +191,16 @@ def test_native_summary_and_description_length_use_the_fitted_artifact() -> None
     assert "reml_score" not in summary
     assert "evidence" not in summary
 
-    description = core.description_length()
+    # The description length is priced at the distortion the fit delivers on
+    # its data (#3435), which the artifact does not store, so the summary does
+    # not report one.
+    assert "description_length" not in summary
+    assert "bits_per_token" not in summary
+
+    fitted = np.asarray(golden["fitted"], dtype=np.float64)
+    rows, cols = np.indices(fitted.shape)
+    x = fitted + 0.05 * np.sin(1.7 * (rows + 1) + 0.9 * (cols + 1))
+    description = core.description_length(x)
     assert description is not None
     assert description["n_tokens"] == len(golden["fitted"])
     assert description["g_dict"] == len(golden["atoms"])
@@ -200,7 +209,20 @@ def test_native_summary_and_description_length_use_the_fitted_artifact() -> None
         for decoder in golden["decoder_blocks"]
         for row in decoder
     )
-    assert summary["bits_per_token"] == pytest.approx(
-        description["bits_per_token"]
+    # The reported operating point is the fit's own residual energy and
+    # explained variance, both in the output metric diag(tier0_scale**-2).
+    metric = np.asarray(golden["tier0_scale"], dtype=np.float64) ** -2
+    distortion = float(np.mean(((x - fitted) ** 2) @ metric))
+    total = float(np.mean(((x - x.mean(axis=0)) ** 2) @ metric))
+    assert description["distortion"] == pytest.approx(distortion, rel=1e-12)
+    assert description["ev"] == pytest.approx(1.0 - distortion / total, rel=1e-12)
+    assert description["residual_bits"] > 0.0
+    assert description["total_bits"] == pytest.approx(
+        description["code_bits"]
+        + description["residual_bits"]
+        + description["selection_bits"]
+        + description["dict_bits"],
+        rel=1e-12,
     )
-    assert summary["description_length"] == description
+    with pytest.raises(ValueError):
+        core.description_length(x[:, :-1])

@@ -420,7 +420,7 @@ def _fit_ours_rust(
 
     d_atoms = [np.asarray(c).shape[1] if np.asarray(c).ndim == 2 else 1 for c in coords]
     native_bpt = None
-    dl = fit.description_length()
+    dl = fit.description_length(train_x)
     if isinstance(dl, dict) and "bits_per_token" in dl:
         native_bpt = float(dl["bits_per_token"])
     return FittedFeaturizer(

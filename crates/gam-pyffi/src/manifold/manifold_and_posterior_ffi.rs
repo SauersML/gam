@@ -4954,6 +4954,7 @@ impl ManifoldSaeCore {
 
     fn description_length_report(
         &self,
+        x: ndarray::ArrayView2<'_, f64>,
         l_param_bits: Option<f64>,
     ) -> PyResult<Option<gam::terms::sae::description_length::ManifoldFitDl>> {
         if self.inner.atoms.is_empty() || self.inner.fitted.is_empty() {
@@ -4966,6 +4967,7 @@ impl ManifoldSaeCore {
             ));
         }
         let assignments = manifold_sae_owned2(&self.inner.assignments)?;
+        let fitted = manifold_sae_owned2(&self.inner.fitted)?;
         let coords = self
             .inner
             .coords
@@ -5034,7 +5036,8 @@ impl ManifoldSaeCore {
                     .tier0_scale
                     .as_deref()
                     .map(ndarray::ArrayView1::from),
-                ev: self.inner.reconstruction_r2,
+                target: x,
+                fitted: fitted.view(),
                 dictionary: &dictionary,
             },
         )
@@ -5173,28 +5176,28 @@ impl ManifoldSaeCore {
     }
 
     /// Fit-level code length from the native manifold-SAE description-length
-    /// kernel. Every input is read from this immutable fitted artifact.
-    #[pyo3(signature = (*, l_param_bits=None))]
-    fn description_length(
+    /// kernel, priced at the distortion the fit delivers on `x`, the `(N, P)`
+    /// rows it was fitted to (#3435). Every other input is read from this
+    /// immutable fitted artifact.
+    #[pyo3(signature = (x, *, l_param_bits=None))]
+    fn description_length<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'py, f64>,
         l_param_bits: Option<f64>,
     ) -> PyResult<Option<PyObject>> {
-        self.description_length_report(l_param_bits)?
+        self.description_length_report(x.as_array(), l_param_bits)?
             .as_ref()
             .map(|report| manifold_description_length_to_pydict(py, report))
             .transpose()
     }
 
     /// Compact fitted-model report assembled from persisted native fields and
-    /// the same Rust description-length/assignment-summary kernels used by the
-    /// standalone FFI functions.
+    /// the same Rust assignment-summary kernel used by the standalone FFI
+    /// functions. The description length is priced at the distortion the fit
+    /// delivers on its data, which the artifact does not store, so it is
+    /// reported by [`Self::description_length`] alone.
     fn summary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let description = self.description_length_report(None)?;
-        let description_py = description
-            .as_ref()
-            .map(|report| manifold_description_length_to_pydict(py, report))
-            .transpose()?;
         let assignments = manifold_sae_owned2(&self.inner.assignments)?;
         let (avg_active_atoms, mean_assignment_mass) =
             manifold_assignment_summary_from_array(assignments.view())
@@ -5229,11 +5232,6 @@ impl ManifoldSaeCore {
             .as_ref()
             .map(|values| values.iter().map(|value| value.exp()).collect::<Vec<_>>());
         let out = PyDict::new(py);
-        out.set_item(
-            "bits_per_token",
-            description.as_ref().map(|report| report.bits_per_token),
-        )?;
-        out.set_item("description_length", description_py)?;
         out.set_item("K", self.inner.atoms.len())?;
         out.set_item("d_atom", common_dim)?;
         out.set_item("atom_dims", atom_dims)?;
