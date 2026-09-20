@@ -192,8 +192,8 @@ pub(crate) fn subspace_rss(
     basis: ArrayView2<'_, f64>,
 ) -> f64 {
     let p = data.ncols();
-    debug_assert_eq!(mean.len(), p);
-    debug_assert_eq!(basis.ncols(), p);
+    assert_eq!(mean.len(), p);
+    assert_eq!(basis.ncols(), p);
     let mut coeff = vec![0.0_f64; basis.nrows()];
     let mut rss = 0.0_f64;
     for &r in rows {
