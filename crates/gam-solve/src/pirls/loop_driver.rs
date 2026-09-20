@@ -1641,14 +1641,18 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             }
             if refresh_iter + 1 == MAX_SHAPE_REFRESH {
                 // Final allowed pass and the shape is still drifting (a
-                // pathological non-contraction). Do NOT re-solve: re-solving
-                // would advance `final_eta` past the η the just-installed shape
-                // was evaluated at, breaking the stored-shape == estimate(final_eta)
-                // invariant. Stopping here keeps the reported shape exactly the
-                // ML estimate at the reported η; the residual weight/φ drift is
-                // bounded by the last `rel_change` and never worse than the
-                // pre-fix frozen-warm-start value.
-                break;
+                // non-contracting alternation). The working state — β̂, weights,
+                // Hessian, EDF — was solved at the PREVIOUS shape, which differs
+                // from the just-installed one by more than the tolerance; the
+                // shape rescales the penalized objective `k·D + βᵀSβ`, so β̂ is
+                // not stationary at the reported shape. That is not a joint
+                // (β, shape) fixed point and may not be reported as a fit
+                // (#3544), exactly as the Gaussian φ refresh below refuses.
+                crate::bail_invalid_estim!(
+                    "Gamma shape did not reach its converged-η fixed point within \
+                     {MAX_SHAPE_REFRESH} re-solves (relative change {rel_change:e} > \
+                     tolerance {SHAPE_REFRESH_REL_TOL:e})"
+                );
             }
             // The shape moved: re-solve β at the corrected shape, warm-started
             // at the converged β, so the final working state is rebuilt with the
@@ -1726,10 +1730,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     break;
                 }
                 if refresh_iter + 1 == MAX_PHI_REFRESH {
-                    // Final allowed pass and φ is still drifting. Do NOT re-solve:
-                    // re-solving would advance η past the point φ was evaluated at,
-                    // breaking the stored-φ == estimate(final_eta) invariant.
-                    break;
+                    // Final allowed pass and φ is still drifting: the working
+                    // state was solved at a φ that differs from the installed one
+                    // by more than the tolerance (φ rescales the effective
+                    // penalty, so β̂ is not stationary at the reported φ). Not a
+                    // joint (β, φ) fixed point, so not a fit (#3544).
+                    crate::bail_invalid_estim!(
+                        "Tweedie dispersion φ did not reach its converged-η fixed point \
+                         within {MAX_PHI_REFRESH} re-solves (relative change {rel_change:e} > \
+                         tolerance {PHI_REFRESH_REL_TOL:e})"
+                    );
                 }
                 // φ moved materially: re-solve β at the corrected φ, warm-started
                 // at the converged β, so the final working state is rebuilt with
@@ -1747,9 +1757,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // ── Gaussian (non-identity link) / inverse Gaussian dispersion φ ─────────
     //
     // The same converged-η refresh as the Tweedie φ above, with the exact MLE
-    // `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` in place of the Pearson moment. Unlike the Tweedie
-    // pass, a φ still moving on the last allowed pass is a failed fit, not a
-    // reported one: the reported φ must be the MLE at the reported η.
+    // `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` in place of the Pearson moment. As in every
+    // converged-η refresh, a φ still moving on the last allowed pass is a failed
+    // fit, not a reported one: the reported φ must be the MLE at the reported η.
     if refine_dispersion_at_converged_eta
         && matches!(
             working_model
@@ -1883,12 +1893,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 break;
             }
             if refresh_iter + 1 == MAX_PHI_REFRESH {
-                // Final allowed pass and φ is still drifting. Do NOT re-solve:
-                // re-solving would advance η past the point the just-installed φ
-                // was evaluated at, breaking the stored-φ == estimate(final_eta)
-                // invariant. Stop here so the reported φ is exactly the moment
-                // estimate at the reported η.
-                break;
+                // Final allowed pass and φ is still drifting: the mean was solved
+                // at a precision that differs from the installed one by more than
+                // the tolerance, and φ feeds back through the digamma mean score,
+                // so β̂ is not stationary at the reported φ. Not a joint (β, φ)
+                // fixed point, so not a fit (#3544).
+                crate::bail_invalid_estim!(
+                    "Beta precision φ did not reach its converged-η fixed point within \
+                     {MAX_PHI_REFRESH} re-solves (relative change {rel_change:e} > \
+                     tolerance {PHI_REFRESH_REL_TOL:e})"
+                );
             }
             // φ moved materially: re-solve β at the corrected φ, warm-started at
             // the converged β, so the mean is refit under the better precision
@@ -2022,12 +2036,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 break;
             }
             if refresh_iter + 1 == MAX_THETA_REFRESH {
-                // Final allowed pass and θ is still drifting. Do NOT re-solve:
-                // re-solving would advance η past the point the just-installed θ
-                // was evaluated at, breaking the stored-θ == estimate(final_eta)
-                // invariant. Stop here so the reported θ is exactly the ML
-                // estimate at the reported η.
-                break;
+                // Final allowed pass and θ is still drifting: the mean was solved
+                // under a variance function whose θ differs from the installed one
+                // by more than the tolerance, and θ enters the NB2 working
+                // response, so β̂ is not stationary at the reported θ. Not a joint
+                // (β, θ) fixed point, so not a fit (#3544).
+                crate::bail_invalid_estim!(
+                    "negative-binomial θ did not reach its converged-η fixed point within \
+                     {MAX_THETA_REFRESH} re-solves (relative change {rel_change:e} > \
+                     tolerance {THETA_REFRESH_REL_TOL:e})"
+                );
             }
             // θ moved materially: re-solve β at the corrected θ, warm-started at
             // the converged β, so the mean is refit under the better variance
