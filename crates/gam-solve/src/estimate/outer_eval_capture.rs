@@ -367,6 +367,11 @@ pub struct QuadratureMarginalAudit {
     /// block membership is differencing two different functions and its
     /// quotient is not a derivative of either.
     pub block_cols: Vec<usize>,
+    /// Per separately integrated piece, whether it was integrated on a feasible
+    /// interval with at least one finite end
+    /// (`BlockExcessTarget::axis_truncation`), so its ends, transported nodes
+    /// and mass `ln Z` move with ρ.
+    pub truncated_pieces: Vec<bool>,
     /// Channel (a), `∂Δ_b/∂ρ_j` — the corrector's explicit penalty-score channel,
     /// raw.
     pub explicit_a: Vec<f64>,
