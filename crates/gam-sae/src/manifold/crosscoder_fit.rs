@@ -534,7 +534,6 @@ pub fn run_auto_sae_crosscoder_fit(
         top_k: None,
         threshold: 0.0,
         seed_refine_routing: refine_routing,
-        seed_refine_random_state: request.config.random_state,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,

@@ -867,11 +867,35 @@ fn canonicalize_penalty(penalty: ArrayView2<'_, f64>) -> Array2<f64> {
     out
 }
 
+/// The simultaneous diagonalization of the pencil `(XᵀWX, S)` a closed-form fit runs on.
+///
+/// With `r = rank(W½X)`, the coefficient space splits into the `r` directions the data
+/// observe and the `p − r` it does not (`p > n`, collinear or all-zero-weight columns).
+/// The data-null block is identified only through the penalty: `S₀₀ = Z₀ᵀSZ₀` is SPD
+/// exactly when `XᵀWX + S` is. Eliminating it (the Schur complement on `S₀₀`) leaves the
+/// `r`-dimensional problem `(X_aᵀWX_a, S_eff)`, `X_a = X·Z₁`,
+/// `S_eff = S₁₁ − S₁₀·S₀₀⁻¹·S₀₁`, which the fields below describe:
+///
+/// - `coefficient_basis` (`p × r`) is `T·C_a`, `T = Z₁ − Z₀·S₀₀⁻¹·S₀₁` the lift back to
+///   coefficients and `C_a` the `X_aᵀWX_a`-whitened eigenbasis of `S_eff`, with
+///   eigenvalues `penalty_eigenvalues` (length `r`) and rotation `eigenvectors` (`r × r`);
+/// - `data_null_basis` (`p × (p − r)`) is `B₀ = Z₀·S₀₀^(-1/2)`: `B₀ᵀSB₀ = I`, `XᵀWX·B₀ = 0`,
+///   and `Tᵀ·S·B₀ = 0`, so `[T·C_a, B₀]` diagonalizes both forms and
+///   `H(λ)⁻¹ = Σ c·cᵀ/(1 + λδ) + B₀B₀ᵀ/λ` — the `δ → ∞` modes of the pencil;
+/// - `penalty_rank = rank(S_eff) = rank(S) − (p − r)` and `nullity = r − penalty_rank`, which
+///   is `S`'s own nullity; `logdet_xtwx = log|X_aᵀWX_a|` and
+///   `logdet_penalty_positive = log|S|₊ − log|S₀₀|`.
+///
+/// Then `log|H(λ)| − log|λS|₊ = logdet_xtwx + Σ log(1 + λδ) − logdet_penalty_positive −
+/// penalty_rank·ρ` exactly: the `(p − r)·ρ + log|S₀₀|` of the data-null block cancels
+/// between the two determinants. A full-rank design has `r = p`, `Z₁ = I`, and an empty
+/// `data_null_basis`.
 #[derive(Clone, Debug)]
 pub struct GaussianRemlEigenCache {
     pub penalty_eigenvalues: Array1<f64>,
     pub eigenvectors: Array2<f64>,
     pub coefficient_basis: Array2<f64>,
+    pub data_null_basis: Array2<f64>,
     pub xtwx_fingerprint: u64,
     pub penalty_fingerprint: u64,
     pub logdet_xtwx: f64,
@@ -884,6 +908,11 @@ impl GaussianRemlEigenCache {
     /// Return the eigenvalue under the same range classification used by REML.
     pub(crate) fn classified_penalty_eigenvalue(&self, index: usize) -> f64 {
         PenaltyRangeSpectrum::of(self).get(index)
+    }
+
+    /// `(XᵀWX + λS)⁻¹` assembled from the pencil's modes, data-null block included.
+    pub fn inverse_hessian(&self, lambda: f64) -> Result<Array2<f64>, EstimationError> {
+        gaussian_reml_inverse_hessian_from_cache(self, lambda)
     }
 }
 
@@ -3268,10 +3297,10 @@ fn gaussian_reml_inverse_hessian_from_cache(
             "Gaussian REML lambda must be finite and positive; got {lambda}"
         );
     }
-    let p = cache.penalty_eigenvalues.len();
+    let (p, data_rank) = cache.coefficient_basis.dim();
     let spectrum = PenaltyRangeSpectrum::of(cache);
     let mut scaled_basis = cache.coefficient_basis.clone();
-    for eig in 0..p {
+    for eig in 0..data_rank {
         // `H = XᵀWX + λS` must be assembled from the same `S` the objective
         // scores; a direction the range predicate calls null carries no `λδ`
         // here either (#2740).
@@ -3280,7 +3309,12 @@ fn gaussian_reml_inverse_hessian_from_cache(
             scaled_basis[[row, eig]] *= scale;
         }
     }
-    let inverse = dense_ab(scaled_basis.view(), cache.coefficient_basis.t());
+    let mut inverse = dense_ab(scaled_basis.view(), cache.coefficient_basis.t());
+    if cache.data_null_basis.ncols() > 0 {
+        // The data-null modes see only `λS`, and `B₀ᵀSB₀ = I`.
+        let data_null = dense_ab(cache.data_null_basis.view(), cache.data_null_basis.t());
+        inverse.scaled_add(1.0 / lambda, &data_null);
+    }
     if inverse.iter().any(|value| !value.is_finite()) {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
@@ -3299,7 +3333,9 @@ fn batched_inverse_hessians_from_caches(
     let uniform = p > 0
         && problems.iter().all(|problem| {
             let cache = &problem.fit.cache;
-            cache.coefficient_basis.dim() == (p, p) && cache.penalty_eigenvalues.len() == p
+            cache.coefficient_basis.dim() == (p, p)
+                && cache.penalty_eigenvalues.len() == p
+                && cache.data_null_basis.ncols() == 0
         });
     if uniform && problems.len() > 1 {
         let mut scaled_basis = Array3::<f64>::zeros((problems.len(), p, p));
@@ -3795,28 +3831,36 @@ impl<'a> PenaltyRangeSpectrum<'a> {
 fn gaussian_reml_penalty_pseudoinverse_from_cache(
     cache: &GaussianRemlEigenCache,
 ) -> Result<Array2<f64>, EstimationError> {
-    let p = cache.penalty_eigenvalues.len();
+    let (p, data_rank) = cache.coefficient_basis.dim();
     // Divide only on the natural penalty range. A positive roundoff mode in
     // its nullspace must never enter this inverse (#2739/#2740).
     let spectrum = PenaltyRangeSpectrum::of(cache);
-    let selected: Vec<usize> = (0..p).filter(|eig| spectrum.get(*eig) > 0.0).collect();
+    let selected: Vec<usize> = (0..data_rank).filter(|eig| spectrum.get(*eig) > 0.0).collect();
     if selected.len() != cache.penalty_rank {
         crate::bail_invalid_estim!(
             "Gaussian REML penalty pseudoinverse: the cache reports penalty_rank={} but {} of its \
-             {p} eigenvalues in the declared range are positive; the pseudoinverse divides by \
-             each selected eigenvalue, so it cannot reconcile a rank it did not derive",
+             {data_rank} eigenvalues in the declared range are positive; the pseudoinverse \
+             divides by each selected eigenvalue, so it cannot reconcile a rank it did not \
+             derive",
             cache.penalty_rank,
             selected.len()
         );
     }
-    let mut scaled_basis = Array2::<f64>::zeros((p, p));
+    let mut scaled_basis = Array2::<f64>::zeros((p, data_rank));
     for eig in selected {
         let delta = spectrum.get(eig);
         for row in 0..p {
             scaled_basis[[row, eig]] = cache.coefficient_basis[[row, eig]] / delta;
         }
     }
-    Ok(dense_ab(scaled_basis.view(), cache.coefficient_basis.t()))
+    let mut inverse = dense_ab(scaled_basis.view(), cache.coefficient_basis.t());
+    if cache.data_null_basis.ncols() > 0 {
+        // The data-null modes are S-orthonormal range directions of `S` (`B₀ᵀSB₀ = I`),
+        // so the same `M·diag(δ⁺)·Mᵀ` over the pencil's full basis gives them weight one.
+        let data_null = dense_ab(cache.data_null_basis.view(), cache.data_null_basis.t());
+        inverse += &data_null;
+    }
+    Ok(inverse)
 }
 
 fn add_deviance_profile_vjp(
@@ -3979,9 +4023,9 @@ pub(crate) fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
 
     let xtwx = dense_xt_diag_x(x, weight.view());
     // The Gram matrix remains the cache identity, never the factorization input.
-    let factor = weighted_design_qr(x, weight.view())?;
-    gaussian_reml_eigen_cache_from_lower(
-        factor.upper.t().to_owned(), penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
+    let range = weighted_design_range(x, weight.view())?;
+    gaussian_reml_eigen_cache_from_design_range(
+        &range, penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
     )
 }
 
@@ -4005,12 +4049,21 @@ fn weighted_design_qr(
         weight[row].sqrt() * x[[row, col]]
     });
     let weighted_view = FaerArrayView::new(&weighted_design);
-    let qr = gam_linalg::faer_ndarray::HouseholderQr::new(weighted_view.as_ref());
+    sign_normalized_design_qr(gam_linalg::faer_ndarray::HouseholderQr::new(weighted_view.as_ref()))
+}
+
+fn householder_upper(qr: &gam_linalg::faer_ndarray::HouseholderQr) -> Array2<f64> {
     let upper_view = qr.r();
-    let mut upper = Array2::from_shape_fn(
-        (upper_view.nrows(), upper_view.ncols()), |(row, col)| upper_view[(row, col)],
-    );
-    if upper.nrows() != x.ncols() || upper.diag().iter().any(|v| !v.is_finite() || *v == 0.0) {
+    Array2::from_shape_fn((upper_view.nrows(), upper_view.ncols()), |(row, col)| {
+        upper_view[(row, col)]
+    })
+}
+
+fn sign_normalized_design_qr(
+    qr: gam_linalg::faer_ndarray::HouseholderQr,
+) -> Result<WeightedDesignQr, EstimationError> {
+    let mut upper = householder_upper(&qr);
+    if upper.nrows() != upper.ncols() || upper.diag().iter().any(|v| !v.is_finite() || *v == 0.0) {
         return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
     }
     let mut row_signs = vec![1.0; upper.nrows()];
@@ -4021,6 +4074,167 @@ fn weighted_design_qr(
         }
     }
     Ok(WeightedDesignQr { qr, upper, row_signs })
+}
+
+/// The column space of the weighted design `A = W½X` of rank `r ≤ min(n, p)`.
+///
+/// `Z₀` is an orthonormal basis of `null(A)` and `Z₁` one of its orthogonal
+/// complement, so `A = A·Z₁·Z₁ᵀ` and `A·Z₁` has full column rank `r` and the same
+/// column space as `A`. The factor is the Householder QR of `A·Z₁`: its head rows
+/// of `Qᵀ·W½y` are the response's coordinates in `col(A)` and its `n − r` tail
+/// rows are the part no column reaches, exactly as for a full-rank design (see
+/// [`rotated_weighted_response`]).
+///
+/// The rank is read off the Householder `R` of `A` itself (`A = Q·R`, so
+/// `null(A) = null(R)`), by the column-pivoted QR of `Rᵀ` at the repository's
+/// QR rank convention [`default_rrqr_rank_alpha`]: a pivot inside Householder
+/// backward error of the largest one is indistinguishable from a zero column.
+struct WeightedDesignRange {
+    /// `Z₀`, `p × (p − r)`.
+    null_basis: Array2<f64>,
+    /// `Z₁`, `p × r`; `None` when `r = p`, where `Z₁ = I`.
+    range_basis: Option<Array2<f64>>,
+    /// Householder QR of `A·Z₁`.
+    factor: WeightedDesignQr,
+}
+
+fn weighted_design_range(
+    x: ArrayView2<'_, f64>,
+    weight: ArrayView1<'_, f64>,
+) -> Result<WeightedDesignRange, EstimationError> {
+    let p = x.ncols();
+    let weighted_design = Array2::from_shape_fn(x.dim(), |(row, col)| {
+        weight[row].sqrt() * x[[row, col]]
+    });
+    let weighted_view = FaerArrayView::new(&weighted_design);
+    let qr = gam_linalg::faer_ndarray::HouseholderQr::new(weighted_view.as_ref());
+    let upper = householder_upper(&qr);
+    if upper.iter().any(|value| !value.is_finite()) {
+        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    }
+    let (null_basis, rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
+        &upper.t().to_owned(),
+        default_rrqr_rank_alpha(),
+    )
+    .map_err(EstimationError::LinearSystemSolveFailed)?;
+    if rank == 0 {
+        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    }
+    if rank == p {
+        return Ok(WeightedDesignRange {
+            null_basis,
+            range_basis: None,
+            factor: sign_normalized_design_qr(qr)?,
+        });
+    }
+    let (range_basis, null_rank) =
+        gam_linalg::faer_ndarray::rrqr_nullspace_basis(&null_basis, default_rrqr_rank_alpha())
+            .map_err(EstimationError::LinearSystemSolveFailed)?;
+    if null_basis.dim() != (p, p - rank) || null_rank != p - rank || range_basis.dim() != (p, rank)
+    {
+        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    }
+    let factor = weighted_design_qr(dense_ab(x, range_basis.view()).view(), weight)?;
+    Ok(WeightedDesignRange {
+        null_basis,
+        range_basis: Some(range_basis),
+        factor,
+    })
+}
+
+/// The eigen cache of `(XᵀWX, S)` built on the design's range factor, including
+/// designs whose `XᵀWX` is singular (#3366).
+///
+/// With `Z₀, Z₁` from [`WeightedDesignRange`] write `S₀₀ = Z₀ᵀSZ₀`,
+/// `S₀₁ = Z₀ᵀSZ₁`, `S₁₁ = Z₁ᵀSZ₁`. The model is identified exactly when `S₀₀` is
+/// positive definite: a direction of `null(X)` the penalty does not reach leaves
+/// the penalized likelihood flat. Then for `β = Z₁a + Z₀b` the data see only `a`,
+/// the penalty is minimised over `b` at `b = −S₀₀⁻¹S₀₁a`, and what remains is the
+/// full-rank problem on `X_a = X·Z₁` with the Schur complement
+/// `S_eff = S₁₁ − S₁₀S₀₀⁻¹S₀₁`, mapped back by `T = Z₁ − Z₀S₀₀⁻¹S₀₁`. With
+/// `B₀ = Z₀·S₀₀^(-1/2)`, `M = [T·C_a, B₀]` diagonalises the pencil:
+/// `MᵀXᵀWXM = diag(I, 0)` and `MᵀSM = diag(Δ, I)`.
+///
+/// The score terms follow from that congruence. `|XᵀWX + λS|` is
+/// `|X_aᵀWX_a|·Π(1+λδ)·λ^(p−r)·|S₀₀|` (the `Z` rotation is orthogonal and the
+/// shear to `[Z₁ − Z₀S₀₀⁻¹S₀₁, Z₀]` is unimodular), and `|λS|₊` carries the same
+/// `λ^(p−r)` over the `p − r` data-null directions, so both cancel in the REML
+/// ratio and the reduced cache keeps `penalty_rank = rank(S_eff)`,
+/// `logdet_xtwx = log|X_aᵀWX_a|` and `logdet_penalty_positive = log|S|₊ − log|S₀₀|`.
+/// The last is not `log|S_eff|₊`: a pseudo-determinant is not invariant under the
+/// shear once `S_eff` is singular, while `|S|₊` is read in the supplied penalty's
+/// own frame like every full-rank cache. The nullity `r − rank(S_eff)` equals
+/// `p − rank(S)`, so `ν = n − nullity` is unchanged.
+fn gaussian_reml_eigen_cache_from_design_range(
+    range: &WeightedDesignRange,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    xtwx_fingerprint: u64,
+) -> Result<GaussianRemlEigenCache, EstimationError> {
+    let lower = range.factor.upper.t().to_owned();
+    let Some(range_basis) = range.range_basis.as_ref() else {
+        return gaussian_reml_eigen_cache_from_lower(lower, penalty, nullspace_dim, xtwx_fingerprint);
+    };
+    let null_basis = &range.null_basis;
+    let unidentified = || EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY };
+    let (natural_eigenvalues, _) = penalty.eigh(Side::Lower).map_err(|_| unidentified())?;
+    let natural_tolerance = penalty_range_tolerance(natural_eigenvalues.view());
+    if natural_eigenvalues.iter().any(|&value| value < -natural_tolerance) {
+        crate::bail_invalid_estim!("Gaussian REML penalty is not positive semidefinite");
+    }
+    let penalty_on_null = dense_ab(penalty, null_basis.view());
+    let null_block = canonicalize_penalty(dense_atb(null_basis.view(), penalty_on_null.view()).view());
+    let (null_eigenvalues, null_eigenvectors) =
+        null_block.eigh(Side::Lower).map_err(|_| unidentified())?;
+    // Identification certificate: the penalty must reach every data-null direction,
+    // at the same rank convention that classifies the penalty's own spectrum.
+    if null_eigenvalues.iter().any(|&value| !(value > natural_tolerance)) {
+        return Err(unidentified());
+    }
+    let cross_block = dense_atb(penalty_on_null.view(), range_basis.view());
+    let mut null_inverse_cross = dense_atb(null_eigenvectors.view(), cross_block.view());
+    for (mut row, &value) in null_inverse_cross.rows_mut().into_iter().zip(null_eigenvalues.iter()) {
+        row.mapv_inplace(|entry| entry / value);
+    }
+    let null_inverse_cross = dense_ab(null_eigenvectors.view(), null_inverse_cross.view());
+    let range_block = dense_atb(range_basis.view(), dense_ab(penalty, range_basis.view()).view());
+    let schur = canonicalize_penalty(
+        (&range_block - &dense_atb(cross_block.view(), null_inverse_cross.view())).view(),
+    );
+    let transform = range_basis - &dense_ab(null_basis.view(), null_inverse_cross.view());
+    let mut data_null_basis = dense_ab(null_basis.view(), null_eigenvectors.view());
+    for (mut column, &value) in data_null_basis.columns_mut().into_iter().zip(null_eigenvalues.iter())
+    {
+        column.mapv_inplace(|entry| entry / value.sqrt());
+    }
+
+    let mut cache =
+        gaussian_reml_eigen_cache_from_lower(lower, schur.view(), None, xtwx_fingerprint)?;
+    let natural_rank = natural_eigenvalues
+        .iter()
+        .filter(|&&value| value > natural_tolerance)
+        .count();
+    if natural_rank != data_null_basis.ncols() + cache.penalty_rank {
+        return Err(unidentified());
+    }
+    if let Some(expected_nullity) = nullspace_dim
+        && expected_nullity != cache.nullity
+    {
+        crate::bail_invalid_estim!(
+            "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {}",
+            cache.nullity
+        );
+    }
+    cache.logdet_penalty_positive = natural_eigenvalues
+        .iter()
+        .filter(|&&value| value > natural_tolerance)
+        .map(|value| value.ln())
+        .sum::<f64>()
+        - null_eigenvalues.iter().map(|value| value.ln()).sum::<f64>();
+    cache.coefficient_basis = dense_ab(transform.view(), cache.coefficient_basis.view());
+    cache.data_null_basis = data_null_basis;
+    cache.penalty_fingerprint = matrix_fingerprint(penalty);
+    Ok(cache)
 }
 
 /// The weighted response rotated by the design's orthogonal factor, `Qᵀ·W½Y`, split at
@@ -4252,6 +4466,7 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
         penalty_eigenvalues,
         eigenvectors,
         coefficient_basis,
+        data_null_basis: Array2::zeros((p, 0)),
         xtwx_fingerprint,
         penalty_fingerprint,
         logdet_xtwx,
@@ -4280,17 +4495,23 @@ fn validate_gaussian_reml_eigen_cache(
     cache: &GaussianRemlEigenCache,
     p: usize,
 ) -> Result<(), EstimationError> {
-    if cache.penalty_eigenvalues.len() != p
-        || cache.eigenvectors.dim() != (p, p)
-        || cache.coefficient_basis.dim() != (p, p)
+    let data_rank = cache.coefficient_basis.ncols();
+    if data_rank > p
+        || cache.penalty_eigenvalues.len() != data_rank
+        || cache.eigenvectors.dim() != (data_rank, data_rank)
+        || cache.coefficient_basis.dim() != (p, data_rank)
+        || cache.data_null_basis.dim() != (p, p - data_rank)
     {
         crate::bail_invalid_estim!(
             "Gaussian REML eigen cache dimension mismatch: expected {p} coefficients"
         );
     }
-    if cache.penalty_rank > p || cache.nullity > p || cache.penalty_rank + cache.nullity != p {
+    if cache.penalty_rank > data_rank
+        || cache.nullity > data_rank
+        || cache.penalty_rank + cache.nullity != data_rank
+    {
         crate::bail_invalid_estim!(
-            "Gaussian REML eigen cache rank/nullity mismatch: rank={}, nullity={}, p={p}",
+            "Gaussian REML eigen cache rank/nullity mismatch: rank={}, nullity={}, data rank={data_rank}",
             cache.penalty_rank,
             cache.nullity
         );
@@ -4306,6 +4527,7 @@ fn validate_gaussian_reml_eigen_cache(
         || cache
             .coefficient_basis
             .iter()
+            .chain(cache.data_null_basis.iter())
             .any(|value| !value.is_finite())
     {
         crate::bail_invalid_estim!(
@@ -4324,7 +4546,7 @@ fn validate_gaussian_reml_eigen_cache(
     let classified_rank = spectrum.rank();
     if classified_rank != cache.penalty_rank {
         crate::bail_invalid_estim!(
-            "Gaussian REML eigen cache reports penalty_rank={} but {classified_rank} of its {p} \
+            "Gaussian REML eigen cache reports penalty_rank={} but {classified_rank} of its {data_rank} \
              eigenvalues in its declared range are positive; the log-determinant sums run over the \
              directions that clear it while log|S|₊ and the gradient offset are denominated in \
              penalty_rank, so the two must be the same count",
@@ -4373,11 +4595,19 @@ fn prepare_gaussian_reml(
 
     // A supplied cache and a built one read the response through the same Householder
     // factor of `W½X` (see [`rotated_weighted_response`]). A supplied cache built from
-    // `XᵀWX` holds that factor's `D·R` as its Cholesky factor.
-    let factor = weighted_design_qr(x, weight.view())?;
+    // `XᵀWX` holds that factor's `D·R` as its Cholesky factor. On a rank-deficient
+    // design the factor is of `W½X·Z₁` (see [`WeightedDesignRange`]).
+    let range = weighted_design_range(x, weight.view())?;
     let cache = match eigen_cache {
         Some(cache) => {
             validate_gaussian_reml_eigen_cache(cache, p)?;
+            let data_rank = range.factor.upper.ncols();
+            if cache.coefficient_basis.ncols() != data_rank {
+                crate::bail_invalid_estim!(
+                    "Gaussian REML eigen cache design rank mismatch: cache has {}, design has {data_rank}",
+                    cache.coefficient_basis.ncols()
+                );
+            }
             let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
             if cache.xtwx_fingerprint != xtwx_fingerprint {
                 crate::bail_invalid_estim!("Gaussian REML eigen cache X'WX mismatch");
@@ -4396,10 +4626,11 @@ fn prepare_gaussian_reml(
             }
             cache.clone()
         }
-        None => gaussian_reml_eigen_cache_from_lower(
-            factor.upper.t().to_owned(), penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
+        None => gaussian_reml_eigen_cache_from_design_range(
+            &range, penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
         )?,
     };
+    let factor = range.factor;
     if n_effective <= cache.nullity {
         crate::bail_invalid_estim!(
             "Gaussian REML requires more positive-weight rows than the nullspace dimension; got n_effective={n_effective}, nullity={}",
@@ -7562,6 +7793,241 @@ mod tests {
         assert_backward_matches_forward_finite_difference(3);
     }
 
+    // #3366: an identified model whose weighted Gram `XᵀWX` is singular — more
+    // coefficients than rows, or a column the data never see — is resolved
+    // exactly through the penalty pencil. These fixtures pin the reduced cache
+    // against a dense evaluation of the SAME REML objective on the full,
+    // positive-definite `H = XᵀWX + λS`.
+
+    fn second_difference_penalty(p: usize) -> Array2<f64> {
+        let mut d = Array2::<f64>::zeros((p - 2, p));
+        for row in 0..p - 2 {
+            d[[row, row]] = 1.0;
+            d[[row, row + 1]] = -2.0;
+            d[[row, row + 2]] = 1.0;
+        }
+        d.t().dot(&d)
+    }
+
+    fn wide_design_3366() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {
+        let (n, p) = (9usize, 12usize);
+        let x = Array2::from_shape_fn((n, p), |(i, j)| {
+            let t = i as f64 / (n - 1) as f64;
+            let knot = j as f64 / (p - 1) as f64;
+            (-(t - knot).powi(2) / 0.045).exp() + 0.05 * ((i + 2 * j) as f64).sin()
+        });
+        let y = Array2::from_shape_fn((n, 1), |(i, _)| {
+            let t = i as f64 / (n - 1) as f64;
+            (2.3 * t).sin() + 0.4 * (11.0 * t + 0.7).sin()
+        });
+        let w = Array1::from_shape_fn(n, |i| 1.0 + 0.2 * (0.9 * i as f64).cos());
+        (x, y, second_difference_penalty(p), w)
+    }
+
+    fn zero_column_design_3366() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {
+        let n = 24usize;
+        let mut x = Array2::from_shape_fn((n, 7), |(i, j)| {
+            let t = (i as f64 - 11.5) / 12.0;
+            t.powi(j as i32) + 0.03 * ((3 * i + j) as f64).cos()
+        });
+        x.column_mut(3).fill(0.0);
+        let y = Array2::from_shape_fn((n, 1), |(i, _)| {
+            let t = (i as f64 - 11.5) / 12.0;
+            0.3 + 0.8 * t - 0.5 * t * t + 0.15 * (9.0 * t).sin()
+        });
+        let w = Array1::from_shape_fn(n, |i| 1.0 + 0.1 * (0.5 * i as f64).sin());
+        (x, y, second_difference_penalty(7), w)
+    }
+
+    struct DenseRemlReference {
+        score: f64,
+        coefficients: Array1<f64>,
+        inverse_hessian: Array2<f64>,
+        edf: f64,
+    }
+
+    /// The REML objective the evaluator implements, formed directly on the
+    /// full `H = XᵀWX + λS` (positive definite for an identified model) and
+    /// the penalty pseudo-determinant `log|λS|₊`.
+    fn dense_reml_reference(
+        x: ArrayView2<'_, f64>,
+        y: ArrayView1<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        w: ArrayView1<'_, f64>,
+        rho: f64,
+    ) -> DenseRemlReference {
+        let lambda = rho.exp();
+        let xtwx = dense_xt_diag_x(x, w);
+        let h = &xtwx + &(penalty.to_owned() * lambda);
+        let (h_eig, h_vec) = h.eigh(Side::Lower).expect("dense H eigendecomposition");
+        assert!(h_eig.iter().all(|&e| e > 0.0), "fixture H must be positive definite");
+        let inverse_hessian =
+            h_vec.dot(&Array2::from_diag(&h_eig.mapv(f64::recip))).dot(&h_vec.t());
+        let xtwy = x.t().dot(&(&w * &y));
+        let coefficients = inverse_hessian.dot(&xtwy);
+        let residual = &y - &x.dot(&coefficients);
+        let dp = (&w * &residual * &residual).sum()
+            + lambda * coefficients.dot(&penalty.dot(&coefficients));
+        let (s_eig, _) = penalty.to_owned().eigh(Side::Lower).expect("penalty eigh");
+        let s_max = s_eig.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let positive: Vec<f64> = s_eig.iter().copied().filter(|&e| e > 1.0e-9 * s_max).collect();
+        let logdet_s = positive.iter().map(|e| e.ln()).sum::<f64>() + positive.len() as f64 * rho;
+        let n_pos = w.iter().filter(|&&v| v > 0.0).count();
+        let nu = (n_pos - (x.ncols() - positive.len())) as f64;
+        let logdet_h = h_eig.iter().map(|e| e.ln()).sum::<f64>();
+        // The observation measure: a prior weight is a precision, so the
+        // Gaussian density carries `−½ Σ log wᵢ` over the rows it counts.
+        let log_weights = w.iter().filter(|&&v| v > 0.0).map(|v| v.ln()).sum::<f64>();
+        let score = 0.5 * (logdet_h - logdet_s)
+            + 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln())
+            - 0.5 * log_weights;
+        let edf = (&inverse_hessian * &xtwx).sum();
+        DenseRemlReference { score, coefficients, inverse_hessian, edf }
+    }
+
+    fn assert_rank_deficient_fit_matches_dense_reference(
+        label: &str,
+        x: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        w: ArrayView1<'_, f64>,
+    ) {
+        let fit = gaussian_reml_multi_closed_form(x, y, penalty, Some(w), None)
+            .unwrap_or_else(|err| panic!("{label}: identified singular-Gram fit refused: {err}"));
+        let p = x.ncols();
+        let data_rank = fit.cache.coefficient_basis.ncols();
+        assert!(data_rank < p, "{label}: fixture must have a singular Gram");
+        assert_eq!(fit.cache.data_null_basis.dim(), (p, p - data_rank), "{label}");
+
+        let dense = dense_reml_reference(x, y.column(0), penalty, w, fit.rho);
+        let scale = 1.0 + dense.score.abs();
+        assert!(
+            (fit.reml_score - dense.score).abs() <= 1.0e-9 * scale,
+            "{label}: score {:.15e} vs dense {:.15e}",
+            fit.reml_score,
+            dense.score
+        );
+        let beta_scale = dense.coefficients.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        for j in 0..p {
+            assert!(
+                (fit.coefficients[[j, 0]] - dense.coefficients[j]).abs() <= 1.0e-8 * beta_scale,
+                "{label}: beta[{j}] {:.12e} vs dense {:.12e}",
+                fit.coefficients[[j, 0]],
+                dense.coefficients[j]
+            );
+        }
+        assert!(
+            (fit.edf - dense.edf).abs() <= 1.0e-9 * (1.0 + dense.edf),
+            "{label}: edf {} vs dense {}",
+            fit.edf,
+            dense.edf
+        );
+        let inverse = fit.cache.inverse_hessian(fit.lambda).expect("cache inverse Hessian");
+        let inv_scale = dense.inverse_hessian.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        for ((i, j), &value) in inverse.indexed_iter() {
+            assert!(
+                (value - dense.inverse_hessian[[i, j]]).abs() <= 1.0e-9 * inv_scale,
+                "{label}: H^-1[{i},{j}] {value:.12e} vs dense {:.12e}",
+                dense.inverse_hessian[[i, j]]
+            );
+        }
+        // The selected ρ is the dense objective's stationary point, and the
+        // reported ρ-gradient is the dense objective's slope there.
+        let dense_slope = adaptive_central_difference(|delta| {
+            dense_reml_reference(x, y.column(0), penalty, w, fit.rho + delta).score
+        });
+        assert_fd_close(&format!("{label}: reml_grad_rho"), fit.reml_grad_rho, dense_slope);
+        assert!(dense_slope.abs() <= 1.0e-6, "{label}: dense slope {dense_slope:.3e} at rho-hat");
+    }
+
+    #[test]
+    fn more_coefficients_than_rows_matches_the_dense_pencil_reml_3366() {
+        let (x, y, s, w) = wide_design_3366();
+        assert_rank_deficient_fit_matches_dense_reference(
+            "p>n",
+            x.view(),
+            y.view(),
+            s.view(),
+            w.view(),
+        );
+    }
+
+    #[test]
+    fn a_column_the_data_never_see_matches_the_dense_pencil_reml_3366() {
+        let (x, y, s, w) = zero_column_design_3366();
+        assert_rank_deficient_fit_matches_dense_reference(
+            "zero column",
+            x.view(),
+            y.view(),
+            s.view(),
+            w.view(),
+        );
+    }
+
+    #[test]
+    fn a_penalty_blind_to_the_data_null_space_is_still_refused_3366() {
+        // The zero column is identified only through the penalty; a penalty
+        // that does not touch it leaves that coefficient unidentified.
+        let (x, y, _, w) = zero_column_design_3366();
+        let mut s = second_difference_penalty(7);
+        s.row_mut(3).fill(0.0);
+        s.column_mut(3).fill(0.0);
+        assert!(matches!(
+            gaussian_reml_multi_closed_form(x.view(), y.view(), s.view(), Some(w.view()), None),
+            Err(EstimationError::ModelIsIllConditioned { .. })
+        ));
+    }
+
+    #[test]
+    fn wide_design_backward_matches_forward_finite_difference_3366() {
+        // Directional derivatives along dense perturbations of every entry of
+        // X, y and the weights at once: `⟨∂f/∂X, V⟩` against the central
+        // difference of `f(X + hV)`, so no entry of the VJP escapes the check.
+        let (x, y, penalty, weights) = wide_design_3366();
+        let x_direction =
+            Array2::from_shape_fn(x.dim(), |(i, j)| ((3 * i + 7 * j) as f64 * 0.61).sin());
+        let y_direction = Array2::from_shape_fn(y.dim(), |(i, _)| (1.3 * i as f64 + 0.2).cos());
+        let w_direction = Array1::from_shape_fn(weights.len(), |i| 0.3 * (0.8 * i as f64).sin());
+        let targets = [
+            ForwardScalar::Lambda,
+            ForwardScalar::RemlScore,
+            ForwardScalar::Coefficient(5, 0),
+            ForwardScalar::Fitted(4, 0),
+            ForwardScalar::Edf,
+        ];
+        for target in targets {
+            let backward =
+                one_hot_backward(x.view(), y.view(), penalty.view(), weights.view(), target);
+            let fd_x = adaptive_central_difference(|delta| {
+                let candidate = &x + &(&x_direction * delta);
+                one_hot_objective(candidate.view(), y.view(), penalty.view(), weights.view(), target)
+            });
+            assert_fd_close(
+                &format!("p>n target={target:?} X direction"),
+                (&backward.grad_x * &x_direction).sum(),
+                fd_x,
+            );
+            let fd_y = adaptive_central_difference(|delta| {
+                let candidate = &y + &(&y_direction * delta);
+                one_hot_objective(x.view(), candidate.view(), penalty.view(), weights.view(), target)
+            });
+            assert_fd_close(
+                &format!("p>n target={target:?} y direction"),
+                (&backward.grad_y * &y_direction).sum(),
+                fd_y,
+            );
+            let fd_w = adaptive_central_difference(|delta| {
+                let candidate = &weights + &(&w_direction * delta);
+                one_hot_objective(x.view(), y.view(), penalty.view(), candidate.view(), target)
+            });
+            assert_fd_close(
+                &format!("p>n target={target:?} weight direction"),
+                backward.grad_weights.dot(&w_direction),
+                fd_w,
+            );
+        }
+    }
+
     #[test]
     fn backward_vjp_matches_finite_difference() {
         let x = array![
@@ -7766,16 +8232,21 @@ mod tests {
         // #3090: a Gram whose Cholesky fails used to be retried at
         // `X'WX + δI` for a geometric δ schedule, and the cache of that
         // different model came back as `Ok`. Its `logdet_xtwx` is then the log
-        // of the invented ridge, not of the data. The design-based builder
-        // reports the same design as ill-conditioned, so the batched path
-        // must too, and its well-posed siblings must be unaffected.
+        // of the invented ridge, not of the data. The Gram-only batched path
+        // has no design to rank-reveal, so it must refuse a singular Gram
+        // rather than invent a ridge, and its well-posed siblings must be
+        // unaffected. (The design-based builder resolves an identified
+        // singular Gram exactly through the penalty pencil, #3366; with a
+        // penalty that vanishes on null(X) the design is unidentified and it
+        // refuses too.)
         let singular = array![[1.0, 1.0], [1.0, 1.0]];
         let regular = array![[4.0, 1.0], [1.0, 3.0]];
         let penalty = array![[0.0, 0.0], [0.0, 1.0]];
         let design = array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
+        let blind_penalty = array![[1.0, 1.0], [1.0, 1.0]];
         assert!(matches!(
             build_gaussian_reml_eigen_cache_with_nullspace_dim(
-                design.view(), penalty.view(), None, None,
+                design.view(), blind_penalty.view(), None, None,
             ),
             Err(EstimationError::ModelIsIllConditioned { .. })
         ));
@@ -7840,6 +8311,7 @@ mod tests {
             penalty_eigenvalues: Array1::from(eigs.to_vec()),
             eigenvectors: Array2::eye(n),
             coefficient_basis: Array2::eye(n),
+            data_null_basis: Array2::zeros((n, 0)),
             xtwx_fingerprint: 0,
             penalty_fingerprint: 0,
             logdet_xtwx: 0.0,
@@ -9382,6 +9854,7 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
             penalty_eigenvalues: eigenvalues,
             eigenvectors: Array2::eye(p),
             coefficient_basis: Array2::eye(p),
+            data_null_basis: Array2::zeros((p, 0)),
             xtwx_fingerprint: 0,
             penalty_fingerprint: 0,
             logdet_xtwx: 0.0,

@@ -4,7 +4,7 @@
 //!
 //! Root cause this guards. `fit_custom_family` boxes the outer ρ = log λ vector
 //! with a uniform over-smoothing ceiling (`EFFECTIVE_DF_CEILING`). It was 10.0,
-//! BELOW the REML optimum of the #1561 plain `s(x, bs='tp')` mean over sin(2πx)
+//! BELOW the REML optimum of the #1561 plain `s(x, bs='tps')` mean over sin(2πx)
 //! (ρ_μ ≈ 11, edf ≈ 15). The μ wiggliness coordinate railed at exactly
 //! ρ = log λ = 10.0 = e¹⁰; the outer bound-projection then ZEROED its (still
 //! −3.5) gradient and the fit certified a spurious constrained optimum at
@@ -87,10 +87,10 @@ fn locscale_mu_smooth_reaches_interior_reml_optimum_not_the_over_smoothing_rail(
 
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(x, bs='tps')".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam loc-scale fit");
+    let result = fit_from_formula("y ~ s(x, bs='tps')", &ds, &cfg).expect("gam loc-scale fit");
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
     else {
         panic!("expected a GaussianLocationScale fit");

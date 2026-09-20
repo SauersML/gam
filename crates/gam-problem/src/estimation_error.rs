@@ -590,8 +590,9 @@ pub enum EstimationError {
     #[error(
         "Pre-fit perfect separation detected in the realized binomial inverse-link design: column {column_index} \
         has a threshold {threshold:.6e} that separates the binary outcomes \
-        (positive_above_threshold={positive_above_threshold}). The likelihood has no finite maximizer along that column; \
-        enable Firth/Jeffreys bias reduction or remove/reparameterize the separating column."
+        (positive_above_threshold={positive_above_threshold}). The likelihood has no finite maximizer along that column, and the Jeffreys prior that bounds it \
+        cannot be combined with optimized SAS or mixture link parameters; fix the link parameters or \
+        remove/reparameterize the separating column."
     )]
     PrefitPerfectSeparationDetected {
         column_index: usize,
@@ -604,7 +605,8 @@ pub enum EstimationError {
         {num_unpenalized_columns} directions no roughness penalty bounds (parametric columns, and a smooth's penalty null space, \
         unpenalized or penalized only by a ridge) admit a separating direction \
         with minimum signed margin {min_signed_margin:.6e}, zero for quasi-complete separation (columns {column_indices:?}). \
-        The likelihood has no finite maximizer along that direction; enable Firth/Jeffreys bias reduction or \
+        The likelihood has no finite maximizer along that direction, and the Jeffreys prior that bounds it \
+        cannot be combined with optimized SAS or mixture link parameters; fix the link parameters or \
         remove/reparameterize the separating columns."
     )]
     PrefitLinearSeparationDetected {
@@ -1143,6 +1145,12 @@ impl EstimationError {
     pub fn advice(&self) -> Option<String> {
         const SEPARATION: &str = "Enable Firth/Jeffreys bias reduction, remove or regularize \
              the separating predictor, or switch link via link(type=...).";
+        // A Firth-capable binomial fit adopts the Jeffreys prior on a pre-fit
+        // certificate (#3129), so the certificate reaches the caller only when
+        // the prior cannot be armed: optimized link parameters (#2654).
+        const PREFIT_SEPARATION: &str = "Fix the SAS or mixture link parameters instead of \
+             optimizing them so the Jeffreys prior can be fitted, remove or regularize the \
+             separating predictor, or switch link via link(type=...).";
         const CONDITIONING: &str = "Check for collinear or constant predictors and overly \
              complex smooth bases.";
         match self {
@@ -1155,10 +1163,10 @@ impl EstimationError {
                 Some(format!("Detected (quasi-)separation. {SEPARATION}"))
             }
             Self::PrefitPerfectSeparationDetected { column_index, .. } => Some(format!(
-                "Detected separation driven by unpenalized column {column_index}. {SEPARATION}"
+                "Detected separation driven by unpenalized column {column_index}. {PREFIT_SEPARATION}"
             )),
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
-                "Detected separation driven by unpenalized columns {column_indices:?}. {SEPARATION}"
+                "Detected separation driven by unpenalized columns {column_indices:?}. {PREFIT_SEPARATION}"
             )),
             Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
                 "The {link} link's range exceeds the family's mean domain and the data put \

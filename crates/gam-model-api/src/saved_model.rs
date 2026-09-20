@@ -13,6 +13,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,13 +54,15 @@ pub enum SavedModelError {
         /// The owner's refusal.
         reason: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// Reading or writing the file failed.
-    #[error("{path}: {reason}")]
+    /// Reading or writing the file failed. The operating system's error keeps
+    /// its kind, so a surface raises the class that kind names (a missing
+    /// directory is a `FileNotFoundError` in Python).
+    #[error("{path}: {source}")]
     Io {
         /// The file.
         path: String,
         /// The operating system's refusal.
-        reason: String,
+        source: std::io::Error,
     },
 }
 
@@ -128,16 +131,25 @@ pub fn read_saved_model_text<T: DeserializeOwned>(
     serde_json::from_value(model).map_err(malformed)
 }
 
-/// Write a saved document atomically: to a sibling temporary file named for
-/// this save, renamed over `path`. A failed save removes its temporary file.
-pub fn write_saved_model(path: &Path, text: &str) -> Result<(), SavedModelError> {
-    let io = |reason: String| SavedModelError::Io {
+/// Write a saved document durably and atomically. The bytes go to a sibling
+/// temporary file named for this save, whose data is synced before it is
+/// renamed over `path`. A failed write, sync or rename removes the temporary
+/// file, so `path` keeps its previous document. On Unix the directory is then
+/// synced, so a save that returns `Ok` survives a crash; a directory that
+/// cannot be synced fails the save, with the new document in place and its
+/// durability unknown. `std` has no directory handle to sync on Windows: there
+/// the rename is atomic and its durability is the filesystem's.
+pub fn write_saved_model(path: &Path, bytes: &[u8]) -> Result<(), SavedModelError> {
+    let io = |source: std::io::Error| SavedModelError::Io {
         path: path.display().to_string(),
-        reason,
+        source,
     };
-    let name = path
-        .file_name()
-        .ok_or_else(|| io("not a file path".to_string()))?;
+    let name = path.file_name().ok_or_else(|| {
+        io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a file path",
+        ))
+    })?;
     let mut temporary = name.to_os_string();
     temporary.push(format!(
         ".tmp{}-{}",
@@ -145,19 +157,45 @@ pub fn write_saved_model(path: &Path, text: &str) -> Result<(), SavedModelError>
         TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed)
     ));
     let temporary = path.with_file_name(temporary);
-    std::fs::write(&temporary, text)
+    std::fs::File::create(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
         .and_then(|()| std::fs::rename(&temporary, path))
         .map_err(|error| {
             drop(std::fs::remove_file(&temporary));
-            io(error.to_string())
-        })
+            io(error)
+        })?;
+    // `std` opens no directory handle off Unix; see above.
+    #[cfg(unix)]
+    sync_directory_of(path).map_err(|error| {
+        io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "the saved model is in place, but its directory could not be synced, so its durability is unknown: {error}"
+            ),
+        ))
+    })?;
+    Ok(())
+}
+
+/// Sync the directory holding `path`, so the rename that put it there is
+/// durable.
+#[cfg(unix)]
+fn sync_directory_of(path: &Path) -> std::io::Result<()> {
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(directory)?.sync_all()
 }
 
 /// The text of a saved document.
 pub fn read_saved_model_file(path: &Path) -> Result<String, SavedModelError> {
-    std::fs::read_to_string(path).map_err(|error| SavedModelError::Io {
+    std::fs::read_to_string(path).map_err(|source| SavedModelError::Io {
         path: path.display().to_string(),
-        reason: error.to_string(),
+        source,
     })
 }
 
@@ -229,13 +267,78 @@ mod tests {
             std::process::id(),
             TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed)
         )));
-        write_saved_model(&scratch.0, &text).unwrap();
+        write_saved_model(&scratch.0, text.as_bytes()).unwrap();
         assert_eq!(read_saved_model_file(&scratch.0).unwrap(), text);
         std::fs::remove_file(&scratch.0).unwrap();
         assert!(matches!(
             read_saved_model_file(&scratch.0),
-            Err(SavedModelError::Io { .. })
+            Err(SavedModelError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
         ));
+    }
+
+    /// A scratch directory removed with its contents when dropped.
+    struct ScratchDirectory(std::path::PathBuf);
+
+    impl ScratchDirectory {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "gam-saved-model-dir-{}-{}",
+                std::process::id(),
+                TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+
+        fn entries(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.0)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.0));
+        }
+    }
+
+    /// gam#3054: a save replaces the previous document whole and leaves no
+    /// temporary file; a save that fails after writing its temporary file
+    /// removes it and leaves what was at the path untouched; a missing
+    /// directory keeps its `NotFound` kind.
+    #[test]
+    fn a_save_replaces_the_document_whole_or_leaves_the_path_untouched_3054() {
+        let directory = ScratchDirectory::new();
+        let path = directory.0.join("model.json");
+        write_saved_model(&path, b"first").unwrap();
+        write_saved_model(&path, b"second").unwrap();
+        assert_eq!(read_saved_model_file(&path).unwrap(), "second");
+        assert_eq!(directory.entries(), vec!["model.json".to_string()]);
+
+        // The temporary file is written and synced, then the rename over a
+        // non-empty directory fails.
+        let occupied = directory.0.join("occupied.json");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("kept"), b"kept").unwrap();
+        assert!(matches!(
+            write_saved_model(&occupied, b"third"),
+            Err(SavedModelError::Io { path, .. }) if path == occupied.display().to_string()
+        ));
+        assert_eq!(
+            directory.entries(),
+            vec!["model.json".to_string(), "occupied.json".to_string()]
+        );
+        assert_eq!(std::fs::read(occupied.join("kept")).unwrap(), b"kept");
+
+        assert!(matches!(
+            write_saved_model(&directory.0.join("missing").join("model.json"), b"fourth"),
+            Err(SavedModelError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert_eq!(read_saved_model_file(&path).unwrap(), "second");
     }
 
     #[test]
@@ -249,8 +352,10 @@ mod tests {
             Err(SavedModelError::Kind { found: None, expected: "test" })
         ));
         assert!(matches!(
-            write_saved_model(Path::new("/"), "{}"),
-            Err(SavedModelError::Io { reason, .. }) if reason == "not a file path"
+            write_saved_model(Path::new("/"), b"{}"),
+            Err(SavedModelError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::InvalidInput
+                    && source.to_string() == "not a file path"
         ));
     }
 }

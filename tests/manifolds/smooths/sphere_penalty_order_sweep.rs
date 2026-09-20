@@ -101,9 +101,9 @@ fn sphere_wahba_penalty_order_sweep_low_orders() {
     let mut failures = Vec::new();
     for m in [1usize, 2, 3] {
         let formula = if m == 1 {
-            "y ~ sphere(lat, lon, k=30, m=1, lmax=200)".to_string()
+            "y ~ sphere(lat, lon, k=30, penalty_order=1, lmax=200)".to_string()
         } else {
-            format!("y ~ sphere(lat, lon, k=30, m={m})")
+            format!("y ~ sphere(lat, lon, k=30, penalty_order={m})")
         };
         match run(&formula) {
             Ok((rmse, mn, mx)) => {
@@ -139,7 +139,7 @@ fn sphere_wahba_m4_must_fit_smooth_truth() {
     // it — that's the whole point of failing here.
     init_parallelism();
     let (rmse, mn, mx) =
-        run("y ~ sphere(lat, lon, k=30, m=4)").expect("wahba m=4 fit must succeed");
+        run("y ~ sphere(lat, lon, k=30, penalty_order=4)").expect("wahba m=4 fit must succeed");
     // The other Wahba orders (m=1, 2, 3) all hit rmse ≤ 0.018 on the
     // same data. Require m=4 to be in the same ballpark — generous 5×
     // budget = 0.10.
@@ -157,7 +157,7 @@ fn sphere_harmonic_penalty_order_sweep() {
     init_parallelism();
     let mut failures = Vec::new();
     for m in [1usize, 2, 3, 4] {
-        let formula = format!("y ~ sphere(lat, lon, method=harmonic, max_degree=4, m={m})");
+        let formula = format!("y ~ sphere(lat, lon, method=harmonic, max_degree=4, penalty_order={m})");
         match run(&formula) {
             Ok((rmse, mn, mx)) => {
                 if rmse > 0.25 || mn < -5.0 || mx > 5.0 {
@@ -183,7 +183,7 @@ fn sphere_invalid_penalty_order_rejected_cleanly() {
         ..FitConfig::default()
     };
     for bad_m in [0usize, 5, 10, 99] {
-        let formula = format!("y ~ sphere(lat, lon, k=20, m={bad_m})");
+        let formula = format!("y ~ sphere(lat, lon, k=20, penalty_order={bad_m})");
         let r = fit_from_formula(&formula, &data, &cfg);
         match r {
             Ok(_) => panic!("m={bad_m} must be rejected (valid range is 1..=4)"),

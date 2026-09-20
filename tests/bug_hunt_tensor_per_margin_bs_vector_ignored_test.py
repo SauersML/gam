@@ -1,6 +1,6 @@
 """Bug hunt: per-margin basis types in a tensor smooth's ``bs=c(...)`` vector
-are silently discarded — ``te(x, z, bs=c("cc","cc"))`` (both margins cyclic),
-``te(x, z, bs=c("ps","ps"))`` (neither cyclic), and ``te(x, z, bs=c("cc","ps"))``
+are silently discarded — ``te(x, z, bs=c("cyclic","cyclic"))`` (both margins cyclic),
+``te(x, z, bs=c("ps","ps"))`` (neither cyclic), and ``te(x, z, bs=c("cyclic","ps"))``
 (mixed) all fit the *byte-identical* surface.
 
 mgcv's ``te(...)`` takes a per-margin basis vector: ``bs=c("cc","cc")`` makes
@@ -10,8 +10,8 @@ margin cyclic. These are genuinely different bases and must produce different
 fitted surfaces — in particular the cyclic margins impose periodicity that the
 P-spline margins do not.
 
-Observed: on the same data, ``bs=c("cc","cc")``, ``bs=c("ps","ps")`` and
-``bs=c("cc","ps")`` return predictions that agree to 0.0 (bit-for-bit), while
+Observed: on the same data, ``bs=c("cyclic","cyclic")``, ``bs=c("ps","ps")`` and
+``bs=c("cyclic","ps")`` return predictions that agree to 0.0 (bit-for-bit), while
 they each differ from the bare ``te(x, z)`` default by ~2e-2. So the engine does
 *something* with the presence of a ``bs=`` option, but the per-margin **vector**
 content is thrown away: every spelling collapses to the same single basis on
@@ -25,7 +25,7 @@ resolution) does not translate each margin's basis token into that margin's
 basis/periodicity, so the per-axis spec is dropped.
 
 Expected: at minimum, specifying different per-margin bases yields different
-fitted surfaces. Concretely, ``bs=c("cc","cc")`` (both cyclic) must differ
+fitted surfaces. Concretely, ``bs=c("cyclic","cyclic")`` (both cyclic) must differ
 materially from ``bs=c("ps","ps")`` (neither cyclic) on data with a real signal.
 """
 
@@ -58,14 +58,14 @@ def _fit_predict(spec: str, seed: int):
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_tensor_per_margin_bs_vector_changes_fit(seed: int) -> None:
-    both_cyclic = _fit_predict('te(x, z, bs=c("cc","cc"))', seed)
+    both_cyclic = _fit_predict('te(x, z, bs=c("cyclic","cyclic"))', seed)
     neither_cyclic = _fit_predict('te(x, z, bs=c("ps","ps"))', seed)
 
     diff = float(np.max(np.abs(both_cyclic - neither_cyclic)))
     # Two genuinely different per-margin basis specs must not produce the
     # bit-identical surface. Today diff == 0.0 (the bs=c(...) vector is dropped).
     assert diff > 1e-6, (
-        f"seed {seed}: te(..., bs=c('cc','cc')) and te(..., bs=c('ps','ps')) "
+        f"seed {seed}: te(..., bs=c('cyclic','cyclic')) and te(..., bs=c('ps','ps')) "
         f"produced indistinguishable fits (max prediction diff {diff:.3e}); the "
         "per-margin bs=c(...) vector is being discarded."
     )
