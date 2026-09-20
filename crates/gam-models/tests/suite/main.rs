@@ -24,6 +24,7 @@ mod multinomial_predictive_ratio_2612;
 mod multinomial_separation_arming_2612;
 mod negbin_theta_joint_certificate_3349;
 mod null_rail_outer_certify;
+mod poisson_chicago_like_refinement_3425;
 mod production_row_program_policy;
 mod standard_reml_outer_search_2817;
 mod two_level_label_response_and_row_floor;
