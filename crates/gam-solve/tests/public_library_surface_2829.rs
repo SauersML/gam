@@ -2,8 +2,8 @@
 //! linking. Public generic exports are product roots even without binary symbols.
 
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam_solve::estimate::reml::jeffreys_subspace::under_identified_subspace_in_metric;
 use gam_solve::estimate::{FitOptions, fit_gam_with_penalty_specs};
+use gam_solve::estimate::reml::jeffreys_subspace::under_identified_subspace_in_metric;
 use ndarray::{Array1, array};
 
 #[test]

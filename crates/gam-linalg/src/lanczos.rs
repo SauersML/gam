@@ -439,7 +439,8 @@ pub fn symmetric_extreme_lanczos_eigenpairs(
                     && completed_index.is_multiple_of(options.check_every)));
         if checkpoint {
             let (values, vectors) = tridiagonal_eigenpairs(&alphas, &betas)?;
-            let selected_indices = mgcv_largest_magnitude_indices(&values, options.target_rank);
+            let selected_indices =
+                mgcv_largest_magnitude_indices(&values, options.target_rank);
             let residual_scale = if exhausted { 0.0 } else { beta };
             let selected_operator_scale = selected_indices
                 .iter()

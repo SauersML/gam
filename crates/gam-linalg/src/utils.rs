@@ -59,8 +59,7 @@ pub const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// (largest-admissible, hence smoothest) value gives `τ₀ = floor/ln2 ≈ 1.443e-8`,
 /// so the absolute perturbation is `P·floor` — exactly the deflation floor
 /// relative to the operator's own curvature scale.
-pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 =
-    SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
+pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 = SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
 
 /// Homogeneity-preserving smooth replacement for `prefactor · max(x, 0)` on a
 /// dimensionless `x` (`prefactor ≥ 0`), at the temperature
@@ -1389,6 +1388,7 @@ impl RankCertifiedPsdPseudoinverse {
     pub fn into_pseudoinverse(self) -> Array2<f64> {
         self.pseudoinverse
     }
+
 }
 
 /// Compute a declared rank-truncated PSD pseudoinverse from one strict,
@@ -1897,10 +1897,7 @@ mod tests {
 
 #[cfg(test)]
 mod pure_fn_tests {
-    use super::{
-        inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic,
-        stable_softplus,
-    };
+    use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic, stable_softplus};
 
     // -----------------------------------------------------------------------
     // stable_softplus: log(1 + exp(x))
@@ -2065,9 +2062,7 @@ mod certified_log_det_tests {
         let largest = values.iter().copied().fold(0.0_f64, f64::max);
         let dim = matrix.nrows();
         (dim * dim) as f64 * accumulation_growth(3 * dim + 1) * largest / smallest
-            + accumulation_growth(2 * dim)
-                * dim as f64
-                * smallest.ln().abs().max(largest.ln().abs())
+            + accumulation_growth(2 * dim) * dim as f64 * smallest.ln().abs().max(largest.ln().abs())
     }
 
     #[test]

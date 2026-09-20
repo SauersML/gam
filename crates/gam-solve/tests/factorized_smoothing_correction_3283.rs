@@ -93,10 +93,7 @@ fn factorized_fit_publishes_the_smoothing_correction_the_dense_fit_publishes_328
         .covariance_corrected
         .as_ref()
         .expect("at full budget the fit publishes its dense corrected covariance");
-    let dense_inference = dense
-        .inference
-        .as_ref()
-        .expect("the dense fit publishes inference");
+    let dense_inference = dense.inference.as_ref().expect("the dense fit publishes inference");
     let dense_correction = dense_inference
         .smoothing_correction
         .as_ref()
@@ -132,15 +129,12 @@ fn factorized_fit_publishes_the_smoothing_correction_the_dense_fit_publishes_328
         inference.smoothing_correction_absence, None,
         "the factorized fit carries its correction, so it records no absence"
     );
-    let published = inference
-        .smoothing_correction_factorized
-        .as_ref()
-        .unwrap_or_else(|| {
-            panic!(
-                "the factorized fit publishes its smoothing correction; it recorded {:?}",
-                inference.smoothing_correction_absence
-            )
-        });
+    let published = inference.smoothing_correction_factorized.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the factorized fit publishes its smoothing correction; it recorded {:?}",
+            inference.smoothing_correction_absence
+        )
+    });
     assert!(
         matches!(
             inference.smoothing_correction_method,
@@ -159,16 +153,8 @@ fn factorized_fit_publishes_the_smoothing_correction_the_dense_fit_publishes_328
     // The comparison below reads the inference branch alone only if both fits
     // reached the same optimum.
     assert_eq!(
-        factorized
-            .log_lambdas
-            .iter()
-            .map(|v| v.to_bits())
-            .collect::<Vec<_>>(),
-        dense
-            .log_lambdas
-            .iter()
-            .map(|v| v.to_bits())
-            .collect::<Vec<_>>(),
+        factorized.log_lambdas.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        dense.log_lambdas.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         "both fits must reach the same smoothing parameters: dense {:?}, factorized {:?}",
         dense.log_lambdas,
         factorized.log_lambdas

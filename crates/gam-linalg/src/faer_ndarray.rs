@@ -443,12 +443,7 @@ pub enum FaerLinalgError {
     #[error(
         "General eigendecomposition certificate refused: {arm} at slot {slot} measured {measured:.3e} against band {band:.3e}"
     )]
-    GeneralEigenCertificateRefused {
-        arm: &'static str,
-        slot: usize,
-        measured: f64,
-        band: f64,
-    },
+    GeneralEigenCertificateRefused { arm: &'static str, slot: usize, measured: f64, band: f64 },
     #[error("Cholesky factorization failed: {0:?}")]
     Cholesky(solvers::LltError),
     #[error("LDLT factorization failed: {0:?}")]
@@ -849,15 +844,13 @@ fn householder_qr(a: MatRef<'_, f64>) -> (Mat<f64>, Mat<f64>, Mat<f64>) {
     let exponent = scale_for_householder(qr.as_mut());
     let block_size = faer::linalg::qr::no_pivoting::factor::recommended_block_size::<f64>(m, n);
     let mut coeff = Mat::<f64>::zeros(block_size, size);
-    let mut mem = MemBuffer::new(
-        faer::linalg::qr::no_pivoting::factor::qr_in_place_scratch::<f64>(
-            m,
-            n,
-            block_size,
-            par,
-            Default::default(),
-        ),
-    );
+    let mut mem = MemBuffer::new(faer::linalg::qr::no_pivoting::factor::qr_in_place_scratch::<f64>(
+        m,
+        n,
+        block_size,
+        par,
+        Default::default(),
+    ));
     faer::linalg::qr::no_pivoting::factor::qr_in_place(
         qr.as_mut(),
         coeff.as_mut(),
@@ -893,11 +886,7 @@ fn split_householder(qr: MatRef<'_, f64>) -> (Mat<f64>, Mat<f64>) {
 
 /// Apply the reflector sequence `Q` of a Householder factorization to `target`
 /// from the left at [`decomposition_parallelism`].
-fn apply_householder_on_the_left(
-    basis: MatRef<'_, f64>,
-    coeff: MatRef<'_, f64>,
-    target: MatMut<'_, f64>,
-) {
+fn apply_householder_on_the_left(basis: MatRef<'_, f64>, coeff: MatRef<'_, f64>, target: MatMut<'_, f64>) {
     let columns = target.ncols();
     faer::linalg::householder::apply_block_householder_sequence_on_the_left_in_place_with_conj(
         basis,
@@ -1236,11 +1225,7 @@ fn row_block_contraction(
 
     let k = lhs.nrows();
     let (m, n) = (lhs.ncols(), rhs.ncols());
-    assert_eq!(
-        rhs.nrows(),
-        k,
-        "row-block contraction operands must share rows"
-    );
+    assert_eq!(rhs.nrows(), k, "row-block contraction operands must share rows");
     assert_eq!(out.dim(), (m, n), "row-block contraction output shape");
     if let Some(w) = weights {
         assert_eq!(w.len(), k, "row-block contraction weights must match rows");
@@ -1861,11 +1846,7 @@ fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mu
 #[inline(always)]
 fn atv_block_accumulate_body(rows: &[f64], v: &[f64], acc: &mut [f64]) {
     let p = acc.len();
-    assert_eq!(
-        rows.len(),
-        v.len() * p,
-        "atv_block_accumulate: block length"
-    );
+    assert_eq!(rows.len(), v.len() * p, "atv_block_accumulate: block length");
     for (&vi, row) in v.iter().zip(rows.chunks_exact(p)) {
         for (a, &xij) in acc.iter_mut().zip(row.iter()) {
             *a = xij.mul_add(vi, *a);
@@ -3249,10 +3230,7 @@ pub trait FaerEigh {
 
 /// Self-adjoint eigendecomposition `A = U diag(S) Uᵀ` of the triangle `side`
 /// names, at [`evd_parallelism`].
-pub fn self_adjoint_evd(
-    a: MatRef<'_, f64>,
-    side: Side,
-) -> Result<(Diag<f64>, Mat<f64>), solvers::EvdError> {
+pub fn self_adjoint_evd(a: MatRef<'_, f64>, side: Side) -> Result<(Diag<f64>, Mat<f64>), solvers::EvdError> {
     let n = a.nrows();
     let par = evd_parallelism();
     let lower = match side {
@@ -3379,38 +3357,16 @@ fn general_eigenpair_backward_errors(
     let (frobenius_sq, _, _) = frobenius_trace_and_diagonal_mass(a);
     let frobenius = frobenius_sq.sqrt();
     let mut av = Mat::<f64>::zeros(n, n);
-    faer::linalg::matmul::matmul(
-        av.as_mut(),
-        faer::Accum::Replace,
-        a,
-        vectors,
-        1.0,
-        pool_parallelism(),
-    );
-    let column_sq = |j: usize| {
-        (0..n)
-            .map(|k| vectors[(k, j)] * vectors[(k, j)])
-            .sum::<f64>()
-    };
-    let relative = |residual: f64, scale: f64| {
-        if residual == 0.0 {
-            0.0
-        } else {
-            residual / scale
-        }
-    };
+    faer::linalg::matmul::matmul(av.as_mut(), faer::Accum::Replace, a, vectors, 1.0, pool_parallelism());
+    let column_sq = |j: usize| (0..n).map(|k| vectors[(k, j)] * vectors[(k, j)]).sum::<f64>();
+    let relative = |residual: f64, scale: f64| if residual == 0.0 { 0.0 } else { residual / scale };
     let mut errors = Array1::<f64>::zeros(n);
     let mut i = 0;
     while i < n {
         if im[i] == 0.0 {
             let lambda = re[i];
-            let residual_sq: f64 = (0..n)
-                .map(|k| (av[(k, i)] - lambda * vectors[(k, i)]).powi(2))
-                .sum();
-            errors[i] = relative(
-                residual_sq.sqrt(),
-                (frobenius + lambda.abs()) * column_sq(i).sqrt(),
-            );
+            let residual_sq: f64 = (0..n).map(|k| (av[(k, i)] - lambda * vectors[(k, i)]).powi(2)).sum();
+            errors[i] = relative(residual_sq.sqrt(), (frobenius + lambda.abs()) * column_sq(i).sqrt());
             i += 1;
         } else {
             if i + 1 >= n {
@@ -3424,15 +3380,11 @@ fn general_eigenpair_backward_errors(
             let residual_sq: f64 = (0..n)
                 .map(|k| {
                     let (x, y) = (vectors[(k, i)], vectors[(k, i + 1)]);
-                    (av[(k, i)] - real * x + imag * y).powi(2)
-                        + (av[(k, i + 1)] - imag * x - real * y).powi(2)
+                    (av[(k, i)] - real * x + imag * y).powi(2) + (av[(k, i + 1)] - imag * x - real * y).powi(2)
                 })
                 .sum();
             let vector_norm = (column_sq(i) + column_sq(i + 1)).sqrt();
-            let error = relative(
-                residual_sq.sqrt(),
-                (frobenius + real.hypot(imag)) * vector_norm,
-            );
+            let error = relative(residual_sq.sqrt(), (frobenius + real.hypot(imag)) * vector_norm);
             errors[i] = error;
             errors[i + 1] = error;
             i += 2;
@@ -3483,19 +3435,8 @@ fn general_eigenvalue_singular_backward_error(
             par,
             Default::default(),
         ));
-        svd::svd(
-            shifted.as_ref(),
-            s.as_mut(),
-            None,
-            None,
-            par,
-            MemStack::new(&mut mem),
-            Default::default(),
-        )?;
-        (
-            s.as_ref().column_vector()[n - 1],
-            s.as_ref().column_vector()[0],
-        )
+        svd::svd(shifted.as_ref(), s.as_mut(), None, None, par, MemStack::new(&mut mem), Default::default())?;
+        (s.as_ref().column_vector()[n - 1], s.as_ref().column_vector()[0])
     } else {
         let lambda = faer::c64::new(re, im);
         let shifted = Mat::<faer::c64>::from_fn(n, n, |i, j| {
@@ -3511,19 +3452,8 @@ fn general_eigenvalue_singular_backward_error(
             par,
             Default::default(),
         ));
-        svd::svd(
-            shifted.as_ref(),
-            s.as_mut(),
-            None,
-            None,
-            par,
-            MemStack::new(&mut mem),
-            Default::default(),
-        )?;
-        (
-            s.as_ref().column_vector()[n - 1].re,
-            s.as_ref().column_vector()[0].re,
-        )
+        svd::svd(shifted.as_ref(), s.as_mut(), None, None, par, MemStack::new(&mut mem), Default::default())?;
+        (s.as_ref().column_vector()[n - 1].re, s.as_ref().column_vector()[0].re)
     };
     if scale == 0.0 {
         return Ok((0.0, 0.0));
@@ -3531,11 +3461,7 @@ fn general_eigenvalue_singular_backward_error(
     let absolute_band = reduction * frobenius_sq.sqrt()
         + crate::roundoff::factor_singular_band(n, n, sigma_max)
         + crate::roundoff::UNIT_ROUNDOFF * (diagonal_max + magnitude);
-    let relative = if sigma_min == 0.0 {
-        0.0
-    } else {
-        sigma_min / scale
-    };
+    let relative = if sigma_min == 0.0 { 0.0 } else { sigma_min / scale };
     Ok((relative, absolute_band / scale))
 }
 
@@ -3557,11 +3483,7 @@ fn general_spectrum_trace_consistent(a: MatRef<'_, f64>, re: &Array1<f64>, reduc
 /// `(|Σ re − tr A|, band)`. The computed spectrum is exactly that of `A + E` with
 /// `‖E‖_F ≤ η_A·‖A‖_F`, so `Σλ = tr A + tr E` with `|tr E| ≤ √n·‖E‖_F`. Both sums
 /// are charged their accumulation bands.
-fn general_spectrum_trace_measure(
-    a: MatRef<'_, f64>,
-    re: &Array1<f64>,
-    reduction: f64,
-) -> (f64, f64) {
+fn general_spectrum_trace_measure(a: MatRef<'_, f64>, re: &Array1<f64>, reduction: f64) -> (f64, f64) {
     let n = a.nrows();
     let (frobenius_sq, trace, diagonal_mass) = frobenius_trace_and_diagonal_mass(a);
     let sum_re: f64 = re.iter().sum();
@@ -3716,10 +3638,7 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
             re: Array1::from_elem(1, owned[[0, 0]]),
             im: Array1::zeros(1),
             backward_errors: Array1::zeros(1),
-            bands: Array1::from_elem(
-                1,
-                general_eigen_pair_band(1, general_eigen_reduction_band(1)),
-            ),
+            bands: Array1::from_elem(1, general_eigen_pair_band(1, general_eigen_reduction_band(1))),
             sources: vec![EigenvalueBackwardErrorSource::VectorResidual],
         });
     }
@@ -3731,15 +3650,13 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         .map_err(FaerLinalgError::GeneralEigen)?;
     let reduction = general_eigen_reduction_band(n);
     let band = general_eigen_pair_band(n, reduction);
-    let mut backward_errors =
-        general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref()).map_err(
-            |(slot, gap)| FaerLinalgError::GeneralEigenCertificateRefused {
-                arm: "conjugate pairing",
-                slot,
-                measured: gap,
-                band: 0.0,
-            },
-        )?;
+    let mut backward_errors = general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref())
+        .map_err(|(slot, gap)| FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "conjugate pairing",
+            slot,
+            measured: gap,
+            band: 0.0,
+        })?;
     let mut bands = Array1::from_elem(n, band);
     let mut sources = vec![EigenvalueBackwardErrorSource::VectorResidual; n];
     // One SVD per distinct failing eigenvalue. For a real A, σ_min(A − λI) = σ_min(A − λ̄I), so a value and its
@@ -3750,19 +3667,11 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         let width = if im[i] == 0.0 { 1 } else { 2 };
         if !(backward_errors[i] <= band) {
             let key = (re[i], im[i].abs());
-            let (measured, singular_band) = match measured_shifts
-                .iter()
-                .find(|(shift, _)| *shift == key)
-            {
+            let (measured, singular_band) = match measured_shifts.iter().find(|(shift, _)| *shift == key) {
                 Some(&(_, outcome)) => outcome,
                 None => {
                     let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        general_eigenvalue_singular_backward_error(
-                            view.as_ref(),
-                            re[i],
-                            im[i],
-                            reduction,
-                        )
+                        general_eigenvalue_singular_backward_error(view.as_ref(), re[i], im[i], reduction)
                     }))
                     .map_err(|_| FaerLinalgError::FactorizationFailed {
                         context: "general eigenvalue backward-error SVD panic boundary",
@@ -3800,8 +3709,7 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         });
     }
     if !general_spectrum_within_schur_bound(view.as_ref(), &re, &im, reduction) {
-        let (magnitude_sq, schur_bound) =
-            general_spectrum_schur_measure(view.as_ref(), &re, &im, reduction);
+        let (magnitude_sq, schur_bound) = general_spectrum_schur_measure(view.as_ref(), &re, &im, reduction);
         return Err(FaerLinalgError::GeneralEigenCertificateRefused {
             arm: "Schur inequality",
             slot: 0,
@@ -3818,13 +3726,7 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         }
         i += if im[i] == 0.0 { 1 } else { 2 };
     }
-    Ok(CertifiedGeneralSpectrum {
-        re,
-        im,
-        backward_errors,
-        bands,
-        sources,
-    })
+    Ok(CertifiedGeneralSpectrum { re, im, backward_errors, bands, sources })
 }
 
 /// #2627 — the eigenvalues `(re, im)` of [`real_general_spectrum`], for callers
@@ -3836,9 +3738,7 @@ pub fn real_general_eigenvalues<S: Data<Elem = f64>>(
 }
 
 /// faer's real eigendecomposition with right eigenvectors, at [`evd_parallelism`].
-fn general_evd(
-    a: MatRef<'_, f64>,
-) -> Result<(Array1<f64>, Array1<f64>, Mat<f64>), solvers::EvdError> {
+fn general_evd(a: MatRef<'_, f64>) -> Result<(Array1<f64>, Array1<f64>, Mat<f64>), solvers::EvdError> {
     let n = a.nrows();
     let par = evd_parallelism();
     let mut re = Diag::<f64>::zeros(n);
@@ -3861,11 +3761,7 @@ fn general_evd(
         MemStack::new(&mut mem),
         Default::default(),
     )?;
-    Ok((
-        diag_to_array(re.as_ref()),
-        diag_to_array(im.as_ref()),
-        vectors,
-    ))
+    Ok((diag_to_array(re.as_ref()), diag_to_array(im.as_ref()), vectors))
 }
 
 impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
@@ -3886,13 +3782,11 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             // many?" answerable without a second run.
             let eigh_started = std::time::Instant::now();
             let eigh_par = evd_parallelism();
-            let (s, u) = catch_unwind(AssertUnwindSafe(|| {
-                self_adjoint_evd(faerview.as_ref(), side)
-            }))
-            .map_err(|_| FaerLinalgError::FactorizationFailed {
-                context: "self-adjoint eigendecomposition panic boundary",
-            })?
-            .map_err(FaerLinalgError::SelfAdjointEigen)?;
+            let (s, u) = catch_unwind(AssertUnwindSafe(|| self_adjoint_evd(faerview.as_ref(), side)))
+                .map_err(|_| FaerLinalgError::FactorizationFailed {
+                    context: "self-adjoint eigendecomposition panic boundary",
+                })?
+                .map_err(FaerLinalgError::SelfAdjointEigen)?;
             let eigh_elapsed = eigh_started.elapsed();
             let eigh_calls = EIGH_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
             let eigh_nanos_total = EIGH_NANOS
@@ -4473,13 +4367,7 @@ mod tests {
         // above: original column norms are non-increasing in pivot order.
         let norms: Vec<f64> = perm
             .iter()
-            .map(|&j| {
-                a.column(j)
-                    .iter()
-                    .map(|value| value * value)
-                    .sum::<f64>()
-                    .sqrt()
-            })
+            .map(|&j| a.column(j).iter().map(|value| value * value).sum::<f64>().sqrt())
             .collect();
         for window in norms.windows(2) {
             assert!(
@@ -5181,11 +5069,7 @@ mod tests {
                     super::standard_fma_dot_fma_avx2(&a, &b),
                 )
             };
-            assert_eq!(
-                dot_v.to_bits(),
-                super::fma_dot_body(&a, &b).to_bits(),
-                "fma_dot seed={seed}"
-            );
+            assert_eq!(dot_v.to_bits(), super::fma_dot_body(&a, &b).to_bits(), "fma_dot seed={seed}");
             assert_eq!(
                 std_v.to_bits(),
                 super::standard_fma_dot_body(&a, &b).to_bits(),
@@ -5194,9 +5078,7 @@ mod tests {
             // Xᵀv block partial: `len` rows of width 7 (a remainder-bearing
             // width), and the axpy over the same data.
             let p = 7;
-            let rows: Vec<f64> = (0..len * p)
-                .map(|k| a[k % len] * (1.0 + (k % 3) as f64))
-                .collect();
+            let rows: Vec<f64> = (0..len * p).map(|k| a[k % len] * (1.0 + (k % 3) as f64)).collect();
             let mut acc_body = vec![0.0f64; p];
             let mut acc_var = vec![0.0f64; p];
             super::atv_block_accumulate_body(&rows, &b, &mut acc_body);
@@ -5488,12 +5370,7 @@ mod evd_degree_2627_tests {
     use super::*;
 
     fn words(values: &Diag<f64>, vectors: &Mat<f64>) -> Vec<u64> {
-        let mut out: Vec<u64> = values
-            .as_ref()
-            .column_vector()
-            .iter()
-            .map(|v| v.to_bits())
-            .collect();
+        let mut out: Vec<u64> = values.as_ref().column_vector().iter().map(|v| v.to_bits()).collect();
         for j in 0..vectors.ncols() {
             for i in 0..vectors.nrows() {
                 out.push(vectors[(i, j)].to_bits());
@@ -5545,10 +5422,7 @@ mod evd_degree_2627_tests {
             }
         }
         let at_width = |width: usize| {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(width)
-                .build()
-                .expect("pool");
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(width).build().expect("pool");
             pool.install(|| {
                 let (values, vectors) = self_adjoint_evd(a.as_ref(), Side::Lower).expect("EVD");
                 words(&values, &vectors)
@@ -5747,6 +5621,7 @@ mod parallelism_snapshot_2738_tests {
              {unavailable}",
         );
     }
+
 }
 
 #[cfg(test)]
@@ -5863,10 +5738,7 @@ mod eigh_ordering_contract_tests {
         let low = values.iter().filter(|v| (**v - 2.0).abs() < 1.0e-9).count();
         let high = values.iter().filter(|v| (**v - 7.0).abs() < 1.0e-9).count();
         assert_eq!(low, 3, "planted multiplicity 3 at lambda=2, got {values:?}");
-        assert_eq!(
-            high, 2,
-            "planted multiplicity 2 at lambda=7, got {values:?}"
-        );
+        assert_eq!(high, 2, "planted multiplicity 2 at lambda=7, got {values:?}");
         for w in 0..3 {
             assert!(
                 (values[w] - 2.0).abs() < 1.0e-9,
@@ -5889,9 +5761,7 @@ mod general_eigenvalues_2627_tests {
     use crate::roundoff::accumulation_growth;
 
     fn hashed_matrix(n: usize, seed: u64) -> Array2<f64> {
-        let mut state = seed
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(0x2627_6E1A);
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x2627_6E1A);
         Array2::from_shape_fn((n, n), |_| {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -5932,31 +5802,19 @@ mod general_eigenvalues_2627_tests {
         }
         let a = q.dot(&b).dot(&q.t());
         let (re, im) = real_general_eigenvalues(&a).expect("certified spectrum");
-        let band =
-            (general_eigen_reduction_band(n) + accumulation_growth(2 * n + 2)) * frobenius(&a);
-        let mut planted = vec![
-            (r1 * t1.cos(), r1 * t1.sin()),
-            (real, 0.0),
-            (r2 * t2.cos(), r2 * t2.sin()),
-        ];
+        let band = (general_eigen_reduction_band(n) + accumulation_growth(2 * n + 2)) * frobenius(&a);
+        let mut planted = vec![(r1 * t1.cos(), r1 * t1.sin()), (real, 0.0), (r2 * t2.cos(), r2 * t2.sin())];
         let mut i = 0;
         while i < n {
             let found = (re[i], im[i]);
             let position = planted
                 .iter()
                 .position(|&(pr, pi)| (pr - found.0).hypot(pi - found.1) <= band)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "eigenvalue {found:?} is within {band:.3e} of no planted one: {planted:?}"
-                    )
-                });
+                .unwrap_or_else(|| panic!("eigenvalue {found:?} is within {band:.3e} of no planted one: {planted:?}"));
             planted.remove(position);
             i += if im[i] == 0.0 { 1 } else { 2 };
         }
-        assert!(
-            planted.is_empty(),
-            "planted eigenvalues left unrecovered: {planted:?}"
-        );
+        assert!(planted.is_empty(), "planted eigenvalues left unrecovered: {planted:?}");
     }
 
     /// The ordering contract on hashed matrices. A conjugate pair is adjacent,
@@ -5977,34 +5835,16 @@ mod general_eigenvalues_2627_tests {
                         i += 1;
                         continue;
                     }
-                    assert!(
-                        im[i] > 0.0,
-                        "n={n} seed={seed}: the pair at {i} starts with im {}",
-                        im[i]
-                    );
-                    assert!(
-                        i + 1 < n,
-                        "n={n} seed={seed}: a pair member at the last index"
-                    );
-                    assert_eq!(
-                        re[i + 1],
-                        re[i],
-                        "n={n} seed={seed}: the pair at {i} has unequal real parts"
-                    );
-                    assert_eq!(
-                        im[i + 1],
-                        -im[i],
-                        "n={n} seed={seed}: the pair at {i} is not conjugate"
-                    );
+                    assert!(im[i] > 0.0, "n={n} seed={seed}: the pair at {i} starts with im {}", im[i]);
+                    assert!(i + 1 < n, "n={n} seed={seed}: a pair member at the last index");
+                    assert_eq!(re[i + 1], re[i], "n={n} seed={seed}: the pair at {i} has unequal real parts");
+                    assert_eq!(im[i + 1], -im[i], "n={n} seed={seed}: the pair at {i} is not conjugate");
                     pairs += 1;
                     i += 2;
                 }
             }
         }
-        assert!(
-            pairs > 0,
-            "no conjugate pair appeared, so the ordering contract was never exercised"
-        );
+        assert!(pairs > 0, "no conjugate pair appeared, so the ordering contract was never exercised");
     }
 
     /// Non-finite input is refused before faer sees it, never as faer's
@@ -6016,10 +5856,7 @@ mod general_eigenvalues_2627_tests {
             a[[2, 1]] = poison;
             match real_general_eigenvalues(&a) {
                 Err(FaerLinalgError::FactorizationFailed { context }) => {
-                    assert!(
-                        context.contains("non-finite"),
-                        "refused for another reason: {context}"
-                    )
+                    assert!(context.contains("non-finite"), "refused for another reason: {context}")
                 }
                 other => panic!("{poison} input must be refused before faer: {other:?}"),
             }
@@ -6050,17 +5887,8 @@ mod general_eigenvalues_2627_tests {
                 .is_ok_and(|errors| errors.iter().all(|error| *error <= eta))
         };
         assert!(within_band(&re, &im));
-        assert!(general_spectrum_trace_consistent(
-            view.as_ref(),
-            &re,
-            reduction
-        ));
-        assert!(general_spectrum_within_schur_bound(
-            view.as_ref(),
-            &re,
-            &im,
-            reduction
-        ));
+        assert!(general_spectrum_trace_consistent(view.as_ref(), &re, reduction));
+        assert!(general_spectrum_within_schur_bound(view.as_ref(), &re, &im, reduction));
         let scale = frobenius(&a);
 
         let shift = 1.0e6 * eta * (scale + re[0].hypot(im[0]));
@@ -6076,8 +5904,7 @@ mod general_eigenvalues_2627_tests {
         // The fallback must not rescue it: the exact backward error sigma_min(A - lambda I) of the moved
         // eigenvalue is outside its own band too.
         let (measured, singular_band) =
-            general_eigenvalue_singular_backward_error(view.as_ref(), moved[0], im[0], reduction)
-                .expect("SVD");
+            general_eigenvalue_singular_backward_error(view.as_ref(), moved[0], im[0], reduction).expect("SVD");
         assert!(
             measured > singular_band,
             "a moved eigenvalue must fail sigma_min too: measured {measured:.3e} against band {singular_band:.3e}"
@@ -6132,29 +5959,12 @@ mod general_eigenvalues_2627_tests {
         for &n in &[1_usize, 2, 5, 17, 40] {
             let a = hashed_matrix(n, 11);
             let spectrum = real_general_spectrum(&a).expect("certified spectrum");
-            assert_eq!(
-                (
-                    spectrum.backward_errors.len(),
-                    spectrum.bands.len(),
-                    spectrum.sources.len()
-                ),
-                (n, n, n)
-            );
+            assert_eq!((spectrum.backward_errors.len(), spectrum.bands.len(), spectrum.sources.len()), (n, n, n));
             for k in 0..n {
                 let (error, band) = (spectrum.backward_errors[k], spectrum.bands[k]);
-                assert!(
-                    band.is_finite() && band > 0.0,
-                    "n={n}: slot {k} band {band}"
-                );
-                assert!(
-                    error.is_finite() && error <= band,
-                    "n={n}: slot {k} backward error {error:e} against band {band:e}"
-                );
-                assert_eq!(
-                    spectrum.sources[k],
-                    EigenvalueBackwardErrorSource::VectorResidual,
-                    "n={n}: slot {k}"
-                );
+                assert!(band.is_finite() && band > 0.0, "n={n}: slot {k} band {band}");
+                assert!(error.is_finite() && error <= band, "n={n}: slot {k} backward error {error:e} against band {band:e}");
+                assert_eq!(spectrum.sources[k], EigenvalueBackwardErrorSource::VectorResidual, "n={n}: slot {k}");
             }
             let mut i = 0;
             while i < n {
@@ -6163,29 +5973,15 @@ mod general_eigenvalues_2627_tests {
                     continue;
                 }
                 assert_eq!(
-                    (
-                        spectrum.backward_errors[i],
-                        spectrum.bands[i],
-                        spectrum.sources[i]
-                    ),
-                    (
-                        spectrum.backward_errors[i + 1],
-                        spectrum.bands[i + 1],
-                        spectrum.sources[i + 1]
-                    ),
+                    (spectrum.backward_errors[i], spectrum.bands[i], spectrum.sources[i]),
+                    (spectrum.backward_errors[i + 1], spectrum.bands[i + 1], spectrum.sources[i + 1]),
                     "n={n}: the pair at {i} carries two different measurements"
                 );
                 i += 2;
             }
             let (re, im) = real_general_eigenvalues(&a).expect("certified spectrum");
-            assert_eq!(
-                re, spectrum.re,
-                "n={n}: the convenience returns other real parts"
-            );
-            assert_eq!(
-                im, spectrum.im,
-                "n={n}: the convenience returns other imaginary parts"
-            );
+            assert_eq!(re, spectrum.re, "n={n}: the convenience returns other real parts");
+            assert_eq!(im, spectrum.im, "n={n}: the convenience returns other imaginary parts");
         }
     }
 
@@ -6215,11 +6011,7 @@ mod general_eigenvalues_2627_tests {
             }
         }
         let mut b = Array2::<f64>::zeros((n, n));
-        for (o, re, im) in [
-            (0_usize, 0.5_f64, 0.75_f64),
-            (2, 0.5, 0.75),
-            (6, -0.625, 0.25),
-        ] {
+        for (o, re, im) in [(0_usize, 0.5_f64, 0.75_f64), (2, 0.5, 0.75), (6, -0.625, 0.25)] {
             b[[o, o]] = re;
             b[[o, o + 1]] = -im;
             b[[o + 1, o]] = im;
@@ -6227,11 +6019,7 @@ mod general_eigenvalues_2627_tests {
         }
         b[[4, 4]] = 2.0;
         b[[5, 5]] = -1.0;
-        assert_eq!(
-            g.dot(&g_inverse),
-            Array2::<f64>::eye(n),
-            "G⁻¹ must be exact"
-        );
+        assert_eq!(g.dot(&g_inverse), Array2::<f64>::eye(n), "G⁻¹ must be exact");
         let t = g.dot(&b).dot(&g_inverse);
         assert_eq!(t.dot(&g), g.dot(&b), "T·G = G·B must hold bitwise");
         (t, g)
@@ -6251,23 +6039,16 @@ mod general_eigenvalues_2627_tests {
         let view = FaerArrayView::new(&t);
         let (re, im, vectors) = general_evd(view.as_ref()).expect("faer eigendecomposition");
         let vector_band = general_eigen_pair_band(n, general_eigen_reduction_band(n));
-        let vector_errors =
-            general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref())
-                .expect("pairing");
+        let vector_errors = general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref()).expect("pairing");
         assert!(
             vector_errors.iter().any(|error| *error > vector_band),
             "the fixture must defeat faer's eigenvector residual, or this pin does not reach sigma_min: {vector_errors:?}"
         );
 
         let spectrum = real_general_spectrum(&t).expect("a semisimple repeated pair certifies");
-        let singular: Vec<usize> = (0..n)
-            .filter(|&k| spectrum.sources[k] == EigenvalueBackwardErrorSource::SingularValue)
-            .collect();
-        assert!(
-            !singular.is_empty(),
-            "no slot was certified by sigma_min: {:?}",
-            spectrum.sources
-        );
+        let singular: Vec<usize> =
+            (0..n).filter(|&k| spectrum.sources[k] == EigenvalueBackwardErrorSource::SingularValue).collect();
+        assert!(!singular.is_empty(), "no slot was certified by sigma_min: {:?}", spectrum.sources);
         for k in 0..n {
             assert!(
                 spectrum.backward_errors[k] <= spectrum.bands[k],
@@ -6279,16 +6060,9 @@ mod general_eigenvalues_2627_tests {
         }
 
         let (_, g_singular, _) = g.svd(false, false).expect("G's singular values");
-        let condition = g_singular.iter().fold(0.0_f64, |m, s| m.max(*s))
-            / g_singular.iter().fold(f64::INFINITY, |m, s| m.min(*s));
+        let condition = g_singular.iter().fold(0.0_f64, |m, s| m.max(*s)) / g_singular.iter().fold(f64::INFINITY, |m, s| m.min(*s));
         let scale = frobenius(&t);
-        let mut planted = vec![
-            (0.5, 0.75),
-            (0.5, 0.75),
-            (2.0, 0.0),
-            (-1.0, 0.0),
-            (-0.625, 0.25),
-        ];
+        let mut planted = vec![(0.5, 0.75), (0.5, 0.75), (2.0, 0.0), (-1.0, 0.0), (-0.625, 0.25)];
         let mut i = 0;
         while i < n {
             let found = (spectrum.re[i], spectrum.im[i]);
@@ -6296,18 +6070,11 @@ mod general_eigenvalues_2627_tests {
             let position = planted
                 .iter()
                 .position(|&(pr, pi)| (pr - found.0).hypot(pi - found.1) <= bar)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "eigenvalue {found:?} is within {bar:.3e} of no planted one: {planted:?}"
-                    )
-                });
+                .unwrap_or_else(|| panic!("eigenvalue {found:?} is within {bar:.3e} of no planted one: {planted:?}"));
             planted.remove(position);
             i += if spectrum.im[i] == 0.0 { 1 } else { 2 };
         }
-        assert!(
-            planted.is_empty(),
-            "planted eigenvalues left unrecovered: {planted:?}"
-        );
+        assert!(planted.is_empty(), "planted eigenvalues left unrecovered: {planted:?}");
     }
 
     /// Jordan blocks certify. A 4×4 Jordan block, and the same block with 1e-12 added
@@ -6328,13 +6095,9 @@ mod general_eigenvalues_2627_tests {
         let mut perturbed = jordan.clone();
         perturbed[[3, 0]] = 1.0e-12;
         for (label, a) in [("jordan", &jordan), ("perturbed jordan", &perturbed)] {
-            let spectrum =
-                real_general_spectrum(a).unwrap_or_else(|error| panic!("{label}: {error}"));
+            let spectrum = real_general_spectrum(a).unwrap_or_else(|error| panic!("{label}: {error}"));
             for k in 0..4 {
-                assert!(
-                    spectrum.backward_errors[k] <= spectrum.bands[k],
-                    "{label}: slot {k}"
-                );
+                assert!(spectrum.backward_errors[k] <= spectrum.bands[k], "{label}: slot {k}");
             }
         }
         let refusal = FaerLinalgError::GeneralEigenCertificateRefused {
@@ -6344,10 +6107,7 @@ mod general_eigenvalues_2627_tests {
             band: 4.7e-12,
         };
         let text = refusal.to_string();
-        assert!(
-            text.contains("sigma_min") && text.contains("slot 2"),
-            "the refusal names its arm and slot: {text}"
-        );
+        assert!(text.contains("sigma_min") && text.contains("slot 2"), "the refusal names its arm and slot: {text}");
     }
 }
 
@@ -6362,24 +6122,13 @@ mod lblt_inertia_2901_tests {
     fn the_bunch_kaufman_inertia_counts_each_pivot_block_by_its_eigenvalues_2901() {
         let swap = Mat::<f64>::from_fn(2, 2, |i, j| if i == j { 0.0 } else { 1.0 });
         let inertia = FaerLblt::new(swap.as_ref(), Side::Lower).inertia();
-        assert_eq!(
-            (inertia.negative, inertia.zero, inertia.positive),
-            (1, 0, 1),
-            "{inertia:?}"
-        );
-        assert!(
-            (inertia.smallest_pivot + 1.0).abs() <= 4.0 * f64::EPSILON,
-            "{inertia:?}"
-        );
+        assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 0, 1), "{inertia:?}");
+        assert!((inertia.smallest_pivot + 1.0).abs() <= 4.0 * f64::EPSILON, "{inertia:?}");
 
         let diagonal = [3.0, -2.0, 0.0];
         let mixed = Mat::<f64>::from_fn(3, 3, |i, j| if i == j { diagonal[i] } else { 0.0 });
         let inertia = FaerLblt::new(mixed.as_ref(), Side::Lower).inertia();
-        assert_eq!(
-            (inertia.negative, inertia.zero, inertia.positive),
-            (1, 1, 1),
-            "{inertia:?}"
-        );
+        assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 1, 1), "{inertia:?}");
         assert_eq!(inertia.smallest_pivot, -2.0, "{inertia:?}");
     }
 }
@@ -6610,9 +6359,7 @@ mod householder_scaling_tests {
         let small_accumulator_is_subnormal =
             |x: f64| x != 0.0 && (x * f64::MIN_POSITIVE.sqrt()).powi(2) < f64::MIN_POSITIVE;
         assert!(
-            a.col_iter().all(|col| col
-                .iter()
-                .all(|&x| x == 0.0 || small_accumulator_is_subnormal(x))),
+            a.col_iter().all(|col| col.iter().all(|&x| x == 0.0 || small_accumulator_is_subnormal(x))),
             "the fixture must reproduce the subnormal accumulator it pins"
         );
         let mut reference = a.to_owned();
@@ -6621,9 +6368,9 @@ mod householder_scaling_tests {
         let largest = reference.norm_max();
         assert_eq!(binary_exponent(largest), target);
         assert!(
-            reference.col_iter().all(|col| col
-                .iter()
-                .any(|&x| x != 0.0 && !small_accumulator_is_subnormal(x))),
+            reference
+                .col_iter()
+                .all(|col| col.iter().any(|&x| x != 0.0 && !small_accumulator_is_subnormal(x))),
             "every column must reach the normal accumulator range once scaled"
         );
         for k in [-600, -40, -3, 3, 40, 600, 900] {
@@ -6631,10 +6378,7 @@ mod householder_scaling_tests {
             scale_by_power_of_two(scaled.as_mut(), k);
             let exponent = scale_for_householder(scaled.as_mut());
             assert_eq!(exponent + k, reference_exponent, "exponent at 2^{k}");
-            assert!(
-                words(scaled.as_ref()) == words(reference.as_ref()),
-                "words at 2^{k}"
-            );
+            assert!(words(scaled.as_ref()) == words(reference.as_ref()), "words at 2^{k}");
         }
         for mut degenerate in [Mat::<f64>::zeros(4, 3), Mat::<f64>::full(4, 3, f64::NAN)] {
             assert_eq!(scale_for_householder(degenerate.as_mut()), 0);
@@ -6653,11 +6397,7 @@ mod householder_scaling_tests {
             .as_mut()
             .submatrix_mut(0, 0, a.ncols(), a.ncols())
             .copy_from(base.r());
-        apply_householder_on_the_left(
-            base.basis.as_ref(),
-            base.coeff.as_ref(),
-            reconstruction.as_mut(),
-        );
+        apply_householder_on_the_left(base.basis.as_ref(), base.coeff.as_ref(), reconstruction.as_mut());
         let residual = (&reconstruction - &a).norm_max();
         assert!(
             residual <= 64.0 * f64::EPSILON * a.norm_l2(),

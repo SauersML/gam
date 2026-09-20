@@ -559,14 +559,8 @@ mod tests {
             .expect("no error")
             .expect("n > 0");
             assert_eq!(sequential, owner, "pairwise_reduce trace at n={n}");
-            assert_eq!(
-                block_fold, owner,
-                "par_deterministic_block_fold trace at n={n}"
-            );
-            assert_eq!(
-                try_block_fold, owner,
-                "par_deterministic_try_block_fold trace at n={n}"
-            );
+            assert_eq!(block_fold, owner, "par_deterministic_block_fold trace at n={n}");
+            assert_eq!(try_block_fold, owner, "par_deterministic_try_block_fold trace at n={n}");
         }
     }
 
@@ -704,10 +698,7 @@ mod tests {
         assert_eq!(leaf_indices_for_work(BASE_CHUNK), 1);
         assert_eq!(leaf_indices_for_work(8192), 1);
         assert_eq!(left_split_over_leaves(33, 2), 32);
-        assert_eq!(
-            left_split_over_leaves(BASE_CHUNK + 1, BASE_CHUNK),
-            left_split(BASE_CHUNK + 1)
-        );
+        assert_eq!(left_split_over_leaves(BASE_CHUNK + 1, BASE_CHUNK), left_split(BASE_CHUNK + 1));
     }
 
     /// The by-work fold at one row per index builds the unweighted fold's tree, so every
@@ -716,9 +707,7 @@ mod tests {
     fn the_by_work_fold_at_one_row_per_index_is_the_unweighted_fold_979() {
         let n = 5 * BASE_CHUNK + 7;
         let base = |range: core::ops::Range<usize>| -> f64 {
-            range
-                .map(|i| ((i as f64) * 0.317).sin() / (1.0 + i as f64))
-                .sum()
+            range.map(|i| ((i as f64) * 0.317).sin() / (1.0 + i as f64)).sum()
         };
         let unweighted = par_deterministic_block_fold(n, base, |a, b| a + b).expect("n > 0");
         let by_work =
@@ -774,10 +763,7 @@ mod tests {
             (value, base_calls.load(Ordering::Relaxed))
         };
         let (_, unweighted_calls) = run(1);
-        assert_eq!(
-            unweighted_calls, 1,
-            "32 indices at one row each fit one leaf"
-        );
+        assert_eq!(unweighted_calls, 1, "32 indices at one row each fit one leaf");
         let (reference, coarse_calls) = run(rows_per_index);
         assert_eq!(
             coarse_calls,

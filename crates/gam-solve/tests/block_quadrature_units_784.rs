@@ -97,8 +97,7 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
                 plus[axis] = z / curvatures[axis].sqrt();
                 let minus = plus.mapv(|value| -value);
                 let q = (target.excess(&plus) + target.excess(&minus)) / (z * z);
-                let band = (target.excess_rounding_band(&plus)
-                    + target.excess_rounding_band(&minus))
+                let band = (target.excess_rounding_band(&plus) + target.excess_rounding_band(&minus))
                     / (z * z);
                 (q, band)
             };
@@ -148,9 +147,7 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
     /// order search never raises one, and a published step means it did.
     fn publish_order_search_step(&self, step: &BlockQuadratureOrderStep) {
         assert!(
-            step.axis_quadrature_errors
-                .iter()
-                .all(|&error| error == 0.0),
+            step.axis_quadrature_errors.iter().all(|&error| error == 0.0),
             "the probe resolves every axis at its first rule, so no axis is raised: {step}"
         );
     }
@@ -209,16 +206,11 @@ fn gamma_fixture(n: usize, k: usize) -> (Array1<f64>, Array2<f64>, Vec<Blockwise
 
 #[test]
 fn block_quadrature_remainder_has_no_quadratic_term_at_the_mode_784() {
-    drop(set_laplace_marginal_corrector(Box::new(
-        QuadraticCoefficientProbe,
-    )));
+    drop(set_laplace_marginal_corrector(Box::new(QuadraticCoefficientProbe)));
     let (y, x, penalties) = gamma_fixture(240, 8);
     let n = y.len();
     let opts = ExternalOptimOptions {
-        family: LikelihoodSpec::new(
-            ResponseFamily::Gamma,
-            InverseLink::Standard(StandardLink::Log),
-        ),
+        family: LikelihoodSpec::new(ResponseFamily::Gamma, InverseLink::Standard(StandardLink::Log)),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,

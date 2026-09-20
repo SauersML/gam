@@ -1,6 +1,6 @@
 use faer::Side;
 use faer::sparse::{SparseColMat, SymbolicSparseColMat};
-use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, strict_symmetric_eigh};
+use gam_linalg::faer_ndarray::{fast_ata, strict_symmetric_eigh, FaerCholesky};
 use gam_linalg::matrix::{FactorizedSystem, SymmetricMatrix};
 use gam_linalg::roundoff::accumulation_growth;
 use gam_linalg::sparse_exact::{factorize_sparse_spd_strict, logdet_from_factor, solve_sparse_spd};

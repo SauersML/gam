@@ -54,15 +54,9 @@ fn pareto_smooth_weights_fits_a_clean_light_tail() {
     let out = pareto_smooth_weights(&w)
         .expect("a clean, well-conditioned light tail must fit (returned None: #1655)");
     let WeightTailShape::Pareto(k_hat) = out.shape else {
-        panic!(
-            "a light tail with distinct excesses must be fitted, got {:?}",
-            out.shape
-        );
+        panic!("a light tail with distinct excesses must be fitted, got {:?}", out.shape);
     };
-    assert!(
-        k_hat.is_finite(),
-        "k_hat must be finite for a light tail, got {k_hat}"
-    );
+    assert!(k_hat.is_finite(), "k_hat must be finite for a light tail, got {k_hat}");
     assert!(
         k_hat < 0.5,
         "a bounded light tail must NOT be flagged heavy; got k_hat={k_hat}"
