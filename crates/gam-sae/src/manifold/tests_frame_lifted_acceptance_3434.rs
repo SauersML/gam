@@ -10,7 +10,6 @@
 //! lifted chart certifies, with no resolved negative lifted curvature.
 use super::tests_fitted_response_edf_2933::{ROOT_GRADIENT_CEILING, polish_to_root, root_norm};
 use super::tests_fitted_response_frames_2933::framed_circle_in;
-use super::*;
 use ndarray::Array2;
 
 /// The normal velocity the control turns the frame by, toward a data-free output
