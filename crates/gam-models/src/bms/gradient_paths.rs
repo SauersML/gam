@@ -1362,11 +1362,13 @@ impl MarginalSlopeCovariance {
         // an EXACT zero therefore refuses honest collinear scores whenever
         // roundoff happens to fall on the negative side — a host- and
         // BLAS-dependent refusal of a valid covariance, not a geometry defect.
-        // Decide against the eigensolver's own band instead, in the established
-        // dimension-scaled form `128·k·ε·max|λ̂|` that
-        // `gam_linalg::utils::rank_certified_psd_pseudoinverse` already uses for
-        // exactly this question. Material indefiniteness outside the band is
-        // still an error.
+        // Decide against the eigensolver's own band instead, in the
+        // dimension-scaled form `128·k·ε·max|λ̂|`. The coefficient is not the
+        // owner band `gam_linalg::roundoff::symmetric_spectrum_rounding_band`
+        // (`k·ε·max|λ̂|`), which `rank_certified_psd_pseudoinverse` now reads;
+        // it is kept here only because `conditional_score_covariance` floors its
+        // innovation at the same number (#4000). Material
+        // indefiniteness outside the band is still an error.
         let spectral_magnitude = eigenvalues
             .iter()
             .fold(0.0_f64, |magnitude, &value| magnitude.max(value.abs()));

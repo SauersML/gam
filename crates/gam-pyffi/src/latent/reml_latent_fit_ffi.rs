@@ -48,12 +48,17 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
             }
             exc
         }
-        SaeFitError::OuterDidNotConverge { stage, result } => {
+        SaeFitError::OuterDidNotConverge {
+            stage,
+            result,
+            certification_refusal,
+        } => {
             let exc = RemlConvergenceError::new_err(message);
             let bound = exc.value(py);
             let attach_result: PyResult<()> = (|| {
                 bound.setattr("stage", stage.to_string())?;
                 bound.setattr("converged", false)?;
+                bound.setattr("certification_refusal", certification_refusal.as_deref())?;
                 bound.setattr("rho_checkpoint", result.rho.clone().into_pyarray(py))?;
                 bound.setattr("final_value", result.final_value)?;
                 bound.setattr("iterations", result.iterations)?;
@@ -3378,22 +3383,6 @@ fn posterior_draw_bands(
 }
 
 #[pyfunction]
-#[pyo3(signature = (eta, family_kind, level, link_spec=None))]
-fn posterior_eta_bands(
-    py: Python<'_>,
-    eta: PyReadonlyArray2<'_, f64>,
-    family_kind: String,
-    level: f64,
-    link_spec: Option<String>,
-) -> PyResult<Py<PyDict>> {
-    let eta = owned_row_major_f64(eta.as_array());
-    let payload = detach_py_result(py, "posterior_eta_bands", move || {
-        posterior_eta_bands_impl(eta, &family_kind, level, link_spec.as_deref())
-    })?;
-    posterior_bands_payload_to_py(py, payload)
-}
-
-#[pyfunction]
 fn posterior_credible_interval(
     py: Python<'_>,
     samples: PyReadonlyArray2<'_, f64>,
@@ -3760,7 +3749,12 @@ fn model_debiased_functional_dataset_json_impl(
     // offset in THIS layout. The `point`/`contrast` query design must be built
     // against the same full layout, not just the columns named in `x0` (#1621).
     let training_headers = dataset.headers.clone();
-    let fit_config = parse_fit_config(None)?;
+    // Replay the fit's own weight and offset columns. A default config
+    // materialized unit weights and a zero offset whatever the model was fit
+    // with, so `standard.weights` (the score weights and the Gram fallback's
+    // `W`) and `standard.offset` (the residual's `η`) described a different
+    // model than the saved `H` and `β` (#3542).
+    let fit_config = postfit_standard_materialization_config(model)?;
     let materialized = materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
     let standard = match materialized.request {
         FitRequest::Standard(req) => req,
@@ -3853,11 +3847,19 @@ fn model_debiased_functional_dataset_json_impl(
     let s_lambda = &*h - xwx;
     let penalty_beta = s_lambda.dot(&beta);
 
-    // Per-row score contributions ∂nll_i/∂β.
-    // For a Gaussian identity model: ∂nll_i/∂β = x_i · (η_i − y_i).
+    // Per-row score contributions of the objective `H` is the Hessian of.
+    // For a Gaussian identity model that objective is
+    // `½ Σ_i w_i (y_i − η_i)² + ½ βᵀS(λ)β` with `w` the PRIOR weights — the same
+    // `W` in `H = XᵀWX + S(λ)` above — so `s_i = w_i · x_i · (η_i − y_i)`.
+    // Dropping `w_i` pairs a weighted Hessian with unweighted scores: scaling
+    // every weight by `c` (a pure dispersion change, β̂ unmoved) scaled `H` by
+    // `c` and the influence values `ψ_i = −n sᵢᵀH⁻¹g` by `1/c`, so the reported
+    // SE moved by `1/c`, and non-uniform precision weights got the sandwich
+    // `H⁻¹ Σ x_i x_iᵀ r_i² H⁻¹` instead of `H⁻¹ Σ w_i² x_i x_iᵀ r_i² H⁻¹` (#3542).
     // Other families need their own derivative chain; currently restricted to
     // Gaussian/identity where the score is exact and the debiasing is cleanest.
     let y = standard.y.view();
+    let prior_weights = standard.weights.view();
     let n = x.nrows();
     let p = x.ncols();
     if !is_gaussian_identity {
@@ -3868,16 +3870,23 @@ fn model_debiased_functional_dataset_json_impl(
             family.pretty_name()
         ));
     }
+    if prior_weights.len() != n {
+        return Err(format!(
+            "debiased_functional: prior-weight length {} does not match design rows {n}",
+            prior_weights.len()
+        ));
+    }
     let effective_offset = design_built
         .compose_offset(standard.offset.view(), "debiased functional training design")
         .map_err(|error| error.to_string())?;
     let eta = x.as_ref().dot(&beta) + &effective_offset;
     let mut row_scores = ndarray::Array2::<f64>::zeros((n, p));
     for i in 0..n {
-        let residual = eta[i] - y[i]; // ∂nll_i/∂η = η_i − y_i for Gaussian/identity
+        // ∂/∂η of ½ w_i (y_i − η_i)² for Gaussian/identity.
+        let weighted_residual = prior_weights[i] * (eta[i] - y[i]);
         let x_row = x.row(i);
         for j in 0..p {
-            row_scores[[i, j]] = x_row[j] * residual;
+            row_scores[[i, j]] = x_row[j] * weighted_residual;
         }
     }
 
@@ -3933,15 +3942,29 @@ fn model_debiased_functional_dataset_json_impl(
         }
         "average_derivative" | "average_value" => {
             // Uses the full training design; optional per-row weights from spec.
-            let weights: Option<ndarray::Array1<f64>> = spec_val
-                .get("weights")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .map(|v| v.as_f64().unwrap_or(1.0))
-                        .collect::<Vec<_>>()
-                })
-                .map(ndarray::Array1::from);
+            // A present `"weights"` key must be an array of numbers: a non-array
+            // value or a non-numeric entry is refused rather than read as
+            // "unweighted" or as weight 1.0.
+            let weights: Option<ndarray::Array1<f64>> = match spec_val.get("weights") {
+                None => None,
+                Some(value) => {
+                    let entries = value.as_array().ok_or_else(|| {
+                        "debiased_functional: \"weights\" must be a list of numbers".to_string()
+                    })?;
+                    let parsed = entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, entry)| {
+                            entry.as_f64().ok_or_else(|| {
+                                format!(
+                                    "debiased_functional: \"weights\"[{i}] is not a number: {entry}"
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<f64>, String>>()?;
+                    Some(ndarray::Array1::from(parsed))
+                }
+            };
             let x_ref = x.as_ref();
             if target == "average_value" {
                 let gradient = SmoothFunctional::AverageValue {

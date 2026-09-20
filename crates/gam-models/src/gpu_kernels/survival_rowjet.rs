@@ -226,8 +226,11 @@ __device__ __forceinline__ void rigid_feature_program_pullback4(
 }
 "#;
 
+/// The shared device probit numerics come first so the `neglog_phi` leaf is
+/// the one device copy of the CPU `normal_logcdf_derivatives` contract.
 #[cfg(target_os = "linux")]
 fn survival_rowjet_source() -> &'static str {
+    use gam_gpu::numerics_device::PROBIT_NUMERICS_CU;
     static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SOURCE.get_or_init(|| {
         let (preamble, kernel) = SURVIVAL_ROWJET_TEMPLATE
@@ -238,11 +241,13 @@ fn survival_rowjet_source() -> &'static str {
             "survival rowjet CUDA template must contain exactly one row-program marker",
         );
         let mut source = String::with_capacity(
-            preamble.len()
+            PROBIT_NUMERICS_CU.len()
+                + preamble.len()
                 + RIGID_FEATURE_PROGRAM_CUDA_VGH.len()
                 + RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA.len()
                 + kernel.len(),
         );
+        source.push_str(PROBIT_NUMERICS_CU);
         source.push_str(preamble);
         source.push_str(RIGID_FEATURE_PROGRAM_CUDA_VGH);
         source.push_str(RIGID_FEATURE_PROGRAM_PULLBACK4_CUDA);
@@ -462,6 +467,26 @@ mod tests {
         assert_eq!(source.matches("void rigid_feature_program(").count(), 1);
         assert!(!source.contains(concat!("rigid_row_", "program")));
         assert_eq!(source.matches("extern \"C\" __global__").count(), 1,);
+        // The probability leaves are the shared device numerics, prepended
+        // once, and the template carries no private copy of them.
+        assert!(source.starts_with(gam_gpu::numerics_device::PROBIT_NUMERICS_CU));
+        assert_eq!(
+            source.matches("#define PROBIT_NUMERICS_INCLUDED").count(),
+            1
+        );
+        assert!(SURVIVAL_ROWJET_TEMPLATE.contains("log_ndtr_mills_curvature("));
+        for private_leaf in [
+            "erfcx_nn",
+            "sp_logcdf_mills",
+            "normal_pdf",
+            "normal_cdf",
+            "1e-300",
+        ] {
+            assert!(
+                !SURVIVAL_ROWJET_TEMPLATE.contains(private_leaf),
+                "private probability leaf or floor reintroduced: {private_leaf}",
+            );
+        }
         for removed in [
             "survival_rowjet_no_t4",
             "struct JS1",

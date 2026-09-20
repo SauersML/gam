@@ -162,11 +162,7 @@ impl ResidualDistributionOps for ResidualDistribution {
 
 #[inline]
 pub(crate) fn residual_distribution_link(distribution: ResidualDistribution) -> StandardLink {
-    match distribution {
-        ResidualDistribution::Gaussian => StandardLink::Probit,
-        ResidualDistribution::Gumbel => StandardLink::CLogLog,
-        ResidualDistribution::Logistic => StandardLink::Logit,
-    }
+    distribution.link_component().as_standard_link()
 }
 
 #[inline]
@@ -187,5 +183,62 @@ pub fn residual_distribution_from_inverse_link(link: &InverseLink) -> Option<Res
         InverseLink::Standard(StandardLink::CLogLog) => Some(ResidualDistribution::Gumbel),
         InverseLink::Standard(StandardLink::Logit) => Some(ResidualDistribution::Logistic),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod shared_residual_jet_tests {
+    use super::{ResidualDistribution, ResidualDistributionOps};
+
+    #[test]
+    fn gaussian_residual_derivatives_match_hermite_formulas() {
+        for z in [-7.0_f64, -2.0, -0.25, 0.0, 0.8, 3.0, 7.0] {
+            let density = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
+            let expected = [density, -z * density, (z * z - 1.0) * density,
+                -(z.powi(3) - 3.0 * z) * density,
+                (z.powi(4) - 6.0 * z * z + 3.0) * density];
+            let law = ResidualDistribution::Gaussian;
+            let actual = [law.pdf(z), law.pdf_derivative(z), law.pdfsecond_derivative(z),
+                law.pdfthird_derivative(z), law.pdffourth_derivative(z)];
+            for (got, want) in actual.into_iter().zip(expected) {
+                assert!((got - want).abs() <= 2e-14 * density.max(want.abs()),
+                    "z={z}: got={got}, want={want}");
+            }
+        }
+    }
+
+    #[test]
+    fn residual_derivatives_preserve_infinite_and_nan_limits() {
+        for law in [ResidualDistribution::Gaussian, ResidualDistribution::Gumbel,
+            ResidualDistribution::Logistic] {
+            for z in [f64::NEG_INFINITY, -1e200, 1e200, f64::INFINITY] {
+                assert_eq!(law.cdf(z), if z < 0.0 { 0.0 } else { 1.0 });
+                for derivative in [law.pdf(z), law.pdf_derivative(z), law.pdfsecond_derivative(z),
+                    law.pdfthird_derivative(z), law.pdffourth_derivative(z)] {
+                    assert_eq!(derivative, 0.0, "{law:?} at {z}");
+                }
+            }
+            for derivative in [law.cdf(f64::NAN), law.pdf(f64::NAN), law.pdf_derivative(f64::NAN),
+                law.pdfsecond_derivative(f64::NAN), law.pdfthird_derivative(f64::NAN),
+                law.pdffourth_derivative(f64::NAN)] {
+                assert!(derivative.is_nan(), "{law:?} must preserve NaN");
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_derivatives_survive_when_the_density_underflows() {
+        let law = ResidualDistribution::Gaussian;
+        for z in [-38.6, 38.6] {
+            assert_eq!(law.pdf(z), 0.0);
+            let first = law.pdf_derivative(z);
+            let second = law.pdfsecond_derivative(z);
+            let third = law.pdfthird_derivative(z);
+            let fourth = law.pdffourth_derivative(z);
+            assert!(first.is_subnormal() && first.signum() == -z.signum());
+            assert!(second.is_subnormal() && second > 0.0);
+            assert!(third.is_subnormal() && third.signum() == -z.signum());
+            assert!(fourth.is_subnormal() && fourth > 0.0);
+        }
     }
 }
