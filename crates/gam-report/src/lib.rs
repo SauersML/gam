@@ -26,13 +26,11 @@ pub struct ReportInput {
     /// its raw criterion (#2627).
     pub raw_reml_score: Option<f64>,
     pub iterations: usize,
-    /// Human-readable P-IRLS / outer convergence status (e.g. "Converged",
-    /// "Max iterations reached"). Plain text so report.rs stays free of gam
-    /// library types; main.rs supplies `PirlsStatus::label()`.
+    /// Status label of the certified solve (the inner status label, or the
+    /// exact closed-form route's name). Saved report producers require a
+    /// minted fit, whose sealed convergence evidence admits only a converged
+    /// inner solve. Plain text keeps the renderer free of solver types.
     pub convergence_status: String,
-    /// Whether the fit cleanly converged. Drives the visual flag on the
-    /// convergence line — any non-converged state is highlighted.
-    pub converged: bool,
     /// Final outer-objective gradient norm at the recorded solution, when the
     /// outer loop measured it (`None` for cache-hit / gradient-free exits).
     pub outer_gradient_norm: Option<f64>,
@@ -563,38 +561,17 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
             None => "not retained by this fit".to_string(),
         },
     ));
-    // Outer iterations, annotated with the cap when the solver did not
-    // converge cleanly so "47" cannot be misread as "converged at 47".
-    let iter_value = if input.converged {
-        format!("{}", input.iterations)
-    } else {
-        format!(
-            "{} <span class=\"conv-warn\">(did not converge)</span>",
-            input.iterations
-        )
-    };
-    summary_pairs.push(("Outer Iterations", iter_value));
-    // Convergence status: always shown, visually flagged when not `Converged`,
-    // so a reader can immediately tell a healthy fit from one that hit the
-    // iteration cap, exhausted the LM step search, or went unstable.
-    let conv_value = if input.converged {
-        format!(
-            "<span class=\"conv-ok\">{}</span>",
-            esc(&input.convergence_status)
-        )
-    } else {
-        format!(
-            "<span class=\"conv-warn\">\u{26A0} {}</span>",
-            esc(&input.convergence_status)
-        )
-    };
-    summary_pairs.push(("Convergence", conv_value));
+    summary_pairs.push(("Outer Iterations", format!("{}", input.iterations)));
+    summary_pairs.push((
+        "Convergence",
+        format!("<span class=\"conv-ok\">{}</span>", esc(&input.convergence_status)),
+    ));
     if let Some(g) = input.outer_gradient_norm {
         summary_pairs.push(("Outer Gradient Norm", format!("{g:.3e}")));
     }
     // Optimality certificate (#934): the fit's analytic KKT self-audit at the
     // optimum. A stationarity flag here names the broken criterion the moment
-    // it is introduced — surface it as loudly as non-convergence.
+    // it is introduced, so surface it loudly.
     if let Some(cert) = &input.criterion_certificate {
         let cert_value = if cert.clean {
             format!(
@@ -1608,7 +1585,6 @@ mod tests {
             raw_reml_score: Some(-17.3),
             iterations: 5,
             convergence_status: "Converged".to_string(),
-            converged: true,
             outer_gradient_norm: None,
             criterion_certificate: None,
             smoothing_forensics: vec![],
@@ -1815,17 +1791,7 @@ mod tests {
         assert!(html.contains("0.1 → 0.2"));
     }
 
-    #[test]
-    fn render_html_non_converged_shows_warning() {
-        let mut input = minimal_input("y ~ s(x)");
-        input.converged = false;
-        input.convergence_status = "Max iterations reached".to_string();
-        let html = render_html(&input).unwrap();
-        assert!(
-            html.contains("conv-warn"),
-            "non-converged fit must show conv-warn class"
-        );
-    }
+
     #[test]
     fn significant_notation_uses_the_rounded_decimal_exponent() {
         for (value, expected) in [
@@ -1869,6 +1835,15 @@ mod tests {
                     .contains(&format!("{label}{text}</span>"))
             );
         }
+    }
+
+    #[test]
+    fn report_renders_the_certified_solve_status_as_escaped_text() {
+        let mut input = minimal_input("y ~ s(x)");
+        input.convergence_status = "exact <scan>".to_string();
+        let html = render_html(&input).expect("report");
+        assert!(html.contains("<span class=\"conv-ok\">exact &lt;scan&gt;</span>"));
+        assert!(html.contains("<span class=\"stat-label\">Outer Iterations</span><span class=\"stat-value\">5</span>"));
     }
 
 }

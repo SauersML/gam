@@ -3156,5 +3156,13 @@
     ],
     "reason": "#4344: route fused Arrow-Schur module compilation through KeyedPtxModuleCache, delete its private map/accessor, remove invariant architecture key fields, and preserve actual compiler/module-loader error text in SchurFactorFailed.",
     "evidence": "MSI complete GPU unit binary builds in3.28seconds and the actual keyed-map poison/reacquisition regression passes. Coherent complete production dependency metadata is checked with warnings denied. Read audit confirms the removed custom-compiler entry had one caller using the identical shared options; fused consumers select the singleton runtime context. No GPU hardware execution is claimed."
+  },
+  {
+    "base": "1044a5d43aaae52da02497f9255b12daba738a22",
+    "items": [
+      "crates/gam-report/src/lib.rs:fn:render_html_non_converged_shows_warning"
+    ],
+    "reason": "#4385: remove ReportInput.converged and its impossible-state test. All three saved-report producers require a minted fit and unconditionally supplied true; sealed FitConvergenceEvidence validates converged inner status, including deserialization. The live status label and optimality-certificate warnings remain.",
+    "evidence": "Source census confirms the three production producers and private sealed convergence fields. All43 complete report unit tests pass, including live certified status escaping and absent/zero/positive EDF. Complete eight-crate reverse dependency production metadata and complete CLI unit metadata pass on MSI with warnings denied."
   }
 ]
