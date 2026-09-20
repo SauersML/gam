@@ -30,7 +30,7 @@
 //! `binomial_q_derivs`, `binomial_q_coeffs`, `validation`,
 //! `weighted_design_products`, `row_linalg`, and `joint_packing`.
 
-use gam_terms::basis::{ActivePenaltyInfo, BasisOptions, PenaltySource};
+use gam_terms::basis::BasisOptions;
 
 use crate::custom_family::{AdditiveBlockJacobian, BlockWorkingSet, BlockwiseFitOptions, ConstraintSet, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, evaluate_custom_family_joint_hyper_efs_owned, evaluate_custom_family_joint_hyper_owned, fit_custom_family, fit_custom_family_fixed_log_lambdas_from_owned_mode, resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map, shared_dense_arc, weighted_crossprod_psi_maps};
 use gam_problem::{ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace};
@@ -78,8 +78,8 @@ use crate::fit_orchestration::drivers::{
     spatial_dims_per_term, spatial_length_scale_term_indices,
 };
 use gam_terms::smooth::{
-    BlockwisePenalty, PenaltyBlockInfo, SpatialLengthScaleOptimizationOptions,
-    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
+    ModelLevel, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec,
 };
 // #1521: relocated DOWN into gam_terms::smooth (was drivers::build_term_collection_design).
 use gam_terms::smooth::build_term_collection_design;

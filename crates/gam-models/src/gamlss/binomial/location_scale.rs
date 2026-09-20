@@ -2045,10 +2045,13 @@ impl crate::custom_family::JeffreysArming for BinomialLocationScaleFamily {
 impl CustomFamily for BinomialLocationScaleFamily {
     // The self-limiting Jeffreys/Firth curvature bounds a coefficient the data do
     // not, but it is armed only when the unarmed fit proves it is needed (#979).
-    // When the log-σ design carries an intercept, the threshold/log-σ map
+    // When the log-σ design spans the constant, the threshold/log-σ map
     // `q = −η_t/σ` has an exact likelihood gauge (`δη_t = η_t, δη_ls = 1` gives
-    // `q̇ = 0`), so the expected information is singular along it at every β, and
-    // the default full Jeffreys span holds that direction. Which span the armed
+    // `q̇ = 0`), so the expected information is singular along it at every β.
+    // The formula builder removes that direction structurally: the binomial
+    // log-σ design carries no intercept (#3879). A caller that constructs the
+    // family directly with a constant log-σ column still has the gauge, and the
+    // default full Jeffreys span then holds that direction. Which span the armed
     // refit uses is open in the #932 audit's constrained Firth/Jeffreys row.
     fn joint_jeffreys_term_required(&self) -> bool {
         self.jeffreys_armed
@@ -2083,9 +2086,14 @@ impl CustomFamily for BinomialLocationScaleFamily {
     // Jeffreys/Firth prior, which is defined on the Fisher information by
     // construction (#1020).
 
-    /// The threshold/log-σ map `q = −η_t/σ` carries an EXACT gauge null: the
-    /// direction `(δη_t = η_t, δη_ls = 1)` gives `q̇ = q_t·η_t + q_ls = 0`, so the
-    /// likelihood joint Hessian is singular along it. Under the default `Smooth`
+    /// When the log-σ design spans the constant, the threshold/log-σ map
+    /// `q = −η_t/σ` carries an EXACT gauge null: the direction
+    /// `(δη_t = η_t, δη_ls = 1)` gives `q̇ = q_t·η_t + q_ls = 0`, so the
+    /// likelihood joint Hessian is singular along it. The formula builder never
+    /// produces such a design (the binomial log-σ design carries no intercept,
+    /// #3879), and there the joint Hessian has no structural null, so
+    /// `HardPseudo` and `Smooth` agree. The mode is kept for families built
+    /// directly with a constant log-σ column. Under the default `Smooth`
     /// pseudo-logdet the near-zero eigenvalue contributes a first-order
     /// `φ'(σ_min)·dσ_min/dρ` term to `d log|H|/dρ` that the analytic
     /// `u⊤(dH/dρ)u` formula cannot match (the eigenvector `u` is numerically

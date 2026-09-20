@@ -414,9 +414,10 @@ pub(crate) fn build_location_scale_wiggle_block(
 /// * Binomial, `q = −η_t·e^{−η_σ}`: the likelihood sees the blocks only through `q`,
 ///   whose tangent null space is `{(δη_t, δη_σ) : δη_t = η_t·δη_σ}`. A log-σ direction
 ///   `f` is unidentified only where `η_t·f` lies in the threshold span. For the
-///   intercept that holds at every β (the exact gauge `pseudo_logdet_mode` names).
-///   For any other `f` it holds only at a constant threshold, so a log-σ column the
-///   threshold also spans is identified whenever the threshold varies.
+///   constant that holds at every β, which is why the binomial log-σ design carries
+///   no intercept ([`binomial_log_sigma_gauge_fixed_spec`]). For any other `f` it
+///   holds only at a constant threshold, so a log-σ column the threshold also spans
+///   is identified whenever the threshold varies.
 ///
 /// The residualization zeroed every scale column in the location span, so the scale
 /// effect it carried could not be fitted. The identifiability audit then dropped the
@@ -438,37 +439,6 @@ pub(crate) fn location_scale_log_sigma_design(
         .into());
     }
     Ok(log_sigma_design.clone())
-}
-
-pub(crate) fn identity_penalty(dim: usize) -> Array2<f64> {
-    let mut penalty = Array2::<f64>::zeros((dim, dim));
-    for i in 0..dim {
-        penalty[[i, i]] = 1.0;
-    }
-    penalty
-}
-
-pub(crate) fn append_binomial_log_sigma_shrinkage_penalty_design(
-    design: &mut TermCollectionDesign,
-) {
-    let p = design.design.ncols();
-    design
-        .penalties
-        .push(BlockwisePenalty::new(0..p, identity_penalty(p)));
-    // Identity penalty penalizes the full space → nullspace dimension is 0.
-    design.nullspace_dims.push(0);
-    design.penaltyinfo.push(PenaltyBlockInfo {
-        global_index: design.penaltyinfo.len(),
-        termname: Some("log_sigma_shrinkage".to_string()),
-        penalty: ActivePenaltyInfo {
-            source: PenaltySource::Other("shrinkage".to_string()),
-            original_index: 0,
-            effective_rank: p,
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            structural_null_frame: None,
-        },
-    });
 }
 
 /// Build the (mean, log-σ) parameter-block pair for a Gaussian location-scale
@@ -549,11 +519,40 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
     Ok((meanspec, noisespec))
 }
 
+/// The binomial location-scale log-σ spec with its gauge fixed: the same terms,
+/// with no global intercept.
+///
+/// `q = −η_t·e^{−η_σ}` sees a constant log-σ level only through the product
+/// with the threshold, so `(β_t, b_0) ↦ (c·β_t, b_0 + ln c)` leaves every row's
+/// likelihood unchanged. The level is therefore not a parameter of the model;
+/// fixing it at `σ = 1` where every log-σ covariate is zero is the standard
+/// heteroskedastic-probit normalization. The overall scale of `q` stays fully
+/// free through the threshold coefficients and their REML-selected smoothing.
+/// The level lives in the spec, so the saved model and every prediction
+/// rebuild the same intercept-free design.
+pub(crate) fn binomial_log_sigma_gauge_fixed_spec(
+    log_sigmaspec: TermCollectionSpec,
+) -> TermCollectionSpec {
+    TermCollectionSpec {
+        level: ModelLevel::NoIntercept,
+        ..log_sigmaspec
+    }
+}
+
 /// Build the (threshold, log-σ) parameter-block pair for a Binomial
 /// location-scale family. Shared by the non-wiggle and wiggle Binomial builders;
 /// mirrors [`build_gaussian_mean_and_scale_blocks`], with the same raw log-σ
-/// design ([`location_scale_log_sigma_design`]), the link-aware joint warm
-/// start, and the same REML-selected full-span scale shrinkage penalty.
+/// design ([`location_scale_log_sigma_design`]), the same formula-native log-σ
+/// penalties and nothing else, and the link-aware joint warm start.
+///
+/// The log-σ design must not carry an intercept. `q = −η_t·e^{−η_σ}` is
+/// unchanged by `(β_t, b_0) ↦ (c·β_t, b_0 + ln c)` for every `c > 0`, so a free
+/// log-σ level is a pure likelihood gauge, and the threshold penalty, which
+/// scales as `c²`, would drive it to `σ → 0`. The gauge is fixed structurally
+/// at `σ = 1` at the reference covariate value, as heteroskedastic probit and
+/// logit fix it ([`binomial_log_sigma_gauge_fixed_spec`]), instead of by a
+/// full-span coefficient ridge whose strength depends on the covariates' units
+/// (#3879).
 pub(crate) fn build_binomial_threshold_and_scale_blocks(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -574,12 +573,18 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     let noise_offset = noise_design
         .compose_offset(noise_offset.view(), &format!("{context}: log_sigma"))
         .map_err(|error| error.to_string())?;
+    if !noise_design.intercept_range.is_empty() {
+        return Err(GamlssError::UnsupportedConfiguration {
+            reason: format!(
+                "{context}: the binomial log_sigma design carries an intercept, which is the exact \
+                 scale gauge of q = -threshold / sigma; build it from \
+                 binomial_log_sigma_gauge_fixed_spec"
+            ),
+        }
+        .into());
+    }
     let raw_log_sigma_design =
         location_scale_log_sigma_design(&mean_design.design, &noise_design.design)?;
-    let p_noise = raw_log_sigma_design.ncols();
-    let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
-        noise_design.penalties_as_penalty_matrix();
-    log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
     let mut thresholdspec = build_location_scale_block(
         "threshold",
         mean_design.design.clone(),
@@ -596,7 +601,7 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
         "log_sigma",
         raw_log_sigma_design,
         noise_offset,
-        log_sigma_penalty_matrices,
+        noise_design.penalties_as_penalty_matrix(),
         vec![],
         noise_log_lambdas,
         noise_beta_hint,
@@ -2977,7 +2982,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 extra_rho0.as_slice().unwrap_or(&[]),
             );
             // The blocks realized at the seed: every block that owns a ρ
-            // coordinate, the noise ridge and the link wiggle included. The
+            // coordinate, the link wiggle included. The
             // family reports its capability on them, and the search takes its ρ
             // domain from them by the #2812 law `fit_custom_family` applies to
             // the same blocks (#2902 item 15).
@@ -3293,21 +3298,6 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
 
     let mut solved = run_exact_joint_spatial!()
         .map_err(|failure| failure.context("exact two-block spatial optimization failed"))?;
-
-    let expected_noise_penalty_count = builder.noise_penalty_count(&solved.designs[1]);
-    let actual_noise_penalty_count = solved.designs[1].penalties.len();
-    if expected_noise_penalty_count > actual_noise_penalty_count {
-        if expected_noise_penalty_count != actual_noise_penalty_count + 1 {
-            return Err(FitFailure::raised(
-                FailureCategory::Invariant,
-                format!(
-                    "location-scale result noise design expected {} penalties after augmentation, got {} before augmentation",
-                    expected_noise_penalty_count, actual_noise_penalty_count
-                ),
-            ));
-        }
-        append_binomial_log_sigma_shrinkage_penalty_design(&mut solved.designs[1]);
-    }
 
     BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
         fit: solved.fit,
@@ -3644,10 +3634,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         true
     }
 
-    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
-        noise_design.penalties.len() + 1
-    }
-
     fn build_blocks(
         &self,
         theta: &Array1<f64>,
@@ -3778,10 +3764,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
 
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         initial_log_lambdas_orzeros(&self.wiggle_block)
-    }
-
-    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
-        noise_design.penalties.len() + 1
     }
 
     fn build_blocks(
@@ -4035,7 +4017,7 @@ pub(crate) fn fit_binomial_location_scale_terms(
             weights: spec.weights,
             link_kind: spec.link_kind,
             meanspec: spec.thresholdspec,
-            noisespec: spec.log_sigmaspec,
+            noisespec: binomial_log_sigma_gauge_fixed_spec(spec.log_sigmaspec),
             mean_offset: spec.threshold_offset,
             noise_offset: spec.log_sigma_offset,
         },
@@ -4063,7 +4045,7 @@ pub(crate) fn fit_binomial_location_scalewiggle_terms(
             weights: spec.weights,
             link_kind: spec.link_kind,
             meanspec: spec.thresholdspec,
-            noisespec: spec.log_sigmaspec,
+            noisespec: binomial_log_sigma_gauge_fixed_spec(spec.log_sigmaspec),
             mean_offset: spec.threshold_offset,
             noise_offset: spec.log_sigma_offset,
             wiggle_knots: spec.wiggle_knots,

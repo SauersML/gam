@@ -2239,6 +2239,27 @@ pub(crate) fn empty_term_collection() -> TermCollectionSpec {
     }
 }
 
+/// One plain linear effect of data column `col`, carrying the formula default
+/// function-metric null-recovery penalty (`double_penalty = true`).
+pub(crate) fn single_linear_term_collection(name: &str, col: usize) -> TermCollectionSpec {
+    TermCollectionSpec {
+        linear_terms: vec![gam_terms::smooth::LinearTermSpec {
+            name: name.to_string(),
+            feature_col: col,
+            feature_cols: vec![col],
+            categorical_levels: Vec::new(),
+            double_penalty: true,
+            coefficient_geometry: gam_terms::smooth::LinearCoefficientGeometry::Unconstrained,
+            coefficient_min: None,
+            coefficient_max: None,
+            frozen_function_mass: None,
+        }],
+        random_effect_terms: Vec::new(),
+        smooth_terms: Vec::new(),
+        level: Default::default(),
+    }
+}
+
 pub(crate) fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
     SpatialLengthScaleOptimizationOptions {
         enabled: true,
@@ -2325,7 +2346,7 @@ pub(crate) fn binomial_location_scale_many_smoothing_params_keeps_second_order_o
             )),
             offset: Array1::zeros(n),
             penalties: (0..k)
-                .map(|_| PenaltyMatrix::Dense(identity_penalty(p)))
+                .map(|_| PenaltyMatrix::Dense(Array2::eye(p)))
                 .collect(),
             nullspace_dims: vec![0; k],
             initial_log_lambdas: Array1::zeros(k),
@@ -2372,7 +2393,10 @@ pub(crate) fn binomial_location_scale_term_builder_requires_exact_spatial_joint_
         weights: Array1::from_elem(n, 1.0),
         link_kind: InverseLink::Standard(StandardLink::Probit),
         meanspec: simple_matern_term_collection(&[0, 1], 0.4),
-        noisespec: simple_matern_term_collection(&[0, 1], 0.75),
+        noisespec: binomial_log_sigma_gauge_fixed_spec(simple_matern_term_collection(
+            &[0, 1],
+            0.75,
+        )),
         mean_offset: Array1::zeros(n),
         noise_offset: Array1::zeros(n),
     };
@@ -2410,7 +2434,10 @@ pub(crate) fn binomial_location_scale_builder_populateswarm_start_betas() {
         weights,
         link_kind: InverseLink::Standard(StandardLink::Probit),
         meanspec: simple_matern_term_collection(&[0, 1], 0.45),
-        noisespec: simple_matern_term_collection(&[0, 1], 0.8),
+        noisespec: binomial_log_sigma_gauge_fixed_spec(simple_matern_term_collection(
+            &[0, 1],
+            0.8,
+        )),
     };
     let mean_design =
         build_term_collection_design(data.view(), builder.meanspec()).expect("mean design");
@@ -2443,7 +2470,8 @@ pub(crate) fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_f
     let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
     let weights = Array1::from_elem(n, 1.0);
     let meanspec = simple_matern_term_collection(&[0, 1], 0.45);
-    let noisespec = simple_matern_term_collection(&[0, 1], 0.8);
+    let noisespec =
+        binomial_log_sigma_gauge_fixed_spec(simple_matern_term_collection(&[0, 1], 0.8));
     let builder = BinomialLocationScaleTermBuilder {
         mean_offset: Array1::zeros(y.len()),
         noise_offset: Array1::zeros(y.len()),
@@ -2853,7 +2881,95 @@ pub(crate) fn binomial_location_scale_terms_reject_free_log_sigma_terms_early() 
     assert_eq!(err.category(), gam_problem::FailureCategory::Input, "{err}");
     let err = err.to_string();
     assert!(err.contains("identify only the composite q = -threshold / sigma"));
-    assert!(err.contains("log_sigma must be intercept-only/fixed"));
+    assert!(err.contains("log_sigma must be a parametric-linear scale"));
+}
+
+/// #3879: an intercept-only log-σ has nothing left to fit once the scale gauge
+/// `(β_t, b_0) ↦ (c·β_t, b_0 + ln c)` of `q = −threshold/σ` is fixed at σ = 1,
+/// so the term API refuses it instead of fitting a ridge-pinned constant.
+#[test]
+pub(crate) fn binomial_location_scale_terms_reject_intercept_only_log_sigma_3879() {
+    let n = 8usize;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        data[[i, 0]] = i as f64;
+        data[[i, 1]] = (i as f64).cos();
+    }
+    let spec = BinomialLocationScaleTermSpec {
+        y: Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })),
+        weights: Array1::from_elem(n, 1.0),
+        link_kind: InverseLink::Standard(StandardLink::Probit),
+        thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
+        log_sigmaspec: empty_term_collection(),
+        threshold_offset: Array1::zeros(n),
+        log_sigma_offset: Array1::zeros(n),
+    };
+    let err = match fit_binomial_location_scale_terms(
+        data.view(),
+        spec,
+        &BlockwiseFitOptions::default(),
+        &spatial_kappa_options(),
+    ) {
+        Ok(_) => panic!("#3879: an intercept-only binomial log_sigma must be refused"),
+        Err(err) => err,
+    };
+    assert_eq!(err.category(), gam_problem::FailureCategory::Input, "{err}");
+    assert!(
+        err.to_string().contains("an intercept-only log_sigma is not a binomial scale model"),
+        "{err}"
+    );
+}
+
+/// #3879: the block builder refuses a log-σ design that carries the intercept,
+/// the exact scale gauge of `q = −threshold/σ`, instead of pinning it with a
+/// coefficient-metric ridge.
+#[test]
+pub(crate) fn binomial_location_scale_builder_refuses_log_sigma_intercept_3879() {
+    let n = 12usize;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0);
+        data[[i, 0]] = t;
+        data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+    }
+    let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+    let builder = BinomialLocationScaleTermBuilder {
+        mean_offset: Array1::zeros(n),
+        noise_offset: Array1::zeros(n),
+        y,
+        weights: Array1::from_elem(n, 1.0),
+        link_kind: InverseLink::Standard(StandardLink::Probit),
+        meanspec: simple_matern_term_collection(&[0, 1], 0.45),
+        noisespec: single_linear_term_collection("x0", 0),
+    };
+    let mean_design =
+        build_term_collection_design(data.view(), builder.meanspec()).expect("mean design");
+    let noise_design =
+        build_term_collection_design(data.view(), builder.noisespec()).expect("noise design");
+    assert!(!noise_design.intercept_range.is_empty());
+    let rho = compose_theta_from_hints_test(
+        builder.mean_penalty_count(&mean_design),
+        builder.noise_penalty_count(&noise_design),
+        &None,
+        &None,
+        &Array1::zeros(0),
+    );
+    let err = match builder.build_blocks(&rho, &mean_design, &noise_design, None, None) {
+        Ok(_) => panic!("#3879: a binomial log_sigma design with an intercept must be refused"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("exact scale gauge"), "{err}");
+
+    let gauge_fixed = binomial_log_sigma_gauge_fixed_spec(single_linear_term_collection("x0", 0));
+    let noise_design =
+        build_term_collection_design(data.view(), &gauge_fixed).expect("gauge-fixed design");
+    assert!(noise_design.intercept_range.is_empty());
+    assert_eq!(noise_design.design.ncols(), 1);
+    assert_eq!(
+        builder.noise_penalty_count(&noise_design),
+        noise_design.penalties.len(),
+        "#3879: the binomial log-sigma rho layout carries only formula-native penalties"
+    );
 }
 
 #[test]
@@ -3061,7 +3177,7 @@ pub(crate) fn binomial_location_scale_termswith_matern_spatial_blocks_fit_finite
         weights,
         link_kind: InverseLink::Standard(StandardLink::Probit),
         thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
-        log_sigmaspec: empty_term_collection(),
+        log_sigmaspec: single_linear_term_collection("x0", 0),
         threshold_offset: Array1::zeros(n),
         log_sigma_offset: Array1::zeros(n),
     };

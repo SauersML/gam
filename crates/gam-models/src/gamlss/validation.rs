@@ -212,19 +212,30 @@ pub(super) fn validate_binomial_log_sigma_identifiable(
 ) -> Result<(), String> {
     // A parametric-linear log_sigma (heteroscedastic binary regression, i.e.
     // het-probit / het-logit) is a low-dimensional scale model whose slopes are
-    // identifiable from the per-observation composite q; the ridge-regularized
-    // fit pins the confounded scale intercept, so linear log_sigma terms are
-    // accepted. A *nonparametric* free log_sigma — a random-effect or smooth
-    // formula — is an unidentified scale gauge for 0/1 Bernoulli data and is
-    // still rejected before the exact spatial joint optimizer is entered.
-    if log_sigmaspec.random_effect_terms.is_empty() && log_sigmaspec.smooth_terms.is_empty() {
-        return Ok(());
+    // identifiable from the per-observation composite q wherever the threshold
+    // varies. Its constant level is not: `(β_t, b_0) ↦ (c·β_t, b_0 + ln c)`
+    // leaves q unchanged, so the fit builds log_sigma without an intercept
+    // (`binomial_log_sigma_gauge_fixed_spec`, σ = 1 at the covariate origin).
+    // A *nonparametric* free log_sigma — a random-effect or smooth formula — is
+    // an unidentified scale gauge for 0/1 Bernoulli data and is rejected before
+    // the exact spatial joint optimizer is entered; an intercept-only log_sigma
+    // has no parameter left once its level is fixed, and is the plain binomial
+    // model.
+    if !(log_sigmaspec.random_effect_terms.is_empty() && log_sigmaspec.smooth_terms.is_empty()) {
+        return Err(GamlssError::UnsupportedConfiguration {
+            reason: format!(
+                "{context}: Bernoulli binomial location-scale data identify only the composite q = -threshold / sigma; log_sigma must be a parametric-linear scale (heteroskedastic probit/logit), not a random-effect or smooth formula"
+            ),
+        }
+        .into());
     }
-
-    Err(GamlssError::UnsupportedConfiguration {
-        reason: format!(
-            "{context}: Bernoulli binomial location-scale data identify only the composite q = -threshold / sigma; log_sigma must be intercept-only/fixed or a parametric-linear scale, not a random-effect or smooth formula"
-        ),
+    if log_sigmaspec.linear_terms.is_empty() {
+        return Err(GamlssError::UnsupportedConfiguration {
+            reason: format!(
+                "{context}: an intercept-only log_sigma is not a binomial scale model: q = -threshold / sigma sees a constant sigma only as the scale of the threshold, so its level is fixed at sigma = 1 and nothing is left to fit; fit the binomial model without a noise formula, or give log_sigma a covariate"
+            ),
+        }
+        .into());
     }
-    .into())
+    Ok(())
 }

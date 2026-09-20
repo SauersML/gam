@@ -17,7 +17,10 @@
 //! The pins fit gamfit's reproduction (issue #3015) with the shared noise column, and
 //! with an independent noise column as the control, and require both to fit and publish
 //! the covariance a location-scale prediction needs. A third pin fits a probit truth whose
-//! log-σ is linear in the shared column and requires the fit to recover that slope.
+//! log-σ is linear in the shared column and requires the fit to recover that slope. A
+//! fourth pins #3879: the binomial log-σ level is the exact scale gauge of
+//! `q = −η_t·e^{−η_σ}` and is fixed structurally, so refitting with the scale covariate
+//! in other units is an exact reparametrization and must give the same fit.
 
 use super::{FitConfig, FitResult, fit_from_formula};
 
@@ -118,12 +121,13 @@ fn a_scale_effect_on_a_threshold_column_is_recovered_3015() {
     let log_sigma = unified.beta_log_sigma();
     assert_eq!(
         log_sigma.len(),
-        2,
-        "#3015: the log-σ block carries its intercept and the x3 slope the noise formula names"
+        1,
+        "#3015: the log-σ block carries only the x3 slope the noise formula names; its level \
+         is the scale gauge of q = -threshold/σ and is fixed at σ = 1 structurally (#3879)"
     );
     let covariance = unified.beta_covariance().expect("posterior covariance");
-    let slope = log_sigma[1];
-    let sd = covariance[[threshold_width + 1, threshold_width + 1]].sqrt();
+    let slope = log_sigma[0];
+    let sd = covariance[[threshold_width, threshold_width]].sqrt();
     assert!(
         sd.is_finite() && sd > 0.0,
         "#3015: the x3 log-σ slope has posterior standard deviation {sd}"
@@ -132,4 +136,95 @@ fn a_scale_effect_on_a_threshold_column_is_recovered_3015() {
         (slope - SLOPE).abs() <= 3.0 * sd && slope > 3.0 * sd,
         "#3015: fitted log-σ slope on x3 {slope} (posterior sd {sd}) against the truth {SLOPE}"
     );
+}
+
+/// gam#3879: the binomial log-σ gauge used to be closed by a full-span identity ridge on
+/// the log-σ coefficients, whose strength depends on the units of every log-σ covariate:
+/// the same model fitted with `x3` and with `1000·x3` saw a different prior on the same
+/// scale function. The gauge is now fixed structurally (no log-σ intercept), and the
+/// remaining log-σ penalty is the formula-native linear-term penalty normalized by the
+/// column's mean square, so `x3 ↦ 1000·x3` is an exact reparametrization of the
+/// penalized criterion: the slope on `x3` must be exactly 1000 times the slope on
+/// `1000·x3`, and the threshold must be unchanged. The two optima can differ only by the
+/// solver's convergence error, so the comparison is made in units of the posterior
+/// standard deviation the fit reports, at a hundredth of it: any difference in what the
+/// model says about the data is excluded, while a unit-dependent prior, which moves the
+/// estimate by an O(1) fraction of its sd, is not.
+#[test]
+fn the_binomial_scale_fit_does_not_depend_on_the_scale_covariates_units_3879() {
+    const SLOPE: f64 = 0.3;
+    const UNITS: f64 = 1000.0;
+    let mut state = 3879u64;
+    let headers = ["y", "x1", "x3", "x3k"].map(String::from).to_vec();
+    let records = (0..ROWS)
+        .map(|_| {
+            let x1 = normal(&mut state);
+            let x3 = normal(&mut state);
+            let threshold = 0.3 - 0.8 * x1;
+            let probability = gam_math::probability::normal_cdf(-threshold * (-SLOPE * x3).exp());
+            let y = if uniform(&mut state) < probability { 1.0 } else { 0.0 };
+            csv::StringRecord::from(vec![
+                format!("{y}"),
+                format!("{x1:.17e}"),
+                format!("{x3:.17e}"),
+                format!("{:.17e}", UNITS * x3),
+            ])
+        })
+        .collect();
+    let data = gam_data::encode_recordswith_inferred_schema(headers, records)
+        .expect("encode the #3879 table");
+    let fit_with = |noise: &str| {
+        let config = FitConfig {
+            family: Some("binomial".to_string()),
+            link: Some("probit".to_string()),
+            noise_formula: Some(noise.to_string()),
+            ..FitConfig::default()
+        };
+        let result = fit_from_formula("y ~ s(x1)", &data, &config).unwrap_or_else(|error| {
+            panic!("#3879: the binomial location-scale fit with noise_formula={noise} must fit: {error}")
+        });
+        let FitResult::BinomialLocationScale(fitted) = result else {
+            panic!("#3879: noise_formula={noise} must return a binomial location-scale fit");
+        };
+        let unified = fitted.fit.fit;
+        assert!(
+            unified.convergence_evidence().inner_status().is_converged(),
+            "#3879: noise_formula={noise}: the inner mode is not converged"
+        );
+        unified
+    };
+    let natural = fit_with("x3");
+    let rescaled = fit_with("x3k");
+    assert_eq!(
+        natural.beta_log_sigma().len(),
+        1,
+        "#3879: the binomial log-σ block must carry the slope alone, with no gauge level"
+    );
+    assert_eq!(rescaled.beta_log_sigma().len(), 1);
+    let width = natural.beta_threshold().len();
+    assert_eq!(rescaled.beta_threshold().len(), width);
+    let covariance = natural.beta_covariance().expect("posterior covariance");
+    let sd = |index: usize| covariance[[index, index]].sqrt();
+
+    let slope = natural.beta_log_sigma()[0];
+    let rescaled_slope = UNITS * rescaled.beta_log_sigma()[0];
+    assert!(
+        (slope - rescaled_slope).abs() <= 1e-2 * sd(width),
+        "#3879: log-σ slope on x3 is {slope} but {UNITS}× the slope on {UNITS}·x3 is \
+         {rescaled_slope} (posterior sd {})",
+        sd(width)
+    );
+    for (j, (a, b)) in natural
+        .beta_threshold()
+        .iter()
+        .zip(rescaled.beta_threshold().iter())
+        .enumerate()
+    {
+        assert!(
+            (a - b).abs() <= 1e-2 * sd(j),
+            "#3879: threshold coefficient {j} is {a} with x3 and {b} with {UNITS}·x3 \
+             (posterior sd {})",
+            sd(j)
+        );
+    }
 }

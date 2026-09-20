@@ -9,7 +9,6 @@ with the same fitted values reports two numbers differing by 5-9x.
     family           standard .deviance   LS .deviance     ratio
     gaussian             193.47887921     1023.66945980     5.29
     gamma                214.22303356     1917.87955312     8.95
-    binomial-logit       769.66861497      769.66861497     1.00
 
 The mean fits are the same model, not merely similar: max|mu_standard -
 mu_locationscale| is 1.9e-11 (gaussian) and 1.9e-09 (gamma), and evaluating the
@@ -23,10 +22,9 @@ What the location-scale path reports instead is exactly ``-2 * log-likelihood``:
     LS gamma:     -2 * (-958.9397765607144) = 1917.87955312   (reported)
 
 i.e. the ``n*log(2*pi*sigma^2)`` / ``lgamma`` normalizing terms are folded in and
-the saturated log-likelihood is never subtracted. The binomial row is the
-control that pins the mechanism: for a 0/1 response the saturated
-log-likelihood is 0, so ``2*(l_sat - l)`` and ``-2*l`` coincide, and that is
-precisely the one family whose reported deviance does not move.
+the saturated log-likelihood is never subtracted. (Binomial has no constant-scale
+location-scale counterpart: its sigma is identified only relative to the
+threshold, so ``noise_formula="1"`` is refused there, #3879.)
 
 This breaks every deviance-based comparison across the boundary -- explained
 deviance ``1 - D/D_null``, deviance-difference tests, and any ``compare_models``
@@ -65,7 +63,6 @@ def _data(family: str) -> dict[str, Any]:
     eta = np.sin(2.0 * np.pi * x) + 0.5 * z
     response = {
         "gaussian": lambda: eta + 0.35 * rng.standard_normal(_N),
-        "binomial-logit": lambda: (rng.random(_N) < 1.0 / (1.0 + np.exp(-eta))).astype(float),
         "gamma": lambda: rng.gamma(6.0, np.exp(0.5 + eta) / 6.0),
     }[family]()
     return {"x": x, "z": z, "y": response}
@@ -114,12 +111,4 @@ def test_location_scale_deviance_is_not_minus_two_loglik(family: str) -> None:
         f"{family}: summary().deviance is exactly -2*log_likelihood "
         f"({summary.deviance!r}); the classical deviance subtracts the saturated "
         "log-likelihood and drops the normalizing constants"
-    )
-
-
-def test_binomial_control_is_unaffected() -> None:
-    """0/1 response => saturated loglik is 0 => the two definitions coincide."""
-    standard, location_scale, _ = _pair("binomial-logit")
-    assert float(location_scale.summary().deviance) == pytest.approx(
-        float(standard.summary().deviance), rel=1e-6
     )
