@@ -867,8 +867,15 @@ pub fn build_term_collection_derivative_design(
             // Term does not involve the differentiated covariate ⇒ zero columns.
             continue;
         }
-        let (block, term_affine_derivative) =
-            smooth_term_first_derivative_block(data, termspec, term_value, deriv_col)?;
+        let (block, term_affine_derivative) = smooth_term_first_derivative_block(
+            data,
+            termspec,
+            term_value,
+            deriv_col,
+            &spec.linear_terms,
+            &spec.smooth_terms,
+            &value.smooth.terms,
+        )?;
         let range = (term_value.coeff_range.start + smooth_start)
             ..(term_value.coeff_range.end + smooth_start);
         if block.ncols() != range.len() {
@@ -969,15 +976,27 @@ fn linear_term_derivative_column(
 /// `deriv_col`, aligned column-for-column with that term's value design block.
 ///
 /// Only non-periodic 1-D B-splines are analytically supported. The block is
-/// `B'_raw(x) · M` where `B'_raw` is the raw B-spline basis FIRST DERIVATIVE on
-/// the term's frozen knots/degree and `M = metadata.identifiability_transform`
-/// is the same linear chart the value design applied (see
-/// `build_term_collection_derivative_design`).
+/// `B'_raw(x) · M − C'(x) · R` where `B'_raw` is the raw B-spline basis FIRST
+/// DERIVATIVE on the term's frozen knots/degree, `M =
+/// metadata.identifiability_transform` is the same linear chart the value
+/// design applied (see `build_term_collection_derivative_design`), and `C'·R`
+/// is the derivative of the row-space correction a span-preserving parametric
+/// residualization subtracted from the value block (`X·T − C·R`, #2747). `R`
+/// is frozen training-row data; `C` is `[intercept | owned linear axes | owner
+/// smooth blocks]` rebuilt at these rows, so it moves with `x` and its
+/// derivative is part of the realized block's derivative.
+///
+/// `linear_terms`, `smooth_specs` and `smooth_values` are the whole
+/// collection's, so an owner smooth named by the correction can be
+/// differentiated through this same function.
 fn smooth_term_first_derivative_block(
     data: ArrayView2<'_, f64>,
     termspec: &SmoothTermSpec,
     term_value: &SmoothTerm,
     deriv_col: usize,
+    linear_terms: &[LinearTermSpec],
+    smooth_specs: &[SmoothTermSpec],
+    smooth_values: &[SmoothTerm],
 ) -> Result<(Array2<f64>, Option<Array1<f64>>), BasisError> {
     let feature_col = match &termspec.basis {
         SmoothBasisSpec::BSpline1D { feature_col, .. } => *feature_col,
@@ -1080,7 +1099,119 @@ fn smooth_term_first_derivative_block(
         }
         None => deriv_basis.to_owned(),
     };
+    // The value block is `X·T − C·R` whenever the collection residualized this
+    // term (#2747). `M` above already carries `T`; the correction's derivative
+    // `C'·R` is the half `M` cannot absorb.
+    let block = match term_value.parametric_residualization.as_ref() {
+        None => block,
+        Some(chart) => {
+            let constraint_derivative = constraint_block_first_derivative(
+                data,
+                termspec,
+                chart,
+                deriv_col,
+                linear_terms,
+                smooth_specs,
+                smooth_values,
+            )?;
+            if constraint_derivative.ncols() != chart.correction.nrows()
+                || chart.correction.ncols() != block.ncols()
+            {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "B-spline term '{}': constraint-block derivative has {} columns and the \
+                     derivative block {} columns, but the frozen row-space correction is {}x{}",
+                    termspec.name,
+                    constraint_derivative.ncols(),
+                    block.ncols(),
+                    chart.correction.nrows(),
+                    chart.correction.ncols()
+                )));
+            }
+            block - constraint_derivative.dot(&chart.correction)
+        }
+    };
     Ok((block, affine_derivative))
+}
+
+/// `∂C/∂x_{deriv_col}` for the constraint block `C` a residualized term's
+/// value block was corrected against, in the column order
+/// `build_constraint_block` stacks it: the parametric block (when the chart
+/// says one led), then each owner smooth's realized block in the chart's order.
+///
+/// The parametric block is `[1 | x_c …]` over
+/// [`parametric_constraint_feature_cols`], so its derivative is `1` in the
+/// column of `deriv_col` and `0` elsewhere; a factor-by level's block is a
+/// level indicator, constant in any continuous covariate. An owner's realized
+/// block is differentiated by [`smooth_term_first_derivative_block`] itself,
+/// which refuses any basis it cannot differentiate exactly; an owner that does
+/// not involve `deriv_col` contributes zero columns.
+fn constraint_block_first_derivative(
+    data: ArrayView2<'_, f64>,
+    termspec: &SmoothTermSpec,
+    chart: &ParametricResidualizationChart,
+    deriv_col: usize,
+    linear_terms: &[LinearTermSpec],
+    smooth_specs: &[SmoothTermSpec],
+    smooth_values: &[SmoothTerm],
+) -> Result<Array2<f64>, BasisError> {
+    let n = data.nrows();
+    let mut blocks = Vec::<Array2<f64>>::new();
+    if chart.has_parametric_block {
+        if factor_by_level_gate(termspec).is_some() {
+            blocks.push(Array2::zeros((n, 1)));
+        } else {
+            let parametric_cols = parametric_constraint_feature_cols(linear_terms, termspec);
+            let mut derivative = Array2::<f64>::zeros((n, 1 + parametric_cols.len()));
+            for (j, &col) in parametric_cols.iter().enumerate() {
+                if col == deriv_col {
+                    derivative.column_mut(j + 1).fill(1.0);
+                }
+            }
+            blocks.push(derivative);
+        }
+    }
+    for &owner_idx in &chart.owner_terms {
+        let (Some(owner_spec), Some(owner_value)) =
+            (smooth_specs.get(owner_idx), smooth_values.get(owner_idx))
+        else {
+            return Err(BasisError::InvalidInput(format!(
+                "term '{}' is residualized against owner term {owner_idx}, which is not in the \
+                 collection",
+                termspec.name
+            )));
+        };
+        let width = owner_value.coeff_range.len();
+        if !smooth_term_feature_cols(owner_spec).contains(&deriv_col) {
+            blocks.push(Array2::zeros((n, width)));
+            continue;
+        }
+        let (owner_block, _) = smooth_term_first_derivative_block(
+            data,
+            owner_spec,
+            owner_value,
+            deriv_col,
+            linear_terms,
+            smooth_specs,
+            smooth_values,
+        )?;
+        if owner_block.ncols() != width {
+            return Err(BasisError::DimensionMismatch(format!(
+                "owner term '{}' derivative block has {} columns but its realized block spans {width}",
+                owner_spec.name,
+                owner_block.ncols()
+            )));
+        }
+        blocks.push(owner_block);
+    }
+    let total: usize = blocks.iter().map(|block| block.ncols()).sum();
+    let mut out = Array2::<f64>::zeros((n, total));
+    let mut col_start = 0usize;
+    for block in &blocks {
+        let col_end = col_start + block.ncols();
+        out.slice_mut(s![.., col_start..col_end]).assign(block);
+        col_start = col_end;
+    }
+    Ok(out)
 }
 
 /// Short human-readable label for a smooth basis variant, used only in the
@@ -2373,6 +2504,28 @@ fn factor_by_level_gate(termspec: &SmoothTermSpec) -> Option<(usize, u64)> {
     }
 }
 
+/// The data columns after the intercept in a (non-factor-by) smooth's
+/// parametric constraint block `C = [1 | x_c …]`, in block order. The one
+/// source for that order: the value build stacks `C` from it and the analytic
+/// derivative design differentiates `C` from it, so a correction row `R[j, ·]`
+/// means the same column in both.
+fn parametric_constraint_feature_cols(
+    linear_terms: &[LinearTermSpec],
+    termspec: &SmoothTermSpec,
+) -> Vec<usize> {
+    let feature_cols = smooth_term_feature_cols(termspec);
+    let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(linear_terms, termspec);
+    for linear in linear_terms
+        .iter()
+        .filter(|linear| feature_cols.contains(&linear.feature_col))
+    {
+        if !parametric_cols.contains(&linear.feature_col) {
+            parametric_cols.push(linear.feature_col);
+        }
+    }
+    parametric_cols
+}
+
 fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
@@ -2402,29 +2555,12 @@ fn build_parametric_constraint_block_for_term(
         return Ok(c);
     }
 
-    let feature_cols = smooth_term_feature_cols(termspec);
-    let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(linear_terms, termspec);
+    let parametric_cols = parametric_constraint_feature_cols(linear_terms, termspec);
     for &feature_col in &parametric_cols {
         if feature_col >= p_data {
             gam_problem::bail_dim_basis!(
                 "smooth term feature column {feature_col} out of bounds for {p_data} columns"
             );
-        }
-    }
-    for linear in linear_terms
-        .iter()
-        .filter(|linear| feature_cols.contains(&linear.feature_col))
-    {
-        if linear.feature_col >= p_data {
-            gam_problem::bail_dim_basis!(
-                "linear term '{}' feature column {} out of bounds for {} columns",
-                linear.name,
-                linear.feature_col,
-                p_data
-            );
-        }
-        if !parametric_cols.contains(&linear.feature_col) {
-            parametric_cols.push(linear.feature_col);
         }
     }
 
