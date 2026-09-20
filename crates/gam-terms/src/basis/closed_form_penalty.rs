@@ -1623,6 +1623,460 @@ pub(crate) fn anisotropic_laplacian_of_radial_second(
     part_u1sq + part_s1u1 + part_s1sq + part_u2 + part_s2
 }
 
+// ============================================================
+//  Origin-reduced hybrid pair kernels (gam#2959 M6)
+// ------------------------------------------------------------
+//  The order-q pair kernel is g_q = (−Δ_B)^q f, where f̂ = ρ^{-4m}(κ²+ρ²)^{-2s}
+//  in d dimensions. With Q_j = (R⁻¹∂_R)^j f, the radial derivatives are
+//      f' = R Q_1,  f'' = Q_1 + R² Q_2,  f''' = 3R Q_2 + R³ Q_3,
+//      f'''' = 3 Q_2 + 6 R² Q_3 + R⁴ Q_4,
+//  and the two Laplacian forms above collapse to
+//      Δ_B f  = u_1 Q_2 + s_1 Q_1,
+//      Δ_B² f = u_1² Q_4 + (2 s_1 u_1 + 4 u_2) Q_3 + (s_1² + 2 s_2) Q_2.
+//  These are sums of channels at the pair's own R, with no R⁻ᵏ factors to cancel.
+//  Each channel is the same spectrum one dimension-step up: the radial
+//  transform gives (R⁻¹∂_R) f_d = −2π f_{d+2} (the Matérn block's own
+//  normalization obeys it term by term), so Q_j = (−2π)^j f_{d+2j}. That is the
+//  Schwinger integral of `stable_hybrid_duchon_radial` in dimension d + 2j.
+//
+//  g_q(0) = C_q(s_1, s_2)·Q_q(0), with C_0 = 1, C_1 = −s_1 and C_2 = s_1² + 2 s_2.
+//  It is the same for every pair of one Gram, and on a kernel much longer than
+//  the centres' spread it is nearly all of each entry. On the M6 fixture (order
+//  0, power 9, 3-D), g_1 ≈ g_1(0)(1 − 5·10⁻³χ²). A Gram restricted by the CPD
+//  constraint Z ⟂ 1 annihilates that constant on both sides of ZᵀGZ. The full
+//  entries' rounding then survives, amplified by the ratio and by the Gram's
+//  spectral spread: about 1e-4 relative noise in the emitted tension penalty,
+//  which no finite difference of ∂S/∂ψ can see through. Such a Gram is
+//  assembled from the ORIGIN-REDUCED kernel g_q(z) − g_q(0)
+//  ([`PairOrigin::Reduced`]). It has the same ZᵀGZ. Its slot q carries
+//  Q_q(R) − Q_q(0) as a Schwinger integral of Matérn blocks minus their own
+//  origin values ([`bessel_shape_origin_reduced`]), each without
+//  cancellation, and its diagonal is exactly zero. The closed-form gate
+//  (`duchon_closed_form_operator_penalty_converges`: 4(m+s) > d + 2q > 4m,
+//  2m ≥ q + 1) is what makes every channel j ≥ q convergent (d + 2j > 4m) and
+//  the origin value finite (ν_q = 2(m+s) − (d+2q)/2 > 0).
+//
+//  A Gram used WITHOUT Z needs the full kernel, and keeps the radial-derivative
+//  table ([`PairOrigin::Full`]).
+// ============================================================
+
+/// Which representative of a hybrid pair kernel a Gram is assembled from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairOrigin {
+    /// `g_q(z)`: for a Gram used without a CPD constraint.
+    Full,
+    /// `g_q(z) − g_q(0)`: for a Gram restricted by `Z ⟂ 1`. Z annihilates the
+    /// constant, so the penalty is unchanged.
+    Reduced,
+}
+
+/// The highest channel an order-`q` pair quantity reads: the η-Hessian
+/// differentiates `g_R`, which already carries `Q_{2q+1}`.
+fn reduced_pair_highest_channel(q: usize) -> usize {
+    2 * q + 2
+}
+
+/// The integer Matérn order `s` when `origin` asks for the origin-reduced
+/// kernel of a gated hybrid order: `κ > 0`, integer `s ≥ 1`, and the
+/// closed-form gate. `None` in every other case, including the scale-free and
+/// fractional kernels, which keep the radial-derivative table for both origins.
+pub(crate) fn reduced_pair_channels_apply(
+    q: usize,
+    m: usize,
+    s: f64,
+    kappa: f64,
+    d: usize,
+    origin: PairOrigin,
+) -> Option<usize> {
+    let hybrid = kappa > 0.0 && kappa.is_finite() && s >= 1.0 && s.fract() == 0.0;
+    (origin == PairOrigin::Reduced
+        && hybrid
+        && q <= 2
+        && super::matern_kernel::duchon_closed_form_operator_penalty_converges(q, m, s, d))
+    .then_some(s as usize)
+}
+
+/// `z^ν K_ν(z) − 2^{ν−1} Γ(ν)` for an integer or half-integer `ν > 0`: the
+/// Matérn shape minus its origin value, with relative accuracy at every `z > 0`.
+///
+/// While the shape is above half its origin value the difference is summed
+/// from the ascending series with the constant term left out, so nothing
+/// cancels. For non-integer `ν`, `K_ν = π(I_{−ν} − I_ν)/(2 sin νπ)` gives
+/// `2^{ν−1} Σ_{k≥1} (−1)^k Γ(ν−k) (z²/4)^k / k!
+///  − (π / (2 sin νπ)) 2^{−ν} z^{2ν} Σ_{k≥0} (z²/4)^k / (k! Γ(k+ν+1))`.
+/// For integer `ν = n`, A&S 9.6.11 gives
+/// `2^{n−1} Σ_{k=1}^{n−1} (n−k−1)! (−z²/4)^k / k!
+///  + (−1)^n 2^{−n} z^{2n} Σ_{k≥0} (z²/4)^k [½(ψ(k+1) + ψ(n+k+1)) − ln(z/2)] / (k! (n+k)!)`.
+/// Below half the origin value the plain difference loses at most one bit.
+pub(crate) fn bessel_shape_origin_reduced(nu: f64, z: f64) -> f64 {
+    assert!(
+        nu > 0.0 && (2.0 * nu).fract() == 0.0,
+        "bessel_shape_origin_reduced requires an integer or half-integer ν > 0: ν={nu}"
+    );
+    assert!(
+        z > 0.0 && z.is_finite(),
+        "bessel_shape_origin_reduced requires finite z > 0: z={z}"
+    );
+    let origin_value = ((nu - 1.0) * std::f64::consts::LN_2 + ln_gamma(nu)).exp();
+    // Past z = 1 the shape is bounded by its origin value, so it can be formed
+    // directly without overflow; at or below it the series is used whatever the
+    // shape's size.
+    if z > 1.0 {
+        let shape = z.powf(nu) * bessel_k(nu, z);
+        if shape <= 0.5 * origin_value {
+            return shape - origin_value;
+        }
+    }
+    let quarter = 0.25 * z * z;
+    let mut total = KahanSum::default();
+    if nu.fract() == 0.0 {
+        let n = nu as usize;
+        // Regular part, k = 1..n−1: 2^{n−1} (n−k−1)! (−z²/4)^k / k!.
+        let mut term = origin_value;
+        for k in 1..n {
+            term *= -quarter / (k as f64 * (n - k) as f64);
+            total.add(term);
+        }
+        // Logarithmic part.
+        let log_half = (0.5 * z).ln();
+        let mut weight = 2.0_f64.powi(-(n as i32)) * z.powi(2 * n as i32) / factorial_f64(n);
+        let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+        for k in 0.. {
+            let bracket = 0.5
+                * (super::duchon_psi_derivatives::digamma_pos_int(k + 1)
+                    + super::duchon_psi_derivatives::digamma_pos_int(n + k + 1))
+                - log_half;
+            let contribution = sign * weight * bracket;
+            total.add(contribution);
+            if contribution.abs() <= f64::EPSILON * total.sum().abs() || k >= 200 {
+                break;
+            }
+            weight *= quarter / ((k + 1) as f64 * (n + k + 1) as f64);
+        }
+    } else {
+        // Regular part, k ≥ 1: 2^{ν−1} (−1)^k Γ(ν−k) (z²/4)^k / k!. Past
+        // k > ν the Γ(ν − k) shrink factorially, so the tail is short.
+        let mut term = origin_value;
+        let mut k = 1_usize;
+        loop {
+            term *= -quarter / (k as f64 * (nu - k as f64));
+            total.add(term);
+            if (k as f64 > nu && term.abs() <= f64::EPSILON * total.sum().abs()) || k >= 400 {
+                break;
+            }
+            k += 1;
+        }
+        // z^{2ν} part: π / (2 sin νπ) = ±π/2 for half-integer ν.
+        let sin_sign = if ((nu - 0.5) as i64) % 2 == 0 { 1.0 } else { -1.0 };
+        let mut weight = -0.5 * std::f64::consts::PI * sin_sign
+            * (2.0 * z.ln() * nu - nu * std::f64::consts::LN_2 - ln_gamma(nu + 1.0)).exp();
+        for k in 0.. {
+            total.add(weight);
+            if weight.abs() <= f64::EPSILON * total.sum().abs() || k >= 200 {
+                break;
+            }
+            weight *= quarter / ((k + 1) as f64 * (k as f64 + nu + 1.0));
+        }
+    }
+    total.sum()
+}
+
+/// The shifted radial channels `Q_0, …, Q_{2q+2}` of one gated hybrid pair
+/// kernel, origin-reduced at slot `q` (see the section note above). Slots
+/// below `q` are zero; no quantity of order `q` reads them.
+pub(crate) struct ReducedPairChannels {
+    q: usize,
+    d: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+}
+
+impl ReducedPairChannels {
+    pub(crate) fn new(q: usize, d: usize, m: usize, s: usize, kappa: f64) -> Self {
+        Self { q, d, m, s, kappa }
+    }
+
+    /// `[Q_0, …, Q_{2q+2}]` at `R > 0`, with `Q_q(R) − Q_q(0)` in slot `q`.
+    ///
+    /// One pass of the 64-point Schwinger rule of
+    /// [`stable_hybrid_duchon_radial`] (the same nodes, weights and `t = 1 − u²`
+    /// substitution) evaluates every channel: node `u` contributes the Matérn
+    /// block of order `n = 2(m+s)` and inverse length `uκ` in dimension `d + 2j`,
+    /// minus its origin value in slot `q`.
+    pub(crate) fn values(&self, big_r: f64) -> Vec<f64> {
+        let highest = reduced_pair_highest_channel(self.q);
+        let p_eff = 2 * self.m;
+        let q_eff = 2 * self.s;
+        let order = (p_eff + q_eff) as f64;
+        let inv_beta =
+            (ln_gamma(order) - ln_gamma(p_eff as f64) - ln_gamma(q_eff as f64)).exp();
+        let (nodes, weights) = gauss_legendre_64();
+        let mut accum = vec![KahanSum::default(); highest + 1];
+        for (xi, wi) in nodes.iter().zip(weights.iter()) {
+            let u = 0.5 * (1.0 + xi);
+            if u <= 0.0 || u >= 1.0 {
+                continue;
+            }
+            let kappa_u = u * self.kappa;
+            let weight =
+                wi * (1.0 - u * u).powi((p_eff - 1) as i32) * u.powi((2 * q_eff - 1) as i32);
+            let z = kappa_u * big_r;
+            for j in self.q..=highest {
+                let half_dim = 0.5 * (self.d + 2 * j) as f64;
+                let nu = order - half_dim;
+                // κ_u^{d/2−n} / ((2π)^{d/2} 2^{n−1} Γ(n)), the Matérn block prefactor.
+                let ln_pref = (half_dim - order) * kappa_u.ln()
+                    - half_dim * (2.0 * std::f64::consts::PI).ln()
+                    - (order - 1.0) * std::f64::consts::LN_2
+                    - ln_gamma(order);
+                let block = if j == self.q {
+                    (ln_pref - nu * kappa_u.ln()).exp() * bessel_shape_origin_reduced(nu, z)
+                } else {
+                    (ln_pref + nu * big_r.ln()).exp() * bessel_k(nu, z)
+                };
+                accum[j].add(weight * block);
+            }
+        }
+        (0..=highest)
+            .map(|j| {
+                if j < self.q {
+                    0.0
+                } else {
+                    (-2.0 * std::f64::consts::PI).powi(j as i32) * inv_beta * accum[j].sum()
+                }
+            })
+            .collect()
+    }
+
+    /// The homogeneity degree `δ_j = d + 2j − 4(m + s)` of channel `j`.
+    fn degree(&self, j: usize) -> f64 {
+        (self.d + 2 * j) as f64 - 4.0 * (self.m + self.s) as f64
+    }
+
+    /// `∂/∂κ` and `∂²/∂κ²` of [`Self::values`] at the same `R`.
+    ///
+    /// `Q_j = κ^{δ_j} G_j(κR)`, so `L = ∂/∂ln κ` acts as
+    /// `L Q_j = δ_j Q_j + R² Q_{j+1}`. The origin-reduced slot obeys the same
+    /// law, because `L Q_q(0) = δ_q Q_q(0)`. Then `∂_κ = L/κ` and
+    /// `∂²_κ = (L² − L)/κ²`. `L` needs the channel above, so the top slot of the
+    /// first derivative and the top two of the second are zero. No quantity of
+    /// order `q` reads them: values read `Q_{≤2q}` and first partials `Q_{≤2q+1}`.
+    pub(crate) fn kappa_derivatives(&self, big_r: f64, values: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        let n = values.len();
+        let r2 = big_r * big_r;
+        let mut first_log = vec![0.0_f64; n];
+        for j in self.q..n.saturating_sub(1) {
+            first_log[j] = self.degree(j) * values[j] + r2 * values[j + 1];
+        }
+        let mut second_log = vec![0.0_f64; n];
+        for j in self.q..n.saturating_sub(2) {
+            second_log[j] = self.degree(j) * first_log[j] + r2 * first_log[j + 1];
+        }
+        let inverse = 1.0 / self.kappa;
+        let first = first_log.iter().map(|value| value * inverse).collect();
+        let second = (0..n)
+            .map(|j| (second_log[j] - first_log[j]) * inverse * inverse)
+            .collect();
+        (first, second)
+    }
+}
+
+/// The self-pair bundle of a hybrid pair block for `origin`. The origin-reduced
+/// kernel of a gated order vanishes at `z = 0` with every derivative; every
+/// other case is [`analytic_self_pair_bundle`] (or none).
+pub(crate) fn self_pair_bundle(
+    q: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+    eta: &[f64],
+    origin: PairOrigin,
+) -> Option<PairBlockBundle> {
+    let d = eta.len();
+    if reduced_pair_channels_apply(q, m, s as f64, kappa, d, origin).is_some() {
+        return Some(PairBlockBundle {
+            value: 0.0,
+            d_eta: vec![0.0; d],
+            d_kappa: 0.0,
+            d2_eta: vec![vec![0.0; d]; d],
+            d2_eta_kappa: vec![0.0; d],
+            d2_kappa: 0.0,
+        });
+    }
+    analytic_self_pair_bundle(q, m, s, kappa, eta)
+}
+
+/// The bare pair kernel `g_q(z)` for [`PairOrigin::Full`], or `g_q(z) − g_q(0)`
+/// for [`PairOrigin::Reduced`] where the gated channels apply (see the section
+/// note above). Matrix entries multiply it by `J = exp(Σ η)`.
+pub(crate) fn duchon_pair_kernel_with_powers(
+    q: usize,
+    m: usize,
+    s: f64,
+    kappa: f64,
+    eta: &[f64],
+    powers: &AnisoMetricPowers,
+    r: &[f64],
+    origin: PairOrigin,
+) -> f64 {
+    let d = r.len();
+    let Some(s_int) = reduced_pair_channels_apply(q, m, s, kappa, d, origin) else {
+        return anisotropic_duchon_penalty_radial_with_powers(q, m, s, kappa, eta, powers, r);
+    };
+    assert_eq!(
+        eta.len(),
+        d,
+        "duchon_pair_kernel_with_powers: eta and r dimension mismatch"
+    );
+    powers.assert_dim(d);
+    if is_zero_lag(r) {
+        return 0.0;
+    }
+    let (big_r, s1, s2, u1, u2) = aniso_invariants_with_powers(powers, r);
+    let channels = ReducedPairChannels::new(q, d, m, s_int, kappa).values(big_r);
+    reduced_g_q_partials(q, big_r, s1, s2, u1, u2, &channels).0
+}
+
+/// `(g, g_R, g_s1, g_s2, g_u1, g_u2)` of the pair kernel on shifted channels
+/// `c = [Q_0, …]` ([`ReducedPairChannels::values`]), with `∂_R Q_j = R Q_{j+1}`.
+/// It is linear in `c`, so the same map sends the channels' κ derivatives to
+/// the partials' κ derivatives.
+pub(crate) fn reduced_g_q_partials(
+    q: usize,
+    big_r: f64,
+    s1: f64,
+    s2: f64,
+    u1: f64,
+    u2: f64,
+    c: &[f64],
+) -> (f64, f64, f64, f64, f64, f64) {
+    let r = big_r;
+    match q {
+        0 => (c[0], r * c[1], 0.0, 0.0, 0.0, 0.0),
+        1 => {
+            let g = -(u1 * c[2] + s1 * c[1]);
+            let g_r = -r * (u1 * c[3] + s1 * c[2]);
+            (g, g_r, -c[1], 0.0, -c[2], 0.0)
+        }
+        2 => {
+            let a = 2.0 * s1 * u1 + 4.0 * u2;
+            let b = s1 * s1 + 2.0 * s2;
+            let g = u1 * u1 * c[4] + a * c[3] + b * c[2];
+            let g_r = r * (u1 * u1 * c[5] + a * c[4] + b * c[3]);
+            let g_s1 = 2.0 * u1 * c[3] + 2.0 * s1 * c[2];
+            let g_s2 = 2.0 * c[2];
+            let g_u1 = 2.0 * u1 * c[4] + 2.0 * s1 * c[3];
+            let g_u2 = 4.0 * c[3];
+            (g, g_r, g_s1, g_s2, g_u1, g_u2)
+        }
+        // SAFETY: `q ∈ {0, 1, 2}` is asserted by every pair-kernel entry point.
+        _ => panic!("reduced_g_q_partials requires q in {{0, 1, 2}}: q={q}"),
+    }
+}
+
+/// The upper triangle of the Hessian of [`reduced_g_q_partials`]' `g` in
+/// `(R, s_1, s_2, u_1, u_2)`, in `radial_g_q_hessian`'s order. Of the pure
+/// invariant entries only `g_s1s1 = 2Q_2`, `g_s1u1 = 2Q_3` and `g_u1u1 = 2Q_4`,
+/// all at `q = 2`, are nonzero.
+pub(crate) fn reduced_g_q_hessian(
+    q: usize,
+    big_r: f64,
+    s1: f64,
+    s2: f64,
+    u1: f64,
+    u2: f64,
+    c: &[f64],
+) -> (
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+) {
+    let r = big_r;
+    let r2 = r * r;
+    match q {
+        0 => (
+            c[1] + r2 * c[2],
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ),
+        1 => {
+            let g_rr = -(u1 * (c[3] + r2 * c[4]) + s1 * (c[2] + r2 * c[3]));
+            (
+                g_rr,
+                -r * c[2],
+                0.0,
+                -r * c[3],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        }
+        2 => {
+            let a = 2.0 * s1 * u1 + 4.0 * u2;
+            let b = s1 * s1 + 2.0 * s2;
+            let g_rr = (u1 * u1 * c[5] + a * c[4] + b * c[3])
+                + r2 * (u1 * u1 * c[6] + a * c[5] + b * c[4]);
+            let g_r_s1 = r * (2.0 * u1 * c[4] + 2.0 * s1 * c[3]);
+            let g_r_s2 = r * 2.0 * c[3];
+            let g_r_u1 = r * (2.0 * u1 * c[5] + 2.0 * s1 * c[4]);
+            let g_r_u2 = r * 4.0 * c[4];
+            (
+                g_rr,
+                g_r_s1,
+                g_r_s2,
+                g_r_u1,
+                g_r_u2,
+                2.0 * c[2],
+                0.0,
+                2.0 * c[3],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                2.0 * c[4],
+                0.0,
+                0.0,
+            )
+        }
+        // SAFETY: `q ∈ {0, 1, 2}` is asserted by every pair-kernel entry point.
+        _ => panic!("reduced_g_q_hessian requires q in {{0, 1, 2}}: q={q}"),
+    }
+}
+
+
 pub(crate) fn aniso_invariants_with_powers(
     powers: &AnisoMetricPowers,
     r: &[f64],
@@ -2180,6 +2634,9 @@ pub(crate) fn aniso_invariants_eta_jacobian_with_powers(
     (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de)
 }
 
+/// The pair block with its η and κ derivatives for `origin`: the full block, or
+/// the origin-reduced one that a CPD-restricted Gram is assembled from (see the
+/// section note on `ReducedPairChannels`).
 pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     q: usize,
     m: usize,
@@ -2188,6 +2645,7 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     eta: &[f64],
     powers: &AnisoMetricPowers,
     r: &[f64],
+    origin: PairOrigin,
 ) -> PairBlockBundle {
     assert_eq!(
         eta.len(),
@@ -2207,7 +2665,7 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     let (big_r_check, _, _, _, _) = aniso_invariants_with_powers(powers, r);
     let analytic_first_ok = big_r_check > 0.0;
     if big_r_check == 0.0
-        && let Some(bundle) = analytic_self_pair_bundle(q, m, s, kappa, eta)
+        && let Some(bundle) = self_pair_bundle(q, m, s, kappa, eta, origin)
     {
         return bundle;
     }
@@ -2228,8 +2686,30 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     let max_order_h = (2 * q + 2).min(6);
     let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
         aniso_invariants_eta_jacobian_with_powers(eta, r, powers);
-    let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h);
-    let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
+    // The origin-reduced kernel of a gated hybrid order is read on its shifted
+    // channels (see `ReducedPairChannels`), whose κ derivatives follow from
+    // homogeneity. Every other case keeps the radial-derivative table. Both feed
+    // the chain rule below, since every partial is linear in its table.
+    let reduced = reduced_pair_channels_apply(q, m, s as f64, kappa, d, origin)
+        .map(|s_int| ReducedPairChannels::new(q, d, m, s_int, kappa));
+    let fr = match &reduced {
+        Some(channels) => channels.values(big_r),
+        None => {
+            radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h)
+        }
+    };
+    let (reduced_first, reduced_second) = reduced
+        .as_ref()
+        .map(|channels| channels.kappa_derivatives(big_r, &fr))
+        .unzip();
+    let partials = |table: &[f64]| {
+        if reduced.is_some() {
+            reduced_g_q_partials(q, big_r, s1, s2, u1, u2, table)
+        } else {
+            radial_g_q_partials(q, big_r, s1, s2, u1, u2, table)
+        }
+    };
+    let (g, g_r, g_s1, g_s2, g_u1, g_u2) = partials(&fr);
     let big_j = eta.iter().sum::<f64>().exp();
     let value = big_j * g;
 
@@ -2248,7 +2728,9 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     // ∂_κ. Analytic via chain rule on F^{(k)}: only the radial-derivative
     // table depends on κ, the invariants (R, s_1, s_2, u_1, u_2) do not.
     // ∂_κ (J · g_q) = J · g_q evaluated with fr replaced by ∂_κ fr.
-    let dfr = if s != 0 && kappa != 0.0 {
+    let dfr = if reduced_first.is_some() {
+        reduced_first
+    } else if s != 0 && kappa != 0.0 {
         let max_order = 2 * q + 1;
         Some(radial_derivatives_of_isotropic_duchon_kappa_partial(
             d, m, s, kappa, big_r, max_order,
@@ -2261,7 +2743,7 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
         // in place of F^{(k)}; the (R, ..., u2) factors are κ-independent.
         // Because g_q is linear in each F^{(k)} for q ∈ {0, 1, 2}, the
         // partial helper applied to ∂_κ F gives ∂_κ g_q.
-        let (dg, _, _, _, _, _) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, dfr);
+        let (dg, _, _, _, _, _) = partials(dfr);
         big_j * dg
     } else {
         0.0
@@ -2272,7 +2754,9 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     // ∂²_κ (J · g_q) = J · g_q evaluated with fr replaced by ∂²_κ fr.
     // Linearity of g_q in each f^{(k)} for q ∈ {0, 1, 2} lets us reuse
     // `radial_g_q_partials` directly on the second-κ-partial table.
-    let d2_kappa = if s != 0 && kappa != 0.0 {
+    let d2_kappa = if let Some(second) = &reduced_second {
+        big_j * partials(second).0
+    } else if s != 0 && kappa != 0.0 {
         let max_order = 2 * q + 1;
         let ddfr =
             radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, big_r, max_order);
@@ -2314,7 +2798,11 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
         g_u1u1,
         _g_u1u2,
         _g_u2u2,
-    ) = radial_g_q_hessian(q, big_r, s1, s2, u1, u2, &fr);
+    ) = if reduced.is_some() {
+        reduced_g_q_hessian(q, big_r, s1, s2, u1, u2, &fr)
+    } else {
+        radial_g_q_hessian(q, big_r, s1, s2, u1, u2, &fr)
+    };
     // Per-axis ∂_{η_l} g (recompute; cheap).
     let bare_d_eta_g: Vec<f64> = (0..d)
         .map(|l| {
@@ -2395,8 +2883,7 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     //                  + (∂_κ g_s1) · ∂s1/∂η_l + (∂_κ g_s2) · ∂s2/∂η_l
     //                  + (∂_κ g_u1) · ∂u1/∂η_l + (∂_κ g_u2) · ∂u2/∂η_l.
     if let Some(dfr) = &dfr {
-        let (dg, dg_r, dg_s1, dg_s2, dg_u1, dg_u2) =
-            radial_g_q_partials(q, big_r, s1, s2, u1, u2, dfr);
+        let (dg, dg_r, dg_s1, dg_s2, dg_u1, dg_u2) = partials(dfr);
         for l in 0..d {
             let bare_cross = dg_r * dr_de[l]
                 + dg_s1 * ds1_de[l]
@@ -2706,5 +3193,112 @@ mod tests {
                 "nu={nu} left={left} right={right} diff={diff}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod origin_reduced_pair_tests {
+    use super::*;
+
+    /// Every component of a pair-block bundle, flattened in one fixed order.
+    fn components(bundle: &PairBlockBundle) -> Vec<f64> {
+        let mut out = vec![bundle.value, bundle.d_kappa, bundle.d2_kappa];
+        out.extend(&bundle.d_eta);
+        out.extend(&bundle.d2_eta_kappa);
+        for row in &bundle.d2_eta {
+            out.extend(row);
+        }
+        out
+    }
+
+    /// The half-order shape is `√(π/2) e^{−z}`, so its origin-reduced value is
+    /// `√(π/2)·expm1(−z)`, correct to about one ulp. The series side (`z ≤ 1`)
+    /// sums terms whose magnitudes total `(e^{z} − 1)/(1 − e^{−z}) = e^{z} ≤ e`
+    /// times the result. Each term carries at most `8ε`: `2ε` from the origin
+    /// value `exp((ν−1)·ln 2 + ln Γ(ν))`, `3ε` from the exp-log form of the
+    /// `z^{2ν}` prefactor, `2ε` from its recurrence and `ε` from the compensated
+    /// sum. So `8e·ε < 24ε` bounds the relative error there. The direct side
+    /// (`z > 1`, shape at most half its origin value) divides a few-ulp
+    /// difference by at least half the origin value, which stays inside that bound.
+    #[test]
+    fn bessel_shape_origin_reduced_matches_the_half_order_closed_form() {
+        let root = (0.5 * std::f64::consts::PI).sqrt();
+        for &z in &[1e-6_f64, 1e-3, 0.05, 0.3, 0.69, 0.7, 1.0, 1.5, 3.0, 9.0, 40.0] {
+            let reduced = bessel_shape_origin_reduced(0.5, z);
+            let exact = root * (-z).exp_m1();
+            let rel = (reduced - exact).abs() / exact.abs();
+            assert!(
+                rel <= 24.0 * f64::EPSILON,
+                "z={z}: reduced {reduced:.17e} vs √(π/2)·expm1(−z) {exact:.17e} (rel {rel:.3e})"
+            );
+        }
+    }
+
+    /// The origin-reduced pair block is the full block minus its own self-pair,
+    /// component by component: `g_q(z) − g_q(0)` with every η and κ derivative.
+    /// The two sides share no evaluation. The reduced block is read on the
+    /// shifted Schwinger channels with a series-subtracted origin. The full block
+    /// comes from the radial-derivative table, and the self-pair from its
+    /// odd-dimensional closed form. The lags sit at `κR ≥ 1`, where the table is
+    /// conditioned, and the metric is anisotropic. The orders keep `s ≤ 3`: the
+    /// closed-form self-pair is a partial-fraction sum over the doubled orders, and
+    /// at `s = 9` its own rounding reaches 3e-9 in the η-Hessian. The measured
+    /// worst component over these orders is 5.3e-12 (a `q = 2`, `d = 9` η-Hessian
+    /// entry), and the bar is ten times that.
+    #[test]
+    fn reduced_pair_block_is_the_full_block_minus_its_self_pair() {
+        let mut failures = Vec::new();
+        for &(q, m, s, d, kappa) in &[
+            (0usize, 1usize, 1usize, 5usize, 0.7_f64),
+            (1, 1, 2, 5, 0.6),
+            (1, 1, 3, 7, 1.3),
+            (2, 2, 2, 9, 0.9),
+            (2, 2, 3, 11, 0.8),
+        ] {
+            assert!(
+                reduced_pair_channels_apply(q, m, s as f64, kappa, d, PairOrigin::Reduced).is_some(),
+                "q={q} m={m} s={s} d={d} must be a gated hybrid order"
+            );
+            let eta: Vec<f64> = (0..d).map(|axis| 0.15 * (1.3 * axis as f64).sin()).collect();
+            let powers = AnisoMetricPowers::new(&eta);
+            let self_pair = components(
+                &analytic_self_pair_bundle(q, m, s, kappa, &eta)
+                    .expect("an odd-dimensional gated order has a closed-form self-pair"),
+            );
+            let mut worst = (0.0_f64, 0usize, 0.0_f64);
+            for &chi in &[1.0_f64, 2.0, 4.0] {
+                let r: Vec<f64> = (0..d)
+                    .map(|axis| chi / kappa * (1.0 + 0.3 * axis as f64).sqrt() / (d as f64).sqrt())
+                    .collect();
+                let bundle = |origin| {
+                    components(&pair_block_radial_with_j_second_derivatives_with_powers(
+                        q, m, s, kappa, &eta, &powers, &r, origin,
+                    ))
+                };
+                let full = bundle(PairOrigin::Full);
+                let reduced = bundle(PairOrigin::Reduced);
+                for (index, ((&full, &reduced), &own)) in
+                    full.iter().zip(&reduced).zip(&self_pair).enumerate()
+                {
+                    let scale = full.abs().max(own.abs()).max(f64::MIN_POSITIVE);
+                    let gap = (reduced - (full - own)).abs() / scale;
+                    if gap > worst.0 {
+                        worst = (gap, index, chi);
+                    }
+                }
+            }
+            eprintln!(
+                "[origin-reduced] q={q} m={m} s={s} d={d} κ={kappa}: worst relative gap {:.3e} (component {}, κR={})",
+                worst.0, worst.1, worst.2
+            );
+            if worst.0 > 5e-11 {
+                failures.push(format!("q={q} m={m} s={s} d={d} κ={kappa}: {:.3e}", worst.0));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "reduced block differs from full − self-pair: {}",
+            failures.join("; ")
+        );
     }
 }

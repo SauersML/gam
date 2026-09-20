@@ -61,7 +61,7 @@ use gam_models::inference::model::{
 use gam_problem::{BlockRole, EstimationError};
 use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::constrained_posterior::{
-    ConstrainedPosteriorGeometry, ConstrainedProjectionLaw,
+    ConstrainedPosteriorGeometry, ConstrainedProjectionLaw, constrained_posterior_correction,
     constrained_posterior_correction_from_covariance,
 };
 use gam_solve::mixture_link::{
@@ -377,6 +377,11 @@ fn selected_uncertainty_backend<'a>(
                     InferenceCovarianceMode::SmoothingCorrected,
                 ));
             }
+            // A fit whose inference stayed factorized carries `Vp = Vb + B·Bᵀ`
+            // as the correction's factor beside its Hessian (#3283).
+            if let Some(backend) = smoothing_corrected_factorized_backend(fit, expected_dim, label)? {
+                return Ok((backend, InferenceCovarianceMode::SmoothingCorrected));
+            }
             // With no smoothing coordinates the correction J Var(rho) Jᵀ is
             // the unique zero-dimensional zero matrix, so Vp = Vb exactly. A
             // persisted dense Vb was returned above by
@@ -406,6 +411,105 @@ fn selected_uncertainty_backend<'a>(
             ))
         }
     }
+}
+
+/// The smoothing-corrected law `Vp = Vb + B·Bᵀ` of a fit whose inference
+/// stayed factorized (#3283), applied through the saved penalized Hessian's
+/// factor with the correction's factor `B` beside it. A constrained fit's law
+/// is the truncation at `Vp`'s own lift, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`: the
+/// construction the fit published its corrected standard errors from. `None`
+/// when the fit carries no factorized correction.
+pub fn smoothing_corrected_factorized_backend<'a>(
+    fit: &'a UnifiedFitResult,
+    expected_dim: usize,
+    label: &str,
+) -> Result<Option<PredictionCovarianceBackend<'a>>, EstimationError> {
+    let Some(factorized) = fit.smoothing_correction_factorized() else {
+        return Ok(None);
+    };
+    fit.require_posterior_mean(label)?;
+    let (hessian, gauge_lift) =
+        usable_penalized_hessian(fit, expected_dim, label).ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "{label}: the fit carries a factorized smoothing correction but no usable \
+                 penalized Hessian to apply it with"
+            ))
+        })?;
+    let gauge = fit.geometry.as_ref().map(|geometry| &geometry.coefficient_gauge);
+    let active_factor = match gauge {
+        Some(gauge) => reduced_factor(gauge, &factorized.factor)?,
+        None => factorized.factor.clone(),
+    };
+    let posterior = fit
+        .geometry
+        .as_ref()
+        .and_then(|geometry| geometry.constrained_posterior.as_ref())
+        .filter(|posterior| posterior.decline().is_none());
+    let scale = fit.coefficient_covariance_scale()?;
+    let backend = PredictionCovarianceBackend::from_factorized_hessian_scaled(
+        SymmetricMatrix::Dense(hessian.clone()),
+        scale,
+    )
+    .and_then(|backend| {
+        backend.with_smoothing_correction(active_factor, |ambient| match posterior {
+            Some(posterior) => {
+                let marginal_times_constraints =
+                    ambient.apply_ambient_active(&posterior.constraints.a.t().to_owned())?;
+                constrained_posterior_correction(
+                    marginal_times_constraints.view(),
+                    posterior.unconstrained_center()?,
+                    &posterior.constraints,
+                )
+            }
+            None => Ok(None),
+        })
+    })
+    .and_then(|backend| match gauge_lift {
+        Some(lift) => backend.with_gauge_lift(lift),
+        None => Ok(backend),
+    })
+    .map_err(|reason| {
+        EstimationError::InvalidInput(format!(
+            "{label}: the factorized smoothing-corrected covariance could not be built: {reason}"
+        ))
+    })?;
+    Ok(Some(backend))
+}
+
+/// Carry a square-root factor saved in the raw frame (`B_raw = T·B`, so that
+/// `B_raw·B_rawᵀ = T·(B·Bᵀ)·Tᵀ` is the gauge congruence every saved
+/// covariance-like matrix receives) back into the active frame:
+/// `B = T⁺·B_raw`, `T⁺ = (TᵀT)⁻¹Tᵀ`, exact because `T` has full column rank
+/// ([`reduced_bilinear_form`] for the factor).
+fn reduced_factor(
+    gauge: &gam_problem::gauge::Gauge,
+    raw: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    if raw.nrows() != gauge.raw_total() {
+        return Err(EstimationError::InvalidInput(format!(
+            "raw-frame factor has {} rows but the coefficient gauge lifts {} rows",
+            raw.nrows(),
+            gauge.raw_total()
+        )));
+    }
+    if gauge.is_identity() {
+        return Ok(raw.clone());
+    }
+    let t = &gauge.t_full;
+    let gram = t.t().dot(t);
+    let factor = gram.cholesky(Side::Lower).map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "coefficient gauge Gram matrix is not positive definite: {error:?}"
+        ))
+    })?;
+    let projected = t.t().dot(raw);
+    let mut reduced = Array2::<f64>::zeros((gauge.reduced_total(), raw.ncols()));
+    for column in 0..raw.ncols() {
+        reduced
+            .column_mut(column)
+            .assign(&factor.solvevec(&projected.column(column).to_owned()));
+    }
+    Ok(reduced)
 }
 
 /// Source of posterior covariance for uncertainty prediction.
@@ -1861,15 +1965,27 @@ fn constrained_law<'a>(
             geometry: std::borrow::Cow::Borrowed(posterior),
         }),
         InferenceCovarianceMode::SmoothingCorrected => {
-            let correction = fit.smoothing_correction().ok_or_else(|| {
-                EstimationError::InvalidInput(match fit.smoothing_correction_absence() {
-                    Some(absence) => format!(
-                        "fit result does not contain smoothing-corrected covariance: {absence}"
-                    ),
-                    None => "fit result does not contain smoothing-corrected covariance".to_string(),
-                })
-            })?;
-            let correction = reduced_bilinear_form(&geometry.coefficient_gauge, correction)?;
+            // The factorized branch keeps the correction as its factor `B`,
+            // `C = B·Bᵀ` (#3283); this law is dense in the active frame anyway.
+            let correction = match (fit.smoothing_correction(), fit.smoothing_correction_factorized()) {
+                (Some(correction), _) => reduced_bilinear_form(&geometry.coefficient_gauge, correction)?,
+                (None, Some(factorized)) => {
+                    let factor = reduced_factor(&geometry.coefficient_gauge, &factorized.factor)?;
+                    factor.dot(&factor.t())
+                }
+                (None, None) => {
+                    return Err(EstimationError::InvalidInput(
+                        match fit.smoothing_correction_absence() {
+                            Some(absence) => format!(
+                                "fit result does not contain smoothing-corrected covariance: \
+                                 {absence}"
+                            ),
+                            None => "fit result does not contain smoothing-corrected covariance"
+                                .to_string(),
+                        },
+                    ));
+                }
+            };
             if correction.dim() != conditional.dim() {
                 return Err(EstimationError::InvalidInput(format!(
                     "smoothing correction is {:?} against a {:?} constrained ambient covariance",
@@ -3511,6 +3627,7 @@ mod tests {
             reparam_qs: None,
             dispersion: gam_problem::Dispersion::UNIT,
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -3553,6 +3670,114 @@ mod tests {
         let expected_upper = 2.0 * standard_normal_quantile(0.9875).expect("upper quantile");
         assert!((lower - expected_lower).abs() < 1e-12);
         assert!((upper - expected_upper).abs() < 1e-12);
+    }
+
+    /// #3283: the twin of [`smoothing_corrected_half_normal_fit`] whose
+    /// inference stayed factorized. It publishes no covariance: its standard
+    /// errors, the corrected ones beside them, and the correction as its
+    /// square-root factor `B`, `B·Bᵀ = C`.
+    fn factorized_smoothing_corrected_half_normal_fit(
+        ambient_variance: f64,
+        factor: f64,
+    ) -> UnifiedFitResult {
+        let mut fit = smoothing_corrected_half_normal_fit(ambient_variance);
+        let conditional = fit.beta_standard_errors().expect("conditional standard errors");
+        let corrected = fit
+            .beta_standard_errors_corrected()
+            .expect("smoothing-corrected standard errors");
+        fit.covariance_conditional = None;
+        fit.covariance_corrected = None;
+        let inference = fit.inference.as_mut().expect("fit inference");
+        inference.smoothing_correction = None;
+        inference.smoothing_correction_first_order = None;
+        inference.smoothing_correction_method_first_order = None;
+        inference.factorized_standard_errors = Some(conditional);
+        inference.smoothing_correction_factorized =
+            Some(gam_solve::model_types::FactorizedSmoothingCorrection {
+                factor: array![[factor]],
+                standard_errors: corrected,
+            });
+        fit
+    }
+
+    /// #3283: a fit whose inference stayed factorized applies the
+    /// smoothing-corrected law it published, `Vp = Vb + B·Bᵀ` truncated at its
+    /// own lift, not a refusal and not the conditional law.
+    ///
+    /// `B = 3/4`, `C = B·Bᵀ = 9/16`, `Vb = H⁻¹ = 1` and `W = Vp = 25/16` are
+    /// exact in binary, and so are `√W = 5/4` and the lift `G = W/(√W·√W) = 1`.
+    /// Both routes hand the same ambient `Vp·Aᵀ = W` to the same moment
+    /// computation and read the same `Δ`, and differ only in how the truncated
+    /// variance is assembled. The factorized backend forms `W − G·Δ·G`, one
+    /// rounded subtraction `C = fl(W − Δ)`. The published dense matrix
+    /// (`truncated_covariance_psd`) forms `(P·√W)² + (G·√C)²` with
+    /// `P = 1 − G = 0` exactly, from the same `C`, so it adds one correctly
+    /// rounded square root and one correctly rounded square,
+    /// `C·(1 + 2δ₁ + δ₂)` with `|δ| ≤ ε/2`: at most `1.5·ε` relative, inside the
+    /// `2·ε` bar below.
+    #[test]
+    fn a_factorized_fit_applies_the_smoothing_corrected_law_it_published_3283() {
+        let dense = smoothing_corrected_half_normal_fit(1.5625);
+        let factorized = factorized_smoothing_corrected_half_normal_fit(1.5625, 0.75);
+        assert_eq!(
+            factorized.published_covariance_mode(),
+            InferenceCovarianceMode::SmoothingCorrected,
+            "the factorized fit publishes the corrected definition it carries"
+        );
+        let eye = Array2::<f64>::eye(1);
+        let (dense_backend, _) = selected_uncertainty_backend(
+            &dense,
+            1,
+            InferenceCovarianceMode::SmoothingCorrected,
+            "3283 dense",
+        )
+        .expect("the dense fit's corrected backend");
+        let (factorized_backend, source) = selected_uncertainty_backend(
+            &factorized,
+            1,
+            InferenceCovarianceMode::SmoothingCorrected,
+            "3283 factorized",
+        )
+        .expect("the factorized fit's corrected backend");
+        assert_eq!(source, InferenceCovarianceMode::SmoothingCorrected);
+        let published = dense_backend.apply_columns(&eye).expect("dense Vp")[[0, 0]];
+        let applied = factorized_backend
+            .apply_columns(&eye)
+            .expect("factorized Vp")[[0, 0]];
+        assert!(
+            (applied - published).abs() <= 2.0 * f64::EPSILON * published,
+            "the factorized law's truncated Vp is {applied:.17e}; the published dense Vp is \
+             {published:.17e}"
+        );
+        let corrected = factorized
+            .beta_standard_errors_corrected()
+            .expect("corrected standard errors")[0];
+        assert_eq!(corrected, published.sqrt(), "the fit's corrected standard error");
+
+        // The dense constrained law rebuilds its ambient `Vb + B·Bᵀ` from the
+        // factor exactly.
+        let geometry = factorized.geometry.as_ref().expect("fit geometry");
+        let law = constrained_law(
+            &factorized,
+            geometry,
+            InferenceCovarianceMode::SmoothingCorrected,
+        )
+        .expect("the factorized fit's smoothing-corrected constrained law");
+        assert_eq!(law.ambient, array![[1.5625]]);
+
+        // Without constraints the backend is `Vb + B·Bᵀ`, exact here.
+        let mut unconstrained = factorized.clone();
+        if let Some(geometry) = unconstrained.geometry.as_mut() {
+            geometry.constrained_posterior = None;
+        }
+        let (backend, _) = selected_uncertainty_backend(
+            &unconstrained,
+            1,
+            InferenceCovarianceMode::SmoothingCorrected,
+            "3283 unconstrained",
+        )
+        .expect("the unconstrained factorized corrected backend");
+        assert_eq!(backend.apply_columns(&eye).expect("Vp")[[0, 0]], 1.5625);
     }
 
     #[test]
@@ -4296,6 +4521,7 @@ mod tests {
             reparam_qs: None,
             dispersion: gam_problem::Dispersion::UNIT,
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,

@@ -992,14 +992,68 @@ fn bspline_endpoint_derivative_row(
 /// and for its frozen replay: the constrained null space is the single centered
 /// linear function, on which the mean slope is nondegenerate.
 fn uses_mean_slope_ridge(spec: &BSplineBasisSpec) -> bool {
-    spec.double_penalty
-        && spec.penalty_order == 2
-        && spec.boundary_conditions.is_free()
+    frozen_replay_uses_mean_slope_ridge(spec)
         && matches!(
             spec.identifiability,
             BSplineIdentifiability::WeightedSumToZero { .. }
                 | BSplineIdentifiability::FrozenTransform { .. }
         )
+}
+
+/// Whether the frozen replay of `spec` charges its ridge along the mean slope.
+/// A freeze turns every applied chart into `FrozenTransform`, so the replay's
+/// predicate is the smooth's own shape.
+fn frozen_replay_uses_mean_slope_ridge(spec: &BSplineBasisSpec) -> bool {
+    spec.double_penalty && spec.penalty_order == 2 && spec.boundary_conditions.is_free()
+}
+
+/// Charge the double-penalty ridge of a B-spline term along the mean slope in
+/// the chart a collection gauge placed it in.
+///
+/// A gauge (the level centering of a factor `by=` smooth, a residualization
+/// against owner terms) restricts the term's penalties and rebuilds the ridge on
+/// the null space of the restricted wiggliness penalty, as `m n̂n̂ᵀ`. The freeze
+/// stores the composed raw-to-collection chart as `FrozenTransform`, and the
+/// frozen replay charges that same null function along the mean slope
+/// (`charge_null_ridge_along_mean_slope`). Without the same charge here the fit
+/// and every rebuild of the saved model (prediction, summary) carry different
+/// penalties: on `s(x, by=g)` the replayed ridge direction makes cosine 0.11 to
+/// 0.40 with the fitted one. Charging here makes the fit use the ridge the
+/// replay rebuilds, which is the one `s(x)` already uses.
+///
+/// `metadata` is the placed metadata, whose transform maps the raw basis into
+/// the collection chart the candidates live in. The charged ridge is
+/// renormalized as the local build normalizes its own.
+pub(crate) fn charge_placed_bspline_null_ridge_along_mean_slope(
+    candidates: Vec<PenaltyCandidate>,
+    spec: &BSplineBasisSpec,
+    metadata: &BasisMetadata,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let BasisMetadata::BSpline1D {
+        knots,
+        identifiability_transform: Some(transform),
+        periodic: None,
+        degree,
+        ..
+    } = metadata
+    else {
+        return Ok(candidates);
+    };
+    if !frozen_replay_uses_mean_slope_ridge(spec) {
+        return Ok(candidates);
+    }
+    let raw_mean_slope = bspline_mean_slope_row(knots, degree.unwrap_or(spec.degree))?;
+    let mut charged = Vec::with_capacity(candidates.len());
+    for candidate in
+        charge_null_ridge_along_mean_slope(candidates, Some(transform), Some(&raw_mean_slope))?
+    {
+        if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+            charged.extend(renormalize_constrained_penalty_candidates(vec![candidate])?);
+        } else {
+            charged.push(candidate);
+        }
+    }
+    Ok(charged)
 }
 
 /// Mean slope `(f(b) − f(a))/(b − a)`, the interval mean of `f'`, of
@@ -1648,19 +1702,14 @@ pub(crate) fn project_penalty_to_psd_cone(matrix: &Array2<f64>) -> Array2<f64> {
     if min_ev >= 0.0 {
         return sym;
     }
-    let mut clamped = sym.clone();
-    for i in 0..n {
-        for j in 0..n {
-            let mut acc = 0.0_f64;
-            for k in 0..evals.len() {
-                let lam = evals[k];
-                if lam > 0.0 {
-                    acc += lam * evecs[[i, k]] * evecs[[j, k]];
-                }
-            }
-            clamped[[i, j]] = acc;
-        }
+    // `Σ_{λ_k > 0} λ_k v_k v_kᵀ` as one GEMM over the kept eigenvectors.
+    let kept: Vec<usize> = (0..evals.len()).filter(|&k| evals[k] > 0.0).collect();
+    let kept_vecs = evecs.select(ndarray::Axis(1), &kept);
+    let mut weighted = kept_vecs.clone();
+    for (mut column, &k) in weighted.columns_mut().into_iter().zip(&kept) {
+        column *= evals[k];
     }
+    let mut clamped = gam_linalg::faer_ndarray::fast_ab(&weighted, &kept_vecs.t());
     // Final symmetrize to wipe any reconstruction asymmetry at the noise floor.
     for i in 0..n {
         for j in 0..i {
@@ -4381,5 +4430,54 @@ mod anchor_offset_tests {
             max_abs < 1e-9,
             "min-norm offset should be orthogonal to Z, got {max_abs}"
         );
+    }
+}
+
+#[cfg(test)]
+mod psd_cone_projection_tests {
+    use super::project_penalty_to_psd_cone;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    use ndarray::Array2;
+
+    /// The cone projection keeps exactly the positive part of the spectrum:
+    /// `Σ_{λ_k > 0} λ_k v_k v_kᵀ`. Build a symmetric matrix with a known
+    /// eigenbasis and two negative eigenvalues, and check the projection is the
+    /// positive-part reconstruction, symmetric, and leaves a PSD input unchanged.
+    #[test]
+    fn keeps_exactly_the_positive_spectrum() {
+        let n = 7;
+        let seed = Array2::from_shape_fn((n, n), |(i, j)| {
+            ((i * 13 + j * 7) % 11) as f64 - 5.0 + if i == j { 3.0 } else { 0.0 }
+        });
+        let (_, basis) = FaerEigh::eigh(&(&seed + &seed.t()), faer::Side::Lower).unwrap();
+        let spectrum = [4.0, 2.5, 1.0, 0.5, 0.0, -0.3, -1.2];
+        let build = |values: &[f64]| {
+            let mut out = Array2::<f64>::zeros((n, n));
+            for (k, &value) in values.iter().enumerate() {
+                let v = basis.column(k);
+                for i in 0..n {
+                    for j in 0..n {
+                        out[[i, j]] += value * v[i] * v[j];
+                    }
+                }
+            }
+            out
+        };
+        let indefinite = build(&spectrum);
+        let expected = build(&spectrum.map(|value: f64| value.max(0.0)));
+        let projected = project_penalty_to_psd_cone(&indefinite);
+        for (got, want) in projected.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        }
+        for i in 0..n {
+            for j in 0..n {
+                assert_eq!(projected[[i, j]], projected[[j, i]]);
+            }
+        }
+        let psd = build(&[3.0, 2.0, 1.0, 1.0, 0.5, 0.25, 0.1]);
+        let sym = (&psd + &psd.t()) * 0.5;
+        for (got, want) in project_penalty_to_psd_cone(&psd).iter().zip(sym.iter()) {
+            assert!((got - want).abs() < 1e-14, "{got} vs {want}");
+        }
     }
 }

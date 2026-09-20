@@ -3,9 +3,11 @@
 usage: python bench/pvalue_calibration/pv-interactions/calibrate.py CELL REPS [OUT.json]
 
 Each replicate r of cell C draws from ``numpy.random.default_rng([crc32(C), r])``, fits
-``gamfit.fit`` and reads ``model.summary().smooth_terms``. Null cells report size at
-.10/.05/.01 with its Monte Carlo SE and a Kolmogorov-Smirnov test of the null p-values
-against U(0, 1); power cells report the rejection rate of the non-null term.
+``gamfit.fit`` and reads ``model.summary().smooth_terms``. Every term reports its
+rejection rate at .10/.05/.01 with the Monte Carlo SE, the upper-tail mass
+``P(p > 1 - a)`` at the same levels, and a two-sided Kolmogorov-Smirnov test of its
+p-values against U(0, 1). A null term is calibrated when both tails sit at nominal
+and KS does not reject; a non-null term's rejection rate is its power.
 """
 import json
 import sys
@@ -128,11 +130,13 @@ def main():
             "m": int(p.size),
             "p_value_none": len(present) - int(p.size),
             "edf_median": float(np.median([t["edf"] for t in present])),
-            "ref_df_median": float(np.median([t["ref_df"] for t in present])),
+            "ref_df_median": float(np.median([t["ref_df"] for t in present if t["ref_df"] is not None]))
+            if p.size else None,
         }
         if p.size:
             for a in (0.10, 0.05, 0.01):
                 entry[f"reject_{a}"] = float(np.mean(p <= a))
+                entry[f"upper_{a}"] = float(np.mean(p > 1.0 - a))
                 entry[f"mcse_{a}"] = float(np.sqrt(a * (1 - a) / p.size))
             ks = stats.kstest(p, "uniform")
             entry["ks_D"], entry["ks_p"] = float(ks.statistic), float(ks.pvalue)

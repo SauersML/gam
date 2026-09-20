@@ -136,9 +136,13 @@ fn outer_gradient_is_the_derivative_of_the_value_production_reports_2933() {
          (pairs={coactivation_pairs}, barrier={barrier:e})"
     );
 
-    // The accepted centre root, with its gates dropped (`Clone` does not carry them):
-    // the term-level criterion re-derives them at every root it prices.
-    let accepted = objective.term.clone();
+    // The accepted centre root with its declared gates released: the term-level
+    // criterion then re-derives them at every root it prices.
+    let mut accepted = objective.term.clone();
+    accepted.decoder_repulsion_gate = None;
+    accepted.barrier_coactivation_gate = None;
+    accepted.amplitude_barrier_gate = None;
+    accepted.streaming_gates_frozen = false;
     let layout = objective.baseline_rho.clone();
     let target = objective.target.clone();
     let (inner_max_iter, learning_rate, ridge_ext_coord, ridge_beta) = (

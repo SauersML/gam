@@ -243,7 +243,9 @@ fn smooth_table(summary: &SummaryPayload, out: &mut String) {
         String::new(),
         "edf".to_string(),
         "Ref.df".to_string(),
-        summary.smooth_statistic.unwrap_or("statistic").to_string(),
+        // Each row is a variance-component score test, whose statistic is
+        // referred to its own weighted chi-square law rather than a chi-square or F.
+        "Score".to_string(),
         "p-value".to_string(),
         String::new(),
         "lambda".to_string(),
@@ -256,7 +258,7 @@ fn smooth_table(summary: &SummaryPayload, out: &mut String) {
                 row_label(row.predictor, &row.name),
                 format_significant(row.edf),
                 format_significant(row.ref_df),
-                optional_number(row.statistic),
+                optional_number(row.chi_sq),
                 format_p_value(row.p_value),
                 significance_stars(row.p_value).to_string(),
                 if row.lambdas.is_empty() {
@@ -414,7 +416,6 @@ mod tests {
             edf,
             ref_df: 9.0,
             chi_sq: Some(41.2),
-            statistic: Some(41.2 / 9.0),
             p_value: Some(3.1e-7),
             lambdas: vec![0.0125],
             edf_rank_bound: label.map(str::to_string),
@@ -487,7 +488,6 @@ mod tests {
                 p_value_unavailable: None,
             }],
             parametric_terms_unavailable: None,
-            smooth_statistic: Some("F"),
             smooth_terms: vec![smooth_row("s(x2)", 4.875, None)],
             smooth_terms_unavailable: None,
             curvature_estimands: Vec::new(),
@@ -536,8 +536,8 @@ x1            -0.25       0.125       -2    0.0484  *
   Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
 
 Approximate significance of smooth terms:
-         edf  Ref.df        F  p-value       lambda
-s(x2)  4.875       9  4.57778  3.10e-7  ***  0.0125
+         edf  Ref.df  Score  p-value       lambda
+s(x2)  4.875       9   41.2  3.10e-7  ***  0.0125
 
 ---
 Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
@@ -558,8 +558,6 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
         assert_eq!(render_summary_text(&fixed_small_model()), golden);
     }
 
-    /// #2901: a smooth term whose EDF spends an uncertified penalty block names the
-    /// label beside the table, and a certified term adds no line.
     #[test]
     fn a_far_tail_pvalue_prints_its_computed_value_with_no_floor() {
         // The survival tails are accurate far below 1e-16, so the report prints
@@ -571,6 +569,8 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
         assert_eq!(format_p_value(Some(f64::NAN)), "NA");
     }
 
+    /// #2901: a smooth term whose EDF spends an uncertified penalty block names the
+    /// label beside the table, and a certified term adds no line.
     #[test]
     fn the_summary_names_an_uncertified_terms_edf_label_2901() {
         let mut summary = fixed_small_model();
@@ -642,7 +642,6 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
         let mut summary = fixed_small_model();
         let mut constrained = smooth_row("s(x2)", 2.5, None);
         constrained.chi_sq = None;
-        constrained.statistic = None;
         constrained.p_value = None;
         constrained.p_value_unavailable = Some(SmoothPValueUnavailable::ShapeConstrained);
         summary.smooth_terms = vec![smooth_row("s(x1)", 3.2, None), constrained];

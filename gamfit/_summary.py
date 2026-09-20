@@ -26,7 +26,6 @@ _SMOOTH_TERM_COLUMNS: tuple[str, ...] = (
     "edf",
     "ref_df",
     "chi_sq",
-    "statistic",
     "p_value",
     "lambdas",
 )
@@ -67,7 +66,6 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "parametric_terms",
     "parametric_term_tests",
     "parametric_terms_unavailable",
-    "smooth_statistic",
     "smooth_terms",
     "smooth_terms_unavailable",
     "curvature_estimands",
@@ -304,24 +302,37 @@ class Summary:
     parametric_terms_unavailable : str or None
         Why :attr:`parametric_terms` could not be built; the same causes as
         :attr:`smooth_terms_unavailable`.
-    smooth_statistic : str or None
-        The reference of each smooth record's ``statistic``: ``"F"`` when the
-        scale is estimated, ``"Chi.sq"`` when it is known.
     smooth_terms : list of dict
         The mgcv-style per-smooth significance table: one record per
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
         ``lambdas`` (the term's smoothing parameters) and — for penalized
-        smooths — ``chi_sq`` (Wood 2013 rank-truncated Wald statistic),
-        ``statistic`` (``chi_sq`` on the :attr:`smooth_statistic` scale) and
-        ``p_value``. Random-effect smooths report ``edf``
-        only. A shape-constrained smooth (``shape=...``) has no ``chi_sq`` or
-        ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
-        instead, because its null ``f = 0`` is the apex of the constraint cone
-        and no calibrated reference exists for the truncated posterior mean.
+        smooths — ``chi_sq`` and ``p_value`` from the
+        variance-component score test of ``f = 0`` (Lin 1997; Zhang & Lin 2003).
+        The score fits the other terms only and weights the term's directions by
+        its fixed structural penalties, one variance component per penalty on
+        its own null scale, so it never reads the term's own fitted
+        smoothing parameter, and its reference law (a weighted
+        :math:`\chi^2_1` sum, over :math:`\chi^2_\rho/\rho` when the scale is
+        estimated) is the null law at the fitted smoothing parameters of the
+        other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
+        Random-effect blocks carry the score test of their variance component
+        against its exact boundary null law, or a ``"random_effect_*"``
+        reason when it could not be scored. A smooth with no valid
+        p-value has no ``chi_sq`` or ``p_value`` and carries a
+        ``p_value_unavailable`` reason instead: ``"shape_constrained"`` (the
+        null is the apex of the constraint cone), ``"unpenalized_direction"``
+        (a direction no penalty shrinks is a fixed effect the variance-component
+        null does not remove), ``"fit_curvature_unavailable"`` (the model kept no
+        exact penalized Hessian and weighted Gram), ``"dispersion_unavailable"``
+        (the coefficient covariance scale cannot be resolved),
+        ``"not_identified"``, ``"indefinite_curvature"`` (a custom family's
+        observed information leaves the term's score no covariance), or
+        ``"residual_df_unavailable"``.
         A model with more than one linear predictor (the Bernoulli
         marginal-slope family) tags each record with ``predictor`` —
         ``"marginal"`` or ``"slope"`` — naming the formula the smooth belongs
-        to; each row is tested against its own predictor's block. Empty when the model has no smooth or random-effect terms; every
+        to; each row is tested against its own predictor's block.
+        Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
         Why :attr:`smooth_terms` could not be built (a model saved without its
@@ -330,8 +341,7 @@ class Summary:
         reason, so an absence is never reported without its reason — the same
         contract as :attr:`reml_score_unavailable`.
 
-        This ``p_value`` is the *first-order* Wald reference; computing it needs
-        only the saved model. For the **second-order-accurate**, Bartlett-corrected
+        This ``p_value`` needs only the saved model. For the **second-order-accurate**, Bartlett-corrected
         likelihood-ratio p-value (the exact Lawley factor auto-applied whenever the
         family carries closed-form cumulant jets, #939/#1063) call
         :meth:`Model.smooth_significance(data) <gamfit.Model.smooth_significance>`,
@@ -442,7 +452,6 @@ class Summary:
     parametric_terms: list[dict[str, Any]] = field(default_factory=list)
     parametric_term_tests: list[dict[str, Any]] = field(default_factory=list)
     parametric_terms_unavailable: str | None = None
-    smooth_statistic: str | None = None
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)
     smooth_terms_unavailable: str | None = None
     #: Fitted curvature κ̂ point estimates for any ``curv(...)`` constant-curvature
@@ -578,14 +587,12 @@ class Summary:
         """Return :attr:`smooth_terms` as a :class:`pandas.DataFrame`.
 
         This is the canonical mgcv ``summary.gam`` per-smooth significance
-        table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq``,
-        ``statistic``, ``p_value``, ``lambdas`` (``chi_sq`` / ``statistic`` /
-        ``p_value`` are absent for random-effect smooths and any
-        shape-constrained term, matching the engine, which only computes the
-        Wood Wald test for ordinary penalized smooths). A shape-constrained row
-        adds a ``p_value_unavailable`` column naming the reason, and a
-        multi-predictor model adds a ``predictor`` column (``"marginal"`` /
-        ``"slope"``).
+        table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq`` (the
+        variance-component score statistic, scaled so its null mean is
+        ``ref_df``), ``p_value``, ``lambdas``. A row with no valid p-value has
+        no ``chi_sq`` or ``p_value`` and adds a ``p_value_unavailable`` column
+        naming the reason, and a multi-predictor model adds a ``predictor``
+        column (``"marginal"`` / ``"slope"``).
         """
         import pandas as pd
 
