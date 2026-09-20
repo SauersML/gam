@@ -59,7 +59,7 @@ fn negbin_te_2d_outer_loop_converges_in_budget_1082() {
     let (headers, rows) = synthetic_count_records(200, 20260530);
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode count dataset");
     let cfg = FitConfig {
-        family: Some("nb".to_string()),
+        family: Some("negative-binomial".to_string()),
         ..FitConfig::default()
     };
 
