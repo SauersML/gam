@@ -304,6 +304,89 @@ fn ordered_beta_bernoulli_majorized_channels_match_fd_of_psd_majorized_operator(
     );
 }
 
+/// The trait-level PSD majorizer of the ordered Beta--Bernoulli prior used to be
+/// the trait default, i.e. the exact Hessian diagonal: it carries the negative
+/// mass-coupled rank-one diagonal `s'_k·u_ik²` and the negative part of the
+/// row-local term, so it was neither PSD nor a majorizer, and it disagreed with
+/// the `max(diagonal_term, 0)` majorizer the Laplace path assembles. It must be
+/// that majorizer: PSD, dominating the exact Hessian, and the frozen operator's
+/// diagonal and log-determinant must be built from it.
+#[test]
+fn ordered_beta_bernoulli_trait_psd_majorizer_is_the_declared_loewner_majorizer() {
+    let w = [1.6_f64, 0.4, 1.2, 0.8];
+    let cases = [
+        (
+            OrderedBetaBernoulliPenalty::new(3, 5.0, 0.85, false),
+            array![
+                0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
+            ],
+            Array1::<f64>::zeros(0),
+        ),
+        (
+            OrderedBetaBernoulliPenalty::new(3, 1.7, 0.8, true).with_row_weights(Some(&w)),
+            array![
+                2.5_f64, -1.8, 0.6, 3.1, 0.1, -2.4, -0.1, 1.7, 0.2, 2.4, -0.3, 0.8
+            ],
+            array![0.15_f64],
+        ),
+    ];
+    for (case, (pen, target, rho)) in cases.iter().enumerate() {
+        let n = target.len();
+        let mut hessian = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[j] = 1.0;
+            hessian
+                .column_mut(j)
+                .assign(&pen.hvp(target.view(), rho.view(), e.view()));
+        }
+        let declared = pen
+            .psd_majorizer_logit_third_channels(target.view(), rho.view())
+            .diagonal_term
+            .mapv(|value| value.max(0.0));
+        let diag = pen
+            .psd_majorizer_diag(target.view(), rho.view())
+            .expect("ordered Beta--Bernoulli majorizer diagonal");
+        let exact_diag = pen
+            .hessian_diag(target.view(), rho.view())
+            .expect("ordered Beta--Bernoulli Hessian diagonal");
+        let scale = hessian.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(scale > 0.0, "case {case}: nonzero curvature");
+        let tol = 1e-12 * scale;
+        assert!(
+            exact_diag.iter().any(|&v| v < -1e-3 * scale),
+            "case {case}: the exact Hessian diagonal has negative entries"
+        );
+        let mut majorizer = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            assert_abs_diff_eq!(diag[i], declared[i], epsilon = tol);
+            assert!(diag[i] >= 0.0, "case {case}: B must be PSD");
+            majorizer[[i, i]] = diag[i];
+        }
+        let min_eig = <Array2<f64> as PenaltyOp>::eigendecompose(&(&majorizer - &hessian))
+            .expect("symmetric eigensolve")
+            .0
+            .iter()
+            .fold(f64::INFINITY, |acc, &v| acc.min(v));
+        assert!(
+            min_eig >= -tol,
+            "case {case}: B must dominate the exact Hessian; min eig(B - H) = {min_eig:.3e}"
+        );
+
+        let kind = AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(pen.clone()));
+        let op = FrozenAnalyticPenaltyOp::new(kind, target.clone(), rho.clone())
+            .expect("frozen operator");
+        let op_diag = op.diag();
+        for i in 0..n {
+            assert_abs_diff_eq!(op_diag[i], declared[i], epsilon = tol);
+        }
+        let lambda = 0.3;
+        let expected: f64 = declared.iter().map(|&d| (d + lambda).ln()).sum();
+        let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-12 * expected.abs().max(1.0));
+    }
+}
+
 #[test]
 fn ordered_beta_bernoulli_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
     let pen = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, true);
@@ -1836,6 +1919,60 @@ fn scadmcp_value_grad_self_consistent_fd() {
         worst <= 1.0e-5,
         "ScadMcp value↔grad FD max abs error = {worst:.3e}"
     );
+}
+
+/// The frozen SCAD/MCP operator applies the PSD majorizer in `matvec`, but its
+/// `diag` and `log_det_plus_lambda_i` used to read the exact Hessian diagonal,
+/// which carries the concave constant `−1/γ` (MCP) / `−1/(γ−1)` (SCAD) across
+/// the taper region: the operator disagreed with itself, and a small `λ`
+/// shift made the log-determinant refuse. All three must be the majorizer.
+#[test]
+fn scadmcp_frozen_diag_and_log_det_are_the_psd_majorizer() {
+    let n_eff = 6usize;
+    let t = array![0.02_f64, 0.3, 0.9, 1.6, -1.1, -2.5];
+    let rho = Array1::<f64>::zeros(0);
+    for (variant, gamma) in [(PenaltyConcavity::Mcp, 3.0), (PenaltyConcavity::Scad, 3.7)] {
+        let pen = ScadMcpPenalty::new(
+            PsiSlice::full(n_eff, Some(1)),
+            0.5,
+            n_eff,
+            gamma,
+            1.0e-4,
+            variant,
+            false,
+        )
+        .unwrap();
+        let exact = pen.hessian_diag(t.view(), rho.view()).unwrap();
+        let majorizer = pen.psd_majorizer_diag(t.view(), rho.view()).unwrap();
+        let lambda = 0.1;
+        assert!(
+            exact.iter().any(|&h| h + lambda < 0.0),
+            "{variant:?}: the exact diagonal is negative past the λ shift in the taper"
+        );
+        let kind = AnalyticPenaltyKind::ScadMcp(Arc::new(pen.clone()));
+        let op = FrozenAnalyticPenaltyOp::new(kind, t.clone(), rho.clone()).unwrap();
+        let diag = op.diag();
+        let mut e = Array1::<f64>::zeros(n_eff);
+        let mut column = Array1::<f64>::zeros(n_eff);
+        let mut expected = 0.0;
+        for i in 0..n_eff {
+            assert!(majorizer[i] >= 0.0, "{variant:?}: B must be PSD");
+            assert!(
+                majorizer[i] >= exact[i],
+                "{variant:?}: B must dominate the exact Hessian"
+            );
+            e[i] = 1.0;
+            op.matvec(e.view(), column.view_mut());
+            e[i] = 0.0;
+            assert_eq!(diag[i], majorizer[i], "{variant:?}: diag is the majorizer");
+            assert_eq!(column[i], diag[i], "{variant:?}: diag agrees with matvec");
+            expected += (majorizer[i] + lambda).ln();
+        }
+        let log_det = op
+            .log_det_plus_lambda_i(lambda)
+            .expect("the majorizer log-determinant is finite for every λ > 0");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-12 * expected.abs().max(1.0));
+    }
 }
 
 #[test]
