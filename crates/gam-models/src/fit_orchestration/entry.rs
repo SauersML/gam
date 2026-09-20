@@ -415,6 +415,181 @@ fn expectile_kkt_residual(
     Ok(max_scaled)
 }
 
+/// Sensitivity `∂r_F/∂a_F` of the LAWS residuals on the rows `F` to their own
+/// asymmetry levels `a_l` (row weight `w_l = base_l·a_l`), through both the
+/// frozen-λ weighted solve and the REML-selected smoothing parameters.
+///
+/// With `H = XᵀWX + S_λ` and `u_k = λ_k S_k(β̂ − m_k)`, implicit
+/// differentiation of the normal equations `XᵀW r = S_λ(β̂ − m)` gives
+/// `∂β̂/∂w_l = H⁻¹x_l r_l` at fixed ρ and `∂β̂/∂ρ_k = −H⁻¹u_k`. The REML
+/// optimum moves by `dρ̂/dw_l = −V_ρ g_l`, where `V_ρ` is the certified inverse
+/// of the outer ρ-Hessian the fit published and `g_l = ∂_{w_l}∇_ρ V` is the
+/// mixed partial of the negative log restricted likelihood:
+///
+///   `g_{l,k} = −½ λ_k (H⁻¹x_l)ᵀ S_k (H⁻¹x_l) + u_kᵀH⁻¹x_l · r_l / φ̂ + O(r_l²)`.
+///
+/// The first term is `∂_{w_l} ½∂_{ρ_k} log|H|`, exact because `H` is affine
+/// in `w_l`; the second is the penalty-quadratic `u_kᵀ∂β̂/∂w_l / φ̂` shared
+/// by the profiled and the joint-φ criteria (their `r_l²` terms differ and are
+/// dropped). Every omitted term is `O(r_l²)`, so the Jacobian is exact at
+/// the generalized fixed point `r_F = 0` it is used to locate. Assembled:
+///
+///   `∂r_j/∂a_l = base_l·(−x_jᵀH⁻¹x_l r_l + Σ_k (x_jᵀH⁻¹u_k)(dρ̂_k/dw_l))`.
+///
+/// `H⁻¹` is `Vb/φ̂`, which already carries any identifiability or active
+/// constraint projection `Z(ZᵀHZ)⁻¹Zᵀ`. A railed or unidentified ρ direction
+/// has zero `V_ρ` rows, i.e. it does not move with the weights.
+fn expectile_free_row_jacobian(
+    fit: &gam_solve::estimate::UnifiedFitResult,
+    design: &TermCollectionDesign,
+    residual: ArrayView1<'_, f64>,
+    base_weights: ArrayView1<'_, f64>,
+    rows: &[usize],
+) -> Result<Array2<f64>, String> {
+    let n = design.design.nrows();
+    let p = fit.beta.len();
+    let k_count = fit.lambdas.len();
+    let vb = fit.covariance_conditional.as_ref().ok_or_else(|| {
+        "the inner fit published no dense conditional covariance Vb = φ̂·H⁻¹".to_string()
+    })?;
+    let v_rho = fit.artifacts.rho_covariance.as_ref().ok_or_else(|| {
+        "the inner fit published no certified inverse outer ρ-Hessian".to_string()
+    })?;
+    let phi = fit
+        .coefficient_covariance_scale()
+        .map_err(|error| error.to_string())?;
+    if !(phi.is_finite() && phi > 0.0) {
+        return Err(format!(
+            "the inner fit's coefficient covariance scale must be finite and positive, got {phi:?}"
+        ));
+    }
+    if design.design.ncols() != p
+        || vb.dim() != (p, p)
+        || design.penalties.len() != k_count
+        || v_rho.dim() != (k_count, k_count)
+        || residual.len() != n
+        || base_weights.len() != n
+        || rows.iter().any(|&row| row >= n)
+    {
+        return Err(format!(
+            "dimension mismatch: design {n}x{}, beta {p}, Vb {:?}, penalties {}, lambdas \
+             {k_count}, V_rho {:?}, residual {}, base weights {}",
+            design.design.ncols(),
+            vb.dim(),
+            design.penalties.len(),
+            v_rho.dim(),
+            residual.len(),
+            base_weights.len(),
+        ));
+    }
+    let h_inverse = |vector: &Array1<f64>| -> Array1<f64> { vb.dot(vector) / phi };
+
+    // u_k = λ_k S_k (β̂ − m_k) embedded in the global coefficient vector, and
+    // its H⁻¹ image −∂β̂/∂ρ_k.
+    let mut penalty_scores = Vec::with_capacity(k_count);
+    for (k, block) in design.penalties.iter().enumerate() {
+        let range = block.col_range.clone();
+        if range.end > p || block.local.dim() != (range.len(), range.len()) {
+            return Err(format!(
+                "penalty {k} block {range:?} with local {:?} does not fit {p} coefficients",
+                block.local.dim()
+            ));
+        }
+        let mean = block
+            .prior_mean
+            .evaluate(range.len(), "expectile generalized fixed point")
+            .map_err(|error| error.to_string())?;
+        let centered = &fit.beta.slice(ndarray::s![range.clone()]) - &mean;
+        let mut score = Array1::<f64>::zeros(p);
+        score
+            .slice_mut(ndarray::s![range])
+            .assign(&(block.local.dot(&centered) * fit.lambdas[k]));
+        let image = h_inverse(&score);
+        penalty_scores.push((score, image));
+    }
+
+    let rows_x: Vec<Array1<f64>> = rows
+        .iter()
+        .map(|&row| {
+            let mut unit = Array1::<f64>::zeros(n);
+            unit[row] = 1.0;
+            design.design.apply_transpose(&unit)
+        })
+        .collect();
+    let rows_z: Vec<Array1<f64>> = rows_x.iter().map(h_inverse).collect();
+
+    let m = rows.len();
+    let mut jacobian = Array2::<f64>::zeros((m, m));
+    for (l_slot, &l) in rows.iter().enumerate() {
+        let z_l = &rows_z[l_slot];
+        let r_l = residual[l];
+        // g_l = ∂_{w_l}∇_ρ V, then dρ̂/dw_l = −V_ρ g_l.
+        let mixed = Array1::from_shape_fn(k_count, |k| {
+            let block = &design.penalties[k];
+            let z_block = z_l.slice(ndarray::s![block.col_range.clone()]);
+            let log_det_term = -0.5 * fit.lambdas[k] * z_block.dot(&block.local.dot(&z_block));
+            let quadratic_term = penalty_scores[k].0.dot(z_l) * r_l / phi;
+            log_det_term + quadratic_term
+        });
+        let rho_response = -v_rho.dot(&mixed);
+        for (j_slot, x_j) in rows_x.iter().enumerate() {
+            let through_rho = (0..k_count)
+                .map(|k| x_j.dot(&penalty_scores[k].1) * rho_response[k])
+                .sum::<f64>();
+            jacobian[[j_slot, l_slot]] = base_weights[l] * (-x_j.dot(z_l) * r_l + through_rho);
+        }
+    }
+    if jacobian.iter().any(|value| !value.is_finite()) {
+        return Err("the residual-weight Jacobian is not finite".to_string());
+    }
+    Ok(jacobian)
+}
+
+/// Solve the square system `a·x = b` by Gaussian elimination with partial
+/// pivoting. An exactly zero pivot is a typed singularity, never a
+/// regularized solve.
+fn solve_square_partial_pivot(
+    mut a: Array2<f64>,
+    mut b: Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    let m = b.len();
+    if a.dim() != (m, m) {
+        return Err(format!("system {:?} does not match right-hand side {m}", a.dim()));
+    }
+    for col in 0..m {
+        let pivot_row = (col..m)
+            .max_by(|&i, &j| a[[i, col]].abs().total_cmp(&a[[j, col]].abs()))
+            .unwrap_or(col);
+        if a[[pivot_row, col]] == 0.0 {
+            return Err(format!("the {m}x{m} system is singular at column {col}"));
+        }
+        if pivot_row != col {
+            for c in 0..m {
+                a.swap([pivot_row, c], [col, c]);
+            }
+            b.swap(pivot_row, col);
+        }
+        for row in col + 1..m {
+            let factor = a[[row, col]] / a[[col, col]];
+            if factor != 0.0 {
+                for c in col..m {
+                    a[[row, c]] -= factor * a[[col, c]];
+                }
+                b[row] -= factor * b[col];
+            }
+        }
+    }
+    let mut x = Array1::<f64>::zeros(m);
+    for row in (0..m).rev() {
+        let tail = (row + 1..m).map(|c| a[[row, c]] * x[c]).sum::<f64>();
+        x[row] = (b[row] - tail) / a[[row, row]];
+    }
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err("the solution is not finite".to_string());
+    }
+    Ok(x)
+}
+
 #[cfg(test)]
 mod expectile_convergence_tests {
     use super::{ExpectileSignCycle, expectile_kkt_residual, weighted_empirical_expectile};
@@ -2979,8 +3154,17 @@ fn joint_expectile_standardized_expectiles(
 /// both one-sided derivatives agree at zero. LAWS solves the penalized WLS
 /// problem with weights frozen at the current sign pattern, then recomputes the
 /// pattern. A returned estimator must satisfy the KKT residual of the original
-/// asymmetric objective; a repeated sign state or an iteration cap is only
-/// termination evidence, never an estimator-selection rule.
+/// asymmetric objective; an iteration cap is only termination evidence, never
+/// an estimator-selection rule.
+///
+/// Because λ̂ is re-selected on every weight vector, the sign map can have no
+/// fixed point: a boundary row whose weight flip moves λ̂ enough to flip its
+/// own residual back makes the map cycle (#3039). A proven cycle hands the
+/// disagreeing rows to the generalized (Clarke) fixed point of the
+/// subgradient weight map, where a row at `r = 0` takes a fractional
+/// asymmetry in `[min(τ,1−τ), max(τ,1−τ)]`, solved by projected Newton with
+/// the analytic residual-weight Jacobian through `dρ̂/dw`. The same KKT
+/// certificate is the only acceptance.
 ///
 /// Each inner solve is the FULL standard Gaussian-identity GAM: any basis,
 /// tensor, spatial smooth, by-variable, random effect, plus REML λ-selection on
@@ -3071,6 +3255,15 @@ fn fit_expectile_laws(
     // proves recurrence using one O(n) sign checkpoint; no iteration-count
     // multiple of the training data is retained.
     let mut sign_cycle = ExpectileSignCycle::default();
+    // Asymmetry `a_i = w_i / base_i` of the weights the next inner fit uses;
+    // `None` while the weights are still the cold-start base weights.
+    let mut asymmetry: Option<Array1<f64>> = None;
+    // Set once the sign map has provably cycled: from then on the rows whose
+    // weight disagrees with their residual sign are resolved at the
+    // generalized fixed point instead of by the (cycling) sign map. Holds the
+    // iteration and cycle length that triggered it, for diagnostics.
+    let mut generalized_since: Option<(usize, usize)> = None;
+    let (asym_lo, asym_hi) = (tau.min(1.0 - tau), tau.max(1.0 - tau));
     // Evidence for the typed exhaustion error: (dimensionless KKT residual,
     // configured KKT bound) of the final uncertified iterate.
     let mut last_kkt = (f64::NAN, f64::NAN);
@@ -3185,23 +3378,94 @@ fn fit_expectile_laws(
         }
         last_kkt = (kkt, kkt_bound);
         last_rho_checkpoint = result.fit.log_lambdas.to_vec();
-        if let Some(cycle_length) = sign_cycle.observe(&sign) {
-            return Err(raised_fit_failure(
+        let target_asymmetry = Array1::from_shape_fn(n, |i| if sign[i] { tau } else { 1.0 - tau });
+        let (entered_at, cycle_length) = match generalized_since {
+            Some(entered) => entered,
+            None => match sign_cycle.observe(&sign) {
+                None => {
+                    weights = Arc::new(next_weights);
+                    asymmetry = Some(target_asymmetry);
+                    continue;
+                }
+                Some(cycle_length) => {
+                    generalized_since = Some((iteration, cycle_length));
+                    (iteration, cycle_length)
+                }
+            },
+        };
+
+        // Generalized (Clarke) fixed point. The REML-selected λ̂ depends on the
+        // weights, so a row whose residual sits at the sign boundary can have
+        // `r > 0` at one endpoint weight and `r < 0` at the other: the sign map
+        // then has no fixed point and cycles. The LAWS weight is the
+        // subgradient `|τ − 1[r < 0]|`, which at `r = 0` is the whole interval
+        // `[min(τ,1−τ), max(τ,1−τ)]`; the fixed point of that set-valued map is
+        // the complementarity problem
+        //   a_i = τ-side endpoint if r_i > 0, other endpoint if r_i < 0,
+        //   a_i ∈ [lo, hi] if r_i = 0,
+        // which exists by the intermediate value theorem. It is solved by a
+        // projected Newton step on the free rows (interior asymmetry, or an
+        // endpoint that disagrees with the residual sign), driving `r_F → 0`
+        // with the analytic Jacobian of `expectile_free_row_jacobian`. Rows at
+        // a sign-consistent endpoint are complementary already and stay
+        // fixed. Acceptance is still the KKT certificate above, whose defect on
+        // a fractional row is `(a_i − target_i)·base_i·r_i → 0` as `r_i → 0`.
+        let generalized_failure = |reason: String| {
+            raised_fit_failure(
                 FailureCategory::Convergence,
                 format!(
-                    "expectile LAWS entered a deterministic sign-pattern cycle without \
-                     reaching the KKT fixed point of the convex asymmetric least-squares \
-                     problem (tau={tau}, iterations={iteration}, cycle_length={cycle_length}, \
-                     KKT residual={:.3e} vs scaled tolerance {:.3e}, \
-                     rho_checkpoint={:?}); non-convergence is a typed error, never a \
-                     best-effort fit",
-                    kkt,
-                    kkt_bound,
+                    "expectile LAWS sign map cycled (tau={tau}, detected at iteration \
+                     {entered_at}, cycle_length={cycle_length}) and the generalized fixed \
+                     point could not be advanced at iteration {iteration} (KKT residual \
+                     {kkt:.3e} vs scaled tolerance {kkt_bound:.3e}, rho_checkpoint={:?}): \
+                     {reason}; non-convergence is a typed error, never a best-effort fit",
                     result.fit.log_lambdas.to_vec(),
                 ),
+            )
+        };
+        let Some(current) = asymmetry.as_mut() else {
+            return Err(generalized_failure(
+                "the cycle was detected before any sign-derived weights were used".to_string(),
             ));
+        };
+        let free: Vec<usize> = (0..n)
+            .filter(|&i| {
+                base_weights[i] > 0.0
+                    && ((current[i] > asym_lo && current[i] < asym_hi)
+                        || current[i] != target_asymmetry[i])
+            })
+            .collect();
+        let jacobian = expectile_free_row_jacobian(
+            &result.fit,
+            &result.design,
+            residual.view(),
+            base_weights.view(),
+            &free,
+        )
+        .map_err(|reason| generalized_failure(format!("residual-weight Jacobian: {reason}")))?;
+        let newton_rhs = Array1::from_iter(free.iter().map(|&i| -residual[i]));
+        let step = solve_square_partial_pivot(jacobian, newton_rhs)
+            .map_err(|reason| generalized_failure(format!("Newton system: {reason}")))?;
+        log::debug!(
+            "[expectile] generalized fixed point iteration {iteration}: {} free rows, \
+             max |r_F| = {:.3e}, KKT = {kkt:.3e}, rho = {:?}",
+            free.len(),
+            free.iter().fold(0.0_f64, |worst, &i| worst.max(residual[i].abs())),
+            result.fit.log_lambdas.to_vec(),
+        );
+        let mut moved = false;
+        for (slot, &i) in free.iter().enumerate() {
+            let projected = (current[i] + step[slot]).clamp(asym_lo, asym_hi);
+            moved |= projected != current[i];
+            current[i] = projected;
         }
-        weights = Arc::new(next_weights);
+        if !moved {
+            return Err(generalized_failure(format!(
+                "the projected Newton step on {} free rows is null at the box boundary",
+                free.len()
+            )));
+        }
+        weights = Arc::new(Array1::from_shape_fn(n, |i| base_weights[i] * current[i]));
     }
 
     Err(raised_fit_failure(

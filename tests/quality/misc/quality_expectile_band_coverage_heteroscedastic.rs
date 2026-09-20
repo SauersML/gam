@@ -190,11 +190,10 @@ fn expectile_bands_cover_true_expectile_under_heteroscedastic_noise() {
         let mut overall = Vec::with_capacity(REPLICATES);
         let mut noisy = Vec::with_capacity(REPLICATES);
         for rep in 0..REPLICATES {
-            // Seed block 1020..1040 is one on which every (τ, seed) LAWS fit
-            // reaches its certified fixed point. Seed 1001 at τ = 0.9 hits the
-            // sign-pattern cycle tracked in gam#3039, which LAWS reports as a
-            // typed error; this test never skips a replicate, so it runs on a
-            // block that isolates band calibration from that separate gap.
+            // Seed block 1020..1040; this test never skips a replicate. The
+            // sign-pattern cycle of seed 1001 at τ = 0.9 (gam#3039) is covered
+            // by its own regression test, which reaches the generalized fixed
+            // point.
             let (x, y) = simulate(1020 + rep as u64);
             let fit = fit_expectile(&encode(&x, &y), tau);
             let xg = design_at(&fit, &grid);

@@ -15,6 +15,7 @@ mod cubic_cell_kernel_bug_hunt;
 mod debug_assert_ban_gate_marginal_slope;
 mod decoder_incoherence_hvp_is_gauss_newton_not_exact;
 mod diagnose_drops_response_column;
+mod expectile_laws_sign_cycle_3039;
 mod faer_ndarray_bug_hunt;
 mod fingerprinter_type_tag_does_not_disambiguate;
 mod gamlss_joint_derivatives_fd_bug_hunt;
