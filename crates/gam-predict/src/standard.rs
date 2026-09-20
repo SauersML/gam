@@ -191,7 +191,7 @@ impl StandardPredictor {
 /// Link-wiggle full-uncertainty / posterior-mean policy for the standard
 /// predictor. Only the wiggle path routes through the generic drivers; the
 /// wiggle-free path keeps the richer [`predict_gamwith_uncertainty`] /
-/// `predict_gam_posterior_mean_from_backend` engines (boundary/OOD inflation,
+/// `predict_gam_posterior_mean_from_backend` engines (extrapolation variance,
 /// smoothing-corrected backend selection), which are
 /// the canonical standard engines, not duplicated boilerplate.
 impl PredictionTransform for StandardPredictor {
