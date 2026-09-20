@@ -2674,5 +2674,13 @@
     ],
     "reason": "#3819: gaussian_reml's private matrix_fingerprint folded each f64's bits into one word with fnv1a_mix, a word-level fold under which X and X with a negated column (whose Grams X'X differ only by a sign conjugation) could collide, so the eigen cache accepted a design it was not built for. Every fingerprint in the file now goes through gam_linalg::matrix::array2_bits_fingerprint, the canonical byte-wise FNV-1a over (nrows, ncols, each value's bits), and the block canonical key hashes the (design, penalty) fingerprint pair with DefaultHasher (it only orders rho blocks in-process). Neither helper has a caller left.",
     "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
+  },
+  {
+    "base": "69e1d6745dae85dbce1d02b71eefdecdc5a57b4e",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/residual_dist.rs:fn:inverse_link_pdffourth_derivative"
+    ],
+    "reason": "#3745: residual_dist.rs kept its own dispatcher inverse_link_pdffourth_derivative, which hand-coded closed forms for the three standard survival residual laws and forwarded every other inverse link to the shared jet in mixture_link.rs. That duplicated the fourth-derivative formula in two places. This PR reads every residual-law derivative from the shared inverse-link jet (inverse_link_pdffourth_derivative_for_inverse_link via residual_distribution_inverse_link), so the duplicate dispatcher has no remaining role.",
+    "evidence": "scripts/source_removal_guard.py --base 69e1d6745dae85dbce1d02b71eefdecdc5a57b4e lists exactly this one removal. Before this PR the dispatcher's only caller was row_kernel.rs (let fpppp = inverse_link_pdffourth_derivative(inverse_link, eta)?), which this PR repoints to the shared jet; git grep -w inverse_link_pdffourth_derivative at the PR head finds no remaining reference. Covered by cargo test -p gam-models --lib -- residual_dist."
   }
 ]
