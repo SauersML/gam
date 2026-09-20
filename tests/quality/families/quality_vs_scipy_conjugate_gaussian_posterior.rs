@@ -133,7 +133,6 @@ fn gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian() {
         .expect("fitted penalized Hessian for whitening");
     let nuts_cfg = NutsConfig {
         n_samples: 10_000,
-        target_accept: 0.8,
         seed: 20260529,
     };
     let nuts = run_nuts_sampling_flattened_family(

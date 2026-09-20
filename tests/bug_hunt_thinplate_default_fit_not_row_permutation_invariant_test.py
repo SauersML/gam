@@ -1,6 +1,6 @@
 """Row-permutation invariance of the DEFAULT univariate thin-plate smooth (#1378).
 
-A univariate thin-plate regression spline ``s(x, bs="tp")`` is a functional of
+A univariate thin-plate regression spline ``s(x, bs="tps")`` is a functional of
 the unordered training sample ``{(x_i, y_i)}``: the radial kernel ``phi(x_i-x_j)``,
 the polynomial nullspace ``{1, x}`` and the smoothness penalty are all symmetric
 in the rows. So the fitted curve MUST be invariant to a pure permutation of the
@@ -84,11 +84,11 @@ def _max_drift_under_permutation(bs: str) -> tuple[float, float]:
 
 
 def test_default_thinplate_fit_is_row_permutation_invariant() -> None:
-    """The DEFAULT ``s(x, bs="tp")`` fit must not move under a row permutation."""
-    drift, signal_range = _max_drift_under_permutation("tp")
+    """The DEFAULT ``s(x, bs="tps")`` fit must not move under a row permutation."""
+    drift, signal_range = _max_drift_under_permutation("tps")
     rel = drift / signal_range
     assert drift < DRIFT_CEILING, (
-        f'default s(x, bs="tp") is not row-permutation invariant: '
+        f'default s(x, bs="tps") is not row-permutation invariant: '
         f"max drift {drift:.6g} ({100 * rel:.3f}% of signal range "
         f"{signal_range:.4g}) >= ceiling {DRIFT_CEILING:g}"
     )

@@ -8,10 +8,9 @@ The pre-fix behaviour was:
                  expected thread to succeed in generating observation.
 
 i.e. the panic-payload was caught at the FFI boundary and surfaced as a
-"panicked inside Rust boundary" message. The fix validates `n_samples` up front
-(mirroring the existing `target_accept` guard), so it now raises a clean message
-that does NOT contain "panicked inside Rust boundary". The chain count is no
-longer configurable: every run uses two chains.
+"panicked inside Rust boundary" message. The fix validates `n_samples` up front,
+so it now raises a clean message that does NOT contain "panicked inside Rust
+boundary". The chain count is no longer configurable: every run uses two chains.
 """
 
 from __future__ import annotations

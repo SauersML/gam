@@ -1093,11 +1093,12 @@ fn run_from_decoder(
             &next_codes,
         );
 
-        // Per-epoch heartbeat on the log::warn channel (log::info is dropped by
-        // the RUST_LOG=warn harnesses, which is why a multi-hour host fit went
-        // silent). A hang in the refresh or route is visible at round cadence,
-        // and the CG certificate (giant component size, the a-priori κ bound,
-        // any typed non-convergence) is on the same line.
+        // Per-epoch heartbeat at debug level: silent by default, and streamed
+        // while the fit runs once the caller lowers the `gamfit` logger (or
+        // the CLI's log level) to debug. A hang in the refresh or route is then
+        // visible at round cadence, and the CG certificate (giant component
+        // size, the a-priori κ bound, any typed non-convergence) is on the
+        // same line.
         log::debug!(
             "[SAE epoch {}/{}] ev={:.6} improve={:.3e} ev_resid={:.3e} decoder_resid={:.3e} \
              routing_resid={:.3e} births={} revived={} live={}/{} \

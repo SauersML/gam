@@ -83,8 +83,8 @@ def test_solver_records_reach_the_gamfit_logger_at_debug(caplog: Any) -> None:
     data = _default_data()
     with caplog.at_level(logging.DEBUG, logger="gamfit"):
         gamfit.fit(data, "y ~ s(x)")
-        # Records produced on engine worker threads are delivered with the GIL
-        # held no later than the next engine call.
+        # Anything still queued when the first call returns is delivered
+        # before the next engine call starts.
         gamfit.fit(data, "y ~ s(x)")
     records = [record for record in caplog.records if record.name == "gamfit"]
     assert records, "no engine records reached the gamfit logger at DEBUG"
@@ -92,6 +92,36 @@ def test_solver_records_reach_the_gamfit_logger_at_debug(caplog: Any) -> None:
         (record.levelname, record.getMessage()) for record in records
     ]
     assert all(hasattr(record, "rust_target") for record in records)
+
+
+def test_engine_records_stream_while_a_main_thread_fit_runs() -> None:
+    """A fit that never returns (killed at a caller's time cap) must already
+    have delivered what it logged, so records may not wait for the call to
+    return (#3271)."""
+    data = _default_data()
+    fit_returned = False
+    arrivals: list[bool] = []
+
+    class _Arrivals(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            arrivals.append(fit_returned)
+
+    logger = logging.getLogger("gamfit")
+    handler = _Arrivals(level=logging.DEBUG)
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        gamfit.fit(data, "y ~ s(x)")
+        fit_returned = True
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+    assert arrivals, "no engine records reached the gamfit logger at DEBUG"
+    assert not arrivals[0], (
+        "the first engine record arrived only after the fit returned: records "
+        "produced during a call must stream to the logger while it runs"
+    )
 
 
 def test_no_engine_records_at_the_default_level(caplog: Any) -> None:

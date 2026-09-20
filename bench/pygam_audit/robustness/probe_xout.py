@@ -2,7 +2,7 @@ import gamfit, numpy as np, warnings, sys
 warnings.simplefilter("ignore")
 from cases import CASES
 c=CASES["x_with_outlier_x"]()
-for f in ["y ~ s(x)", "y ~ s(x, knot_placement=quantile)", "y ~ s(x, bs=tp)"]:
+for f in ["y ~ s(x)", "y ~ s(x, knot_placement=quantile)", "y ~ s(x, bs=tps)"]:
     try:
         m=gamfit.fit(c["data"],f); p=m.predict(c["pred"])
         p=p["posterior_mean"] if isinstance(p,dict) else np.asarray(p).ravel()

@@ -1,6 +1,6 @@
 //! Regression for issue #1507: `model.sample()` must respect hard *box*
 //! constraints on a linear coefficient (`nonnegative()` / `nonpositive()` /
-//! `linear(min=, max=)` / `constrain(...)`).
+//! `linear(min=, max=)`).
 //!
 //! These bounds are enforced at fit time as KKT inequality rows
 //! (`src/terms/smooth/design_construction.rs` reads
