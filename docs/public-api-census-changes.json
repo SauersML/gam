@@ -4886,5 +4886,13 @@
     },
     "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit asks the shared identification rule crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867) instead of its own pub(crate) copy learned_frailty_scale_is_identified, which is deleted. The same entry is in docs/source-removal-changes.json.",
     "evidence": "public_api_census.py with base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate refuses exactly this identity (13820 -> 13819 public function declarations). In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences."
+  },
+  {
+    "base": "f978f1d043baca9753bc81e60ef5a8ac0de02060",
+    "removed": {
+      "crates/gam-predict/src/posterior_bands.rs::eta_bands_from_matrix_link": 1
+    },
+    "reason": "#3604: dead posterior_eta_bands path deleted; draw_bands_from_matrices is the single posterior-band reducer.",
+    "evidence": "No caller of eta_bands_from_matrix_link remains in the workspace."
   }
 ]

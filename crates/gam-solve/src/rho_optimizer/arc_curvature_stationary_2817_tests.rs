@@ -882,6 +882,57 @@ fn a_descending_search_stops_at_the_first_point_its_verdict_certifies_2954() {
     assert_eq!(published.value, COST_2817);
 }
 
+/// A caller's required `|Pg|` (#2568) holds the online stop until it is met
+/// (#3311, #3429).
+///
+/// 6ac3a704e7 took the Newton-decrement verdict at every evaluation and stopped
+/// at the first point it certified, whatever the caller required, so the exact
+/// block Gaussian REML fit returned a point short of its `|Pg| <= 1e-8`. #3429
+/// declines such a point in the online stop. This pins the boundary.
+///
+/// The descending search above halts at its first point, where the verdict
+/// certifies the residual [`CERTIFIED_GRADIENT_2954`]. With a requirement one ulp
+/// below that residual, the same search keeps moving, because the caller asked
+/// for a tighter point than the verdict needs. The exact block Gaussian REML fit
+/// is such a caller: its backward pass needs the optimum's zero gradient. With a
+/// requirement exactly at the residual, the requirement is met, and the search
+/// halts at the same first point (the control).
+#[test]
+fn a_caller_requirement_holds_the_online_stop_until_it_is_met_3311() {
+    let (config, evidence) = certifying_verdict_2954();
+    let run = |required: f64| {
+        let config = OuterConfig {
+            required_projected_gradient_norm: Some(required),
+            ..config.clone()
+        };
+        let samples = descending_2817(array![CERTIFIED_GRADIENT_2954], SECOND_STALL_2817 + 3);
+        drive_arc_oracle_publishing_2817(
+            vec![array![0.5]; samples.len()],
+            samples,
+            array![[1.0]],
+            wide_box_2817(1),
+            Some(RESOLUTION_2817),
+            |_| COST_2817,
+            Some((&config, evidence.clone())),
+        )
+    };
+
+    let (held, published) = run(CERTIFIED_GRADIENT_2954.next_down());
+    assert!(
+        held.iter().all(|outcome| outcome.is_ok()),
+        "a requirement tighter than the certified residual must keep the search moving: {held:?}"
+    );
+    assert!(published.is_none_or(|exit| !exit.converged));
+
+    let (halted, published) = run(CERTIFIED_GRADIENT_2954);
+    assert_eq!(
+        halted,
+        vec![Err(ARC_CURVATURE_STATIONARY_SENTINEL.to_string())],
+        "a requirement the residual meets must not hold the stop"
+    );
+    assert!(published.expect("the halt publishes its point").converged);
+}
+
 /// CONTROL: the curvature-resolvability rung still waits for a stalled
 /// criterion. The same descending search on a route that takes no verdict, whose
 /// every point is inside the rung's tolerance, is never halted on it.
