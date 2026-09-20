@@ -538,11 +538,13 @@ pub trait UncertaintyCovarianceSource {
     /// `None` and are handled with the family's own `InverseLink`.
     fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState>;
     /// Gaussian residual standard deviation used to widen observation
-    /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
-    /// report `0.0`, which collapses the observation interval to the mean
-    /// interval (the only safe default when no dispersion is available).
-    fn observation_standard_deviation(&self) -> f64 {
-        0.0
+    /// intervals for `ResponseFamily::Gaussian`. Raw covariance alone has no
+    /// residual scale and reports `None`, so the Gaussian observation band is
+    /// omitted exactly as the Beta / estimated-NB bands are without their fitted
+    /// dispersion; reading it as `0.0` would silently report the mean interval
+    /// as the observation interval.
+    fn observation_standard_deviation(&self) -> Option<f64> {
+        None
     }
     /// Fitted dispersion/precision hint used to widen observation intervals for
     /// dispersion-bearing families (Tweedie, Gamma, Beta). Raw covariance alone
@@ -585,8 +587,8 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
         UnifiedFitResult::fitted_link_state(self, family).ok()
     }
-    fn observation_standard_deviation(&self) -> f64 {
-        self.standard_deviation
+    fn observation_standard_deviation(&self) -> Option<f64> {
+        Some(self.standard_deviation)
     }
     fn observation_phi(&self) -> Option<f64> {
         self.likelihood_scale.fixed_phi()
@@ -2326,13 +2328,13 @@ where
         Array1::from_iter(mean.iter().enumerate().map(|(i, &m)| term(i, m)))
     };
     // The Gaussian per-row noise is the one term that can be refused (invalid
-    // prior weights); every other arm is `None` only for a missing dispersion.
+    // prior weights); like every other arm it is `None` for a missing
+    // dispersion (a raw covariance carries no residual scale).
     let gaussian_noise = match response {
-        ResponseFamily::Gaussian => Some(gaussian_observation_variance_per_row(
-            source.observation_standard_deviation().powi(2),
-            n,
-            prior_weights,
-        )?),
+        ResponseFamily::Gaussian => source
+            .observation_standard_deviation()
+            .map(|sd| gaussian_observation_variance_per_row(sd.powi(2), n, prior_weights))
+            .transpose()?,
         _ => None,
     };
     let predictive = || match response {
@@ -3481,6 +3483,34 @@ mod tests {
         assert!(
             nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
             "bare Vb must not build an estimated-NB observation interval from the seed theta"
+        );
+
+        let gaussian = gam_spec::LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        );
+        let gaussian_raw = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            gaussian.clone(),
+            &covariance,
+            &options,
+        )
+        .expect("raw Gaussian covariance prediction");
+        assert!(
+            gaussian_raw.observation_lower.is_none() && gaussian_raw.observation_upper.is_none(),
+            "bare Vb carries no residual scale, so it must not report the mean band as the \
+             Gaussian observation band"
+        );
+        let conformal_err =
+            predictive_standard_error(&gaussian, &array![0.0], &array![0.1], &covariance)
+                .expect_err("conformal must refuse a Gaussian scale with no residual SD");
+        assert!(
+            conformal_err
+                .to_string()
+                .contains("requires fitted observation-scale dispersion"),
+            "unexpected conformal error: {conformal_err}"
         );
     }
 
