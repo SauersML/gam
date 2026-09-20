@@ -3,7 +3,7 @@
 //!
 //! The GPU path (`gpu::linalg_dispatch::try_fast_spectral_leverage_diagonal`) only
 //! engages when a device was probed AND the workload clears the `XtDiagX`
-//! dispatch floor (n ≥ `xtwx_n_min`, 2·n·p² ≥ `xtwx_flops_min`); the shape
+//! dispatch floor (2·n·p² ≥ `xtwx_flops_min`); the shape
 //! below is sized to clear it. On a machine without a usable GPU the function
 //! returns `None` and the `Some(_)` arm is skipped — the test then asserts
 //! nothing, exactly like the sibling `gpu_*_match_cpu` parity tests. On the
@@ -16,8 +16,8 @@ use ndarray::Array2;
 
 #[test]
 fn gpu_spectral_leverage_diagonal_matches_cpu_when_available() {
-    // n·p² = 60_000·40² = 9.6e7 → 2·n·p² = 1.92e8 ≥ xtwx_flops_min (1e8) and
-    // n ≥ xtwx_n_min (50_000), so the GPU gate admits this shape on the box.
+    // n·p² = 60_000·40² = 9.6e7 → 2·n·p² = 1.92e8 ≥ xtwx_flops_min (1e8), so the
+    // GPU gate admits this shape on the box.
     let n = 60_000usize;
     let p = 40usize;
     let rank = 40usize;

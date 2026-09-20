@@ -3488,9 +3488,52 @@ pub fn assemble_competing_risks_cif(
     })
 }
 
+/// Aalen-Johansen CIF assembly from per-endpoint cumulative hazards that carry
+/// no rounding band.
+///
+/// Without a band there is no scale on which a decrease could be rounding, so
+/// the check is exact: every value must be `>= 0` and every endpoint's
+/// cumulative hazard must be nondecreasing along each row, or the assembly is
+/// refused with [`SurvivalError::NonMonotoneCumulativeHazard`]. Plateaus
+/// (equal consecutive values) are accepted. A producer that knows the rounding
+/// of its own evaluations passes it to
+/// [`assemble_competing_risks_cif_from_endpoints_with_rounding`] instead.
 pub fn assemble_competing_risks_cif_from_endpoints(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
+) -> Result<CompetingRisksCifResult, SurvivalError> {
+    assemble_competing_risks_cif_banded(times, cumulative_hazards, None)
+}
+
+/// Aalen-Johansen CIF assembly from per-endpoint cumulative hazards, each entry
+/// carrying the producer's certified rounding band.
+///
+/// `rounding_bands[k][[row, j]] >= 0` bounds `|computed - exact|` for
+/// `cumulative_hazards[k][[row, j]]`. The exact cumulative hazard is
+/// nondecreasing, so two computed values can read as a decrease only by the
+/// sum of their bands. For one row and one endpoint, the value `H_j` is
+/// compared with the running maximum `H_m` (the value the recurrence carries
+/// forward) and refused when
+///
+/// ```text
+/// H_j - H_m < -(band_j + band_m)      or      H_j < -band_j
+/// ```
+///
+/// A decrease inside the band is clamped to a zero increment. The band is per
+/// entry, so whether one subject's curve is accepted never depends on the
+/// other subjects in the batch (#3529).
+pub fn assemble_competing_risks_cif_from_endpoints_with_rounding(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazards: &[Array2<f64>],
+    rounding_bands: &[Array2<f64>],
+) -> Result<CompetingRisksCifResult, SurvivalError> {
+    assemble_competing_risks_cif_banded(times, cumulative_hazards, Some(rounding_bands))
+}
+
+fn assemble_competing_risks_cif_banded(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazards: &[Array2<f64>],
+    rounding_bands: Option<&[Array2<f64>]>,
 ) -> Result<CompetingRisksCifResult, SurvivalError> {
     let n_endpoints = cumulative_hazards.len();
     if n_endpoints == 0 || times.is_empty() {
@@ -3519,11 +3562,28 @@ pub fn assemble_competing_risks_cif_from_endpoints(
         }
     }
 
-    let max_abs_hazard = cumulative_hazards
-        .iter()
-        .flat_map(|endpoint_hazard| endpoint_hazard.iter())
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let monotone_tolerance = 1.0e-10_f64 * max_abs_hazard.max(1.0);
+    if let Some(bands) = rounding_bands {
+        if bands.len() != n_endpoints {
+            return Err(SurvivalError::DimensionMismatch);
+        }
+        for band in bands {
+            if band.dim() != (n_rows, n_times) {
+                return Err(SurvivalError::DimensionMismatch);
+            }
+            if band.iter().any(|value| !value.is_finite()) {
+                return Err(SurvivalError::NonFiniteInput);
+            }
+            if band.iter().any(|value| *value < 0.0) {
+                return Err(SurvivalError::InvalidInput {
+                    reason: "competing-risks cumulative-hazard rounding bands must be nonnegative"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    let band_at = |endpoint: usize, row: usize, time_idx: usize| -> f64 {
+        rounding_bands.map_or(0.0, |bands| bands[endpoint][[row, time_idx]])
+    };
     let mut cif: Vec<Array2<f64>> = (0..n_endpoints)
         .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
         .collect();
@@ -3544,19 +3604,27 @@ pub fn assemble_competing_risks_cif_from_endpoints(
         let mut cif_flat = vec![0.0_f64; n_endpoints * n_times];
         let mut surv_row = vec![0.0_f64; n_times];
         let mut previous_cif = vec![0.0_f64; n_endpoints];
+        // `previous_cumulative` is the running maximum the recurrence carries
+        // forward (it starts at the exact origin `H(0) = 0`, band 0), and
+        // `previous_band` is the band of the entry that set it.
         let mut previous_cumulative = vec![0.0_f64; n_endpoints];
+        let mut previous_band = vec![0.0_f64; n_endpoints];
         let mut increments = vec![0.0_f64; n_endpoints];
         let mut previous_total_cumulative = 0.0_f64;
         for time_idx in 0..n_times {
             let mut total_increment = 0.0_f64;
             for endpoint in 0..n_endpoints {
                 let current = cumulative_hazards[endpoint][[row, time_idx]];
-                if current < -monotone_tolerance {
+                let band = band_at(endpoint, row, time_idx);
+                if current < -band {
                     return Err(SurvivalError::NonMonotoneCumulativeHazard);
                 }
                 let raw_increment = current - previous_cumulative[endpoint];
-                if raw_increment < -monotone_tolerance {
+                if raw_increment < -(band + previous_band[endpoint]) {
                     return Err(SurvivalError::NonMonotoneCumulativeHazard);
+                }
+                if raw_increment >= 0.0 {
+                    previous_band[endpoint] = band;
                 }
                 let increment = raw_increment.max(0.0);
                 increments[endpoint] = increment;
@@ -4422,6 +4490,95 @@ mod tests {
         let err = assemble_competing_risks_cif(times.view(), cumulative.view())
             .expect_err("nonmonotone cumulative hazard should be rejected");
         assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+    }
+
+    /// #3529: whether a row's decrease is refused depends only on that row's
+    /// own values and bands. Row 0 carries `H ~ 1e3`, row 1 a genuine relative
+    /// decrease of `1e-5` at `H ~ 1e-3`. The old batch-wide tolerance
+    /// `1e-10 * max|H| = 1e-7` let row 1's `1e-8` decrease through as a zero
+    /// increment.
+    #[test]
+    fn competing_risks_cif_refuses_a_small_row_decrease_beside_a_large_row_3529() {
+        let times = array![1.0, 2.0, 3.0];
+        let row1_peak = 1.0e-3_f64;
+        let row1_after = row1_peak * (1.0 - 1.0e-5);
+        let cumulative = vec![array![[500.0, 900.0, 1000.0], [0.5e-3, row1_peak, row1_after]]];
+        let err = assemble_competing_risks_cif_from_endpoints(times.view(), &cumulative)
+            .expect_err("a 1e-5 relative decrease is not rounding");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        // Rounding bands of `8ε|H|` per entry, the scale of an f64 evaluation, sit
+        // far below the decrease, so the banded assembly refuses it too.
+        let bands = vec![cumulative[0].mapv(|value| 8.0 * f64::EPSILON * value.abs())];
+        let err = assemble_competing_risks_cif_from_endpoints_with_rounding(
+            times.view(),
+            &cumulative,
+            &bands,
+        )
+        .expect_err("a decrease above the entries' rounding bands is refused");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        // Removing row 1's decrease leaves row 0 unchanged and assembles.
+        let mut monotone = cumulative.clone();
+        monotone[0][[1, 2]] = row1_peak;
+        assemble_competing_risks_cif_from_endpoints(times.view(), &monotone)
+            .expect("nondecreasing rows assemble");
+    }
+
+    /// #3529: a decrease within the sum of the two entries' bands is rounding;
+    /// it is clamped to a zero increment, so the CIF is flat across it. The
+    /// same values without a band are refused, and a decrease just past the
+    /// band is refused with it.
+    #[test]
+    fn competing_risks_cif_clamps_a_decrease_inside_its_rounding_band_3529() {
+        let times = array![1.0, 2.0, 3.0, 4.0];
+        let peak = 0.25_f64;
+        let band_value = 4.0 * f64::EPSILON * peak;
+        let dip = peak - band_value;
+        let cumulative = vec![array![[0.1, peak, dip, 0.4]], array![[0.05, 0.1, 0.2, 0.3]]];
+        let bands: Vec<Array2<f64>> = cumulative
+            .iter()
+            .map(|hazard| hazard.mapv(|_| band_value))
+            .collect();
+
+        let result = assemble_competing_risks_cif_from_endpoints_with_rounding(
+            times.view(),
+            &cumulative,
+            &bands,
+        )
+        .expect("a decrease inside the rounding band assembles");
+        assert!(result.cif[0][[0, 2]] >= result.cif[0][[0, 1]]);
+        for time_idx in 0..times.len() {
+            let total = result.cif[0][[0, time_idx]]
+                + result.cif[1][[0, time_idx]]
+                + result.overall_survival[[0, time_idx]];
+            assert_eq!(total, 1.0, "closure at time_idx={time_idx}");
+        }
+
+        let err = assemble_competing_risks_cif_from_endpoints(times.view(), &cumulative)
+            .expect_err("without a band any strict decrease is refused");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        let mut past_band = cumulative.clone();
+        past_band[0][[0, 2]] = peak - 4.0 * band_value;
+        let err = assemble_competing_risks_cif_from_endpoints_with_rounding(
+            times.view(),
+            &past_band,
+            &bands,
+        )
+        .expect_err("a decrease past both bands is refused");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        let mut negative_band = bands.clone();
+        negative_band[1][[0, 0]] = -1.0;
+        assert!(
+            assemble_competing_risks_cif_from_endpoints_with_rounding(
+                times.view(),
+                &cumulative,
+                &negative_band,
+            )
+            .is_err()
+        );
     }
 
     #[test]
