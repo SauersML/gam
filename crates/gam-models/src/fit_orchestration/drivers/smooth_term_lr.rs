@@ -3735,8 +3735,8 @@ pub fn smooth_term_lr_inference_forspec(
         // either edge. A term whose geometry cannot be projected keeps the
         // precision box around unit strength.
         let block_gram = {
-            let dense = full.design.design.to_dense();
-            let block = dense.slice(ndarray::s![.., coeff_range.start..coeff_range.end]);
+            let block =
+                full_design_dense.slice(ndarray::s![.., coeff_range.start..coeff_range.end]);
             block.t().dot(&block)
         };
         let log_scale_windows: Vec<(f64, f64)> = term_penalties
