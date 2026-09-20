@@ -3923,6 +3923,7 @@ dependencies = [
  "gam",
  "gam-build-identity",
  "gam-math",
+ "gam-model-api",
  "gam-predict",
  "gam-runtime",
  "log",
