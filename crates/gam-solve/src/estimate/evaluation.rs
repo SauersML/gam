@@ -163,7 +163,7 @@ where
         );
     }
 
-    let (cfg, _) = resolved_external_config(opts)?;
+    let (mut cfg, _) = resolved_external_config(opts)?;
 
     let y_o = y.to_owned();
     let w_o = w.to_owned();
@@ -173,9 +173,13 @@ where
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
 
-    // Certify binomial separation before any inner solve, as the fitting entry
-    // does: a separated unpenalized design has no finite mode (#2469).
-    crate::estimate::prefit::reject_prefit_binomial_separation(&cfg, y, w, &x_fit, &canonical)?;
+    // Decide the binomial prior before any inner solve, as the fitting entry
+    // does: a separated unpenalized design has no finite flat-prior mode
+    // (#2469), so the objective evaluated here is the Jeffreys-prior one the
+    // fit optimizes on that design (#3129).
+    crate::estimate::prefit::arm_jeffreys_on_prefit_binomial_separation(
+        &mut cfg, opts, y, w, &x_fit, &canonical,
+    )?;
     let mut reml_state = RemlState::newwith_offset(
         y_o.view(),
         x_fit,
@@ -232,7 +236,7 @@ where
         );
     }
 
-    let (cfg, _) = resolved_external_config(opts)?;
+    let (mut cfg, _) = resolved_external_config(opts)?;
 
     let y_o = y.to_owned();
     let w_o = w.to_owned();
@@ -242,9 +246,13 @@ where
     let fit_linear_constraints =
         conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
 
-    // Certify binomial separation before any inner solve, as the fitting entry
-    // does: a separated unpenalized design has no finite mode (#2469).
-    crate::estimate::prefit::reject_prefit_binomial_separation(&cfg, y, w, &x_fit, &canonical)?;
+    // Decide the binomial prior before any inner solve, as the fitting entry
+    // does: a separated unpenalized design has no finite flat-prior mode
+    // (#2469), so the objective evaluated here is the Jeffreys-prior one the
+    // fit optimizes on that design (#3129).
+    crate::estimate::prefit::arm_jeffreys_on_prefit_binomial_separation(
+        &mut cfg, opts, y, w, &x_fit, &canonical,
+    )?;
     let mut reml_state = RemlState::newwith_offset(
         y_o.view(),
         x_fit,
