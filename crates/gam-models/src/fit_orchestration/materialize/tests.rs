@@ -2793,6 +2793,7 @@ fn reference_gaussian_no_wiggle(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
     let sigma_floor =
         crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
@@ -2807,7 +2808,8 @@ fn reference_gaussian_no_wiggle(
         response_scale: 1.0,
         sigma_floor,
     };
-    rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
+    rescale_gaussian_location_scale_to_raw(&mut result, s, &raw_offsets)
+        .expect("gaussian location-scale raw remap");
     result
 }
 
@@ -2820,6 +2822,7 @@ fn reference_gaussian_wiggle(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
     let sigma_floor =
         crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
@@ -2860,7 +2863,8 @@ fn reference_gaussian_wiggle(
         response_scale: 1.0,
         sigma_floor,
     };
-    rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
+    rescale_gaussian_location_scale_to_raw(&mut result, s, &raw_offsets)
+        .expect("gaussian location-scale raw remap");
     result
 }
 
@@ -2909,6 +2913,7 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
     // Fit in *standardized* units (the engine's internal state before the raw
     // remap) so the remap under test is applied exactly once, by this test.
     let mut spec = spec;
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
     let sigma_floor =
         crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
@@ -2962,7 +2967,8 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
         );
     }
 
-    rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
+    rescale_gaussian_location_scale_to_raw(&mut result, s, &raw_offsets)
+        .expect("gaussian location-scale raw remap");
 
     let fit = &result.fit.fit;
     let top_conditional = fit
@@ -3054,6 +3060,7 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         ..
     } = request;
     let mut spec = spec;
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
     let sigma_floor =
         crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
@@ -3091,12 +3098,14 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         &mut rescaled,
         s,
         ActiveFrameUnits::RescalePrecision,
+        &raw_offsets,
     )
     .expect("rescaled representation");
     rescale_gaussian_location_scale_to_raw_with_units(
         &mut composed,
         s,
         ActiveFrameUnits::ComposeIntoGauge,
+        &raw_offsets,
     )
     .expect("composed representation");
     let (a, b) = (&rescaled.fit.fit, &composed.fit.fit);

@@ -347,6 +347,7 @@ fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -946,6 +947,7 @@ fn test_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -1416,6 +1418,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -1770,6 +1773,7 @@ fn oracle_rigid_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -2105,6 +2109,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -2254,6 +2259,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         };
         // ZERO deviation coefficients: the flex calculus runs in full, but the
         // primary NLL reduces to the rigid closed form so the rigid Tower4 is the
@@ -2453,6 +2459,7 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let primary = flex_primary_slices(&family);
     let p = primary.total;
@@ -2897,6 +2904,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let specs = vec![
         dummy_blockspec(1),
@@ -2947,6 +2955,7 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3022,6 +3031,7 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3095,6 +3105,7 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3169,6 +3180,7 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3257,6 +3269,7 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3332,6 +3345,7 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.4, 7.0],
@@ -3398,6 +3412,7 @@ fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.6, 0.6],
@@ -3477,6 +3492,7 @@ fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 1,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.0, 0.5],
@@ -3545,6 +3561,7 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 1,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3626,6 +3643,7 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3711,6 +3729,7 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3791,6 +3810,7 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![
         ParameterBlockState {
@@ -3874,6 +3894,7 @@ fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -4213,6 +4234,7 @@ fn make_block_psi_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -4355,6 +4377,7 @@ fn make_flex_baseline_psi_test_fixture() -> (
         time_wiggle_degree: Some(degree),
         time_wiggle_ncols: wiggle_width,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
 
     let mut beta_time = Array1::zeros(time_width);
@@ -5321,6 +5344,7 @@ fn make_flex_no_wiggle_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -6042,6 +6066,7 @@ fn flex_contraction_fixture_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let h_dim = score_runtime.basis_dim();
     let w_dim = link_runtime.basis_dim();
@@ -6267,6 +6292,7 @@ fn make_time_guard_family(deriv_coeff: f64, deriv_offset: f64) -> SurvivalMargin
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -6491,6 +6517,7 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         };
         let sd = score_runtime.basis_dim();
         let ld = link_runtime.basis_dim();
@@ -8184,6 +8211,7 @@ fn make_timewiggle_test_family(
         time_wiggle_degree: Some(TIMEWIGGLE_TEST_DEGREE),
         time_wiggle_ncols: TIMEWIGGLE_TEST_NCOLS,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -8918,6 +8946,7 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: cache,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         }
     };
     let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
@@ -9251,6 +9280,7 @@ fn link_deviation_row_likelihood_is_c1_across_its_support_end_2971() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
     let beta_w = Array1::from_iter((0..w_dim).map(|k| 0.035 * (k as f64 + 0.7).cos()));

@@ -103,7 +103,9 @@ TRIALS_MAX = 20
 #   gamma_inverse       Gamma, shape 3, fitted on the canonical inverse link;
 #                       the truth is ``1 / mu = 1 + 0.2 eta``, which stays
 #                       positive for every design (``|eta| <= sqrt(p)``).
-#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3, log link.
+#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3; the
+#                       truth is on the log scale, the fit on the canonical
+#                       ``1 / mu^2`` link (gamfit's default for the family).
 #   lognormal_gaussian  ``log y = 0.5 + 0.7 eta + N(0, 0.5^2)`` fitted as a
 #                       Gaussian on the log scale (response and mean are logs).
 #   lognormal_gamma     the same draw of ``y`` fitted by Gamma(log) on the raw

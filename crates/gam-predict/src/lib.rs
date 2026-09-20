@@ -5516,3 +5516,6 @@ mod gamma_dispersion_location_scale_predictable_1119_tests;
 
 #[cfg(test)]
 mod gaussian_location_scale_gauge_lifted_precision_1561_tests;
+
+#[cfg(test)]
+mod gaussian_location_scale_wiggle_replay_3001_tests;
