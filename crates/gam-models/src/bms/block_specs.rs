@@ -2804,7 +2804,8 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // jacobian` carries the out-of-fold `J = ∂z/∂θ₁`; the realized leakage
     // directions `Z_infl = diag(s_f·β̂₀)·J` are residualised against the fitted
     // marginal+slope target span and appended to the additive marginal-index
-    // block as a fixed-ridge absorber, so the joint penalised solve makes the
+    // block as a REML-learned ridge absorber, so the joint penalised solve
+    // makes the
     // (α,β) score orthogonal to the remaining nuisance span without letting the
     // absorber compete for identifiable β(x) signal. `None` ⇒ raw z, and the
     // free score_warp spline below is the x-free-column fallback. β̂₀(x_i) is
@@ -2845,7 +2846,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         // the rigid-pilot W-metric.  For BMS the absorbed columns are installed
         // in the same additive predictor as the marginal surface; if we protect
         // only M, any component of Z_infl aligned with the slope design G can
-        // be assigned to the fixed-ridge absorber by the joint solve, erasing
+        // be assigned to the ridge absorber by the joint solve, erasing
         // genuine β(x) heterogeneity.  Projecting out [M | G] keeps the nuisance
         // absorber orthogonal to both parametric target surfaces while still
         // absorbing Stage-1 leakage directions outside that identifiable target
@@ -2854,7 +2855,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
         let rigid_slope_at_rows = &spec.slope_offset + baseline.1;
         let residualized = crate::marginal_slope_orthogonal::residualized_influence_block(
             jac,
-            z_train,
             &rigid_slope_at_rows,
             probit_scale,
             protected_dense.view(),
