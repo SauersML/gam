@@ -2142,16 +2142,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // Use the workspace-backed variant for the dense path to reuse the
     // `final_aug_matrix` allocation; the sparse path still allocates
     // internally because no pre-computed factor is available at this site.
-    let mut edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
+    let edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
         calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut saved_workspace)?
     } else {
         calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?
     };
-    if !edf.is_finite() || edf.is_nan() {
-        let p = penalized_hessian_transformed.ncols() as f64;
-        let r = penalty_active.rank() as f64;
-        edf = (p - r).max(0.0);
-    }
 
     // An exhausted iteration budget stays an exhausted budget. The loop's own
     // post-loop soft acceptance (`pirls_soft_acceptance`) has already decided
