@@ -1249,6 +1249,19 @@ impl SaeManifoldTerm {
             && relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
     }
 
+    /// The `½λ²/scale` ratio [`Self::inner_decrement_certifies`] reads, with the
+    /// objective scale `|F| + 1` of the penalized objective `F` at the iterate.
+    /// A non-finite `F` has no scale to measure a decrease against, so the ratio
+    /// is NaN and the certificate refuses. Dividing by an infinite scale instead
+    /// would drive the ratio to 0 and certify any finite decrement.
+    pub(crate) fn inner_relative_decrement(decrement_sq: f64, objective: f64) -> f64 {
+        if objective.is_finite() {
+            0.5 * decrement_sq / (objective.abs() + 1.0)
+        } else {
+            f64::NAN
+        }
+    }
+
     /// `λ² = −gᵀΔ` of an inner acceptance factor's step, as the decrement
     /// certificate reads it (#2228, SPEC rule 22). `f64::max` returns its non-NaN
     /// operand, so the former `.max(0.0)` priced a NaN decrement as 0, and a

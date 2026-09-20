@@ -8069,12 +8069,17 @@ impl SaeManifoldTerm {
             // EV-keyed veto restored the same ρ-independent incumbent after
             // every probe and flattened the outer objective into the
             // #2230/#2134 restore-churn grind).
+            // A final objective that is infinite, or fails to evaluate (priced
+            // as +inf), is the worst degradation there is. It must restore:
+            // finiteness is checked first because an infinite final objective
+            // makes the tolerance infinite too, and `inf <= inf` would keep
+            // the blown state.
             let final_obj = self
                 .penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 .unwrap_or(f64::INFINITY);
             let obj_scale = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 * (1.0 + final_obj.abs().max(best_reconstruction_obj.abs()));
-            if !(final_obj <= best_reconstruction_obj + obj_scale) {
+            if !(final_obj.is_finite() && final_obj <= best_reconstruction_obj + obj_scale) {
                 let final_ev = self
                     .dictionary_reconstruction_ev(target, rho)
                     .unwrap_or(f64::NAN);
@@ -8193,12 +8198,15 @@ impl SaeManifoldTerm {
         // re-entry never improves on its own entry objective, so the bank
         // equals the entry state and the comparison is a no-op there.
         if let Some(bank) = warranty_state.as_ref() {
+            // The bank's objective is finite by construction. A final objective
+            // that is infinite or unevaluable (priced as +inf) is degraded past
+            // it and restores; it must not widen the tolerance to +inf.
             let final_obj = self
                 .penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 .unwrap_or(f64::INFINITY);
             let warranty_tol = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 * (1.0 + final_obj.abs().max(warranty_obj.abs()));
-            if !(final_obj <= warranty_obj + warranty_tol) {
+            if !(final_obj.is_finite() && final_obj <= warranty_obj + warranty_tol) {
                 log::debug!(
                     "[#2228] exit warranty: final penalized objective {final_obj:.6e} degraded \
                      past the best accepted boundary {warranty_obj:.6e}; restoring the banked \
