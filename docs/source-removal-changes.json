@@ -2592,11 +2592,11 @@
     "evidence": "scripts/source_removal_guard.py --base 3c2b08bc13124f15576fef1513960f97053c1647 --head d91b01836688765aadbbed2aff2ef0f78d7e9d41 (the landing session's merge of main into claude/pygam-partial-effects) lists exactly these 11 guarded removals and fails without this entry. Read-proof, git grep -w -c over *.rs at that head: DEFAULT_SIMULATIONS 0, model_partial_dependence 0, model_partial_dependence_impl 0, PartialDependenceOutput 0; standard_mean_design is in gam-predict/src/partial_effect.rs (2), geometry_ffi.rs (1, the variance-share caller) and manifold_and_posterior_ffi.rs (1, the difference-smooth caller); standard_mean_termspec (3), standard_mean_prediction_design (2) and NONZERO_ANCHOR_DESIGN_ERROR (3) are all in gam-predict/src/partial_effect.rs; SimultaneousBandOptions::at_level appears 5 times in gam-inference/src/effects.rs, and main's whole-curve coverage test is ported to it. The renamed tests are each declared once in gam-inference/src/partial_dependence.rs."
   },
   {
-    "base": "6ea77be1415759473aacd55df7a20f7dbe985ffe",
+    "base": "15e7666340914de4903aad94a79f0cb642e99410",
     "items": [
       "crates/gam-runtime/src/warm_start/store.rs:fn:touch_lookup_hit"
     ],
     "reason": "#3882, #3885: the warm-start lookup fast path now re-reads and touches the cached meta itself and re-records the post-touch meta and key-directory stamps through remember_lookup, the one helper the slow path also uses, so the private wrapper touch_lookup_hit (read_meta + touch_lookup_meta, discarding the touched meta the row now needs) has no caller.",
-    "evidence": "scripts/source_removal_guard.py with --base 6ea77be1415759473aacd55df7a20f7dbe985ffe and head the change's commit lists exactly this removal. Read-proof at the head: git grep -w touch_lookup_hit finds no occurrence in the repository; it was a private method of WarmStartStore in crates/gam-runtime/src/warm_start/store.rs whose only call site was the lookup_with fast path rewritten here."
+    "evidence": "scripts/source_removal_guard.py with --base 15e7666340914de4903aad94a79f0cb642e99410 and head the change's commit lists exactly this removal. Read-proof at the head: git grep -w touch_lookup_hit finds no occurrence in the repository; it was a private method of WarmStartStore in crates/gam-runtime/src/warm_start/store.rs whose only call site was the lookup_with fast path rewritten here."
   }
 ]
