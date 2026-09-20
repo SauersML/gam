@@ -371,6 +371,42 @@ mod tests {
     }
 
     #[test]
+    fn lc22_probe2_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let fresh = || {
+            let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+            SaeManifoldOuterObjective::new(
+                term, target, Some(AnalyticPenaltyRegistry::new()), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+            )
+        };
+        let xs = [4.0, 6.0, 7.0, 7.9, 7.99, 8.0, 8.01, 8.1, 9.0, 10.0, 12.0];
+        for &x in &xs {
+            let mut o = fresh();
+            let r = ndarray::Array1::from(vec![x, -4.0]);
+            match o.eval(&r) {
+                Ok(ev) => eprintln!("[probe2 fresh] x={x} cost={:.12e} g0={:.6e} g1={:.6e}", ev.cost, ev.gradient[0], ev.gradient[1]),
+                Err(e) => eprintln!("[probe2 fresh] x={x} err {e}"),
+            }
+        }
+        let mut o = fresh();
+        for &x in &xs {
+            let r = ndarray::Array1::from(vec![x, -4.0]);
+            match o.eval(&r) {
+                Ok(ev) => eprintln!("[probe2 seq] x={x} cost={:.12e} g0={:.6e}", ev.cost, ev.gradient[0]),
+                Err(e) => eprintln!("[probe2 seq] x={x} err {e}"),
+            }
+        }
+        for &h in &[1e-2, 1e-3, 1e-4, 1e-5] {
+            let mut o = fresh();
+            let c = o.eval(&ndarray::Array1::from(vec![8.0, -4.0])).map(|e| (e.cost, e.gradient[0])).unwrap();
+            let fp = o.eval(&ndarray::Array1::from(vec![8.0 + h, -4.0])).map(|e| e.cost).unwrap();
+            let fm = o.eval(&ndarray::Array1::from(vec![8.0 - h, -4.0])).map(|e| e.cost).unwrap();
+            let c2 = o.eval(&ndarray::Array1::from(vec![8.0, -4.0])).map(|e| (e.cost, e.gradient[0])).unwrap();
+            eprintln!("[probe2 fd] h={h} c={:.12e} g0={:.6e} fd={:.6e} fwd={:.6e} bwd={:.6e} re-eval c={:.12e} g0={:.6e}", c.0, c.1, (fp - fm) / (2.0 * h), (fp - c.0) / h, (c.0 - fm) / h, c2.0, c2.1);
+        }
+    }
+
+    #[test]
     fn converged_native_replay_passes_zero_optimization_audit_and_perturbation_fails() {
         let (target, term, rho, pin, provenance) = native_converged_state();
         let mut perturbed = term.clone();
