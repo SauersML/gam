@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
+  The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
+  the default slope (an intercept in every slope surface and a constant or no offset) any σ
+  fits the data exactly as well as any other once the slope is rescaled. Such a fit is now
+  refused by that reason at fit entry, before any solve, instead of by a missing derivative
+  or a per-score rule. A slope offset outside the slope design's span does identify σ, and
+  those fits keep their previous behaviour. A fixed `frailty_sd` is unaffected (gam#2938).
+
 - **The arrow-Schur "certified mixed precision" solve is removed** (#2946 census T10).
   The streaming/residency path turned it on by default. It factored the reduced
   Schur complement and the per-row blocks in f64, copied those factors to f32,
