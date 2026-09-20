@@ -276,6 +276,60 @@ impl EventHistoryFamily {
         Ok((value, gradient, product))
     }
 
+    /// `trace(Fᵀ (D_β H[u_i] + D²_β H[d_a, d_b]) F)` of the negative
+    /// log-likelihood Hessian `H` for each `u_i`, column `i` of `second_modes`,
+    /// at `(a, b) = pairs[i]` over the columns of `directions` (gam#2922).
+    ///
+    /// The trace is `Σ_c f_cᵀ (·) f_c` over the columns `f_c` of `F`, and each
+    /// term is one path evaluation over `Rows<Rows<TwoSeed<0>, 1>, 1>`: both
+    /// levels carry `f_c`, so the mixed channel is `f_cᵀ ∇²ℓ f_c`, and the
+    /// hyper-dual seed `β + ε d_a + δ d_b + εδ u_i` makes its `εδ` coefficient
+    /// `f_cᵀ (D²∇²ℓ[d_a, d_b] + D∇²ℓ[u_i]) f_c`. A term costs sixteen channels,
+    /// where the drift it replaces costs a full block sweep of `TwoSeed<0>`
+    /// and one of `OneSeed<0>`, `b(b + 1)/2` evaluations each over
+    /// `b = ⌈p / TANGENT_WIDTH⌉` blocks at up to `4 (1 + TANGENT_WIDTH)²`
+    /// channels (#3322). The value is the exact derivative of the same computed
+    /// path, summed over the columns in order.
+    pub(super) fn second_correction_traces(
+        &self, states: &[ParameterBlockState], factor: &Array2<f64>, second_modes: &Array2<f64>,
+        directions: &Array2<f64>, pairs: &[(usize, usize)],
+    ) -> Result<Vec<f64>, String> {
+        self.validate_states(states)?;
+        let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+        let total = values.len();
+        if factor.nrows() != total || second_modes.nrows() != total || directions.nrows() != total
+            || second_modes.ncols() != pairs.len()
+            || pairs.iter().any(|&(a, b)| a >= directions.ncols() || b >= directions.ncols())
+        {
+            return Err("event-history second correction traces: inconsistent shapes".to_string());
+        }
+        if [factor, second_modes, directions].iter().any(|m| m.iter().any(|x| !x.is_finite())) {
+            return Err("event-history second correction traces: non-finite input".to_string());
+        }
+        let columns = factor.ncols();
+        let jobs: Vec<(usize, usize)> = (0..pairs.len())
+            .flat_map(|i| (0..columns).map(move |c| (i, c)))
+            .collect();
+        let terms: Vec<Result<f64, EventHistoryError>> = jobs.par_iter().map(|&(i, c)| {
+            let (a, b) = pairs[i];
+            let seeded: Vec<Rows<Rows<TwoSeed<0>, 1>, 1>> = (0..total).map(|q| {
+                let coefficient = TwoSeed {
+                    base: scalar0(values[q]),
+                    eps: scalar0(directions[[q, a]]),
+                    del: scalar0(directions[[q, b]]),
+                    eps_del: scalar0(second_modes[[q, i]]),
+                };
+                Rows::seed(Rows::seed(coefficient, [factor[[q, c]]]), [factor[[q, c]]])
+            }).collect();
+            Ok(self.path_value(states, &seeded)?.rows[0].rows[0].eps_del())
+        }).collect();
+        let mut traces = vec![0.0; pairs.len()];
+        for (&(i, _), term) in jobs.iter().zip(terms) {
+            traces[i] -= term?;
+        }
+        Ok(traces)
+    }
+
     pub(super) fn computed_joint<S: Directional>(
         &self, states: &[ParameterBlockState], u: Option<&Array1<f64>>,
         v: Option<&Array1<f64>>, derivatives: bool,
@@ -378,6 +432,15 @@ impl ExactNewtonJointHessianWorkspace for ComputedHessianWorkspace {
         &self, arr: &Array1<f64>, arr2: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(self.family.second_directional_hessian(&self.states, arr, arr2)?))
+    }
+
+    fn projected_second_correction_traces(
+        &self, factor: &Array2<f64>, second_modes: &Array2<f64>, directions: &Array2<f64>,
+        pairs: &[(usize, usize)],
+    ) -> Result<Option<Array1<f64>>, String> {
+        self.family.clear_reference_refusal();
+        Ok(Some(Array1::from(self.family.second_correction_traces(
+            &self.states, factor, second_modes, directions, pairs)?)))
     }
 }
 
@@ -1053,5 +1116,42 @@ mod tests {
             workspace.hessian_source_preference_for_intent(MaterializationIntent::InnerSolve),
             JointHessianSourcePreference::Dense
         );
+    }
+
+    /// The row-kernel traces are `trace(Fᵀ (D_β H[u_i] + D²_β H[d_a, d_b]) F)`
+    /// of the drifts the workspace materialises (#3322). Both are exact
+    /// derivatives of the same computed path and differ only in where the
+    /// contraction with `F` happens, so they agree to rounding: a relative
+    /// `1e-9` of the absolute contraction `Σ_c |f_c|ᵀ |C| |f_c|` leaves four
+    /// orders of magnitude above the `~10⁴ ε` a path's accumulated rounding
+    /// reaches, and a dropped term, a sign slip or a swapped seed moves a trace
+    /// by the size of one of its parts.
+    #[test]
+    fn the_second_correction_traces_contract_the_materialised_drifts_3322() {
+        let (family, states) = wide_reference_family(4);
+        let total = family.total_width();
+        assert!(family.differentiates_the_computed_path());
+        let workspace = ComputedHessianWorkspace::new(family.clone(), states.clone());
+        let column = |scale: f64, shift: usize| -> Array1<f64> {
+            Array1::from_iter((0..total).map(|q| scale * (((q + shift) % 5) as f64 - 1.5)))
+        };
+        let factor = Array2::from_shape_fn((total, 3), |(q, c)| 0.3 * ((q * (c + 2)) % 7) as f64 - 0.8);
+        let directions = ndarray::stack(ndarray::Axis(1), &[column(0.4, 0).view(), column(-0.25, 2).view()]).unwrap();
+        let pairs = [(0, 0), (1, 0), (1, 1)];
+        let second_modes = ndarray::stack(ndarray::Axis(1),
+            &[column(0.7, 1).view(), column(0.2, 3).view(), column(-0.5, 4).view()]).unwrap();
+        let traces = workspace.projected_second_correction_traces(&factor, &second_modes, &directions, &pairs)
+            .unwrap().expect("the computed path has a row kernel");
+        for (i, &(a, b)) in pairs.iter().enumerate() {
+            let drift = family.directional_hessian(&states, &second_modes.column(i).to_owned()).unwrap()
+                + family.second_directional_hessian(&states,
+                    &directions.column(a).to_owned(), &directions.column(b).to_owned()).unwrap();
+            let oracle = (factor.t().dot(&drift).dot(&factor)).diag().sum();
+            let magnitude = (factor.mapv(f64::abs).t().dot(&drift.mapv(f64::abs)).dot(&factor.mapv(f64::abs)))
+                .diag().sum();
+            assert!(oracle.abs() > 1e-3 * magnitude, "trace {i} must be material");
+            assert!((traces[i] - oracle).abs() <= 1e-9 * magnitude,
+                "trace {i}: {} against the materialised {oracle}", traces[i]);
+        }
     }
 }
