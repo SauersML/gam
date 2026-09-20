@@ -17,6 +17,15 @@ pub(crate) fn materialize_location_scale<'a>(
         .noise_formula
         .as_deref()
         .ok_or_else(|| "noise_formula is required for location-scale models".to_string())?;
+    // None of the location-scale requests built below carries a frailty, so an
+    // active one would be dropped and the fit would run without it. Refuse it,
+    // as the standard and transformation-normal materializers do.
+    if config.frailty.is_active() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "frailty is not supported for location-scale (noise_formula) models"
+                .to_string(),
+        });
+    }
     let mut noise_parsed = parse_formula(&format!("{} ~ {noise_formula}", parsed.response))?;
     apply_secondary_predictor_basis_parsimony(&mut noise_parsed.terms, data.values.nrows());
 
