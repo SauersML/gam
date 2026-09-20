@@ -11,8 +11,8 @@
 //! ## Workload (LLM / SAE shape, per #1017)
 //!
 //! The SAE/LLM fit is `q ≤ 6` row blocks × `p` in the thousands × `n` in the
-//! thousands — *thousands of small dense ops*, no single op large enough to
-//! trip the legacy row-count gate (`xtwx_n_min = 50_000`). The two device hot
+//! thousands — *thousands of small dense ops*, no single op with a large row
+//! count (the dense gates key on flops, not rows). The two device hot
 //! kernels at this shape are:
 //!
 //!   1. **tile-GEMM**: the `Xᵀ·diag(w)·X` reduction (`n × p`) that forms each

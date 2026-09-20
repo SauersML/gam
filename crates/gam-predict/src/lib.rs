@@ -534,9 +534,16 @@ pub trait UncertaintyCovarianceSource {
         label: &str,
     ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError>;
     /// Optional fitted adaptive-link state (SAS / BetaLogistic / Mixture /
-    /// latent cloglog). Standard links and raw covariance sources return
-    /// `None` and are handled with the family's own `InverseLink`.
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState>;
+    /// latent cloglog). Raw covariance sources return `Ok(None)` and are
+    /// handled with the family's own `InverseLink`. A fitted source whose
+    /// recorded link state is inconsistent with `family` (an adaptive link
+    /// with no fitted state, or an unsupported binomial link) returns the
+    /// typed error rather than silently predicting with the family's
+    /// embedded link, matching `strategy_from_fit` on the posterior-mean path.
+    fn resolved_fitted_link_state(
+        &self,
+        family: &LikelihoodSpec,
+    ) -> Result<Option<FittedLinkState>, EstimationError>;
     /// Gaussian residual standard deviation used to widen observation
     /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
     /// report `0.0`, which collapses the observation interval to the mean
@@ -582,8 +589,11 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError> {
         selected_uncertainty_backend(self, expected_dim, mode, label)
     }
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
-        UnifiedFitResult::fitted_link_state(self, family).ok()
+    fn resolved_fitted_link_state(
+        &self,
+        family: &LikelihoodSpec,
+    ) -> Result<Option<FittedLinkState>, EstimationError> {
+        UnifiedFitResult::fitted_link_state(self, family).map(Some)
     }
     fn observation_standard_deviation(&self) -> f64 {
         self.standard_deviation
@@ -632,13 +642,16 @@ impl UncertaintyCovarianceSource for Array2<f64> {
         }
     }
 
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
+    fn resolved_fitted_link_state(
+        &self,
+        family: &LikelihoodSpec,
+    ) -> Result<Option<FittedLinkState>, EstimationError> {
         match &family.link {
             InverseLink::Standard(_)
             | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_) => None,
+            | InverseLink::Mixture(_) => Ok(None),
         }
     }
 }
@@ -1003,7 +1016,7 @@ impl FittedModelPredictExt for FittedModel {
             }
             PredictModelClass::Standard => {
                 let family = self.family_state.likelihood();
-                let link_kind = self.resolved_inverse_link().ok().flatten();
+                let link_kind = runtime.inverse_link.clone();
                 let fit = self.fit_result.as_ref()?;
                 let beta = if runtime.link_wiggle.is_some() {
                     fit.block_by_role(BlockRole::Mean)?.beta.clone()
@@ -1039,18 +1052,23 @@ impl FittedModelPredictExt for FittedModel {
                 ) {
                     return None;
                 }
+                // `resolved_inverse_link` is `None` for every survival family, so
+                // the fitted survival link lives only in the saved `link` (the
+                // same source `resolve_survival_inverse_link_from_saved` reads).
+                // `SurvivalPredictor` evaluates the bare link and cannot replay a
+                // fitted link wiggle, so a wiggled survival fit has no generic
+                // predictor rather than one on the wrong link.
+                if runtime.link_wiggle.is_some() {
+                    return None;
+                }
                 let unified = self.unified()?;
-                let inverse_link = self.resolved_inverse_link().ok().flatten().unwrap_or(
-                    gam_spec::InverseLink::Standard(gam_spec::StandardLink::Probit),
-                );
+                let inverse_link = self.payload().link.clone()?;
                 SurvivalPredictor::from_unified(unified, inverse_link)
                     .ok()
                     .map(|p| Box::new(p) as Box<dyn PredictableModel>)
             }
             PredictModelClass::BinomialLocationScale => {
-                let inverse_link = self.resolved_inverse_link().ok().flatten().unwrap_or(
-                    gam_spec::InverseLink::Standard(gam_spec::StandardLink::Probit),
-                );
+                let inverse_link = runtime.inverse_link.clone()?;
                 let fit = self.fit_result.as_ref()?;
                 let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
                 let beta_noise = location_scale_noise_beta(fit)
@@ -1068,7 +1086,7 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_mu = gaussian_location_scale_mean_beta(fit)?;
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
-                let inverse_link = self.resolved_inverse_link().ok().flatten();
+                let inverse_link = runtime.inverse_link.clone();
                 Some(Box::new(DispersionLocationScalePredictor {
                     beta_mu,
                     beta_noise,
@@ -1126,11 +1144,9 @@ impl FittedModelPredictExt for FittedModel {
             payload.baseline_slope.ok_or_else(|| {
                 "marginal-slope predictor requires a saved slope baseline".to_string()
             })?,
-            self.resolved_inverse_link()
-                .map_err(|err| format!("marginal-slope predictor inverse link: {err}"))?
-                .unwrap_or(gam_spec::InverseLink::Standard(
-                    gam_spec::StandardLink::Probit,
-                )),
+            runtime.inverse_link.clone().ok_or_else(|| {
+                "marginal-slope predictor requires a resolved inverse link".to_string()
+            })?,
             self.family_state
                 .frailty()
                 .ok_or_else(|| {
@@ -2834,7 +2850,7 @@ where
     eta += &offset;
     // Track whether the centre was actually shifted to β_BC: the covariance must
     // gain the matching A·V·Aᵀ Jacobian only when it did (#1870).
-    let fitted_link_state = source.resolved_fitted_link_state(&family);
+    let fitted_link_state = source.resolved_fitted_link_state(&family)?;
     let mixture_state = match fitted_link_state.as_ref() {
         Some(FittedLinkState::Mixture { state, .. }) => Some(state.clone()),
         _ => None,
@@ -3455,6 +3471,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fitted_source_missing_adaptive_link_state_errors_instead_of_using_embedded_link() {
+        // A Binomial-SAS family paired with a fit that recorded no SAS state is
+        // an inconsistent fit/family pair. `strategy_from_fit` refuses it on the
+        // posterior-mean path; the uncertainty path must refuse it too instead
+        // of silently predicting with the family's embedded seed link.
+        let x = array![[1.0_f64]];
+        let beta = array![0.0_f64];
+        let offset = array![0.0_f64];
+        let state = gam_solve::mixture_link::sas_link_state_from_raw(0.7, -0.4)
+            .expect("valid SAS link state");
+        let family =
+            gam_spec::LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(state));
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+            ..PredictUncertaintyOptions::default()
+        };
+        let mut fit = test_fit_with_covariance(beta.clone(), array![[0.25]]);
+        let error = expect_estimation_error(
+            predict_gamwith_uncertainty(
+                x.view(),
+                beta.view(),
+                offset.view(),
+                family.clone(),
+                &fit,
+                &options,
+            ),
+            "a SAS family with no fitted SAS state must not predict",
+        );
+        assert!(
+            error.to_string().contains("SAS"),
+            "unexpected error for missing SAS state: {error}"
+        );
+
+        fit.fitted_link = FittedLinkState::Sas {
+            state,
+            covariance: None,
+        };
+        predict_gamwith_uncertainty(x.view(), beta.view(), offset.view(), family, &fit, &options)
+            .expect("a fit carrying its SAS state predicts");
+    }
+
     fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
@@ -3589,6 +3650,7 @@ mod tests {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         });
         fit
     }
@@ -4431,6 +4493,61 @@ mod tests {
         assert!((posterior.mean[0] - point.mean[0]).abs() <= 1e-12);
     }
 
+    fn saved_survival_location_scale_model(link: Option<InverseLink>) -> FittedModel {
+        use gam_models::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "Surv(t0, t1, event) ~ 1".to_string(),
+            ModelKind::Survival,
+            FittedFamily::Survival {
+                likelihood: gam_spec::LikelihoodSpec::royston_parmar(),
+                survival_likelihood: Some("location-scale".to_string()),
+                survival_distribution: None,
+                frailty: gam_models::survival::lognormal_kernel::FrailtySpec::None,
+            },
+            "survival".to_string(),
+        );
+        payload.unified = Some(survival_fit_with_covariance(
+            array![-1.0],
+            array![0.0],
+            Array2::zeros((2, 2)),
+        ));
+        payload.link = link;
+        FittedModel::from_payload(payload)
+    }
+
+    #[test]
+    fn saved_survival_predictor_uses_the_saved_fitted_link_not_probit() {
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![0.0]),
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let model =
+            saved_survival_location_scale_model(Some(InverseLink::Standard(StandardLink::CLogLog)));
+        assert_eq!(model.predict_model_class(), PredictModelClass::Survival);
+        let point = model
+            .predictor()
+            .expect("saved survival location-scale predictor")
+            .predict_plugin_response(&input)
+            .expect("saved survival point prediction");
+        // q0 = -eta_threshold * exp(-eta_log_sigma) = 1; cloglog S(q0) = exp(-e^q0).
+        let expected_cloglog = (-(1.0_f64.exp())).exp();
+        let probit = 1.0 - normal_cdf(1.0);
+        assert!((point.mean[0] - expected_cloglog).abs() <= 1e-12);
+        assert!((point.mean[0] - probit).abs() > 1e-3);
+
+        assert!(
+            saved_survival_location_scale_model(None)
+                .predictor()
+                .is_none(),
+            "a survival payload without its fitted link must not predict on a substitute link"
+        );
+    }
+
     #[test]
     fn survival_predictor_zero_threshold_with_tiny_sigma_stays_finite() {
         let predictor = SurvivalPredictor {
@@ -4483,6 +4600,7 @@ mod tests {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         };
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
