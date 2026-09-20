@@ -17,7 +17,7 @@ use ndarray::Array1;
 // Canonical stable softplus lives in `gam-linalg`; its sign-split identity
 // already reproduces the explicit NaN/±inf guard arms this module used to
 // carry (NaN → NaN, +inf → +inf, −inf → 0), so the alias is value-identical.
-pub(super) use gam_linalg::utils::stable_softplus as softplus;
+pub(super) use gam_math::special::softplus;
 
 /// Layer 3 defense: clamp products that overflow to ±inf back to ±MAX.
 /// With layer 1 (exp_neg_stable) active this should not trigger in normal

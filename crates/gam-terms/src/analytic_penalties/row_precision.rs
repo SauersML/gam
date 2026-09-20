@@ -849,7 +849,7 @@ impl ParametricRowPrecisionPriorPenalty {
                     "ParametricRowPrecisionPriorPenalty::new raw_beta[{k}] must be finite"
                 ));
             }
-            let beta_k = gam_linalg::utils::stable_softplus(raw_beta_k);
+            let beta_k = gam_math::special::softplus(raw_beta_k);
             if !(beta_k.is_finite() && beta_k >= 0.0) {
                 return Err(format!(
                     "ParametricRowPrecisionPriorPenalty::new softplus(raw_beta[{k}]) must be finite and >= 0"
@@ -947,7 +947,7 @@ impl ParametricRowPrecisionPriorPenalty {
         // `α = exp(ρ)` on the log-strength domain is positive and `β·r² ≥ 0`, so
         // the conditional precision is positive with nothing added to it.
         let alpha = validated_exp_log_strength(self.active_log_alpha(k, rho));
-        let beta = gam_linalg::utils::stable_softplus(self.active_raw_beta(k, rho));
+        let beta = gam_math::special::softplus(self.active_raw_beta(k, rho));
         alpha + beta * self.dist2(n, k, rho)
     }
 
@@ -1123,8 +1123,8 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
             let log_alpha = self.active_log_alpha(k, rho);
             let alpha = validated_exp_log_strength(log_alpha);
             let raw_beta = self.active_raw_beta(k, rho);
-            let beta = gam_linalg::utils::stable_softplus(raw_beta);
-            let beta_jac = gam_linalg::utils::stable_logistic(raw_beta);
+            let beta = gam_math::special::softplus(raw_beta);
+            let beta_jac = gam_math::special::logistic(raw_beta);
             let mut grad_alpha_direct = 0.0;
             let mut grad_beta_direct = 0.0;
             let mut grad_mu_direct = vec![0.0_f64; du];

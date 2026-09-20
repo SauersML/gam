@@ -394,7 +394,7 @@ pub(crate) fn inverse_link_log_survival_checked(
         InverseLink::Standard(StandardLink::Probit) => {
             probit_log_survival_and_ratio_derivatives(eta).0
         }
-        InverseLink::Standard(StandardLink::Logit) => -gam_linalg::utils::stable_softplus(eta),
+        InverseLink::Standard(StandardLink::Logit) => -gam_math::special::softplus(eta),
         InverseLink::Standard(StandardLink::CLogLog) => -eta.exp(),
         _ => {
             // No closed log form for the remaining links: their survival value

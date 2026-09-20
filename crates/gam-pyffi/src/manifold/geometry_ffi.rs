@@ -1433,26 +1433,6 @@ fn sinkhorn_barycenter_vjp<'py>(
 }
 
 #[pyfunction]
-fn numerics_sigmoid_stable<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArrayDyn<'py, f64>,
-) -> PyResult<Py<PyArrayDyn<f64>>> {
-    let owned = x.as_array().to_owned();
-    let out = py.detach(move || owned.mapv(sigmoid_stable));
-    Ok(out.into_pyarray(py).unbind())
-}
-
-#[pyfunction]
-fn numerics_inverse_softplus<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArrayDyn<'py, f64>,
-) -> PyResult<Py<PyArrayDyn<f64>>> {
-    let owned = x.as_array().to_owned();
-    let out = py.detach(move || owned.mapv(inverse_softplus_scalar));
-    Ok(out.into_pyarray(py).unbind())
-}
-
-#[pyfunction]
 fn response_geometry_normalize_fisher_rao<'py>(
     py: Python<'py>,
     value: PyReadonlyArrayDyn<'py, f64>,
@@ -4836,8 +4816,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_barycenter_forward, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_barycenter_vjp, module)?)?;
-    module.add_function(wrap_pyfunction!(numerics_sigmoid_stable, module)?)?;
-    module.add_function(wrap_pyfunction!(numerics_inverse_softplus, module)?)?;
     module.add_function(wrap_pyfunction!(
         response_geometry_normalize_fisher_rao,
         module

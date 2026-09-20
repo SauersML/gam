@@ -188,21 +188,6 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
     Ok(out.unbind())
 }
 
-/// Numerically stable logistic CDF used by `numerics_sigmoid_stable` (a
-/// scalar Python helper exposed to the gamfit numerics module). The
-/// multi-output penalised fitter no longer needs this helper directly —
-/// it routes through `gam::families::binomial_multi` whose internal
-/// `sigmoid_stable` lives in the Rust core.
-fn sigmoid_stable(eta: f64) -> f64 {
-    if eta >= 0.0 {
-        let e = (-eta).exp();
-        1.0 / (1.0 + e)
-    } else {
-        let e = eta.exp();
-        e / (1.0 + e)
-    }
-}
-
 /// FFI shim wrapping the canonical multi-output penalized fitters at fixed λ.
 ///
 /// Dispatches to either

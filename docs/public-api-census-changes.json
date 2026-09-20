@@ -4824,5 +4824,14 @@
     },
     "reason": "#2946 census T1/C1: curved_dictionary_global_optimality_verdict was the decision rule of GlobalOptimalityVerdict::CertifiedGlobal, which published 'unique global optimum' from the underived sufficient condition mu_hat <= c0*a^2*(1-1/SNR)*(1-C_kappa*kappa)/K with the chosen constants c0 = 1.0 and C_kappa = 0.125; margin and is_certified were that verdict's accessors. SPEC: 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' The verdict is deleted; its measured inputs survive as DictionaryIncoherenceReport (mu_hat, per_atom_kappa_hat, peak_activity_floor, snr_proxy).",
     "evidence": "At base 81623168aa public_api_census.py reports exactly these 3 identities. At head git grep -w finds no occurrence of curved_dictionary_global_optimality_verdict or GlobalOptimalityVerdict outside CHANGELOG.md and the ledgers; the remaining is_certified/margin names belong to other types (Verdict::is_certified and others) and are untouched. The Python dict keys global_optimality, global_optimality_certified and global_optimality_margin had no Python reader. cargo check --workspace --tests rc 0."
+  },
+  {
+    "base": "ac126ad0c60e5955a6756732c88b3e0b61ce5ca1",
+    "removed": {
+      "crates/gam-linalg/src/utils.rs::stable_logistic": 1,
+      "crates/gam-linalg/src/utils.rs::stable_softplus": 1
+    },
+    "reason": "#3735: gam_linalg::utils::{stable_softplus, stable_logistic} duplicated gam_math::special::{softplus, logistic} expression for expression. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. All callers now import the gam-math kernels.",
+    "evidence": "At head git grep -w finds no occurrence of stable_softplus or stable_logistic; every former caller (gam-model-kernels, gam-models, gam-sae, gam-solve, gam-terms, gam-inference, gam-pyffi) depends on gam-math directly."
   }
 ]
