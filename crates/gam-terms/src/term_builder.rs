@@ -3704,7 +3704,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                univariate_spline_basis_dim(ds.values.column(cols[0]))
+                univariate_spline_basis_dim(ds.values.column(cols[0]), sizing_rows)
             } else {
                 0
             };
@@ -3898,7 +3898,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                univariate_spline_basis_dim(ds.values.column(cols[0]))
+                univariate_spline_basis_dim(ds.values.column(cols[0]), sizing_rows)
             } else {
                 0
             };
@@ -4887,8 +4887,17 @@ pub(crate) fn support_capped_bspline_dimension(
 /// (after its distinct-value support cap), the floor under a 1-D radial
 /// smooth's default so it is not dimensioned coarser than the spline it
 /// competes with on the same data.
-pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>) -> usize {
-    let dim = pilot_internal_knots_for_column(col).saturating_add(DEFAULT_BSPLINE_DEGREE + 1);
+///
+/// #3179: `sizing_rows` is the row count the competing `s(x)` is sized from
+/// — the smallest level of a categorical `by=`, otherwise every row — so the
+/// floor tracks the spline's pilot exactly instead of the full column length.
+pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>, sizing_rows: usize) -> usize {
+    let dim = pilot_internal_knots(
+        sizing_rows,
+        DEFAULT_BSPLINE_DEGREE,
+        DEFAULT_PENALTY_ORDER.min(DEFAULT_BSPLINE_DEGREE),
+    )
+    .saturating_add(DEFAULT_BSPLINE_DEGREE + 1);
     match unique_count_column(col) {
         unique if unique >= 2 => dim.min(unique),
         _ => dim,
