@@ -493,6 +493,36 @@ mod standard_convergence_gate_tests {
     }
 }
 
+/// Record the intercept-only deviance `D₀` on the fit, the denominator of its
+/// reported deviance explained `1 − D/D₀` (a saved model keeps no response to
+/// recompute it from). Only a fit with exactly one intercept column and no
+/// offset nests the intercept-only model; any other fit records `None`.
+fn record_null_deviance(
+    fit: &mut UnifiedFitResult,
+    design: &gam_terms::smooth::TermCollectionDesign,
+    request_family: &LikelihoodSpec,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+) {
+    let nested = design.intercept_range.len() == 1 && offset.iter().all(|&o| o == 0.0);
+    fit.artifacts.null_deviance = nested
+        .then(|| {
+            let likelihood = gam_spec::GlmLikelihoodSpec {
+                spec: fit
+                    .likelihood_family
+                    .clone()
+                    .unwrap_or_else(|| request_family.clone()),
+                scale: fit.likelihood_scale,
+            };
+            gam_solve::pirls::calculate_null_deviance(y, &likelihood, weights)
+            .map_err(|error| log::warn!("null-model deviance is unavailable: {error}"))
+            .ok()
+        })
+        .flatten()
+        .filter(|d| d.is_finite());
+}
+
 pub(crate) fn fit_standard_model(
     request: StandardFitRequest<'_>,
 ) -> Result<StandardFitResult, FitFailure> {
@@ -569,7 +599,7 @@ pub(crate) fn fit_standard_model_on_design(
     // define their appended link coordinates (#2654).
     let is_firth_capable_binomial = request.family.supports_firth();
     let base = fit_standard_base(&request, &request.family, &request.options, realized_design);
-    let fitted = match base {
+    let mut fitted = match base {
         Ok(fitted) => fitted,
         Err(original_error) => {
             let rescue_is_defined = is_firth_capable_binomial
@@ -635,6 +665,14 @@ pub(crate) fn fit_standard_model_on_design(
         }
     };
 
+    record_null_deviance(
+        &mut fitted.fit,
+        &fitted.design,
+        &request.family,
+        request.y.view(),
+        request.weights.view(),
+        request.offset.view(),
+    );
     let adaptive_bases = adaptive_bases(&request.spec);
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
@@ -756,6 +794,14 @@ pub(crate) fn fit_standard_model_on_design(
     // solver. Preserve the resolved response and inverse link explicitly;
     // response-scale prediction after assembly or reload depends on it (#2748).
     solved.fit.likelihood_family = Some(fitted_wiggle_family);
+    record_null_deviance(
+        &mut solved.fit,
+        &solved.design,
+        &request.family,
+        request.y.view(),
+        request.weights.view(),
+        request.offset.view(),
+    );
 
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,

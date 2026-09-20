@@ -10,6 +10,28 @@
   proxy. The Python `incoherence_report` dict loses the `global_optimality`,
   `global_optimality_certified` and `global_optimality_margin` keys, and the report
   is no longer recorded in the certificate ledger.
+
+- **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
+  The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
+  the default slope (an intercept in every slope surface and a constant or no offset) any σ
+  fits the data exactly as well as any other once the slope is rescaled. Such a fit is now
+  refused by that reason at fit entry, before any solve, instead of by a missing derivative
+  or a per-score rule. A slope offset outside the slope design's span does identify σ, and
+  those fits keep their previous behaviour. A fixed `frailty_sd` is unaffected (gam#2938).
+
+- **The arrow-Schur "certified mixed precision" solve is removed** (#2946 census T10).
+  The streaming/residency path turned it on by default. It factored the reduced
+  Schur complement and the per-row blocks in f64, copied those factors to f32,
+  solved in f32, and refined with f64 residuals until a backward-error certificate
+  closed. The gates were chosen constants: at most 6 refinements, a 1e-11
+  certificate, a κ·u_f32 margin of 0.5 with a ceiling of 1.0, and a 64·ε floor.
+  Because the f64 factors already existed, the f32 solves and refinement matvecs
+  were extra work on top of an f64 triangular solve that the same factor answers
+  directly. Every dense reduced solve now runs that one f64 solve.
+  `ArrowSolvePrecisionPolicy`, `ArrowSolveOptions::solve_precision`,
+  `MixedPrecisionStatus` and `ArrowPcgDiagnostics::mixed_precision_status` are
+  deleted. The GPU PIRLS mixed-precision policy (`GpuMixedPrecisionPolicy`) is a
+  separate path and is unchanged.
 - **One exception hierarchy, chosen by the engine's error category.** Every engine
   error now reports one Rust `ErrorCategory` (formula, data, convergence, not fitted,
   internal). Python raises a class under that category's base, and the CLI exits

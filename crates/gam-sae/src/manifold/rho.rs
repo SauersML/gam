@@ -562,72 +562,23 @@ impl SaeManifoldRho {
             bound.validate_log_strength_domain()?;
             return Ok(bound);
         }
-        // Separable-gate modes (softmax entropy / ThresholdGate gated-L1).
-        //
-        // #1782 — a SINGLE-atom (K = 1) fit has no cross-atom routing, so the
-        // response-dispersion identity `λ/φ` is exactly the effective stiffness
-        // and full scaling is well-founded: keep it BYTE-FOR-BYTE (this is the
-        // regime the planted-circle noise-scale sweep pins). But a MULTI-atom
-        // (K > 1) fit couples the per-atom decoders and coordinates through the
-        // shared routing gate, and on clean data `φ_seed ≪ 1` the dispersion
-        // shift `ln φ_seed` WEAKENS the decoder-smoothness / ARD seed toward
-        // zero. That hands the coupled `(coords, decoders)` block enough slack to
-        // overfit AT THE SEED, driving the undamped per-row / cross-row joint
-        // Hessian indefinite — a non-PD seed whose quasi-Laplace score log-det is
-        // undefined. Because the SAE fit runs from a single start,
-        // the EFS startup validation then rejects it with "no candidate seeds
-        // passed outer startup validation" (the #1782 softmax / threshold-gate failure),
-        // exactly where ordered_beta_bernoulli — which is never dispersion-weakened — survives.
-        //
-        // Fix: for K > 1 keep the seed decoder-smoothness / ARD from being
-        // WEAKENED below their (dimensionless) construction strength — floor the
-        // shift at 0 so noisy data (`φ > 1`) still STRENGTHENS smoothing (the
-        // well-founded direction) while clean data can no longer collapse the
-        // seed penalties into the non-PD basin. The sparse (gate) coordinate,
-        // which does not enter the decoder Hessian, keeps its full dispersion
-        // scaling. The EFS fixed point then descends each λ from this feasible,
-        // PD seed to the same interior optimum.
-        if bound.log_lambda_smooth.len() <= 1 {
-            return bound.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true);
-        }
-        if !(dispersion.is_finite() && dispersion > 0.0) {
-            return Err(format!(
-                "SaeManifoldRho::seed_scaled_by_dispersion_for_assignment: dispersion must \
-                 be finite and positive; got {dispersion}"
-            ));
-        }
-        let shift = dispersion.ln();
-        let smooth_ard_shift = shift.max(0.0);
-        let mut scaled = bound;
-        if scaled.sparse_flat_index().is_some() {
-            scaled.log_lambda_sparse += shift;
-        }
-        for value in &mut scaled.log_lambda_smooth {
-            *value += smooth_ard_shift;
-        }
-        for atom in &mut scaled.log_ard {
-            for value in atom.iter_mut() {
-                *value += smooth_ard_shift;
-            }
-        }
-        scaled.validate_log_strength_domain()?;
-        Ok(scaled)
+        // Separable-gate modes (softmax entropy / ThresholdGate gated-L1): every
+        // scale-coupled coordinate (the gate strength, each smoothness and each ARD
+        // log-strength) takes the full shift `ln φ` at every K, so the seed's
+        // effective stiffness `λ/φ` is the construction value (#3233).
+        bound.seed_scaled_by_dispersion(dispersion)
     }
 
-    pub(crate) fn seed_scaled_by_dispersion_with_sparse_policy(
-        &self,
-        dispersion: f64,
-        scale_sparse: bool,
-    ) -> Result<Self, String> {
+    fn seed_scaled_by_dispersion(&self, dispersion: f64) -> Result<Self, String> {
         if !(dispersion.is_finite() && dispersion > 0.0) {
             return Err(format!(
-                "SaeManifoldRho::seed_scaled_by_dispersion_with_sparse_policy: dispersion must be \
-                 finite and positive; got {dispersion}"
+                "SaeManifoldRho::seed_scaled_by_dispersion: dispersion must be finite and \
+                 positive; got {dispersion}"
             ));
         }
         let shift = dispersion.ln();
         let mut scaled = self.clone();
-        if scale_sparse && scaled.sparse_flat_index().is_some() {
+        if scaled.sparse_flat_index().is_some() {
             scaled.log_lambda_sparse += shift;
         }
         for value in &mut scaled.log_lambda_smooth {

@@ -13,6 +13,7 @@ use crate::inference::predict_io::{FittedLatentScoreMap, LatentConditioningSpan}
 use crate::marginal_slope_orthogonal::influence_absorber_log_lambda;
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb};
+use gam_linalg::roundoff::{accumulation_growth, factor_singular_band};
 use gam_problem::jeffreys_arming::JeffreysArmingEvidence;
 
 /// Sup-norm of the FITTED marginal linear predictor `η = X·β` at which the
@@ -682,15 +683,23 @@ pub(crate) enum ReducedSlopeOutcome {
 /// 2. an effective slope direction with `C v = 0` carries no curvature at all,
 ///    is unidentified, and drops first;
 /// 3. the singular values of the slope basis's residual off the marginal
-///    basis are the sines `sin θ_k`, and direction `k` drops only when its sine
-///    is inside the rounding band of 0.
+///    basis are the sines `sin θ_k`, and direction `k` drops when its curvature
+///    is inside the band the joint Hessian forms it within.
 ///
-/// The rounding band is the backward error of those orthonormalizations and
-/// projections: a Householder/SVD factorization of an `n × k` matrix with unit
-/// columns is exact for a perturbation of relative size `≲ max(n, k)·ε`
-/// (Golub & Van Loan, *Matrix Computations*, §5.2, §8.6), so a singular value
-/// or an angle sine at or below `max(n, k)·ε` (relative to the largest) is
-/// indistinguishable from zero in floating point. Nothing is tuned.
+/// The span bases are resolved at the SVD's backward error
+/// ([`factor_singular_band`]: a factorization of an `n × k` matrix with unit
+/// columns is exact for a perturbation of relative size `max(n, k)·ε`). The
+/// drop decision is not an angle test against that band. What the fit reads is
+/// direction `k`'s data curvature in the joint Hessian, `sin²θ_k` along the
+/// joint direction `u_k = [a_k; v_k]` whose effective image is the `k`-th
+/// residual (`v_k` reaches the slope image, `a_k` profiles out its marginal
+/// part), and the Hessian's entries are `n`-row sums, so it forms that curvature
+/// within `γ_n·‖|J|·|u_k|‖²` of exact (gam#3045). A direction whose `sin²θ_k` lies
+/// inside that band plus twice the sine's own SVD rounding is one the joint
+/// Hessian cannot tell from a null direction, however far its sine sits above
+/// `max(n, k)·ε`; one above it carries curvature the inner solve can use.
+/// `|J|·|u_k|` does not move when a column is rescaled, so neither does the
+/// decision. Nothing is tuned.
 ///
 /// `T` is an orthonormal basis of the kept generalized eigendirections, which
 /// are `C`-orthogonal to the dropped ones (the complement is coordinate-free).
@@ -741,18 +750,18 @@ pub(crate) fn reduced_slope_transform_effective(
             "reduced slope reparam: the effective pilot Jacobians are non-finite".to_string(),
         );
     }
-    let rounding_band = |k: usize| (n.max(k) as f64) * f64::EPSILON;
-
-    let (marginal_basis, _) = equilibrated_range_basis(&m_eff, rounding_band(p_m))?;
-    let (slope_basis, slope_coefficients) = equilibrated_range_basis(&g_eff, rounding_band(p_g))?;
+    let (marginal_basis, marginal_coefficients) =
+        equilibrated_range_basis(&m_eff, factor_singular_band(n, p_m, 1.0))?;
+    let (slope_basis, slope_coefficients) =
+        equilibrated_range_basis(&g_eff, factor_singular_band(n, p_g, 1.0))?;
     if slope_basis.ncols() == 0 {
         // Every effective slope direction has `C v = 0`: no curvature at all.
         return Ok(ReducedSlopeOutcome::FullyConfounded);
     }
-    let residual = if marginal_basis.ncols() == 0 {
-        slope_basis.clone()
-    } else {
-        &slope_basis - &marginal_basis.dot(&fast_atb(&marginal_basis, &slope_basis))
+    let cosines = (marginal_basis.ncols() > 0).then(|| fast_atb(&marginal_basis, &slope_basis));
+    let residual = match cosines.as_ref() {
+        Some(cosines) => &slope_basis - &marginal_basis.dot(cosines),
+        None => slope_basis.clone(),
     };
     let (_, sines, angle_vt) = residual
         .svd(false, true)
@@ -760,8 +769,41 @@ pub(crate) fn reduced_slope_transform_effective(
     let angle_vt = angle_vt.ok_or_else(|| {
         "reduced slope reparam: principal-angle SVD returned no right vectors".to_string()
     })?;
-    let angle_band = rounding_band(p_m + p_g);
-    let kept: Vec<usize> = (0..sines.len()).filter(|&k| sines[k] > angle_band).collect();
+    // The joint direction behind sine k, u_k = [a_k; v_k]: v_k = V_Y·q_k reaches the
+    // unit slope image U_Y·q_k, and a_k = −V_X·(U_Xᵀ·U_Y)·q_k profiles out its
+    // marginal part, so J·u_k is the residual image and its data curvature is
+    // exactly sin²θ_k.
+    let rotation = angle_vt.t().to_owned();
+    let slope_directions = fast_ab(&slope_coefficients, &rotation);
+    let marginal_directions = match cosines.as_ref() {
+        Some(cosines) => -fast_ab(&marginal_coefficients, &fast_ab(cosines, &rotation)),
+        None => Array2::<f64>::zeros((p_m, rotation.ncols())),
+    };
+    // The joint Hessian forms that curvature as an n-row sum, within
+    // γ_n·‖|J|·|u_k|‖² of exact; the product |J|·|u_k| does not move when a column
+    // is rescaled (J → J·D, u → D⁻¹·u).
+    let mut absolute_curvature = vec![0.0_f64; rotation.ncols()];
+    for row in 0..n {
+        for (k, total) in absolute_curvature.iter_mut().enumerate() {
+            let mut image = 0.0;
+            for j in 0..p_m {
+                image += m_eff[[row, j]].abs() * marginal_directions[[j, k]].abs();
+            }
+            for j in 0..p_g {
+                image += g_eff[[row, j]].abs() * slope_directions[[j, k]].abs();
+            }
+            *total += image * image;
+        }
+    }
+    // The SVD of the residual returns each sine within its backward error on
+    // ‖R‖ ≤ 1, so a computed sin²θ_k is within twice that of the curvature.
+    let sine_rounding = factor_singular_band(n, slope_basis.ncols(), 1.0);
+    let kept: Vec<usize> = (0..sines.len())
+        .filter(|&k| {
+            let formation = accumulation_growth(n) * absolute_curvature[k];
+            sines[k] * sines[k] > formation + 2.0 * sine_rounding
+        })
+        .collect();
     let r = kept.len();
     // r == p_g: no effective-confounded direction to remove — keep the raw
     // design. r == 0: the whole effective slope image is in the effective
@@ -1489,6 +1531,53 @@ mod runaway_tests {
                 assert!(
                     (image[i] - reference[i]).abs() < 1.0e-9,
                     "k={k}: kept effective image {image:?} differs from {reference:?}"
+                );
+            }
+        }
+    }
+
+    /// gam#3045: a direction is kept or dropped on the curvature the joint Hessian
+    /// forms, not on its angle. The slope column's effective image is the marginal
+    /// column plus `δ` times an independent one, so its direction carries data
+    /// curvature `sin²θ ≈ δ²/2` of its energy. At `δ = 1e-9` that is ~5e-19, far
+    /// inside the `γ_n·‖|J|·|u|‖²` (~1e-13) an `n`-row Hessian sum forms it within,
+    /// although `sin θ ≈ 7e-10` sits far above the SVD's `max(n, k)·ε` (~9e-14):
+    /// the Hessian cannot tell the direction from a null one, so it drops and the
+    /// block is refused. At `δ = 1e-3` the curvature (~5e-7) is resolved and the
+    /// direction stays.
+    #[test]
+    pub(crate) fn effective_reduction_drops_a_direction_the_hessian_cannot_resolve_3045() {
+        let n = 400;
+        let m = Array2::<f64>::from_elem((n, 1), 1.0);
+        // With zero offsets and baselines the effective slope scale is f_i = z_i.
+        let z = Array1::from_iter((0..n).map(|i| 0.5 + ((i as f64) * 0.37).sin().abs()));
+        let w = Array1::<f64>::ones(n);
+        let zero = Array1::<f64>::zeros(n);
+        let independent = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.71).cos()));
+        for (delta, resolved) in [(1.0e-9, false), (1.0e-3, true)] {
+            let g = Array2::from_shape_fn((n, 1), |(i, _)| (1.0 + delta * independent[i]) / z[i]);
+            let outcome = reduced_slope_transform_effective(
+                m.view(),
+                g.view(),
+                &z,
+                &w,
+                &zero,
+                &zero,
+                0.0,
+                0.0,
+                1.0,
+            )
+            .expect("effective reduction must succeed");
+            if resolved {
+                assert!(
+                    matches!(outcome, ReducedSlopeOutcome::FullRank),
+                    "δ={delta}: a curvature the Hessian resolves must be kept, got {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, ReducedSlopeOutcome::FullyConfounded),
+                    "δ={delta}: a curvature inside the Hessian's formation band must drop, got \
+                     {outcome:?}"
                 );
             }
         }

@@ -40,6 +40,43 @@ pub(crate) fn circle_log_marginal(log_kappa: f64, period: f64) -> (f64, f64) {
     (period.ln() + centered_log_i0, scaled_derivative)
 }
 
+/// `(log M(κ, P), d log M / dκ)` for any real curvature `κ`: the integral of
+/// [`circle_log_marginal`] continued through `κ ≤ 0` (#2933 F07).
+///
+/// A unit-pinned direction of the evidence factor still has its raw curvature, which can
+/// be zero or negative. The same energy integrates there without a threshold:
+///
+/// ```text
+///   κ > 0:  log M = log P − η + log I0(η)
+///   κ ≤ 0:  log M = log P + |η| + log I0(|η|)          (I0 even, η = κP²/(2π)² ≤ 0)
+///   d log M / dκ = (P/2π)²·(I1(η)/I0(η) − 1)          (I1 odd)
+/// ```
+///
+/// so `M` is `P` at `κ = 0` and grows past it as the phase's mode turns into its maximum:
+/// the mass of `e^{|η|(1 − cos x)}` sits at the antipode, which the circle holds.
+pub(crate) fn circle_log_marginal_signed(kappa: f64, period: f64) -> (f64, f64) {
+    let scale = (period / std::f64::consts::TAU).powi(2);
+    if kappa > 0.0 {
+        let (log_marginal, scaled_derivative) = circle_log_marginal(kappa.ln(), period);
+        let eta = kappa * scale;
+        // Below `η = 1` the ratio form has no cancellation, and it stays exact where
+        // `η` underflows and `η·d/dη` would round to zero.
+        let derivative = if eta < 1.0 {
+            let (_, ratio, _) = gam_math::special::bessel_i0_centered_terms(eta);
+            scale * (ratio - 1.0)
+        } else {
+            scaled_derivative / kappa
+        };
+        return (log_marginal, derivative);
+    }
+    let magnitude = -kappa * scale;
+    let (centered_log_i0, ratio, _) = gam_math::special::bessel_i0_centered_terms(magnitude);
+    (
+        period.ln() + 2.0 * magnitude + centered_log_i0,
+        -scale * (1.0 + ratio),
+    )
+}
+
 /// Per-row log partition of one atom's ARD coordinate prior and its
 /// log-precision derivatives (see [`SaeManifoldTerm::ard_log_partition`]).
 pub(crate) struct ArdLogPartition {
@@ -1218,6 +1255,66 @@ mod tests {
                 "P={period}: log M at log kappa=1e3 is {log_value:.17e}, Laplace {laplace:.17e}"
             );
             assert_eq!(derivative.to_bits(), (-0.5_f64).to_bits(), "P={period}: overflow score");
+        }
+    }
+
+    #[test]
+    fn signed_circle_log_marginal_is_the_quadrature_at_every_curvature_sign_2933_f07() {
+        for &period in &PERIODS {
+            let k = TAU / period;
+            let scale = 1.0 / (k * k);
+            for exponent in -12..=5 {
+                for sign in [-1.0_f64, 1.0] {
+                    let eta = sign * 10.0_f64.powf(0.5 * exponent as f64);
+                    assert_nodes_resolve(eta.abs());
+                    let kappa = eta * k * k;
+                    let (log_value, derivative) = circle_log_marginal_signed(kappa, period);
+                    let (mass, mean_energy) = trapezoid_circle_moments(kappa, period, NODES);
+                    // The positive-curvature budget of the unsigned pin; at `κ < 0` every
+                    // summand's exponent is at most `2|η|`, so the same `(3|η| + 1)ε` holds.
+                    let value_band = gamma(NODES)
+                        + (3.0 * eta.abs() + 1.0) * f64::EPSILON
+                        + 4.0 * f64::EPSILON * (1.0 + period.ln().abs() + log_value.abs());
+                    assert!(
+                        (log_value - mass.ln()).abs() <= value_band,
+                        "P={period} eta={eta:e}: log M={log_value:.17e}, quadrature {:.17e}",
+                        mass.ln(),
+                    );
+                    // `d log M / dκ = −E[(1 − cos k·u)]/k² = −E[η(1 − cos k·u)]/κ`.
+                    let expected = -mean_energy / kappa;
+                    let derivative_band =
+                        (2.0 * gamma(NODES) + (2.0 * eta.abs() + 4.0) * f64::EPSILON)
+                            * expected.abs().max(scale);
+                    assert!(
+                        (derivative - expected).abs() <= derivative_band,
+                        "P={period} eta={eta:e}: d log M/d kappa={derivative:.17e}, quadrature \
+                         {expected:.17e}, |diff|={:.3e} > {derivative_band:.3e}",
+                        (derivative - expected).abs(),
+                    );
+                }
+            }
+            // κ = 0 is the period itself, with the score `−(P/2π)²` both sides reach.
+            let (log_value, derivative) = circle_log_marginal_signed(0.0, period);
+            assert_eq!(log_value.to_bits(), period.ln().to_bits(), "P={period}: log M(0)");
+            assert!(
+                (derivative + scale).abs() <= 2.0 * f64::EPSILON * scale,
+                "P={period}: score at kappa = 0 is {derivative:e}, not {:e}",
+                -scale
+            );
+            for kappa in [1.0e-300, -1.0e-300, f64::MIN_POSITIVE] {
+                let (value, score) = circle_log_marginal_signed(kappa, period);
+                assert!(
+                    (value - period.ln()).abs() <= 4.0 * f64::EPSILON * (1.0 + period.ln().abs())
+                        && (score + scale).abs() <= 4.0 * f64::EPSILON * scale,
+                    "P={period} kappa={kappa:e}: ({value:e}, {score:e}) is not continuous at 0"
+                );
+            }
+            // A positive curvature never holds more than the period.
+            for exponent in -8..=8 {
+                let kappa = 10.0_f64.powi(exponent);
+                let (value, _) = circle_log_marginal_signed(kappa, period);
+                assert!(value <= period.ln() + 4.0 * f64::EPSILON * (1.0 + period.ln().abs()));
+            }
         }
     }
 

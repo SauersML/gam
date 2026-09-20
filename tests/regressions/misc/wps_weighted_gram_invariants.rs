@@ -12,7 +12,7 @@
 //!     trace, so this angle is blind to the symmetrization defect but exposes the
 //!     basis defect directly.)
 //!
-//!  2. **Weighted Gram is symmetric PSD.** `fit.weighted_gram()` must be a
+//!  2. **Weighted Gram is symmetric PSD.** `fit.saved_frame_weighted_gram()` must be a
 //!     genuine symmetric positive-semidefinite curvature — the property that
 //!     makes `tr(X'WX·Σ_ρ) ≥ 0`. The old `H·F` reconstruction was asymmetric and
 //!     indefinite.
@@ -125,11 +125,12 @@ fn weighted_gram_is_symmetric_psd() {
             let fit = &std_fit.fit;
 
             let gram = fit
-                .weighted_gram()
+                .saved_frame_weighted_gram()
+                .expect("weighted Gram has a saved-frame form")
                 .expect("weighted Gram present on an inferential Gaussian fit");
 
             // Symmetric to round-off.
-            let asym = max_abs_asymmetry(gram);
+            let asym = max_abs_asymmetry(&gram);
             let scale = gram
                 .iter()
                 .copied()
@@ -144,7 +145,7 @@ fn weighted_gram_is_symmetric_psd() {
 
             // Positive semidefinite: the curvature X'WX (PSD by construction, and
             // PSD-floored on storage). The old H·F reconstruction had min-eig < 0.
-            let min_eig = min_eigenvalue(gram);
+            let min_eig = min_eigenvalue(&gram);
             assert!(
                 min_eig >= -1e-8 * scale,
                 "weighted Gram must be PSD; min eigenvalue {min_eig:.3e} \
@@ -175,13 +176,15 @@ fn penalized_hessian_times_influence_equals_weighted_gram() {
             let fit = &std_fit.fit;
 
             let h = fit
-                .penalized_hessian()
+                .saved_frame_penalized_hessian()
+                .expect("penalized Hessian has a saved-frame form")
                 .expect("penalized Hessian present on an inferential Gaussian fit");
             let f = fit
                 .coefficient_influence()
                 .expect("influence matrix present on an inferential Gaussian fit");
             let xwx = fit
-                .weighted_gram()
+                .saved_frame_weighted_gram()
+                .expect("weighted Gram has a saved-frame form")
                 .expect("weighted Gram present on an inferential Gaussian fit");
 
             let hf = h.dot(f);
@@ -371,10 +374,12 @@ fn conditioned_model_retains_influence_and_its_identities_2672() {
                 )
             });
             let h = fit
-                .penalized_hessian()
+                .saved_frame_penalized_hessian()
+                .expect("penalized Hessian has a saved-frame form")
                 .expect("penalized Hessian present on an inferential Gaussian fit");
             let gram = fit
-                .weighted_gram()
+                .saved_frame_weighted_gram()
+                .expect("weighted Gram has a saved-frame form")
                 .expect("weighted Gram present on an inferential Gaussian fit");
             let edf = fit.edf_total().expect("edf_total present");
 
@@ -413,13 +418,13 @@ fn conditioned_model_retains_influence_and_its_identities_2672() {
             );
 
             // And the Gram itself is still a genuine symmetric PSD curvature.
-            let asym = max_abs_asymmetry(gram);
+            let asym = max_abs_asymmetry(&gram);
             assert!(
                 asym <= 1e-9 * scale,
                 "weighted Gram must stay symmetric on a conditioned model; max \
                  asymmetry {asym:.3e} (freq={freq}, seed={seed})"
             );
-            let min_eig = min_eigenvalue(gram);
+            let min_eig = min_eigenvalue(&gram);
             assert!(
                 min_eig >= -1e-8 * scale,
                 "weighted Gram must stay PSD on a conditioned model; min eigenvalue \
