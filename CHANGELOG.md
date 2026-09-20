@@ -1,13 +1,22 @@
 ## Unreleased
 
+- **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
+  (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
+  point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is
+  deleted, and so is `cholesky_logdet_from_col_major`. `GpuMixedPrecisionPolicy` is deleted,
+  since only its `Refinement` variant was ever reachable. `GpuDispatchPolicy` loses seven
+  fields that no dispatch decision read: `xtwx_n_min`, `xtwx_use_fused_below_p`,
+  `syevd_min_p`, `sparse_min_nnz`, `keep_design_resident_min_bytes`,
+  `prefer_gpu_factorization_min_p` and `mixed_precision`.
+
 - **The PIRLS dense Newton direction is solved the same way on every host** (#3551).
   On a CUDA host the direction was sent to a device Cholesky on the raw Hessian, with
   no size gate and no residual certificate, and a non-finite device result was silently
   redone on the CPU. An indefinite Hessian (a delayed-entry survival fit away from its
   mode) failed the device factorization and the fit errored, where a CPU-only host took
-  the #2814 Gill–Murray descent step. The device route and its solution-only
-  mixed-precision entry point are removed; the direction is always taken on
-  `descent_curvature(H)` under the one certificate.
+  the #2814 Gill–Murray descent step. The PIRLS device route and its gam-solve
+  wrapper are removed; the direction is always taken on `descent_curvature(H)` under
+  the one certificate.
 
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from

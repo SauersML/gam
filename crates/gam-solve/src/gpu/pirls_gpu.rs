@@ -1610,9 +1610,8 @@ extern "C" __global__ void chol_logdet_col_major(
     }
 
     /// Launch the device-side Cholesky-factor logdet kernel and download
-    /// the single scalar result. Replaces the per-step p² host download of
-    /// the Cholesky factor that the host-side `cholesky_logdet_from_col_major`
-    /// required.
+    /// the single scalar result, so the p² Cholesky factor never has to be
+    /// downloaded to the host for its log-determinant.
     fn cholesky_logdet_device(
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         ctx: &std::sync::Arc<cudarc::driver::CudaContext>,

@@ -132,12 +132,15 @@ fn symmetric_gram_single_upload_matches_host_reference_or_declines() {
     // the same reference; the decline is the documented fallback.
 }
 
-/// #1412 (mixed precision): the fp32-factor + fp64-refinement solve must return
-/// a FULL-fp64-accurate solution (matches a host SPD solve to refinement
-/// tolerance) and a finite fp64 logdet. Device-agnostic: on a CPU host the
-/// entry point returns `Err` (no runtime), which is the documented decline.
+/// #1412 (mixed-precision solution-only): the PIRLS Newton direction takes the
+/// fp32-factor + fp64-refinement path with no fp64 POTRF. The contract that
+/// matters for correctness: the returned solution is FULL-fp64-accurate
+/// (matches a host SPD solve to refinement tolerance), since refinement hands
+/// back `x` only once its residual reaches the attainable band. On a host
+/// without a CUDA runtime the entry point returns `Err`; on a host with one,
+/// `Err` is a device fault and fails the test.
 #[test]
-fn mixed_precision_solve_is_fp64_accurate_or_declines() {
+fn mixed_precision_solution_only_is_fp64_accurate_or_declines() {
     let p = 128usize; // ≥ REFINEMENT_MIN_P so the fp32 path is admitted on device
     // Diagonally-dominant SPD A (well-conditioned so fp32+refinement converges).
     let a = Array2::from_shape_fn((p, p), |(i, j)| {
@@ -152,19 +155,33 @@ fn mixed_precision_solve_is_fp64_accurate_or_declines() {
 
     let host = solve_spd_host(&a, &b);
 
-    if let Ok((sol, logdet)) = gam::gpu::solver::cholesky_solve_gpu(a.view(), rhs.view()) {
-        assert_eq!(sol.dim(), (p, 1));
-        let mut max_diff = 0.0_f64;
-        for i in 0..p {
-            max_diff = max_diff.max((sol[[i, 0]] - host[i]).abs());
+    // Solution-only mixed-precision path.
+    match gam::gpu::solver::cholesky_solve_only_gpu(a.view(), rhs.view()) {
+        Ok(sol) => {
+            assert_eq!(sol.dim(), (p, 1));
+            let mut max_diff = 0.0_f64;
+            for i in 0..p {
+                max_diff = max_diff.max((sol[[i, 0]] - host[i]).abs());
+            }
+            let scale = 1.0 + host.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            assert!(
+                max_diff < 1e-9 * scale,
+                "solution-only mixed-precision differs from host solve by {max_diff:e} \
+                 (refinement must recover full fp64 accuracy)"
+            );
         }
-        let scale = 1.0 + host.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        assert!(
-            max_diff < 1e-9 * scale,
-            "mixed-precision solve differs from host solve by {max_diff:e} \
-             (refinement must recover full fp64 accuracy)"
-        );
-        assert!(logdet.is_finite(), "the solve must produce a finite logdet");
+        Err(err) => {
+            assert!(
+                gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
+                    .unwrap_or_else(|error| {
+                        panic!("GPU probe fault in mixed-precision solve test: {error}")
+                    })
+                    .is_none(),
+                "mixed-precision solve returned Err on a host WITH a CUDA runtime present: \
+                 {err}. A well-conditioned SPD system must solve on device (fp32 + \
+                 refinement, or fp64), so a runtime-present decline is a device fault."
+            );
+        }
     }
 }
 
